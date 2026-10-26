@@ -2560,22 +2560,11 @@ pub struct ScanOptions<V: Value> {
     stacked_axis_shardings: Vec<ShardingDimension>,
 }
 
-impl<V: Value> Default for ScanOptions<V> {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            iteration_count: ScanIterationCount::Inferred,
-            reverse: false,
-            unroll: 1,
-            stacked_axis_shardings: Vec::new(),
-        }
-    }
-}
-
 // TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value> ScanOptions<V> {
-    /// Creates options that infer the count and visit slices in forward order without unrolling.
+    /// Creates a new [`ScanOptions`] instance that infers the count and visit slices in forward order
+    /// without unrolling.
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -2707,6 +2696,18 @@ impl<V: Value> ScanOptions<V> {
             .with_reverse(self.reverse)
             .with_unroll(self.unroll)?
             .with_stacked_axis_shardings(self.stacked_axis_shardings.clone()))
+    }
+}
+
+impl<V: Value> Default for ScanOptions<V> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            iteration_count: ScanIterationCount::Inferred,
+            reverse: false,
+            unroll: 1,
+            stacked_axis_shardings: Vec::new(),
+        }
     }
 }
 

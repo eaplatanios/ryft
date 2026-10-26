@@ -520,12 +520,36 @@ where
     /// them because it discards the program along with the captures. It passes the trace's context to `function`
     /// together with its inputs, like [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes).
     #[allow(clippy::type_complexity)]
+    #[inline]
     fn trace_with_named_axes_counting_captures<
         F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
         Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
+        let mut function = Some(function);
+        Self::trace_with_named_axes_counting_captures_erased(
+            &mut |context: &Self, input: Input::To<Tracer<Self>>| function.take().unwrap()(context, input),
+            input_type,
+            named_axes,
+        )
+    }
+
+    /// Internal helper that traces like
+    /// [`trace_with_named_axes_counting_captures`](Self::trace_with_named_axes_counting_captures) with the callback
+    /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
+    /// once per input and output structure rather than once per callback type: every trace of a distinct closure would
+    /// otherwise instantiate this body and every closure and iterator adapter in it again. The callback is invoked
+    /// exactly once.
+    #[allow(clippy::type_complexity)]
+    fn trace_with_named_axes_counting_captures_erased<
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: &mut dyn FnMut(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
@@ -765,6 +789,7 @@ impl<C: Context> NestedTracingContext<C> {
     /// the provided named axes, which shadow same-named bindings of `parent`. This is the nested-tracing counterpart
     /// of [`TracingContext::trace_with_named_axes`].
     #[allow(clippy::type_complexity)]
+    #[inline]
     pub fn trace_with_named_axes<F, Output>(
         parent: C,
         function: F,
@@ -776,6 +801,32 @@ impl<C: Context> NestedTracingContext<C> {
     >
     where
         F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Output: Parameterized<Tracer<Self>>,
+        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let mut function = Some(function);
+        Self::trace_with_named_axes_erased(
+            parent,
+            &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs),
+            input_types,
+            named_axes,
+        )
+    }
+
+    /// Internal helper that traces like [`trace_with_named_axes`](Self::trace_with_named_axes) with the callback type
+    /// erased. This is the body of that function, which only wraps its callback, so that this body is compiled once per
+    /// output structure rather than once per callback type. The callback is invoked exactly once.
+    #[allow(clippy::type_complexity)]
+    fn trace_with_named_axes_erased<Output>(
+        parent: C,
+        function: &mut dyn FnMut(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
+        input_types: Vec<C::Type>,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<
+        (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
+        ProgramError,
+    >
+    where
         Output: Parameterized<Tracer<Self>>,
         Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {

@@ -1792,6 +1792,7 @@ pub trait Batch: Context {
     /// operations. Refer to the documentation of the [`batch`] function for information on the batching transform and
     /// its arguments. Unlike that function, this method also serves inputs with no leaf values (i.e., that are empty),
     /// provided that `batch_axis` supplies an explicit batch extent.
+    #[inline]
     fn batch<
         F: FnOnce(I::To<BatchingTracer<Self, Self::Policy>>) -> Result<O, ProgramError>,
         I: Parameterized<
@@ -1813,45 +1814,75 @@ pub trait Batch: Context {
         output_batch_axes: OutputBatchAxes,
         batch_axis: Specification,
     ) -> Result<O::To<Self::Value>, BatchingError> {
-        let input_structure = input.parameter_structure();
-        let inputs = input.into_parameters().collect::<Vec<_>>();
-
-        // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills
-        // every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure broadcasts
-        // based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
-        let input_batch_axes = input_batch_axes
-            .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
-            .into_parameters()
-            .collect::<Vec<_>>();
-
-        // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
-        let (context, inputs) =
-            BatchingContext::<Self, Self::Policy>::prepare_inputs(self, inputs, input_batch_axes, batch_axis.into())?;
-        let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
-        let input = I::To::<BatchingTracer<Self, Self::Policy>>::from_parameters(input_structure, inputs)?;
-        let output = function(input)?;
-
-        // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
-        // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
-        // structure gives one axis per leaf.
-        let output_structure = output.parameter_structure();
-        let output_batch_axis_values = output_batch_axes
-            .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
-            .into_parameters()
-            .collect::<Vec<_>>();
-
-        // The active policy materializes each requested output axis. Unwrapping to parent values preserves any
-        // enclosing batching level's metadata, so nested transforms require no side table.
-        let parent_outputs = output
-            .into_parameters()
-            .zip(output_batch_axis_values)
-            .map(|(output, output_batch_axis)| {
-                Self::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-
-        Ok(O::To::<Self::Value>::from_parameters(output_structure, parent_outputs)?)
+        let mut function = Some(function);
+        batch_erased(
+            self,
+            &mut |input| function.take().unwrap()(input),
+            input,
+            input_batch_axes,
+            output_batch_axes,
+            batch_axis.into(),
+        )
     }
+}
+
+/// Internal helper that batches like [`Batch::batch`] with the callback and specification types erased. This is the
+/// body of that function, which only wraps its callback and converts its specification, so that this body is compiled
+/// once per context and input, output, and axis structure rather than once per callback type. The callback is invoked
+/// exactly once.
+#[allow(clippy::type_complexity)]
+fn batch_erased<
+    C: Batch,
+    I: Parameterized<C::Value, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<C, C::Policy>>>,
+    O: Parameterized<BatchingTracer<C, C::Policy>, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<C::Value>>,
+    InputBatchAxes: Parameterized<BatchAxis>,
+    OutputBatchAxes: Parameterized<BatchAxis>,
+>(
+    parent: &C,
+    function: &mut dyn FnMut(I::To<BatchingTracer<C, C::Policy>>) -> Result<O, ProgramError>,
+    input: I,
+    input_batch_axes: InputBatchAxes,
+    output_batch_axes: OutputBatchAxes,
+    batch_axis: BatchAxisSpecification<<C::Policy as BatchingPolicy<C>>::Extent>,
+) -> Result<O::To<C::Value>, BatchingError> {
+    let input_structure = input.parameter_structure();
+    let inputs = input.into_parameters().collect::<Vec<_>>();
+
+    // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills
+    // every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure broadcasts
+    // based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
+    let input_batch_axes = input_batch_axes
+        .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
+        .into_parameters()
+        .collect::<Vec<_>>();
+
+    // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
+    let (context, inputs) =
+        BatchingContext::<C, C::Policy>::prepare_inputs(parent, inputs, input_batch_axes, batch_axis)?;
+    let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
+    let input = I::To::<BatchingTracer<C, C::Policy>>::from_parameters(input_structure, inputs)?;
+    let output = function(input)?;
+
+    // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
+    // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
+    // structure gives one axis per leaf.
+    let output_structure = output.parameter_structure();
+    let output_batch_axis_values = output_batch_axes
+        .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
+        .into_parameters()
+        .collect::<Vec<_>>();
+
+    // The active policy materializes each requested output axis. Unwrapping to parent values preserves any
+    // enclosing batching level's metadata, so nested transforms require no side table.
+    let parent_outputs = output
+        .into_parameters()
+        .zip(output_batch_axis_values)
+        .map(|(output, output_batch_axis)| {
+            C::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
+        })
+        .collect::<Result<Vec<_>, BatchingError>>()?;
+
+    Ok(O::To::<C::Value>::from_parameters(output_structure, parent_outputs)?)
 }
 
 impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch for C {

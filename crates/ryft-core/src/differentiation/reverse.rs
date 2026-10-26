@@ -3883,6 +3883,7 @@ pub trait ReverseModeDifferentiate:
     /// alone, so it can materialize its own structural zeros without the caller supplying `primal` again. Leaves
     /// with static zeros are not retained.
     #[allow(clippy::type_complexity)]
+    #[inline]
     fn vjp<
         F: FnOnce(
             Input::To<LinearizationTracer<Self>>,
@@ -3897,24 +3898,8 @@ pub trait ReverseModeDifferentiate:
         primal: Input,
         capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError> {
-        // Retain, as zero sources, only the non-reference primal leaves whose structural zero cotangents cannot be
-        // constructed from their types alone. Linearization consumes `primal`, so the sources are selected first.
-        let input_structure = primal.parameter_structure();
-        let zero_sources = primal
-            .parameters()
-            .map(|primal| {
-                let primal_type = primal.r#type();
-                if primal_type.is_reference() {
-                    return Ok(None);
-                }
-                let cotangent_type = primal_type.cotangent()?;
-                Ok(Self::Operation::requires_zero_source(&cotangent_type).then(|| primal.clone()))
-            })
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
-        let (output, pushforward) =
-            linearize_for_rule(self, function, primal, capture, DifferentiationRule::JvpForTranspose)?;
-        let pullback = Pullback::from_pushforward(pushforward, input_structure, zero_sources);
-        Ok((output, pullback))
+        let mut function = Some(function);
+        vjp_erased(self, &mut |input, capture| function.take().unwrap()(input, capture), primal, capture)
     }
 
     /// Validates the scalar `output` of a gradient entry point and constructs its cotangent seed. The output must be a
@@ -3959,6 +3944,44 @@ pub trait ReverseModeDifferentiate:
         check_count!("output", seeds, 1, ProgramError);
         Ok(seeds.pop().unwrap())
     }
+}
+
+/// Internal helper that differentiates like [`ReverseModeDifferentiate::vjp`] with the callback type erased. This is
+/// the body of that function, which only wraps its callback, so that this body is compiled once per context and input,
+/// capture, and output structure rather than once per callback type. The callback is invoked exactly once.
+#[allow(clippy::type_complexity)]
+fn vjp_erased<
+    C: ReverseModeDifferentiate,
+    Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    context: &C,
+    function: &mut dyn FnMut(
+        Input::To<LinearizationTracer<C>>,
+        Capture::To<LinearizationTracer<C>>,
+    ) -> Result<Output, ProgramError>,
+    primal: Input,
+    capture: Capture,
+) -> Result<(Output::To<C::Value>, Pullback<C, Input, Output::To<C::Value>>), DifferentiationError> {
+    // Retain, as zero sources, only the non-reference primal leaves whose structural zero cotangents cannot be
+    // constructed from their types alone. Linearization consumes `primal`, so the sources are selected first.
+    let input_structure = primal.parameter_structure();
+    let zero_sources = primal
+        .parameters()
+        .map(|primal| {
+            let primal_type = primal.r#type();
+            if primal_type.is_reference() {
+                return Ok(None);
+            }
+            let cotangent_type = primal_type.cotangent()?;
+            Ok(C::Operation::requires_zero_source(&cotangent_type).then(|| primal.clone()))
+        })
+        .collect::<Result<Vec<_>, DifferentiationError>>()?;
+    let (output, pushforward) =
+        linearize_for_rule(context, function, primal, capture, DifferentiationRule::JvpForTranspose)?;
+    let pullback = Pullback::from_pushforward(pushforward, input_structure, zero_sources);
+    Ok((output, pullback))
 }
 
 impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseModeDifferentiate for C

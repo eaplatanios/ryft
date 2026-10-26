@@ -168,6 +168,38 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
     {
+        let mut forward_fn = Some(forward_fn);
+        let mut transpose_fn = Some(transpose_fn);
+        Self::stage_erased(
+            context,
+            residuals,
+            linear_inputs,
+            &mut |residuals, linear_inputs| forward_fn.take().unwrap()(residuals, linear_inputs),
+            &mut |residuals, output_cotangents| transpose_fn.take().unwrap()(residuals, output_cotangents),
+        )
+    }
+
+    /// Internal helper that stages like [`stage`](Self::stage) with the callback types erased. This is the body of that
+    /// function, which only wraps its callbacks, so that this body is compiled once per context rather than once per
+    /// pair of callback types. Each callback is invoked exactly once.
+    #[allow(clippy::type_complexity)]
+    fn stage_erased<C: Context<Type = T, Operation: From<LinearCallOperation<T>>>>(
+        context: &C,
+        residuals: Vec<C::Value>,
+        linear_inputs: Vec<C::Value>,
+        forward_fn: &mut dyn FnMut(
+            &[Tracer<NestedTracingContext<C>>],
+            &[Tracer<NestedTracingContext<C>>],
+        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+        transpose_fn: &mut dyn FnMut(
+            &[Tracer<NestedTracingContext<C>>],
+            &[Tracer<NestedTracingContext<C>>],
+        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+    ) -> Result<Vec<C::Value>, ProgramError>
+    where
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
+    {
         let residual_count = residuals.len();
         let forward_input_types =
             residuals.iter().chain(&linear_inputs).map(|value| value.r#type().into_owned()).collect();

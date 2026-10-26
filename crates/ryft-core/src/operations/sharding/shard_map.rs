@@ -4594,12 +4594,12 @@ fn reconcile_input_cotangent<V: Value<Type = ArrayIrType>, O>(
     target: &ArrayIrType,
 ) -> Result<Tracer<TracingContext<V, O>>, ProgramError>
 where
-    TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
     O: Operation<Type = ArrayIrType>
         + OperationProjection<
             ArrayType,
             Projected: From<BroadcastOperation> + From<ReshardOperation> + From<TransferToMemoryOperation>,
         >,
+    TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
 {
     let actual = contribution.r#type().into_owned();
     if actual == *target {
@@ -5022,16 +5022,44 @@ fn shard_map_within_named_axes(
 ///   - `function`: Flat body closure over the body context and the local shard-map values.
 ///   - `global_input_types`: Caller's global input types, in the order of the input shardings.
 ///   - `outer_named_axes`: Enclosing named-axis bindings that the body inherits.
-fn trace_shard_map_body<C, F>(
+#[inline]
+fn trace_shard_map_body<
+    C: Domain<Type = ArrayIrType>,
+    F: FnOnce(&ShardMapContext<C>, Vec<ShardMapTracer<C>>) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
+>(
     shard_map: ShardMap,
     function: F,
+    global_input_types: Vec<ArrayType>,
+    outer_named_axes: Vec<(String, NamedAxis)>,
+) -> Result<TracedShardMap<C, Vec<ArrayType>, Vec<ArrayType>>, ShardMapError>
+where
+    ShardMapTracer<C>: ParallelVary,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
+{
+    let mut function = Some(function);
+    trace_shard_map_body_erased(
+        shard_map,
+        &mut |context, inputs| function.take().unwrap()(context, inputs),
+        global_input_types,
+        outer_named_axes,
+    )
+}
+
+/// Internal helper that traces like [`trace_shard_map_body`] with the callback type erased. This is the body of that
+/// function, which only wraps its callback, so that this body is compiled once per domain rather than once per callback
+/// type. The callback is invoked exactly once.
+fn trace_shard_map_body_erased<C: Domain<Type = ArrayIrType>>(
+    shard_map: ShardMap,
+    function: &mut dyn FnMut(
+        &ShardMapContext<C>,
+        Vec<ShardMapTracer<C>>,
+    ) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
     global_input_types: Vec<ArrayType>,
     mut outer_named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<TracedShardMap<C, Vec<ArrayType>, Vec<ArrayType>>, ShardMapError>
 where
-    C: Domain<Type = ArrayIrType>,
     ShardMapTracer<C>: ParallelVary,
-    F: FnOnce(&ShardMapContext<C>, Vec<ShardMapTracer<C>>) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {

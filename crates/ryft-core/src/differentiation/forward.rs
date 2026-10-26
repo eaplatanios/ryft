@@ -3039,6 +3039,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     /// forward only with respect to `primal`, with this [`Context`] executing or staging the differentiated
     /// operations. Refer to the documentation of [`DifferentiationBuilder::jvp`](crate::DifferentiationBuilder::jvp)
     /// for the forward-mode transform.
+    #[inline]
     fn jvp<
         F: FnOnce(
             Input::To<DifferentiationTracer<Self>>,
@@ -3061,91 +3062,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     where
         Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
     {
-        if primal.parameters().next().is_none() {
-            return Err(DifferentiationError::EmptyInput);
-        }
-
-        let primal_structure = primal.parameter_structure();
-        let tangent_structure = tangent.parameter_structure();
-        if tangent_structure != primal_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{primal_structure:?}"),
-                right_structure: format!("{tangent_structure:?}"),
-            }
-            .into());
-        }
-
-        // The tangents take part in the alias validation. A tangent reference is mutated by the reference forward mode
-        // differentiation rules independently of every primal reference, and so it must be a distinct allocation.
-        ReferenceBoundary::new_for_differentiation(
-            self,
-            primal.parameters(),
-            tangent.parameters(),
-            capture.parameters(),
-        )?;
-
-        // Active inputs receive the caller-provided tangents. Captures share the same transform context but receive
-        // only structural zero tangents, so they affect primal evaluation without affecting differentiation.
-        let context = DifferentiationContext::fused(self.clone());
-        let input_duals = primal
-            .into_parameters()
-            .zip(tangent.into_parameters())
-            .map(|(primal, tangent)| {
-                Ok::<_, ProgramError>(DifferentiationTracer::new(
-                    DifferentiationDual::new(primal, tangent)?,
-                    context.clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let input = Input::To::<DifferentiationTracer<Self>>::from_parameters(primal_structure, input_duals)?;
-        let capture_structure = capture.parameter_structure();
-        let capture_duals = capture
-            .into_parameters()
-            .map(|primal| -> Result<_, DifferentiationError> {
-                Ok(DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal)?, context.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let capture = Capture::To::<DifferentiationTracer<Self>>::from_parameters(capture_structure, capture_duals)?;
-        let output = function(input, capture)?;
-
-        // Split each output dual into its primal value and its materialized tangent. A structural zero derives its
-        // runtime extents from the corresponding primal result before the public boundary requires a concrete value.
-        let output_structure = output.parameter_structure();
-        let output_duals = output.into_parameters().collect::<Vec<_>>();
-        let mut primal_outputs = Vec::with_capacity(output_duals.len());
-        let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-        for (output_index, output_dual) in output_duals.into_iter().enumerate() {
-            let (primal, tangent) = output_dual.into_dual().into_parts();
-            let tangent = match tangent {
-                MaybeZero::Value(tangent) => tangent,
-                MaybeZero::Zero(_) if primal.r#type().is_reference() => {
-                    // A reference type is never a zero differential space and a zero reference tangent cannot be
-                    // materialized, so a reference output rooted in a captured (i.e., plumbing) reference is rejected
-                    // here with a boundary diagnostic instead of failing inside the zero materialization below.
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!(
-                            "output {output_index} is a reference rooted in a reference that carries no tangent \
-                             (a captured or inactive reference); pass that reference as a differentiated input instead",
-                        ),
-                    }
-                    .into());
-                }
-                MaybeZero::Zero(r#type) => {
-                    let residuals =
-                        capture_and_validate_zero_residual_values(self, &primal, &r#type, "jvp output tangent")?;
-                    let (operation, zero_inputs) =
-                        Self::Operation::zero_operation_with_residuals(r#type, residuals.as_slice())?;
-                    let mut outputs = self.bind(operation, Vec::new(), zero_inputs.as_slice())?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    outputs.remove(0)
-                }
-            };
-            tangent_outputs.push(tangent);
-            primal_outputs.push(primal);
-        }
-        let primal_output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
-        let tangent_output = Output::To::<Self::Value>::from_parameters(output_structure, tangent_outputs)?;
-        Ok((primal_output, tangent_output))
+        let mut function = Some(function);
+        jvp_erased(self, &mut |input, capture| function.take().unwrap()(input, capture), primal, tangent, capture)
     }
 
     /// Linearizes `function` at `primal`, treating `capture` as known nondifferentiated runtime inputs and returning
@@ -3177,6 +3095,121 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     }
 }
 
+/// Internal helper that differentiates like [`ForwardModeDifferentiate::jvp`] with the callback type erased. This is
+/// the body of that function, which only wraps its callback, so that this body is compiled once per context and input,
+/// capture, and output structure rather than once per callback type: every differentiation of a distinct closure would
+/// otherwise instantiate this body and every closure and iterator adapter in it again. The callback is invoked exactly
+/// once.
+#[allow(clippy::type_complexity)]
+fn jvp_erased<
+    C: ForwardModeDifferentiate,
+    Input: Parameterized<
+            C::Value,
+            Family: ParameterizedFamily<DifferentiationTracer<C>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    Capture: Parameterized<C::Value, Family: ParameterizedFamily<DifferentiationTracer<C>>>,
+    Output: Parameterized<DifferentiationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    primal_context: &C,
+    function: &mut dyn FnMut(
+        Input::To<DifferentiationTracer<C>>,
+        Capture::To<DifferentiationTracer<C>>,
+    ) -> Result<Output, ProgramError>,
+    primal: Input,
+    tangent: Input::To<C::Value>,
+    capture: Capture,
+) -> Result<(Output::To<C::Value>, Output::To<C::Value>), DifferentiationError>
+where
+    C::Operation: DifferentiableOperation<C> + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+{
+    if primal.parameters().next().is_none() {
+        return Err(DifferentiationError::EmptyInput);
+    }
+
+    let primal_structure = primal.parameter_structure();
+    let tangent_structure = tangent.parameter_structure();
+    if tangent_structure != primal_structure {
+        return Err(ParameterError::MismatchedParameterStructures {
+            left_structure: format!("{primal_structure:?}"),
+            right_structure: format!("{tangent_structure:?}"),
+        }
+        .into());
+    }
+
+    // The tangents take part in the alias validation. A tangent reference is mutated by the reference forward mode
+    // differentiation rules independently of every primal reference, and so it must be a distinct allocation.
+    ReferenceBoundary::new_for_differentiation(
+        primal_context,
+        primal.parameters(),
+        tangent.parameters(),
+        capture.parameters(),
+    )?;
+
+    // Active inputs receive the caller-provided tangents. Captures share the same transform context but receive
+    // only structural zero tangents, so they affect primal evaluation without affecting differentiation.
+    let context = DifferentiationContext::fused(primal_context.clone());
+    let input_duals = primal
+        .into_parameters()
+        .zip(tangent.into_parameters())
+        .map(|(primal, tangent)| {
+            Ok::<_, ProgramError>(DifferentiationTracer::new(
+                DifferentiationDual::new(primal, tangent)?,
+                context.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let input = Input::To::<DifferentiationTracer<C>>::from_parameters(primal_structure, input_duals)?;
+    let capture_structure = capture.parameter_structure();
+    let capture_duals = capture
+        .into_parameters()
+        .map(|primal| -> Result<_, DifferentiationError> {
+            Ok(DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal)?, context.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let capture = Capture::To::<DifferentiationTracer<C>>::from_parameters(capture_structure, capture_duals)?;
+    let output = function(input, capture)?;
+
+    // Split each output dual into its primal value and its materialized tangent. A structural zero derives its
+    // runtime extents from the corresponding primal result before the public boundary requires a concrete value.
+    let output_structure = output.parameter_structure();
+    let output_duals = output.into_parameters().collect::<Vec<_>>();
+    let mut primal_outputs = Vec::with_capacity(output_duals.len());
+    let mut tangent_outputs = Vec::with_capacity(output_duals.len());
+    for (output_index, output_dual) in output_duals.into_iter().enumerate() {
+        let (primal, tangent) = output_dual.into_dual().into_parts();
+        let tangent = match tangent {
+            MaybeZero::Value(tangent) => tangent,
+            MaybeZero::Zero(_) if primal.r#type().is_reference() => {
+                // A reference type is never a zero differential space and a zero reference tangent cannot be
+                // materialized, so a reference output rooted in a captured (i.e., plumbing) reference is rejected
+                // here with a boundary diagnostic instead of failing inside the zero materialization below.
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "output {output_index} is a reference rooted in a reference that carries no tangent \
+                         (a captured or inactive reference); pass that reference as a differentiated input instead",
+                    ),
+                }
+                .into());
+            }
+            MaybeZero::Zero(r#type) => {
+                let residuals =
+                    capture_and_validate_zero_residual_values(primal_context, &primal, &r#type, "jvp output tangent")?;
+                let (operation, zero_inputs) =
+                    C::Operation::zero_operation_with_residuals(r#type, residuals.as_slice())?;
+                let mut outputs = primal_context.bind(operation, Vec::new(), zero_inputs.as_slice())?;
+                check_count!("output", outputs, 1, ProgramError);
+                outputs.remove(0)
+            }
+        };
+        tangent_outputs.push(tangent);
+        primal_outputs.push(primal);
+    }
+    let primal_output = Output::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
+    let tangent_output = Output::To::<C::Value>::from_parameters(output_structure, tangent_outputs)?;
+    Ok((primal_output, tangent_output))
+}
+
 /// Linearizes `function` at `primal` using the provided [`DifferentiationRule`], returning its primal outputs and
 /// a [`Pushforward`] containing the saved residuals and derivative program. Shares boundary validation, partial
 /// evaluation, extent retention, and reference-lifetime handling with public linearization. When the rule is
@@ -3184,6 +3217,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 /// assumed executable as a pushforward. The returned pushforward then also omits the reconstruction of its zero-space
 /// output tangents (and the runtime dimensions that it would read), so it can only be converted into a pullback.
 #[allow(clippy::type_complexity)]
+#[inline]
 pub(crate) fn linearize_for_rule<
     C: Context<Type: DifferentiableType>,
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
@@ -3193,6 +3227,45 @@ pub(crate) fn linearize_for_rule<
 >(
     context: &C,
     function: F,
+    primal: Input,
+    capture: Capture,
+    rule: DifferentiationRule,
+) -> Result<(Output::To<C::Value>, Pushforward<C, Input, Output::To<C::Value>>), DifferentiationError>
+where
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    let mut function = Some(function);
+    linearize_for_rule_erased(
+        context,
+        &mut |input: Input::To<LinearizationTracer<C>>, capture: Capture::To<LinearizationTracer<C>>| {
+            function.take().unwrap()(input, capture)
+        },
+        primal,
+        capture,
+        rule,
+    )
+}
+
+/// Internal helper that linearizes like [`linearize_for_rule`] with the callback type erased. This is the body of that
+/// function, which only wraps its callback, so that this body is compiled once per context and input, capture, and
+/// output structure rather than once per callback type: every linearization of a distinct closure would otherwise
+/// instantiate this body and every closure and iterator adapter in it again. The callback is invoked exactly once.
+#[allow(clippy::type_complexity)]
+fn linearize_for_rule_erased<
+    C: Context<Type: DifferentiableType>,
+    Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    context: &C,
+    function: &mut dyn FnMut(
+        Input::To<LinearizationTracer<C>>,
+        Capture::To<LinearizationTracer<C>>,
+    ) -> Result<Output, ProgramError>,
     primal: Input,
     capture: Capture,
     rule: DifferentiationRule,
