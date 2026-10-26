@@ -56,7 +56,7 @@
 //!
 //! # Nested Regions
 //!
-//! Every [`Context::bind`] receives one instruction-scoped [`BindingRegionDriver`]. Eager binding adapts that driver
+//! Every [`Context::bind`] receives one instruction-scoped [`AttachedRegions`]. Eager binding adapts those regions
 //! into an [`InterpretationDriver`] for the operation's eager rule. Region-free applications use an empty driver.
 //! Higher-order eager rules select attached regions by index and recursively replay them through the same active
 //! context. Borrowed regions remain in the source arena, and shared replay mappings preserve repeated roots and
@@ -89,9 +89,9 @@ use crate::macros::check_count;
 use crate::operations::GuardOperation;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, Instruction, Operation, OperationProvider, Program,
-    ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection,
+    Atom, AtomId, AttachedRegions, EmptyRegionDriver, Instruction, Operation, OperationProvider, Program, ProgramError,
+    RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition,
+    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection,
 };
 
 /// Provides instruction-scoped access to the attached [`Region`](crate::Region)s of one interpreted [`Operation`]
@@ -150,9 +150,9 @@ pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Constant, C::Operatio
     ///
     ///   - `context`: Interpretation [`Domain`] that the rule received, through which the operation is bound.
     ///   - `operation`: [`Operation`] being applied.
-    ///   - `regions`: Application-scoped [`BindingRegionDriver`] providing the complete ordered
-    ///     [`Region`](crate::Region)s of this application (e.g., a [`ReplayRegionDriver`] over the attached regions
-    ///     of a nested [`Instruction`]).
+    ///   - `regions`: Application-scoped [`AttachedRegions`] providing the complete ordered [`Region`](crate::Region)s
+    ///     of this application (e.g., [`AttachedRegions::Replay`] over the attached regions of a nested
+    ///     [`Instruction`], built from a [`ReplayRegionDriver`]).
     ///   - `inputs`: Input values supplied to the operation, in operation-defined order.
     ///
     /// # Errors
@@ -160,11 +160,11 @@ pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Constant, C::Operatio
     /// Returns the errors of binding `operation` through the active context, and [`ProgramError::UnsupportedOperation`]
     /// when this driver has no active context to bind through (e.g., [`EmptyRegionDriver`], which is used for direct
     /// rule invocations).
-    fn bind<R: BindingRegionDriver<C::Constant, C::Operation>>(
+    fn bind(
         &self,
         context: &C,
         operation: C::Operation,
-        regions: R,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError>;
 }
@@ -181,11 +181,11 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
     }
 
     #[inline]
-    fn bind<R: BindingRegionDriver<C::Constant, C::Operation>>(
+    fn bind(
         &self,
         _context: &C,
         operation: C::Operation,
-        _regions: R,
+        _regions: AttachedRegions<'_, C::Constant, C::Operation>,
         _inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
@@ -197,7 +197,7 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
     }
 }
 
-/// Adapts the [`BindingRegionDriver`] supplied to one eager [`Context::bind`] operation application to the
+/// Adapts the [`AttachedRegions`] supplied to one eager [`Context::bind`] operation application to the
 /// interpretation-specific recursion provided by [`InterpretationDriver`]. Its regions are exactly the nested
 /// computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a selected
 /// region through the active [`Context`] without taking ownership of it, lifting stored constants into runtime values.
@@ -241,11 +241,11 @@ impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> InterpretationDrive
     }
 
     #[inline]
-    fn bind<R: BindingRegionDriver<C::Constant, C::Operation>>(
+    fn bind(
         &self,
         context: &C,
         operation: C::Operation,
-        regions: R,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         context.bind(operation, regions, inputs)
@@ -1519,7 +1519,12 @@ mod tests {
         let context = TestArrayContext::new();
         let input = Array::scalar(2.0f32).unwrap();
         assert_eq!(
-            EmptyRegionDriver.bind(&context, AddOperation::new().into(), Vec::new(), &[input.clone(), input]),
+            EmptyRegionDriver.bind(
+                &context,
+                AddOperation::new().into(),
+                AttachedRegions::Empty,
+                &[input.clone(), input]
+            ),
             Err(ProgramError::UnsupportedOperation {
                 message: "cannot bind `add` through an empty region driver, which has no active interpretation \
                           context"
@@ -1550,7 +1555,7 @@ mod tests {
             |inputs: Vec<Tracer<TracingContext<Array, TestArrayOperation>>>| {
                 let context = inputs[0].context().clone();
                 let outputs = driver.interpret_region(&context, 0, inputs)?;
-                driver.bind(&context, NegOperation::new().into(), Vec::new(), &outputs)
+                driver.bind(&context, NegOperation::new().into(), AttachedRegions::Empty, &outputs)
             },
             vec![input_type],
         )
@@ -1577,11 +1582,16 @@ mod tests {
         let driver = EagerInterpretationDriver::new(&regions);
         let input = Array::scalar(2.0f32).unwrap();
         assert_eq!(
-            driver.bind(&context, AddOperation::new().into(), Vec::new(), &[input.clone(), input]),
+            driver.bind(&context, AddOperation::new().into(), AttachedRegions::Empty, &[input.clone(), input]),
             Ok(vec![Array::scalar(4.0f32).unwrap()]),
         );
         assert_eq!(
-            driver.bind(&context, AddOperation::new().into(), Vec::new(), &[Array::scalar(2.0f32).unwrap()]),
+            driver.bind(
+                &context,
+                AddOperation::new().into(),
+                AttachedRegions::Empty,
+                &[Array::scalar(2.0f32).unwrap()]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
     }
