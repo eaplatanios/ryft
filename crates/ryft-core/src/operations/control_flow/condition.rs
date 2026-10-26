@@ -767,11 +767,7 @@ impl<
             inputs = Cow::Owned(guarded_inputs);
         }
 
-        context.fold_or_residualize(
-            O::from(*self),
-            driver.regions().map(|region| region.to_program()).collect(),
-            &inputs,
-        )
+        context.fold_or_residualize(O::from(*self), driver.region_programs(), &inputs)
     }
 }
 

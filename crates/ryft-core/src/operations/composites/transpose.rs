@@ -713,7 +713,7 @@ where
                 if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
                     let outputs = context.parent().bind(
                         self.clone(),
-                        driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
+                        driver.region_programs(),
                         inputs.iter().map(P::value).cloned().collect::<Vec<_>>().as_slice(),
                     )?;
                     return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>());
@@ -1524,11 +1524,7 @@ mod tests {
             if let Self::Condition(operation) = self {
                 return operation.partially_evaluate(context, driver, inputs);
             }
-            context.fold_or_residualize(
-                self.clone(),
-                driver.regions().map(|region| region.to_program()).collect(),
-                inputs,
-            )
+            context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
         }
     }
 

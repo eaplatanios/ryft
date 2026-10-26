@@ -2035,134 +2035,154 @@ impl<
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            let packed_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            let output_types = Operation::infer_output_types(self, packed_types.as_slice(), &[])?;
-            return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_types.len()]);
-        };
-
-        // Preserve the first mapped input's natural position when every mapped input can represent it. Otherwise, use
-        // a leading internal axis, which is valid regardless of differences in unbatched per-item rank, and restore the
-        // natural output position after interpretation.
-        let batch_axis_position = if inputs
-            .iter()
-            .all(|input| input.batch_axis().is_replicated() || output_batch_axis_position < input.r#type().rank())
-        {
-            output_batch_axis_position
-        } else {
-            0
-        };
-        let batch_axis = Axis::from(batch_axis_position);
-
-        // Preserve placement removed with each mapped dimension, then align every mapped input onto the common
-        // batch-axis position before broadcasting per-item shapes.
-        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
-        let unbatched_types = inputs
-            .iter()
-            .map(|input| -> Result<_, BatchingError> {
-                let mut unbatched_type = input.unbatched_type();
-                if let Some(sharding) = unbatched_type.sharding.as_mut() {
-                    let varying_manual_axes = axis_sharding.manual_axes(sharding.mesh());
-                    sharding
-                        .extend_varying_manual_axes(varying_manual_axes)
-                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-                }
-                Ok(unbatched_type)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
-
-        // Broadcast every input to the common unbatched per-item shape when one exists. Otherwise, retain each input's
-        // own per-item shape and let the operation's inference report the incompatibility.
-        let common_unbatched_type = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
-        let axis_dimension = M::axis_dimension(context)?;
-        let broadcasted_inputs = inputs
-            .iter()
-            .zip(unbatched_types.iter())
-            .map(|(input, unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
-                let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
-                target_type.data_type = unbatched_type.data_type();
-                let batched_type =
-                    target_type.batched(batch_axis_position, axis_dimension.clone(), axis_sharding.clone())?;
-                if batched_type == *input.r#type() {
-                    return Ok(input.clone());
-                }
-
-                // Right-align this input's per-item dimensions in the target while preserving the mapped dimension
-                // at the common batch-axis position.
-                let target_unbatched_rank = batched_type.rank() - 1;
-                let is_mapped = !input.batch_axis().is_replicated();
-                let output_axes = (0..input.r#type().rank())
-                    .map(|dimension| {
-                        if is_mapped && dimension == batch_axis_position {
-                            return batch_axis_position;
-                        }
-                        let per_item_index =
-                            if is_mapped && dimension > batch_axis_position { dimension - 1 } else { dimension };
-                        let position = (target_unbatched_rank - unbatched_type.rank()) + per_item_index;
-                        if position < batch_axis_position { position } else { position + 1 }
-                    })
-                    .collect();
-
-                // Resolve the source of every batched output dimension. The mapped axis comes from the transform's
-                // extent, static target dimensions carry their extents directly, and each dynamic target dimension is
-                // read from the broadcast-compatible source axis that supplied it (which exists by construction of the
-                // broadcasted target shape).
-                let dimension_sources = batched_type
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .enumerate()
-                    .map(|(axis, _)| -> Result<DimensionSource<C::Value>, BatchingError> {
-                        if axis == batch_axis_position {
-                            return Ok(DimensionSource::BatchExtent);
-                        }
-                        let target_axis = if axis < batch_axis_position { axis } else { axis - 1 };
-                        let target_dimension = &target_type.shape().dimensions()[target_axis];
-                        if let Dimension::Static(extent) = target_dimension {
-                            return Ok(DimensionSource::Static(*extent));
-                        }
-                        inputs
-                            .iter()
-                            .zip(unbatched_types.iter())
-                            .find_map(|(source, source_type)| {
-                                let rank_offset = target_type.rank() - source_type.rank();
-                                let source_axis = target_axis.checked_sub(rank_offset)?;
-                                if source_axis >= source_type.rank()
-                                    || source_type.shape().dimensions()[source_axis] != *target_dimension
-                                {
-                                    return None;
-                                }
-                                let packed_axis =
-                                    if source.batch_axis().is_replicated() || source_axis < batch_axis_position {
-                                        source_axis
-                                    } else {
-                                        source_axis + 1
-                                    };
-                                Some(DimensionSource::Value { source: source.value().clone(), axis: packed_axis })
-                            })
-                            .ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "cannot locate a source for elementwise output dimension \
-                                     {target_dimension}",
-                                ))
-                                .into()
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                M::broadcast_input(context, input, batched_type, output_axes, batch_axis, dimension_sources)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let input_types = broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let output_types = Operation::infer_output_types(self, input_types.as_slice(), &[])?;
-        let output_batch_axes = vec![BatchAxis::new(batch_axis); output_types.len()];
-        self.interpret_with_batch_axes(context, &broadcasted_inputs, &output_batch_axes)?
-            .into_iter()
-            .map(|output| output.move_axis(output_batch_axis_position))
-            .collect::<Result<Vec<_>, _>>()
+        batch_elementwise(
+            context,
+            inputs,
+            &|input_types| Ok(Operation::infer_output_types(self, input_types, &[])?),
+            &|inputs, output_batch_axes| self.interpret_with_batch_axes(context, inputs, output_batch_axes),
+        )
     }
+}
+
+/// Internal helper that batches an elementwise operation application following the policy documented on the blanket
+/// [`BatchableOperation`] implementation above, which is its only caller. The operation enters only through
+/// `infer_output_types` (its output type inference) and `interpret` (its interpretation over the aligned inputs with
+/// the provided output batch axes), so this body is compiled once per context and extent policy rather than once per
+/// elementwise operation type. Keep it free of the operation type: every closure and iterator adapter in it is
+/// instantiated per distinct signature.
+#[allow(clippy::type_complexity)]
+fn batch_elementwise<C: Context<Type = ArrayType, Value: Transpose>, M: ArrayExtentBatchingPolicy<C>>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
+    inputs: &[ArrayBatch<C::Value>],
+    infer_output_types: &dyn Fn(&[ArrayType]) -> Result<Vec<ArrayType>, BatchingError>,
+    interpret: &dyn Fn(&[ArrayBatch<C::Value>], &[BatchAxis]) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
+        let packed_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = infer_output_types(packed_types.as_slice())?;
+        return interpret(inputs, &vec![BatchAxis::replicated(); output_types.len()]);
+    };
+
+    // Preserve the first mapped input's natural position when every mapped input can represent it. Otherwise, use
+    // a leading internal axis, which is valid regardless of differences in unbatched per-item rank, and restore the
+    // natural output position after interpretation.
+    let batch_axis_position = if inputs
+        .iter()
+        .all(|input| input.batch_axis().is_replicated() || output_batch_axis_position < input.r#type().rank())
+    {
+        output_batch_axis_position
+    } else {
+        0
+    };
+    let batch_axis = Axis::from(batch_axis_position);
+
+    // Preserve placement removed with each mapped dimension, then align every mapped input onto the common
+    // batch-axis position before broadcasting per-item shapes.
+    let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
+    let unbatched_types = inputs
+        .iter()
+        .map(|input| -> Result<_, BatchingError> {
+            let mut unbatched_type = input.unbatched_type();
+            if let Some(sharding) = unbatched_type.sharding.as_mut() {
+                let varying_manual_axes = axis_sharding.manual_axes(sharding.mesh());
+                sharding
+                    .extend_varying_manual_axes(varying_manual_axes)
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+            }
+            Ok(unbatched_type)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
+
+    // Broadcast every input to the common unbatched per-item shape when one exists. Otherwise, retain each input's
+    // own per-item shape and let the operation's inference report the incompatibility.
+    let common_unbatched_type = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
+    let axis_dimension = M::axis_dimension(context)?;
+    let broadcasted_inputs = inputs
+        .iter()
+        .zip(unbatched_types.iter())
+        .map(|(input, unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
+            let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
+            target_type.data_type = unbatched_type.data_type();
+            let batched_type =
+                target_type.batched(batch_axis_position, axis_dimension.clone(), axis_sharding.clone())?;
+            if batched_type == *input.r#type() {
+                return Ok(input.clone());
+            }
+
+            // Right-align this input's per-item dimensions in the target while preserving the mapped dimension
+            // at the common batch-axis position.
+            let target_unbatched_rank = batched_type.rank() - 1;
+            let is_mapped = !input.batch_axis().is_replicated();
+            let output_axes = (0..input.r#type().rank())
+                .map(|dimension| {
+                    if is_mapped && dimension == batch_axis_position {
+                        return batch_axis_position;
+                    }
+                    let per_item_index =
+                        if is_mapped && dimension > batch_axis_position { dimension - 1 } else { dimension };
+                    let position = (target_unbatched_rank - unbatched_type.rank()) + per_item_index;
+                    if position < batch_axis_position { position } else { position + 1 }
+                })
+                .collect();
+
+            // Resolve the source of every batched output dimension. The mapped axis comes from the transform's
+            // extent, static target dimensions carry their extents directly, and each dynamic target dimension is
+            // read from the broadcast-compatible source axis that supplied it (which exists by construction of the
+            // broadcasted target shape).
+            let dimension_sources = batched_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(axis, _)| -> Result<DimensionSource<C::Value>, BatchingError> {
+                    if axis == batch_axis_position {
+                        return Ok(DimensionSource::BatchExtent);
+                    }
+                    let target_axis = if axis < batch_axis_position { axis } else { axis - 1 };
+                    let target_dimension = &target_type.shape().dimensions()[target_axis];
+                    if let Dimension::Static(extent) = target_dimension {
+                        return Ok(DimensionSource::Static(*extent));
+                    }
+                    inputs
+                        .iter()
+                        .zip(unbatched_types.iter())
+                        .find_map(|(source, source_type)| {
+                            let rank_offset = target_type.rank() - source_type.rank();
+                            let source_axis = target_axis.checked_sub(rank_offset)?;
+                            if source_axis >= source_type.rank()
+                                || source_type.shape().dimensions()[source_axis] != *target_dimension
+                            {
+                                return None;
+                            }
+                            let packed_axis =
+                                if source.batch_axis().is_replicated() || source_axis < batch_axis_position {
+                                    source_axis
+                                } else {
+                                    source_axis + 1
+                                };
+                            Some(DimensionSource::Value { source: source.value().clone(), axis: packed_axis })
+                        })
+                        .ok_or_else(|| {
+                            TypeError::invalid(format!(
+                                "cannot locate a source for elementwise output dimension {target_dimension}",
+                            ))
+                            .into()
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            M::broadcast_input(context, input, batched_type, output_axes, batch_axis, dimension_sources)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let input_types = broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let output_types = infer_output_types(input_types.as_slice())?;
+    let output_batch_axes = vec![BatchAxis::new(batch_axis); output_types.len()];
+    interpret(&broadcasted_inputs, &output_batch_axes)?
+        .into_iter()
+        .map(|output| output.move_axis(output_batch_axis_position))
+        .collect::<Result<Vec<_>, _>>()
 }
 
 impl<

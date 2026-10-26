@@ -1537,11 +1537,7 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>> Partia
         // so normalize against them before the default rule folds or residualizes the cast: a proven cast is pure and
         // must not be ordered behind earlier assertions.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        context.fold_or_residualize(
-            self.clone().normalized(&input_types),
-            driver.regions().map(|region| region.to_program()).collect(),
-            inputs,
-        )
+        context.fold_or_residualize(self.clone().normalized(&input_types), driver.region_programs(), inputs)
     }
 }
 

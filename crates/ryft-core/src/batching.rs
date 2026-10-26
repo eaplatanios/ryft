@@ -1280,6 +1280,7 @@ pub trait InterpretableBatchableOperation<C: Context, P: BatchingPolicy<C>> {
 }
 
 impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> InterpretableBatchableOperation<C, P> for O {
+    #[inline]
     fn interpret_with_batch_axes(
         &self,
         context: &BatchingContext<C, P>,
@@ -1287,21 +1288,34 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
         output_batch_axes: &[BatchAxis],
     ) -> Result<Vec<P::Batch>, BatchingError> {
         // Every `InterpretableOperation` over the parent context's values is an `InterpretableBatchableOperation`.
-        // The batched interpretation unpacks the input values, interprets the operation once through `interpret`
-        // against the parent context (which owns those packed values), and repackages each output with its
-        // requested `BatchAxis`.
-        if inputs.is_empty() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        }
-        let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
-        let output_values = self.interpret(&context.parent().clone(), &EmptyRegionDriver, input_values.as_slice())?;
-        check_count!("output", output_values, output_batch_axes.len(), ProgramError);
-        output_values
-            .into_iter()
-            .zip(output_batch_axes.iter().copied())
-            .map(|(value, axis)| P::batch(value, axis))
-            .collect()
+        interpret_batches(context, inputs, output_batch_axes, &|parent, input_values| {
+            self.interpret(parent, &EmptyRegionDriver, input_values)
+        })
     }
+}
+
+/// Internal helper that unpacks the input values of `inputs`, interprets the operation once through `interpret`
+/// against the parent context (which owns those packed values), and repackages each output with its requested
+/// `BatchAxis`. This is the body of the blanket [`InterpretableBatchableOperation`] implementation above, which only
+/// supplies the operation's interpretation, so that this body is compiled once per context and policy rather than once
+/// per operation type.
+fn interpret_batches<C: Context, P: BatchingPolicy<C>>(
+    context: &BatchingContext<C, P>,
+    inputs: &[P::Batch],
+    output_batch_axes: &[BatchAxis],
+    interpret: &dyn Fn(&C, &[C::Value]) -> Result<Vec<C::Value>, ProgramError>,
+) -> Result<Vec<P::Batch>, BatchingError> {
+    if inputs.is_empty() {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    }
+    let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+    let output_values = interpret(&context.parent().clone(), input_values.as_slice())?;
+    check_count!("output", output_values, output_batch_axes.len(), ProgramError);
+    output_values
+        .into_iter()
+        .zip(output_batch_axes.iter().copied())
+        .map(|(value, axis)| P::batch(value, axis))
+        .collect()
 }
 
 /// Active [`Context`] for one batching level, introducing exactly one logical mapped axis. Its [`BatchingPolicy`]
@@ -1574,6 +1588,29 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
     }
 }
 
+impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> BatchingContext<C, P> {
+    /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
+    /// context, which only converts its input operation, so that this body is compiled once per context and region
+    /// driver rather than once per input operation type.
+    fn bind_operation<D: BindingRegionDriver<C::Constant, C::Operation>>(
+        &self,
+        operation: C::Operation,
+        driver: D,
+        inputs: &[BatchingTracer<C, P>],
+    ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError> {
+        // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
+        // inputs. The implementation dispatches primitive work through the parent context, executing eagerly under
+        // an eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
+        // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
+        // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
+        operation.validate_region_interfaces(&driver.region_interfaces())?;
+        let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
+        let driver = RecursiveBatchingDriver::new(&driver);
+        let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
+        Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
+    }
+}
+
 impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Domain for BatchingContext<C, P> {
     type Type = C::Type;
     type Value = BatchingTracer<C, P>;
@@ -1614,17 +1651,7 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
         driver: D,
         inputs: &[BatchingTracer<C, P>],
     ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError> {
-        // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
-        // inputs. The implementation dispatches primitive work through the parent context, executing eagerly under an
-        // eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
-        // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
-        // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
-        let operation = operation.into();
-        operation.validate_region_interfaces(&driver.region_interfaces())?;
-        let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
-        let driver = RecursiveBatchingDriver::new(&driver);
-        let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
-        Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
+        self.bind_operation(operation.into(), driver, inputs)
     }
 
     #[inline]

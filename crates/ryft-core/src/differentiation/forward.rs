@@ -1952,6 +1952,37 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     }
 }
 
+impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P>
+where
+    C::Type: DifferentiableType,
+    C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<C>
+        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
+    /// context, which only converts its input operation, so that this body is compiled once per context and region
+    /// driver rather than once per input operation type.
+    fn bind_operation<D: BindingRegionDriver<C::Constant, C::Operation>>(
+        &self,
+        operation: C::Operation,
+        driver: D,
+        inputs: &[DifferentiationTracer<C, P>],
+    ) -> Result<Vec<DifferentiationTracer<C, P>>, ProgramError> {
+        // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
+        // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
+        let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
+        let output_duals = self.bind_duals(&operation, driver, &input_duals)?;
+
+        // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
+        // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
+        Ok(output_duals.into_iter().map(|dual| DifferentiationTracer::new(dual, self.clone())).collect())
+    }
+}
+
 impl<C: Context, P: DifferentiationPolicy<C>> Domain for DifferentiationContext<C, P> {
     type Type = C::Type;
     type Value = DifferentiationTracer<C, P>;
@@ -1977,22 +2008,14 @@ where
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 
+    #[inline]
     fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: O,
         driver: D,
         inputs: &[DifferentiationTracer<C, P>],
     ) -> Result<Vec<DifferentiationTracer<C, P>>, ProgramError> {
-        let operation = operation.into();
-
-        // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
-        // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
-        let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
-        let output_duals = self.bind_duals(&operation, driver, &input_duals)?;
-
-        // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
-        // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
-        Ok(output_duals.into_iter().map(|dual| DifferentiationTracer::new(dual, self.clone())).collect())
+        self.bind_operation(operation.into(), driver, inputs)
     }
 
     #[inline]

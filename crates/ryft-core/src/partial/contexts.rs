@@ -521,6 +521,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     residualization imports them into the residual [`Program`].
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Their
     ///     known-ness determines whether the operation is folded or residualized.
+    #[inline]
     pub fn fold_or_residualize<P: Into<C::Operation>>(
         &self,
         operation: P,
@@ -530,9 +531,19 @@ impl<C: Context> PartialEvaluationContext<C> {
         if let Some(error) = self.error() {
             return Err(error);
         }
+        self.fold_or_residualize_operation(operation.into(), regions, inputs)
+    }
 
-        let operation = operation.into();
-
+    /// Internal helper that folds or residualizes an already converted [`Operation`]. This is the body of
+    /// [`fold_or_residualize`](Self::fold_or_residualize), which only converts its input operation, so that this body
+    /// is compiled once per context rather than once per input operation type. Keep it free of the input operation type
+    /// parameter: every closure and iterator adapter in it is instantiated per distinct signature.
+    fn fold_or_residualize_operation(
+        &self,
+        operation: C::Operation,
+        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Specifies whether this operation may stay in the residual program when an eager parent reports that it cannot
         // execute it (i.e., returns `ProgramError::UnsupportedOperation`), rather than failing partial evaluation. This
         // is how work that has no eager value on this backend, such as a reduction over a manual mesh axis, survives
@@ -661,6 +672,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Known inputs
     ///     are materialized as residual program inputs or constants, while unknown inputs reuse their existing residual
     ///     atoms.
+    #[inline]
     pub fn residualize<P: Into<C::Operation>>(
         &self,
         operation: P,
@@ -670,9 +682,18 @@ impl<C: Context> PartialEvaluationContext<C> {
         if let Some(error) = self.error() {
             return Err(error);
         }
+        self.residualize_operation(operation.into(), regions, inputs)
+    }
 
-        let operation = operation.into();
-
+    /// Internal helper that residualizes an already converted [`Operation`]. This is the body of
+    /// [`residualize`](Self::residualize), which only converts its input operation, so that this body
+    /// is compiled once per context rather than once per input operation type.
+    fn residualize_operation(
+        &self,
+        operation: C::Operation,
+        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Combine the operation's effect classes with those of its executable computation regions. Dormant
         // derivative rules and other non-computation regions do not contribute effects when this operation runs.
         let effects = regions
@@ -1571,55 +1592,23 @@ impl<C: Context> PartialEvaluationContext<C> {
     }
 }
 
-impl<C: Context> Clone for PartialEvaluationContext<C> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            parent: self.parent.clone(),
-            builder: self.builder.clone(),
-            inputs: self.inputs.clone(),
-            staged_feeders: self.staged_feeders.clone(),
-            imported_known_values: self.imported_known_values.clone(),
-            constant_reference_identities: self.constant_reference_identities.clone(),
-            provenance: self.provenance.clone(),
-            reference_placement: self.reference_placement,
-            allow_effect_folding: self.allow_effect_folding,
-            defer_ordered_effects: self.defer_ordered_effects.clone(),
-            residual_placement: self.residual_placement.clone(),
-            error: self.error.clone(),
-        }
-    }
-}
-
-impl<C: Context> Domain for PartialEvaluationContext<C> {
-    type Type = C::Type;
-    type Value = PartialTracer<C>;
-    type Constant = C::Constant;
-    type Operation = C::Operation;
-}
-
-impl<C: Context> Context for PartialEvaluationContext<C>
+impl<C: Context> PartialEvaluationContext<C>
 where
     C::Operation:
         PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
 {
-    #[inline]
-    fn lift(&self, constant: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
-        // Lifting a staged constant produces a known value carrying an inline-constant materialization, so that
-        // residual work consuming it rebuilds it as a residual-program constant rather than a residual input.
-        Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known_constant(self.parent.lift(constant)?)))
-    }
-
-    fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
+    /// ontext, which only converts its input operation, so that this body is compiled once per context and region
+    /// driver rather than once per input operation type
+    fn bind_operation<D: BindingRegionDriver<C::Constant, C::Operation>>(
         &self,
-        operation: O,
+        operation: C::Operation,
         driver: D,
         inputs: &[PartialTracer<C>],
     ) -> Result<Vec<PartialTracer<C>>, ProgramError> {
         // Unwrap the input tracers into context-free partial-evaluation values, dispatch the operation's partial
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
-        let operation = operation.into();
         operation.validate_region_interfaces(&driver.region_interfaces())?;
         let input_values = match self.error.borrow().clone() {
             Some(error) => Err(error),
@@ -1668,6 +1657,56 @@ where
             .into_iter()
             .map(|r#type| PartialTracer::poisoned(self.clone(), error.clone(), r#type))
             .collect())
+    }
+}
+
+impl<C: Context> Clone for PartialEvaluationContext<C> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            parent: self.parent.clone(),
+            builder: self.builder.clone(),
+            inputs: self.inputs.clone(),
+            staged_feeders: self.staged_feeders.clone(),
+            imported_known_values: self.imported_known_values.clone(),
+            constant_reference_identities: self.constant_reference_identities.clone(),
+            provenance: self.provenance.clone(),
+            reference_placement: self.reference_placement,
+            allow_effect_folding: self.allow_effect_folding,
+            defer_ordered_effects: self.defer_ordered_effects.clone(),
+            residual_placement: self.residual_placement.clone(),
+            error: self.error.clone(),
+        }
+    }
+}
+
+impl<C: Context> Domain for PartialEvaluationContext<C> {
+    type Type = C::Type;
+    type Value = PartialTracer<C>;
+    type Constant = C::Constant;
+    type Operation = C::Operation;
+}
+
+impl<C: Context> Context for PartialEvaluationContext<C>
+where
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+{
+    #[inline]
+    fn lift(&self, constant: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
+        // Lifting a staged constant produces a known value carrying an inline-constant materialization, so that
+        // residual work consuming it rebuilds it as a residual-program constant rather than a residual input.
+        Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known_constant(self.parent.lift(constant)?)))
+    }
+
+    #[inline]
+    fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+        &self,
+        operation: O,
+        driver: D,
+        inputs: &[PartialTracer<C>],
+    ) -> Result<Vec<PartialTracer<C>>, ProgramError> {
+        self.bind_operation(operation.into(), driver, inputs)
     }
 
     #[inline]

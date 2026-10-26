@@ -254,11 +254,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         // know about. A named level therefore batches its regions structurally, which is also what lets the named-axis
         // operations inside them resolve against it.
         if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
-            let outputs = context.parent().bind(
-                self.clone(),
-                driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
-                input_values.as_slice(),
-            )?;
+            let outputs = context.parent().bind(self.clone(), driver.region_programs(), input_values.as_slice())?;
             return Ok(outputs.into_iter().map(P::replicated).collect());
         }
 

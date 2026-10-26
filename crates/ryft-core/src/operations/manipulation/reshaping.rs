@@ -811,7 +811,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> P
             // an unknown array does not leave a redundant reshape in the residual program.
             return Ok(vec![input.clone()]);
         }
-        context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
+        context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
     }
 }
 

@@ -427,7 +427,7 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
+        context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
     }
 }
 

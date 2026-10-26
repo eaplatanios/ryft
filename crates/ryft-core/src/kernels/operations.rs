@@ -569,7 +569,7 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        let regions = driver.regions().map(|region| region.to_program()).collect();
+        let regions = driver.region_programs();
         if let Self::Call(call) = self {
             // Only concrete scalar-prefetch values specialize the call. Ordinary data inputs remain residual,
             // even when known: static transforms must never execute a kernel's mutations.

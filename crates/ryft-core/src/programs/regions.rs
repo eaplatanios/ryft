@@ -1393,6 +1393,15 @@ pub trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
         self.regions().map(RegionRef::interface).collect()
     }
 
+    /// Returns an owned [`Program`] representing each attached [`Region`], in order. Rules that forward their regions
+    /// to [`PartialEvaluationContext::fold_or_residualize`](crate::PartialEvaluationContext::fold_or_residualize) or
+    /// [`Context::bind`](crate::Context::bind) call this instead of mapping [`regions`](Self::regions) themselves so
+    /// that the collection is compiled once per driver rather than once per calling operation type.
+    #[inline]
+    fn region_programs(&self) -> Vec<Program<V, O, Vec<V>, Vec<V>>> {
+        self.regions().map(RegionRef::to_program).collect()
+    }
+
     /// Returns a borrowed view of the [`Region`] at `index`, or an error when the current operation application has no
     /// region at that index.
     #[inline]
