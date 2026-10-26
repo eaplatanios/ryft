@@ -1098,10 +1098,9 @@ impl_differentiable_operation! {
                 .into());
             }
 
-            let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
-                ReshapeOperation::new(output_type.shape().clone())
-                    .with_output_sharding(operation.output_sharding().cloned()),
-            );
+            let projected_operation: <O as OperationProjection<ArrayType>>::Projected = ReshapeOperation::new(output_type.shape().clone())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .into();
 
             // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
             transpose_projected_operation(

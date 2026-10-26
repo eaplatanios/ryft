@@ -497,7 +497,7 @@ impl DifferentiationRule {
                 let (primal, tangent) = output.into_parts();
                 let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
                 let tangent = match tangent {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(C::Type::from(r#type)),
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.into()),
                     MaybeZero::Value(value) => {
                         MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
                     }

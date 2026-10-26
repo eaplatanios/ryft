@@ -954,7 +954,7 @@ where
 
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
             return jvp_projected_operation(destinations, &operation, inputs);
         }
 

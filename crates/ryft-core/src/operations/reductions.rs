@@ -926,7 +926,7 @@ where
                 ReductionKind::Product | ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All
             )
         {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
             return jvp_projected_operation(context, &operation, inputs);
         }
 

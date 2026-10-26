@@ -959,7 +959,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.sequential_scan = Some(Arc::new(|length, carry_count, axis_sharding, stacked_output_count| {
             let scan = ScanOperation::<V::Type>::new(carry_count, length)
                 .with_stacked_axis_shardings(vec![axis_sharding.clone(); stacked_output_count]);
-            Ok((O::from(scan), V::Type::from(ArrayType::scalar(DataType::I64))))
+            Ok((O::from(scan), ArrayType::scalar(DataType::I64).into()))
         }));
         self
     }

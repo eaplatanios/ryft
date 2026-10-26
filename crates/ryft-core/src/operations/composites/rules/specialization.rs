@@ -1273,7 +1273,7 @@ where
         // of its slice index of this family.
         let (scan, index_type) =
             self.member()?.sequential_batching_scan(length, carry_count, axis_sharding, stacked_output_count)?;
-        Ok((Oc::from(scan), Vc::Type::from(index_type)))
+        Ok((Oc::from(scan), index_type.into()))
     }
 
     fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError> {

@@ -1747,27 +1747,32 @@ where
 
     #[inline]
     fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        Self::from(O::Projected::from(BroadcastOperation::new(output_type, output_axes)))
+        let operation: O::Projected = BroadcastOperation::new(output_type, output_axes).into();
+        Self::from(operation)
     }
 
     #[inline]
     fn residual_stack_update() -> Self {
-        Self::from(O::Projected::from(DynamicUpdateSliceOperation::new()))
+        let operation: O::Projected = DynamicUpdateSliceOperation::new().into();
+        Self::from(operation)
     }
 
     #[inline]
     fn residual_stack_add() -> Self {
-        Self::from(O::Projected::from(AddOperation::<ArrayType>::new()))
+        let operation: O::Projected = AddOperation::<ArrayType>::new().into();
+        Self::from(operation)
     }
 
     #[inline]
     fn residual_stack_select() -> Self {
-        Self::from(O::Projected::from(SelectOperation::<ArrayType>::new()))
+        let operation: O::Projected = SelectOperation::<ArrayType>::new().into();
+        Self::from(operation)
     }
 
     #[inline]
     fn mask_reduce_any(axes: Vec<usize>) -> Self {
-        Self::from(O::Projected::from(ReduceOperation::new(axes, ReductionKind::Any)))
+        let operation: O::Projected = ReduceOperation::new(axes, ReductionKind::Any).into();
+        Self::from(operation)
     }
 
     #[inline]
@@ -1969,10 +1974,10 @@ where
 
     // Run the primal loop over its original state plus a counter, one stack per stored residual, and a validity mask.
     let predicate_type = condition.output_types()[0].as_array_type()?.clone();
-    let counter_type = C::Type::from(bounded_while_scalar_type(DataType::I64, &predicate_type)?);
-    let boolean_scalar_type = C::Type::from(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
-    let mask_stack_type =
-        C::Type::from(boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap());
+    let counter_type: C::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
+    let boolean_scalar_type: C::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
+    let mask_stack_type: C::Type =
+        boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap().into();
     let (extended_condition, augmented_body, stack_types) =
         build_bounded_while_programs(condition, &stacked_primal_program, stacked_residual_types.as_slice(), bound)?;
     let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -2073,7 +2078,7 @@ where
         branch_input_types.clone(),
     )?
     .1;
-    let mut scan_body_input_types = vec![C::Type::from(ArrayType::scalar(DataType::I64))];
+    let mut scan_body_input_types: Vec<C::Type> = vec![ArrayType::scalar(DataType::I64).into()];
     scan_body_input_types.extend(iteration_input_types.iter().cloned());
     scan_body_input_types.push(boolean_scalar_type);
     let scan_body = {
@@ -2473,10 +2478,10 @@ where
 {
     let state_count = condition.input_types().len();
     let predicate_type = condition.output_types()[0].as_array_type()?.clone();
-    let counter_type = V::Type::from(bounded_while_scalar_type(DataType::I64, &predicate_type)?);
-    let boolean_scalar_type = V::Type::from(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
-    let mask_stack_type =
-        V::Type::from(boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap());
+    let counter_type: V::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
+    let boolean_scalar_type: V::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
+    let mask_stack_type: V::Type =
+        boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap().into();
     let storage_types = residual_types.iter().map(O::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
     let predicate_axes = predicate_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
     for storage_type in &storage_types {
@@ -2509,9 +2514,9 @@ where
         .map(|storage_type| {
             storage_type
                 .as_array_type()
-                .map(|storage_type| V::Type::from(storage_type.with_inserted_dimension(0, bound.into()).unwrap()))
+                .map(|storage_type| storage_type.with_inserted_dimension(0, bound.into()).unwrap().into())
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<V::Type>, _>>()?;
 
     let body_input_types = primal_body
         .input_types()

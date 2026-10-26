@@ -1375,9 +1375,7 @@ impl_differentiable_operation! {
                 .into());
             }
 
-            let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
-                PadOperation::<ArrayType>::from(operation.clone()),
-            );
+            let projected_operation: <O as OperationProjection<ArrayType>>::Projected = PadOperation::<ArrayType>::from(operation.clone()).into();
 
             // The explicit output extents are shape inputs with no cotangent contribution, so their accumulators are
             // left untouched and default to structural zeros.

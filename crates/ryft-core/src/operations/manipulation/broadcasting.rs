@@ -1146,10 +1146,8 @@ impl_differentiable_operation! {
                 _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
             };
 
-            let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
-                output_type,
-                operation.output_axes().to_vec(),
-            ));
+            let projected_operation: <O as OperationProjection<ArrayType>>::Projected =
+                BroadcastOperation::new(output_type, operation.output_axes().to_vec()).into();
 
             // Dimension inputs do not receive cotangents. Forward only the array inputs' handles.
             transpose_projected_operation(

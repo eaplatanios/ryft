@@ -919,7 +919,7 @@ impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePol
     fn r#type(&self) -> Cow<'_, C::Type> {
         match self {
             Self::Value(value) => value.r#type(),
-            Self::Reference(reference) => Cow::Owned(C::Type::from(reference.r#type().clone())),
+            Self::Reference(reference) => Cow::Owned(reference.r#type().clone().into()),
         }
     }
 }
@@ -2200,8 +2200,8 @@ where
             > {
                 let r#type = context.allocation_entry(allocation)?.r#type.clone();
                 let discharged = context.is_allocation_discharged(allocation)?;
-                let input_type =
-                    if discharged { C::Type::from(r#type.referent().clone()) } else { C::Type::from(r#type.clone()) };
+                let input_type: C::Type =
+                    if discharged { r#type.referent().clone().into() } else { r#type.clone().into() };
                 let input = destination.input(input_type);
                 if let Some(region_allocation) = caller_to_region_allocations.get(&allocation).copied() {
                     return region_context.allocation_reference(region_allocation).map(ReferenceDischargeValue::from);
@@ -2289,7 +2289,7 @@ where
                         // through requested view outputs, and a preserved view replays through the destination
                         // reference the region receives.
                         if context.is_allocation_discharged(*allocation)? {
-                            let input = destination.input(C::Type::from(view_type.referent().clone()));
+                            let input = destination.input(view_type.referent().clone().into());
                             let reference = region_context.bind_discharged(view_type.clone(), input)?;
                             view_inputs.push((position, reference.allocation_id()));
                             ReferenceDischargeValue::from(reference)
@@ -2680,7 +2680,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         // Validate before taking the mutable environment borrow so a type error leaves both the current state and its
         // mutation bit unchanged.
         let r#type = self.allocation_entry(allocation)?.r#type.clone();
-        let expected = C::Type::from(r#type.referent().clone());
+        let expected: C::Type = r#type.referent().clone().into();
         let actual = current.r#type();
         if actual.as_ref() != &expected {
             return Err(ProgramError::MalformedProgram(format!(
@@ -2814,7 +2814,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     where
         C::Type: From<P::Referent>,
     {
-        let expected = C::Type::from(r#type.referent().clone());
+        let expected: C::Type = r#type.referent().clone().into();
         let actual = initial.r#type();
         if actual.as_ref() != &expected {
             return Err(ProgramError::MalformedProgram(format!(
@@ -4052,7 +4052,7 @@ where
                 let source = ReferenceSource::from_flat_input_index(input_index, capture_count);
                 let selected = context.selects_external(source);
                 let reference = if selected {
-                    let state = destination.input(V::Type::from(reference_type.referent().clone()));
+                    let state = destination.input(reference_type.referent().clone().into());
                     context.bind_discharged(reference_type, state)?
                 } else {
                     // An unselected external allocation keeps its reference-typed boundary position exactly as the

@@ -476,7 +476,7 @@ impl<
         // `parallel_reduce` per axis, which leaves a contribution that is invariant over them like the root.
         for axis in axes {
             let operation = ParallelReduceOperation::new(ReductionKind::Sum, axis).with_mesh(mesh.clone());
-            let operation = <O as OperationProjection<ArrayType>>::Projected::from(operation);
+            let operation: <O as OperationProjection<ArrayType>>::Projected = operation.into();
             contribution = context.bind(operation, Vec::new(), &[contribution])?.remove(0);
         }
 
@@ -484,7 +484,7 @@ impl<
         // that precedes `parallel_vary` for values, so the adjoint of that placement restores the root's type.
         if referent.sharding().is_none() {
             let operation = BroadcastOperation::new(referent.clone(), (0..referent.rank()).collect());
-            let operation = <O as OperationProjection<ArrayType>>::Projected::from(operation);
+            let operation: <O as OperationProjection<ArrayType>>::Projected = operation.into();
             contribution = context.bind(operation, Vec::new(), &[contribution])?.remove(0);
         }
 

@@ -1527,7 +1527,7 @@ impl<
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
         jvp_projected_operation(context, &operation, inputs)
     }
 }

@@ -434,7 +434,7 @@ where
         };
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
             return jvp_projected_operation(context, &operation, inputs);
         }
 
@@ -554,9 +554,10 @@ where
             return Ok(());
         }
 
+        let operation: <O as OperationProjection<ArrayType>>::Projected = self.clone().into();
         transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected, V, O>(
             context,
-            &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
+            &operation,
             inputs,
             outputs,
             accumulators,
@@ -1081,7 +1082,7 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let input_type = <&ArrayType>::try_from(inputs[0].primal().r#type().as_ref())?.clone();
         if input_type.static_shape().is_some() || !inputs[0].tangent().is_zero() || inputs[1].tangent().is_zero() {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
             return jvp_projected_operation(context, &operation, inputs);
         }
 
@@ -1972,7 +1973,7 @@ where
         let (input, _) = inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
             return jvp_projected_operation(context, &operation, inputs);
         }
 
@@ -2094,9 +2095,10 @@ where
             return Ok(());
         }
 
+        let operation: <O as OperationProjection<ArrayType>>::Projected = self.clone().into();
         transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected, V, O>(
             context,
-            &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
+            &operation,
             inputs,
             outputs,
             accumulators,
@@ -2450,7 +2452,8 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 
     fn provide(request: DynamicSliceOperation, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
         check_count!("input", input_types, 1 + request.sizes().len(), ProgramError);
-        Ok(<Self as OperationProjection<ArrayType>>::Projected::from(request).into())
+        let operation: <Self as OperationProjection<ArrayType>>::Projected = request.into();
+        Ok(operation.into())
     }
 }
 
@@ -3567,7 +3570,7 @@ where
         let input = &inputs[0];
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = (*self).into();
             return jvp_projected_operation(context, &operation, inputs);
         }
 

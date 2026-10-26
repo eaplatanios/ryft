@@ -443,10 +443,11 @@ impl<
     fn provide(request: CompareOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
         match (input_types[0], input_types[1]) {
-            (ArrayIrType::Array(_), ArrayIrType::Array(_)) => Ok(
-                <Self as OperationProjection<ArrayType>>::Projected::from(CompareOperation::new(request.direction()))
-                    .into(),
-            ),
+            (ArrayIrType::Array(_), ArrayIrType::Array(_)) => {
+                let operation: <Self as OperationProjection<ArrayType>>::Projected =
+                    CompareOperation::new(request.direction()).into();
+                Ok(operation.into())
+            }
             (ArrayIrType::Dimension(_), ArrayIrType::Dimension(_)) => Ok(request.into()),
             (left, right) => Err(TypeError::invalid(format!(
                 "`{COMPARE_OPERATION_NAME}` inputs must both be arrays or both be first-class dimensions, but got \

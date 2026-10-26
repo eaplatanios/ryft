@@ -712,16 +712,18 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
         let compiled_output_types = output_types(program.as_ref());
         let declared_output_types = request.lowered().output_types();
         if compiled_output_types.len() != declared_output_types.len() {
-            return Err(D::Error::from(ProgramError::InvalidOutputCount {
+            return Err(ProgramError::InvalidOutputCount {
                 expected: declared_output_types.len(),
                 actual: compiled_output_types.len(),
-            }));
+            }
+            .into());
         }
         for (declared, actual) in declared_output_types.iter().zip(&compiled_output_types) {
             if !declared.is_refined_by(actual) {
-                return Err(D::Error::from(ProgramError::InvalidArgument {
+                return Err(ProgramError::InvalidArgument {
                     message: format!("output type {actual} does not refine declared type {declared}"),
-                }));
+                }
+                .into());
             }
         }
         Ok(request.into_compiled(program, compiled_output_types))

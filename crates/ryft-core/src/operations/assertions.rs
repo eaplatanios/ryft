@@ -1886,7 +1886,7 @@ impl<C: Context<Type: ReferenceMemberType, Operation: From<GuardOperation<C::Typ
                                  `{declared_type}`",
                             ))
                         })?;
-                        declared_types.push(C::Type::from(referent.clone()));
+                        declared_types.push(referent.clone().into());
                         values.push(context.read(reference)?);
                         kept_outputs.push(false);
                     }

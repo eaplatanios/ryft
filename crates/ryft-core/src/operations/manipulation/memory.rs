@@ -205,7 +205,8 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
         // Array IR families select the transfer through their array projection, so that the provided operation is
         // the canonical array member (e.g., `ArrayIrOperation::Array(ArrayOperation::TransferToMemory(_))`).
         check_count!("input", input_types, 1, ProgramError);
-        Ok(<Self as OperationProjection<ArrayType>>::Projected::from(request).into())
+        let operation: <Self as OperationProjection<ArrayType>>::Projected = request.into();
+        Ok(operation.into())
     }
 }
 

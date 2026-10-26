@@ -339,7 +339,7 @@ impl<C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType>>> 
     {
         // The explicit projection is the one conversion step that `Context::bind` cannot infer on its own, because the
         // member family converts into the operation family but `operation` only converts into the member family.
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(operation);
+        let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = operation.into();
         let mut outputs = self.bind(operation, Vec::new(), inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))

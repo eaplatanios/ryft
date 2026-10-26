@@ -1413,7 +1413,7 @@ where
             r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
         };
         if is_static(&input_type) && is_static(&updates_type) {
-            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
             return jvp_projected_operation(destinations, &operation, inputs);
         }
 

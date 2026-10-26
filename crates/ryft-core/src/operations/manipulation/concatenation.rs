@@ -806,9 +806,8 @@ impl_differentiable_operation! {
             }
 
             if array_types.iter().all(|input_type| input_type.static_shape().is_some()) {
-                let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
-                    ConcatenateOperation::<ArrayType>::from(operation.clone()),
-                );
+                let projected_operation: <O as OperationProjection<ArrayType>>::Projected =
+                    ConcatenateOperation::<ArrayType>::from(operation.clone()).into();
 
                 // The trailing result extent is a shape input with no cotangent contribution, so its accumulator is
                 // left untouched and defaults to a structural zero.

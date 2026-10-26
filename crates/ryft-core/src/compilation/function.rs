@@ -1449,7 +1449,7 @@ where
 
         let input_types =
             Input::from_parameters(producer.key().input_structure().clone(), effective_input_types.iter().cloned())
-                .map_err(|error| D::Error::from(ProgramError::from(error)))?;
+                .map_err(ProgramError::from)?;
         JitCacheStatisticsState::increment(&self.state.statistics.traces);
         let tracing_start = Instant::now();
         let staged = match self.state.domain.stage(CompilationStagingRequest::new(

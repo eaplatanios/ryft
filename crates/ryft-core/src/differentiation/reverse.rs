@@ -351,7 +351,7 @@ where
                 })?;
                 let zero = O::materialize_zero_from_residual_sources(
                     context,
-                    MaybeZero::Zero(V::Type::from(referent.clone())),
+                    MaybeZero::Zero(referent.clone().into()),
                     sources.iter(),
                 )?;
                 let mut references = context.bind(
@@ -4359,7 +4359,7 @@ where
         .into());
     }
 
-    let member_operation = <O as OperationProjection<T>>::Projected::from(operation.clone());
+    let member_operation: <O as OperationProjection<T>>::Projected = operation.clone().into();
     transpose_projected_operation(context, &member_operation, &data_inputs, outputs, &data_accumulators)
 }
 
@@ -4538,7 +4538,7 @@ where
             })?;
             let zero = C::Operation::materialize_zero_from_residual_sources(
                 context,
-                MaybeZero::Zero(C::Type::from(referent.clone())),
+                MaybeZero::Zero(referent.clone().into()),
                 std::iter::once(primal),
             )?;
             let mut outputs = context.bind(

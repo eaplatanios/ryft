@@ -3681,7 +3681,8 @@ where
     if driver.region_count() != 0 {
         return Err(ProgramError);
     }
-    let _ = (context.parent(), inputs, C::Operation::from(operation.clone()));
+    let converted: C::Operation = operation.clone().into();
+    let _ = (context.parent(), inputs, converted);
     Ok(vec![ReferenceDischargeValue::labeled(operation.name())])
 }
 

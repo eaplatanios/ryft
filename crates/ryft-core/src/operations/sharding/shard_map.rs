@@ -4659,8 +4659,8 @@ where
                     .map_err(TypeError::from)?,
                 None => Sharding::replicated(mesh.clone(), target_array.rank()),
             };
-            let reshard =
-                <O as OperationProjection<ArrayType>>::Projected::from(ReshardOperation::new(target_placement));
+            let reshard: <O as OperationProjection<ArrayType>>::Projected =
+                ReshardOperation::new(target_placement).into();
             contribution = context.bind(O::from(reshard), Vec::new(), &[contribution])?.remove(0);
         }
     }
@@ -4670,15 +4670,15 @@ where
     let placed_target = target_array.clone().with_memory(memory);
     if *contribution.r#type() != ArrayIrType::Array(placed_target.clone()) {
         let axes = (0..placed_target.rank()).collect();
-        let broadcast =
-            <O as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(placed_target, axes));
+        let broadcast: <O as OperationProjection<ArrayType>>::Projected =
+            BroadcastOperation::new(placed_target, axes).into();
         contribution = context.bind(O::from(broadcast), Vec::new(), &[contribution])?.remove(0);
     }
 
     // Step 3: `transfer_to_memory` into the caller's memory kind.
     if memory != target_array.memory() {
         let transfer = TransferToMemoryOperation::new(target_array.memory());
-        let transfer = <O as OperationProjection<ArrayType>>::Projected::from(transfer);
+        let transfer: <O as OperationProjection<ArrayType>>::Projected = transfer.into();
         contribution = context.bind(O::from(transfer), Vec::new(), &[contribution])?.remove(0);
     }
     Ok(contribution)
