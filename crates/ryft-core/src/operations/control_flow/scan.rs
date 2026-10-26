@@ -2590,8 +2590,6 @@ pub struct ScanOptions<V: Value> {
     stacked_axis_shardings: Vec<ShardingDimension>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value> ScanOptions<V> {
     /// Creates a new [`ScanOptions`] instance that infers the count and visit slices in forward order
     /// without unrolling.
@@ -2604,19 +2602,20 @@ impl<V: Value> ScanOptions<V> {
     /// dimension value, or [`ScanIterationCount::Inferred`] to infer a static count from the stacked inputs. A value's
     /// type and relationships to the stacked inputs are validated by [`Scan::scan`].
     #[inline]
-    pub fn with_iteration_count(mut self, iteration_count: impl Into<ScanIterationCount<V>>) -> Self {
+    pub fn with_iteration_count<C: Into<ScanIterationCount<V>>>(mut self, iteration_count: C) -> Self {
         self.iteration_count = iteration_count.into();
         self
     }
 
-    /// Sets whether slices are visited in reverse order (refer to [`ScanOperation::with_reverse`]).
+    /// Sets whether slices are visited in reverse order. Refer to [`ScanOperation::with_reverse`] for more information.
     #[inline]
     pub fn with_reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
         self
     }
 
-    /// Sets the lowering unroll factor, which must be at least one (refer to [`ScanOperation::with_unroll`]).
+    /// Sets the lowering unrolling factor, which must be at least one. Refer to [`ScanOperation::with_unroll`]
+    /// for more information.
     ///
     /// # Errors
     ///
@@ -2627,15 +2626,15 @@ impl<V: Value> ScanOptions<V> {
         Ok(self)
     }
 
-    /// Sets the scan-axis placements of the stacked output values, in parameter order (refer to
-    /// [`ScanOperation::with_stacked_axis_shardings`]).
+    /// Sets the scan-axis placements of the stacked output values, in parameter order. Refer to
+    /// [`ScanOperation::with_stacked_axis_shardings`] for more information.
     #[inline]
     pub fn with_stacked_axis_shardings(mut self, shardings: Vec<ShardingDimension>) -> Self {
         self.stacked_axis_shardings = shardings;
         self
     }
 
-    /// Returns the iteration count selection.
+    /// Returns the [`ScanIterationCount`].
     #[inline]
     pub fn iteration_count(&self) -> &ScanIterationCount<V> {
         &self.iteration_count
@@ -2647,7 +2646,7 @@ impl<V: Value> ScanOptions<V> {
         self.reverse
     }
 
-    /// Returns the lowering unroll factor.
+    /// Returns the lowering unrolling factor.
     #[inline]
     pub fn unroll(&self) -> usize {
         self.unroll
@@ -2658,6 +2657,8 @@ impl<V: Value> ScanOptions<V> {
     pub fn stacked_axis_shardings(&self) -> &[ShardingDimension] {
         &self.stacked_axis_shardings
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Resolves the count and constructs the primitive payload without discarding an explicit count value.
     fn operation(&self, carry_count: usize, input_types: &[V::Type]) -> Result<ScanOperation<V::Type>, ProgramError>
