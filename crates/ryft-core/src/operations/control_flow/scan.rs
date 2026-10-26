@@ -2142,14 +2142,13 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // Partition-aware transpose rule for a primal `ScanOperation`. Reference carries and stacks accumulate through
-        // the enclosing context's cotangent references, which are resolved (and allocated on first use when their state
-        // cotangent is live) before the primal rule threads them positionally through the reversed scan. Ordinary carry
-        // cotangents drive earlier iterations and scanned cotangents have element shapes inside the body, so the
-        // destinations are resolved without the accumulators, every non-reference cotangent is returned as a value, and
-        // the accumulators then apply demand or gradient buffers. A universe without reference types (e.g.,
-        // `ArrayType`, whose referent family is `NoReferent`) has no cotangent references.
-
+        // Reference carries and stacks accumulate through the enclosing context's cotangent references, which are
+        // resolved (and allocated on first use when their state cotangent is live) before the primal rule threads
+        // them positionally through the reversed scan. Ordinary carry cotangents drive earlier iterations and scanned
+        // cotangents have element shapes inside the body, so the destinations are resolved without the accumulators,
+        // every non-reference cotangent is returned as a value, and the accumulators then apply demand or gradient
+        // buffers. A universe without reference types (e.g., `ArrayType`, whose referent family is `NoReferent`)
+        // has no cotangent references.
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let cotangents = context.cotangent_destinations(driver, inputs, &[])?;
 
@@ -2176,9 +2175,9 @@ where
             // Unknown inputs are linear. Promote a changing known, non-reference carry with a nonzero cotangent space
             // to internal linear state; its known initializer must still receive no cotangent. A changing known
             // zero-space carry cannot be promoted: its per-iteration values must arrive as stacked residuals. A known
-            // reference carry is loop state that passes through by the validated contract (the body returns it as
-            // its own root, possibly through a nested region, so its atom need not be its input atom), whatever the
-            // body does to its state.
+            // reference carry is loop state that passes through by the validated contract (the body returns it as its
+            // own root, possibly through a nested region, so its atom need not be its input atom), whatever the body
+            // does to its state.
             let passes_through = passed_through_carries(body, 1..1 + carry_count);
             let input_linear = inputs[..scan_input_count]
                 .iter()
@@ -2219,7 +2218,7 @@ where
                 .filter_map(|(index, (&linear, &kind))| linear.then_some((index + 1, kind)))
                 .unzip();
 
-            // Carry cotangents recur between iterations and need concrete values. Disconnected scanned-input cotangents
+            // Carry cotangents recur between iterations and need concrete values. Disconnected scanned input cotangents
             // remain structural zeros, so the reversed scan need not allocate or return their stacks.
             let materialize_zeros = input_indices.iter().map(|&index| index <= carry_count).collect::<Vec<_>>();
 
@@ -2240,9 +2239,10 @@ where
             for (&index, &slot) in input_indices.iter().zip(transposed.cotangents()) {
                 input_cotangent_slots[index - 1] = slot;
             }
+
             // Threading belongs to this scan attachment, not the retained transposition cache. Known carries pass
-            // through their value slots, live reference carries keep shared roots, and reference-stack identity outputs
-            // are omitted because their accumulated state is already visible through those roots.
+            // through their value slots, live reference carries keep shared roots, and reference-stack identity
+            // outputs are omitted because their accumulated state is already visible through those roots.
             let reversed_body = {
                 let program = Arc::unwrap_or_clone(transposed.into_program());
                 let body_output_types = body.output_types();
@@ -2259,9 +2259,9 @@ where
                     }
                 }
 
-                // The retained transpose accepts output seeds, live cotangent references, then known values with the
-                // original index first. Zero-space seeds occupy positions but carry no information, so they are
-                // projected out.
+                // The retained transpose accepts output seeds, live cotangent references, then known values with
+                // the original index first. Zero-space seeds occupy positions but carry no information, so they
+                // are projected out.
                 let mut cotangent_input_count = 0;
                 let mut output_cotangent_positions = Vec::with_capacity(body_output_types.len());
                 for (output_type, &zero) in body_output_types.iter().zip(&zero_output_cotangents) {
@@ -2294,9 +2294,9 @@ where
                     })
                     .collect::<Vec<_>>();
 
-                // Select the intrinsic index first, restore each retained carry at its original position, then append
-                // live output slices and the reference roots or known residual slices consumed by each reversed
-                // iteration.
+                // Select the intrinsic index first, restore each retained carry at its original position, then
+                // append live output slices and the reference roots or known residual slices consumed by each
+                // reversed iteration.
                 let mut input_order = vec![index_position];
                 for &index in &retained_carries {
                     let position = if !input_linear[index] {
@@ -2329,6 +2329,7 @@ where
                     };
                     input_order.push(position);
                 }
+
                 input_order.extend(output_cotangent_positions[carry_count..].iter().flatten().copied());
 
                 // A scanned input is either linear (with a cotangent reference slot exactly when it is a live
@@ -2341,8 +2342,8 @@ where
                     .map(|&index| {
                         program.input_ids().get(index).copied().ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
-                                "`{SCAN_OPERATION_NAME}` transposition boundary references missing input position \
-                                 {index}",
+                                "`{SCAN_OPERATION_NAME}` transposition boundary references \
+                                 missing input position {index}",
                             ))
                         })
                     })
@@ -2351,8 +2352,8 @@ where
                 // The transposed body returns its cotangents in body order: the linear carries lead the live scanned
                 // inputs, and a dead reference carry returns none. A known carry passes its threaded input through
                 // instead. Output metadata identifies the live scanned-input cotangents, of which only the
-                // `Return`-kind ones are stacked: a live reference stack returns its per-iteration cotangent view by
-                // identity, which the reversed scan cannot stack.
+                // `Return`-kind ones are stacked: a live reference stack returns its per-iteration cotangent
+                // view by identity, which the reversed scan cannot stack.
                 let mut outputs = program.output_ids().iter().copied();
                 let mut restored_outputs = Vec::with_capacity(program.output_count() + retained_carries.len());
                 for (position, &index) in retained_carries.iter().enumerate() {
