@@ -2030,8 +2030,8 @@ mod tests {
         TypeError, Typed,
     };
     use crate::tests::{
-        TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
-        TestFixtureOperation, TestOrderedStateOperation,
+        TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayTracingContext, TestFixtureOperation,
+        TestOrderedStateOperation,
     };
     use crate::tracing::TracingContext;
 
@@ -2285,7 +2285,7 @@ mod tests {
             PartialTracer::new(source.clone(), PartialEvaluationValue::known(parent.input(scalar_type.clone())));
         source
             .residualize(
-                TestArrayOperation::Add(AddOperation::new()),
+                ArrayOperation::Add(AddOperation::new()),
                 Vec::new(),
                 &[known.value().unwrap().clone(), known.value().unwrap().clone()],
             )
@@ -2318,9 +2318,8 @@ mod tests {
             if message == "cannot import a value from a partial-evaluation context with a different parent context",),);
 
         // Binding a foreign value cannot reinterpret its atom identifier in this builder, including in release builds.
-        let poisoned = target
-            .bind(TestArrayOperation::Add(AddOperation::new()), Vec::new(), &[known.clone(), known])
-            .unwrap();
+        let poisoned =
+            target.bind(ArrayOperation::Add(AddOperation::new()), Vec::new(), &[known.clone(), known]).unwrap();
         assert!(matches!(poisoned[0].value(), Err(ProgramError::MalformedProgram(message))
             if message == "cannot bind a value belonging to another partial-evaluation context; import known values explicitly",),);
         assert!(target.builder.borrow().instructions().is_empty());
@@ -3068,7 +3067,7 @@ mod tests {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         // `inline_program` replays a program over seed values. All-known seeds fold every instruction, lifting the
         // program constant into the known-side context, and so the replay returns folded values.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0).unwrap());
@@ -3849,7 +3848,7 @@ mod tests {
         let literal = staging.constant(Array::scalar(4.0).unwrap());
 
         // A known feeder still occupies an input of the residual program.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();

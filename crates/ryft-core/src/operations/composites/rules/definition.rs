@@ -1102,7 +1102,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, ShardingDimension};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, ShardingDimension,
+    };
     use crate::batching::BatchingLevelExtent;
     use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
     use crate::operations::composites::rules::registration::CustomRuleRegistration;
@@ -1119,7 +1121,6 @@ mod tests {
     };
     use crate::operations::references::{ReferenceAddUpdate, ReferenceNew, ReferenceRead};
     use crate::programs::TypeError;
-    use crate::tests::TestArrayOperation;
 
     use super::*;
 
@@ -1543,7 +1544,7 @@ mod tests {
                 .defers_forward(),
         );
         assert!(defers_forward_in_ir(&LiftedCustomRules::Member(deferred.reference())));
-        assert!(defers_forward_in_ir(&LiftedCustomRules::<Array, TestArrayOperation>::Unavailable(
+        assert!(defers_forward_in_ir(&LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
             UnavailableCustomRules::from_source(&deferred.reference()),
         )));
         assert_eq!(counters.counts(), (0, 0, 0));

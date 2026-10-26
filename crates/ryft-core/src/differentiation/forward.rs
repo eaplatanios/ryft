@@ -3898,7 +3898,7 @@ pub(crate) mod tests {
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue, TestArrayOperation, TestFixtureOperation,
+        ProjectedProgramType, ProjectedProgramValue, TestFixtureOperation,
     };
     use crate::tracing::{NestedTracingContext, Trace};
 
@@ -4556,7 +4556,7 @@ pub(crate) mod tests {
     fn boundary_program(
         inputs: &[DataType],
         outputs: &[Array],
-    ) -> Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> {
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         for &data_type in inputs {
             builder.add_input(ArrayType::scalar(data_type));
@@ -4570,11 +4570,11 @@ pub(crate) mod tests {
     /// Constructs a pushforward with a reference-free public boundary and its matching reconstruction plan.
     /// Tests independently vary the compact program and residual values to exercise constructor validation.
     fn pushforward_with_boundary(
-        program: Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>>,
+        program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
         residuals: Vec<Array>,
         inputs: &[Array],
         outputs: &[Array],
-    ) -> Result<Pushforward<EagerContext<Array, TestArrayOperation>, Vec<Array>, Vec<Array>>, ProgramError> {
+    ) -> Result<Pushforward<EagerContext<Array, ArrayOperation<Array>>, Vec<Array>, Vec<Array>>, ProgramError> {
         let context = EagerContext::new();
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
         let output_types = outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
@@ -4694,7 +4694,7 @@ pub(crate) mod tests {
         ));
 
         // An inactive output keeps the runtime dimension identity of its actual primal.
-        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::unbounded()).into()]),
@@ -4723,7 +4723,7 @@ pub(crate) mod tests {
         let tangent_reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap()));
         assert!(!DifferentiationDual::new_with_zero_tangent(reference.clone()).unwrap().is_tangent_active());
         assert!(DifferentiationDual::new(reference, tangent_reference).unwrap().is_tangent_active());
-        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
         let dynamic = context.input(ArrayType::new(
             DataType::F32,
@@ -4810,7 +4810,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_linearization_new_with_respect_to() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_input(ArrayType::scalar(DataType::Boolean));
         let last = builder.add_input(ArrayType::scalar(DataType::F32));
@@ -4844,7 +4844,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_linearization_pullback() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder
@@ -5016,7 +5016,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_recursive_differentiation_driver_jvp_program() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F64));
         let second = builder.add_input(ArrayType::scalar(DataType::F32));
         let program = builder
@@ -5025,14 +5025,14 @@ pub(crate) mod tests {
         let region = program.entry_region_ref();
         let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
         let differentiated =
-            DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(&driver, region, &[1, 0])
+            DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::jvp_program(&driver, region, &[1, 0])
                 .unwrap();
 
         // The driver preserves the requested order and shares the region's existing cached program.
         assert!(Arc::ptr_eq(&differentiated, &region.jvp_shared(&[1, 0]).unwrap()));
         let reverse_driver =
             RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::JvpForTranspose };
-        let reverse = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(
+        let reverse = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::jvp_program(
             &reverse_driver,
             region,
             &[1, 0],
@@ -5042,7 +5042,7 @@ pub(crate) mod tests {
         assert_eq!(reverse.to_string(), differentiated.to_string());
         assert!(Arc::ptr_eq(
             &reverse,
-            &DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(
+            &DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::jvp_program(
                 &reverse_driver,
                 region,
                 &[1, 0],
@@ -5059,7 +5059,7 @@ pub(crate) mod tests {
             ],
         );
         assert!(matches!(
-            DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(&driver, region, &[0, 0]),
+            DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::jvp_program(&driver, region, &[0, 0]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "differentiation input index 0 is selected more than once",
         ));
@@ -5067,7 +5067,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_recursive_differentiation_driver_linearize_program() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F64));
         let second = builder.add_input(ArrayType::scalar(DataType::F32));
         let program = builder
@@ -5075,7 +5075,7 @@ pub(crate) mod tests {
             .unwrap();
         let region = program.entry_region_ref();
         let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
-        let linearization = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(
+        let linearization = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::linearize_program(
             &driver,
             region,
             &[1, 0],
@@ -5083,7 +5083,7 @@ pub(crate) mod tests {
         .unwrap();
         let reverse_driver =
             RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::JvpForTranspose };
-        let reverse = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(
+        let reverse = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::linearize_program(
             &reverse_driver,
             region,
             &[1, 0],
@@ -5092,7 +5092,7 @@ pub(crate) mod tests {
         assert!(!Arc::ptr_eq(&linearization.primal, &reverse.primal));
         assert!(!Arc::ptr_eq(&linearization.tangent, &reverse.tangent));
         assert_eq!(reverse.primal().to_string(), linearization.primal().to_string());
-        let repeated = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(
+        let repeated = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::linearize_program(
             &reverse_driver,
             region,
             &[1, 0],
@@ -5111,7 +5111,7 @@ pub(crate) mod tests {
             Ok(vec![Array::scalar(5.0_f64).unwrap(), Array::scalar(3.0_f32).unwrap()]),
         );
         assert!(matches!(
-            DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(&driver, region, &[2]),
+            DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::linearize_program(&driver, region, &[2]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "differentiation input index 2 is out of range for a region with 2 inputs",
         ));
@@ -5119,7 +5119,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_rule_apply() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new())
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new())
             .with_rule(DifferentiationRule::JvpForTranspose);
         assert!(matches!(
             DifferentiationRule::Jvp.apply(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
@@ -5675,7 +5675,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_tracer_new() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let primal = Array::scalar(2.0_f64).unwrap();
         let tangent = Array::scalar(3.0_f64).unwrap();
         let dual = DifferentiationDual::new(primal.clone(), tangent.clone()).unwrap();
@@ -5694,7 +5694,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_tracer_equality() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let first = DifferentiationTracer::new(
             DifferentiationDual::new(Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()).unwrap(),
             context.clone(),
@@ -5702,7 +5702,7 @@ pub(crate) mod tests {
         assert_eq!(first, first);
         assert_eq!(first, first.clone());
         // Context stamping does not change value equality; either half of the dual does.
-        let other_context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let other_context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         assert_eq!(first, DifferentiationTracer::new(first.dual().clone(), other_context));
         assert_ne!(
             first,
@@ -5736,7 +5736,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_context_fused() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         assert!(std::ptr::eq(context.primal(), context.tangent()));
         assert_eq!(context.primal_to_tangent(Array::scalar(3.0_f32).unwrap()), Ok(Array::scalar(3.0_f32).unwrap()));
     }
@@ -5745,7 +5745,7 @@ pub(crate) mod tests {
     fn test_differentiation_context_partitioned() {
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
             Array,
-            TestArrayOperation,
+            ArrayOperation<Array>,
         >::new()));
         assert!(!std::ptr::eq(context.primal(), context.tangent()));
         let primal = context.primal().lift(Array::scalar(3.0_f32).unwrap()).unwrap();
@@ -5758,7 +5758,7 @@ pub(crate) mod tests {
     fn test_differentiation_context_new() {
         let context = DifferentiationContext::<_, FusedDifferentiationPolicy>::new(EagerContext::<
             Array,
-            TestArrayOperation,
+            ArrayOperation<Array>,
         >::new());
         assert!(std::ptr::eq(context.primal(), context.tangent()));
     }
@@ -5807,7 +5807,7 @@ pub(crate) mod tests {
     fn test_differentiation_context_dual_primal_to_tangent() {
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
             Array,
-            TestArrayOperation,
+            ArrayOperation<Array>,
         >::new()));
         let primal = context.primal().lift(Array::scalar(3.0).unwrap()).unwrap();
         let tangent = PartialTracer::new(
@@ -5829,7 +5829,7 @@ pub(crate) mod tests {
         assert!(matches!(outputs[1].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
         assert_eq!(outputs[0].primal().context().import_known(&tangent), Ok(tangent));
 
-        let fused = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let fused = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let input = DifferentiationDual::new(Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()).unwrap();
         let outputs = fused.dual_primal_to_tangent(std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -5873,7 +5873,7 @@ pub(crate) mod tests {
         // Partitioned differentiation transfers a known primal before constructing its tangent zero.
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
             Array,
-            TestArrayOperation,
+            ArrayOperation<Array>,
         >::new()));
         let primal = context.primal().lift(Array::scalar(2f32).unwrap()).unwrap();
         let zero = context
@@ -5885,7 +5885,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_context_bind() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let input = DifferentiationTracer::new(
             DifferentiationDual::new(Array::scalar(0.0_f64).unwrap(), Array::scalar(3.0_f64).unwrap()).unwrap(),
             context.clone(),
@@ -5899,7 +5899,7 @@ pub(crate) mod tests {
     #[test]
     fn test_differentiation_context_bind_invalid_symbolic_zero_inputs() {
         // A failed shortcut-eligibility probe defers to the ordinary rule; that rule still rejects malformed inputs.
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let input = DifferentiationTracer::new(
             DifferentiationDual::new_with_zero_tangent(Array::scalar(1f64).unwrap()).unwrap(),
             context.clone(),
@@ -6188,7 +6188,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_context_resolve() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let constant = context.lift(Array::scalar(2.0).unwrap()).unwrap();
         assert!(matches!(
             context.resolve(&constant),
@@ -6201,8 +6201,8 @@ pub(crate) mod tests {
         );
         assert!(matches!(context.resolve(&live), ValueResolution::Opaque));
 
-        let parent = TracingContext::<Array, TestArrayOperation>::new();
-        let foreign = TracingContext::<Array, TestArrayOperation>::new();
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let foreign = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = foreign.input(ArrayType::scalar(DataType::F64));
         let context = DifferentiationContext::fused(parent);
         let opaque = DifferentiationTracer::new(
@@ -6251,7 +6251,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_region_jvp() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_input(ArrayType::scalar(DataType::Boolean));
         let last = builder.add_input(ArrayType::scalar(DataType::F32));
@@ -6382,7 +6382,7 @@ pub(crate) mod tests {
     fn test_region_jvp_shared() {
         // A shared region is differentiated once and reused by every copy of it, which is what removes the repeated
         // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let callee = Arc::new(
@@ -6394,9 +6394,9 @@ pub(crate) mod tests {
 
         // Two independently built programs that intern the same callee share its retained program, because importing
         // a region copies its complete reachable contents and therefore carries its transforms along.
-        let mut first_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first_region = first_builder.intern_callee(&callee, None).unwrap();
-        let mut second_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let second_region = second_builder.intern_callee(&callee, None).unwrap();
         assert!(Arc::ptr_eq(
             &RegionRef::new(&first_builder.regions, first_region).unwrap().jvp_shared(&[0]).unwrap(),
@@ -6412,7 +6412,7 @@ pub(crate) mod tests {
         assert_eq!((statistics.productions, statistics.hits), (1, 3));
 
         // A region whose contents are genuinely rewritten starts over with a freshly derived program.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         builder.add_instruction(MulOperation::new(), Vec::new(), vec![output, output], None).unwrap();
@@ -6428,7 +6428,7 @@ pub(crate) mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn test_region_jvp_shared_debug_recheck_detects_corrupted_cached_program() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let program =
@@ -6437,7 +6437,7 @@ pub(crate) mod tests {
         // Publish an artifact that disagrees with what differentiating this region produces, which is exactly the
         // state a nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does
         // not compute.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let unrelated = Arc::new(
@@ -6461,7 +6461,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_region_jvp_shared_keys_artifacts_by_effective_selection() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
@@ -6506,7 +6506,7 @@ pub(crate) mod tests {
         ));
 
         // Selecting a zero-space input adds no tangent slot and does not change the cached artifact.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_input(ArrayType::scalar(DataType::Boolean));
         let program = builder
@@ -6520,7 +6520,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_region_linearize() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_input(ArrayType::scalar(DataType::Boolean));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -6627,7 +6627,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_region_linearize_omits_inactive_tangent_inputs() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
@@ -6693,7 +6693,7 @@ pub(crate) mod tests {
     fn test_region_linearize_shared() {
         // A shared callee is linearized once and reused by every copy of its sealed region, which is what removes the
         // repeated re-transformation that outer programs interning one callee would otherwise pay.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let callee = Arc::new(
@@ -6706,9 +6706,9 @@ pub(crate) mod tests {
 
         // Two independently built programs that intern the same callee share its retained linearization, because
         // importing a region copies its complete reachable contents and therefore carries its transforms along.
-        let mut first_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first_region = first_builder.intern_callee(&callee, None).unwrap();
-        let mut second_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let second_region = second_builder.intern_callee(&callee, None).unwrap();
         let first = RegionRef::new(&first_builder.regions, first_region).unwrap().linearize_shared(&[0]).unwrap();
         let second = RegionRef::new(&second_builder.regions, second_region).unwrap().linearize_shared(&[0]).unwrap();
@@ -6726,7 +6726,7 @@ pub(crate) mod tests {
         let simplified = callee.simplified().unwrap();
         assert!(Arc::ptr_eq(simplified.entry_region_ref().linearize_shared(&[0]).unwrap().primal(), &primal));
 
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         builder.add_instruction(MulOperation::new(), Vec::new(), vec![output, output], None).unwrap();
@@ -6745,7 +6745,7 @@ pub(crate) mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("formal", bounds))]),
         );
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(dynamic_type);
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let dynamic_callee =
@@ -6806,7 +6806,7 @@ pub(crate) mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn test_region_linearize_shared_debug_recheck_detects_corrupted_cached_linearization() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let program =
@@ -6815,7 +6815,7 @@ pub(crate) mod tests {
         // Publish an artifact that disagrees with what linearizing this region produces, which is exactly the state a
         // nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does not
         // compute.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let unrelated = Arc::new(
@@ -6928,7 +6928,7 @@ pub(crate) mod tests {
     fn test_region_linearize_shared_does_not_retain_its_source_cache() {
         // `to_program` deliberately preserves the source entry region's cache. Linearizing that materialized copy is
         // therefore the strongest ownership-cycle attempt available through today's built-in transform API.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let program =
@@ -6950,7 +6950,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_region_linearize_shared_normalizes_zero_spaces() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_input(ArrayType::scalar(DataType::Boolean));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -6971,7 +6971,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_region_linearize_shared_keys_artifacts_by_effective_selection() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
@@ -6994,7 +6994,7 @@ pub(crate) mod tests {
         // Test that the fused JVP program of `f(x) = x²` presents the `[x, ẋ] ↦ [x², 2x · ẋ]` boundary.
         // The primal input leads, one fresh tangent input follows, and the outputs are the primal output followed by
         // its tangent.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         let program =
@@ -7025,7 +7025,7 @@ pub(crate) mod tests {
         // instructions carry distinct scopes so per-instruction attribution is observable rather than incidental.
         let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
         let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated =
             builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], Some(first.clone())).unwrap()[0];
@@ -7105,7 +7105,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_jvp_uses_the_primal_array_operation_family() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (_, program) = NestedTracingContext::trace(
             context,
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
@@ -7116,7 +7116,7 @@ pub(crate) mod tests {
 
         // The fused JVP remains in the ordinary primal operation family instead of introducing a capture-keyed
         // linear operation family.
-        let _: &Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> = &program;
+        let _: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> = &program;
         assert_eq!(program.input_ids().len(), 2);
         assert_eq!(program.output_ids().len(), 2);
         assert_eq!(
@@ -7185,7 +7185,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_jvp_with_respect_to() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -7199,7 +7199,7 @@ pub(crate) mod tests {
     fn test_program_linearize() {
         // Linearizing `f(x) = (-x)²` retains the computed `-x` as one shared residual for both product-rule
         // terms. The tangent program consumes that residual without recomputing its primal producer.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![negated, negated], None).unwrap()[0];
@@ -7653,7 +7653,7 @@ pub(crate) mod tests {
     fn test_program_linearize_constant_output_tangent() {
         // A constant-valued output still has an ordinary tangent output whose value is zero. Preserve this output
         // alongside the live derivative, regardless of how its zero is represented internally.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(2.0).unwrap());
         let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
@@ -7679,7 +7679,7 @@ pub(crate) mod tests {
         // Boundary-degenerate programs retain their canonical signatures. A zero-input constant program has one
         // primal output and one zero tangent output, while a zero-output program still retains the dead tangent
         // input corresponding to its primal input.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let constant = builder.add_constant(Array::scalar(5.0).unwrap());
         let program = builder.build::<Vec<Array>, Vec<Array>>(vec![constant], Vec::new(), vec![Placeholder]).unwrap();
         let linearization = program.linearize().unwrap();
@@ -7687,7 +7687,7 @@ pub(crate) mod tests {
         assert_eq!(linearization.primal().interpret(Vec::new()).unwrap(), vec![Array::scalar(5.0).unwrap()]);
         assert_eq!(linearization.tangent().interpret(Vec::new()).unwrap(), vec![Array::scalar(0.0).unwrap()]);
 
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let linearization = program.linearize().unwrap();
@@ -7699,7 +7699,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_linearize_with_respect_to() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -7905,8 +7905,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_partitioned_program_interpret_in_context_empty_boundary() {
-        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
-        let partition = ProgramBuilder::<Array, TestArrayOperation>::new()
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let partition = ProgramBuilder::<Array, ArrayOperation<Array>>::new()
             .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
             .unwrap()
             .partition(&[])
@@ -7919,13 +7919,13 @@ pub(crate) mod tests {
         // `ForwardModeDifferentiate::jvp` on an explicit context runs the closure directly on duals. For
         // `f(x) = x²` at `x = 2` along the tangent `ẋ = 3`, the primal output is `4` and the tangent
         // output is `2 · 2 · 3 = 12`.
-        let (value, tangent) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(|x, ()| Ok(x.clone() * x), Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap(), ())
             .unwrap();
         assert_eq!(value, Array::scalar(4.0).unwrap());
         assert_eq!(tangent, Array::scalar(12.0).unwrap());
 
-        let (value, tangent) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |input, scale| Ok(input * scale),
                 Array::scalar(2.0).unwrap(),
@@ -8164,7 +8164,7 @@ pub(crate) mod tests {
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
         // Inputs without tangent spaces retain first-class zero-space boundary leaves. Their only valid tangent value
         // is a rank-zero structural-zero array, and output structural zeros materialize with the same type.
-        let (value, tangent): ((Array, Array), (Array, Array)) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, tangent): ((Array, Array), (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |inputs, ()| Ok(inputs),
                 (Array::scalar(2.0f64).unwrap(), Array::scalar(3i32).unwrap()),
@@ -8176,13 +8176,13 @@ pub(crate) mod tests {
         assert_eq!(tangent, (Array::scalar(1.0f64).unwrap(), zero.clone()));
 
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
-        let (value, tangent) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(|token, ()| Ok(token), token.clone(), zero.clone(), ())
             .unwrap();
         assert_eq!(value, token.clone());
         assert_eq!(tangent, zero.clone());
         assert!(matches!(
-            EagerContext::<Array, TestArrayOperation>::new().jvp(
+            EagerContext::<Array, ArrayOperation<Array>>::new().jvp(
                 |token, ()| Ok(token),
                 token.clone(),
                 token.clone(),
@@ -8198,7 +8198,7 @@ pub(crate) mod tests {
         // Under an active trace, the builder's `jvp` terminal recovers the staging context from its tracer inputs, so
         // it composes inside traced code without threading a context. The closure stages the fused primal and tangent
         // operations into the enclosing trace.
-        let (_, program) = EagerContext::<Array, TestArrayOperation>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, tangent) =
                     differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |x| Ok(x.clone() * x))?;
@@ -8219,7 +8219,7 @@ pub(crate) mod tests {
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         // The same composition preserves zero-space leaves for tokens instead of attempting to stage token
         // arithmetic while constructing the enclosing program.
-        let (_, program) = EagerContext::<Array, TestArrayOperation>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |token| Ok(token))?;
                 Ok(vec![value, tangent])
@@ -8259,7 +8259,7 @@ pub(crate) mod tests {
         // `ForwardModeDifferentiate::linearize` on an explicit context runs the closure once at the primal point and
         // returns the primal output together with a reusable pushforward: applying it pushes any number of tangents
         // through the Jacobian at that point without re-tracing or re-differentiating.
-        let (value, pushforward) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .linearize(|x, ()| Ok(x.clone() * x), Array::scalar(2.0).unwrap(), ())
             .unwrap();
         assert_eq!(value, Array::scalar(4.0).unwrap());
@@ -8436,7 +8436,7 @@ pub(crate) mod tests {
 
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let (value, pushforward) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .linearize(|token, ()| Ok(token), token.clone(), ())
             .unwrap();
         assert_eq!(value, token.clone());
@@ -8455,7 +8455,7 @@ pub(crate) mod tests {
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
         // Under an active trace, the builder's `linearize` terminal recovers the staging context from its tracer input,
         // so primal work stages into the enclosing trace and the pushforward replays there when applied.
-        let (_, program) = EagerContext::<Array, TestArrayOperation>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|x| Ok(x.clone() * x))?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
@@ -8469,7 +8469,7 @@ pub(crate) mod tests {
         assert_abs_diff_eq!(outputs[0].to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1].to_f64s()[0], 12.0, epsilon = 1e-9);
 
-        let (_, program) = EagerContext::<Array, TestArrayOperation>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|token| Ok(token))?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
@@ -8487,7 +8487,7 @@ pub(crate) mod tests {
         // concrete known values under an eager context. For a true predicate and `x = 3`, `f(x) = x * x` linearizes to
         // the pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `-x` branch is never traced at all. Its `neg` operation cannot appear in the
         // pushforward program.
-        let (value, pushforward) = EagerContext::<Array, TestArrayOperation>::new()
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .linearize(
                 |(predicate, x), ()| Ok(if predicate.concretize().unwrap() { x.clone() * x } else { -x }),
                 (Array::scalar(true).unwrap(), Array::scalar(3.0).unwrap()),
@@ -8524,7 +8524,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tangent_activity_new() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F32));
         let second = builder.add_input(ArrayType::scalar(DataType::F32));
         let metadata = builder.add_input(ArrayType::scalar(DataType::Boolean));
@@ -8532,7 +8532,7 @@ pub(crate) mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![second, metadata, first], vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
         let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
-        let activity = TangentActivity::<EagerContext<Array, TestArrayOperation>>::new(
+        let activity = TangentActivity::<EagerContext<Array, ArrayOperation<Array>>>::new(
             &driver,
             program.entry_region_ref(),
             &[true, false, false],
@@ -8554,7 +8554,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tangent_activity_from_loop_body() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F32));
         let second = builder.add_input(ArrayType::scalar(DataType::F32));
         let source = builder.add_input(ArrayType::scalar(DataType::F32));
@@ -8571,7 +8571,7 @@ pub(crate) mod tests {
         // Activity reaches the two inactive carries on successive iterations. The source carry resets to a constant
         // but must retain its tangent slot, while the extra output follows the newly active second carry.
         let (input_tangent_liveness, activity) =
-            TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
+            TangentActivity::<EagerContext<Array, ArrayOperation<Array>>>::from_loop_body(
                 &driver,
                 body.entry_region_ref(),
                 vec![false, false, true],
@@ -8595,7 +8595,7 @@ pub(crate) mod tests {
         );
 
         let (input_tangent_liveness, activity) =
-            TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
+            TangentActivity::<EagerContext<Array, ArrayOperation<Array>>>::from_loop_body(
                 &driver,
                 body.entry_region_ref(),
                 vec![false; 3],

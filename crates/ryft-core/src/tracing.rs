@@ -1376,7 +1376,7 @@ mod tests {
         AtomId, EffectClass, EffectClasses, Operation, ProgramError, ReferenceBoundary, ReferenceType, ReferenceView,
         RegionInterface, TypeError, Typed,
     };
-    use crate::tests::{TestArrayContext, TestArrayOperation};
+    use crate::tests::TestArrayContext;
 
     use super::*;
 
@@ -1410,7 +1410,7 @@ mod tests {
     #[test]
     fn test_context_trace_rejects_captures_registered_into_its_discarded_capture_table() {
         /// Capturing trace universe whose staged constants are capture references into a runtime `Array` table.
-        type CapturingTrace = TracingContext<CaptureReference<ArrayType>, TestArrayOperation, Array>;
+        type CapturingTrace = TracingContext<CaptureReference<ArrayType>, ArrayOperation<Array>, Array>;
 
         /// Stages `x + capture#0` with the capture registered through the trace's own context.
         fn capturing_body(x: Tracer<CapturingTrace>) -> Result<Vec<Tracer<CapturingTrace>>, ProgramError> {
@@ -2037,7 +2037,7 @@ mod tests {
     #[test]
     fn test_tracing_context_trace_with_context_and_named_axes_rejects_captures() {
         let result =
-            TracingContext::<CaptureReference<ArrayType>, TestArrayOperation, Array>::trace_with_context_and_named_axes(
+            TracingContext::<CaptureReference<ArrayType>, ArrayOperation<Array>, Array>::trace_with_context_and_named_axes(
                 |context, ()| {
                     let reference = context.capture(Array::scalar(3f32).unwrap())?;
                     Ok(context.constant(reference))
@@ -2182,8 +2182,8 @@ mod tests {
         assert_eq!(provenances, vec![Provenance::scope(scope.clone(), Provenance::unknown()), Provenance::unknown()]);
 
         // Independent traces own independent states, so scopes never leak across traces or leave residue behind.
-        let first = TracingContext::<Array, TestArrayOperation>::new();
-        let second = TracingContext::<Array, TestArrayOperation>::new();
+        let first = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let second = TracingContext::<Array, ArrayOperation<Array>>::new();
         first.invoke_with_provenance_scope(scope.clone(), || {
             assert_eq!(first.provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
             assert_eq!(second.provenance(), Provenance::unknown());
@@ -2303,7 +2303,7 @@ mod tests {
         // state for the nested program, so nested scopes fold over the seed without affecting the parent.
         let outer_scope = ProvenanceScope::new("outer");
         let nested_scope = ProvenanceScope::new("nested");
-        let parent = TracingContext::<Array, TestArrayOperation>::new();
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
         parent.invoke_with_provenance_scope(outer_scope.clone(), || {
             let seed = parent.provenance();
             let nested = NestedTracingContext::new(parent.clone());

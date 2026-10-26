@@ -667,7 +667,7 @@ mod tests {
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
         ValueDirectDispatch, ValueProjection,
     };
-    use crate::tests::{TestArrayContext, TestArrayOperation, TestRegionOperation};
+    use crate::tests::{TestArrayContext, TestRegionOperation};
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
     use super::*;
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn test_closed_program_without_unused_captures() {
         // Construction rejects references to missing captures.
-        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
         let capture = builder.add_constant(CaptureReference::new(1, ArrayType::scalar(DataType::F64)));
         let program = builder
             .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
@@ -779,7 +779,7 @@ mod tests {
         ));
 
         // Construction rejects references whose declared type differs from their capture's runtime type.
-        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
         let capture = builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::I64)));
         let program = builder
             .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
@@ -797,7 +797,7 @@ mod tests {
 
         // Pruning drops the dead capture #0 and re-indexes the surviving capture #1 into a contiguous table
         // while preserving the program structure.
-        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let capture = builder.add_constant(CaptureReference::new(1, ArrayType::scalar(DataType::F64)));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
@@ -855,14 +855,14 @@ mod tests {
         type TestClosedProgram = ClosedProgram<
             Array,
             CaptureReference<ArrayType>,
-            TestArrayOperation,
+            ArrayOperation<Array>,
             Vec<CaptureReference<ArrayType>>,
             Vec<CaptureReference<ArrayType>>,
         >;
 
         /// Builds `input + capture#<used_capture>` over a two-entry capture table.
         fn closed_program(used_capture: usize) -> TestClosedProgram {
-            let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let capture = builder.add_constant(CaptureReference::new(used_capture, ArrayType::scalar(DataType::F64)));
             let output =
@@ -1022,7 +1022,7 @@ mod tests {
     fn test_closed_program_to_program_with_lifted_captures() {
         // The program computes `(input + capture#0) + capture#0` through one shared constant atom, and capture #1 is
         // never referenced, so the lift covers shared references and dead captures at once.
-        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let capture = builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::F64)));
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
@@ -1179,7 +1179,7 @@ mod tests {
         // The program computes `(input + capture#1) + immediate`, capture #0 is dead, and the immediate constant
         // carries its own literal instead of naming a capture slot.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestConstant, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<TestConstant, ArrayOperation<Array>>::new();
         let input = builder.add_input(scalar_type.clone());
         let capture = builder.add_constant(TestConstant::Captured(CaptureReference::new(1, scalar_type.clone())));
         let immediate = builder.add_constant(TestConstant::Immediate(Array::scalar(5.0).unwrap()));

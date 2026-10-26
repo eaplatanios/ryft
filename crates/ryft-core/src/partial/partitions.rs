@@ -1188,7 +1188,7 @@ mod tests {
         EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, ProgramBuilder, ProgramError,
         ReferenceType,
     };
-    use crate::tests::{TestArrayIrOperation, TestArrayOperation};
+    use crate::tests::TestArrayIrOperation;
 
     use super::*;
 
@@ -1279,13 +1279,13 @@ mod tests {
     fn test_partitioned_program_from_parts() {
         // The known program returns `-a` as a fully known output followed by `-a` as a residual edge, and the residual
         // program computes `x - e` from the unknown input `x` and the edge `e`.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
         let known = builder
             .build::<Vec<Array>, Vec<Array>>(vec![negated, negated], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let edge = builder.add_input(ArrayType::scalar(DataType::F64));
         let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, edge], None).unwrap()[0];
@@ -1362,7 +1362,7 @@ mod tests {
     fn test_partitioned_program_original_input_count() {
         // `f(a, x, b, u) = (-a * x, b * x)` partitioned with `x` unknown: forwarding feeds `b` to the residual program
         // directly and the known program uses neither `b` nor `u`, yet the original boundary still has four inputs.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let b = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1398,7 +1398,7 @@ mod tests {
     fn test_partitioned_program_residual_edges() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let scalar = builder.add_input(scalar_type.clone());
         let vector = builder.add_input(vector_type.clone());
         let known = builder
@@ -1408,7 +1408,7 @@ mod tests {
             let known_output_count = outputs.iter().filter(|output| output.is_known()).count();
             let output_types = known.output_types();
             let input_types = known.input_types();
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let inputs = sources
                 .iter()
                 .map(|source| {
@@ -1609,7 +1609,7 @@ mod tests {
     fn test_partitioned_program_has_forwarded_residual_inputs() {
         // `f(a, x) = (-a, -a * x, a * x)` partitioned with `x` unknown has residual edges that repeat a known output
         // and a known input until they are forwarded.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
@@ -1650,7 +1650,7 @@ mod tests {
         // `f(a, b, c, x) = (a + a, (a + a) * x, b * x, -c * x)` partitioned with `x` unknown: the residual edges are
         // the known output `a + a`, the known input `b`, and `-c`. Forwarding feeds the first two from that output and
         // that input, so the known program returns each value once and no longer receives `b`.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let b = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1718,13 +1718,13 @@ mod tests {
         );
 
         // Edges that carry the same known program atom share one edge.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
         let known_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![negated, negated], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1769,7 +1769,7 @@ mod tests {
 
     #[test]
     fn test_partitioned_program_forward_residuals_preserves_repeated_known_outputs() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let known = builder
@@ -1779,7 +1779,7 @@ mod tests {
                 vec![Placeholder; 5],
             )
             .unwrap();
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
@@ -1828,7 +1828,7 @@ mod tests {
     #[test]
     fn test_partitioned_program_forward_residuals_large_boundary() {
         let count = 4096;
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let known = builder.add_input(ArrayType::scalar(DataType::F64));
         let unknown = builder.add_input(ArrayType::scalar(DataType::F64));
         let mut value = known;
@@ -1857,7 +1857,7 @@ mod tests {
         );
 
         // Repeated feeders share edges in first-use order, even when that order reverses the known outputs.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let unknown = builder.add_input(ArrayType::scalar(DataType::F64));
         let mut sources = vec![ResidualInputSource::UnknownInput(1)];
         let mut outputs = Vec::new();
@@ -1908,7 +1908,7 @@ mod tests {
     fn test_partitioned_program_forward_residuals_is_idempotent() {
         // `f(a, b, x) = (a + a, (a + a) * x, b * x)` partitioned with `x` unknown forwards a known output and a known
         // input that the known program then stops receiving. Forwarding again keeps both sources and both programs.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let b = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -2307,7 +2307,7 @@ mod tests {
 
     #[test]
     fn test_region_partition_with_configuration_rejects_invalid_required_output() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -2445,7 +2445,7 @@ mod tests {
         // `f(a, x) = (a + a, -a * x)` partitioned with `a` known and `x` unknown: `a + a` is a fully known output,
         // `-a` is a residual edge trailing it among the known program's outputs, and the residual program computes
         // the mixed output over the surviving unknown input plus the edge.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];

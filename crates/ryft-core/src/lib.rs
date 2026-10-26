@@ -299,11 +299,6 @@ pub(crate) mod tests {
         hasher.finish()
     }
 
-    /// Ordinary array operation family for core tests. Tests use the production [`ArrayOperation`] family over the
-    /// fixed `Array` value family, so that their transform instantiations are shared with the production tests;
-    /// malformed rules and arbitrary region interfaces remain explicit, separate protocol fixtures.
-    pub(crate) type TestArrayOperation = ArrayOperation<Array>;
-
     /// Small array operation family for the tests of `jvp_for_transpose`, which use the scalar and weighted cube
     /// fixtures, the rule-marker fixtures for nested rule selection, conditional regions, and the composite transpose
     /// carriers that the fixtures' reverse rules retain. The production [`ArrayOperation`] family cannot host these
@@ -388,11 +383,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// Eager array context over the ordinary array operation family of core protocol tests.
-    pub(crate) type TestArrayContext = EagerContext<Array, TestArrayOperation>;
+    /// Eager array context over the production [`ArrayOperation`] family for core protocol tests. Tests use that
+    /// family over the fixed `Array` value family, so that their transform instantiations are shared with the
+    /// production tests; malformed rules and arbitrary region interfaces remain explicit, separate protocol fixtures.
+    pub(crate) type TestArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
-    /// Staging context for the same ordinary array family, used to replay residual programs into an outer trace.
-    pub(crate) type TestArrayTracingContext = TracingContext<Array, TestArrayOperation>;
+    /// Staging context for the same production array family, used to replay residual programs into an outer trace.
+    pub(crate) type TestArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
 
     /// Small reference-capable family for mixed Intermediate Representation (IR) boundary tests. Keeping its type
     /// universe explicit avoids treating a reference as an ordinary array or importing the complete production mixed
@@ -402,7 +399,7 @@ pub(crate) mod tests {
     pub(crate) enum TestArrayIrOperation {
         Constant(Box<ConstantOperation<ArrayIrValue<Array>>>),
         #[ryft(projected(ArrayType))]
-        Array(Box<TestArrayOperation>),
+        Array(Box<ArrayOperation<Array>>),
         ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
         ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
     }

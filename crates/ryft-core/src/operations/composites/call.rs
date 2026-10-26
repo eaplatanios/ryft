@@ -2044,7 +2044,7 @@ mod tests {
         EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, OutputRegionProvenance,
         ProgramBuilder, ReferenceType, RegionInterface, RegionRole, RegionSlot,
     };
-    use crate::tests::{TestArrayOperation, hash_of};
+    use crate::tests::hash_of;
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -5044,7 +5044,7 @@ mod tests {
         // replicated `p` leaves the primal replicated, while the derivative is mapped.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = {
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(scalar_type.clone());
             let parameter = builder.add_input(scalar_type.clone());
             builder
@@ -5057,7 +5057,7 @@ mod tests {
             })
             .with_batching_support();
         let program = |definition: TestDefinition| {
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let primal = builder.import_program(primal.clone());
             let coefficient = builder.add_input(scalar_type.clone());
             let parameter = builder.add_input(scalar_type.clone());
@@ -5112,7 +5112,7 @@ mod tests {
             .with_batching_support()
             .with_batched_output_axes(vec![BatchAxis::new(0), BatchAxis::replicated()]);
         let pair_primal = {
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(scalar_type.clone());
             let parameter = builder.add_input(scalar_type.clone());
             builder
@@ -5120,7 +5120,7 @@ mod tests {
                 .unwrap()
         };
         let pair_program = {
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let primal = builder.import_program(pair_primal);
             let coefficient = builder.add_input(scalar_type.clone());
             let parameter = builder.add_input(scalar_type.clone());
@@ -6905,11 +6905,11 @@ mod tests {
         // specialization. The pair rule forwards each input tangent to the corresponding output.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let pair_program = |definition: &TestRegistration| {
-            let mut primal = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut primal = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let inputs = vec![primal.add_input(scalar_type.clone()), primal.add_input(scalar_type.clone())];
             let primal =
                 primal.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let primal = builder.import_program(primal);
             let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
             let outputs = builder
@@ -7401,7 +7401,7 @@ mod tests {
         );
         let r#type = ArrayType::scalar(DataType::F64);
         let primal = |output_count: usize| {
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(r#type.clone());
             builder
                 .build(vec![input; output_count], vec![Placeholder], vec![Placeholder; output_count])

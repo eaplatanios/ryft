@@ -477,7 +477,6 @@ mod tests {
         FlatProgram, Operation, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef,
         TypeError, Typed, Value,
     };
-    use crate::tests::TestArrayOperation;
     use crate::tracing::Trace;
 
     use super::*;
@@ -565,13 +564,13 @@ mod tests {
     // Fixtures of the tests of calls and carriers with retained rules.
 
     /// Eager context whose operation family registers the retained-rule operations.
-    pub(super) type TestContext = EagerContext<Array, TestArrayOperation>;
+    pub(super) type TestContext = EagerContext<Array, ArrayOperation<Array>>;
 
     /// Retained-rule definition over [`TestContext`].
-    pub(super) type TestDefinition = CustomRuleDefinition<Array, TestArrayOperation>;
+    pub(super) type TestDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
 
     /// Registration of a [`TestDefinition`].
-    pub(super) type TestRegistration = CustomRuleRegistration<Array, TestArrayOperation>;
+    pub(super) type TestRegistration = CustomRuleRegistration<Array, ArrayOperation<Array>>;
 
     /// Retained-rule definition over the production [`ArrayOperation`] member family.
     pub(super) type MemberDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
@@ -664,7 +663,7 @@ mod tests {
 
     /// Stages one call of `definition` over an input of type `r#type`.
     pub(super) fn custom_rule_program(definition: &TestRegistration, r#type: ArrayType) -> FlatProgram<TestContext> {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let primal = builder.import_program(cube_program(&r#type));
         let input = builder.add_input(r#type);
         let output = builder

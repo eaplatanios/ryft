@@ -295,8 +295,7 @@ mod tests {
         AtomId, Operation, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, TypeError, Typed,
     };
     use crate::tests::{
-        TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
-        TestFixtureOperation,
+        TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayTracingContext, TestFixtureOperation,
     };
     use crate::tracing::TracingContext;
 
@@ -340,7 +339,7 @@ mod tests {
         // Build a residual program `g(x, r) = x * r + 3`, with `x` standing for the original program's surviving
         // unknown input and `r` for a known residual feeder carrying the folded value `2`, and pair it with an
         // original output report whose first output folded to `5`.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let r = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(3.0).unwrap());
@@ -1860,7 +1859,7 @@ mod tests {
         // still a residual input because it witnesses the extent of the unknown input.
         let dimension = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(array_type.clone());
         let unknown = builder.add_input(array_type.clone());
         let program = builder
@@ -2118,7 +2117,7 @@ mod tests {
         // `f(a, x) = (a * a) * x + 1` with `a` known as a live tracer of an enclosing trace and `x` unknown: the known
         // `a * a` folds by staging into the outer program, the residual program consumes its staged result through a
         // known feeder naming the outer atom, and the literal is rebuilt inline as a residual constant.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0).unwrap());

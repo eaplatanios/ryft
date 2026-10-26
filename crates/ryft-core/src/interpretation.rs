@@ -1482,14 +1482,14 @@ mod tests {
         AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, RegionId, RegionInterface,
         RegionSlot, TypeError,
     };
-    use crate::tests::{TestArrayContext, TestArrayOperation, TestRegionOperation};
+    use crate::tests::{TestArrayContext, TestRegionOperation};
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
     /// Two dependent operations with a shared final result for resumable last-use tests.
-    fn stepping_program() -> Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+    fn stepping_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
         let constant = builder.add_constant(Array::scalar(3f32).unwrap());
         builder.add_constant(Array::scalar(99f32).unwrap());
@@ -1503,10 +1503,10 @@ mod tests {
         let context = TestArrayContext::new();
         let expected = ProgramError::MalformedProgram("empty region driver cannot interpret a region".to_string());
         let expected_region = ProgramError::MalformedProgram("region index 0 is out of range".to_string());
-        assert_eq!(RegionDriver::<Array, TestArrayOperation>::regions(&EmptyRegionDriver).count(), 0);
-        assert_eq!(RegionDriver::<Array, TestArrayOperation>::region_count(&EmptyRegionDriver), 0);
+        assert_eq!(RegionDriver::<Array, ArrayOperation<Array>>::regions(&EmptyRegionDriver).count(), 0);
+        assert_eq!(RegionDriver::<Array, ArrayOperation<Array>>::region_count(&EmptyRegionDriver), 0);
         assert!(matches!(
-            RegionDriver::<Array, TestArrayOperation>::region(&EmptyRegionDriver, 0),
+            RegionDriver::<Array, ArrayOperation<Array>>::region(&EmptyRegionDriver, 0),
             Err(error) if error == expected_region,
         ));
         assert_eq!(EmptyRegionDriver.interpret_region(&context, 0, Vec::<Array>::new()), Err(expected));
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_eager_interpretation_driver_interpret_region() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input_type = ArrayType::scalar(DataType::F32);
         let input = builder.add_input(input_type.clone());
         let constant = builder.add_constant(Array::scalar(3f32).unwrap());
@@ -1551,8 +1551,8 @@ mod tests {
 
         // The same stored region retains Array constants when its runtime values are Tracers. This also exercises
         // constant lifting and operation binding through the interpretation driver with distinct value families.
-        let (_, restaged) = TracingContext::<Array, TestArrayOperation>::trace(
-            |inputs: Vec<Tracer<TracingContext<Array, TestArrayOperation>>>| {
+        let (_, restaged) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
                 let context = inputs[0].context().clone();
                 let outputs = driver.interpret_region(&context, 0, inputs)?;
                 driver.bind(&context, NegOperation::new().into(), AttachedRegions::Empty, &outputs)
@@ -1578,7 +1578,7 @@ mod tests {
     fn test_eager_interpretation_driver_bind() {
         // The eager driver binds through the eager context that it serves, which interprets the operation.
         let context = TestArrayContext::new();
-        let regions = Vec::<Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>>>::new();
+        let regions = Vec::<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>::new();
         let driver = EagerInterpretationDriver::new(&regions);
         let input = Array::scalar(2.0f32).unwrap();
         assert_eq!(
@@ -1599,7 +1599,7 @@ mod tests {
     #[test]
     fn test_program_interpret_materializes_duplicate_outputs() {
         // A program whose two outputs are the same atom materializes that value into both output positions.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder
@@ -1667,7 +1667,7 @@ mod tests {
             Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
             Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
         ]);
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let source_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated = builder
             .add_instruction(NegOperation::new(), Vec::new(), vec![source_input], Some(nested.clone()))
@@ -1682,7 +1682,7 @@ mod tests {
         // Replays the source program into a fresh trace, either directly or with `outer` entered as an ambient scope,
         // and additionally stages one instruction that is not a replay of any source instruction.
         let replay = |ambient_scope: bool| {
-            let context = TracingContext::<Array, TestArrayOperation>::new();
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let input = context.input(ArrayType::scalar(DataType::F64));
             let stage = || {
                 let outputs = source.interpret_in_context(&context, vec![input]).unwrap();
@@ -1727,7 +1727,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_lifts_live_constants_once() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(7.0f64).unwrap());
         let c1 = builder.add_constant(Array::scalar(3.0f64).unwrap());
@@ -1755,7 +1755,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_mismatched_parameter_structures() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder.build::<Vec<Array>, Array>(vec![i0], vec![Placeholder], Placeholder).unwrap();
         assert!(matches!(
@@ -1772,7 +1772,7 @@ mod tests {
     #[test]
     fn test_program_interpret_input_type_checking() {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -1785,7 +1785,7 @@ mod tests {
 
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
@@ -1804,7 +1804,7 @@ mod tests {
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
@@ -1834,13 +1834,13 @@ mod tests {
         let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.simplified_dimension()]));
         let branches = [0, 1].map(|output_index| {
-            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let inputs = [builder.add_input(vector_type.clone()), builder.add_input(vector_type.clone())];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![inputs[output_index]], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         });
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let first = builder.add_input(vector_type.clone());
         let second = builder.add_input(vector_type);
@@ -1926,7 +1926,7 @@ mod tests {
     #[test]
     fn test_program_interpret_boundary_refinements() {
         // This sentinel deliberately violates its inferred output shape to exercise replay validation.
-        // Valid production operations in `TestArrayOperation` must not implement that behavior.
+        // Valid production operations in `ArrayOperation<Array>` must not implement that behavior.
         #[derive(Clone)]
         struct WrongShapeOperation;
 
@@ -2271,7 +2271,7 @@ mod tests {
         let dynamic = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone()]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), dynamic]));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
@@ -2298,7 +2298,7 @@ mod tests {
         assert_eq!(program.to_string(), original_program);
 
         // A statically typed payload establishes no boundary facts, so ordinary replay is untouched.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         let output = builder
             .add_instruction(
@@ -2321,7 +2321,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_wrong_number_of_operation_inputs() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder.build::<Array, Array>(vec![i0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let o0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -2356,7 +2356,7 @@ mod tests {
 
     #[test]
     fn test_region_ref_interpret_in_context() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let r#type = ArrayType::new_static(DataType::F64, [2]);
         let input = builder.add_input(r#type.clone());
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -2756,7 +2756,7 @@ mod tests {
     #[test]
     fn test_region_interpreter_context() {
         let program = stepping_program();
-        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
         let state = RegionInterpreter::new(context.clone(), program.entry_region_ref(), vec![input]).unwrap();
         assert!(std::rc::Rc::ptr_eq(state.context().builder(), context.builder()));
@@ -2781,7 +2781,7 @@ mod tests {
     #[test]
     fn test_region_interpreter_step() {
         let program = stepping_program();
-        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
         let state = RegionInterpreter::new(context.clone(), program.entry_region_ref(), vec![input]).unwrap();
         let state = state.step().unwrap();
@@ -2845,7 +2845,7 @@ mod tests {
 
     #[test]
     fn test_region_interpreter_state_is_complete() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_constant(Array::scalar(3f32).unwrap());
         let program = builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![], vec![Placeholder]).unwrap();
         let state = RegionInterpreterState::new(program.entry_region_ref(), vec![], |_, value| {
@@ -2865,7 +2865,7 @@ mod tests {
             })
             .unwrap();
         let mut dispatched = Vec::new();
-        let mut dispatch = |instruction: &Instruction<TestArrayOperation>, inputs: &[Array]| {
+        let mut dispatch = |instruction: &Instruction<ArrayOperation<Array>>, inputs: &[Array]| {
             dispatched.push(instruction.operation().name());
             instruction.operation().interpret(&TestArrayContext::new(), &EmptyRegionDriver, inputs)
         };

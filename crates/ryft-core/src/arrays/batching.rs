@@ -3072,7 +3072,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope, ReferenceType};
     use crate::specialization::SpecializationCacheStatistics;
-    use crate::tests::{TestArrayContext, TestArrayOperation};
+    use crate::tests::TestArrayContext;
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
     use super::*;
@@ -6090,7 +6090,7 @@ mod tests {
     #[test]
     fn test_region_ref_batched_cache_specializes_arguments() {
         // Repeated structural requests are served from the region's retained artifact, keyed by the complete request.
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
@@ -6207,7 +6207,7 @@ mod tests {
 
     #[test]
     fn test_region_ref_batched_cache_preserves_mixed_rank_align_all_semantics() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F64));
         let vector = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         let program = builder
@@ -6499,7 +6499,7 @@ mod tests {
         let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
         let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let mapped = builder.add_input(vector_type.clone());
         let replicated = builder.add_input(vector_type);
         let summed = builder
@@ -6533,7 +6533,7 @@ mod tests {
 
     #[test]
     fn test_program_batched_rejects_mismatched_output_axes_count() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =

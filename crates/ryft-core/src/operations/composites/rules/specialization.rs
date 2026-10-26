@@ -2028,7 +2028,6 @@ mod tests {
         member_cube_definition,
     };
     use crate::programs::ReferenceType;
-    use crate::tests::TestArrayOperation;
 
     use super::*;
 
@@ -2873,7 +2872,7 @@ mod tests {
         // A rule program whose outputs have the expected types is returned unchanged. Only its leading outputs (e.g.,
         // the primal outputs of a forward rule, which its residuals follow) or the selected ones are compared.
         let (f64_type, f32_type) = (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = vec![builder.add_input(f64_type.clone()), builder.add_input(f32_type.clone())];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
@@ -2901,7 +2900,7 @@ mod tests {
         let vector_type =
             |variable: &DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
         let (first, second) = (DimensionVariable::new("n", bounds), DimensionVariable::new("n", bounds));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = vec![builder.add_input(vector_type(&first)), builder.add_input(vector_type(&second))];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();

@@ -1229,7 +1229,6 @@ mod tests {
         OutputRegionProvenance, Program, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation,
         RegionDataFlow, RegionDriver, RegionInterface, RegionRef, RegionSlot, ValueProjection,
     };
-    use crate::tests::TestArrayOperation;
     use crate::tracing::{Trace, TracingContext};
 
     use super::*;
@@ -1306,7 +1305,7 @@ mod tests {
     type ReferenceTestCarrier = CompositeTransposeOperation<ArrayIrValue<Array>, ReferenceTestOperation>;
 
     /// Reference-capable operation family for the carrier tests that need caller-owned cotangent buffers or reference
-    /// effects, which [`TestArrayOperation`] lacks. It hosts the reverse-mode carrier, which tests construct directly
+    /// effects, which [`ArrayOperation`] lacks. It hosts the reverse-mode carrier, which tests construct directly
     /// as reverse-mode linearization would stage it, together with the ordinary array IR operations that backward rules
     /// emit, a region-carrying computation, and the production condition and linear call. It supports direct
     /// transposition rather than differentiation.
@@ -2251,7 +2250,7 @@ mod tests {
             vec![scalar_type.clone()],
             false,
         );
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type)];
         let outputs = builder.add_instruction(carrier, Vec::new(), inputs, None).unwrap().to_vec();
         let program =
@@ -2325,7 +2324,7 @@ mod tests {
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type)];
         let outputs = builder.add_instruction(carrier, Vec::new(), inputs, None).unwrap().to_vec();
         let program =

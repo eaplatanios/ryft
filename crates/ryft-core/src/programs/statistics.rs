@@ -289,7 +289,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::constants::ConstantOperation;
     use crate::operations::{ADD_OPERATION_NAME, Neg};
@@ -297,7 +297,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::EffectClass;
     use crate::programs::regions::RegionSlot;
-    use crate::tests::{TestArrayOperation, TestRegionOperation};
+    use crate::tests::TestRegionOperation;
 
     use super::*;
 
@@ -310,8 +310,8 @@ mod tests {
 
     #[test]
     fn test_statistics_scalar_program_counts_and_depth() {
-        let domain = EagerContext::<Array, TestArrayOperation>::new();
-        let (_, program): (Array, Program<Array, TestArrayOperation, Array, Array>) = domain
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (_, program): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) = domain
             .interpret_and_trace(
                 |x| {
                     let with_constant = x.clone() + x.context().constant(Array::scalar(1.0).unwrap());
@@ -354,11 +354,11 @@ mod tests {
 
     #[test]
     fn test_statistics_zero_input_instruction_output_has_depth_one() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let produced = builder
             .add_instruction(ConstantOperation::new(Array::scalar(1.0).unwrap()), vec![], vec![], None)
             .unwrap()[0];
-        let program: Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> =
+        let program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> =
             builder.build(vec![produced], vec![], vec![Placeholder]).unwrap();
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
@@ -397,8 +397,8 @@ mod tests {
 
     #[test]
     fn test_statistics_duplicate_outputs_only_affect_output_count() {
-        let domain = EagerContext::<Array, TestArrayOperation>::new();
-        let (_, program): ((Array, Array), Program<Array, TestArrayOperation, Array, (Array, Array)>) = domain
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (_, program): ((Array, Array), Program<Array, ArrayOperation<Array>, Array, (Array, Array)>) = domain
             .interpret_and_trace(
                 |x| {
                     let negated = x.neg()?;

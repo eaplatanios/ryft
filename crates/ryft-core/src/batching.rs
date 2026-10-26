@@ -2108,7 +2108,7 @@ mod tests {
     use crate::programs::{ProgramBuilder, Typed};
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue, TestArrayContext, TestArrayOperation,
+        ProjectedProgramType, ProjectedProgramValue, TestArrayContext,
     };
     use crate::tracing::Trace;
 
@@ -2675,7 +2675,7 @@ mod tests {
         assert_eq!(aligned_program.input_types(), std::slice::from_ref(&axis_one_type));
         assert_eq!(aligned_program.output_types(), std::slice::from_ref(&axis_zero_type));
         assert_eq!(aligned_program.instructions().len(), 1);
-        assert!(matches!(aligned_program.instructions()[0].operation(), TestArrayOperation::Transpose(_)));
+        assert!(matches!(aligned_program.instructions()[0].operation(), ArrayOperation::Transpose(_)));
         assert_eq!(
             aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()]),
             Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()]),
@@ -2782,7 +2782,7 @@ mod tests {
         let replicated = BatchingTracer::new(context.clone(), ArrayBatch::replicated(constant.clone()));
         assert_eq!(context.resolve(&replicated), ValueResolution::Constant(constant));
 
-        let trace = TracingContext::<Array, TestArrayOperation>::new();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::with_policy(trace.clone(), 2);
         let packed = trace.input(ArrayType::new_static(DataType::F64, [2]));
         let mapped = BatchingTracer::new(context.clone(), ArrayBatch::new(packed, Some(0)).unwrap());

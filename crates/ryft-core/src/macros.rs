@@ -5172,16 +5172,6 @@ pub mod checks {
         assert_eq!(Operation::infer_output_types(operation, input_types, &[]), expected);
     }
 
-    // TODO(eaplatanios): Inline this.
-    /// Returns the representative array type with element type `data_type` that the elementwise selectors of
-    /// [`check_operation_type_inference!`] use. It carries shape, layout, and memory metadata so that the checks also
-    /// verify structural lifting.
-    fn representative_array_type(data_type: DataType) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
-            .with_memory(Memory::Host { pinned: true })
-    }
-
     /// Checks a successful unary element type case of [`check_operation_type_inference!`] in both the data type and
     /// the array type universes. The array type check uses a representative rank-2 [`ArrayType`] with explicit layout
     /// and memory metadata and expects every output to keep that metadata while taking its declared element type.
@@ -5210,7 +5200,9 @@ pub mod checks {
             Operation::infer_output_types(data_operation, &[input_data_type], &[]),
             Ok(output_data_types.clone()),
         );
-        let input_type = representative_array_type(input_data_type);
+        let input_type = ArrayType::new(input_data_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_memory(Memory::Host { pinned: true });
         assert_eq!(
             Operation::infer_output_types(array_operation, std::slice::from_ref(&input_type), &[]),
             Ok(output_data_types
@@ -5250,7 +5242,9 @@ pub mod checks {
             Operation::infer_output_types(data_operation, &[left_data_type, right_data_type], &[]),
             Ok(output_data_types.clone()),
         );
-        let left_type = representative_array_type(left_data_type);
+        let left_type = ArrayType::new(left_data_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_memory(Memory::Host { pinned: true });
         let right_type = left_type.clone().with_data_type(right_data_type);
         assert_eq!(
             Operation::infer_output_types(array_operation, &[left_type.clone(), right_type], &[]),
@@ -5259,21 +5253,6 @@ pub mod checks {
                 .map(|output_data_type| left_type.clone().with_data_type(output_data_type))
                 .collect::<Vec<_>>()),
         );
-    }
-
-    // TODO(eaplatanios): Inline this.
-    /// Returns the one-axis explicit mesh used by the generated sharding rejection fixtures.
-    #[track_caller]
-    fn sharding_fixture_mesh() -> LogicalMesh {
-        LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap()
-    }
-
-    // TODO(eaplatanios): Inline this.
-    /// Returns `input_type` with a fully replicated sharding over `mesh`.
-    #[track_caller]
-    fn replicated_array_type(mesh: &LogicalMesh, input_type: ArrayType) -> ArrayType {
-        let dimensions = vec![ShardingDimension::Replicated; input_type.rank()];
-        input_type.with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
     }
 
     /// Checks the `@reject @unreduced` contract of [`check_operation_type_inference!`]: `operation` must reject
@@ -5287,7 +5266,7 @@ pub mod checks {
     #[track_caller]
     pub fn check_unreduced_input_rejection<O: Operation<Type = ArrayType>>(operation: &O, input_types: Vec<ArrayType>) {
         let descriptor = Operation::name(operation);
-        let mesh = sharding_fixture_mesh();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mut unreduced_input_types = Vec::with_capacity(input_types.len());
         for input_type in input_types {
             let dimensions = vec![ShardingDimension::Replicated; input_type.rank()];
@@ -5322,9 +5301,12 @@ pub mod checks {
         right_type: ArrayType,
     ) {
         let descriptor = Operation::name(operation);
-        let mesh = sharding_fixture_mesh();
-        let left = replicated_array_type(&mesh, left_type);
-        let right = replicated_array_type(&mesh, right_type);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let left_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated; left_type.rank()]).unwrap();
+        let left = left_type.with_sharding(left_sharding).unwrap();
+        let right_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated; right_type.rank()]).unwrap();
+        let right = right_type.with_sharding(right_sharding).unwrap();
         let reduced_left = left
             .clone()
             .with_sharding(left.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
