@@ -697,7 +697,7 @@ impl ReferenceAccessOperation for AsyncCopyOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for AsyncCopyOperation {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for AsyncCopyOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -756,7 +756,7 @@ impl Operation for WaitOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for WaitOperation {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for WaitOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,

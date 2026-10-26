@@ -657,8 +657,12 @@ where
     }
 }
 
-impl<C: Domain, V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
-    InterpretableOperation<C> for CompositeTransposeOperation<V, O, S>
+impl<
+    C: Domain<Type = V::Type>,
+    V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
+    O,
+    S: CustomRuleSource<V, O>,
+> InterpretableOperation<C> for CompositeTransposeOperation<V, O, S>
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,

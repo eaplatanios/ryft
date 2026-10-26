@@ -459,6 +459,8 @@ impl<
         + InterpretableOperation<Self>
         + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
 > Context for EagerContext<V, O>
+where
+    Self: Domain<Type = V::Type, Value = V, Constant = V, Operation = O>,
 {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {

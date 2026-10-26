@@ -126,7 +126,7 @@ impl Operation for NoKernelExtension {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for NoKernelExtension {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for NoKernelExtension {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -528,7 +528,7 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
     }
 }
 
-impl<C: Domain, Extension> InterpretableOperation<C> for KernelOperation<Extension>
+impl<C: Domain<Type = ArrayIrType>, Extension> InterpretableOperation<C> for KernelOperation<Extension>
 where
     Extension: Operation<Type = ArrayIrType> + InterpretableOperation<C>,
     ArrayIrOperation<Array>: InterpretableOperation<C>,
@@ -1038,7 +1038,7 @@ mod tests {
             }
         }
 
-        impl<C: Domain> InterpretableOperation<C> for UnavailableExtension {
+        impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for UnavailableExtension {
             fn interpret<D: InterpretationDriver<C>>(
                 &self,
                 _context: &C,

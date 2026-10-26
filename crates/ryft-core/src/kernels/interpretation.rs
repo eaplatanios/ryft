@@ -204,6 +204,12 @@ pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS: usize = 10_000;
 
 impl<Extension> KernelDefinition<Extension>
 where
+    EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
+            Type = ArrayIrType,
+            Value = ArrayIrValue<Array>,
+            Constant = ArrayIrValue<Array>,
+            Operation = KernelOperation<Extension>,
+        >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     /// Interprets this definition on host arrays after checking initialization, output coverage, and races. The
@@ -307,6 +313,12 @@ where
 impl<Extension> InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>
     for KernelCallOperation
 where
+    EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
+            Type = ArrayIrType,
+            Value = ArrayIrValue<Array>,
+            Constant = ArrayIrValue<Array>,
+            Operation = KernelOperation<Extension>,
+        >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>(
@@ -340,6 +352,12 @@ impl KernelCallOperation {
         order: Option<&[usize]>,
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError>
     where
+        EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
+                Type = ArrayIrType,
+                Value = ArrayIrValue<Array>,
+                Constant = ArrayIrValue<Array>,
+                Operation = KernelOperation<Extension>,
+            >,
         Extension:
             KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
         D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
@@ -564,7 +582,7 @@ impl KernelCallOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for ScratchOperation {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for ScratchOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -691,6 +709,18 @@ impl<Extension: Operation<Type = ArrayIrType>> Domain for QualifiedKernelContext
 
 impl<Extension> Context for QualifiedKernelContext<Extension>
 where
+    Self: Domain<
+            Type = ArrayIrType,
+            Value = ArrayIrValue<Array>,
+            Constant = ArrayIrValue<Array>,
+            Operation = KernelOperation<Extension>,
+        >,
+    EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
+            Type = ArrayIrType,
+            Value = ArrayIrValue<Array>,
+            Constant = ArrayIrValue<Array>,
+            Operation = KernelOperation<Extension>,
+        >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
@@ -887,6 +917,12 @@ impl<Extension: Operation<Type = ArrayIrType>, D: RegionDriver<ArrayIrValue<Arra
 impl<Extension, D> InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>
     for QualifiedKernelDriver<'_, Extension, D>
 where
+    EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
+            Type = ArrayIrType,
+            Value = ArrayIrValue<Array>,
+            Constant = ArrayIrValue<Array>,
+            Operation = KernelOperation<Extension>,
+        >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
     D: RegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>,
 {

@@ -416,7 +416,7 @@ impl<C: Context<Type = ArrayIrType>, P: ReferenceDischargePolicy<C>> ReferenceDi
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for XlaKernelOperation {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for XlaKernelOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,

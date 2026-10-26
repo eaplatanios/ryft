@@ -975,8 +975,12 @@ where
 
 // Interpretation replays only the primal region, so it applies in every context, including contexts of families that
 // embed this call's family (e.g., kernel bodies).
-impl<C: Domain, V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
-    InterpretableOperation<C> for CompositeOperation<V, O, S>
+impl<
+    C: Domain<Type = V::Type>,
+    V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
+    O,
+    S: CustomRuleSource<V, O>,
+> InterpretableOperation<C> for CompositeOperation<V, O, S>
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(

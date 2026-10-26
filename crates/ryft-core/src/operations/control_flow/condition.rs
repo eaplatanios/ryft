@@ -2965,6 +2965,7 @@ mod tests {
         O: Operation<Type = V::Type>
             + InterpretableOperation<EagerContext<V, O>>
             + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+        EagerContext<V, O>: Domain<Type = V::Type, Value = V, Constant = V, Operation = O>,
     {
         let mut known_outputs = known_program.interpret(arguments[..known_input_count].to_vec())?.into_iter();
         let residual_arguments = evaluation

@@ -8,7 +8,7 @@
 use thiserror::Error;
 
 use crate::arrays::{Array, ArrayIrType, ArrayIrValue};
-use crate::contexts::EagerContext;
+use crate::contexts::{Domain, EagerContext};
 use crate::interpretation::InterpretableOperation;
 use crate::kernels::calls::KernelDefinition;
 use crate::kernels::grids::{Grid, GridExecution};
@@ -61,6 +61,12 @@ pub struct KernelInterleaving {
 
 impl<Extension> KernelDefinition<Extension>
 where
+    EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
+            Type = ArrayIrType,
+            Value = ArrayIrValue<Array>,
+            Constant = ArrayIrValue<Array>,
+            Operation = KernelOperation<Extension>,
+        >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     /// Explores all program-order-preserving instruction interleavings within the supplied bounds. Qualification

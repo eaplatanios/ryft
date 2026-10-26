@@ -128,9 +128,9 @@ struct OperationEnum {
     /// Program-shaped generics after reducing payload-specific value parameters to the program constant space.
     program_generics: syn::Generics,
 
-    /// Program-shaped generics for the batching dispatcher, without the per-payload `Operation` predicates that its
-    /// rule predicates imply through the `BatchableOperation` supertrait.
-    batching_generics: syn::Generics,
+    /// Program-shaped generics for the interpretation, batching, and discharge dispatchers, without the per-payload
+    /// `Operation` predicates that their rule predicates imply through the rule traits' super-traits.
+    dispatcher_generics: syn::Generics,
 
     /// Program-shaped enum self type after reducing payload-specific value parameters to the program constant space.
     program_self_type: syn::Type,
@@ -482,9 +482,10 @@ impl OperationParser {
             .map(|parameter| program_value_substitutions(&value_type_parameters, parameter))
             .unwrap_or_default();
         let program_self_type = substitute_type_idents(&self_type, &program_value_substitutions);
-        // `BatchableOperation` carries `Operation<Type = C::Type>` as its supertrait, so the batching dispatcher's
-        // per-payload rule predicates already imply the payload `Operation` predicates and do not restate them.
-        let batching_generics = substitute_generics(
+        // The interpretation, batching, and discharge rule traits carry `Operation<Type = C::Type>` as their
+        // super-trait, so those dispatchers' per-payload rule predicates already imply the payload `Operation`
+        // predicates and do not restate them.
+        let dispatcher_generics = substitute_generics(
             &operation_generics(&generics, &variants, &self.ryft_crate, &operation_type, false),
             &program_value_substitutions,
         );
@@ -523,7 +524,7 @@ impl OperationParser {
             program_constant_type,
             program_constant_parameter,
             program_generics,
-            batching_generics,
+            dispatcher_generics,
             program_self_type,
             variants,
         })
@@ -1430,7 +1431,7 @@ impl OperationEnum {
         } else {
             syn::parse_quote!(#ryft::ArrayBatch<#parent_value_type>)
         };
-        let mut batching_generics = self.batching_generics.clone();
+        let mut batching_generics = self.dispatcher_generics.clone();
         batching_generics.params.push(syn::parse_quote!(__ParentContext));
         if has_explicit_operation_family {
             batching_generics.params.push(syn::parse_quote!(__BatchingPolicy));
@@ -1611,7 +1612,7 @@ impl OperationEnum {
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
         let discharge_self_type = &self.program_self_type;
-        let mut discharge_generics = self.batching_generics.clone();
+        let mut discharge_generics = self.dispatcher_generics.clone();
         discharge_generics.params.push(syn::parse_quote!(__ParentContext));
         discharge_generics.params.push(syn::parse_quote!(__ReferenceDischargePolicy));
         let discharge_where_clause = discharge_generics.make_where_clause();
@@ -2356,7 +2357,7 @@ impl OperationEnum {
         let program_constant_type = &self.program_constant_type;
         let has_separate_interpretation_value_type = self.has_separate_runtime_value_type;
         let interpretation_value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
-        let mut generics = self.program_generics.clone();
+        let mut generics = self.dispatcher_generics.clone();
         generics.params.push(syn::parse_quote!(__Context));
         let where_clause = generics.make_where_clause();
         let mut domain_bound: syn::TypeParamBound = syn::parse_quote!(#ryft::Domain<Type = #primary_type>);
@@ -2406,6 +2407,20 @@ impl OperationEnum {
                 <__Context as #ryft::Domain>::Value: #ryft::ValueProjection<
                     #member_type,
                     Projected: #ryft::Value<Type = #member_type>,
+                >
+            });
+            // The member's eager domain is built from the payload itself, so state its type as an assumption: the
+            // payload rule predicate's `Operation<Type = C::Type>` super-trait then normalizes through the parameter
+            // environment instead of recursing through the payload's own bounds.
+            where_clause.predicates.push(syn::parse_quote! {
+                #ryft::EagerContext<
+                    <<__Context as #ryft::Domain>::Value as #ryft::ValueProjection<#member_type>>::Projected,
+                    #operation_type,
+                >: #ryft::Domain<
+                    Type = #member_type,
+                    Value = <<__Context as #ryft::Domain>::Value as #ryft::ValueProjection<#member_type>>::Projected,
+                    Constant = <<__Context as #ryft::Domain>::Value as #ryft::ValueProjection<#member_type>>::Projected,
+                    Operation = #operation_type,
                 >
             });
             where_clause.predicates.push(syn::parse_quote! {

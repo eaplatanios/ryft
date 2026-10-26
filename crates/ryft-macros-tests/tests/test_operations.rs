@@ -577,7 +577,7 @@ where
 }
 
 /// Stand-in for `ryft_core::InterpretableOperation`.
-trait InterpretableOperation<C: Domain>: Operation {
+trait InterpretableOperation<C: Domain>: Operation<Type = C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -596,6 +596,12 @@ fn interpret_projected_operation<C: Domain, T: Type, O, D>(
 where
     C::Value: ValueProjection<T, Projected: Value<Type = T>>,
     O: Operation<Type = T> + InterpretableOperation<EagerContext<<C::Value as ValueProjection<T>>::Projected, O>>,
+    EagerContext<<C::Value as ValueProjection<T>>::Projected, O>: Domain<
+            Type = T,
+            Value = <C::Value as ValueProjection<T>>::Projected,
+            Constant = <C::Value as ValueProjection<T>>::Projected,
+            Operation = O,
+        >,
     D: InterpretationDriver<C>,
 {
     if !operation.region_slots().is_empty() || driver.region_count() != 0 {

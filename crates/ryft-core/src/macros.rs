@@ -7392,6 +7392,7 @@ mod tests {
                 + InterpretableOperation<EagerContext<Array, O>>
                 + DifferentiableOperation<EagerContext<Array, O>>
                 + OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
+            EagerContext<Array, O>: Domain<Type = ArrayType, Value = Array, Constant = Array, Operation = O>,
         {
         }
 

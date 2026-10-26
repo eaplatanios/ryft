@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 
-use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::partial::contexts::{PartialEvaluationContext, ReferencePlacement};
 use crate::partial::operations::PartiallyEvaluatableOperation;
@@ -243,6 +243,7 @@ where
         O: InterpretableOperation<EagerContext<V, O>>
             + PartiallyEvaluatableOperation<EagerContext<V, O>>
             + PartiallyEvaluatableOperation<TracingContext<V, O>>,
+        EagerContext<V, O>: Domain<Type = V::Type, Value = V, Constant = V, Operation = O>,
     {
         self.partially_evaluate_in_context(&EagerContext::new(), inputs)
     }
