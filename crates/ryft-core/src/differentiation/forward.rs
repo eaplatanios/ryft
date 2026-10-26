@@ -3898,7 +3898,7 @@ pub(crate) mod tests {
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue, TestArrayOperation,
+        ProjectedProgramType, ProjectedProgramValue, TestArrayOperation, TestFixtureOperation,
     };
     use crate::tracing::{NestedTracingContext, Trace};
 
@@ -5151,7 +5151,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_independent_residuals() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
         let input = Array::scalar(3f64).unwrap();
         assert_eq!(
             context.jvp(
@@ -5209,7 +5209,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_primal_work() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
         let program =
@@ -5291,12 +5291,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_nested_condition() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
         let branch =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let branch = builder.import_program(branch);
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -5384,7 +5384,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_after_batching() {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
         let program =
@@ -5414,7 +5414,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_higher_order() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
         let (_, pullback) = context
             .vjp(
                 |input, ()| {
@@ -5450,7 +5450,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_reverse_over_forward() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
         let (tangent, pullback) = context
             .vjp(
                 |input, ()| {
@@ -5481,7 +5481,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_forward_over_reverse() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
         let (gradient, tangent) = context
             .jvp(
                 |input, ()| {
@@ -5511,7 +5511,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_reverse_over_reverse() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
         let (gradient, pullback) = context
             .vjp(
                 |input, ()| {
@@ -5538,7 +5538,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_multiple_residuals() {
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
         let weight = Array::vector(vec![1f64, 2f64]).unwrap();
         let input = Array::vector(vec![3f64, 4f64]).unwrap();
         // Forward mode uses the JVP rule: `ẏ = x³ ẇ + 3w x² ẋ`.
@@ -5578,7 +5578,7 @@ pub(crate) mod tests {
         // The rules save different residuals: the JVP rule saves both coefficients, while the reverse rule saves the
         // two inputs and defers the coefficients to its backward program.
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let weight = builder.add_input(vector_type.clone());
         let input = builder.add_input(vector_type);
         let output =
@@ -5625,7 +5625,7 @@ pub(crate) mod tests {
         // The pullback of `nested_rule` is its backward program `ȳ ↦ rule_marker(ȳ)`, an identity whose JVP rule
         // doubles tangents and whose reverse rule triples cotangents. A transform applied to the pullback starts a
         // fresh transform that selects the nested call's rule by its own kind.
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, TestFixtureOperation>::new();
 
         // Forward mode over the pullback selects the nested JVP rule.
         let (cotangent, tangent) = context

@@ -2031,7 +2031,7 @@ mod tests {
     };
     use crate::tests::{
         TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
-        TestOrderedStateOperation,
+        TestFixtureOperation, TestOrderedStateOperation,
     };
     use crate::tracing::TracingContext;
 
@@ -3213,13 +3213,13 @@ mod tests {
         // program with a mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let first = builder.add_input(vector_type.clone());
         builder.add_input(vector_type.clone());
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestFixtureOperation>::new());
         assert_eq!(
             context
                 .inline_program(
@@ -3889,13 +3889,13 @@ mod tests {
         // mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let first = builder.add_input(vector_type.clone());
         builder.add_input(vector_type.clone());
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestFixtureOperation>::new());
         assert_eq!(
             context
                 .prepare_root_inputs(

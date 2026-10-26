@@ -251,7 +251,7 @@ pub(crate) mod tests {
 
     use ryft_macros::Operation;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::forward::tests::{
         CustomCubeOperation, CustomWeightedCubeOperation, NestedRuleOperation, RuleMarkerOperation,
@@ -264,12 +264,12 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, CompositeOperation, CompositeTransposeOperation,
-        ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation, DivOperation,
-        ExpOperation, GuardOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation,
-        PadOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation,
-        ReshapeOperation, ReshardOperation, SelectOperation, SliceOperation, StopGradientOperation, SubOperation,
-        TransposeOperation, UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
+        AddOperation, BroadcastOperation, CompareOperation, CompositeTransposeOperation, ConcatenateOperation,
+        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, GuardOperation,
+        MulOperation, NegOperation, OneLikeOperation, OneOperation, PadOperation, ParallelVaryOperation,
+        ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
+        SelectOperation, SliceOperation, StopGradientOperation, SubOperation, TransposeOperation, UpdateSliceOperation,
+        ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -299,19 +299,26 @@ pub(crate) mod tests {
         hasher.finish()
     }
 
-    /// Small ordinary array operation family for core tests. Each payload is a real operation, while malformed rules
-    /// and arbitrary region interfaces remain explicit, separate protocol fixtures. Captures and interpretation need
-    /// constant and arithmetic operations, and tracing's static constructors additionally need the zero and one
-    /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
-    /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
-    /// division, subtraction, exponentiation, and selection. Mapped conditional predicates require gradient barriers
-    /// on inactive branch inputs. These dependencies apply to the operation family even when a particular scalar test
-    /// emits none of those operations. Tests of `jvp_for_transpose` additionally use the scalar and weighted cube
-    /// fixtures, the rule-marker fixtures for nested rule selection, conditional regions, and a retained linear call.
-    /// All regions use the fixed `Array` value family, so no value type parameter is needed.
+    /// Ordinary array operation family for core tests. Tests use the production [`ArrayOperation`] family over the
+    /// fixed `Array` value family, so that their transform instantiations are shared with the production tests;
+    /// malformed rules and arbitrary region interfaces remain explicit, separate protocol fixtures.
+    pub(crate) type TestArrayOperation = ArrayOperation<Array>;
+
+    /// Small array operation family for the tests of `jvp_for_transpose`, which use the scalar and weighted cube
+    /// fixtures, the rule-marker fixtures for nested rule selection, conditional regions, and the composite transpose
+    /// carriers that the fixtures' reverse rules retain. The production [`ArrayOperation`] family cannot host these
+    /// fixtures. Because this family has no entry guard, partial-evaluation tests also use it to check that unproven
+    /// entry relationships are rejected rather than dropped. It pairs the fixtures with the real operations that the
+    /// transform rules require of any family: constant and arithmetic operations; the zero and one operations for
+    /// tracing's static constructors; broadcast and transpose for staged batching alignment; conversion, reduction,
+    /// reshape, and reshard for differentiation's shared alignment rules; comparison, concatenation, division,
+    /// exponentiation, selection, slicing, and subtraction for reduction derivatives; slice updates and padding for
+    /// the transposes of slicing; and gradient barriers for mapped conditional predicates. These dependencies apply
+    /// to the operation family even when a particular test emits none of those operations. All regions use the fixed
+    /// `Array` value family, so no value type parameter is needed.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type(ArrayType), constant(Array), dispatch(batching, differentiation, transposition))]
-    pub(crate) enum TestArrayOperation {
+    pub(crate) enum TestFixtureOperation {
         Constant(ConstantOperation<Array>),
         Zero(ZeroOperation<ArrayType>),
         ZeroLike(ZeroLikeOperation<ArrayType>),
@@ -337,9 +344,7 @@ pub(crate) mod tests {
         Select(SelectOperation<ArrayType>),
         Condition(ConditionOperation<ArrayType>),
         StopGradient(StopGradientOperation<ArrayType>),
-        LinearCall(LinearCallOperation<ArrayType>),
-        Composite(CompositeOperation<Array, TestArrayOperation>),
-        CompositeTranspose(CompositeTransposeOperation<Array, TestArrayOperation>),
+        CompositeTranspose(CompositeTransposeOperation<Array, TestFixtureOperation>),
         CustomCube(CustomCubeOperation),
         CustomWeightedCube(CustomWeightedCubeOperation),
         RuleMarker(RuleMarkerOperation),
@@ -349,7 +354,7 @@ pub(crate) mod tests {
     // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation
     // and the `reference_freeze` transpose name its transform type to select the reference cotangent accumulation,
     // which resolves to the reference-free `reference_add_update` provider.
-    impl ReferenceAccessOperation for TestArrayOperation {
+    impl ReferenceAccessOperation for TestFixtureOperation {
         type Transform = NoReferenceTransform<NoReferent, ArrayType>;
 
         fn base_input_count(&self) -> usize {
@@ -372,18 +377,18 @@ pub(crate) mod tests {
         }
     }
 
-    impl OperationProvider<ArrayType, ParallelVaryOperation> for TestArrayOperation {
+    impl OperationProvider<ArrayType, ParallelVaryOperation> for TestFixtureOperation {
         type Operation = Self;
 
         fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
             check_count!("input", input_types, 1, ProgramError);
             Err(ProgramError::UnsupportedOperation {
-                message: "test array operation family cannot align manual variation".to_string(),
+                message: "test fixture operation family cannot align manual variation".to_string(),
             })
         }
     }
 
-    /// Eager array context with only the operations required by ordinary core protocol tests.
+    /// Eager array context over the ordinary array operation family of core protocol tests.
     pub(crate) type TestArrayContext = EagerContext<Array, TestArrayOperation>;
 
     /// Staging context for the same ordinary array family, used to replay residual programs into an outer trace.

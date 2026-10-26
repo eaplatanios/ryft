@@ -296,6 +296,7 @@ mod tests {
     };
     use crate::tests::{
         TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
+        TestFixtureOperation,
     };
     use crate::tracing::TracingContext;
 
@@ -1934,7 +1935,7 @@ mod tests {
         // evaluating a program with a mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
         let first = builder.add_input(vector_type.clone());
         builder.add_input(vector_type.clone());
         let program = builder
