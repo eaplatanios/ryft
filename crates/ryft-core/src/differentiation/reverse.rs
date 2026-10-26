@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{
     DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer, Pushforward, linearize_for_rule,
 };
@@ -3850,7 +3850,6 @@ pub trait ReverseModeDifferentiate:
         Type: ReferenceMemberType,
         Operation: PartiallyEvaluatableOperation<Self>
                        + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                       + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
                        + ReferenceAccessOperation<
@@ -3869,6 +3868,13 @@ pub trait ReverseModeDifferentiate:
             Operation = Self::Operation,
         > + OperationProvider<Self::Type, AddOperation<Self::Type>, Operation = Self::Operation>,
     >
+where
+    // Stated on the partial-evaluation context's own operation projection rather than on `Self::Operation`: both
+    // name the same type, but a bound on `Self::Operation` would elaborate to a second `Operation<Type = ..>`
+    // equality for it (next to the one `TransposableOperation` supplies) with a different right-hand side, which the
+    // current trait solver reports as ambiguous (E0284). As a trait `where` clause this is not implied for users,
+    // so generic code bounded by this trait restates it.
+    <PartialEvaluationContext<Self> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<Self>>,
 {
     /// Reverse-mode-differentiates `function` at `primal`, returning the primal output and a reusable [`Pullback`],
     /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of
@@ -3963,7 +3969,10 @@ fn vjp_erased<
     ) -> Result<Output, ProgramError>,
     primal: Input,
     capture: Capture,
-) -> Result<(Output::To<C::Value>, Pullback<C, Input, Output::To<C::Value>>), DifferentiationError> {
+) -> Result<(Output::To<C::Value>, Pullback<C, Input, Output::To<C::Value>>), DifferentiationError>
+where
+    <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+{
     // Retain, as zero sources, only the non-reference primal leaves whose structural zero cotangents cannot be
     // constructed from their types alone. Linearization consumes `primal`, so the sources are selected first.
     let input_structure = primal.parameter_structure();
@@ -4037,6 +4046,7 @@ where
         > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
 {
     let destinations = gradient_destinations(context, &primals)?;
     let (output, pullback) = context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
@@ -4076,13 +4086,14 @@ where
             ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
             Operation = C::Operation,
         > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>): Parameterized<
             LinearizationTracer<C>,
             To<C::Value> = (C::Value, AuxiliaryOutput),
             Family: ParameterizedFamily<C::Value>,
         >,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
 {
     let destinations = gradient_destinations(context, &primals)?;
     let ((output, auxiliary), pullback): ((C::Value, AuxiliaryOutput), _) =

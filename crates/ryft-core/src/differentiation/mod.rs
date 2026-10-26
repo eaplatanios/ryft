@@ -159,7 +159,7 @@ use std::fmt::{Debug, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
@@ -1024,6 +1024,7 @@ impl<Input, ContextState>
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1080,6 +1081,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1123,6 +1125,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -1393,12 +1396,13 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 To<V> = AuxiliaryOutput,
                 Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
             >,
-        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
-            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1446,12 +1450,13 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 To<V> = AuxiliaryOutput,
                 Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
             >,
-        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
-            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
@@ -1779,6 +1784,7 @@ impl<Input, Capture, ContextState>
         ) -> Result<Output, ProgramError>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         let context = self.context.resolve(&self.primal)?;
         context.vjp(function, self.primal, self.capture.0)
@@ -1821,6 +1827,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         value_and_gradient_in_context(
             &self.context.resolve(&self.primal)?,
@@ -1863,6 +1870,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -2127,12 +2135,13 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
             >,
         Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
-        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
-            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         value_and_gradient_auxiliary_in_context(
             &self.context.resolve(&self.primal)?,
@@ -2181,12 +2190,13 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
             >,
         Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
-        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
-            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }

@@ -1324,9 +1324,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
-//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
-//  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
 /// Represents [`Operation`]s that support Jacobian-Vector Products (JVPs), with a separately overridable rule for
 /// constructing derivatives intended for transposition. Reading an operation as a function `y = f(x₁, …, xₙ)` from its
 /// inputs to its outputs, the [`jvp`](Self::jvp) function propagates [`DifferentiationDual`]s through it. Each input
@@ -1362,13 +1359,13 @@ where
 ///     bounds at its construction site. Output-level semantic queries such as [`Operation::is_zero`] are forwarded by
 ///     the base operation dispatcher and therefore introduce no additional witness bounds.
 ///
-/// The super-trait is plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
-/// cannot discharge that projection equality at implementation heads whose differentiation context is itself built
-/// from `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a
-/// payload whose [`Operation::Type`] disagrees with `C::Type` cannot be differentiated in `C`: the requirement is
-/// restated by the derived dispatcher's per-payload predicates and by the family-level dispatchers, and any mismatched
-/// payload is rejected with a type-mismatch error at its use site.
-pub trait DifferentiableOperation<C: Context>: Operation {
+/// The super-trait is `Operation<Type = C::Type>`, so a payload whose [`Operation::Type`] disagrees with `C::Type`
+/// cannot implement the rule for `C`, and every `O: DifferentiableOperation<C>` bound elaborates to that equality
+/// without restating it. Generic code whose context is itself built from the operation states the context's domain
+/// as an assumption (naming all of its associated types) rather than restating the operation's type. Refer to the
+/// type compatibility notes of [`InterpretableOperation`](crate::InterpretableOperation) for the trait solver
+/// limitations behind that rule.
+pub trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
     /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
     /// `(y, ẏ) = (f(x), Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ)` where `f` is the function this operation computes. The returned vector
     /// must be aligned with this operation's outputs, each element pairing a primal output value with its tangent, both
@@ -1392,9 +1389,7 @@ pub trait DifferentiableOperation<C: Context>: Operation {
         context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        Self: Operation<Type = C::Type>;
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 
     /// Applies this operation's derivative rule for subsequent transposition during reverse-mode differentiation.
     /// Like [`Self::jvp`], this function maps input duals to output duals, with primal and tangent operations bound
@@ -1443,10 +1438,7 @@ pub trait DifferentiableOperation<C: Context>: Operation {
         context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        Self: Operation<Type = C::Type>,
-    {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         self.jvp(context, driver, inputs)
     }
 }

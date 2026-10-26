@@ -4338,10 +4338,14 @@ mod tests {
     where
         C: Context<Type: DifferentiableType>,
         C::Operation: DifferentiableOperation<C>
-            + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-            + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        // The nested context rules are stated on each context's own operation projection so that only one
+        // `Operation<Type = ..>` equality elaborates for `C::Operation` (refer to `ReverseModeDifferentiate`).
+        <TracingContext<C::Constant, C::Operation> as Domain>::Operation:
+            DifferentiableOperation<TracingContext<C::Constant, C::Operation>>,
+        <PartialEvaluationContext<TracingContext<C::Constant, C::Operation>> as Domain>::Operation:
+            DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>,
     {
         fn jvp_program(
             &self,

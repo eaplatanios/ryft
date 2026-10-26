@@ -2496,6 +2496,14 @@ fn test_downstream_reference_operation_providers_support_value_only_array_ir_fam
                 Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
                 Operation = ValueOnlyOperation,
             >,
+        // The member's projected context is built from this family, so its domain is stated as an assumption (with
+        // all of its associated types) rather than recovered through the family's own projection impls.
+        ProjectedContext<C, ArrayType>: Domain<
+                Type = ArrayType,
+                Value = <C::Value as ValueProjection<ArrayType>>::Projected,
+                Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
+                Operation = ValueOnlyArrayOperation,
+            >,
         Self: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
     {
         fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(

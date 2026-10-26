@@ -128,8 +128,8 @@ struct OperationEnum {
     /// Program-shaped generics after reducing payload-specific value parameters to the program constant space.
     program_generics: syn::Generics,
 
-    /// Program-shaped generics for the interpretation, batching, and discharge dispatchers, without the per-payload
-    /// `Operation` predicates that their rule predicates imply through the rule traits' super-traits.
+    /// Program-shaped generics for the interpretation, batching, discharge, and differentiation dispatchers, without
+    /// the per-payload `Operation` predicates that their rule predicates imply through the rule traits' super-traits.
     dispatcher_generics: syn::Generics,
 
     /// Program-shaped enum self type after reducing payload-specific value parameters to the program constant space.
@@ -482,9 +482,9 @@ impl OperationParser {
             .map(|parameter| program_value_substitutions(&value_type_parameters, parameter))
             .unwrap_or_default();
         let program_self_type = substitute_type_idents(&self_type, &program_value_substitutions);
-        // The interpretation, batching, and discharge rule traits carry `Operation<Type = C::Type>` as their
-        // super-trait, so those dispatchers' per-payload rule predicates already imply the payload `Operation`
-        // predicates and do not restate them.
+        // The interpretation, batching, discharge, and differentiation rule traits carry `Operation<Type = C::Type>`
+        // as their super-trait, so those dispatchers' per-payload rule predicates already imply the payload
+        // `Operation` predicates and do not restate them.
         let dispatcher_generics = substitute_generics(
             &operation_generics(&generics, &variants, &self.ryft_crate, &operation_type, false),
             &program_value_substitutions,
@@ -1739,7 +1739,7 @@ impl OperationEnum {
         let primary_type = &self.operation_type;
         let program_constant_type = &self.program_constant_type;
         let differentiation_self_type = &self.program_self_type;
-        let mut differentiation_generics = self.program_generics.clone();
+        let mut differentiation_generics = self.dispatcher_generics.clone();
         differentiation_generics.params.push(syn::parse_quote!(__DifferentiationContext));
         let where_clause = differentiation_generics.make_where_clause();
         where_clause.predicates.push(syn::parse_quote! {
