@@ -44,7 +44,7 @@ macro_rules! check_count {
 
 /// Checks types against a structural or semantic type contract. All forms use an `@` selector and return
 /// [`TypeError`](crate::TypeError)s as appropriate, converted into the enclosing function's error type, when the
-/// selected contract is not satisfied. Data-type selectors compose by intersection when written next to one another.
+/// selected contract is not satisfied. Data type selectors compose by intersection when written next to one another.
 /// For example, `@numeric @real` accepts real numeric types, while `@float @real` accepts real floating-point types.
 /// The available selectors are:
 ///
@@ -132,7 +132,7 @@ macro_rules! check_types {
         }
     }};
 
-    // This branch applies one or more composable data-type predicates to every input type.
+    // This branch applies one or more composable data type predicates to every input type.
     ($(@$selector:ident)+, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -144,7 +144,7 @@ macro_rules! check_types {
         }
     }};
 
-    // This internal helper terminates a composed data-type contract after every predicate has accepted the candidate.
+    // This internal helper terminates a composed data type contract after every predicate has accepted the candidate.
     // It supplies the `true` identity needed to combine an arbitrary number of selectors with logical conjunction.
     (@matches_data_type $input_type:ident;) => {
         true
@@ -706,7 +706,7 @@ macro_rules! define_arithmetic_dimension_capability {
 /// );
 /// ```
 ///
-/// An operation whose result element type differs from its input can provide a data-type inference closure. The
+/// An operation whose result element type differs from its input can provide a data type inference closure. The
 /// generated array inference broadcasts the array structure and applies that same closure to its element data types.
 /// Named functions remain supported because function paths are expressions. Operations with genuinely custom array
 /// metadata semantics can additionally provide `infer_array_types`:
@@ -745,12 +745,12 @@ macro_rules! define_arithmetic_dimension_capability {
 ///   - `infer_data_types`: Optional callable expression with signature `Fn(&[DataType]) -> Result<Vec<DataType>,
 ///     TypeError>`. It receives the operation's validated input data types and returns its single output data type.
 ///     Both closures and function paths are accepted. When omitted, unary operations preserve their input data type
-///     and binary operations use ordinary data-type broadcasting.
+///     and binary operations use ordinary data type broadcasting.
 ///   - `infer_array_types`: Optional callable expression with signature `Fn(&[ArrayType]) -> Result<Vec<ArrayType>,
 ///     TypeError>`. It receives the validated input array types and returns the single output array type. Both closures
 ///     and function paths are accepted. When omitted, the macro broadcasts the input array structure and applies
 ///     `infer_data_types` to the input element data types.
-///   - `check_data_types = [@selector ..., ...]`: Optional ordered list of [`check_types!`] data-type contracts applied
+///   - `check_data_types = [@selector ..., ...]`: Optional ordered list of [`check_types!`] data type contracts applied
 ///     to scalar input types and array element types before type inference. Space-separated selectors compose one
 ///     contract, while commas separate independently checked contracts.
 ///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to array
@@ -1115,7 +1115,7 @@ macro_rules! define_elementwise_operation {
         }
     };
 
-    // This internal branch invokes caller-provided data-type inference for either operation arity.
+    // This internal branch invokes caller-provided data type inference for either operation arity.
     (@infer_data_types [$infer_data_types:expr] @$arity:ident $input_types:expr $(, $name:ident)? $(,)?) => {
         ($infer_data_types)($input_types)
     };
@@ -1132,7 +1132,7 @@ macro_rules! define_elementwise_operation {
             .map_err(|_| $crate::TypeError::invalid(format!("`{}` input types are not broadcast-compatible", $name)))
     };
 
-    // This internal branch invokes caller-provided array-type inference instead of structural lifting.
+    // This internal branch invokes caller-provided array type inference instead of structural lifting.
     (
         @infer_array_types [$infer_array_types:expr] [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr $(, $name:ident)? $(,)?
@@ -4043,19 +4043,19 @@ macro_rules! impl_parameterwise_operator {
     };
 }
 
-/// Checks exact type-inference behavior for a concrete, regionless [`Operation`](crate::Operation). Each ordinary case
+/// Checks exact type inference behavior for a concrete, regionless [`Operation`](crate::Operation). Each ordinary case
 /// declares `input_types` and either the expected `output_types` or exact [`TypeError`](crate::TypeError) message.
 /// Cases are expanded independently, so one invocation may cover different [`Type`](crate::Type) families such as
 /// [`DataType`](crate::DataType) and [`ArrayType`](crate::ArrayType). A case whose input and output types do not
 /// identify the family, most commonly an empty-input error case, may declare it explicitly with `type = ...`. The
-/// `@elementwise @unary` and `@elementwise @binary` selectors check an elementwise operation's data-type inference
+/// `@elementwise @unary` and `@elementwise @binary` selectors check an elementwise operation's data type inference
 /// together with its lifting to representative, metadata-bearing [`ArrayType`](crate::ArrayType)s. Their successful
 /// cases declare input element data types and the expected output element data type; rejected cases declare the exact
-/// data-type inference diagnostic. The macro also provides selectors for shared sharding rejection contracts whose
+/// data type inference diagnostic. The macro also provides selectors for shared sharding rejection contracts whose
 /// generated mesh fixtures would otherwise obscure the behavior under test:
 ///
-///   - `@elementwise @unary`: Checks unary element-type inference and successful array-type lifting.
-///   - `@elementwise @binary`: Checks binary element-type inference and successful array-type lifting.
+///   - `@elementwise @unary`: Checks unary element type inference and successful array type lifting.
+///   - `@elementwise @binary`: Checks binary element type inference and successful array type lifting.
 ///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
 ///   - `@reject @mismatched_reduced`: Checks both input orders for a binary operation whose inputs must carry the same
 ///     reduced-axis markers.
@@ -4101,11 +4101,11 @@ macro_rules! impl_parameterwise_operator {
 ///
 /// # Parameters
 ///
-///   - `$selector`: Optional generated type-inference contract: `@elementwise @unary`, `@elementwise @binary`,
+///   - `$selector`: Optional generated type inference contract: `@elementwise @unary`, `@elementwise @binary`,
 ///     `@reject @unreduced`, or `@reject @mismatched_reduced`.
 ///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
-///   - `cases = $cases`: Type-inference test cases. Ordinary cases use `input_types` and either `output_types` or
-///     `error`; elementwise cases use the corresponding element-data-type fields documented below.
+///   - `cases = $cases`: Type inference test cases. Ordinary cases use `input_types` and either `output_types` or
+///     `error`; elementwise cases use the corresponding element data type fields documented below.
 ///   - `type = $type`: Optional explicit [`Type`](crate::Type) family for a case whose other expressions cannot
 ///     determine the operation implementation.
 ///   - `input_types = $input_types`: Input types used by one ordinary case or by the selected generated rejection
@@ -4118,8 +4118,8 @@ macro_rules! impl_parameterwise_operator {
 ///     case, in result order.
 #[macro_export]
 macro_rules! check_operation_type_inference {
-    // This branch checks unary element-type cases and lifts every successful case through a representative array type.
-    // It leaves rejected cases in the data-type universe because custom array inference may own a more specific error.
+    // This branch checks unary element type cases and lifts every successful case through a representative array type.
+    // It leaves rejected cases in the data type universe because custom array inference may own a more specific error.
     (
         @elementwise @unary,
         operation = $operation:ident,
@@ -4131,7 +4131,7 @@ macro_rules! check_operation_type_inference {
         );)+
     }};
 
-    // This branch checks binary element-type cases and lifts every successful case through matching representative
+    // This branch checks binary element type cases and lifts every successful case through matching representative
     // array structures. Using matching structures keeps the contract valid for elementwise operations that deliberately
     // impose stricter array relationships than ordinary broadcasting.
     (
@@ -4145,7 +4145,7 @@ macro_rules! check_operation_type_inference {
         );)+
     }};
 
-    // This branch checks one or more exact regionless type-inference cases. It evaluates the operation once and
+    // This branch checks one or more exact regionless type inference cases. It evaluates the operation once and
     // delegates each heterogeneous success or error case to an internal assertion branch.
     (
         operation = $operation:expr,
@@ -4161,31 +4161,9 @@ macro_rules! check_operation_type_inference {
         @reject @unreduced,
         operation = $operation:expr,
         input_types = [$($input_type:expr),+ $(,)?] $(,)?
-    ) => {{
-        let operation = $operation;
-        let descriptor = $crate::programs::operations::Operation::name(&operation);
-        let mesh = $crate::arrays::sharding::LogicalMesh::new(vec![
-            $crate::arrays::sharding::MeshAxis::new("x", 2, $crate::arrays::sharding::MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let input_types = vec![$($input_type),+]
-            .into_iter()
-            .map(|input_type| {
-                let dimensions = vec![$crate::arrays::sharding::ShardingDimension::Replicated; input_type.rank()];
-                let sharding = $crate::arrays::sharding::Sharding::new(mesh.clone(), dimensions)
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap();
-                input_type.with_sharding(sharding).unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(&operation, input_types.as_slice(), &[]),
-            Err($crate::programs::types::TypeError::invalid(format!(
-                "`{descriptor}` does not support unreduced inputs",
-            ))),
-        );
-    }};
+    ) => {
+        $crate::macros::checks::check_unreduced_input_rejection(&$operation, vec![$($input_type),+])
+    };
 
     // This branch generates both input orderings with mismatched reduced-axis markers and checks that a binary
     // operation rejects each ordering with the same diagnostic.
@@ -4193,49 +4171,9 @@ macro_rules! check_operation_type_inference {
         @reject @mismatched_reduced,
         operation = $operation:expr,
         input_types = [$left_type:expr, $right_type:expr $(,)?] $(,)?
-    ) => {{
-        let operation = $operation;
-        let descriptor = $crate::programs::operations::Operation::name(&operation);
-        let mesh = $crate::arrays::sharding::LogicalMesh::new(vec![
-            $crate::arrays::sharding::MeshAxis::new("x", 2, $crate::arrays::sharding::MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let plain = |input_type: $crate::arrays::ArrayType| {
-            let dimensions = vec![$crate::arrays::sharding::ShardingDimension::Replicated; input_type.rank()];
-            input_type
-                .with_sharding($crate::arrays::sharding::Sharding::new(mesh.clone(), dimensions).unwrap())
-                .unwrap()
-        };
-        let left = plain($left_type);
-        let right = plain($right_type);
-        let reduced_left = left
-            .clone()
-            .with_sharding(left.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
-            .unwrap();
-        let reduced_right = right
-            .clone()
-            .with_sharding(right.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
-            .unwrap();
-        let expected = Err($crate::programs::types::TypeError::invalid(format!(
-            "`{descriptor}` inputs must be reduced over the same axes",
-        )));
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &operation,
-                &[reduced_left, right.clone()],
-                &[],
-            ),
-            expected.clone(),
-        );
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &operation,
-                &[left, reduced_right],
-                &[],
-            ),
-            expected,
-        );
-    }};
+    ) => {
+        $crate::macros::checks::check_mismatched_reduced_input_rejection(&$operation, $left_type, $right_type)
+    };
 
     // This internal branch checks a successful explicitly typed case. The type annotation disambiguates applications
     // with no input or output expressions from which Rust could infer the operation's `Type` family.
@@ -4246,19 +4184,11 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             output_types = [$($output_type:expr),* $(,)?] $(,)?
         }
-    ) => {{
-        let input_types = [$($input_type),*];
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &$operation,
-                input_types.as_slice(),
-                &[],
-            ),
-            Ok(vec![$($output_type),*]),
-        );
-    }};
+    ) => {
+        $crate::macros::checks::check_type_inference(&$operation, &[$($input_type),*], Ok(vec![$($output_type),*]))
+    };
 
-    // This internal branch checks a successful unary element-type case in both the data-type and array-type universes.
+    // This internal branch checks a successful unary element type case in both the data type and array type universes.
     // The array fixture carries shape, layout, and memory metadata so the assertion also verifies structural lifting.
     (
         @elementwise_unary_case $data_operation:ident, $operation:ident,
@@ -4266,41 +4196,16 @@ macro_rules! check_operation_type_inference {
             input_data_types = [$input_data_type:expr $(,)?],
             output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
         }
-    ) => {{
-        let array_operation = $operation::<$crate::arrays::ArrayType>::new();
-        let input_data_type = $input_data_type;
-        let output_data_types: ::std::vec::Vec<$crate::arrays::DataType> = ::std::vec![$($output_data_type),*];
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &$data_operation,
-                &[input_data_type],
-                &[],
-            ),
-            Ok(output_data_types.clone()),
-        );
-        let input_type = $crate::arrays::ArrayType::new(
-            input_data_type,
-            $crate::arrays::Shape::new(vec![
-                $crate::arrays::Dimension::Static(2),
-                $crate::arrays::Dimension::Static(3),
-            ]),
+    ) => {
+        $crate::macros::checks::check_elementwise_unary_type_inference(
+            &$data_operation,
+            &$operation::<$crate::arrays::ArrayType>::new(),
+            $input_data_type,
+            ::std::vec![$($output_data_type),*],
         )
-        .with_layout($crate::arrays::Layout::Strided($crate::arrays::StridedLayout::new(vec![3, 1])))
-        .with_memory($crate::arrays::Memory::Host { pinned: true });
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &array_operation,
-                ::std::slice::from_ref(&input_type),
-                &[],
-            ),
-            Ok(output_data_types
-                .into_iter()
-                .map(|output_data_type| input_type.clone().with_data_type(output_data_type))
-                .collect::<::std::vec::Vec<_>>()),
-        );
-    }};
+    };
 
-    // This internal branch checks a rejected unary element-type case and compares the exact operation-owned diagnostic.
+    // This internal branch checks a rejected unary element type case and compares the exact operation-owned diagnostic.
     (
         @elementwise_unary_case $data_operation:ident, $operation:ident,
         {
@@ -4314,51 +4219,24 @@ macro_rules! check_operation_type_inference {
         });
     };
 
-    // This internal branch checks a successful binary element-type case in both universes. Matching array structures
-    // isolate element-type lifting from the separately tested shared broadcasting contract.
+    // This internal branch checks a successful binary element type case in both universes. Matching array structures
+    // isolate element type lifting from the separately tested shared broadcasting contract.
     (
         @elementwise_binary_case $data_operation:ident, $operation:ident,
         {
             input_data_types = [$left_data_type:expr, $right_data_type:expr $(,)?],
             output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
         }
-    ) => {{
-        let array_operation = $operation::<$crate::arrays::ArrayType>::new();
-        let left_data_type = $left_data_type;
-        let right_data_type = $right_data_type;
-        let output_data_types: ::std::vec::Vec<$crate::arrays::DataType> = ::std::vec![$($output_data_type),*];
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &$data_operation,
-                &[left_data_type, right_data_type],
-                &[],
-            ),
-            Ok(output_data_types.clone()),
-        );
-        let left_type = $crate::arrays::ArrayType::new(
-            left_data_type,
-            $crate::arrays::Shape::new(vec![
-                $crate::arrays::Dimension::Static(2),
-                $crate::arrays::Dimension::Static(3),
-            ]),
+    ) => {
+        $crate::macros::checks::check_elementwise_binary_type_inference(
+            &$data_operation,
+            &$operation::<$crate::arrays::ArrayType>::new(),
+            [$left_data_type, $right_data_type],
+            ::std::vec![$($output_data_type),*],
         )
-        .with_layout($crate::arrays::Layout::Strided($crate::arrays::StridedLayout::new(vec![3, 1])))
-        .with_memory($crate::arrays::Memory::Host { pinned: true });
-        let right_type = left_type.clone().with_data_type(right_data_type);
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &array_operation,
-                &[left_type.clone(), right_type],
-                &[],
-            ),
-            Ok(output_data_types
-                .into_iter()
-                .map(|output_data_type| left_type.clone().with_data_type(output_data_type))
-                .collect::<::std::vec::Vec<_>>()),
-        );
-    }};
+    };
 
-    // This internal branch checks a rejected binary element-type case and compares the exact operation-owned diagnostic.
+    // This internal branch checks a rejected binary element type case and compares the exact operation-owned diagnostic.
     (
         @elementwise_binary_case $data_operation:ident, $operation:ident,
         {
@@ -4381,19 +4259,15 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             error = $message:expr $(,)?
         }
-    ) => {{
-        let input_types = [$($input_type),*];
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &$operation,
-                input_types.as_slice(),
-                &[],
-            ),
+    ) => {
+        $crate::macros::checks::check_type_inference(
+            &$operation,
+            &[$($input_type),*],
             Err($crate::programs::types::TypeError::invalid(
                 ::core::convert::Into::<::std::string::String>::into($message),
             )),
-        );
-    }};
+        )
+    };
 
     // This internal branch checks a successful ordinary case by inferring with no attached regions and comparing the
     // complete ordered output-type vector. Keeping success separate lets callers use natural `output_types` syntax.
@@ -4403,17 +4277,9 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             output_types = [$($output_type:expr),* $(,)?] $(,)?
         }
-    ) => {{
-        let input_types = [$($input_type),*];
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &$operation,
-                input_types.as_slice(),
-                &[],
-            ),
-            Ok(vec![$($output_type),*]),
-        );
-    }};
+    ) => {
+        $crate::macros::checks::check_type_inference(&$operation, &[$($input_type),*], Ok(vec![$($output_type),*]))
+    };
 
     // This internal branch checks a rejected ordinary case against its complete `TypeError` message. It is distinct
     // from the success branch so diagnostics remain exact without making callers construct the error wrapper.
@@ -4423,19 +4289,15 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             error = $message:expr $(,)?
         }
-    ) => {{
-        let input_types = [$($input_type),*];
-        assert_eq!(
-            $crate::programs::operations::Operation::infer_output_types(
-                &$operation,
-                input_types.as_slice(),
-                &[],
-            ),
+    ) => {
+        $crate::macros::checks::check_type_inference(
+            &$operation,
+            &[$($input_type),*],
             Err($crate::programs::types::TypeError::invalid(
                 ::core::convert::Into::<::std::string::String>::into($message),
             )),
-        );
-    }};
+        )
+    };
 }
 
 /// Checks how a concrete [`Operation`](crate::Operation) behaves under partial evaluation. The concise `inputs`
@@ -4497,79 +4359,13 @@ macro_rules! check_operation_partial_evaluation {
         operation = $operation:expr,
         inputs = [$($input:expr),+ $(,)?],
         expected = $expected:expr $(,)?
-    ) => {{
-        let operation = $operation;
-        let inputs: Vec<$crate::Array> = vec![$($input),+];
-        let expected: $crate::Array = $expected;
-        let mut builder = $crate::programs::builders::ProgramBuilder::<
-            $crate::Array,
-            $crate::ArrayOperation<$crate::Array>,
-        >::new();
-        let input_ids = inputs
-            .iter()
-            .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
-            .collect::<Vec<_>>();
-        let operation: $crate::ArrayOperation<$crate::Array> =
-            ::core::convert::Into::into(operation);
-        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
-        assert_eq!(output_ids.len(), 1);
-        let program = builder
-            .build::<
-                Vec<$crate::Array>,
-                Vec<$crate::Array>,
-            >(
-                output_ids,
-                vec![$crate::parameters::Placeholder; inputs.len()],
-                vec![$crate::parameters::Placeholder],
-            )
-            .unwrap();
-        let context = $crate::contexts::EagerContext::<
-            $crate::Array,
-            $crate::ArrayOperation<$crate::Array>,
-        >::new();
-
-        let known = inputs
-            .iter()
-            .cloned()
-            .map($crate::partial::PartialValue::Known)
-            .collect::<Vec<_>>();
-        let evaluation = program.partially_evaluate(known.as_slice()).unwrap();
-        assert!(evaluation.program().instructions().is_empty());
-        assert_eq!(evaluation.outputs().len(), 1);
-        assert!(evaluation.outputs()[0].is_known());
-        assert_eq!(evaluation.interpret(&context, &[]).unwrap(), vec![expected.clone()]);
-
-        for unknown_index in 0..inputs.len() {
-            let mut knowledge = known.clone();
-            knowledge[unknown_index] = $crate::partial::PartialValue::Unknown(
-                $crate::programs::types::Typed::r#type(&inputs[unknown_index]).into_owned(),
-            );
-            let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-            assert_eq!(evaluation.program().instructions().len(), 1);
-            assert_eq!(evaluation.outputs().len(), 1);
-            assert!(evaluation.outputs()[0].is_unknown());
-            assert_eq!(
-                evaluation.interpret(&context, &[inputs[unknown_index].clone()]).unwrap(),
-                vec![expected.clone()],
-            );
-        }
-
-        if inputs.len() > 1 {
-            let unknown = inputs
-                .iter()
-                .map(|input| {
-                    $crate::partial::PartialValue::Unknown(
-                        $crate::programs::types::Typed::r#type(input).into_owned(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let evaluation = program.partially_evaluate(unknown.as_slice()).unwrap();
-            assert_eq!(evaluation.program().instructions().len(), 1);
-            assert_eq!(evaluation.outputs().len(), 1);
-            assert!(evaluation.outputs()[0].is_unknown());
-            assert_eq!(evaluation.interpret(&context, inputs.as_slice()).unwrap(), vec![expected]);
-        }
-    }};
+    ) => {
+        $crate::macros::checks::check_default_partial_evaluation(
+            ::core::convert::Into::into($operation),
+            vec![$($input),+],
+            $expected,
+        )
+    };
 
     // This branch forwards explicit cases to the array reference backend form.
     (
@@ -4600,53 +4396,14 @@ macro_rules! check_operation_partial_evaluation {
             ),* $(,)?
         ] $(,)?
     ) => {{
-        let operation = $operation;
+        let operation: $operation_family = ::core::convert::Into::into($operation);
         $(
-        {
-            let inputs: Vec<($crate::partial::PartialValue<$value>, Option<$value>)> =
-                vec![$($crate::check_operation_partial_evaluation!(@partial_input $value, $input)),*];
-            let expected_outputs: Vec<(bool, $value)> =
-                vec![$($crate::check_operation_partial_evaluation!(@partial_output $output)),*];
-            let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
-            let input_ids = inputs
-                .iter()
-                .map(|(input, _)| {
-                    builder.add_input($crate::programs::types::Typed::r#type(input).into_owned())
-                })
-                .collect::<Vec<_>>();
-            let operation: $operation_family = ::core::convert::Into::into(operation.clone());
-            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
-            let output_count = output_ids.len();
-            let program = builder
-                .build::<Vec<$value>, Vec<$value>>(
-                    output_ids,
-                    vec![$crate::parameters::Placeholder; inputs.len()],
-                    vec![$crate::parameters::Placeholder; output_count],
-                )
-                .unwrap();
-            let knowledge = inputs.iter().map(|(input, _)| input.clone()).collect::<Vec<_>>();
-            let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-            assert_eq!(evaluation.program().instructions().len(), $instruction_count);
-            assert_eq!(evaluation.outputs().len(), expected_outputs.len());
-            for (actual, (expected_known, _)) in evaluation.outputs().iter().zip(expected_outputs.iter()) {
-                assert_eq!(actual.is_known(), *expected_known);
-            }
-            let unknown_inputs = inputs
-                .into_iter()
-                .filter_map(|(_, replay)| replay)
-                .collect::<Vec<_>>();
-            let actual_outputs = evaluation
-                .interpret(
-                    &$crate::contexts::EagerContext::<$value, $operation_family>::new(),
-                    unknown_inputs.as_slice(),
-                )
-                .unwrap();
-            let expected_outputs = expected_outputs
-                .into_iter()
-                .map(|(_, value)| value)
-                .collect::<Vec<_>>();
-            assert_eq!(actual_outputs, expected_outputs);
-        }
+            $crate::macros::checks::check_partial_evaluation::<_, $value, $operation_family>(
+                &operation,
+                vec![$($crate::check_operation_partial_evaluation!(@partial_input $value, $input)),*],
+                vec![$($crate::check_operation_partial_evaluation!(@partial_output $output)),*],
+                $instruction_count,
+            );
         )*
     }};
 
@@ -4830,15 +4587,14 @@ macro_rules! check_operation_batching {
             $crate::batching::BatchingContext::<_, $crate::ArrayBatchingPolicy>::new($context, axis_size)
             .with_axis_sharding(axis_sharding);
         $(
-            let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
-            let expected_outputs = vec![$($crate::check_operation_batching!(@batch_value $output)),*];
-            let actual_outputs = $crate::batching::BatchableOperation::batch(
+            $crate::macros::checks::check_batching(
                 &operation,
                 &context,
                 driver,
-                inputs.as_slice(),
-            ).unwrap();
-            $crate::check_operation_batching!(@compare_batches $comparison, actual_outputs, expected_outputs);
+                vec![$($crate::check_operation_batching!(@batch_value $input)),*],
+                vec![$($crate::check_operation_batching!(@batch_value $output)),*],
+                &$crate::check_operation_batching!(@comparison $comparison),
+            );
         )*
     }};
 
@@ -4853,41 +4609,15 @@ macro_rules! check_operation_batching {
         $crate::ArrayBatch::replicated($value)
     };
 
-    // This internal branch compares complete batched values exactly.
-    (@compare_batches (@exact), $actual:expr, $expected:expr) => {{
-        assert_eq!($actual, $expected);
-    }};
+    // This internal branch selects exact comparison of complete batched values.
+    (@comparison (@exact)) => {
+        $crate::macros::checks::Exact
+    };
 
-    // This internal branch compares batch metadata exactly and numerical payloads within the requested tolerance.
-    (@compare_batches (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {{
-        let actual = $actual;
-        let expected = $expected;
-        let epsilon: f64 = $epsilon;
-        assert_eq!(actual.len(), expected.len());
-        for (output_index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                $crate::programs::types::Typed::r#type(actual),
-                $crate::programs::types::Typed::r#type(expected),
-                "batching output {output_index} has the wrong type",
-            );
-            assert_eq!(
-                actual.batch_axis(),
-                expected.batch_axis(),
-                "batching output {output_index} has the wrong batch axis",
-            );
-            let actual_values = actual.value().to_f64s();
-            let expected_values = expected.value().to_f64s();
-            assert_eq!(actual_values.len(), expected_values.len());
-            for (value_index, (actual, expected)) in
-                actual_values.iter().zip(expected_values.iter()).enumerate()
-            {
-                assert!(
-                    (actual - expected).abs() <= epsilon,
-                    "batching output {output_index} value {value_index} differs: {actual} vs {expected}",
-                );
-            }
-        }
-    }};
+    // This internal branch selects exact comparison of batch metadata and approximate comparison of numerical payloads.
+    (@comparison (@approx($epsilon:expr))) => {
+        $crate::macros::checks::Approximate { epsilon: $epsilon }
+    };
 }
 
 /// Checks how a concrete [`Operation`](crate::Operation) behaves under forward-mode differentiation. Each
@@ -4968,118 +4698,35 @@ macro_rules! check_operation_differentiation {
                 }
             ),+ $(,)?
         ] $(,)?) => {{
-        let operation = $operation;
+        let operation: $operation_family = ::core::convert::Into::into($operation);
         let step: f64 = $step;
         let epsilon: f64 = $epsilon;
-        assert!(step > 0.0, "finite-difference step must be positive");
-        assert!(epsilon >= 0.0, "comparison epsilon must be non-negative");
+        $crate::macros::checks::check_finite_difference_configuration(step, epsilon);
         $(
-        {
-            // Convert each fixture into the selected backend's value family. Every primal input and output must
-            // have a corresponding tangent so both differentiation paths can use the same expected results.
-            let primals: Vec<$value> = vec![$(::core::convert::Into::into($primal)),+];
-            let tangents: Vec<$value> = vec![$(::core::convert::Into::into($tangent)),+];
-            assert_eq!(primals.len(), tangents.len(), "primal and tangent input counts differ");
-            let expected_primals: Vec<$value> = vec![$(::core::convert::Into::into($primal_output)),+];
-            let expected_tangents: Vec<$value> = vec![$(::core::convert::Into::into($tangent_output)),+];
-            assert_eq!(
-                expected_primals.len(),
-                expected_tangents.len(),
-                "primal and tangent output counts differ",
+            $crate::macros::checks::check_differentiation::<_, $value, $operation_family>(
+                &operation,
+                step,
+                epsilon,
+                $crate::macros::checks::DifferentiationCase {
+                    primals: vec![$(::core::convert::Into::into($primal)),+],
+                    tangents: vec![$(::core::convert::Into::into($tangent)),+],
+                    primal_outputs: vec![$(::core::convert::Into::into($primal_output)),+],
+                    tangent_outputs: vec![$(::core::convert::Into::into($tangent_output)),+],
+                    jvp: $crate::check_operation_differentiation!(@rendering $($jvp)?),
+                },
             );
-
-            // Build a single-operation program with input types inferred from the fixture. All operation outputs
-            // become program outputs; the placeholders describe the flat input and output vector structures.
-            let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
-            let input_ids = primals
-                .iter()
-                .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
-                .collect::<Vec<_>>();
-            let operation: $operation_family = ::core::convert::Into::into(operation.clone());
-            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
-            assert_eq!(output_ids.len(), expected_primals.len(), "declared output count is incorrect");
-            let output_count = output_ids.len();
-            let program = builder
-                .build::<Vec<$value>, Vec<$value>>(
-                    output_ids,
-                    vec![$crate::parameters::Placeholder; primals.len()],
-                    vec![$crate::parameters::Placeholder; output_count],
-                )
-                .unwrap();
-
-            // Construct the fused derivative and, when supplied, check its expected symbolic program as well.
-            let jvp = program.jvp().unwrap();
-            $(assert_eq!(jvp.to_string(), $jvp.trim_end());)?
-
-            // The fused JVP takes all primals followed by all tangents and returns outputs in that same grouping.
-            // Check both halves against the fixture before using its tangents in the numerical check below.
-            let jvp_inputs = primals.iter().cloned().chain(tangents.iter().cloned()).collect::<Vec<_>>();
-            let actual = jvp.interpret(jvp_inputs).unwrap();
-            assert_eq!(actual.len(), 2 * output_count);
-            let (actual_primals, actual_tangents) = actual.split_at(output_count);
-            for (actual, expected) in actual_primals.iter().zip(expected_primals.iter()) {
-                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
-            }
-            for (actual, expected) in actual_tangents.iter().zip(expected_tangents.iter()) {
-                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
-            }
-
-            // Linearization exercises separate primal and tangent construction destinations. A rule that omits a
-            // required primal-to-tangent transfer can pass fused execution but fail on this path.
-            let linearization = program.linearize().unwrap();
-
-            // The primal program returns public primal outputs followed by residuals saved for the tangent program.
-            let separated_primals = linearization.primal().interpret(primals.clone()).unwrap();
-            assert_eq!(separated_primals.len(), output_count + linearization.residual_count());
-            for (actual, expected) in separated_primals[..output_count].iter().zip(expected_primals.iter()) {
-                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
-            }
-
-            // Supply input tangents followed by the saved residuals. The tangent program returns only output
-            // tangents, which must agree with the same fixture used for fused execution.
-            let separated_inputs = tangents
-                .iter()
-                .cloned()
-                .chain(separated_primals[output_count..].iter().cloned())
-                .collect();
-            let separated_tangents = linearization.tangent().interpret(separated_inputs).unwrap();
-            assert_eq!(separated_tangents.len(), expected_tangents.len());
-            for (actual, expected) in separated_tangents.iter().zip(expected_tangents.iter()) {
-                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
-            }
-
-            // Perturb every primal along its input tangent in both directions. Evaluating the original program
-            // at these points gives a numerical directional derivative independent of the differentiation rules.
-            let plus_inputs = primals
-                .iter()
-                .cloned()
-                .zip(tangents.iter().cloned())
-                .map(|(primal, tangent)| primal + tangent * step)
-                .collect::<Vec<_>>();
-            let minus_inputs = primals
-                .iter()
-                .cloned()
-                .zip(tangents.iter().cloned())
-                .map(|(primal, tangent)| primal - tangent * step)
-                .collect::<Vec<_>>();
-            let plus_outputs = program.interpret(plus_inputs).unwrap();
-            let minus_outputs = program.interpret(minus_inputs).unwrap();
-            assert_eq!(plus_outputs.len(), output_count);
-            assert_eq!(minus_outputs.len(), output_count);
-
-            // Compare the fused JVP with the central difference (f(x + h*v) - f(x - h*v)) / (2*h).
-            // The separated path has already been checked against the same expected tangent values above.
-            for ((actual, plus), minus) in actual_tangents
-                .iter()
-                .zip(plus_outputs.into_iter())
-                .zip(minus_outputs.into_iter())
-            {
-                let estimate = (plus - minus) * (1.0 / (2.0 * step));
-                ::approx::assert_abs_diff_eq!(actual, &estimate, epsilon = epsilon);
-            }
-        }
         )+
     }};
+
+    // This internal branch records that a case declares no expected JVP program rendering.
+    (@rendering) => {
+        None
+    };
+
+    // This internal branch borrows the expected JVP program rendering declared by a case.
+    (@rendering $rendering:expr) => {
+        Some(::core::convert::AsRef::<str>::as_ref(&$rendering))
+    };
 }
 
 /// Checks how a concrete [`Operation`](crate::Operation) behaves under transposition. Supported cases build a single
@@ -5194,6 +4841,7 @@ macro_rules! check_operation_transposition {
         )
     };
 
+
     // This internal branch builds and executes each pullback, then dispatches the selected cotangent comparison.
     (
         @run $comparison:tt,
@@ -5209,50 +4857,18 @@ macro_rules! check_operation_transposition {
                 }
             ),+ $(,)?
         ] $(,)?) => {{
-        let operation = $operation;
+        let operation: $operation_family = ::core::convert::Into::into($operation);
         $(
-        {
-            let inputs: Vec<(_, bool, Option<$value>)> =
-                vec![$($crate::check_operation_transposition!(@input $value, $input)),+];
-            let linear_indices = inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (_, linear, _))| linear.then_some(index))
-                .collect::<Vec<_>>();
-            assert!(!linear_indices.is_empty(), "a supported transposition case needs at least one linear input");
-            let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
-            let input_ids = inputs
-                .iter()
-                .map(|(r#type, _, _)| builder.add_input(r#type.clone()))
-                .collect::<Vec<_>>();
-            let operation: $operation_family = ::core::convert::Into::into(operation.clone());
-            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
-            let output_count = output_ids.len();
-            let program = builder
-                .build::<Vec<$value>, Vec<$value>>(
-                    output_ids,
-                    vec![$crate::parameters::Placeholder; inputs.len()],
-                    vec![$crate::parameters::Placeholder; output_count],
-                )
-                .unwrap();
-            let pullback = program.transpose_with_respect_to(linear_indices.as_slice(), &[]).unwrap();
-            $(assert_eq!(pullback.to_string(), $pullback.trim_end());)?
-
-            let output_cotangents: Vec<$value> =
-                vec![$(::core::convert::Into::into($output_cotangent)),+];
-            assert_eq!(output_cotangents.len(), output_count, "declared output cotangent count is incorrect");
-            let expected: Vec<$value> = vec![$(::core::convert::Into::into($input_cotangent)),+];
-            assert_eq!(expected.len(), linear_indices.len(), "declared input cotangent count is incorrect");
-            let pullback_inputs = output_cotangents
-                .into_iter()
-                .chain(inputs.into_iter().filter_map(|(_, _, value)| value))
-                .collect::<Vec<_>>();
-            let actual = pullback.interpret(pullback_inputs).unwrap();
-            assert_eq!(actual.len(), expected.len());
-            for (actual, expected) in actual.iter().zip(expected.iter()) {
-                $crate::check_operation_transposition!(@assert $comparison, actual, expected);
-            }
-        }
+            $crate::macros::checks::check_transposition::<_, $value, $operation_family, _>(
+                &operation,
+                $crate::macros::checks::TranspositionCase {
+                    inputs: vec![$($crate::check_operation_transposition!(@input $value, $input)),+],
+                    output_cotangents: vec![$(::core::convert::Into::into($output_cotangent)),+],
+                    input_cotangents: vec![$(::core::convert::Into::into($input_cotangent)),+],
+                    pullback: $crate::check_operation_transposition!(@rendering $($pullback)?),
+                },
+                &$crate::check_operation_transposition!(@comparison $comparison),
+            );
         )+
     }};
 
@@ -5279,33 +4895,12 @@ macro_rules! check_operation_transposition {
         backend = ($value:ty, $operation_family:ty),
         operation = $operation:expr,
         input_types = [$($input_type:expr),+ $(,)?] $(,)?
-    ) => {{
-        let operation: $operation_family = ::core::convert::Into::into($operation);
-        let descriptor = $crate::programs::operations::Operation::name(&operation);
-        let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
-        let input_types = vec![$($input_type),+];
-        let input_count = input_types.len();
-        let input_ids = input_types
-            .into_iter()
-            .map(|input_type| builder.add_input(input_type))
-            .collect::<Vec<_>>();
-        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
-        let output_count = output_ids.len();
-        let program = builder
-            .build::<Vec<$value>, Vec<$value>>(
-                output_ids,
-                vec![$crate::parameters::Placeholder; input_count],
-                vec![$crate::parameters::Placeholder; output_count],
-            )
-            .unwrap();
-        let input_indices = (0..input_count).collect::<Vec<_>>();
-        assert!(matches!(
-            program.transpose_with_respect_to(input_indices.as_slice(), &[]),
-            Err($crate::differentiation::DifferentiationError::Program(
-                $crate::programs::ProgramError::UnsupportedOperation { message },
-            )) if message == format!("operation `{descriptor}` is not transposable"),
-        ));
-    }};
+    ) => {
+        $crate::macros::checks::check_transposition_rejection::<_, $value, $operation_family>(
+            ::core::convert::Into::into($operation),
+            vec![$($input_type),+],
+        )
+    };
 
     // This internal branch represents one linear input by type without supplying a known primal value.
     (@input $value:ty, (@linear(type = $r#type:expr))) => {
@@ -5318,14 +4913,24 @@ macro_rules! check_operation_transposition {
         ($crate::programs::types::Typed::r#type(&input).into_owned(), false, Some(input))
     }};
 
-    // This internal branch compares one interpreted cotangent exactly.
-    (@assert (@exact), $actual:expr, $expected:expr) => {
-        assert_eq!($actual, $expected)
+    // This internal branch records that a case declares no expected pullback program rendering.
+    (@rendering) => {
+        None
     };
 
-    // This internal branch compares one interpreted cotangent within the requested tolerance.
-    (@assert (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {
-        ::approx::assert_abs_diff_eq!($actual, $expected, epsilon = $epsilon)
+    // This internal branch borrows the expected pullback program rendering declared by a case.
+    (@rendering $rendering:expr) => {
+        Some(::core::convert::AsRef::<str>::as_ref(&$rendering))
+    };
+
+    // This internal branch selects exact comparison of interpreted cotangents.
+    (@comparison (@exact)) => {
+        $crate::macros::checks::Exact
+    };
+
+    // This internal branch selects comparison of interpreted cotangents within the requested tolerance.
+    (@comparison (@approx($epsilon:expr))) => {
+        $crate::macros::checks::Approximate { epsilon: $epsilon }
     };
 }
 
@@ -5380,42 +4985,22 @@ macro_rules! check_gradient {
         // Both pins leave the function's output type generic so that `$function` may return its value either directly
         // or wrapped in a `Result` (refer to `MaybeFallible` for the exact contract). The traced copy's output is
         // consumed by `gradient`, which accepts both shapes natively, while `pin_eager` normalizes the concrete copy's
-        // output by unwrapping through `MaybeFallible::into_result`, so that the assertion rules below always receive
-        // an infallible function.
-
-        fn pin_traced<
-            __F: Fn(
-                $crate::differentiation::LinearizationTracer<
-                    $crate::contexts::EagerContext<
-                        $crate::Array,
-                        $crate::ArrayOperation<$crate::Array>,
-                    >,
-                >,
-            ) -> __Output,
-            __Output,
-        >(function: __F) -> __F {
-            function
-        }
-
-        fn pin_eager<
-            __F: Fn($crate::Array) -> __Output,
-            __Output: $crate::MaybeFallible<$crate::Array, $crate::ProgramError>,
-        >(
-            function: __F,
-        ) -> impl Fn($crate::Array) -> $crate::Array {
-            move |input| {
-                $crate::MaybeFallible::into_result(function(input)).unwrap_or_else(|error| panic!("{error}"))
-            }
-        }
-
+        // output into a `Result` through `MaybeFallible::into_result`, so that the shared assertion function always
+        // receives the same function signature.
         let input: $crate::Array = ::core::convert::Into::into($input);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
         let gradient = $crate::differentiation::differentiate_at(input.clone())
-            .gradient(pin_traced($function))
+            .gradient($crate::macros::checks::pin_traced($function))
             .unwrap();
 
-        $crate::check_gradient!(@assert(gradient, pin_eager($function), input, step, tolerance))
+        $crate::macros::checks::check_gradient(
+            gradient,
+            &$crate::macros::checks::pin_eager($function),
+            input,
+            step,
+            tolerance,
+        )
     }};
 
     // This public branch evaluates an array function with nondifferentiated runtime captures through reverse-mode
@@ -5427,127 +5012,959 @@ macro_rules! check_gradient {
         step = $step:expr,
         tolerance = $tolerance:expr $(,)?
     ) => {{
-        fn pin_traced<
-            __F: Fn(
-                $crate::differentiation::LinearizationTracer<
-                    $crate::contexts::EagerContext<
-                        $crate::Array,
-                        $crate::ArrayOperation<$crate::Array>,
-                    >,
-                >,
-                $crate::differentiation::LinearizationTracer<
-                    $crate::contexts::EagerContext<
-                        $crate::Array,
-                        $crate::ArrayOperation<$crate::Array>,
-                    >,
-                >,
-            ) -> __Output,
-            __Output,
-        >(function: __F) -> __F {
-            function
-        }
-
-        fn pin_eager<
-            __F: Fn($crate::Array, $crate::Array) -> __Output,
-            __Output: $crate::MaybeFallible<$crate::Array, $crate::ProgramError>,
-        >(
-            function: __F,
-        ) -> impl Fn($crate::Array, $crate::Array) -> $crate::Array {
-            move |input, captures| {
-                $crate::MaybeFallible::into_result(function(input, captures))
-                    .unwrap_or_else(|error| panic!("{error}"))
-            }
-        }
-
         let input: $crate::Array = ::core::convert::Into::into($input);
         let captures: $crate::Array = ::core::convert::Into::into($capture);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
         let gradient = $crate::differentiation::differentiate_at(input.clone())
             .with_captures(captures.clone())
-            .gradient(pin_traced($function))
+            .gradient($crate::macros::checks::pin_traced_with_captures($function))
             .unwrap();
 
-        $crate::check_gradient!(
-            @assert(
-                gradient,
-                move |input| pin_eager($function)(input, captures.clone()),
-                input,
-                step,
-                tolerance,
-            )
+        $crate::macros::checks::check_gradient(
+            gradient,
+            &move |input| $crate::macros::checks::pin_eager_with_captures($function)(input, captures.clone()),
+            input,
+            step,
+            tolerance,
         )
     }};
+}
 
-    // This internal branch checks a reverse-mode `$gradient` of the ℝⁿ → ℝ or ℂⁿ → ℝ function `$evaluate` at `$input`
-    // (an array of any shape whose output is a rank-0 real `f64` array) against the central finite-difference estimates
-    // of its partials, perturbing one input element at a time with all others held fixed.
-    (@assert($gradient:expr, $evaluate:expr, $input:expr, $step:expr, $tolerance:expr $(,)?)) => {{
-        let gradient = $gradient;
-        let evaluate = $evaluate;
-        let input = $input;
-        let step = $step;
-        let tolerance = $tolerance;
+/// Support functions that implement the operation test-check macros [`check_operation_type_inference!`],
+/// [`check_operation_partial_evaluation!`], [`check_operation_batching!`], [`check_operation_differentiation!`],
+/// [`check_operation_transposition!`], and [`check_gradient!`]. Each macro parses its declarative case syntax,
+/// evaluates the case fixtures, converts them into the selected backend's value family, and then makes one call into
+/// this module. The called function builds the single-instruction [`Program`](crate::Program) under test (where the
+/// check needs one), applies the transformation being checked, and asserts on the results.
+///
+/// These functions are public because the exported macros expand to calls into them from the invoking crate, and
+/// downstream crates that test their own operations or backend families may also call them directly (e.g., to build
+/// cases programmatically instead of through the macro syntax). They are intended for test code only: every check
+/// reports a failure by panicking rather than by returning an error, and the functions are `#[track_caller]` so that
+/// the panic points at the macro invocation or at the direct call rather than at a line inside this module.
+///
+/// The functions exist to keep test executables small. When the macros expanded their assertion logic inline, every
+/// invocation produced its own monomorphized copy of the program construction, transformation, and comparison code.
+/// Sharing one generic body per check instead instantiates that code once per operation type or backend family.
+pub mod checks {
+    use std::fmt::Debug;
+    use std::ops::{Add, Mul, Sub};
 
-        // The function output is a rank-0 real array, so the central difference reads its single `f64` element.
-        let central_difference = |plus: $crate::Array, minus: $crate::Array| {
-            (evaluate(plus).to_f64s()[0] - evaluate(minus).to_f64s()[0]) / (2.0 * step)
-        };
+    use approx::AbsDiffEq;
 
-        let input_type = $crate::programs::types::Typed::r#type(&input).into_owned();
-        let element_count = $crate::Array::element_count(&input_type).unwrap();
-        match input_type.data_type() {
-            $crate::arrays::DataType::F64 => {
-                let perturbed = |index: usize, delta: f64| {
-                    let mut values = input.to_f64s();
-                    values[index] += delta;
-                    $crate::Array::from_elements::<f64>(input_type.clone(), &values).unwrap()
-                };
-                let estimates = (0..element_count)
-                    .map(|index| central_difference(perturbed(index, step), perturbed(index, -step)))
-                    .collect::<Vec<_>>();
-                let estimate = $crate::Array::from_elements::<f64>(input_type.clone(), &estimates).unwrap();
-                ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
+    use crate::arrays::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, Dimension, Layout, Memory, Shape,
+        StridedLayout,
+    };
+    use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingPolicy};
+    use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiableType, DifferentiationError, LinearizationTracer, ResidualZeroProvider,
+        TransposableOperation,
+    };
+    use crate::errors::MaybeFallible;
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::{
+        AddOperation, Complex, GuardOperation, Imaginary, Real, ReferenceAddUpdateOperation, ReferenceNewOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
+    use crate::programs::{
+        Operation, OperationProvider, ProgramBuilder, ProgramError, ReferenceAccessOperation, ReferenceMemberType,
+        ReferenceTransform, Type, TypeError, Typed, Value,
+    };
+    use crate::tracing::TracingContext;
+
+    /// Value comparison used by [`check_batching`] and [`check_transposition`] to compare actual with
+    /// expected outputs. The `@exact` and `@approx(epsilon = ...)` selectors of [`check_operation_batching!`] and
+    /// [`check_operation_transposition!`] expand to [`Exact`] and [`Approximate`], respectively. Downstream crates may
+    /// implement this trait for their own value types or comparison policies.
+    pub trait Comparison<V> {
+        /// Asserts that `actual` matches `expected` under this comparison.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `actual` does not match `expected`. Implementations should be `#[track_caller]` so that the panic
+        /// reports the location of the check that requested the comparison.
+        #[track_caller]
+        fn assert_matches(&self, actual: &V, expected: &V);
+    }
+
+    /// [`Comparison`] that requires complete value equality (i.e., [`PartialEq`]) and is available for every value type
+    /// that implements [`Debug`] and [`PartialEq`].
+    #[derive(Clone, Copy, Debug)]
+    pub struct Exact;
+
+    impl<V: Debug + PartialEq> Comparison<V> for Exact {
+        #[track_caller]
+        fn assert_matches(&self, actual: &V, expected: &V) {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// [`Comparison`] that requires numerical values to agree within the absolute tolerance [`Approximate::epsilon`].
+    /// It compares [`Array`]s with [`approx::assert_abs_diff_eq!`]. For [`ArrayBatch`] vectors, it compares the number
+    /// of batches and each batch's type and batch axis exactly, and only the `f64` conversions of the batch payloads
+    /// within the tolerance.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Approximate {
+        /// Absolute comparison tolerance.
+        pub epsilon: f64,
+    }
+
+    impl Comparison<Array> for Approximate {
+        #[track_caller]
+        fn assert_matches(&self, actual: &Array, expected: &Array) {
+            approx::assert_abs_diff_eq!(actual, expected, epsilon = self.epsilon);
+        }
+    }
+
+    impl Comparison<Vec<ArrayBatch<Array>>> for Approximate {
+        #[track_caller]
+        fn assert_matches(&self, actual: &Vec<ArrayBatch<Array>>, expected: &Vec<ArrayBatch<Array>>) {
+            // Batch metadata must match exactly, while numerical payloads only need to agree within `epsilon`.
+            let epsilon = self.epsilon;
+            assert_eq!(actual.len(), expected.len());
+            for (output_index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    Typed::r#type(actual),
+                    Typed::r#type(expected),
+                    "batching output {output_index} has the wrong type",
+                );
+                assert_eq!(
+                    actual.batch_axis(),
+                    expected.batch_axis(),
+                    "batching output {output_index} has the wrong batch axis",
+                );
+                let actual_values = actual.value().to_f64s();
+                let expected_values = expected.value().to_f64s();
+                assert_eq!(actual_values.len(), expected_values.len());
+                for (value_index, (actual, expected)) in actual_values.iter().zip(expected_values.iter()).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= epsilon,
+                        "batching output {output_index} value {value_index} differs: {actual} vs {expected}",
+                    );
+                }
             }
-            $crate::arrays::DataType::C128 => {
+        }
+    }
+
+    /// Checks one regionless typ -inference case of [`check_operation_type_inference!`] by inferring the output types
+    /// of `operation` for `input_types` with no attached regions and comparing the complete result with `expected`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: [`Operation`] under test.
+    ///   - `input_types`: Input types, in operation input order.
+    ///   - `expected`: Expected output types, in result order, or the expected [`TypeError`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inference result differs from `expected`.
+    #[track_caller]
+    pub fn check_type_inference<O: Operation>(
+        operation: &O,
+        input_types: &[O::Type],
+        expected: Result<Vec<O::Type>, TypeError>,
+    ) {
+        assert_eq!(Operation::infer_output_types(operation, input_types, &[]), expected);
+    }
+
+    // TODO(eaplatanios): Inline this.
+    /// Returns the representative array type with element type `data_type` that the elementwise selectors of
+    /// [`check_operation_type_inference!`] use. It carries shape, layout, and memory metadata so that the checks also
+    /// verify structural lifting.
+    fn representative_array_type(data_type: DataType) -> ArrayType {
+        ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_memory(Memory::Host { pinned: true })
+    }
+
+    /// Checks a successful unary element type case of [`check_operation_type_inference!`] in both the data type and
+    /// the array type universes. The array type check uses a representative rank-2 [`ArrayType`] with explicit layout
+    /// and memory metadata and expects every output to keep that metadata while taking its declared element type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_operation`: Operation under test, instantiated for the [`DataType`] universe.
+    ///   - `array_operation`: The same operation, instantiated for the [`ArrayType`] universe.
+    ///   - `input_data_type`: Element type of the single input.
+    ///   - `output_data_types`: Expected output element types, in result order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either universe infers a result other than the expected output types.
+    #[track_caller]
+    pub fn check_elementwise_unary_type_inference<D, A>(
+        data_operation: &D,
+        array_operation: &A,
+        input_data_type: DataType,
+        output_data_types: Vec<DataType>,
+    ) where
+        D: Operation<Type = DataType>,
+        A: Operation<Type = ArrayType>,
+    {
+        assert_eq!(
+            Operation::infer_output_types(data_operation, &[input_data_type], &[]),
+            Ok(output_data_types.clone()),
+        );
+        let input_type = representative_array_type(input_data_type);
+        assert_eq!(
+            Operation::infer_output_types(array_operation, std::slice::from_ref(&input_type), &[]),
+            Ok(output_data_types
+                .into_iter()
+                .map(|output_data_type| input_type.clone().with_data_type(output_data_type))
+                .collect::<Vec<_>>()),
+        );
+    }
+
+    /// Checks a successful binary element type case of [`check_operation_type_inference!`] in both
+    /// the data type and the array type universes. Both array inputs share the representative structure used by
+    /// [`check_elementwise_unary_type_inference`], which isolates element type lifting from the separately tested
+    /// shared broadcasting contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_operation`: Operation under test, instantiated for the [`DataType`] universe.
+    ///   - `array_operation`: The same operation, instantiated for the [`ArrayType`] universe.
+    ///   - `input_data_types`: Element types of the left and right inputs.
+    ///   - `output_data_types`: Expected output element types, in result order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either universe infers a result other than the expected output types.
+    #[track_caller]
+    pub fn check_elementwise_binary_type_inference<D, A>(
+        data_operation: &D,
+        array_operation: &A,
+        input_data_types: [DataType; 2],
+        output_data_types: Vec<DataType>,
+    ) where
+        D: Operation<Type = DataType>,
+        A: Operation<Type = ArrayType>,
+    {
+        let [left_data_type, right_data_type] = input_data_types;
+        assert_eq!(
+            Operation::infer_output_types(data_operation, &[left_data_type, right_data_type], &[]),
+            Ok(output_data_types.clone()),
+        );
+        let left_type = representative_array_type(left_data_type);
+        let right_type = left_type.clone().with_data_type(right_data_type);
+        assert_eq!(
+            Operation::infer_output_types(array_operation, &[left_type.clone(), right_type], &[]),
+            Ok(output_data_types
+                .into_iter()
+                .map(|output_data_type| left_type.clone().with_data_type(output_data_type))
+                .collect::<Vec<_>>()),
+        );
+    }
+
+    // TODO(eaplatanios): Inline this.
+    /// Returns the one-axis explicit mesh used by the generated sharding rejection fixtures.
+    #[track_caller]
+    fn sharding_fixture_mesh() -> LogicalMesh {
+        LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap()
+    }
+
+    // TODO(eaplatanios): Inline this.
+    /// Returns `input_type` with a fully replicated sharding over `mesh`.
+    #[track_caller]
+    fn replicated_array_type(mesh: &LogicalMesh, input_type: ArrayType) -> ArrayType {
+        let dimensions = vec![ShardingDimension::Replicated; input_type.rank()];
+        input_type.with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
+    }
+
+    /// Checks the `@reject @unreduced` contract of [`check_operation_type_inference!`]: `operation` must reject
+    /// `input_types` with the standard "does not support unreduced inputs" [`TypeError`] once every input carries a
+    /// replicated sharding over a one-axis explicit mesh whose axis is marked unreduced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the generated sharding fixture cannot be applied to an input type or if inference does not return the
+    /// expected diagnostic.
+    #[track_caller]
+    pub fn check_unreduced_input_rejection<O: Operation<Type = ArrayType>>(operation: &O, input_types: Vec<ArrayType>) {
+        let descriptor = Operation::name(operation);
+        let mesh = sharding_fixture_mesh();
+        let mut unreduced_input_types = Vec::with_capacity(input_types.len());
+        for input_type in input_types {
+            let dimensions = vec![ShardingDimension::Replicated; input_type.rank()];
+            let sharding = Sharding::new(mesh.clone(), dimensions).unwrap().with_unreduced_axes(["x"]).unwrap();
+            unreduced_input_types.push(input_type.with_sharding(sharding).unwrap());
+        }
+        assert_eq!(
+            Operation::infer_output_types(operation, unreduced_input_types.as_slice(), &[]),
+            Err(TypeError::invalid(format!("`{descriptor}` does not support unreduced inputs"))),
+        );
+    }
+
+    /// Checks the `@reject @mismatched_reduced` contract of [`check_operation_type_inference!`]: binary `operation`
+    /// must reject inputs whose reduced-axis markers differ with the standard "must be reduced over the same axes"
+    /// [`TypeError`]. Both inputs carry a replicated sharding over a one-axis explicit mesh, and the check marks the
+    /// mesh axis as reduced on the left input only and then on the right input only.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Binary [`Operation`] under test.
+    ///   - `left_type`: Left input type, before the generated sharding is applied.
+    ///   - `right_type`: Right input type, before the generated sharding is applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the generated sharding fixture cannot be applied to an input type or if either ordering does not
+    /// return the expected diagnostic.
+    #[track_caller]
+    pub fn check_mismatched_reduced_input_rejection<O: Operation<Type = ArrayType>>(
+        operation: &O,
+        left_type: ArrayType,
+        right_type: ArrayType,
+    ) {
+        let descriptor = Operation::name(operation);
+        let mesh = sharding_fixture_mesh();
+        let left = replicated_array_type(&mesh, left_type);
+        let right = replicated_array_type(&mesh, right_type);
+        let reduced_left = left
+            .clone()
+            .with_sharding(left.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_right = right
+            .clone()
+            .with_sharding(right.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let expected = Err(TypeError::invalid(format!("`{descriptor}` inputs must be reduced over the same axes")));
+        assert_eq!(Operation::infer_output_types(operation, &[reduced_left, right.clone()], &[]), expected.clone());
+        assert_eq!(Operation::infer_output_types(operation, &[left, reduced_right], &[]), expected);
+    }
+
+    /// Checks the concise default-rule form of [`check_operation_partial_evaluation!`] on the eager [`Array`]
+    /// reference backend: all-known inputs fold the single-output `operation`, every individual unknown-input position
+    /// residualizes it, and an all-unknown input set does the same, with every replay producing `expected`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Single-output operation under test.
+    ///   - `inputs`: Concrete inputs, in operation input order. They serve both as known values and as the replay
+    ///     values supplied for unknown inputs.
+    ///   - `expected`: Expected output for `inputs`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the program cannot be built, partially evaluated, or interpreted, if `operation` does not have exactly
+    /// one output, or if any input classification folds, residualizes, or replays differently than described above.
+    #[track_caller]
+    pub fn check_default_partial_evaluation(operation: ArrayOperation<Array>, inputs: Vec<Array>, expected: Array) {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut input_ids = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            input_ids.push(builder.add_input(Typed::r#type(input).into_owned()));
+        }
+        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
+        assert_eq!(output_ids.len(), 1);
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(output_ids, vec![Placeholder; inputs.len()], vec![Placeholder])
+            .unwrap();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+
+        let known = inputs.iter().cloned().map(PartialValue::Known).collect::<Vec<_>>();
+        let evaluation = program.partially_evaluate(known.as_slice()).unwrap();
+        assert!(evaluation.program().instructions().is_empty());
+        assert_eq!(evaluation.outputs().len(), 1);
+        assert!(evaluation.outputs()[0].is_known());
+        assert_eq!(evaluation.interpret(&context, &[]).unwrap(), vec![expected.clone()]);
+
+        for unknown_index in 0..inputs.len() {
+            let mut knowledge = known.clone();
+            knowledge[unknown_index] = PartialValue::Unknown(Typed::r#type(&inputs[unknown_index]).into_owned());
+            let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+            assert_eq!(evaluation.program().instructions().len(), 1);
+            assert_eq!(evaluation.outputs().len(), 1);
+            assert!(evaluation.outputs()[0].is_unknown());
+            assert_eq!(
+                evaluation.interpret(&context, &[inputs[unknown_index].clone()]).unwrap(),
+                vec![expected.clone()],
+            );
+        }
+
+        if inputs.len() > 1 {
+            let unknown = inputs
+                .iter()
+                .map(|input| PartialValue::Unknown(Typed::r#type(input).into_owned()))
+                .collect::<Vec<_>>();
+            let evaluation = program.partially_evaluate(unknown.as_slice()).unwrap();
+            assert_eq!(evaluation.program().instructions().len(), 1);
+            assert_eq!(evaluation.outputs().len(), 1);
+            assert!(evaluation.outputs()[0].is_unknown());
+            assert_eq!(evaluation.interpret(&context, inputs.as_slice()).unwrap(), vec![expected]);
+        }
+    }
+
+    /// Checks one explicit case of [`check_operation_partial_evaluation!`]. It partially evaluates a single-instruction
+    /// program that applies `operation`, checks the residual instruction count and the known-ness of every output, and
+    /// then interprets the partial evaluation with the replay values of the unknown inputs and compares the outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation under test.
+    ///   - `inputs`: Inputs, in operation input order, each pairing its [`PartialValue`] with the replay value that is
+    ///     supplied for it when it is unknown (`None` for known inputs).
+    ///   - `expected_outputs`: Expected outputs, in result order, each pairing whether it is known with its expected
+    ///     replayed value.
+    ///   - `residual_instructions`: Expected number of instructions in the residual program.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the program cannot be built, partially evaluated, or interpreted, or if the residual instruction
+    /// count, an output classification, or a replayed output differs from the expectation.
+    #[track_caller]
+    pub fn check_partial_evaluation<
+        T: Type,
+        V: Value<Type = T> + Debug + PartialEq,
+        O: Operation<Type = T>
+            + InterpretableOperation<EagerContext<V, O>>
+            + PartiallyEvaluatableOperation<EagerContext<V, O>>
+            + PartiallyEvaluatableOperation<TracingContext<V, O>>,
+    >(
+        operation: &O,
+        inputs: Vec<(PartialValue<V>, Option<V>)>,
+        expected_outputs: Vec<(bool, V)>,
+        residual_instructions: usize,
+    ) where
+        EagerContext<V, O>: Domain<Type = T, Value = V, Constant = V, Operation = O>,
+        TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+    {
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut input_ids = Vec::with_capacity(inputs.len());
+        for (input, _) in &inputs {
+            input_ids.push(builder.add_input(Typed::r#type(input).into_owned()));
+        }
+        let output_ids = builder.add_instruction(operation.clone(), Vec::new(), input_ids, None).unwrap().to_vec();
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<V>, Vec<V>>(output_ids, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])
+            .unwrap();
+        let knowledge = inputs.iter().map(|(input, _)| input.clone()).collect::<Vec<_>>();
+        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+        assert_eq!(evaluation.program().instructions().len(), residual_instructions);
+        assert_eq!(evaluation.outputs().len(), expected_outputs.len());
+        for (actual, (expected_known, _)) in evaluation.outputs().iter().zip(expected_outputs.iter()) {
+            assert_eq!(actual.is_known(), *expected_known);
+        }
+        let unknown_inputs = inputs.into_iter().filter_map(|(_, replay)| replay).collect::<Vec<_>>();
+        let actual_outputs = evaluation.interpret(&EagerContext::<V, O>::new(), unknown_inputs.as_slice()).unwrap();
+        let expected_outputs = expected_outputs.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
+        assert_eq!(actual_outputs, expected_outputs);
+    }
+
+    /// Checks one case of [`check_operation_batching!`] by batching `operation` in `context` and comparing the
+    /// resulting batches with `expected_outputs` under `comparison`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation under test.
+    ///   - `context`: [`BatchingContext`] that owns the mapped axis and the parent context.
+    ///   - `driver`: [`BatchingDriver`] used for any regions of `operation`.
+    ///   - `inputs`: Input batches, in operation input order.
+    ///   - `expected_outputs`: Expected output batches, in result order.
+    ///   - `comparison`: [`Comparison`] applied to the complete output vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if batching fails or if `comparison` rejects the outputs.
+    #[track_caller]
+    pub fn check_batching<
+        C: Context<Value = Array>,
+        O: BatchableOperation<C, ArrayBatchingPolicy>,
+        D: BatchingDriver<C, ArrayBatchingPolicy>,
+        M: Comparison<Vec<ArrayBatch<Array>>>,
+    >(
+        operation: &O,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        driver: &D,
+        inputs: Vec<ArrayBatch<Array>>,
+        expected_outputs: Vec<ArrayBatch<Array>>,
+        comparison: &M,
+    ) where
+        ArrayBatchingPolicy: BatchingPolicy<C, Batch = ArrayBatch<Array>>,
+    {
+        let actual_outputs = BatchableOperation::batch(operation, context, driver, inputs.as_slice()).unwrap();
+        comparison.assert_matches(&actual_outputs, &expected_outputs);
+    }
+
+    /// Checks the finite-difference configuration of [`check_operation_differentiation!`], which passes the same
+    /// `step` and `epsilon` to [`check_differentiation`] for every case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `step` is not positive or `epsilon` is negative.
+    #[track_caller]
+    pub fn check_finite_difference_configuration(step: f64, epsilon: f64) {
+        assert!(step > 0.0, "finite-difference step must be positive");
+        assert!(epsilon >= 0.0, "comparison epsilon must be non-negative");
+    }
+
+    /// Fixtures of one [`check_operation_differentiation!`] case, converted into the selected backend's value family
+    /// and checked by [`check_differentiation`].
+    pub struct DifferentiationCase<'r, V> {
+        /// Primal inputs, in operation input order.
+        pub primals: Vec<V>,
+
+        /// Input tangents, one for each primal input.
+        pub tangents: Vec<V>,
+
+        /// Expected primal outputs, in result order.
+        pub primal_outputs: Vec<V>,
+
+        /// Expected output tangents, one for each primal output.
+        pub tangent_outputs: Vec<V>,
+
+        /// Optional expected rendering of the fused JVP program.
+        pub jvp: Option<&'r str>,
+    }
+
+    /// Checks one case of [`check_operation_differentiation!`]. The case builds a single-instruction program, checks
+    /// its fused JVP and its linearization against the declared outputs, and independently checks the fused output
+    /// tangents against the central directional finite difference `(f(x + h·ẋ) - f(x - h·ẋ)) / (2h)` with spacing
+    /// `h = step`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation under test.
+    ///   - `step`: Central finite-difference spacing.
+    ///   - `epsilon`: Absolute tolerance for every comparison of actual and expected values.
+    ///   - `case`: Inputs, tangents, expected outputs, and optional expected JVP rendering of the case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture counts are inconsistent, if the program cannot be built, transformed, or interpreted,
+    /// if the Jacobian-Vector Product (JVP) rendering differs from the expected one, or if any fused, linearized,
+    /// or finite-difference result differs from its expected value by more than `epsilon`.
+    #[track_caller]
+    pub fn check_differentiation<
+        T: DifferentiableType,
+        V: Value<Type = T> + AbsDiffEq<Epsilon = f64> + Debug + Add<Output = V> + Sub<Output = V> + Mul<f64, Output = V>,
+        O: Operation<Type = T>
+            + InterpretableOperation<EagerContext<V, O>>
+            + OperationProvider<T, GuardOperation<T>, Operation = O>
+            + PartiallyEvaluatableOperation<TracingContext<V, O>>
+            + DifferentiableOperation<TracingContext<V, O>>
+            + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
+            + ResidualZeroProvider<T, Operation = O>,
+    >(
+        operation: &O,
+        step: f64,
+        epsilon: f64,
+        case: DifferentiationCase<'_, V>,
+    ) where
+        EagerContext<V, O>: Domain<Type = T, Value = V, Constant = V, Operation = O>,
+        TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+    {
+        // Every primal input and output must have a corresponding tangent so both differentiation paths can use the
+        // same expected results.
+        let DifferentiationCase {
+            primals,
+            tangents,
+            primal_outputs: expected_primals,
+            tangent_outputs: expected_tangents,
+            jvp: jvp_rendering,
+        } = case;
+        assert_eq!(primals.len(), tangents.len(), "primal and tangent input counts differ");
+        assert_eq!(expected_primals.len(), expected_tangents.len(), "primal and tangent output counts differ");
+
+        // Build a single-operation program with input types inferred from the fixture. All operation outputs become
+        // program outputs; the placeholders describe the flat input and output vector structures.
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut input_ids = Vec::with_capacity(primals.len());
+        for input in &primals {
+            input_ids.push(builder.add_input(Typed::r#type(input).into_owned()));
+        }
+        let output_ids = builder.add_instruction(operation.clone(), Vec::new(), input_ids, None).unwrap().to_vec();
+        assert_eq!(output_ids.len(), expected_primals.len(), "declared output count is incorrect");
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<V>, Vec<V>>(output_ids, vec![Placeholder; primals.len()], vec![Placeholder; output_count])
+            .unwrap();
+
+        // Construct the fused derivative and, when supplied, check its expected symbolic program as well.
+        let jvp = program.jvp().unwrap();
+        if let Some(jvp_rendering) = jvp_rendering {
+            assert_eq!(jvp.to_string(), jvp_rendering.trim_end());
+        }
+
+        // The fused JVP takes all primals followed by all tangents and returns outputs in that same grouping. Check
+        // both halves against the fixture before using its tangents in the numerical check below.
+        let jvp_inputs = primals.iter().cloned().chain(tangents.iter().cloned()).collect::<Vec<_>>();
+        let actual = jvp.interpret(jvp_inputs).unwrap();
+        assert_eq!(actual.len(), 2 * output_count);
+        let (actual_primals, actual_tangents) = actual.split_at(output_count);
+        for (actual, expected) in actual_primals.iter().zip(expected_primals.iter()) {
+            approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+        }
+        for (actual, expected) in actual_tangents.iter().zip(expected_tangents.iter()) {
+            approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+        }
+
+        // Linearization exercises separate primal and tangent construction destinations. A rule that omits a required
+        // primal-to-tangent transfer can pass fused execution but fail on this path.
+        let linearization = program.linearize().unwrap();
+
+        // The primal program returns public primal outputs followed by residuals saved for the tangent program.
+        let separated_primals = linearization.primal().interpret(primals.clone()).unwrap();
+        assert_eq!(separated_primals.len(), output_count + linearization.residual_count());
+        for (actual, expected) in separated_primals[..output_count].iter().zip(expected_primals.iter()) {
+            approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+        }
+
+        // Supply input tangents followed by the saved residuals. The tangent program returns only output tangents,
+        // which must agree with the same fixture used for fused execution.
+        let separated_inputs =
+            tangents.iter().cloned().chain(separated_primals[output_count..].iter().cloned()).collect();
+        let separated_tangents = linearization.tangent().interpret(separated_inputs).unwrap();
+        assert_eq!(separated_tangents.len(), expected_tangents.len());
+        for (actual, expected) in separated_tangents.iter().zip(expected_tangents.iter()) {
+            approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+        }
+
+        // Perturb every primal along its input tangent in both directions. Evaluating the original program at these
+        // points gives a numerical directional derivative independent of the differentiation rules.
+        let mut plus_inputs = Vec::with_capacity(primals.len());
+        for (primal, tangent) in primals.iter().cloned().zip(tangents.iter().cloned()) {
+            plus_inputs.push(primal + tangent * step);
+        }
+        let mut minus_inputs = Vec::with_capacity(primals.len());
+        for (primal, tangent) in primals.iter().cloned().zip(tangents.iter().cloned()) {
+            minus_inputs.push(primal - tangent * step);
+        }
+        let plus_outputs = program.interpret(plus_inputs).unwrap();
+        let minus_outputs = program.interpret(minus_inputs).unwrap();
+        assert_eq!(plus_outputs.len(), output_count);
+        assert_eq!(minus_outputs.len(), output_count);
+
+        // Compare the fused JVP with the central difference (f(x + h*v) - f(x - h*v)) / (2*h). The separated path has
+        // already been checked against the same expected tangent values above.
+        for ((actual, plus), minus) in
+            actual_tangents.iter().zip(plus_outputs.into_iter()).zip(minus_outputs.into_iter())
+        {
+            let estimate = (plus - minus) * (1.0 / (2.0 * step));
+            approx::assert_abs_diff_eq!(actual, &estimate, epsilon = epsilon);
+        }
+    }
+
+    /// Fixtures of one supported [`check_operation_transposition!`] case, converted into the selected backend's value
+    /// family and checked by [`check_transposition`].
+    pub struct TranspositionCase<'r, V: Value> {
+        /// Operation inputs in source-input order. Each input carries its type, whether it is linear, and, for a known
+        /// input, its concrete value.
+        pub inputs: Vec<(V::Type, bool, Option<V>)>,
+
+        /// Output cotangents, in result order.
+        pub output_cotangents: Vec<V>,
+
+        /// Expected input cotangents, in linear-input order.
+        pub input_cotangents: Vec<V>,
+
+        /// Optional expected rendering of the pullback program.
+        pub pullback: Option<&'r str>,
+    }
+
+    /// Checks one supported case of [`check_operation_transposition!`] by transposing a single-instruction program
+    /// with respect to its linear inputs and comparing the interpreted input cotangents under `comparison`. The
+    /// pullback receives the output cotangents followed by the known input values in source-input order, and returns
+    /// input cotangents in linear-input order.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation under test.
+    ///   - `case`: Inputs, output cotangents, expected input cotangents, and optional expected pullback rendering of
+    ///     the case.
+    ///   - `comparison`: [`Comparison`] applied to each input cotangent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the case has no linear input or inconsistent fixture counts, if the program cannot be built,
+    /// transposed, or interpreted, if the pullback rendering differs from the expected one, or if `comparison` rejects
+    /// an input cotangent.
+    #[track_caller]
+    pub fn check_transposition<
+        T: DifferentiableType + ReferenceMemberType,
+        V: Value<Type = T>,
+        O: TransposableOperation<V, O>
+            + InterpretableOperation<EagerContext<V, O>>
+            + OperationProvider<T, GuardOperation<T>, Operation = O>
+            + ResidualZeroProvider<T, Operation = O>
+            + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <T as ReferenceMemberType>::Referent>>
+            + OperationProvider<T, ReferenceNewOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
+            + OperationProvider<
+                T,
+                ReferenceAddUpdateOperation<
+                    <T as ReferenceMemberType>::Referent,
+                    T,
+                    <O as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = O,
+            > + OperationProvider<T, AddOperation<T>, Operation = O>,
+        M: Comparison<V>,
+    >(
+        operation: &O,
+        case: TranspositionCase<'_, V>,
+        comparison: &M,
+    ) where
+        EagerContext<V, O>: Domain<Type = T, Value = V, Constant = V, Operation = O>,
+        TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+    {
+        let TranspositionCase { inputs, output_cotangents, input_cotangents, pullback: pullback_rendering } = case;
+        let mut linear_indices = Vec::new();
+        for (index, (_, linear, _)) in inputs.iter().enumerate() {
+            if *linear {
+                linear_indices.push(index);
+            }
+        }
+        assert!(!linear_indices.is_empty(), "a supported transposition case needs at least one linear input");
+
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut input_ids = Vec::with_capacity(inputs.len());
+        for (r#type, _, _) in &inputs {
+            input_ids.push(builder.add_input(r#type.clone()));
+        }
+        let output_ids = builder.add_instruction(operation.clone(), Vec::new(), input_ids, None).unwrap().to_vec();
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<V>, Vec<V>>(output_ids, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(linear_indices.as_slice(), &[]).unwrap();
+        if let Some(pullback_rendering) = pullback_rendering {
+            assert_eq!(pullback.to_string(), pullback_rendering.trim_end());
+        }
+
+        assert_eq!(output_cotangents.len(), output_count, "declared output cotangent count is incorrect");
+        let expected = input_cotangents;
+        assert_eq!(expected.len(), linear_indices.len(), "declared input cotangent count is incorrect");
+        let pullback_inputs = output_cotangents
+            .into_iter()
+            .chain(inputs.into_iter().filter_map(|(_, _, value)| value))
+            .collect::<Vec<_>>();
+        let actual = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            comparison.assert_matches(actual, expected);
+        }
+    }
+
+    /// Checks the `@rejected` contract of [`check_operation_transposition!`]: transposing a single-instruction program
+    /// that applies `operation` to inputs of `input_types` with respect to every input must fail with the standard
+    /// "is not transposable" [`ProgramError::UnsupportedOperation`] error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the program cannot be built or if transposition does not return the expected error.
+    #[track_caller]
+    pub fn check_transposition_rejection<
+        T: DifferentiableType + ReferenceMemberType,
+        V: Value<Type = T>,
+        O: TransposableOperation<V, O>
+            + ResidualZeroProvider<T, Operation = O>
+            + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <T as ReferenceMemberType>::Referent>>
+            + OperationProvider<T, ReferenceNewOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
+            + OperationProvider<
+                T,
+                ReferenceAddUpdateOperation<
+                    <T as ReferenceMemberType>::Referent,
+                    T,
+                    <O as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = O,
+            > + OperationProvider<T, AddOperation<T>, Operation = O>,
+    >(
+        operation: O,
+        input_types: Vec<T>,
+    ) where
+        TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+    {
+        let descriptor = Operation::name(&operation);
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let input_count = input_types.len();
+        let mut input_ids = Vec::with_capacity(input_count);
+        for input_type in input_types {
+            input_ids.push(builder.add_input(input_type));
+        }
+        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<V>, Vec<V>>(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])
+            .unwrap();
+        let input_indices = (0..input_count).collect::<Vec<_>>();
+        assert!(matches!(
+            program.transpose_with_respect_to(input_indices.as_slice(), &[]),
+            Err(DifferentiationError::Program(
+                ProgramError::UnsupportedOperation { message },
+            )) if message == format!("operation `{descriptor}` is not transposable"),
+        ));
+    }
+
+    /// Returns `function` unchanged while pinning its input type to [`LinearizationTracer`]s over the canonical eager
+    /// [`Array`] reference context. [`check_gradient!`] passes its traced copy of the function through this identity so
+    /// that the closure literal's otherwise unconstrained input type is inferred for the gradient computation.
+    pub fn pin_traced<F: Fn(LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>) -> Output, Output>(
+        function: F,
+    ) -> F {
+        function
+    }
+
+    /// Variant of [`pin_traced`] for a [`check_gradient!`] function that takes a runtime capture as its second
+    /// argument. It pins both arguments to [`LinearizationTracer`]s over the canonical eager [`Array`] reference
+    /// context.
+    pub fn pin_traced_with_captures<
+        F: Fn(
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Output,
+        Output,
+    >(
+        function: F,
+    ) -> F {
+        function
+    }
+
+    /// Pins the input type of the concrete copy of a [`check_gradient!`] function to [`Array`] and normalizes its
+    /// direct or fallible output into a [`Result`] (see [`MaybeFallible`]), producing the `evaluate` argument of
+    /// [`fn@check_gradient`].
+    pub fn pin_eager<F: Fn(Array) -> Output, Output: MaybeFallible<Array, ProgramError>>(
+        function: F,
+    ) -> impl Fn(Array) -> Result<Array, ProgramError> {
+        move |input| MaybeFallible::into_result(function(input))
+    }
+
+    /// Variant of [`pin_eager`] for a [`check_gradient!`] function that takes a runtime capture as its second argument.
+    /// It pins both arguments to [`Array`] and normalizes the function's output into a [`Result`].
+    pub fn pin_eager_with_captures<F: Fn(Array, Array) -> Output, Output: MaybeFallible<Array, ProgramError>>(
+        function: F,
+    ) -> impl Fn(Array, Array) -> Result<Array, ProgramError> {
+        move |input, captures| MaybeFallible::into_result(function(input, captures))
+    }
+
+    /// Checks the reverse-mode `gradient` of the ℝⁿ → ℝ or ℂⁿ → ℝ function `evaluate` at `input` (an array of any
+    /// shape whose function output is a rank-0 real `f64` array) against the central finite-difference estimates of its
+    /// partials, perturbing one input element at a time with all others held fixed. This implements the assertion half
+    /// of [`check_gradient!`], which computes `gradient` itself before calling this function. For a `c128` input, the
+    /// two real partials of each element assemble the conjugate steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `gradient`: Gradient under test, with the same type as `input`.
+    ///   - `evaluate`: Function evaluated directly on concrete perturbed inputs.
+    ///   - `input`: Point at which the gradient is checked. Its element type must be `f64` or `c128`.
+    ///   - `step`: Central finite-difference spacing `h` in `(f(x + h) - f(x - h)) / (2h)`.
+    ///   - `tolerance`: Absolute tolerance for comparing `gradient` with the finite-difference estimate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input` has an element type other than `f64` or `c128`, if `evaluate` returns an error, or if
+    /// `gradient` differs from the finite-difference estimate by more than `tolerance`.
+    #[track_caller]
+    pub fn check_gradient(
+        gradient: Array,
+        evaluate: &dyn Fn(Array) -> Result<Array, ProgramError>,
+        input: Array,
+        step: f64,
+        tolerance: f64,
+    ) {
+        let input_type = Typed::r#type(&input).into_owned();
+        let element_count = Array::element_count(&input_type).unwrap();
+        match input_type.data_type() {
+            DataType::F64 => {
+                let mut estimates = Vec::with_capacity(element_count);
+                for index in 0..element_count {
+                    let plus = perturbed_real(&input, &input_type, index, step);
+                    let minus = perturbed_real(&input, &input_type, index, -step);
+                    estimates.push(central_difference(evaluate, plus, minus, step));
+                }
+                let estimate = Array::from_elements::<f64>(input_type.clone(), &estimates).unwrap();
+                approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
+            }
+            DataType::C128 => {
                 // Per input element, the two central differences estimate the real partials that assemble the
                 // conjugate steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
-                let part_type = input_type.clone().with_data_type($crate::arrays::DataType::F64);
-                let real_values = $crate::operations::Real::real(&input).unwrap().to_f64s();
-                let imaginary_values = $crate::operations::Imaginary::imaginary(&input).unwrap().to_f64s();
-                let perturbed = |index: usize, real_delta: f64, imaginary_delta: f64| {
-                    let mut real_values = real_values.clone();
-                    let mut imaginary_values = imaginary_values.clone();
-                    real_values[index] += real_delta;
-                    imaginary_values[index] += imaginary_delta;
-                    $crate::operations::Complex::complex(
-                        &$crate::Array::from_elements::<f64>(part_type.clone(), &real_values).unwrap(),
-                        &$crate::Array::from_elements::<f64>(part_type.clone(), &imaginary_values).unwrap(),
-                    )
-                    .unwrap()
-                };
+                let part_type = input_type.clone().with_data_type(DataType::F64);
+                let real_values = Real::real(&input).unwrap().to_f64s();
+                let imaginary_values = Imaginary::imaginary(&input).unwrap().to_f64s();
                 let mut real_estimates = Vec::with_capacity(element_count);
                 let mut imaginary_estimates = Vec::with_capacity(element_count);
                 for index in 0..element_count {
                     real_estimates.push(central_difference(
-                        perturbed(index, step, 0.0),
-                        perturbed(index, -step, 0.0),
+                        evaluate,
+                        perturbed_complex(&part_type, &real_values, &imaginary_values, index, step, 0.0),
+                        perturbed_complex(&part_type, &real_values, &imaginary_values, index, -step, 0.0),
+                        step,
                     ));
                     imaginary_estimates.push(-central_difference(
-                        perturbed(index, 0.0, step),
-                        perturbed(index, 0.0, -step),
+                        evaluate,
+                        perturbed_complex(&part_type, &real_values, &imaginary_values, index, 0.0, step),
+                        perturbed_complex(&part_type, &real_values, &imaginary_values, index, 0.0, -step),
+                        step,
                     ));
                 }
-                let estimate = $crate::operations::Complex::complex(
-                    &$crate::Array::from_elements::<f64>(part_type.clone(), &real_estimates).unwrap(),
-                    &$crate::Array::from_elements::<f64>(part_type, &imaginary_estimates).unwrap(),
+                let estimate = Complex::complex(
+                    &Array::from_elements::<f64>(part_type.clone(), &real_estimates).unwrap(),
+                    &Array::from_elements::<f64>(part_type, &imaginary_estimates).unwrap(),
                 )
                 .unwrap();
-                ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
+                approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
             other => panic!("finite-difference gradient checking requires an f64 or c128 input but got {other}"),
         }
-    }};
+    }
+
+    /// Evaluates the rank-0 real `f64` output of a [`check_gradient!`] function, panicking with the function's error
+    /// if it fails.
+    #[track_caller]
+    fn evaluate_scalar(evaluate: &dyn Fn(Array) -> Result<Array, ProgramError>, input: Array) -> f64 {
+        match evaluate(input) {
+            Ok(output) => output.to_f64s()[0],
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Returns the central finite-difference estimate `(f(plus) - f(minus)) / (2 * step)` of `evaluate`.
+    #[track_caller]
+    fn central_difference(
+        evaluate: &dyn Fn(Array) -> Result<Array, ProgramError>,
+        plus: Array,
+        minus: Array,
+        step: f64,
+    ) -> f64 {
+        (evaluate_scalar(evaluate, plus) - evaluate_scalar(evaluate, minus)) / (2.0 * step)
+    }
+
+    /// Returns the `f64` array `input` with its element at `index` shifted by `delta`.
+    #[track_caller]
+    fn perturbed_real(input: &Array, input_type: &ArrayType, index: usize, delta: f64) -> Array {
+        let mut values = input.to_f64s();
+        values[index] += delta;
+        Array::from_elements::<f64>(input_type.clone(), &values).unwrap()
+    }
+
+    /// Returns the `c128` array with real parts `real_values` and imaginary parts `imaginary_values`, with the element
+    /// at `index` shifted by `real_delta` and `imaginary_delta`, respectively.
+    #[track_caller]
+    fn perturbed_complex(
+        part_type: &ArrayType,
+        real_values: &[f64],
+        imaginary_values: &[f64],
+        index: usize,
+        real_delta: f64,
+        imaginary_delta: f64,
+    ) -> Array {
+        let mut real_values = real_values.to_vec();
+        let mut imaginary_values = imaginary_values.to_vec();
+        real_values[index] += real_delta;
+        imaginary_values[index] += imaginary_delta;
+        Complex::complex(
+            &Array::from_elements::<f64>(part_type.clone(), &real_values).unwrap(),
+            &Array::from_elements::<f64>(part_type.clone(), &imaginary_values).unwrap(),
+        )
+        .unwrap()
+    }
 }
 
 pub use crate::{
@@ -5740,7 +6157,7 @@ mod tests {
 
     define_elementwise_operation!(
         @unary
-        /// Unary operation used to test custom data-type inference.
+        /// Unary operation used to test custom data type inference.
         TestMagnitudeOperation,
         TEST_MAGNITUDE_OPERATION_NAME,
         Abs,
@@ -5756,7 +6173,7 @@ mod tests {
 
     define_elementwise_operation!(
         @binary
-        /// Binary operation used to test custom array-type inference.
+        /// Binary operation used to test custom array type inference.
         TestStrictAddOperation,
         TEST_STRICT_ADD_OPERATION_NAME,
         Add,
