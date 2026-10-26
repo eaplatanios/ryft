@@ -341,15 +341,15 @@ pub trait ScanType:
     /// output types, `[carry..., stacked_y...]`. The expected operation input types are derived from the body
     /// signature. Carries and reference stacks are validated against their body-declared types, and stacked arrays
     /// through their slices, which are what the body receives on each iteration (refer to [`ScanOperation`] for how
-    /// a slice drops the placement of the scan axis). Actual `input_types` may carry more precise metadata, such as the
-    /// normalized [`Sharding`](crate::Sharding)s that concrete backend array types carry. Validation therefore uses the
-    /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. Reference
-    /// inputs refine their declared referents, and an aliased carry output retains its input allocation's own type. The
-    /// output types are the carry output types of the body followed by its stacked output types, each stacked along a
-    /// new leading scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the
-    /// body to sharded inputs) and leave unspecified the ones that it does not. They are further refined by the static
-    /// extents that the inputs establish for dynamic dimensions (e.g., an `f32[3]` carry input for a carry that the
-    /// body declares as `f32[rows]`), except where a carry defines the dimension's identity and may therefore change
+    /// a slice drops the placement of the scan axis). Actual `input_types` may carry more precise metadata, such as
+    /// the normalized [`Sharding`]s that concrete backend array types carry. Validation therefore uses the directional
+    /// declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. Reference inputs refine
+    /// their declared referents, and an aliased carry output retains its input allocation's own type. The output types
+    /// are the carry output types of the body followed by its stacked output types, each stacked along a new leading
+    /// scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the body to
+    /// sharded inputs) and leave unspecified the ones that it does not. They are further refined by the static extents
+    /// that the inputs establish for dynamic dimensions (e.g., an `f32[3]` carry input for a carry that the body
+    /// declares as `f32[rows]`), except where a carry defines the dimension's identity and may therefore change
     /// it across iterations.
     ///
     /// # Parameters
@@ -1183,7 +1183,7 @@ impl<T: ScanType> ScanOperation<T> {
                 self.stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
             let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
                 // Inserting a replicated dimension into a valid sharding cannot fail.
-                slice_type.with_inserted_dimension(0, iteration_count.clone()).unwrap()
+                slice_type.with_inserted_dimension(0, iteration_count.clone())?
             } else {
                 slice_type.batched(0, iteration_count.clone(), stacked_axis_sharding.clone()).map_err(|error| {
                     TypeError::invalid(format!(
@@ -9697,7 +9697,11 @@ mod tests {
                 .to_vec()
         });
         assert_eq!(
-            context.bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![doubling_body], &[initial.clone()]),
+            context.bind(
+                TestOperation::Scan(TestScanOperation::new(1, 3)),
+                vec![doubling_body],
+                std::slice::from_ref(&initial)
+            ),
             Ok(vec![Array::scalar(8.0).unwrap()]),
         );
 
@@ -9780,7 +9784,7 @@ mod tests {
         .into());
         let carry = array(Array::scalar(1.0f64).unwrap());
         assert_eq!(
-            context.bind(ScanOperation::<ArrayIrType>::new(1, 0), vec![body.clone()], &[carry.clone()]),
+            context.bind(ScanOperation::<ArrayIrType>::new(1, 0), vec![body.clone()], std::slice::from_ref(&carry)),
             expected
         );
         assert_eq!(context.bind(ScanOperation::<ArrayIrType>::new(1, 1), vec![body], &[carry]), expected);
@@ -10466,7 +10470,7 @@ mod tests {
 
         /// Evaluates the unrolled recurrence eagerly, indexing `stack` in the requested iteration order.
         fn unrolled(stack: &ArrayReference<Array>, iterations: &[usize]) -> Result<Vec<TestIrValue>, ProgramError> {
-            let mut carry = Array::scalar(1.0f32).unwrap();
+            let mut carry = Array::scalar(1.0f32)?;
             for &iteration in iterations {
                 let element = stack.with_transform(ArrayReferenceTransform::Index {
                     axis: 0,
@@ -10871,7 +10875,7 @@ mod tests {
         );
         let items = Array::from_elements::<f64>(stacked_type, &[5.0, 7.0]).unwrap();
         assert_eq!(
-            evaluation.interpret(&TestEagerContext::new(), &[items.clone()]),
+            evaluation.interpret(&TestEagerContext::new(), std::slice::from_ref(&items)),
             Ok(vec![Array::scalar(3.0).unwrap(), items]),
         );
     }
@@ -12473,7 +12477,7 @@ mod tests {
         let carry_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         let stacked_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3]));
         assert_eq!(program.output_types(), vec![carry_type.clone(), stacked_type.clone()]);
-        let arguments = vec![
+        let arguments = [
             array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             array(
                 Array::from_elements::<f64>(
@@ -22634,7 +22638,12 @@ mod tests {
             ))),
         );
         assert_eq!(
-            ArrayType::validate_scan_body_type_signature(&body_input_types[1..], &[scalar_type.clone()], 0, &length),
+            ArrayType::validate_scan_body_type_signature(
+                &body_input_types[1..],
+                std::slice::from_ref(&scalar_type),
+                0,
+                &length
+            ),
             Err(TypeError::invalid(format!(
                 "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
                  array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
@@ -22681,7 +22690,12 @@ mod tests {
             Ok(()),
         );
         assert_eq!(
-            ArrayType::validate_scan_input_type_signature(&body_input_types, 1, &length, &[scalar_type.clone()]),
+            ArrayType::validate_scan_input_type_signature(
+                &body_input_types,
+                1,
+                &length,
+                std::slice::from_ref(&scalar_type)
+            ),
             Err(TypeError::invalid("expected 2 inputs but got 1")),
         );
         assert_eq!(
@@ -23167,7 +23181,11 @@ mod tests {
             |(inputs, scalar)| {
                 let count = scalar
                     .context()
-                    .bind(DimensionFromScalarOperation::new(count_type.clone()), Vec::new(), &[scalar.clone()])?
+                    .bind(
+                        DimensionFromScalarOperation::new(count_type.clone()),
+                        Vec::new(),
+                        std::slice::from_ref(&scalar),
+                    )?
                     .remove(0);
                 scan(|_, (), input| Ok(((), input)), (), inputs, ScanOptions::new().with_iteration_count(count))
             },
@@ -23225,7 +23243,7 @@ mod tests {
                 |_, (first, second), ()| Ok(((second, first), ())),
                 (first, second),
                 (),
-                ScanOptions::new().with_iteration_count(0)
+                ScanOptions::new().with_iteration_count(0),
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the loop \
@@ -23240,7 +23258,7 @@ mod tests {
             |anchor| {
                 anchor.context().scan(
                     |index, (), ()| {
-                        index.context().bind(PrintOperation::new("step"), Vec::new(), &[index.clone()])?;
+                        index.context().bind(PrintOperation::new("step"), Vec::new(), std::slice::from_ref(&index))?;
                         Ok(((), ()))
                     },
                     (),
