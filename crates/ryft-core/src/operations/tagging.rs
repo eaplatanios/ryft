@@ -172,7 +172,7 @@ impl<C: Context<Type = ArrayType, Operation: From<TagOperation<ArrayType>>>, P: 
         // metadata. Treating the tag as an interpreted identity would drop it from staged batched programs, where
         // key-based consumers such as rematerialization policies look for it.
         check_count!("input", inputs, 1, ProgramError);
-        context.forward_to_parent(C::Operation::from(self.clone()), inputs)
+        context.forward_to_parent(self.clone().into(), inputs)
     }
 }
 

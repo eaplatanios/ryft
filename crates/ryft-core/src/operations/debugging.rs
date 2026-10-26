@@ -220,7 +220,7 @@ impl<C: Context<Type = ArrayType, Operation: From<PrintOperation<ArrayType>>>, P
         // print the parent's input at transformation time and drop the instruction and its effect from the programs
         // that a staging parent produces.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into())
+        Ok(context.forward_to_parent(self.clone().into(), inputs)?.into())
     }
 }
 

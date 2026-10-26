@@ -173,7 +173,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelVaryOperation>>, P: Ar
             }
             .into());
         }
-        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?)
+        Ok(context.forward_to_parent(self.clone().into(), inputs)?)
     }
 }
 

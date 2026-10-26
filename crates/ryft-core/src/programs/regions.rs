@@ -1163,9 +1163,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> Copy for RegionRef<'_, V, O> {}
+impl<'r, V: Value, O: Operation<Type = V::Type>> Copy for RegionRef<'r, V, O> {}
 
-impl<V: Value, O: Operation<Type = V::Type>> Clone for RegionRef<'_, V, O> {
+impl<'r, V: Value, O: Operation<Type = V::Type>> Clone for RegionRef<'r, V, O> {
     #[inline]
     fn clone(&self) -> Self {
         *self

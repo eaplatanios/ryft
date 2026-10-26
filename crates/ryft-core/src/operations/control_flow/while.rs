@@ -580,7 +580,7 @@ where
                     conditional_inputs.push(predicate);
                     conditional_inputs.extend(outputs);
                     outputs = context.parent().bind(
-                        C::Operation::from(ConditionOperation::<T>::new()),
+                        ConditionOperation::<T>::new(),
                         vec![body_program, unchanged],
                         conditional_inputs.as_slice(),
                     )?;
@@ -723,11 +723,7 @@ where
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, condition, body)?;
         if inputs.iter().all(PartialEvaluationValue::is_known) {
-            return context.fold_or_residualize(
-                C::Operation::from(*self),
-                vec![condition.to_program(), body.to_program()],
-                inputs,
-            );
+            return context.fold_or_residualize(*self, vec![condition.to_program(), body.to_program()], inputs);
         }
 
         let state_types = body.input_types();
@@ -746,11 +742,7 @@ where
             || condition.effects().has_deferred_work()
             || body.effects().has_deferred_work()
         {
-            return context.fold_or_residualize(
-                C::Operation::from(*self),
-                vec![condition.to_program(), body.to_program()],
-                inputs,
-            );
+            return context.fold_or_residualize(*self, vec![condition.to_program(), body.to_program()], inputs);
         }
 
         // Every pure fallback below first attempts the closed-knownness split — a known state subset whose next
@@ -763,11 +755,7 @@ where
             {
                 return Ok(outputs);
             }
-            context.fold_or_residualize(
-                C::Operation::from(*self),
-                vec![condition.to_program(), body.to_program()],
-                inputs,
-            )
+            context.fold_or_residualize(*self, vec![condition.to_program(), body.to_program()], inputs)
         };
 
         // A state element can only fold if its type is not a reference and mentions no type identity (see the rule
@@ -874,11 +862,7 @@ where
         )? {
             return Ok(outputs);
         }
-        context.fold_or_residualize(
-            C::Operation::from(while_operation),
-            vec![residual_condition, residual_body],
-            inputs,
-        )
+        context.fold_or_residualize(while_operation, vec![residual_condition, residual_body], inputs)
     }
 }
 
@@ -1859,11 +1843,8 @@ where
     let activity = while_tangent_activity(driver, driver.region(1)?, inputs)?;
     if activity.1.input_indices().is_empty() {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let outputs = context.primal().bind(
-            C::Operation::from(*operation),
-            vec![condition.clone(), body.clone()],
-            primal_inputs.as_slice(),
-        )?;
+        let outputs =
+            context.primal().bind(*operation, vec![condition.clone(), body.clone()], primal_inputs.as_slice())?;
         check_count!("output", outputs, state_count, ProgramError);
         return outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
     }
@@ -1892,9 +1873,10 @@ where
         extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0))?);
         // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
         // requested through the instruction-scoped driver over them.
+        let masked_while: C::Operation = masked_while.into();
         let mut outputs = driver.bind_jvp_operation(
             context,
-            &C::Operation::from(masked_while),
+            &masked_while,
             vec![masked_condition, masked_body],
             extended_inputs.as_slice(),
         )?;
@@ -2003,7 +1985,7 @@ where
         primal_inputs.push(zeros.remove(0));
     }
     let mut while_outputs = context.primal().bind(
-        C::Operation::from(WhileOperation::new().with_iteration_bound(bound)?),
+        WhileOperation::new().with_iteration_bound(bound)?,
         vec![extended_condition, augmented_body],
         primal_inputs.as_slice(),
     )?;
@@ -2120,7 +2102,7 @@ where
                 conditional_inputs
                     .extend_from_slice(&iteration_inputs[invariant_residual_count + tangent_state_count..]);
                 let conditional_outputs = trace_context.bind(
-                    C::Operation::from(ConditionOperation::new()),
+                    ConditionOperation::new(),
                     vec![active_body, passive_body],
                     conditional_inputs.as_slice(),
                 )?;
@@ -2158,10 +2140,7 @@ where
     );
     tangent_scan_inputs.push(context.primal_to_tangent(mask_stack)?);
     let tangent_scan = ScanOperation::<C::Type>::new(invariant_residual_count + tangent_state_count, bound);
-    let tangent_outputs =
-        context
-            .tangent()
-            .bind(C::Operation::from(tangent_scan), vec![scan_body], tangent_scan_inputs.as_slice())?;
+    let tangent_outputs = context.tangent().bind(tangent_scan, vec![scan_body], tangent_scan_inputs.as_slice())?;
     check_count!("output", tangent_outputs, invariant_residual_count + tangent_state_count, ProgramError);
     let tangent_outputs = tangent_outputs.into_iter().skip(invariant_residual_count).collect();
     DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &input_tangent_liveness)
@@ -2267,17 +2246,13 @@ where
     }
     let fused_regions = [Arc::new(fused_condition), fused_body];
     let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-        context.primal().bind(
-            C::Operation::from(fused_while),
-            CalleeRegionDriver::new(&fused_regions),
-            &fused_inputs,
-        )?
+        context.primal().bind(fused_while, CalleeRegionDriver::new(&fused_regions), &fused_inputs)?
     } else {
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let arguments =
             fused_inputs.iter().map(|value| builder.add_input(value.r#type().into_owned())).collect::<Vec<_>>();
         let regions = fused_regions.iter().map(|program| builder.import_region(program.entry_region_ref())).collect();
-        let outputs = builder.add_instruction(C::Operation::from(fused_while), regions, arguments, None)?.to_vec();
+        let outputs = builder.add_instruction(fused_while, regions, arguments, None)?.to_vec();
         let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             outputs,
             vec![Placeholder; fused_state_count],

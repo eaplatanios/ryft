@@ -1268,8 +1268,7 @@ where
 
         // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
         let selected = intermediates.last().unwrap().clone();
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(AddOperation::new());
-        let operation = C::Operation::from(operation);
+        let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = AddOperation::new().into();
         let mut outputs = context.bind(operation, Vec::new(), &[selected, update])?;
         check_count!("output", outputs, 1, ProgramError);
         let accumulated = outputs.remove(0);

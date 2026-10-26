@@ -1362,7 +1362,7 @@ impl<T: Type> CastOperation<T> {
     ) -> Result<C::Value, ProgramError> {
         let input_type = value.r#type();
         let identity = !self.checked && witnesses.is_empty() && input_type.as_ref() == &self.output_type;
-        let operation = C::Operation::from(self);
+        let operation: C::Operation = self.into();
         if identity {
             // Equal types can still be invalid cast declarations (e.g., a reference or a named dimension output).
             operation.infer_output_types(std::slice::from_ref(input_type.as_ref()), &[])?;

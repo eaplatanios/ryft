@@ -336,11 +336,11 @@ where
 
             // A mesh reduction combines the local shards elementwise, so unrelated mapped axes pass through
             // untouched, exactly as they do through its adjoint `parallel_vary`.
-            return context.forward_to_parent(C::Operation::from(self.clone()), inputs);
+            return context.forward_to_parent(self.clone().into(), inputs);
         }
 
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return context.forward_to_parent(C::Operation::from(self.clone()), inputs);
+            return context.forward_to_parent(self.clone().into(), inputs);
         }
 
         if self.axis_index_groups.is_some() {

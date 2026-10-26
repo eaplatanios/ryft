@@ -1348,11 +1348,10 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingCont
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
         let Some(batch_axis) = input.batch_axis_position() else {
-            return Ok(self.forward_to_parent(C::Operation::from(operation.clone()), inputs)?);
+            return Ok(self.forward_to_parent(operation.clone().into(), inputs)?);
         };
         let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
-        let mut outputs =
-            self.parent().bind(C::Operation::from(operation), Vec::new(), std::slice::from_ref(input.value()))?;
+        let mut outputs = self.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(output_batch_axis))?])
     }

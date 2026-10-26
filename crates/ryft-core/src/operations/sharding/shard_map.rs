@@ -4038,7 +4038,6 @@ where
         for (output, root) in outputs[output_count..].iter_mut().zip(&edge_roots) {
             if root.is_some() {
                 let operation = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
-                let operation = C::Operation::from(operation);
                 *output = builder.add_instruction(operation, Vec::new(), vec![*output], None)?[0];
             }
         }
@@ -4087,7 +4086,7 @@ where
             .zip(&residuals)
             .map(|(input, residual)| match residual {
                 ShardMapResidual::ReferenceSnapshot(_) => {
-                    let operation = C::Operation::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+                    let operation = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
                     Ok(builder.add_instruction(operation, Vec::new(), vec![input.unwrap()], None)?[0])
                 }
                 _ => Ok(input.unwrap()),
