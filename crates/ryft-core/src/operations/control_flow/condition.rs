@@ -1974,14 +1974,17 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
     /// because the residual branch that the same predicate selects reads only this branch's edges. Returns a rejection
     /// message in the inner result when `build_placeholder_fn` cannot construct a placeholder for one of the edges of
     /// `peer`.
-    fn known_branch<
-        BuildPlaceholderFn: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
-    >(
+    #[allow(clippy::type_complexity)]
+    fn known_branch(
         &self,
         peer: &Self,
         is_true_branch: bool,
         output_known: &[bool],
-        build_placeholder_fn: &mut BuildPlaceholderFn,
+        build_placeholder_fn: &mut dyn FnMut(
+            &mut ProgramBuilder<V, O>,
+            &V::Type,
+            &[AtomId],
+        ) -> Result<Option<AtomId>, ProgramError>,
     ) -> Result<Result<Program<V, O, Vec<V>, Vec<V>>, String>, ProgramError> {
         // Replay the known program in a detached builder over matching known inputs. Placeholder failure may reject
         // the split, so this work must not reach the caller's context until both known branches are ready.
@@ -2157,6 +2160,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
 ///   - `bind_residual_fn`: Binds the residual condition over the predicate, the unknown inputs, and both branches'
 ///     residual edges, and returns the residual outputs.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn reconstruct_partitioned_condition<
     V: Value<Type: ConditionType>,
     O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
@@ -2174,6 +2178,48 @@ fn reconstruct_partitioned_condition<
     mut build_placeholder_fn: BuildPlaceholderFn,
     mut bind_known_fn: BindKnownFn,
     mut bind_residual_fn: BindResidualFn,
+) -> Result<Result<Vec<Input>, String>, ProgramError> {
+    reconstruct_partitioned_condition_erased(
+        predicate_type,
+        branch_input_types,
+        output_count,
+        inputs,
+        input_known,
+        partitions,
+        &mut build_placeholder_fn,
+        &mut bind_known_fn,
+        &mut bind_residual_fn,
+    )
+}
+
+/// Internal helper that rebuilds a partitioned conditional like [`reconstruct_partitioned_condition`] with the callback
+/// types erased. This is the body of that function, which only wraps its callbacks, so that this body is compiled once
+/// per value, operation, and input type rather than once per combination of callback types: every partial evaluation
+/// and linearization of a conditional would otherwise instantiate this body and every closure and iterator adapter in
+/// it again. Each callback is invoked exactly as often as by the wrapped function.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn reconstruct_partitioned_condition_erased<
+    V: Value<Type: ConditionType>,
+    O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
+    Input: Clone,
+>(
+    predicate_type: &V::Type,
+    branch_input_types: &[V::Type],
+    output_count: usize,
+    inputs: &[Input],
+    input_known: &[bool],
+    partitions: [PartitionedProgram<V, O>; 2],
+    build_placeholder_fn: &mut dyn FnMut(
+        &mut ProgramBuilder<V, O>,
+        &V::Type,
+        &[AtomId],
+    ) -> Result<Option<AtomId>, ProgramError>,
+    bind_known_fn: &mut dyn FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    bind_residual_fn: &mut dyn FnMut(
+        O,
+        Vec<Program<V, O, Vec<V>, Vec<V>>>,
+        &[Input],
+    ) -> Result<Vec<Input>, ProgramError>,
 ) -> Result<Result<Vec<Input>, String>, ProgramError> {
     let [true_partition, false_partition] = partitions;
     let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
@@ -2251,15 +2297,14 @@ fn reconstruct_partitioned_condition<
     let known_outputs = if known_side_is_empty {
         Vec::new()
     } else {
-        let known_true = match true_split.known_branch(&false_split, true, &output_known, &mut build_placeholder_fn)? {
+        let known_true = match true_split.known_branch(&false_split, true, &output_known, build_placeholder_fn)? {
             Ok(branch) => branch,
             Err(rejection) => return Ok(Err(rejection)),
         };
-        let known_false =
-            match false_split.known_branch(&true_split, false, &output_known, &mut build_placeholder_fn)? {
-                Ok(branch) => branch,
-                Err(rejection) => return Ok(Err(rejection)),
-            };
+        let known_false = match false_split.known_branch(&true_split, false, &output_known, build_placeholder_fn)? {
+            Ok(branch) => branch,
+            Err(rejection) => return Ok(Err(rejection)),
+        };
         let mut known_condition_inputs = vec![predicate.clone()];
         known_condition_inputs
             .extend(branch_inputs.iter().zip(input_known).filter(|(_, known)| **known).map(|(input, _)| input.clone()));

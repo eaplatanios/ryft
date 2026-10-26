@@ -3626,6 +3626,7 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
 ///   - `bind_residual_fn`: Binds the residual scan, preserving deferred work and effects.
 // These arguments keep source validation, boundary wiring, and the two binding destinations explicit.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn reconstruct_partitioned_scan<
     V: Value<Type: ScanType>,
     O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
@@ -3646,6 +3647,49 @@ fn reconstruct_partitioned_scan<
     mut resolve_constant_fn: ResolveConstantFn,
     mut bind_known_fn: BindKnownFn,
     mut bind_residual_fn: BindResidualFn,
+) -> Result<Option<Vec<Input>>, ProgramError> {
+    reconstruct_partitioned_scan_erased(
+        scan,
+        body_input_types,
+        inputs,
+        body_known,
+        iteration_count_known,
+        split_without_known_work,
+        partition,
+        &mut lift_known_fn,
+        &mut resolve_constant_fn,
+        &mut bind_known_fn,
+        &mut bind_residual_fn,
+    )
+}
+
+/// Internal helper that rebuilds a partitioned scan like [`reconstruct_partitioned_scan`] with the callback types
+/// erased. This is the body of that function, which only wraps its callbacks, so that this body is compiled once per
+/// value, operation, and input type rather than once per combination of callback types: every partial evaluation and
+/// linearization of a scan would otherwise instantiate this body and every closure and iterator adapter in it again.
+/// Each callback is invoked exactly as often as by the wrapped function.
+// These arguments keep source validation, boundary wiring, and the two binding destinations explicit.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn reconstruct_partitioned_scan_erased<
+    V: Value<Type: ScanType>,
+    O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
+    Input: Clone,
+>(
+    scan: &ScanOperation<V::Type>,
+    body_input_types: &[V::Type],
+    inputs: &[Input],
+    body_known: &[bool],
+    iteration_count_known: bool,
+    split_without_known_work: bool,
+    partition: PartitionedProgram<V, O>,
+    lift_known_fn: &mut dyn FnMut(V) -> Result<Input, ProgramError>,
+    resolve_constant_fn: &mut dyn FnMut(&Input) -> Option<V>,
+    bind_known_fn: &mut dyn FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    bind_residual_fn: &mut dyn FnMut(
+        O,
+        Vec<Program<V, O, Vec<V>, Vec<V>>>,
+        &[Input],
+    ) -> Result<Vec<Input>, ProgramError>,
 ) -> Result<Option<Vec<Input>>, ProgramError> {
     /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body
     /// passes through unchanged.
