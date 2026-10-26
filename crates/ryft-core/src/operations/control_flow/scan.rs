@@ -3253,7 +3253,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
             })
             .collect::<Vec<_>>();
         let body = self.activity.jvp_program().with_boundary(&self.input_order, &body_output_order)?;
-        let outputs = context.bind(C::Operation::from(self.operation.clone()), vec![body], scan_inputs)?;
+        let outputs = context.bind(self.operation.clone(), vec![body], scan_inputs)?;
         self.to_jvp_order(outputs)
     }
 
@@ -3529,10 +3529,13 @@ fn validate_scan_iteration_count<T: ScanType>(
                 None => format!("provably equal to `{iteration_count}`"),
             };
             return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` iteration count input has type `{iteration_count_type}` but stacked \
-                 input {} has type `{type}` whose leading dimension is not {requirement}",
+                "`{}` iteration count input has type `{}` but stacked input {} has type `{}` \
+                 whose leading dimension is not {}",
+                SCAN_OPERATION_NAME,
+                iteration_count_type,
                 carry_count + index,
-                r#type = r#type,
+                r#type,
+                requirement,
             )));
         }
     }
