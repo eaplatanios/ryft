@@ -2528,9 +2528,7 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Selection of the iteration count for a structured scan.
+/// Selection of the iteration count for a structured scan operation.
 #[derive(Clone, Debug)]
 enum ScanIterationCount<V> {
     /// Infer a static count from the stacked inputs.
@@ -2544,7 +2542,6 @@ enum ScanIterationCount<V> {
 }
 
 /// Configuration of [`Scan::scan`] and [`scan()`]. The carry count is derived from the structured initial state.
-///
 /// By default, the iteration count is inferred from a stacked input with a statically known leading extent. A scan
 /// without stacked values needs an explicit count. Dynamic counts use [`Self::with_iteration_count_value`], including
 /// dimension values whose types happen to pin one extent: the value remains an input so its validation is preserved.
@@ -2559,11 +2556,12 @@ pub struct ScanOptions<V: Value> {
     /// Number of body copies per lowered loop iteration.
     unroll: usize,
 
-    /// Placements of the leading axes of stacked output leaves.
+    /// Placements of the leading axes of stacked output values.
     stacked_axis_shardings: Vec<ShardingDimension>,
 }
 
 impl<V: Value> Default for ScanOptions<V> {
+    #[inline]
     fn default() -> Self {
         Self {
             iteration_count: ScanIterationCount::Inferred,
@@ -2573,6 +2571,8 @@ impl<V: Value> Default for ScanOptions<V> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value> ScanOptions<V> {
     /// Creates options that infer the count and visit slices in forward order without unrolling.
@@ -2614,7 +2614,7 @@ impl<V: Value> ScanOptions<V> {
         Ok(self)
     }
 
-    /// Sets the scan-axis placements of the stacked output leaves, in parameter order (refer to
+    /// Sets the scan-axis placements of the stacked output values, in parameter order (refer to
     /// [`ScanOperation::with_stacked_axis_shardings`]).
     #[inline]
     pub fn with_stacked_axis_shardings(mut self, shardings: Vec<ShardingDimension>) -> Self {
@@ -3846,6 +3846,7 @@ impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
                 Ok(input.clone())
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         // Batch one iteration at its replicated index, carry axes, and slice axes. Join carry axes to a fixed point
         // so every carry leaves at the same axis at which it entered, then broadcast any widened initial carries.
         let mut iteration_axes = std::iter::once(BatchAxis::replicated())
