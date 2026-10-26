@@ -3375,9 +3375,16 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         Ok(self.to_jvp_order(outputs.into_iter().map(|(value, _)| value).collect())?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Reorders the outputs of the fused scan from scan order into Jacobian-Vector Product (JVP) order.
+    /// Reorders the fused scan's `outputs` into Jacobian-Vector Product (JVP) order (i.e., all primal outputs, followed
+    /// by their live tangents in the same order). The scan groups primal and tangent carries before stacked outputs.
+    /// For example, with one carry and one stacked output, both with live tangents:
+    ///
+    /// ```text
+    ///   Scan Order: [carry, carry_tangent, stack, stack_tangent]
+    ///   JVP Order:  [carry, stack, carry_tangent, stack_tangent]
+    /// ```
+    ///
+    /// Outputs without a live tangent contribute only their primal value to either order.
     ///
     /// # Errors
     ///
@@ -3391,13 +3398,13 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         Ok(ordered.into_iter().map(Option::unwrap).collect())
     }
 
-    /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
-    /// (`[primal_entries..., live(tangent_entries)...]`) into scan order, where carries lead the scanned entries on
-    /// both the primal and live tangent sides: `[primal_carries..., live(tangent_carries)..., primal_scanned...,
-    /// live(tangent_scanned)...]`. The `has_tangent` mask marks the primal entries whose tangent entry exists in the
-    /// compact signature; the position of the `k`-th live entry's tangent entry is the number of primal entries plus
-    /// `k`. The first `carry_count` primal entries form the carry block, including the intrinsic index for an input
-    /// signature, so `carry_count` must not exceed the number of entries.
+    /// Returns the permutation that converts one side of a compact fused JVP body signature from Jacobian-Vector
+    /// Product (JVP) order (i.e., `[primal_entries..., live(tangent_entries)...]`) into scan order, where carries
+    /// lead the scanned entries on both the primal and live tangent sides (i.e., `[primal_carries...,
+    /// live(tangent_carries)..., primal_scanned..., live(tangent_scanned)...]`. The `has_tangent` mask marks the primal
+    /// entries whose tangent entry exists in the compact signature; the position of the `k`-th live entry's tangent
+    /// entry is the number of primal entries plus `k`. The first `carry_count` primal entries form the carry block,
+    /// including the intrinsic index for an input signature, so `carry_count` must not exceed the number of entries.
     fn signature_permutation(has_tangent: &[bool], carry_count: usize) -> Vec<usize> {
         let entry_count = has_tangent.len();
         let tangent_positions = has_tangent
@@ -3416,6 +3423,8 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         permutation
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
 /// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is only a
