@@ -3421,15 +3421,13 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
-/// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is only a
-/// hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the compiler
-/// remains free to place the slice. A scan axis sharded over [`Manual`](MeshAxisType::Manual) mesh axes makes those
-/// axes vary across the slice (refer to [`ArrayType::without_dimension`]), while one sharded over
-/// [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit reshard can remove an explicit
-/// placement.
+/// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is
+/// only a hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the
+/// compiler remains free to place the slice. A scan axis sharded over [`Manual`](MeshAxisType::Manual) mesh axes makes
+/// those axes vary across the slice (refer to [`ArrayType::without_dimension`]), while one sharded over
+/// [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit reshard can
+/// remove an explicit placement.
 fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, Dimension), TypeError> {
     let mut stacked_type = stacked_type.clone();
     if let Some(sharding) = stacked_type.sharding()
@@ -3454,6 +3452,8 @@ fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, 
         ))
     })
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates the runtime dimension's identity or singleton refinement independently of stacked-axis equality.
 fn validate_scan_iteration_count_type<T: ScanType>(
