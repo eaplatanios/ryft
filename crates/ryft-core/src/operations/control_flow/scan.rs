@@ -3196,11 +3196,9 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         Ok(Self { operation, activity, input_order, output_order })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the inputs of the fused scan for the input duals `inputs`: the primals and the live tangents in scan
-    /// order, followed by the iteration count of a scan with a dynamic iteration count. A carry that the fixed point
-    /// made live from a structural-zero initial tangent receives that zero materialized from its own primal.
+    /// Returns the input values of the fused scan for the input duals `inputs` (i.e., the primals and the live tangents
+    /// in scan order, followed by the iteration count of a scan with a dynamic iteration count). A carry that the fixed
+    /// point made live from a structural-zero initial tangent receives that zero materialized from its own primal.
     ///
     /// # Errors
     ///
@@ -3234,10 +3232,10 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
             .collect())
     }
 
-    /// Binds the fused scan in `context`, which is both the primal and the tangent context, to `scan_inputs` (refer to
-    /// [`Self::inputs`]), and returns its outputs in JVP order. The fused body reorders the forward-mode program of the
-    /// body into scan order and selects its live tangent outputs while doing so, which avoids an intermediate projected
-    /// program.
+    /// Binds the fused scan operation in `context`, which is both the primal and the tangent context, to `scan_inputs`
+    /// (refer to [`Self::inputs`]), and returns its outputs in Jacobian-Vector Product (JVP) order. The fused body
+    /// reorders the forward mode program of the body into scan order and selects its live tangent outputs while doing
+    /// so, which avoids an intermediate projected program.
     ///
     /// # Errors
     ///
@@ -3262,12 +3260,12 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         self.to_jvp_order(outputs)
     }
 
-    /// Stages the separate-destination linearization of the fused scan, applied to `scan_inputs` (refer to
-    /// [`Self::inputs`]), and returns its outputs in JVP order. The `body` is linearized through `driver` and the
-    /// linearization is joined over the fused boundary into a primal scan bound in the primal context and a tangent
-    /// scan bound in the tangent context (refer to `reconstruct_partitioned_scan`), which stacks varying residuals,
-    /// forwards stacked inputs and invariant carries, and hoists computed invariants. The caller has guarded the scan
-    /// boundary, so the primal input types prove every relationship that it checks.
+    /// Stages the separate destination linearization of the fused scan operation, applied to `scan_inputs` (refer to
+    /// [`Self::inputs`]), and returns its outputs in Jacobian-Vector Product (JVP) order. The `body` is linearized
+    /// through `driver` and the linearization is joined over the fused boundary into a primal scan bound in the primal
+    /// context and a tangent scan bound in the tangent context (refer to `reconstruct_partitioned_scan`), which stacks
+    /// varying residuals, forwards stacked inputs and invariant carries, and hoists computed invariants. The caller has
+    /// guarded the scan boundary, so the primal input types prove every relationship that it checks.
     ///
     /// # Errors
     ///
@@ -3288,6 +3286,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         let live_input_count = self.activity.input_indices().len();
         let (primal_program, tangent_program, residual_count) =
             driver.linearize_program(body, self.activity.input_indices())?.into_parts();
+
         // The linearized tangent program returns one tangent per output tangent slot, so the structural zeros that the
         // fixed point identified are projected out exactly as for the fused body.
         let live_tangent_slots = self.activity.live_tangent_slots(self.activity.output_tangent_liveness());
@@ -3333,8 +3332,10 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
             true,
             partition,
             |constant| Ok((context.primal().lift(constant)?, true)),
-            // Residuals of a linearization stay inputs of its tangent program instead of being embedded in it.
-            |_| None,
+            |_| {
+                // Residuals of a linearization stay inputs of its tangent program instead of being embedded in it.
+                None
+            },
             |operation, programs, inputs| {
                 let inputs = inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
                 Ok(context
@@ -3370,10 +3371,13 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
                  reference as a differentiated input or discharge the references first",
             ),
         })?;
+
         Ok(self.to_jvp_order(outputs.into_iter().map(|(value, _)| value).collect())?)
     }
 
-    /// Reorders the outputs of the fused scan from scan order into JVP order.
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Reorders the outputs of the fused scan from scan order into Jacobian-Vector Product (JVP) order.
     ///
     /// # Errors
     ///
