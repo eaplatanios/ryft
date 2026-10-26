@@ -2102,17 +2102,17 @@ where
             }
         }
 
-        let fused = FusedScanJvp::<C>::new(self, driver, &inputs)?;
-        let scan_inputs = fused.inputs(context, &inputs)?;
+        let jvp = ScanJvp::<C>::new(self, driver, &inputs)?;
+        let scan_inputs = jvp.inputs(context, &inputs)?;
         let mut primal_outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-            fused.bind_fused(context.primal(), &scan_inputs)?
+            jvp.bind_fused(context.primal(), &scan_inputs)?
         } else {
-            fused.bind_linearized(context, driver, body, &scan_inputs)?
+            jvp.bind_linearized(context, driver, body, &scan_inputs)?
         };
 
         // Both paths return primals followed by live tangents. Restore structural-zero output tangents before
         // forwarding unchanged carries from their guarded inputs.
-        let output_live = fused.activity.output_tangent_liveness();
+        let output_live = jvp.activity.output_tangent_liveness();
         let tangent_outputs = primal_outputs.split_off(output_live.len());
         let mut outputs = DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, output_live)?;
         self.forward_carries(body, &inputs, &mut outputs);
@@ -3964,41 +3964,17 @@ fn reconstruct_partitioned_scan<
     ))
 }
 
-/// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
-/// (`[primal_entries..., live(tangent_entries)...]`) into scan order, where carries lead the scanned entries on both
-/// the primal and live tangent sides: `[primal_carries..., live(tangent_carries)..., primal_scanned...,
-/// live(tangent_scanned)...]`. The `has_tangent` mask marks the primal entries whose tangent entry exists in the
-/// compact signature; the position of the `k`-th live entry's tangent entry is the number of primal entries plus `k`.
-/// The first `carry_count` primal entries are the carries, so `carry_count` must not exceed the number of entries.
-fn live_scan_signature_permutation(has_tangent: &[bool], carry_count: usize) -> Vec<usize> {
-    let entry_count = has_tangent.len();
-    let tangent_positions = has_tangent
-        .iter()
-        .scan(entry_count, |next_position, &live| {
-            let position = live.then_some(*next_position);
-            *next_position += usize::from(live);
-            Some(position)
-        })
-        .collect::<Vec<_>>();
-    let mut permutation = Vec::with_capacity(entry_count + has_tangent.iter().filter(|&&live| live).count());
-    permutation.extend(0..carry_count);
-    permutation.extend(tangent_positions[..carry_count].iter().flatten());
-    permutation.extend(carry_count..entry_count);
-    permutation.extend(tangent_positions[carry_count..].iter().flatten());
-    permutation
-}
-
-/// Fused forward-mode application of a [`ScanOperation`]: one scan over the compact fused body that carries a tangent
+/// Forward-mode application of a [`ScanOperation`]: one scan over the compact fused body that carries a tangent
 /// exactly for the body inputs and outputs whose tangents are live. Plumbing references, zero-space inputs, and
 /// structural-zero tangents are not live, so inactive carries keep structural-zero tangents instead of threading
 /// materialized zeros through the loop, and stacked outputs whose tangents depend on no live tangent (including one
 /// produced by an explicitly zero instruction in a body whose references make every other value conservatively
 /// dependent; refer to [`Program::output_dependence`]) leave the scan as symbolic zeros instead of materialized zero
 /// stacks. Carry liveness is the monotone fixed point of [`TangentActivity::from_loop_body`]. The fused boundary is in
-/// scan order (refer to `live_scan_signature_permutation`), so the live carry tangents become carries of the fused
+/// scan order (refer to [`Self::signature_permutation`]), so the live carry tangents become carries of the fused
 /// scan. Shared destinations bind this scan directly (refer to [`Self::bind_fused`]), while separate destinations
 /// linearize the body and join the linearization over the same boundary (refer to [`Self::bind_linearized`]).
-struct FusedScanJvp<C: Context> {
+struct ScanJvp<C: Context> {
     /// Fused scan, which carries the live carry tangents after the primal carries.
     operation: ScanOperation<C::Type>,
 
@@ -4012,7 +3988,7 @@ struct FusedScanJvp<C: Context> {
     output_order: Vec<usize>,
 }
 
-impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
+impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
     /// Analyzes the forward-mode activity of an application of `scan` to the input duals `inputs` and derives its
     /// fused body through `driver`, whose region 0 is the body.
     ///
@@ -4032,8 +4008,8 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
         let (input_tangent_liveness, activity) =
             TangentActivity::from_loop_body(driver, body, input_tangent_liveness, 1..1 + carry_count, 0..carry_count)?;
         let output_live = activity.output_tangent_liveness();
-        let input_order = live_scan_signature_permutation(&input_tangent_liveness, carry_count + 1);
-        let output_order = live_scan_signature_permutation(output_live, carry_count);
+        let input_order = Self::signature_permutation(&input_tangent_liveness, carry_count + 1);
+        let output_order = Self::signature_permutation(output_live, carry_count);
         let live_carry_count = input_tangent_liveness[1..=carry_count].iter().filter(|&&live| live).count();
         // The fused scan stacks the primal stacked outputs at their placements, followed by the live tangents of the
         // stacked outputs, which are placed like their primals.
@@ -4236,6 +4212,31 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
             ordered[position] = Some(output);
         }
         Ok(ordered.into_iter().map(Option::unwrap).collect())
+    }
+
+    /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
+    /// (`[primal_entries..., live(tangent_entries)...]`) into scan order, where carries lead the scanned entries on
+    /// both the primal and live tangent sides: `[primal_carries..., live(tangent_carries)..., primal_scanned...,
+    /// live(tangent_scanned)...]`. The `has_tangent` mask marks the primal entries whose tangent entry exists in the
+    /// compact signature; the position of the `k`-th live entry's tangent entry is the number of primal entries plus
+    /// `k`. The first `carry_count` primal entries form the carry block, including the intrinsic index for an input
+    /// signature, so `carry_count` must not exceed the number of entries.
+    fn signature_permutation(has_tangent: &[bool], carry_count: usize) -> Vec<usize> {
+        let entry_count = has_tangent.len();
+        let tangent_positions = has_tangent
+            .iter()
+            .scan(entry_count, |next_position, &live| {
+                let position = live.then_some(*next_position);
+                *next_position += usize::from(live);
+                Some(position)
+            })
+            .collect::<Vec<_>>();
+        let mut permutation = Vec::with_capacity(entry_count + has_tangent.iter().filter(|&&live| live).count());
+        permutation.extend(0..carry_count);
+        permutation.extend(tangent_positions[..carry_count].iter().flatten());
+        permutation.extend(carry_count..entry_count);
+        permutation.extend(tangent_positions[carry_count..].iter().flatten());
+        permutation
     }
 }
 
@@ -23239,11 +23240,14 @@ mod tests {
     }
 
     #[test]
-    fn test_live_scan_signature_permutation() {
+    fn test_scan_jvp_signature_permutation() {
         // The live tangent entries follow all primal entries in JVP order. Scan order interleaves them so that the
         // carries, followed by the live carry tangents, lead the scanned entries and their live tangents.
-        assert_eq!(live_scan_signature_permutation(&[true, false, true, true], 2), vec![0, 1, 4, 2, 3, 5, 6]);
-        assert_eq!(live_scan_signature_permutation(&[false, true, false], 1), vec![0, 1, 2, 3]);
-        assert_eq!(live_scan_signature_permutation(&[false, false], 2), vec![0, 1]);
+        assert_eq!(
+            ScanJvp::<TestEagerContext>::signature_permutation(&[true, false, true, true], 2),
+            vec![0, 1, 4, 2, 3, 5, 6],
+        );
+        assert_eq!(ScanJvp::<TestEagerContext>::signature_permutation(&[false, true, false], 1), vec![0, 1, 2, 3]);
+        assert_eq!(ScanJvp::<TestEagerContext>::signature_permutation(&[false, false], 2), vec![0, 1]);
     }
 }
