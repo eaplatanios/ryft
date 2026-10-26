@@ -2120,8 +2120,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     T: ScanType + DifferentiableType,
     V: Value<Type = T>,
@@ -2378,17 +2376,6 @@ where
             let reversed_body = Arc::new(reversed_body);
             let (scan_inputs, iteration_count_inputs) = inputs.split_at(input_linear.len());
 
-            // A dead carry still needs an initial cotangent value for the recurrence. Gather live output cotangents,
-            // known inputs, and cotangent references as sources of the runtime identities needed to materialize that
-            // zero.
-            let dimension_sources = || {
-                outputs
-                    .iter()
-                    .filter_map(MaybeZero::as_value)
-                    .chain(inputs.iter().filter_map(PartialValue::as_known))
-                    .chain(cotangents.references())
-            };
-
             // Every non-linear input is known by the classification above. Consume cotangent references in input order,
             // carrying live reference state unchanged through the reversed iterations and omitting ignored references.
             let mut cotangent_references = cotangents.references().iter();
@@ -2400,18 +2387,25 @@ where
                     }
                     CotangentDestinationKind::Ignore => {}
                     CotangentDestinationKind::Return if input_linear[index] => {
+                        // A dead carry still needs an initial cotangent value for the recurrence. Gather live output
+                        // cotangents, known inputs, and cotangent references as sources of the runtime identities
+                        // needed to materialize that zero.
                         reversed_inputs.push(O::materialize_zero_from_residual_sources(
                             &**context,
                             outputs[index].clone(),
-                            dimension_sources(),
+                            outputs
+                                .iter()
+                                .filter_map(MaybeZero::as_value)
+                                .chain(inputs.iter().filter_map(PartialValue::as_known))
+                                .chain(cotangents.references()),
                         )?);
                     }
                     CotangentDestinationKind::Return => reversed_inputs.push(input.as_known().unwrap().clone()),
                 }
             }
 
-            // Live stacked output cotangents enter as slices. Their types are those of the scan's output stacks; zero
-            // seeds and zero-space cotangents have no reversed-scan input.
+            // Live stacked output cotangents enter as slices. Their types are those of the scan's output stacks;
+            // zero seeds and zero-space cotangents have no reversed-scan input.
             for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
                 if let MaybeZero::Value(cotangent) = cotangent
                     && !output_type.is_reference()
@@ -2441,8 +2435,8 @@ where
             for input in iteration_count_inputs {
                 reversed_inputs.push(input.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
                     message: format!(
-                        "`{SCAN_OPERATION_NAME}` transposition does not support a linear iteration count input; the \
-                         iteration count is not differentiable",
+                        "`{SCAN_OPERATION_NAME}` transposition does not support a linear iteration count input; \
+                         the iteration count is not differentiable",
                     ),
                 })?);
             }
@@ -2471,7 +2465,7 @@ where
                 .collect();
 
             // Reverse visit order while preserving iteration count and the lowering-only unroll factor. Residual stack
-            // slice i then meets the cotangent for the same forward iteration without reversing any arrays.
+            // slice `i` then meets the cotangent for the same forward iteration without reversing any arrays.
             let reversed = ScanOperation {
                 carry_count: retained_carry_count,
                 reverse: !self.reverse,
@@ -2525,12 +2519,16 @@ where
                 })
                 .collect::<Result<Vec<_>, DifferentiationError>>()?
         };
+
         for (accumulator, contribution) in accumulators.iter().zip(contributions) {
             accumulator.accumulate(context, contribution)?;
         }
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Selection of the iteration count for a structured scan.
 #[derive(Clone, Debug)]
