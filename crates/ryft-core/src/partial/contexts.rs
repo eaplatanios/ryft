@@ -19,9 +19,9 @@ use crate::partial::values::{
 };
 use crate::programs::operations::OperationFoldReplacement;
 use crate::programs::{
-    AtomId, BindingRegionDriver, EffectClasses, FlatProgram, InstructionId, Operation, OperationPayloadProjection,
+    AtomId, AttachedRegions, EffectClasses, FlatProgram, InstructionId, Operation, OperationPayloadProjection,
     OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
-    ProvenanceState, ReferenceAnalysis, ReferenceIdentity, RegionRef, RegionReplayMappings, RegionRole,
+    ProvenanceState, ReferenceAnalysis, ReferenceIdentity, RegionDriver, RegionRef, RegionReplayMappings, RegionRole,
     ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueDomainDispatch,
     ValueProjection,
 };
@@ -934,8 +934,10 @@ impl<C: Context> PartialEvaluationContext<C> {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 let renaming = type_identities.instruction_renaming(region, instruction, &input_types)?;
                 let operation = instruction.operation().rename_type_identities(&renaming)?;
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?
-                    .with_type_identity_renaming(&renaming)?;
+                let regions = AttachedRegions::from(
+                    ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?
+                        .with_type_identity_renaming(&renaming)?,
+                );
                 let index = instruction_index.get();
                 instruction_index.set(index + 1);
                 let driver = RecursivePartialEvaluationDriver {
@@ -1598,18 +1600,18 @@ where
         PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
 {
     /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
-    /// ontext, which only converts its input operation, so that this body is compiled once per context and region
-    /// driver rather than once per input operation type
-    fn bind_operation<D: BindingRegionDriver<C::Constant, C::Operation>>(
+    /// context, which only converts its input operation and regions, so that this body is compiled once per context
+    /// rather than once per input operation type or way of supplying regions.
+    fn bind_operation(
         &self,
         operation: C::Operation,
-        driver: D,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[PartialTracer<C>],
     ) -> Result<Vec<PartialTracer<C>>, ProgramError> {
         // Unwrap the input tracers into context-free partial-evaluation values, dispatch the operation's partial
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
-        operation.validate_region_interfaces(&driver.region_interfaces())?;
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
         let input_values = match self.error.borrow().clone() {
             Some(error) => Err(error),
             None => inputs
@@ -1629,7 +1631,7 @@ where
         let error = match input_values {
             Ok(input_values) => {
                 let input_values = input_values.into_iter().cloned().collect::<Vec<_>>();
-                let driver = RecursivePartialEvaluationDriver { driver: &driver, repeated_residual: false };
+                let driver = RecursivePartialEvaluationDriver { driver: &regions, repeated_residual: false };
                 let outputs = operation.partially_evaluate(self, &driver, input_values.as_slice());
                 match outputs {
                     Ok(outputs) => {
@@ -1647,7 +1649,7 @@ where
         // also fails, the output arity is unknowable and the error surfaces immediately instead.
         self.error.borrow_mut().get_or_insert_with(|| error.clone());
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let region_interfaces = driver.regions().map(RegionRef::interface).collect::<Vec<_>>();
+        let region_interfaces = regions.region_interfaces();
         let Ok(output_types) = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())
         else {
             return Err(error);
@@ -1700,13 +1702,17 @@ where
     }
 
     #[inline]
-    fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, O: Into<C::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[PartialTracer<C>],
-    ) -> Result<Vec<PartialTracer<C>>, ProgramError> {
-        self.bind_operation(operation.into(), driver, inputs)
+    ) -> Result<Vec<PartialTracer<C>>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        self.bind_operation(operation.into(), regions.into(), inputs)
     }
 
     #[inline]

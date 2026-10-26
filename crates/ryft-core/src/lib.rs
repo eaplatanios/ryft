@@ -195,7 +195,7 @@ pub use partial::{
     ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualProducer, ResidualRejection, ResidualStorage,
 };
 pub use programs::{
-    Atom, AtomId, AttachedRegionStatistics, BatchableReferenceTransform, BindingRegionDriver, BoundReferenceTransform,
+    Atom, AtomId, AttachedRegionStatistics, AttachedRegions, BatchableReferenceTransform, BoundReferenceTransform,
     CalleeRegionDriver, Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, EffectClassesIterator,
     Effects, EffectsSummary, EmptyRegionDriver, ErasedOperation, ExternalReferenceBinding, FlatProgram,
     InputRegionProvenance, Instruction, InstructionId, LiteralIdentity, MaybeZero, MemberOperation, NoIdentity,

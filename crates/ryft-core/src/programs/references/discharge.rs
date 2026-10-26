@@ -4251,7 +4251,7 @@ pub fn discharge_reference_free_operation<
             });
         }
     }
-    let regions = driver.regions().map(RegionRef::to_program).collect::<Vec<_>>();
+    let regions = driver.region_programs();
     let values = inputs
         .iter()
         .enumerate()

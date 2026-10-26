@@ -1510,10 +1510,7 @@ impl<C: Domain<Type: CastType, Value: Cast<C::Type>>> InterpretableOperation<C> 
         // Concrete values carry their extents in their types. For symbolic values, conditional facts cannot replace a
         // runtime check: interpretation accepts only relationships already proven by the types, in both modes.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let output_type = self.infer_interpreted_output_type(
-            &input_types,
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
-        )?;
+        let output_type = self.infer_interpreted_output_type(&input_types, &driver.region_interfaces())?;
         if inputs.len() == 1 && inputs[0].r#type().as_ref() == &output_type {
             return Ok(vec![inputs[0].clone()]);
         }
@@ -1555,10 +1552,7 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
         // the original invocation's representations. The parent validates the supplied values against the lifted
         // declaration, preserving source/witness shapes, layout and sharding unrelated to the mapped axes.
         check_count!("input", inputs, self.input_types.len(), ProgramError);
-        self.infer_output_types(
-            &self.input_types,
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
-        )?;
+        self.infer_output_types(&self.input_types, &driver.region_interfaces())?;
 
         // An exact one-input identity has no relationship left to check. Keep its physical layout. Witnesses or
         // different declarations can impose additional relationships, so they continue through the lifted primitive.
@@ -1640,7 +1634,7 @@ where
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
 
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
+        let region_interfaces = driver.region_interfaces();
 
         check_count!("input", input_types, self.input_types.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);

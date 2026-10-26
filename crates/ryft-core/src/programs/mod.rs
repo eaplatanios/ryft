@@ -156,7 +156,7 @@ pub use references::{
     validate_reference_boundary, validated_reference_access_descriptors,
 };
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
+    AttachedRegions, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
     RegionArena, RegionArenaIterator, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary,
     RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionDriver, RegionId, RegionInterface,
     RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,

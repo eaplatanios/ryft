@@ -80,7 +80,7 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::GuardOperation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    AtomId, BindingRegionDriver, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
+    AtomId, AttachedRegions, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
     Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
     TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
@@ -636,13 +636,17 @@ impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOp
     }
 
     #[inline]
-    fn bind<P: Into<O>, D: BindingRegionDriver<V, O>>(
+    fn bind<'r, P: Into<O>, R: Into<AttachedRegions<'r, V, O>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[Tracer<Self>],
-    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        self.stage_operation(operation, driver, inputs)
+    ) -> Result<Vec<Tracer<Self>>, ProgramError>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.stage_operation(operation, regions, inputs)
     }
 
     #[inline]
@@ -907,13 +911,17 @@ impl<C: Context> Context for NestedTracingContext<C> {
     }
 
     #[inline]
-    fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, P: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        self.stage_operation(operation, driver, inputs)
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        self.stage_operation(operation, regions, inputs)
     }
 
     #[inline]

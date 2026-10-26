@@ -333,7 +333,7 @@ mod tests {
     use crate::parameters::Parameter;
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, EmptyRegionDriver, Provenance, ProvenanceScope, Typed, ValueDomainDispatch,
+        AttachedRegions, EffectClasses, EmptyRegionDriver, Provenance, ProvenanceScope, Typed, ValueDomainDispatch,
     };
     use crate::tracing::{Trace, TracingContext};
 
@@ -523,12 +523,16 @@ mod tests {
                 Ok(DispatchArray { array, output_count: self.0 })
             }
 
-            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
                 &self,
                 _operation: O,
-                _driver: D,
+                _regions: R,
                 inputs: &[DispatchArray],
-            ) -> Result<Vec<DispatchArray>, ProgramError> {
+            ) -> Result<Vec<DispatchArray>, ProgramError>
+            where
+                Self::Constant: 'r,
+                Self::Operation: 'r,
+            {
                 if self.0 == 1 {
                     return Err(ProgramError::InvalidArgument { message: "injected transfer failure".to_string() });
                 }

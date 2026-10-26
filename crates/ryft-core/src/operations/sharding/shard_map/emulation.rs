@@ -76,7 +76,7 @@ use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_N
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::parameters::Parameter;
 use crate::programs::{
-    BindingRegionDriver, Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection,
+    AttachedRegions, Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection,
     ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed, Value,
     ValueDirectDispatch,
 };
@@ -446,7 +446,7 @@ where
         let mut outputs = vec![Vec::with_capacity(device_count); instruction.outputs().len()];
         for device in 0..device_count {
             let device_inputs = inputs.iter().map(|values| values[device].clone()).collect::<Vec<_>>();
-            let regions = ReplayRegionDriver::new(region, instruction.regions(), mappings)?;
+            let regions = AttachedRegions::from(ReplayRegionDriver::new(region, instruction.regions(), mappings)?);
             let device_outputs =
                 self.driver.bind(self.context, instruction.operation().clone(), regions, &device_inputs)?;
             check_count!("output", device_outputs, outputs.len(), ProgramError);
@@ -864,11 +864,11 @@ where
         (self.interpret_region)(self.region(index)?, inputs)
     }
 
-    fn bind<R: BindingRegionDriver<ArrayIrValue<Array>, O>>(
+    fn bind(
         &self,
         _context: &LockstepDomain<O>,
         operation: O,
-        _regions: R,
+        _regions: AttachedRegions<'_, ArrayIrValue<Array>, O>,
         _inputs: &[LockstepValue<O>],
     ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
@@ -1388,7 +1388,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicyReference;
     use crate::programs::{
-        AtomId, BindingRegionDriver, EffectClass, Program, ProgramBuilder, ProjectedValue, ReferenceType, RegionDriver,
+        AtomId, AttachedRegions, EffectClass, Program, ProgramBuilder, ProjectedValue, ReferenceType, RegionDriver,
         ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
@@ -3010,11 +3010,11 @@ mod tests {
                 self.region(index)?.interpret_in_context(context, inputs)
             }
 
-            fn bind<R: BindingRegionDriver<TestValue, TestOperation>>(
+            fn bind(
                 &self,
                 context: &EagerContext<TestValue, TestOperation>,
                 operation: TestOperation,
-                regions: R,
+                regions: AttachedRegions<'_, TestValue, TestOperation>,
                 inputs: &[TestValue],
             ) -> Result<Vec<TestValue>, ProgramError> {
                 if let Some(print) = operation.projected_payload::<PrintOperation<ArrayType>>() {

@@ -1873,7 +1873,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope, ValueDirectDispatch,
+        AttachedRegions, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope, ValueDirectDispatch,
         ValueDomainDispatch,
     };
     use crate::tests::hash_of;
@@ -3311,12 +3311,16 @@ mod tests {
                 Ok(constant)
             }
 
-            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
                 &self,
                 _operation: O,
-                _driver: D,
+                _regions: R,
                 _inputs: &[Self::Value],
-            ) -> Result<Vec<Self::Value>, ProgramError> {
+            ) -> Result<Vec<Self::Value>, ProgramError>
+            where
+                Self::Constant: 'r,
+                Self::Operation: 'r,
+            {
                 unreachable!("the rejected custom-call batching path must not bind an operation")
             }
 

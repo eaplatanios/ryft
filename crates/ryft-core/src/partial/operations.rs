@@ -207,7 +207,7 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
         let context = instruction_context.as_ref().unwrap_or(context);
         let must_defer = deferred_instructions.contains(&instruction_id);
         let outputs = if must_defer || shared_reference_boundary {
-            let programs = self.regions().map(RegionRef::to_program).collect();
+            let programs = self.region_programs();
             if must_defer {
                 context.residualize(operation.clone(), programs, inputs)
             } else {

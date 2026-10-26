@@ -1357,12 +1357,7 @@ impl OperationEnum {
             if variant.is_generic_extension || !matches!(variant.class, OperationVariantClass::FamilyNative) {
                 quote! {
                     Self::#variant_ident(_) => {
-                        let regions = driver
-                            .regions()
-                            .into_iter()
-                            .map(|region| region.to_program())
-                            .collect();
-                        context.fold_or_residualize(self.clone(), regions, inputs)
+                        context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
                     },
                 }
             } else {

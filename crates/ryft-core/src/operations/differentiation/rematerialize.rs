@@ -505,7 +505,7 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
         if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
-            let regions = driver.regions().map(|region| region.to_program()).collect::<Vec<_>>();
+            let regions = driver.region_programs();
             let outputs = context.parent().bind(self.clone(), regions, input_values.as_slice())?;
             return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>());
         }

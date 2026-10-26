@@ -1772,9 +1772,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 
 /// _Flat_ [`Program`] (i.e., with flat `Vec`-valued inputs and outputs) over a [`Domain`]'s constant and operation
 /// universe. This is the canonical shape for nested computations constructed standalone, including owned region
-/// programs and shared callees composed into the region driver passed to [`Context::bind`](crate::Context::bind).
-/// Borrowed replay exposes regions through [`BindingRegionDriver`](crate::BindingRegionDriver) without converting
-/// them into this owned shape.
+/// programs and shared callees composed into the [`AttachedRegions`](crate::AttachedRegions) passed to
+/// [`Context::bind`](crate::Context::bind). Borrowed replay exposes regions through
+/// [`AttachedRegions::Replay`](crate::AttachedRegions::Replay) without converting them into this owned shape.
 pub type FlatProgram<D> = Program<
     <D as Domain>::Constant,
     <D as Domain>::Operation,

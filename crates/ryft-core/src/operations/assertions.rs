@@ -427,7 +427,7 @@ impl<C: Domain<Type: Into<ArrayIrType>, Value: Assert>> InterpretableOperation<C
         check_count!("input", inputs, 1 + self.labels.len(), ProgramError);
         self.infer_output_types(
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+            &driver.region_interfaces(),
         )?;
         let observations = self
             .labels
@@ -457,7 +457,7 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
         check_count!("input", inputs, 1 + self.labels.len(), ProgramError);
         self.infer_output_types(
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+            &driver.region_interfaces(),
         )?;
 
         // Elementwise assertions need the ordinary execution path to collect failing indices and observations.
@@ -529,7 +529,7 @@ where
                 .iter()
                 .map(|input| <ArrayBatchingPolicy<P> as BatchingPolicy<C>>::unbatched_type(input).into_owned())
                 .collect::<Vec<_>>(),
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+            &driver.region_interfaces(),
         )?;
 
         let Some(assertion) = BatchedAssertion::from_inputs(self, context, inputs)? else {
@@ -565,7 +565,7 @@ where
         // Validate the per-item signature before eliminating an empty batch or changing the input shapes.
         self.infer_output_types(
             &inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>(),
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+            &driver.region_interfaces(),
         )?;
 
         // Run the shared rule over the array view of this batching level, which shares its first-class extent. A
@@ -1950,7 +1950,7 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>> PartiallyEvaluatableO
         // where all of its outputs are unknown.
         self.infer_output_types(
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+            &driver.region_interfaces(),
         )?;
         context.fold_or_residualize(self.clone(), Vec::new(), inputs)
     }
@@ -1972,10 +1972,7 @@ impl<T: Type, C: Context<Type = T, Operation: From<GuardOperation<T>>>, P: Batch
         // original declaration before lifting erases layout and adds batch-axis variation. The parent validates the
         // physical operands against the lifted contract, retaining every other input constraint.
         check_count!("input", inputs, self.declared_types.len(), ProgramError);
-        self.infer_output_types(
-            &self.declared_types,
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
-        )?;
+        self.infer_output_types(&self.declared_types, &driver.region_interfaces())?;
 
         // The inserted batch dimension belongs to the surrounding program. Freshen the guard-local names together
         // before inserting it, so reusing a nominal identity across those scopes cannot create an extra equality.

@@ -17,10 +17,11 @@
 //! output originates there rather than directly from that [`Instruction`].
 //!
 //! Operation rules receive application-scoped structural access to attached [`Region`]s through [`RegionDriver`]s.
-//! Binding applications obtain their complete ordered region sequence from [`BindingRegionDriver`], which can provide
-//! owned programs, borrowed regions, and shared callees (e.g., a JIT-compiled function). Replay and transforms provide
-//! borrowed views of the regions attached to the current instruction. [`EmptyRegionDriver`] supplies the same contract
-//! for applications with no attached regions.
+//! Binding applications supply their complete ordered region sequence as [`AttachedRegions`], one concrete type whose
+//! variants carry owned programs, borrowed regions of a replayed instruction, shared callees (e.g., a Just-In-Time
+//! compiled function), plain borrowed views, or nothing, so that every context boundary and rule body is compiled once
+//! per context rather than once per way of supplying regions. [`EmptyRegionDriver`] supplies the read-side contract for
+//! applications with no attached regions.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -1446,15 +1447,55 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionD
     }
 }
 
-/// [`RegionDriver`] for the regions supplied to one [`Context::bind`](crate::Context::bind) [`Operation`] application.
-/// In addition to providing application-scoped structural access through [`RegionDriver`], a binding region driver can
-/// be consumed through [`import_into`](Self::import_into) to import its regions into a staging context's destination
-/// [`ProgramBuilder`]. Implementations determine whether those regions are moved from owned [`Program`]s, borrowed from
-/// a replayed program while preserving source-region sharing, or interned as shared callees.
+/// Attached [`Region`]s supplied to one [`Context::bind`](crate::Context::bind) [`Operation`] application, in
+/// operation-defined order. This is the one concrete region type that every context boundary accepts: the variants
+/// differ only in how the regions are imported into a staging context's destination [`ProgramBuilder`] (moved from
+/// owned programs, interned as shared callees by [`Arc`] identity, borrowed from a replayed program while preserving
+/// source-region sharing and type-identity renaming, or cloned from plain borrowed views), while their read side
+/// through [`RegionDriver`] is the same. Carrying the import strategy as data rather than as a type parameter keeps
+/// every bind boundary, staging body, and transform rule compiled once per context instead of once per driver type.
 ///
-/// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
-/// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
-pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> + Sized {
+/// Call sites keep passing what they have: owned [`Vec`]s and fixed-size arrays of [`Program`]s,
+/// [`EmptyRegionDriver`], [`CalleeRegionDriver`], and [`ReplayRegionDriver`] all convert through [`From`]. A custom
+/// [`RegionDriver`] that only exposes regions is attached through [`views`](Self::views), whose import clones each
+/// region's reachable closure exactly like [`RegionRef::to_program`].
+pub enum AttachedRegions<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// No attached regions.
+    Empty,
+
+    /// Owned [`Program`]s, moved into the destination builder when imported.
+    Owned(Vec<Program<V, O, Vec<V>, Vec<V>>>),
+
+    /// Shared callee [`Program`]s, interned by [`Arc`] identity when imported (see [`CalleeRegionDriver`]).
+    Callees(&'r [Arc<Program<V, O, Vec<V>, Vec<V>>>]),
+
+    /// Borrowed [`Region`]s of one replayed [`Instruction`], imported through the replay's shared source-to-destination
+    /// mappings (see [`ReplayRegionDriver`]).
+    Replay(ReplayRegionDriver<'r, V, O>),
+
+    /// Plain borrowed views, each cloned into a detached [`Program`] when imported.
+    Views(Vec<RegionRef<'r, V, O>>),
+}
+
+impl<'r, V: Value, O: Operation<Type = V::Type>> AttachedRegions<'r, V, O> {
+    /// Attaches the [`Region`]s exposed by any [`RegionDriver`] as borrowed views, in application order.
+    #[inline]
+    pub fn views<D: RegionDriver<V, O>>(driver: &'r D) -> Self {
+        Self::Views(driver.regions().collect())
+    }
+
+    /// Returns the attached [`Region`] at `index`, which must be in range.
+    #[inline]
+    fn region_at(&self, index: usize) -> RegionRef<'_, V, O> {
+        match self {
+            Self::Empty => unreachable!("empty attached regions have no region {index}"),
+            Self::Owned(programs) => programs[index].entry_region_ref(),
+            Self::Callees(callees) => callees[index].entry_region_ref(),
+            Self::Replay(driver) => driver.region_at(index),
+            Self::Views(views) => views[index],
+        }
+    }
+
     /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order and returns their
     /// [`RegionId`]s in the same order. Each type in `input_types` corresponds to the corresponding attached [`Region`]
     /// at that same index and [`None`] preserves its declared input [`TypeIdentity`](crate::TypeIdentity)s, while
@@ -1462,25 +1503,12 @@ pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     /// renames stored type metadata without re-inferring instruction outputs or replaying bodies. The staging context
     /// specializes bodies when input bounds or shapes become more precise, and reconciles signatures that depend on
     /// other attached regions before recording the operation.
-    fn import_into(
-        self,
-        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        input_types: &[Option<Vec<V::Type>>],
-    ) -> Result<Vec<RegionId>, ProgramError>;
-}
-
-impl<
-    V: Value,
-    O: Operation<Type = V::Type>,
-    R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
-> BindingRegionDriver<V, O> for R
-{
-    fn import_into(
+    pub fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
         input_types: &[Option<Vec<V::Type>>],
     ) -> Result<Vec<RegionId>, ProgramError> {
-        let region_count = self.as_ref().len();
+        let region_count = self.region_count();
         if region_count != input_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "region type-identity instantiation count {} does not match attached region count {}",
@@ -1488,23 +1516,117 @@ impl<
                 region_count,
             )));
         }
-        let mut builder = builder.borrow_mut();
-        self.into_iter()
-            .zip(input_types)
-            .map(|(program, input_types)| {
-                Ok(builder.import_program(match input_types {
-                    Some(input_types) => program.with_instantiated_type_identities(input_types)?.into_owned(),
-                    None => program,
-                }))
-            })
-            .collect()
+        match self {
+            Self::Empty => Ok(Vec::new()),
+            Self::Owned(programs) => import_owned_programs(programs, builder, input_types),
+            Self::Callees(callees) => {
+                let mut builder = builder.borrow_mut();
+                callees
+                    .iter()
+                    .zip(input_types)
+                    .map(|(callee, input_types)| builder.intern_callee(callee, input_types.as_deref()))
+                    .collect()
+            }
+            Self::Replay(driver) => driver.import_into(builder, input_types),
+            Self::Views(views) => {
+                import_owned_programs(views.into_iter().map(RegionRef::to_program).collect(), builder, input_types)
+            }
+        }
     }
 }
 
-/// [`BindingRegionDriver`] for shared callee [`Program`]s attached to one [`Context::bind`](crate::Context::bind)
-/// [`Operation`] application. Callees are exposed in the order provided at construction and are interned by [`Arc`]
-/// identity when imported into a [`StagingContext`](crate::StagingContext), preserving sharing between repeated
-/// references to the same program.
+/// Imports owned [`Program`]s into `builder` in order, instantiating the declared input type identities of those with
+/// a requested input signature (see [`AttachedRegions::import_into`], which has already validated the counts).
+fn import_owned_programs<V: Value, O: Operation<Type = V::Type>>(
+    programs: Vec<Program<V, O, Vec<V>, Vec<V>>>,
+    builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+    input_types: &[Option<Vec<V::Type>>],
+) -> Result<Vec<RegionId>, ProgramError> {
+    let mut builder = builder.borrow_mut();
+    programs
+        .into_iter()
+        .zip(input_types)
+        .map(|(program, input_types)| {
+            Ok(builder.import_program(match input_types {
+                Some(input_types) => program.with_instantiated_type_identities(input_types)?.into_owned(),
+                None => program,
+            }))
+        })
+        .collect()
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for AttachedRegions<'_, V, O> {
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        (0..self.region_count()).map(move |index| self.region_at(index))
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Owned(programs) => programs.len(),
+            Self::Callees(callees) => callees.len(),
+            Self::Replay(driver) => driver.region_count(),
+            Self::Views(views) => views.len(),
+        }
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        if index < self.region_count() {
+            Ok(self.region_at(index))
+        } else {
+            Err(ProgramError::MalformedProgram(format!("region index {index} is out of range")))
+        }
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> From<Vec<Program<V, O, Vec<V>, Vec<V>>>> for AttachedRegions<'_, V, O> {
+    #[inline]
+    fn from(programs: Vec<Program<V, O, Vec<V>, Vec<V>>>) -> Self {
+        Self::Owned(programs)
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, const N: usize> From<[Program<V, O, Vec<V>, Vec<V>>; N]>
+    for AttachedRegions<'_, V, O>
+{
+    #[inline]
+    fn from(programs: [Program<V, O, Vec<V>, Vec<V>>; N]) -> Self {
+        Self::Owned(Vec::from(programs))
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> From<EmptyRegionDriver> for AttachedRegions<'_, V, O> {
+    #[inline]
+    fn from(_: EmptyRegionDriver) -> Self {
+        Self::Empty
+    }
+}
+
+impl<'r, V: Value, O: Operation<Type = V::Type>> From<CalleeRegionDriver<'r, V, O>> for AttachedRegions<'r, V, O> {
+    #[inline]
+    fn from(driver: CalleeRegionDriver<'r, V, O>) -> Self {
+        Self::Callees(driver.callees)
+    }
+}
+
+impl<'r, V: Value, O: Operation<Type = V::Type>> From<ReplayRegionDriver<'r, V, O>> for AttachedRegions<'r, V, O> {
+    #[inline]
+    fn from(driver: ReplayRegionDriver<'r, V, O>) -> Self {
+        Self::Replay(driver)
+    }
+}
+
+/// [`RegionDriver`] over shared callee [`Program`]s attached to one [`Context::bind`](crate::Context::bind)
+/// [`Operation`] application. Callees are exposed in the order provided at construction and, once attached as
+/// [`AttachedRegions::Callees`], are interned by [`Arc`] identity when imported into a
+/// [`StagingContext`](crate::StagingContext), preserving sharing between repeated references to the same program.
 pub struct CalleeRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Shared callee [`Program`]s in [`Operation`]-defined region order.
     callees: &'r [Arc<Program<V, O, Vec<V>, Vec<V>>>],
@@ -1529,39 +1651,17 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for CalleeRegion
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
-    fn import_into(
-        self,
-        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        input_types: &[Option<Vec<V::Type>>],
-    ) -> Result<Vec<RegionId>, ProgramError> {
-        if self.callees.len() != input_types.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "region type-identity instantiation count {} does not match attached region count {}",
-                input_types.len(),
-                self.callees.len(),
-            )));
-        }
-        let mut builder = builder.borrow_mut();
-        self.callees
-            .iter()
-            .zip(input_types)
-            .map(|(callee, input_types)| builder.intern_callee(callee, input_types.as_deref()))
-            .collect()
-    }
-}
-
-/// [`BindingRegionDriver`] for the borrowed [`Region`]s attached to one replayed [`Instruction`]. The roots remain
+/// [`RegionDriver`] over the borrowed [`Region`]s attached to one replayed [`Instruction`]. The roots remain
 /// in their source region arena and are exposed in instruction order through [`RegionDriver`]. When a staging context
 /// imports them, `mappings` preserves their source identities across every instruction in the surrounding replay.
 /// Construction validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain
 /// non-fallible without trusting callers to preserve that relationship.
 ///
-/// Custom transforms can create one driver per instruction and pass it to their region-aware operation rules. Share
-/// one [`RegionReplayMappings`] across those drivers so instructions referencing the same source region reuse its
-/// destination import. Create fresh mappings for each source-arena replay, including recursive replays. The driver
-/// exposes and imports attached regions; it does not transform their bodies. Contexts that consume attached regions
-/// structurally (i.e., staging and differentiation contexts) own their specialization.
+/// Custom transforms can create one driver per instruction and attach it (as [`AttachedRegions::Replay`]) to their
+/// region-aware operation rules. Share one [`RegionReplayMappings`] across those drivers so instructions referencing
+/// the same source region reuse its destination import. Create fresh mappings for each source-arena replay, including
+/// recursive replays. The driver exposes and imports attached regions; it does not transform their bodies. Contexts
+/// that consume attached regions structurally (i.e., staging and differentiation contexts) own their specialization.
 ///
 /// For example, the following imports attached regions incrementally into one builder while preserving sharing across
 /// instructions. A transform can supply its established [`TypeIdentityRenaming`] when replay has replaced identities
@@ -1571,8 +1671,8 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Calle
 /// # use std::cell::RefCell;
 /// # use std::rc::Rc;
 /// # use ryft_core::{
-/// #     BindingRegionDriver, Operation, ProgramBuilder, ProgramError, RegionId, RegionRef,
-/// #     RegionReplayMappings, ReplayRegionDriver, Type, TypeIdentityRenaming, Value,
+/// #     AttachedRegions, Operation, ProgramBuilder, ProgramError, RegionId, RegionRef, RegionReplayMappings,
+/// #     ReplayRegionDriver, Type, TypeIdentityRenaming, Value,
 /// # };
 /// fn import_attached_regions<V: Value, O: Operation<Type = V::Type>>(
 ///     source: RegionRef<'_, V, O>,
@@ -1583,8 +1683,9 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Calle
 ///     source.instructions().iter().map(|instruction| {
 ///         let roots = instruction.regions();
 ///         let driver = ReplayRegionDriver::new(source, roots, &mappings)?.with_type_identity_renaming(renaming)?;
+///
 ///         // Retain each region's declared input types after applying the replay's type-identity renaming.
-///         driver.import_into(builder, &vec![None; roots.len()])
+///         AttachedRegions::from(driver).import_into(builder, &vec![None; roots.len()])
 ///     }).collect()
 /// }
 /// ```
@@ -1713,27 +1814,33 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for ReplayRegion
         V: 'r,
         O: 'r,
     {
-        self.roots.iter().map(|root| match &self.renamed_source {
-            Some(source) => RegionRef::new(&source.arena, *root).unwrap(),
-            None => self.source.with_id(*root).unwrap(),
-        })
+        (0..self.roots.len()).map(move |index| self.region_at(index))
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.roots.len()
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'_, V, O> {
+    /// Returns the attached [`Region`] at `index`, which must be in range (see [`RegionDriver::regions`]).
+    #[inline]
+    fn region_at(&self, index: usize) -> RegionRef<'_, V, O> {
+        let root = self.roots[index];
+        match &self.renamed_source {
+            Some(source) => RegionRef::new(&source.arena, root).unwrap(),
+            None => self.source.with_id(root).unwrap(),
+        }
+    }
+
+    /// Imports the attached [`Region`]s into `builder` through the replay's shared mappings (the body of
+    /// [`AttachedRegions::import_into`] for [`AttachedRegions::Replay`], which has already validated the counts).
     fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
         input_types: &[Option<Vec<V::Type>>],
     ) -> Result<Vec<RegionId>, ProgramError> {
-        if self.roots.len() != input_types.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "region type-identity instantiation count {} does not match attached region count {}",
-                input_types.len(),
-                self.roots.len(),
-            )));
-        }
-
         // Region IDs belong to one destination arena. Reuse only this builder's import caches, and remove entries
         // for builders that have been dropped. Weak references let the caches recognize a builder without keeping
         // it alive or preventing trace finalization from taking ownership of it.
@@ -4064,10 +4171,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_binding_region_driver_for_owned_collections() {
+    fn test_attached_regions_for_owned_collections() {
         let empty_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let empty_driver: [TestProgram; 0] = [];
-        assert_eq!(empty_driver.import_into(&empty_builder, &[]), Ok(Vec::new()));
+        assert_eq!(AttachedRegions::from(empty_driver).import_into(&empty_builder, &[]), Ok(Vec::new()));
         assert!(empty_builder.borrow().regions.is_empty());
         let array_driver =
             [identity_program(ArrayType::scalar(DataType::F32)), identity_program(ArrayType::scalar(DataType::F64))];
@@ -4077,7 +4184,7 @@ pub(crate) mod tests {
         );
         let array_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         assert_eq!(
-            array_driver.import_into(&array_builder, &[None, None]),
+            AttachedRegions::from(array_driver).import_into(&array_builder, &[None, None]),
             Ok(vec![RegionId::new(0), RegionId::new(1)]),
         );
         assert_eq!(array_builder.borrow().regions.len(), 2);
@@ -4092,7 +4199,7 @@ pub(crate) mod tests {
         );
         let vector_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         assert_eq!(
-            vector_driver.import_into(&vector_builder, &[None, None]),
+            AttachedRegions::from(vector_driver).import_into(&vector_builder, &[None, None]),
             Ok(vec![RegionId::new(0), RegionId::new(1)]),
         );
         assert_eq!(vector_builder.borrow().regions.len(), 2);
@@ -4108,7 +4215,10 @@ pub(crate) mod tests {
             vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(driver.import_into(&builder, &[None, None]), Ok(vec![RegionId::new(0), RegionId::new(0)]));
+        assert_eq!(
+            AttachedRegions::from(driver).import_into(&builder, &[None, None]),
+            Ok(vec![RegionId::new(0), RegionId::new(0)])
+        );
         assert_eq!(builder.borrow().regions.len(), 1);
     }
 
@@ -4139,7 +4249,10 @@ pub(crate) mod tests {
         let roots = [first_root, first_root];
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(driver.import_into(&destination, &[None, None]), Ok(vec![RegionId::new(1), RegionId::new(1)]),);
+        assert_eq!(
+            AttachedRegions::from(driver).import_into(&destination, &[None, None]),
+            Ok(vec![RegionId::new(1), RegionId::new(1)]),
+        );
         assert_eq!(destination.borrow().regions.len(), 2);
     }
 
@@ -4160,13 +4273,19 @@ pub(crate) mod tests {
 
         let first_input_types = vec![array_type(DimensionVariable::new("first", bounds))];
         let first_driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
-        let first = first_driver.import_into(&destination, &[Some(first_input_types.clone())]).unwrap()[0];
+        let first = AttachedRegions::from(first_driver)
+            .import_into(&destination, &[Some(first_input_types.clone())])
+            .unwrap()[0];
 
         let second_input_types = vec![array_type(DimensionVariable::new("second", bounds))];
         let second_driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
-        let second = second_driver.import_into(&destination, &[Some(second_input_types.clone())]).unwrap()[0];
+        let second = AttachedRegions::from(second_driver)
+            .import_into(&destination, &[Some(second_input_types.clone())])
+            .unwrap()[0];
         let repeated_driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
-        let repeated = repeated_driver.import_into(&destination, &[Some(second_input_types.clone())]).unwrap()[0];
+        let repeated = AttachedRegions::from(repeated_driver)
+            .import_into(&destination, &[Some(second_input_types.clone())])
+            .unwrap()[0];
 
         assert_ne!(first, second);
         assert_eq!(second, repeated);
@@ -4184,7 +4303,7 @@ pub(crate) mod tests {
             .with_type_identity_renaming(&renaming)
             .unwrap();
         assert_eq!(driver.region(0).unwrap().input_types(), vec![array_type(replayed.clone())]);
-        let imported = driver.import_into(&renamed_destination, &[None]).unwrap()[0];
+        let imported = AttachedRegions::from(driver).import_into(&renamed_destination, &[None]).unwrap()[0];
         assert_eq!(
             renamed_destination.borrow().region_ref(imported).unwrap().input_types(),
             vec![array_type(replayed)]
@@ -4208,13 +4327,19 @@ pub(crate) mod tests {
             for explicit in [explicit_first, !explicit_first] {
                 let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
                 let inputs = if explicit { declared.as_slice() } else { &[None, None] };
-                assert_eq!(driver.import_into(&destination, inputs), Ok(vec![RegionId::new(1), RegionId::new(2)]));
+                assert_eq!(
+                    AttachedRegions::from(driver).import_into(&destination, inputs),
+                    Ok(vec![RegionId::new(1), RegionId::new(2)])
+                );
                 assert_eq!(destination.borrow().regions.len(), 3);
             }
         }
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(driver.import_into(&destination, &[None, None]), Ok(vec![RegionId::new(1), RegionId::new(2)]),);
+        assert_eq!(
+            AttachedRegions::from(driver).import_into(&destination, &[None, None]),
+            Ok(vec![RegionId::new(1), RegionId::new(2)]),
+        );
         let destination = destination.borrow();
         assert_eq!(destination.regions.len(), 3);
         assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
@@ -4234,7 +4359,7 @@ pub(crate) mod tests {
             .unwrap();
         let shared_source = driver.renamed_source.clone().unwrap();
         assert_eq!(
-            driver.import_into(&renamed_destination, &[None, None]),
+            AttachedRegions::from(driver).import_into(&renamed_destination, &[None, None]),
             Ok(vec![RegionId::new(1), RegionId::new(2)])
         );
         let repeated = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings)
@@ -4244,7 +4369,7 @@ pub(crate) mod tests {
         assert!(Rc::ptr_eq(&shared_source, repeated.renamed_source.as_ref().unwrap()));
         assert_eq!(mappings.renamed_sources.borrow().len(), 1);
         assert_eq!(
-            repeated.import_into(&renamed_destination, &[None, None]),
+            AttachedRegions::from(repeated).import_into(&renamed_destination, &[None, None]),
             Ok(vec![RegionId::new(1), RegionId::new(2)])
         );
         {
@@ -4274,7 +4399,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(!Rc::ptr_eq(&shared_source, driver.renamed_source.as_ref().unwrap()));
             assert_eq!(
-                driver.import_into(&renamed_destination, &declared),
+                AttachedRegions::from(driver).import_into(&renamed_destination, &declared),
                 Ok(vec![RegionId::new(4), RegionId::new(5)])
             );
             assert_eq!(renamed_destination.borrow().regions.len(), 6);
@@ -4289,12 +4414,15 @@ pub(crate) mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let first_roots = [first_root];
         let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &first_roots, &mappings).unwrap();
-        assert_eq!(first_driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
+        assert_eq!(AttachedRegions::from(first_driver).import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
         let second_roots = [second_root];
         let second_driver = ReplayRegionDriver::new(program.entry_region_ref(), &second_roots, &mappings).unwrap();
-        assert_eq!(second_driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(2)]));
+        assert_eq!(AttachedRegions::from(second_driver).import_into(&destination, &[None]), Ok(vec![RegionId::new(2)]));
         let repeated_driver = ReplayRegionDriver::new(program.entry_region_ref(), &first_roots, &mappings).unwrap();
-        assert_eq!(repeated_driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
+        assert_eq!(
+            AttachedRegions::from(repeated_driver).import_into(&destination, &[None]),
+            Ok(vec![RegionId::new(1)])
+        );
         let destination = destination.borrow();
         assert_eq!(destination.regions.len(), 3);
         assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
@@ -4310,9 +4438,15 @@ pub(crate) mod tests {
         second_destination.borrow_mut().import_program(identity_program(ArrayType::scalar(DataType::F32)));
         let roots = [first_root];
         let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(first_driver.import_into(&first_destination, &[None]), Ok(vec![RegionId::new(1)]));
+        assert_eq!(
+            AttachedRegions::from(first_driver).import_into(&first_destination, &[None]),
+            Ok(vec![RegionId::new(1)])
+        );
         let second_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(second_driver.import_into(&second_destination, &[None]), Ok(vec![RegionId::new(2)]));
+        assert_eq!(
+            AttachedRegions::from(second_driver).import_into(&second_destination, &[None]),
+            Ok(vec![RegionId::new(2)])
+        );
         assert_eq!(first_destination.borrow().regions.len(), 2);
         assert_eq!(second_destination.borrow().regions.len(), 3);
     }
@@ -4325,14 +4459,17 @@ pub(crate) mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let weak_destination = Rc::downgrade(&destination);
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
+        assert_eq!(AttachedRegions::from(driver).import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
         assert_eq!(Rc::strong_count(&destination), 1);
         assert_eq!(mappings.destinations.borrow().len(), 1);
         drop(destination);
         assert!(weak_destination.upgrade().is_none());
         let replacement = Rc::new(RefCell::new(ProgramBuilder::new()));
         let replacement_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(replacement_driver.import_into(&replacement, &[None]), Ok(vec![RegionId::new(1)]));
+        assert_eq!(
+            AttachedRegions::from(replacement_driver).import_into(&replacement, &[None]),
+            Ok(vec![RegionId::new(1)])
+        );
         assert_eq!(mappings.destinations.borrow().len(), 1);
     }
 

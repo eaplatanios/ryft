@@ -434,8 +434,8 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
 /// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
 /// operation (the single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
-/// [`BindingRegionDriver`](ryft_core::BindingRegionDriver) passed to [`Context::bind`], so repeated calls staged from
-/// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
+/// [`AttachedRegions`](ryft_core::AttachedRegions) passed to [`Context::bind`], so repeated calls staged from one
+/// function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
 /// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
 /// and the executable array IR form to remain distinct payload types with one [`Operation`] contract each.
 /// The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it participates in

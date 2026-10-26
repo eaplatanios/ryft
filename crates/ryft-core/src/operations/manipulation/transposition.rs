@@ -631,7 +631,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Typed,
+        AttachedRegions, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Typed,
         ValueDomainDispatch,
     };
 
@@ -1356,12 +1356,16 @@ mod tests {
                 Ok(DispatchArray { array, output_count: self.0 })
             }
 
-            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
                 &self,
                 _operation: O,
-                _driver: D,
+                _regions: R,
                 inputs: &[DispatchArray],
-            ) -> Result<Vec<DispatchArray>, ProgramError> {
+            ) -> Result<Vec<DispatchArray>, ProgramError>
+            where
+                Self::Constant: 'r,
+                Self::Operation: 'r,
+            {
                 Ok(vec![inputs[0].clone(); self.0])
             }
 

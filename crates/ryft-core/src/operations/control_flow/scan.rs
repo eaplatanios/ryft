@@ -4298,7 +4298,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{PartialEvaluationInput, PartialTracer};
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, InstructionId, Program,
+        AttachedRegions, EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, InstructionId, Program,
         ProgramBuilder, Provenance, ProvenanceScope, ReferenceAccessOperation, ReferenceRegionInputBinding,
         ReferenceRoot, ReferenceSource, ReferenceType, ReferenceView, RegionDataFlowRegionBoundary, RegionDriver,
         RegionId, ValueId,
@@ -23470,22 +23470,27 @@ mod tests {
                 Ok(constant)
             }
 
-            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Array, Self::Operation>>(
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Array, Self::Operation>>>(
                 &self,
                 operation: O,
-                driver: D,
+                regions: R,
                 inputs: &[Array],
-            ) -> Result<Vec<Array>, ProgramError> {
+            ) -> Result<Vec<Array>, ProgramError>
+            where
+                Array: 'r,
+                Self::Operation: 'r,
+            {
                 let operation = operation.into();
+                let regions = regions.into();
                 self.binds.borrow_mut().push(operation.name());
                 if matches!(operation, ArrayOperation::ParallelVary(_)) {
                     let output_types = operation.infer_output_types(
                         &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-                        &driver.region_interfaces(),
+                        &regions.region_interfaces(),
                     )?;
                     return Ok(vec![Array::from_logical_bytes(output_types[0].clone(), &inputs[0].logical_bytes())?]);
                 }
-                EagerContext::<Array, ArrayOperation<Array>>::new().bind(operation, driver, inputs)
+                EagerContext::<Array, ArrayOperation<Array>>::new().bind(operation, regions, inputs)
             }
 
             fn is_eager(&self) -> bool {

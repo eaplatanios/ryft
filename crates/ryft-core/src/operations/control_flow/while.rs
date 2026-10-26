@@ -3039,7 +3039,7 @@ mod tests {
     use crate::operations::trigonometric::SinOperation;
     use crate::partial::{PartialTracer, ResidualInputSource};
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
+        AttachedRegions, EffectClasses, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
         ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
@@ -3257,15 +3257,19 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+        fn bind<'r, P: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
             &self,
             operation: P,
-            driver: D,
+            regions: R,
             inputs: &[Self::Value],
-        ) -> Result<Vec<Self::Value>, ProgramError> {
+        ) -> Result<Vec<Self::Value>, ProgramError>
+        where
+            Self::Constant: 'r,
+            Self::Operation: 'r,
+        {
             // Region-carrying binds route through the eager context's own bind, which grants application-scoped region
             // access.
-            EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
+            EagerContext::<Array, Self::Operation>::new().bind(operation, regions, inputs)
         }
 
         fn is_eager(&self) -> bool {
@@ -3354,17 +3358,21 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+        fn bind<'r, P: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
             &self,
             operation: P,
-            driver: D,
+            regions: R,
             inputs: &[Self::Value],
-        ) -> Result<Vec<Self::Value>, ProgramError> {
+        ) -> Result<Vec<Self::Value>, ProgramError>
+        where
+            Self::Constant: 'r,
+            Self::Operation: 'r,
+        {
             let operation = operation.into();
             if matches!(operation, ArrayOperation::Print(_)) {
                 self.print_count.set(self.print_count.get() + 1);
             }
-            EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
+            EagerContext::<Array, Self::Operation>::new().bind(operation, regions, inputs)
         }
 
         fn is_eager(&self) -> bool {

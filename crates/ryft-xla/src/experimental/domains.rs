@@ -13,20 +13,20 @@ use std::time::{Duration, Instant};
 use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, BatchingError,
-    BindingRegionDriver, CallRequest, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext,
-    CompilationDomain, CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId,
-    DeviceMesh, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation,
-    DimensionSize, DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext,
-    EffectClass, EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh,
-    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
-    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
-    ReferenceReplacementPreparation, ReferenceSource, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape,
-    Sharding, ShardingDimension, SortDirection, SpecializationCache, SpecializationCacheEntry,
-    SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
-    Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
-    Zero, ZeroOperation, validate_reference_boundary,
+    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, AttachedRegions,
+    BatchingError, CallRequest, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
+    CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
+    DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize,
+    DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass,
+    EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh, LoweringRequest, Memory,
+    MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
+    Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
+    ReferenceReplacementPreparation, ReferenceSource, RegionDriver, RegionKey, RegionRef, ScatterMode,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, SpecializationCache,
+    SpecializationCacheEntry, SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain,
+    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
+    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array, ProjectedContext};
@@ -1158,19 +1158,22 @@ impl<'c> Context for XlaDomain<'c> {
     /// domain's compile cache, and executed on this domain's PJRT client via the crate-private `eager_bind` path. The
     /// nullary additive/multiplicative identities keep a fast path that materializes the constant directly through the
     /// runtime client without compiling a program.
-    fn bind<P, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, P, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>
     where
         P: Into<Self::Operation>,
+        Self::Constant: 'r,
+        Self::Operation: 'r,
     {
         ensure_effect_dispatch_allowed()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let operation = operation.into();
-        operation.validate_region_interfaces(&driver.region_interfaces())?;
+        let regions = regions.into();
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
         let name = operation.name();
         if inputs.is_empty() && (name == ZERO_OPERATION_NAME || name == ONE_OPERATION_NAME) {
             let array_type = eager_identity_output_type(&operation)?;
@@ -1183,7 +1186,7 @@ impl<'c> Context for XlaDomain<'c> {
                 return Ok(vec![XlaValue::Array(value)]);
             }
         }
-        self.eager_bind(operation, driver, inputs)
+        self.eager_bind(operation, regions, inputs)
     }
 
     /// Every [`XlaDomain`] is client-backed, so it executes every bound operation for real and its concrete
@@ -1338,10 +1341,10 @@ impl<'c> XlaDomain<'c> {
     /// and conversions between dimensions and scalars are decided on the host. Only their array results are uploaded
     /// (refer to [`Self::eager_scalar`]). Reference operands of any other operation, and reference state carried by
     /// attached regions, are rejected because XLA eager execution lowers each operation.
-    fn eager_bind<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
+    fn eager_bind(
         &self,
         operation: XlaOperation,
-        driver: D,
+        regions: AttachedRegions<'_, XlaConstant, XlaOperation>,
         inputs: &[XlaValue<'c>],
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
         if let Some(outputs) = self.eager_reference_bind(&operation, inputs) {
@@ -1360,7 +1363,7 @@ impl<'c> XlaDomain<'c> {
         // rejects unresolved references artifact-wide, so accepting one here would only defer failure to compilation
         // with a less targeted diagnostic.
         if operation.effects().classes().contains(EffectClass::OrderedState)
-            || driver.regions().any(|region| {
+            || regions.regions().any(|region| {
                 region.contains_effect_in_closure(EffectClass::OrderedState)
                     || region.contains_atom_type_in_closure(Type::is_reference)
             })
@@ -1374,7 +1377,7 @@ impl<'c> XlaDomain<'c> {
             });
         }
         if let XlaOperation::Dimension(operation) = &operation {
-            if driver.regions().count() != 0 {
+            if regions.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension operations do not accept attached regions").into());
             }
             let inputs = inputs
@@ -1395,7 +1398,7 @@ impl<'c> XlaDomain<'c> {
                 .collect());
         }
         if let XlaOperation::DimensionSize(operation) = &operation {
-            if driver.regions().count() != 0 {
+            if regions.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension_size does not accept attached regions").into());
             }
             check_count!("input", inputs, 1, ProgramError);
@@ -1407,7 +1410,7 @@ impl<'c> XlaDomain<'c> {
             return Ok(vec![XlaValue::Dimension(XlaDimension::new(value, self.with_mesh(array.mesh().clone())))]);
         }
         if let XlaOperation::DimensionFromScalar(operation) = &operation {
-            if driver.regions().count() != 0 {
+            if regions.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension_from_scalar does not accept attached regions").into());
             }
             check_count!("input", inputs, 1, ProgramError);
@@ -1419,7 +1422,7 @@ impl<'c> XlaDomain<'c> {
         }
 
         if matches!(&operation, XlaOperation::DimensionToScalar(_)) {
-            if driver.regions().count() != 0 {
+            if regions.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension_to_scalar does not accept attached regions").into());
             }
             check_count!("input", inputs, 1, ProgramError);
@@ -1430,7 +1433,7 @@ impl<'c> XlaDomain<'c> {
         if let XlaOperation::Compare(operation) = &operation
             && let [XlaValue::Dimension(left), XlaValue::Dimension(right)] = inputs
         {
-            if driver.regions().count() != 0 {
+            if regions.regions().count() != 0 {
                 return Err(TypeError::invalid("compare does not accept attached regions").into());
             }
             // Both extents are concrete, so the predicate is decided on the host by the comparison of first-class
@@ -1482,10 +1485,10 @@ impl<'c> XlaDomain<'c> {
         // and its inputs directly to a compiled program, so a repeated application skips tracing, lowering, and
         // compilation-key construction and only revalidates its input placement. Hits are looked up through a
         // borrowed query, and the owned key is only built on a miss.
-        let regions = driver.regions().map(RegionRef::key).collect::<Vec<_>>();
+        let region_keys = regions.regions().map(RegionRef::key).collect::<Vec<_>>();
         let query = XlaEagerDispatchQuery {
             operation: &operation,
-            regions: regions.as_slice(),
+            regions: region_keys.as_slice(),
             inputs,
             mesh: self.mesh.as_ref().or_else(|| array_inputs.first().map(XlaArray::mesh)),
             compilation_options: &self.compilation_options,
@@ -1496,13 +1499,13 @@ impl<'c> XlaDomain<'c> {
                 compiled
             }
             None => {
-                // The query borrows `regions`, so the key takes them only after its last use of the query.
+                // The query borrows `region_keys`, so the key takes them only after its last use of the query.
                 let key = XlaEagerDispatchKey {
                     operation: operation.clone(),
                     inputs: (0..inputs.len()).map(|index| query.input(index).into_owned()).collect(),
                     mesh: query.mesh.cloned(),
                     compilation_options: Arc::clone(&self.compilation_options),
-                    regions: regions.into(),
+                    regions: region_keys.into(),
                 };
                 let entry = self
                     .session
@@ -1516,7 +1519,7 @@ impl<'c> XlaDomain<'c> {
                     }
                     SpecializationCacheEntry::Vacant(producer) => producer.insert(self.compile_eager_operation(
                         operation,
-                        driver,
+                        regions,
                         inputs,
                         array_inputs.as_slice(),
                     )?),
@@ -1535,17 +1538,17 @@ impl<'c> XlaDomain<'c> {
     /// Traces one eager operation application into a single-instruction program over the inputs' physical types
     /// (shardings included), validates the placement of its array inputs, lowers the program, and compiles it through
     /// this domain's compilation cache (so that equal lowerings share one compiled program).
-    fn compile_eager_operation<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
+    fn compile_eager_operation(
         &self,
         operation: XlaOperation,
-        driver: D,
+        regions: AttachedRegions<'_, XlaConstant, XlaOperation>,
         inputs: &[XlaValue<'c>],
         array_inputs: &[XlaArray<'c>],
     ) -> Result<Arc<XlaCompiledProgram<'c>>, ProgramError> {
         // Trace the single-instruction program, attaching the provided region bodies to that instruction.
-        let region_input_types = vec![None; driver.regions().count()];
+        let region_input_types = vec![None; regions.region_count()];
         let builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
-        let region_ids = driver.import_into(&builder, &region_input_types)?;
+        let region_ids = regions.import_into(&builder, &region_input_types)?;
         let output_atoms = {
             let mut builder = builder.borrow_mut();
             // Eager dimension values have static types, which define no identities, so equal dimension inputs share one

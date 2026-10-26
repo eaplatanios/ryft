@@ -8,7 +8,7 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
-    Accuracy, Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BindingRegionDriver,
+    Accuracy, Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions,
     CastOperation, CastType, CompiledCallOperation, Context, DataType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, DimensionBounds,
     DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext,
@@ -526,11 +526,11 @@ fn test_external_scan_interpretation_domain() {
             self.region(index)?.to_program().interpret(inputs)
         }
 
-        fn bind<R: BindingRegionDriver<BackendValue, BackendOperation>>(
+        fn bind(
             &self,
             _context: &Backend<'o>,
             operation: BackendOperation,
-            regions: R,
+            regions: AttachedRegions<'_, BackendValue, BackendOperation>,
             inputs: &[BackendValue],
         ) -> Result<Vec<BackendValue>, ProgramError> {
             HostContext::new().bind(operation, regions, inputs)

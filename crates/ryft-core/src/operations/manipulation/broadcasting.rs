@@ -1760,8 +1760,8 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance,
-        ProvenanceScope, Typed, ValueDomainDispatch,
+        AttachedRegions, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
+        Typed, ValueDomainDispatch,
     };
     use crate::tracing::TracingContext;
 
@@ -1819,12 +1819,16 @@ mod tests {
             Ok(DispatchValue { value, output_count: self.0, operation: PhantomData })
         }
 
-        fn bind<Operation: Into<O>, D: BindingRegionDriver<V, O>>(
+        fn bind<'r, Operation: Into<O>, R: Into<AttachedRegions<'r, V, O>>>(
             &self,
             _operation: Operation,
-            _driver: D,
+            _regions: R,
             inputs: &[Self::Value],
-        ) -> Result<Vec<Self::Value>, ProgramError> {
+        ) -> Result<Vec<Self::Value>, ProgramError>
+        where
+            V: 'r,
+            O: 'r,
+        {
             Ok(vec![inputs[0].clone(); self.0])
         }
 
