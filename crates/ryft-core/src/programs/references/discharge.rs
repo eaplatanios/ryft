@@ -2446,9 +2446,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
-//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
-//  context type is built from `Self` (E0284); the equality is enforced per function through `where` clauses instead.
 /// Represents [`Operation`]s that can be discharged (i.e., rewritten so that the references they touch become explicit
 /// immutable state).
 ///
@@ -2477,12 +2474,14 @@ where
 /// uses, and higher-order rules request nested work through their driver rather than carrying a bound stating that
 /// their own operation family is dischargeable, which is what keeps an operation enum's bound graph finite.
 ///
-/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
-/// cannot prove that projection equality at implementation heads whose discharge context is itself built from `Self`.
-/// The equality is instead required per function through `where Self: Operation<Type = C::Type>`, so a payload whose
-/// [`Operation::Type`] disagrees with `C::Type` cannot be discharged in `C` and is rejected with a type-mismatch error
-/// at its use site.
-pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation {
+/// The super-trait is `Operation<Type = C::Type>`, so a payload whose [`Operation::Type`] disagrees with `C::Type`
+/// cannot implement the rule for `C`, and every `O: ReferenceDischargeableOperation<C, P>` bound elaborates to that
+/// equality without restating it. Bounds whose domain is itself built from `Self` state the domain's type as an
+/// assumption rather than restating the operation's type. Refer to the documentation of
+/// [`BatchableOperation`](crate::BatchableOperation) for the trait-solver limitations behind that rule.
+pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>:
+    Operation<Type = C::Type>
+{
     /// Rewrites this [`Operation`] application so that the references it touches become explicit immutable state,
     /// and returns the [`ReferenceDischargeValue`]s its outputs produce.
     ///
@@ -2505,9 +2504,7 @@ pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy
         context: &ReferenceDischargeContext<C, P>,
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
-    where
-        Self: Operation<Type = C::Type>;
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>;
 }
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a

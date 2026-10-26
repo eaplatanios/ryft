@@ -1611,7 +1611,7 @@ impl OperationEnum {
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
         let discharge_self_type = &self.program_self_type;
-        let mut discharge_generics = self.program_generics.clone();
+        let mut discharge_generics = self.batching_generics.clone();
         discharge_generics.params.push(syn::parse_quote!(__ParentContext));
         discharge_generics.params.push(syn::parse_quote!(__ReferenceDischargePolicy));
         let discharge_where_clause = discharge_generics.make_where_clause();

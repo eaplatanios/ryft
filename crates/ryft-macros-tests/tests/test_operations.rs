@@ -3643,15 +3643,13 @@ trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>: Regio
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> for EmptyRegionDriver {}
 
 /// Stand-in for `ryft_core::ReferenceDischargeableOperation`.
-trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation {
+trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation<Type = C::Type> {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
         context: &ReferenceDischargeContext<C, P>,
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
-    where
-        Self: Operation<Type = C::Type>;
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>;
 }
 
 /// Replays one reference-free operation verbatim, mirroring the call shape of
