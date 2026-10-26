@@ -3130,7 +3130,286 @@ impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>, P: Bat
     }
 }
 
+/// Represents a forward-mode application of a [`ScanOperation`] (i.e., one scan over the compact fused body that
+/// carries a tangent exactly for the body inputs and outputs whose tangents are live). Plumbing references, zero-space
+/// inputs, and structural-zero tangents are not live, so inactive carries keep structural-zero tangents instead of
+/// threading materialized zeros through the loop, and stacked outputs whose tangents depend on no live tangent
+/// (including one produced by an explicitly zero instruction in a body whose references make every other value
+/// conservatively dependent; refer to [`Program::output_dependence`] for more information) leave the scan as symbolic
+/// zeros instead of materialized zero stacks. Carry liveness is the monotone fixed point of
+/// [`TangentActivity::from_loop_body`]. The fused boundary is in scan order (refer to [`Self::signature_permutation`]),
+/// so the live carry tangents become carries of the fused scan. Shared destinations bind this scan directly (via
+/// [`Self::bind_fused`]), while separate destinations linearize the body and join the linearization over the same
+/// boundary (refer to [`Self::bind_linearized`]).
+struct ScanJvp<C: Context> {
+    /// Fused [`ScanOperation`], which carries the live carry tangents after the primal carries.
+    operation: ScanOperation<C::Type>,
+
+    /// Canonical body [`TangentActivity`], including its live input indices, fused program, and output tangent slots.
+    activity: TangentActivity<C>,
+
+    /// Position in Jacobian-Vector Product (JVP) order (i.e., `[body_inputs..., live_tangents...]`) of each fused body
+    /// input, in scan order.
+    input_order: Vec<usize>,
+
+    /// Position in Jacobian-Vector Product (JVP) order (i.e., `[primal_outputs..., live_tangents...]`) of each fused
+    /// scan output, in scan order.
+    output_order: Vec<usize>,
+}
+
 // TODO(eaplatanios): Review from here onwards.
+
+impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
+    /// Analyzes the forward-mode activity of an application of `scan` to the input duals `inputs` and derives its
+    /// fused body through `driver`, whose region 0 is the body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of analyzing the body's tangent activity through the differentiation driver.
+    fn new<D: DifferentiationDriver<C>>(
+        scan: &ScanOperation<C::Type>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Self, DifferentiationError> {
+        let body = driver.region(0)?;
+        let carry_count = scan.carry_count;
+        let input_tangent_liveness = std::iter::once(false)
+            .chain(inputs[..body.input_ids().len() - 1].iter().map(|input| !input.tangent().is_zero()))
+            .collect();
+        let (input_tangent_liveness, activity) =
+            TangentActivity::from_loop_body(driver, body, input_tangent_liveness, 1..1 + carry_count, 0..carry_count)?;
+        let output_live = activity.output_tangent_liveness();
+        let input_order = Self::signature_permutation(&input_tangent_liveness, carry_count + 1);
+        let output_order = Self::signature_permutation(output_live, carry_count);
+        let live_carry_count = input_tangent_liveness[1..=carry_count].iter().filter(|&&live| live).count();
+        // The fused scan stacks the primal stacked outputs at their placements, followed by the live tangents of the
+        // stacked outputs, which are placed like their primals.
+        let stacked_output_count = output_live.len() - carry_count;
+        let stacked_axis_shardings = (0..stacked_output_count)
+            .chain((0..stacked_output_count).filter(|&index| output_live[carry_count + index]))
+            .map(|index| scan.stacked_axis_shardings.get(index).cloned().unwrap_or(ShardingDimension::Replicated))
+            .collect();
+        let operation = ScanOperation {
+            carry_count: carry_count + live_carry_count,
+            ..scan.clone().with_stacked_axis_shardings(stacked_axis_shardings)
+        };
+        Ok(Self { operation, activity, input_order, output_order })
+    }
+
+    /// Returns the inputs of the fused scan for the input duals `inputs`: the primals and the live tangents in scan
+    /// order, followed by the iteration count of a scan with a dynamic iteration count. A carry that the fixed point
+    /// made live from a structural-zero initial tangent receives that zero materialized from its own primal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of materializing such a zero.
+    fn inputs<P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<C::Value>, DifferentiationError>
+    where
+        C: Zero<C::Value>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    {
+        // The fused boundary adds one input per live tangent. Body position `0` is the intrinsic index, so live
+        // body positions are offset by one from their corresponding scan inputs.
+        let body_input_count = self.input_order.len() - self.activity.input_indices().len();
+        let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_count - 1);
+        let tangents = self
+            .activity
+            .input_indices()
+            .iter()
+            .map(|&index| context.materialize_dual_tangent(&body_inputs[index - 1]))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self.input_order[1..]
+            .iter()
+            .map(|&position| match position.checked_sub(body_input_count) {
+                Some(tangent) => tangents[tangent].clone(),
+                None => body_inputs[position - 1].primal().clone(),
+            })
+            .chain(iteration_count_inputs.iter().map(|input| input.primal().clone()))
+            .collect())
+    }
+
+    /// Binds the fused scan in `context`, which is both the primal and the tangent context, to `scan_inputs` (refer to
+    /// [`Self::inputs`]), and returns its outputs in JVP order. The fused body reorders the forward-mode program of the
+    /// body into scan order and selects its live tangent outputs while doing so, which avoids an intermediate projected
+    /// program.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of reordering the body and of binding the fused scan.
+    fn bind_fused(&self, context: &C, scan_inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
+    where
+        C::Operation: From<ScanOperation<C::Type>>,
+    {
+        let output_live = self.activity.output_tangent_liveness();
+        let body_output_count = output_live.len();
+        let live_tangent_slots = self.activity.live_tangent_slots(output_live);
+        let body_output_order = self
+            .output_order
+            .iter()
+            .map(|&position| match position.checked_sub(body_output_count) {
+                Some(tangent) => body_output_count + live_tangent_slots[tangent],
+                None => position,
+            })
+            .collect::<Vec<_>>();
+        let body = self.activity.jvp_program().with_boundary(&self.input_order, &body_output_order)?;
+        let outputs = context.bind(C::Operation::from(self.operation.clone()), vec![body], scan_inputs)?;
+        self.to_jvp_order(outputs)
+    }
+
+    /// Stages the separate-destination linearization of the fused scan, applied to `scan_inputs` (refer to
+    /// [`Self::inputs`]), and returns its outputs in JVP order. The `body` is linearized through `driver` and the
+    /// linearization is joined over the fused boundary into a primal scan bound in the primal context and a tangent
+    /// scan bound in the tangent context (refer to `reconstruct_partitioned_scan`), which stacks varying residuals,
+    /// forwards stacked inputs and invariant carries, and hoists computed invariants. The caller has guarded the scan
+    /// boundary, so the primal input types prove every relationship that it checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] when a reference would cross from the primal scan to the tangent
+    /// scan, and the errors of linearizing the body and of binding either scan.
+    fn bind_linearized<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        body: RegionRef<'_, C::Constant, C::Operation>,
+        scan_inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, DifferentiationError>
+    where
+        C::Operation: From<ScanOperation<C::Type>> + ResidualStackOperation<C::Type>,
+    {
+        let body_input_count = self.input_order.len() - self.activity.input_indices().len();
+        let body_output_count = self.activity.output_tangent_liveness().len();
+        let live_input_count = self.activity.input_indices().len();
+        let (primal_program, tangent_program, residual_count) =
+            driver.linearize_program(body, self.activity.input_indices())?.into_parts();
+        // The linearized tangent program returns one tangent per output tangent slot, so the structural zeros that the
+        // fixed point identified are projected out exactly as for the fused body.
+        let live_tangent_slots = self.activity.live_tangent_slots(self.activity.output_tangent_liveness());
+        let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
+        let mut fused_input_types = body.input_types();
+        fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
+        let body_input_types =
+            self.input_order.iter().map(|&position| fused_input_types[position].clone()).collect::<Vec<_>>();
+        let mut scan_positions = vec![0; self.input_order.len()];
+        for (scan_position, &position) in self.input_order.iter().enumerate() {
+            scan_positions[position] = scan_position;
+        }
+        let body_known = self.input_order.iter().map(|&position| position < body_input_count).collect::<Vec<_>>();
+        let partition = PartitionedProgram::from_parts(
+            Arc::unwrap_or_clone(primal_program),
+            tangent_program,
+            body_known.len(),
+            (0..body_known.len()).filter(|&index| body_known[index]).collect(),
+            (0..live_input_count)
+                .map(|index| ResidualInputSource::UnknownInput(scan_positions[body_input_count + index]))
+                .chain((0..residual_count).map(ResidualInputSource::ResidualEdge))
+                .collect(),
+            self.output_order
+                .iter()
+                .map(|&position| match position.checked_sub(body_output_count) {
+                    Some(tangent) => PartialEvaluationOutput::Unknown(tangent),
+                    None => PartialEvaluationOutput::Known(position),
+                })
+                .collect(),
+        )?;
+
+        let inputs = scan_inputs
+            .iter()
+            .zip(body_known[1..].iter().chain(std::iter::repeat(&true)))
+            .map(|(value, &known)| (value.clone(), known))
+            .collect::<Vec<_>>();
+        let outputs = reconstruct_partitioned_scan(
+            &self.operation,
+            &body_input_types,
+            &inputs,
+            &body_known,
+            true,
+            true,
+            partition,
+            |constant| Ok((context.primal().lift(constant)?, true)),
+            // Residuals of a linearization stay inputs of its tangent program instead of being embedded in it.
+            |_| None,
+            |operation, programs, inputs| {
+                let inputs = inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
+                Ok(context
+                    .primal()
+                    .bind(operation, programs, &inputs)?
+                    .into_iter()
+                    .map(|value| (value, true))
+                    .collect())
+            },
+            |operation, programs, inputs| {
+                let inputs = inputs
+                    .iter()
+                    .map(|(value, known)| {
+                        if *known {
+                            context.primal_to_tangent(value.clone()).map_err(ProgramError::from)
+                        } else {
+                            Ok(value.clone())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(context
+                    .tangent()
+                    .bind(operation, programs, &inputs)?
+                    .into_iter()
+                    .map(|value| (value, false))
+                    .collect())
+            },
+        )?
+        .ok_or_else(|| ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{SCAN_OPERATION_NAME}` linearization cannot store the residual boundary required by its body, \
+                 because a reference would cross from its known iterations to its tangent iterations; pass the \
+                 reference as a differentiated input or discharge the references first",
+            ),
+        })?;
+        Ok(self.to_jvp_order(outputs.into_iter().map(|(value, _)| value).collect())?)
+    }
+
+    /// Reorders the outputs of the fused scan from scan order into JVP order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidOutputCount`] when `outputs` does not hold one value per fused scan output.
+    fn to_jvp_order<Output>(&self, outputs: Vec<Output>) -> Result<Vec<Output>, ProgramError> {
+        check_count!("output", outputs, self.output_order.len(), ProgramError);
+        let mut ordered = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
+        for (output, &position) in outputs.into_iter().zip(&self.output_order) {
+            ordered[position] = Some(output);
+        }
+        Ok(ordered.into_iter().map(Option::unwrap).collect())
+    }
+
+    /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
+    /// (`[primal_entries..., live(tangent_entries)...]`) into scan order, where carries lead the scanned entries on
+    /// both the primal and live tangent sides: `[primal_carries..., live(tangent_carries)..., primal_scanned...,
+    /// live(tangent_scanned)...]`. The `has_tangent` mask marks the primal entries whose tangent entry exists in the
+    /// compact signature; the position of the `k`-th live entry's tangent entry is the number of primal entries plus
+    /// `k`. The first `carry_count` primal entries form the carry block, including the intrinsic index for an input
+    /// signature, so `carry_count` must not exceed the number of entries.
+    fn signature_permutation(has_tangent: &[bool], carry_count: usize) -> Vec<usize> {
+        let entry_count = has_tangent.len();
+        let tangent_positions = has_tangent
+            .iter()
+            .scan(entry_count, |next_position, &live| {
+                let position = live.then_some(*next_position);
+                *next_position += usize::from(live);
+                Some(position)
+            })
+            .collect::<Vec<_>>();
+        let mut permutation = Vec::with_capacity(entry_count + has_tangent.iter().filter(|&&live| live).count());
+        permutation.extend(0..carry_count);
+        permutation.extend(tangent_positions[..carry_count].iter().flatten());
+        permutation.extend(carry_count..entry_count);
+        permutation.extend(tangent_positions[carry_count..].iter().flatten());
+        permutation
+    }
+}
 
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
 /// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is only a
@@ -3291,7 +3570,7 @@ fn placed_scan_stack_type(
 ///
 /// The domains have different variation rules: a stack that starts unsharded may receive slices with mesh metadata
 /// under mixed auto/manual scan-axis sharding. The homogeneous writer's stricter checks would reject this case.
-pub(crate) fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
+fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
     stack: V,
     iteration: usize,
     value: V,
@@ -3962,282 +4241,6 @@ fn reconstruct_partitioned_scan<
             })
             .collect(),
     ))
-}
-
-/// Forward-mode application of a [`ScanOperation`]: one scan over the compact fused body that carries a tangent
-/// exactly for the body inputs and outputs whose tangents are live. Plumbing references, zero-space inputs, and
-/// structural-zero tangents are not live, so inactive carries keep structural-zero tangents instead of threading
-/// materialized zeros through the loop, and stacked outputs whose tangents depend on no live tangent (including one
-/// produced by an explicitly zero instruction in a body whose references make every other value conservatively
-/// dependent; refer to [`Program::output_dependence`]) leave the scan as symbolic zeros instead of materialized zero
-/// stacks. Carry liveness is the monotone fixed point of [`TangentActivity::from_loop_body`]. The fused boundary is in
-/// scan order (refer to [`Self::signature_permutation`]), so the live carry tangents become carries of the fused
-/// scan. Shared destinations bind this scan directly (refer to [`Self::bind_fused`]), while separate destinations
-/// linearize the body and join the linearization over the same boundary (refer to [`Self::bind_linearized`]).
-struct ScanJvp<C: Context> {
-    /// Fused scan, which carries the live carry tangents after the primal carries.
-    operation: ScanOperation<C::Type>,
-
-    /// Canonical body activity, including its live input indices, fused program, and output tangent slots.
-    activity: TangentActivity<C>,
-
-    /// Position in JVP order (i.e., `[body_inputs..., live_tangents...]`) of each fused body input, in scan order.
-    input_order: Vec<usize>,
-
-    /// Position in JVP order (i.e., `[primal_outputs..., live_tangents...]`) of each fused scan output, in scan order.
-    output_order: Vec<usize>,
-}
-
-impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
-    /// Analyzes the forward-mode activity of an application of `scan` to the input duals `inputs` and derives its
-    /// fused body through `driver`, whose region 0 is the body.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of analyzing the body's tangent activity through the differentiation driver.
-    fn new<D: DifferentiationDriver<C>>(
-        scan: &ScanOperation<C::Type>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Self, DifferentiationError> {
-        let body = driver.region(0)?;
-        let carry_count = scan.carry_count;
-        let input_tangent_liveness = std::iter::once(false)
-            .chain(inputs[..body.input_ids().len() - 1].iter().map(|input| !input.tangent().is_zero()))
-            .collect();
-        let (input_tangent_liveness, activity) =
-            TangentActivity::from_loop_body(driver, body, input_tangent_liveness, 1..1 + carry_count, 0..carry_count)?;
-        let output_live = activity.output_tangent_liveness();
-        let input_order = Self::signature_permutation(&input_tangent_liveness, carry_count + 1);
-        let output_order = Self::signature_permutation(output_live, carry_count);
-        let live_carry_count = input_tangent_liveness[1..=carry_count].iter().filter(|&&live| live).count();
-        // The fused scan stacks the primal stacked outputs at their placements, followed by the live tangents of the
-        // stacked outputs, which are placed like their primals.
-        let stacked_output_count = output_live.len() - carry_count;
-        let stacked_axis_shardings = (0..stacked_output_count)
-            .chain((0..stacked_output_count).filter(|&index| output_live[carry_count + index]))
-            .map(|index| scan.stacked_axis_shardings.get(index).cloned().unwrap_or(ShardingDimension::Replicated))
-            .collect();
-        let operation = ScanOperation {
-            carry_count: carry_count + live_carry_count,
-            ..scan.clone().with_stacked_axis_shardings(stacked_axis_shardings)
-        };
-        Ok(Self { operation, activity, input_order, output_order })
-    }
-
-    /// Returns the inputs of the fused scan for the input duals `inputs`: the primals and the live tangents in scan
-    /// order, followed by the iteration count of a scan with a dynamic iteration count. A carry that the fixed point
-    /// made live from a structural-zero initial tangent receives that zero materialized from its own primal.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of materializing such a zero.
-    fn inputs<P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<C::Value>, DifferentiationError>
-    where
-        C: Zero<C::Value>,
-        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
-    {
-        // The fused boundary adds one input per live tangent. Body position `0` is the intrinsic index, so live
-        // body positions are offset by one from their corresponding scan inputs.
-        let body_input_count = self.input_order.len() - self.activity.input_indices().len();
-        let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_count - 1);
-        let tangents = self
-            .activity
-            .input_indices()
-            .iter()
-            .map(|&index| context.materialize_dual_tangent(&body_inputs[index - 1]))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(self.input_order[1..]
-            .iter()
-            .map(|&position| match position.checked_sub(body_input_count) {
-                Some(tangent) => tangents[tangent].clone(),
-                None => body_inputs[position - 1].primal().clone(),
-            })
-            .chain(iteration_count_inputs.iter().map(|input| input.primal().clone()))
-            .collect())
-    }
-
-    /// Binds the fused scan in `context`, which is both the primal and the tangent context, to `scan_inputs` (refer to
-    /// [`Self::inputs`]), and returns its outputs in JVP order. The fused body reorders the forward-mode program of the
-    /// body into scan order and selects its live tangent outputs while doing so, which avoids an intermediate projected
-    /// program.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of reordering the body and of binding the fused scan.
-    fn bind_fused(&self, context: &C, scan_inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
-    where
-        C::Operation: From<ScanOperation<C::Type>>,
-    {
-        let output_live = self.activity.output_tangent_liveness();
-        let body_output_count = output_live.len();
-        let live_tangent_slots = self.activity.live_tangent_slots(output_live);
-        let body_output_order = self
-            .output_order
-            .iter()
-            .map(|&position| match position.checked_sub(body_output_count) {
-                Some(tangent) => body_output_count + live_tangent_slots[tangent],
-                None => position,
-            })
-            .collect::<Vec<_>>();
-        let body = self.activity.jvp_program().with_boundary(&self.input_order, &body_output_order)?;
-        let outputs = context.bind(C::Operation::from(self.operation.clone()), vec![body], scan_inputs)?;
-        self.to_jvp_order(outputs)
-    }
-
-    /// Stages the separate-destination linearization of the fused scan, applied to `scan_inputs` (refer to
-    /// [`Self::inputs`]), and returns its outputs in JVP order. The `body` is linearized through `driver` and the
-    /// linearization is joined over the fused boundary into a primal scan bound in the primal context and a tangent
-    /// scan bound in the tangent context (refer to `reconstruct_partitioned_scan`), which stacks varying residuals,
-    /// forwards stacked inputs and invariant carries, and hoists computed invariants. The caller has guarded the scan
-    /// boundary, so the primal input types prove every relationship that it checks.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`] when a reference would cross from the primal scan to the tangent
-    /// scan, and the errors of linearizing the body and of binding either scan.
-    fn bind_linearized<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        body: RegionRef<'_, C::Constant, C::Operation>,
-        scan_inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, DifferentiationError>
-    where
-        C::Operation: From<ScanOperation<C::Type>> + ResidualStackOperation<C::Type>,
-    {
-        let body_input_count = self.input_order.len() - self.activity.input_indices().len();
-        let body_output_count = self.activity.output_tangent_liveness().len();
-        let live_input_count = self.activity.input_indices().len();
-        let (primal_program, tangent_program, residual_count) =
-            driver.linearize_program(body, self.activity.input_indices())?.into_parts();
-        // The linearized tangent program returns one tangent per output tangent slot, so the structural zeros that the
-        // fixed point identified are projected out exactly as for the fused body.
-        let live_tangent_slots = self.activity.live_tangent_slots(self.activity.output_tangent_liveness());
-        let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
-        let mut fused_input_types = body.input_types();
-        fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
-        let body_input_types =
-            self.input_order.iter().map(|&position| fused_input_types[position].clone()).collect::<Vec<_>>();
-        let mut scan_positions = vec![0; self.input_order.len()];
-        for (scan_position, &position) in self.input_order.iter().enumerate() {
-            scan_positions[position] = scan_position;
-        }
-        let body_known = self.input_order.iter().map(|&position| position < body_input_count).collect::<Vec<_>>();
-        let partition = PartitionedProgram::from_parts(
-            Arc::unwrap_or_clone(primal_program),
-            tangent_program,
-            body_known.len(),
-            (0..body_known.len()).filter(|&index| body_known[index]).collect(),
-            (0..live_input_count)
-                .map(|index| ResidualInputSource::UnknownInput(scan_positions[body_input_count + index]))
-                .chain((0..residual_count).map(ResidualInputSource::ResidualEdge))
-                .collect(),
-            self.output_order
-                .iter()
-                .map(|&position| match position.checked_sub(body_output_count) {
-                    Some(tangent) => PartialEvaluationOutput::Unknown(tangent),
-                    None => PartialEvaluationOutput::Known(position),
-                })
-                .collect(),
-        )?;
-
-        let inputs = scan_inputs
-            .iter()
-            .zip(body_known[1..].iter().chain(std::iter::repeat(&true)))
-            .map(|(value, &known)| (value.clone(), known))
-            .collect::<Vec<_>>();
-        let outputs = reconstruct_partitioned_scan(
-            &self.operation,
-            &body_input_types,
-            &inputs,
-            &body_known,
-            true,
-            true,
-            partition,
-            |constant| Ok((context.primal().lift(constant)?, true)),
-            // Residuals of a linearization stay inputs of its tangent program instead of being embedded in it.
-            |_| None,
-            |operation, programs, inputs| {
-                let inputs = inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
-                Ok(context
-                    .primal()
-                    .bind(operation, programs, &inputs)?
-                    .into_iter()
-                    .map(|value| (value, true))
-                    .collect())
-            },
-            |operation, programs, inputs| {
-                let inputs = inputs
-                    .iter()
-                    .map(|(value, known)| {
-                        if *known {
-                            context.primal_to_tangent(value.clone()).map_err(ProgramError::from)
-                        } else {
-                            Ok(value.clone())
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(context
-                    .tangent()
-                    .bind(operation, programs, &inputs)?
-                    .into_iter()
-                    .map(|value| (value, false))
-                    .collect())
-            },
-        )?
-        .ok_or_else(|| ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{SCAN_OPERATION_NAME}` linearization cannot store the residual boundary required by its body, \
-                 because a reference would cross from its known iterations to its tangent iterations; pass the \
-                 reference as a differentiated input or discharge the references first",
-            ),
-        })?;
-        Ok(self.to_jvp_order(outputs.into_iter().map(|(value, _)| value).collect())?)
-    }
-
-    /// Reorders the outputs of the fused scan from scan order into JVP order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::InvalidOutputCount`] when `outputs` does not hold one value per fused scan output.
-    fn to_jvp_order<Output>(&self, outputs: Vec<Output>) -> Result<Vec<Output>, ProgramError> {
-        check_count!("output", outputs, self.output_order.len(), ProgramError);
-        let mut ordered = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
-        for (output, &position) in outputs.into_iter().zip(&self.output_order) {
-            ordered[position] = Some(output);
-        }
-        Ok(ordered.into_iter().map(Option::unwrap).collect())
-    }
-
-    /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
-    /// (`[primal_entries..., live(tangent_entries)...]`) into scan order, where carries lead the scanned entries on
-    /// both the primal and live tangent sides: `[primal_carries..., live(tangent_carries)..., primal_scanned...,
-    /// live(tangent_scanned)...]`. The `has_tangent` mask marks the primal entries whose tangent entry exists in the
-    /// compact signature; the position of the `k`-th live entry's tangent entry is the number of primal entries plus
-    /// `k`. The first `carry_count` primal entries form the carry block, including the intrinsic index for an input
-    /// signature, so `carry_count` must not exceed the number of entries.
-    fn signature_permutation(has_tangent: &[bool], carry_count: usize) -> Vec<usize> {
-        let entry_count = has_tangent.len();
-        let tangent_positions = has_tangent
-            .iter()
-            .scan(entry_count, |next_position, &live| {
-                let position = live.then_some(*next_position);
-                *next_position += usize::from(live);
-                Some(position)
-            })
-            .collect::<Vec<_>>();
-        let mut permutation = Vec::with_capacity(entry_count + has_tangent.iter().filter(|&&live| live).count());
-        permutation.extend(0..carry_count);
-        permutation.extend(tangent_positions[..carry_count].iter().flatten());
-        permutation.extend(carry_count..entry_count);
-        permutation.extend(tangent_positions[carry_count..].iter().flatten());
-        permutation
-    }
 }
 
 #[cfg(test)]
