@@ -2936,15 +2936,12 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Runs [`Scan::scan`] in the execution domain recovered from the first carry or stacked-input leaf, or from an
-/// explicit iteration-count value. Structured carries and inputs may be empty individually; when all three sources
-/// contain no values, use the context constructor instead.
+/// Runs [`Scan::scan`] in the execution domain recovered from the first carry or stacked-input value, or from an
+/// explicit iteration count value. Structured carries and inputs may be empty individually but when all three sources
+/// contain no values, you must use the context constructor instead (i.e., via [`Scan`]).
 ///
 /// ```
-/// use ryft_core::{Array, ProgramError, ScanOptions, scan};
-///
+/// # use ryft_core::{Array, ProgramError, ScanOptions, scan};
 /// # fn main() -> Result<(), ProgramError> {
 /// let (sum, prefixes) = scan(
 ///     |_, carry, item| {
@@ -2967,7 +2964,11 @@ where
 #[inline]
 pub fn scan<
     V: Value<Domain: Scan>,
-    Carry: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
+    Carry: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>,
+            ParameterStructure: PartialEq,
+        >,
     Input: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
     Output: Parameterized<Tracer<NestedTracingContext<V::Domain>>, Family: ParameterizedFamily<V>>,
     F: FnMut(
@@ -2980,15 +2981,12 @@ pub fn scan<
     carry: Carry,
     inputs: Input,
     options: ScanOptions<V>,
-) -> Result<(Carry, Output::To<V>), ProgramError>
-where
-    Carry::ParameterStructure: PartialEq,
-{
+) -> Result<(Carry, Output::To<V>), ProgramError> {
     let context = carry
         .parameters()
         .next()
         .or_else(|| inputs.parameters().next())
-        .or_else(|| match &options.iteration_count {
+        .or(match &options.iteration_count {
             ScanIterationCount::Value(value) => Some(value),
             _ => None,
         })
@@ -3001,6 +2999,8 @@ where
         })?;
     context.scan(body, carry, inputs, options)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
 /// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is only a
