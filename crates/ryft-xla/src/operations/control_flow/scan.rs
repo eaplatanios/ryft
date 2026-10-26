@@ -3939,7 +3939,7 @@ mod tests {
                     |index, (), ()| Ok(((), index.convert_element_type(DataType::F64)?)),
                     (),
                     (),
-                    ScanOptions::new().with_iteration_count_value(count).with_unroll(2)?,
+                    ScanOptions::new().with_iteration_count(count).with_unroll(2)?,
                 )?;
                 Ok(outputs)
             },

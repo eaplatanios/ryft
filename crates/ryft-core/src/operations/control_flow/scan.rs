@@ -2529,8 +2529,24 @@ where
 }
 
 /// Selection of the iteration count for a structured scan operation.
-#[derive(Clone, Debug)]
-enum ScanIterationCount<V> {
+///
+/// A [`usize`] converts to [`Self::Static`], and a [`Value`] converts to [`Self::Value`]. A value remains an input to
+/// the scan even when its type pins one extent, preserving its runtime validation. Use [`Self::Inferred`] to select
+/// static count inference from the stacked inputs.
+///
+/// ```
+/// # use ryft_core::{Array, ArrayIrValue, DimensionValue, ProgramError, ScanIterationCount, ScanOptions};
+/// # fn main() -> Result<(), ProgramError> {
+/// let options = ScanOptions::<ArrayIrValue<Array>>::new().with_iteration_count(3);
+/// let count = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
+/// let options = options.with_iteration_count(count);
+/// let options = options.with_iteration_count(ScanIterationCount::Inferred);
+/// assert!(matches!(options.iteration_count(), ScanIterationCount::Inferred));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanIterationCount<V> {
     /// Infer a static count from the stacked inputs.
     Inferred,
 
@@ -2541,10 +2557,24 @@ enum ScanIterationCount<V> {
     Value(V),
 }
 
+impl<V> From<usize> for ScanIterationCount<V> {
+    #[inline]
+    fn from(iteration_count: usize) -> Self {
+        Self::Static(iteration_count)
+    }
+}
+
+impl<V: Value> From<V> for ScanIterationCount<V> {
+    #[inline]
+    fn from(iteration_count: V) -> Self {
+        Self::Value(iteration_count)
+    }
+}
+
 /// Configuration of [`Scan::scan`] and [`scan()`]. The carry count is derived from the structured initial state.
 /// By default, the iteration count is inferred from a stacked input with a statically known leading extent. A scan
-/// without stacked values needs an explicit count. Dynamic counts use [`Self::with_iteration_count_value`], including
-/// dimension values whose types happen to pin one extent: the value remains an input so its validation is preserved.
+/// without stacked values needs an explicit count. [`Self::with_iteration_count`] accepts a static [`usize`], a
+/// first-class dimension value, or an explicit [`ScanIterationCount`] selection.
 #[derive(Clone, Debug)]
 pub struct ScanOptions<V: Value> {
     /// Source of the declared iteration count.
@@ -2570,18 +2600,12 @@ impl<V: Value> ScanOptions<V> {
         Self::default()
     }
 
-    /// Sets an explicit static iteration count, replacing any earlier count selection.
+    /// Sets the iteration count selection, replacing any earlier selection. Accepts a static [`usize`], a first-class
+    /// dimension value, or [`ScanIterationCount::Inferred`] to infer a static count from the stacked inputs. A value's
+    /// type and relationships to the stacked inputs are validated by [`Scan::scan`].
     #[inline]
-    pub fn with_iteration_count(mut self, iteration_count: usize) -> Self {
-        self.iteration_count = ScanIterationCount::Static(iteration_count);
-        self
-    }
-
-    /// Sets a first-class dimension value that supplies the iteration count, replacing any earlier count selection.
-    /// Its type and relationships to the stacked inputs are validated by [`Scan::scan`].
-    #[inline]
-    pub fn with_iteration_count_value(mut self, iteration_count: V) -> Self {
-        self.iteration_count = ScanIterationCount::Value(iteration_count);
+    pub fn with_iteration_count(mut self, iteration_count: impl Into<ScanIterationCount<V>>) -> Self {
+        self.iteration_count = iteration_count.into();
         self
     }
 
@@ -2611,22 +2635,10 @@ impl<V: Value> ScanOptions<V> {
         self
     }
 
-    /// Returns the explicit static count, or `None` when the count is inferred or supplied by a value.
+    /// Returns the iteration count selection.
     #[inline]
-    pub fn iteration_count(&self) -> Option<usize> {
-        match self.iteration_count {
-            ScanIterationCount::Static(count) => Some(count),
-            _ => None,
-        }
-    }
-
-    /// Returns the explicit count value, or `None` when the count is inferred or static.
-    #[inline]
-    pub fn iteration_count_value(&self) -> Option<&V> {
-        match &self.iteration_count {
-            ScanIterationCount::Value(value) => Some(value),
-            _ => None,
-        }
+    pub fn iteration_count(&self) -> &ScanIterationCount<V> {
+        &self.iteration_count
     }
 
     /// Returns whether input slices are visited in reverse order.
@@ -22725,8 +22737,7 @@ mod tests {
     #[test]
     fn test_scan_options() {
         let options = ScanOptions::<Array>::new();
-        assert_eq!(options.iteration_count(), None);
-        assert_eq!(options.iteration_count_value(), None);
+        assert_eq!(options.iteration_count(), &ScanIterationCount::Inferred);
         assert!(!options.reverse());
         assert_eq!(options.unroll(), 1);
         assert_eq!(options.stacked_axis_shardings(), &[]);
@@ -22736,7 +22747,7 @@ mod tests {
             .with_unroll(2)
             .unwrap()
             .with_stacked_axis_shardings(vec![ShardingDimension::Replicated]);
-        assert_eq!(options.iteration_count(), Some(3));
+        assert_eq!(options.iteration_count(), &ScanIterationCount::Static(3));
         assert!(options.reverse());
         assert_eq!(options.unroll(), 2);
         assert_eq!(options.stacked_axis_shardings(), &[ShardingDimension::Replicated]);
@@ -22745,9 +22756,12 @@ mod tests {
             Some(ProgramError::Type(TypeError::invalid("`scan` unroll factor must be at least 1"))),
         );
         let count = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let options = ScanOptions::new().with_iteration_count(2).with_iteration_count_value(count.clone());
-        assert_eq!(options.iteration_count(), None);
-        assert_eq!(options.iteration_count_value(), Some(&count));
+        let options = ScanOptions::new().with_iteration_count(2).with_iteration_count(count.clone());
+        assert_eq!(options.iteration_count(), &ScanIterationCount::Value(count));
+        assert_eq!(
+            options.with_iteration_count(ScanIterationCount::Inferred).iteration_count(),
+            &ScanIterationCount::Inferred,
+        );
     }
 
     #[test]
@@ -22813,8 +22827,7 @@ mod tests {
                 |index, (), ()| Ok(((), index)),
                 (),
                 (),
-                ScanOptions::new()
-                    .with_iteration_count_value(TestIrValue::Dimension(DimensionValue::constant(0).unwrap())),
+                ScanOptions::new().with_iteration_count(TestIrValue::Dimension(DimensionValue::constant(0).unwrap())),
             ),
             Ok(((), array(Array::vector(Vec::<i64>::new()).unwrap()))),
         );
@@ -22953,7 +22966,7 @@ mod tests {
                     },
                     carry,
                     inputs,
-                    ScanOptions::new().with_iteration_count_value(count),
+                    ScanOptions::new().with_iteration_count(count),
                 )
             },
             (
@@ -22998,7 +23011,7 @@ mod tests {
                     .context()
                     .bind(DimensionFromScalarOperation::new(count_type.clone()), Vec::new(), &[scalar.clone()])?
                     .remove(0);
-                scan(|_, (), input| Ok(((), input)), (), inputs, ScanOptions::new().with_iteration_count_value(count))
+                scan(|_, (), input| Ok(((), input)), (), inputs, ScanOptions::new().with_iteration_count(count))
             },
             (
                 ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![length.into()]))),

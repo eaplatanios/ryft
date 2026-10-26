@@ -7,8 +7,9 @@ use pretty_assertions::assert_eq;
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BatchAxis, BindingRegionDriver,
     Context, DataType, Domain, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, NamedAxes, NamedAxis, Operation,
-    ProgramError, Provenance, ProvenanceScope, Scan, ScanOptions, ShardMap, ShardMapOperation, Sharding,
-    ShardingDimension, Tracer, TracingContext, Typed, ValueProjection, ValueResolution, batch, differentiate_at, scan,
+    ProgramError, Provenance, ProvenanceScope, Scan, ScanIterationCount, ScanOptions, ShardMap, ShardMapOperation,
+    Sharding, ShardingDimension, Tracer, TracingContext, Typed, ValueProjection, ValueResolution, batch,
+    differentiate_at, scan,
 };
 
 type IrValue = ArrayIrValue<Array>;
@@ -345,7 +346,10 @@ fn test_scan_frontend_stacked_axis_shardings() {
             |_, (), slice| Ok(((), slice)),
             (),
             Array::from_elements(input_type, &[1f32, 2.0, 3.0]).unwrap(),
-            ScanOptions::new().with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]),
+            ScanOptions::new()
+                .with_iteration_count(99)
+                .with_iteration_count(ScanIterationCount::Inferred)
+                .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]),
         ),
         Ok(((), Array::from_elements(output_type, &[1f32, 2.0, 3.0]).unwrap())),
     );
