@@ -263,7 +263,10 @@ impl LinearCollectiveOperation for ParallelPermuteOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: ZeroLike>> InterpretableOperation<C> for ParallelPermuteOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelPermuteOperation
+where
+    C::Value: ZeroLike,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -289,14 +292,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelPermuteOperation>>> Pa
 {
 }
 
-impl<
-    C: Context<
-            Type = ArrayType,
-            Value: ZeroLike + Concatenate + Slice + Transpose + Reshard,
-            Operation: From<ParallelPermuteOperation>,
-        >,
-    P: ArrayExtentBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelPermuteOperation
+impl<C: Context<Type = ArrayType, Operation: From<ParallelPermuteOperation>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelPermuteOperation
+where
+    C::Value: ZeroLike + Concatenate + Slice + Transpose + Reshard,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -540,8 +539,9 @@ impl<
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: ParallelPermute<ArrayType>>>
-    ParallelPermute<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> ParallelPermute<ArrayIrType> for V
+where
+    V::Projected: ParallelPermute<ArrayType>,
 {
     #[inline]
     fn parallel_permute(

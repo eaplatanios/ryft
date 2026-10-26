@@ -312,10 +312,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>>> Par
 {
 }
 
-impl<
-    C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>, Value: Reduce>,
-    P: ArrayExtentBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelReduceOperation
+impl<C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelReduceOperation
+where
+    C::Value: Reduce,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,

@@ -562,8 +562,9 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     ) -> Result<Self::Value, ProgramError>;
 }
 
-impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C::Value> + Fill<i64, C::Value>>
-    ScanInterpretationDomain for C
+impl<C: Domain<Type = ArrayType> + Zero<C::Value> + Fill<i64, C::Value>> ScanInterpretationDomain for C
+where
+    C::Value: Slice + UpdateSlice + Reshape,
 {
     #[inline]
     fn iteration_count(_iteration_count: &Self::Value) -> Result<usize, ProgramError> {
@@ -2768,11 +2769,7 @@ pub trait Scan: Context {
     /// Returns errors for invalid counts, signatures, carry structure/static-field changes, reference identities,
     /// incompatible metadata, or nonconvergent manual variation, and errors from tracing, alignment, or binding.
     fn scan<
-        Carry: Parameterized<
-                Self::Value,
-                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>,
-                ParameterStructure: PartialEq,
-            >,
+        Carry: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         Input: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         Output: Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<Self::Value>>,
         F: FnMut(
@@ -2786,7 +2783,9 @@ pub trait Scan: Context {
         carry: Carry,
         inputs: Input,
         options: ScanOptions<Self::Value>,
-    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>;
+    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>
+    where
+        Carry::ParameterStructure: PartialEq;
 }
 
 impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>> Scan for C
@@ -2794,11 +2793,7 @@ where
     Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
 {
     fn scan<
-        Carry: Parameterized<
-                Self::Value,
-                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>,
-                ParameterStructure: PartialEq,
-            >,
+        Carry: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         Input: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         Output: Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<Self::Value>>,
         F: FnMut(
@@ -2812,7 +2807,10 @@ where
         carry: Carry,
         inputs: Input,
         options: ScanOptions<Self::Value>,
-    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError> {
+    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>
+    where
+        Carry::ParameterStructure: PartialEq,
+    {
         let carry_structure = carry.parameter_structure();
         let input_structure = inputs.parameter_structure();
         let carry_values = carry.into_parameters().collect::<Vec<_>>();
@@ -2964,11 +2962,7 @@ where
 #[inline]
 pub fn scan<
     V: Value<Domain: Scan>,
-    Carry: Parameterized<
-            V,
-            Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>,
-            ParameterStructure: PartialEq,
-        >,
+    Carry: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
     Input: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
     Output: Parameterized<Tracer<NestedTracingContext<V::Domain>>, Family: ParameterizedFamily<V>>,
     F: FnMut(
@@ -2981,7 +2975,10 @@ pub fn scan<
     carry: Carry,
     inputs: Input,
     options: ScanOptions<V>,
-) -> Result<(Carry, Output::To<V>), ProgramError> {
+) -> Result<(Carry, Output::To<V>), ProgramError>
+where
+    Carry::ParameterStructure: PartialEq,
+{
     let context = carry
         .parameters()
         .next()

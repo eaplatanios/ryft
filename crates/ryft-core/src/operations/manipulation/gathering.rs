@@ -653,8 +653,9 @@ impl<V: Value<Type = ArrayType>> Operation for GatherOperation<V> {
 
 impl_reference_dischargeable_operation!(@reference_free <V> GatherOperation<V> where V: Value<Type = ArrayType>);
 
-impl<Stored: Value<Type = ArrayType>, C: Domain<Type = ArrayType, Value: Gather<Stored>>> InterpretableOperation<C>
-    for GatherOperation<Stored>
+impl<Stored: Value<Type = ArrayType>, C: Domain<Type = ArrayType>> InterpretableOperation<C> for GatherOperation<Stored>
+where
+    C::Value: Gather<Stored>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -1849,10 +1850,10 @@ where
 // Array IR values gather through their array views. The capability's stored-constant parameter precedes its universe,
 // which the shared projection macro cannot express, and so this projection is written out. It covers array IR tracers
 // and concrete array IR values alike.
-impl<
-    Stored: Value<Type = ArrayType>,
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Gather<Stored, ArrayType>>,
-> Gather<Stored, ArrayIrType> for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>>
+    Gather<Stored, ArrayIrType> for V
+where
+    V::Projected: Gather<Stored, ArrayType>,
 {
     #[inline]
     fn gather(
@@ -1946,7 +1947,8 @@ where
     V: DimensionSize
         + DynamicBroadcast<ArrayIrType>
         + ManualVariationAlignment<ArrayIrType>
-        + ValueProjection<ArrayType, Projected: Gather<Stored>>,
+        + ValueProjection<ArrayType>,
+    V::Projected: Gather<Stored>,
     V::Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicZero<V>,
 {
     fn dynamic_gather_axis<A: Into<Axis>>(

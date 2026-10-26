@@ -270,7 +270,8 @@ where
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
 {
     fn configure(
@@ -314,7 +315,8 @@ where
     Input::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Output::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
 {
@@ -411,13 +413,16 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Residual::ParameterStructure: Debug + PartialEq + Send,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
 {
@@ -480,15 +485,18 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
     Input::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Output::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Residual::ParameterStructure: Debug + PartialEq + Send,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
 {
@@ -564,14 +572,17 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<CotangentAccumulator>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Output::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Residual::ParameterStructure: Debug + PartialEq + Send,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
 {
@@ -770,12 +781,8 @@ where
         + ResidualZeroProvider<V::Type, Operation = O>,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
-    Output: 'static
-        + Parameterized<
-            CustomRuleTracer<V, O>,
-            Family: ParameterizedFamily<BatchAxis>,
-            ParameterStructure: Debug + PartialEq + Send + Sync,
-        >,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
 {
     fn configure(
         &self,
@@ -810,12 +817,8 @@ where
         + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
-    Output: 'static
-        + Parameterized<
-            CustomRuleTracer<V, O>,
-            Family: ParameterizedFamily<BatchAxis>,
-            ParameterStructure: Debug + PartialEq + Send + Sync,
-        >,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
 {
     fn configure(
         &self,
@@ -884,12 +887,8 @@ where
     O: 'static + Operation<Type = V::Type>,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
-    Output: 'static
-        + Parameterized<
-            CustomRuleTracer<V, O>,
-            Family: ParameterizedFamily<BatchAxis>,
-            ParameterStructure: Debug + PartialEq + Send + Sync,
-        >,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Rule: ?Sized
         + 'static
         + Fn(
@@ -1047,12 +1046,15 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + Operation<Type = V::Type>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Residual::ParameterStructure: Debug + PartialEq + Send,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
     Forward: ?Sized + 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
@@ -1109,7 +1111,8 @@ where
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual: Parameterized<CustomRuleTracer<V, O>>,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
@@ -1197,7 +1200,8 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
-    Input: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
+    Input: Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq,
     Output: Parameterized<CustomRuleTracer<V, O>>,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
@@ -1270,11 +1274,8 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
-    Input: Parameterized<
-            CustomRuleTracer<V, O>,
-            Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
-            ParameterStructure: Debug + PartialEq,
-        >,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    Input::ParameterStructure: Debug + PartialEq,
     Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
     Residual: Parameterized<CustomRuleTracer<V, O>>,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
@@ -1372,7 +1373,8 @@ where
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Jvp: ?Sized + Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
 {
@@ -1429,7 +1431,8 @@ where
     Input::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq,
     Output::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Jvp: ?Sized

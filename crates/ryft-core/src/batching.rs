@@ -1737,7 +1737,10 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingTracer<C, P> {
     }
 }
 
-impl<C: Context, P: BatchingPolicy<C, Batch: PartialEq>> PartialEq for BatchingTracer<C, P> {
+impl<C: Context, P: BatchingPolicy<C>> PartialEq for BatchingTracer<C, P>
+where
+    P::Batch: PartialEq,
+{
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         // A batch-carrying value compares by its packed value (through that value's own `PartialEq`, which is

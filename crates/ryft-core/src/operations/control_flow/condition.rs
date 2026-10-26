@@ -777,13 +777,11 @@ impl<
         + From<BroadcastOperation>
         + From<SelectOperation<ArrayType>>
         + From<ConditionOperation<ArrayType>>,
-    C: Context<
-            Type = ArrayType,
-            Value: Broadcast + Transpose + Select + StopGradient + ManualVariationAlignment<ArrayType>,
-            Operation = O,
-        >,
+    C: Context<Type = ArrayType, Operation = O>,
     P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ConditionOperation<ArrayType>
+where
+    C::Value: Broadcast + Transpose + Select + StopGradient + ManualVariationAlignment<ArrayType>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -844,17 +842,6 @@ impl<
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
-            Value: DimensionSize
-                       + DynamicBroadcast
-                       + ValueProjection<
-                ArrayType,
-                Projected: Broadcast
-                               + Select
-                               + StopGradient
-                               + Transpose
-                               + ManualVariationAlignment<ArrayType>
-                               + Value<Type = ArrayType>,
-            >,
             Operation: OperationPayloadProjection
                            + OperationProjection<
                 ArrayType,
@@ -865,6 +852,10 @@ impl<
                            + From<DimensionSizeOperation>,
         >,
 > BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
+where
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected:
+        Broadcast + Select + StopGradient + Transpose + ManualVariationAlignment<ArrayType> + Value<Type = ArrayType>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -1534,11 +1525,7 @@ pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Doma
     /// mismatched branch output types).
     fn condition<
         Input: Parameterized<Self, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>>,
-        Output: Parameterized<
-                Tracer<NestedTracingContext<Self::Domain>>,
-                Family: ParameterizedFamily<Self>,
-                ParameterStructure: PartialEq,
-            >,
+        Output: Parameterized<Tracer<NestedTracingContext<Self::Domain>>, Family: ParameterizedFamily<Self>>,
         TrueFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
         FalseFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
     >(
@@ -1546,7 +1533,9 @@ pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Doma
         true_fn: TrueFn,
         false_fn: FalseFn,
         inputs: Input,
-    ) -> Result<Output::To<Self>, ProgramError>;
+    ) -> Result<Output::To<Self>, ProgramError>
+    where
+        Output::ParameterStructure: PartialEq;
 }
 
 impl<
@@ -1560,11 +1549,7 @@ where
 {
     fn condition<
         Input: Parameterized<Self, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>>,
-        Output: Parameterized<
-                Tracer<NestedTracingContext<Self::Domain>>,
-                Family: ParameterizedFamily<Self>,
-                ParameterStructure: PartialEq,
-            >,
+        Output: Parameterized<Tracer<NestedTracingContext<Self::Domain>>, Family: ParameterizedFamily<Self>>,
         TrueFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
         FalseFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
     >(
@@ -1572,7 +1557,10 @@ where
         true_fn: TrueFn,
         false_fn: FalseFn,
         inputs: Input,
-    ) -> Result<Output::To<Self>, ProgramError> {
+    ) -> Result<Output::To<Self>, ProgramError>
+    where
+        Output::ParameterStructure: PartialEq,
+    {
         // Reject invalid predicates before either branch function is traced.
         ConditionOperation::<V::Type>::validate_predicate_type(self.r#type().as_ref())?;
 

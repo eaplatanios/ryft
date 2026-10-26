@@ -310,13 +310,10 @@ pub trait MemberInterpretableOperation<C: Domain>: Operation {
     ) -> Result<Vec<C::Value>, ProgramError>;
 }
 
-impl<
-    T: Type,
-    V: Value<Type = T>,
-    O: Operation<Type = T>,
-    Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<V>,
-> Program<V, O, Input, Output>
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<V, O, Input, Output>
+where
+    Input::ParameterStructure: Debug + PartialEq,
 {
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
     /// [`Program`]s. It checks that the provided input value matches the program's expected input structure and type,

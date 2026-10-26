@@ -216,7 +216,10 @@ impl Operation for ScaledDotOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: ScaledDot>> InterpretableOperation<C> for ScaledDotOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ScaledDotOperation
+where
+    C::Value: ScaledDot,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,

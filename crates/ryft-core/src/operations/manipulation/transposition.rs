@@ -237,7 +237,10 @@ impl Operation for TransposeOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Transpose>> InterpretableOperation<C> for TransposeOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TransposeOperation
+where
+    C::Value: Transpose,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -255,8 +258,10 @@ impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> Partiall
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Transpose>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for TransposeOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for TransposeOperation
+where
+    C::Value: Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,

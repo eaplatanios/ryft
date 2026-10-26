@@ -220,13 +220,10 @@ where
     }
 }
 
-impl<
-    T: Type,
-    U: Type,
-    Transform: ReferenceTransform<Type = U, Referent = T>,
-    C: Domain<Type = U, Value: ReferenceSwap<Transform, C::Value, C::Value, C::Value>>,
-> InterpretableOperation<C> for ReferenceSwapOperation<T, U, Transform>
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>, C: Domain<Type = U>>
+    InterpretableOperation<C> for ReferenceSwapOperation<T, U, Transform>
 where
+    C::Value: ReferenceSwap<Transform, C::Value, C::Value, C::Value>,
     ReferenceSwapOperation<T, U, Transform>: Operation<Type = U>,
 {
     #[inline]

@@ -79,7 +79,8 @@ fn batch_attention_static<C, O>(
     output_roles: &[AttentionBatchOutput],
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>,
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast + Reduce + Reshape + Transpose,
     O: Operation<Type = ArrayType>
         + InterpretableBatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
 {
@@ -293,8 +294,8 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<O> + From<ReduceOperation>,
     O: Operation<Type = ArrayType>,
 {
@@ -468,9 +469,10 @@ where
 
 /// Batching rule for [`DotProductAttentionOperation`]: one mapped batch level folds into the operation's own batch
 /// dimension through the shared static-extent normalization adapter.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>>
-    BatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>> for DotProductAttentionOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>
+    for DotProductAttentionOperation
 where
+    C::Value: Broadcast + Reduce + Reshape + Transpose,
     DotProductAttentionOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>>(
@@ -486,9 +488,10 @@ where
 
 /// Batching rule for [`DotProductAttentionBackwardOperation`]: the same static-extent normalization as the forward
 /// operation, additionally restoring a broadcast bias-cotangent batch dimension.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>>
-    BatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>> for DotProductAttentionBackwardOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>
+    for DotProductAttentionBackwardOperation
 where
+    C::Value: Broadcast + Reduce + Reshape + Transpose,
     DotProductAttentionBackwardOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>>(
@@ -522,8 +525,8 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<DotProductAttentionOperation> + From<ReduceOperation>,
 {
@@ -557,8 +560,8 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<DotProductAttentionBackwardOperation> + From<ReduceOperation>,
 {

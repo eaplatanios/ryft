@@ -1150,10 +1150,11 @@ impl<
     T: Type,
     V: Value<Type = T>,
     O: Operation<Type = T>,
-    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>, ParameterStructure: Debug + PartialEq>,
+    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
     Output: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
 > Program<V, O, Input, Output>
 where
+    Input::ParameterStructure: Debug + PartialEq,
     TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
 {
     /// Specializes this [`Program`] to the provided refined input types by replaying every

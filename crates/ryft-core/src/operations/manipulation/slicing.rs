@@ -197,7 +197,10 @@ impl Operation for SliceOperation {
 
 impl_reference_dischargeable_operation!(@reference_free SliceOperation);
 
-impl<C: Domain<Type = ArrayType, Value: Slice>> InterpretableOperation<C> for SliceOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for SliceOperation
+where
+    C::Value: Slice,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -903,7 +906,10 @@ impl Operation for UpdateSliceOperation {
 
 impl_reference_dischargeable_operation!(@reference_free UpdateSliceOperation);
 
-impl<C: Domain<Type = ArrayType, Value: UpdateSlice>> InterpretableOperation<C> for UpdateSliceOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for UpdateSliceOperation
+where
+    C::Value: UpdateSlice,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1487,15 +1493,19 @@ impl DynamicSliceOperation<ArrayIrType> {
         V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
             + DimensionSize
             + DimensionToScalar
-            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + SaturatingSub + Mul + DimensionMin>,
+            + ValueProjection<ArrayType>
+            + ValueProjection<DimensionType>,
     >(
         &self,
         zeros: &V,
         cotangent: &V,
         starts: &[V],
         dimensions: &[V],
-    ) -> Result<V, ProgramError> {
+    ) -> Result<V, ProgramError>
+    where
+        <V as ValueProjection<ArrayType>>::Projected: Add + Mul + Concatenate + Scatter + TransferToMemory,
+        <V as ValueProjection<DimensionType>>::Projected: Add + SaturatingSub + Mul + DimensionMin,
+    {
         let context = cotangent.domain();
         let cotangent_type = cotangent.r#type();
         let cotangent_type = <&ArrayType>::try_from(cotangent_type.as_ref())?;
@@ -1610,7 +1620,10 @@ impl Operation for DynamicSliceOperation<ArrayType> {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicSliceOperation<ArrayType>);
 
-impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C> for DynamicSliceOperation<ArrayType> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for DynamicSliceOperation<ArrayType>
+where
+    C::Value: DynamicSlice,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1632,29 +1645,24 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 {
 }
 
-impl<
-    C: Context<
-            Type = ArrayType,
-            Value: ZeroLike
-                       + Broadcast
-                       + Transpose
-                       + Slice
-                       + Reshape
-                       + Reshard
-                       + Concatenate
-                       + Gather
-                       + Compare
-                       + Add
-                       + Select
-                       + ConvertElementType
-                       + TransferToMemory
-                       + OneLike
-                       + Reduce,
-            Operation: From<ConstantOperation<Array>>,
-        >,
-    P: ArrayExtentBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation<ArrayType>
+impl<C: Context<Type = ArrayType, Operation: From<ConstantOperation<Array>>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation<ArrayType>
 where
+    C::Value: ZeroLike
+        + Broadcast
+        + Transpose
+        + Slice
+        + Reshape
+        + Reshard
+        + Concatenate
+        + Gather
+        + Compare
+        + Add
+        + Select
+        + ConvertElementType
+        + TransferToMemory
+        + OneLike
+        + Reduce,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -2203,8 +2211,9 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicSliceOperation<ArrayIrType>);
 
-impl<C: Domain<Type = ArrayIrType, Value: DynamicSliceWithDimensions>> InterpretableOperation<C>
-    for DynamicSliceOperation<ArrayIrType>
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DynamicSliceOperation<ArrayIrType>
+where
+    C::Value: DynamicSliceWithDimensions,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -2313,8 +2322,12 @@ impl_differentiable_operation! {
         C::Operation: From<DynamicSliceOperation<ArrayIrType>> + From<LinearCallOperation<ArrayIrType>>
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
         Tracer<NestedTracingContext<C>>: DimensionSize + DimensionToScalar
-            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + SaturatingSub + Mul + DimensionMin>,
+            + ValueProjection<ArrayType>
+            + ValueProjection<DimensionType>,
+        <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::Projected:
+            Add + Mul + Concatenate + Scatter + TransferToMemory,
+        <Tracer<NestedTracingContext<C>> as ValueProjection<DimensionType>>::Projected:
+            Add + SaturatingSub + Mul + DimensionMin,
         NestedTracingContext<C>: StagingContext<
                 Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation,
             > + DimensionConstant + DynamicIota<Tracer<NestedTracingContext<C>>>
@@ -2381,8 +2394,12 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType>,
         Tracer<TracingContext<V, O>>: DimensionSize + DimensionToScalar
-            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + SaturatingSub + Mul + DimensionMin>,
+            + ValueProjection<ArrayType>
+            + ValueProjection<DimensionType>,
+        <Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::Projected:
+            Add + Mul + Concatenate + Scatter + TransferToMemory,
+        <Tracer<TracingContext<V, O>> as ValueProjection<DimensionType>>::Projected:
+            Add + SaturatingSub + Mul + DimensionMin,
         TracingContext<V, O>: DimensionConstant + DynamicIota<Tracer<TracingContext<V, O>>>
             + DynamicZero<Tracer<TracingContext<V, O>>>,
     {
@@ -2944,7 +2961,8 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
         Self: Value<Type: ArrayMemberType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DimensionToScalar
-            + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
+            + ValueProjection<ArrayType>,
+        Self::Projected: Add + Mul + Broadcast + TransferToMemory,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -3038,7 +3056,8 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
             + DynamicReshape
             + DimensionSize
             + DimensionToScalar
-            + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
+            + ValueProjection<ArrayType>,
+        Self::Projected: Add + Mul + Broadcast + TransferToMemory,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -3263,7 +3282,10 @@ impl Operation for DynamicUpdateSliceOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicUpdateSliceOperation);
 
-impl<C: Domain<Type = ArrayType, Value: DynamicUpdateSlice>> InterpretableOperation<C> for DynamicUpdateSliceOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for DynamicUpdateSliceOperation
+where
+    C::Value: DynamicUpdateSlice,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -3287,11 +3309,10 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicU
 {
 }
 
-impl<
-    C: Context<Type = ArrayType, Value: ZeroLike + Broadcast + Transpose + Slice + Reshape + Concatenate + Reshard>,
-    P: ArrayExtentBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicUpdateSliceOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for DynamicUpdateSliceOperation
 where
+    C::Value: ZeroLike + Broadcast + Transpose + Slice + Reshape + Concatenate + Reshard,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -4235,14 +4256,17 @@ fn validate_dynamic_slice_bound_counts(rank: usize, start_count: usize, size_cou
 /// assigning a nontrivial sharding to the extent-one slices used internally by the expansion.
 fn batch_by_item_expansion<
     O: Operation<Type = ArrayType> + InterpretableOperation<C>,
-    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + Reshape + Concatenate + Reshard>,
+    C: Context<Type = ArrayType>,
     P: ArrayExtentBatchingPolicy<C>,
 >(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],
     axis_size: usize,
-) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+where
+    C::Value: Broadcast + Transpose + Slice + Reshape + Concatenate + Reshard,
+{
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     }

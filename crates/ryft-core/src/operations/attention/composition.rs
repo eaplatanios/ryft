@@ -213,7 +213,8 @@ where
         + DimensionSize
         + DynamicBroadcast
         + DynamicReshape
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Add + And + Compare + Select + Sub>,
+        + ValueProjection<ArrayType>,
+    V::Projected: Value<Type = ArrayType> + Add + And + Compare + Select + Sub,
     V::Domain: Context<Type = ArrayIrType>,
     V::Domain: DimensionConstant,
     <<V as ValueProjection<ArrayType>>::Projected as Value>::Domain:
@@ -512,11 +513,8 @@ fn zero_query_rows_ir<V>(
     row_axis: usize,
 ) -> Result<ArrayProjection<V>, ProgramError>
 where
-    V: Value<Type = ArrayIrType>
-        + AttentionIota
-        + DimensionSize
-        + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Compare + Select>,
+    V: Value<Type = ArrayIrType> + AttentionIota + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    V::Projected: Value<Type = ArrayType> + Compare + Select,
     V::Domain: Context<Type = ArrayIrType>,
     <ArrayProjection<V> as Value>::Domain: Fill<f64, ArrayProjection<V>>,
 {

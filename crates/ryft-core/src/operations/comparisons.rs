@@ -235,8 +235,9 @@ impl ElementwiseOperation for CompareOperation<ArrayType> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> CompareOperation<T> where T: Type);
 
-impl<D: Domain<Type: ComparisonType, Value: Compare<D::Value>>> InterpretableOperation<D>
-    for CompareOperation<D::Type>
+impl<D: Domain<Type: ComparisonType>> InterpretableOperation<D> for CompareOperation<D::Type>
+where
+    D::Value: Compare<D::Value>,
 {
     #[inline]
     fn interpret<I: InterpretationDriver<D>>(

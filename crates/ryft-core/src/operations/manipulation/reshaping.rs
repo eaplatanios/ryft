@@ -134,7 +134,10 @@ impl Operation for ReshapeOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for ReshapeOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ReshapeOperation
+where
+    C::Value: Reshape,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -772,7 +775,10 @@ impl Operation for DynamicReshapeOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicReshapeOperation);
 
-impl<C: Domain<Type = ArrayIrType, Value: DynamicReshape>> InterpretableOperation<C> for DynamicReshapeOperation {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DynamicReshapeOperation
+where
+    C::Value: DynamicReshape,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -817,7 +823,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> P
 
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicReshapeOperation
 where
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Operation: From<ConstantOperation<DimensionValue>> + From<DynamicReshapeOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -1227,9 +1234,8 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>
-            + DimensionSize
-            + ValueProjection<DimensionType, Projected: Mul>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize + ValueProjection<DimensionType>,
+        Self::Projected: Mul,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;

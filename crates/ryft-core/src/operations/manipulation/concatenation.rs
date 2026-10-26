@@ -323,7 +323,10 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> ConcatenateOperation<T> where T: Type);
 
-impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation<ArrayType> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ConcatenateOperation<ArrayType>
+where
+    C::Value: Concatenate,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -335,8 +338,9 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
     }
 }
 
-impl<C: Domain<Type = ArrayIrType, Value: DynamicConcatenate>> InterpretableOperation<C>
-    for ConcatenateOperation<ArrayIrType>
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for ConcatenateOperation<ArrayIrType>
+where
+    C::Value: DynamicConcatenate,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -362,9 +366,10 @@ where
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ConcatenateOperation<ArrayType>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ConcatenateOperation<ArrayType>
 where
+    C::Value: Broadcast + Transpose,
     ConcatenateOperation<ArrayType>: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -400,7 +405,8 @@ where
 
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for ConcatenateOperation<ArrayIrType>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Broadcast + Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ConcatenateOperation<ArrayIrType>>
         + From<DynamicBroadcastOperation>
@@ -476,8 +482,8 @@ impl_differentiable_operation! {
     ConcatenateOperation<ArrayType>,
     jvp<C>
     where
-        C: Context<Type = ArrayType, Value: Concatenate, Operation: From<ConcatenateOperation<ArrayType>>>
-            + Zero<C::Value>,
+        C: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>> + Zero<C::Value>,
+        C::Value: Concatenate,
     {
         |operation, context, _driver, inputs| {
             // Concatenation is linear in every input, so its tangent concatenates the input tangents along the same
@@ -1112,7 +1118,8 @@ where
 // input still has its axis and extent validated.
 impl<V: Value<Type = ArrayIrType> + DynamicConcatenate<ArrayIrType>> Concatenate<ArrayIrType> for V
 where
-    V: DimensionSize + ValueProjection<DimensionType, Projected: Add>,
+    V: DimensionSize + ValueProjection<DimensionType>,
+    V::Projected: Add,
 {
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,

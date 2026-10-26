@@ -168,8 +168,9 @@ impl Operation for DotProductAttentionOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: DotProductAttention>> InterpretableOperation<C>
-    for DotProductAttentionOperation
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for DotProductAttentionOperation
+where
+    C::Value: DotProductAttention,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,

@@ -1551,7 +1551,10 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationTracer<C, P> {
 
 // A dual compares by its two halves (through the carried values' own `PartialEq`, which is identity-shaped for its
 // tracer-valued halves), ignoring the stamped context, so two duals are equal exactly when both of their halves are.
-impl<C: Context<Value: PartialEq>, P: DifferentiationPolicy<C>> PartialEq for DifferentiationTracer<C, P> {
+impl<C: Context, P: DifferentiationPolicy<C>> PartialEq for DifferentiationTracer<C, P>
+where
+    C::Value: PartialEq,
+{
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.primal() == other.primal()
@@ -3046,11 +3049,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             Input::To<DifferentiationTracer<Self>>,
             Capture::To<DifferentiationTracer<Self>>,
         ) -> Result<Output, ProgramError>,
-        Input: Parameterized<
-                Self::Value,
-                Family: ParameterizedFamily<DifferentiationTracer<Self>>,
-                ParameterStructure: Debug + PartialEq,
-            >,
+        Input: Parameterized<Self::Value, Family: ParameterizedFamily<DifferentiationTracer<Self>>>,
         Capture: Parameterized<Self::Value, Family: ParameterizedFamily<DifferentiationTracer<Self>>>,
         Output: Parameterized<DifferentiationTracer<Self>, Family: ParameterizedFamily<Self::Value>>,
     >(
@@ -3061,6 +3060,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
+        Input::ParameterStructure: Debug + PartialEq,
         Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
     {
         let mut function = Some(function);
@@ -3104,11 +3104,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 #[allow(clippy::type_complexity)]
 fn jvp_erased<
     C: ForwardModeDifferentiate,
-    Input: Parameterized<
-            C::Value,
-            Family: ParameterizedFamily<DifferentiationTracer<C>>,
-            ParameterStructure: Debug + PartialEq,
-        >,
+    Input: Parameterized<C::Value, Family: ParameterizedFamily<DifferentiationTracer<C>>>,
     Capture: Parameterized<C::Value, Family: ParameterizedFamily<DifferentiationTracer<C>>>,
     Output: Parameterized<DifferentiationTracer<C>, Family: ParameterizedFamily<C::Value>>,
 >(
@@ -3122,6 +3118,7 @@ fn jvp_erased<
     capture: Capture,
 ) -> Result<(Output::To<C::Value>, Output::To<C::Value>), DifferentiationError>
 where
+    Input::ParameterStructure: Debug + PartialEq,
     C::Operation: DifferentiableOperation<C> + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     if primal.parameters().next().is_none() {
@@ -4005,7 +4002,10 @@ pub(crate) mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType, Value: Mul>> InterpretableOperation<C> for CustomCubeOperation {
+    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CustomCubeOperation
+    where
+        C::Value: Mul,
+    {
         fn interpret<D: InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -4126,7 +4126,10 @@ pub(crate) mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType, Value: Mul>> InterpretableOperation<C> for CustomWeightedCubeOperation {
+    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CustomWeightedCubeOperation
+    where
+        C::Value: Mul,
+    {
         fn interpret<D: InterpretationDriver<C>>(
             &self,
             _context: &C,

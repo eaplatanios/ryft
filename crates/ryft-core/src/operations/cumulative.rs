@@ -261,7 +261,10 @@ impl Operation for CumulativeOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Cumulative>> InterpretableOperation<C> for CumulativeOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CumulativeOperation
+where
+    C::Value: Cumulative,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,

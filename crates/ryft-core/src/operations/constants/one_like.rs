@@ -67,7 +67,10 @@ impl ElementwiseOperation for OneLikeOperation<ArrayType> {
     }
 }
 
-impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation<C::Type> {
+impl<C: Domain> InterpretableOperation<C> for OneLikeOperation<C::Type>
+where
+    C::Value: OneLike,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,

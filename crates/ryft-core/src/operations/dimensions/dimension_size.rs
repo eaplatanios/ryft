@@ -186,8 +186,9 @@ impl Operation for DimensionSizeOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DimensionSizeOperation);
 
-impl<C: Domain<Type = ArrayIrType, Value: DimensionSize<C::Value>>> InterpretableOperation<C>
-    for DimensionSizeOperation
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DimensionSizeOperation
+where
+    C::Value: DimensionSize<C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,

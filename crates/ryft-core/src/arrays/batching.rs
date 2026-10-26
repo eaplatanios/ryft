@@ -770,8 +770,9 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayExtentBatchi
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayExtentBatchingPolicy<C>
-    for StaticArrayExtentBatchingPolicy
+impl<C: Context<Type = ArrayType>> ArrayExtentBatchingPolicy<C> for StaticArrayExtentBatchingPolicy
+where
+    C::Value: Broadcast + Transpose,
 {
     #[inline]
     fn axis_dimension(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<Dimension, BatchingError> {
@@ -916,8 +917,8 @@ impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchingPolicy<Project
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Operation:
         From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation> + OperationProjection<ArrayType>,
 {
@@ -1104,8 +1105,9 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RecursiveBatchingPolicy<C> for ArrayBatchingPolicy
+impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for ArrayBatchingPolicy
 where
+    C::Value: Broadcast + Transpose,
     C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
@@ -1181,8 +1183,10 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Gather> + Iota<C::Value>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>>
+impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>>
     DiagonalBatchingPolicy<C> for ArrayBatchingPolicy<P>
+where
+    C::Value: Gather,
 {
     fn diagonal(
         context: &C,
@@ -1207,7 +1211,10 @@ impl<C: Context<Type = ArrayType, Value: Gather> + Iota<C::Value>, P: BatchingPo
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatchingPolicy {
+impl<C: Context<Type = ArrayType>> BatchingEntrypointPolicy<C> for ArrayBatchingPolicy
+where
+    C::Value: Broadcast + Transpose,
+{
     fn pack_inputs(
         context: &C,
         inputs: Vec<C::Value>,
@@ -1445,8 +1452,8 @@ impl<C: ContextProjection<DimensionType, Type = ArrayIrType>> ReplicatedBatching
 
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -1706,7 +1713,8 @@ where
 
 impl<C: Context<Type = ArrayIrType> + DynamicIota<C::Value>> DiagonalBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Gather>,
+    C::Value: DimensionSize + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Gather,
 {
     fn diagonal(
         context: &C,
@@ -1736,11 +1744,9 @@ where
 
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value: DimensionSize
-        + Assert
-        + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: Compare<C::Value>>,
+    C::Value: DimensionSize + Assert + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected: Compare<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -1969,8 +1975,8 @@ where
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>, T: Type> ValueProjection<T>
     for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -2024,11 +2030,10 @@ where
 // Every input is then broadcast to the common per-item shape with the batch axis inserted there. Inputs whose per-item
 // shapes are not broadcast-compatible are left at their batch-axis-inserted shapes so the operation surfaces its own
 // shape error.
-impl<
-    C: Context<Type = ArrayType, Value: Transpose>,
-    O: ElementwiseOperation + InterpretableOperation<C>,
-    M: ArrayExtentBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatchingPolicy<M>> for O
+impl<C: Context<Type = ArrayType>, O: ElementwiseOperation + InterpretableOperation<C>, M: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<M>> for O
+where
+    C::Value: Transpose,
 {
     #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
@@ -2053,12 +2058,15 @@ impl<
 /// elementwise operation type. Keep it free of the operation type: every closure and iterator adapter in it is
 /// instantiated per distinct signature.
 #[allow(clippy::type_complexity)]
-fn batch_elementwise<C: Context<Type = ArrayType, Value: Transpose>, M: ArrayExtentBatchingPolicy<C>>(
+fn batch_elementwise<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>>(
     context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
     inputs: &[ArrayBatch<C::Value>],
     infer_output_types: &dyn Fn(&[ArrayType]) -> Result<Vec<ArrayType>, BatchingError>,
     interpret: &dyn Fn(&[ArrayBatch<C::Value>], &[BatchAxis]) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
-) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+where
+    C::Value: Transpose,
+{
     let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
         let packed_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = infer_output_types(packed_types.as_slice())?;

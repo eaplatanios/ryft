@@ -546,7 +546,10 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatching<C> for ParallelAllToAllOperation {
+impl<C: Context<Type = ArrayType>> ShapeChangingCollectiveBatching<C> for ParallelAllToAllOperation
+where
+    C::Value: Transpose,
+{
     fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
@@ -652,7 +655,10 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for ParallelAllToAllOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelAllToAllOperation
+where
+    C::Value: Reshape,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -685,9 +691,11 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllToAllOperation>>> P
 }
 
 impl<
-    C: Context<Type = ArrayType, Value: Transpose, Operation: From<ParallelAllToAllOperation>>,
+    C: Context<Type = ArrayType, Operation: From<ParallelAllToAllOperation>>,
     P: CollectiveArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelAllToAllOperation
+where
+    C::Value: Transpose,
 {
     #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -773,10 +781,11 @@ impl MemberOperation<ArrayIrType> for ParallelAllToAllOperation {
 impl<
     C: Domain<
             Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
-                       + ValueProjection<DimensionType, Projected = DimensionValue>,
+            Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
 > MemberInterpretableOperation<C> for ParallelAllToAllOperation
+where
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape,
 {
     #[inline]
     fn interpret_in_parent<D: InterpretationDriver<C>>(
@@ -793,14 +802,6 @@ impl<
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
-            Value: Assert
-                       + DimensionSize
-                       + DynamicBroadcast
-                       + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-                       + ValueProjection<
-                DimensionType,
-                Projected: Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
-            >,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: From<ParallelAllToAllOperation>
                            + From<DynamicBroadcastOperation>
@@ -810,6 +811,11 @@ impl<
                            + OperationProjection<ArrayType>,
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelAllToAllOperation
+where
+    C::Value: Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     #[inline]
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -1067,8 +1073,10 @@ where
                         + DimensionConstant,
         > + Assert
         + DimensionSize<V>
-        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Mul + Div + Rem + Compare<V>>
-        + ValueProjection<ArrayType, Projected: ParallelVary>,
+        + ValueProjection<DimensionType>
+        + ValueProjection<ArrayType>,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul + Div + Rem + Compare<V>,
+    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
     fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,

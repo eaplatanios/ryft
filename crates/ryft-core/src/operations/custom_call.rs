@@ -1285,7 +1285,10 @@ impl Operation for CustomCallOperation {
 
 impl_reference_dischargeable_operation!(@reference_free CustomCallOperation);
 
-impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CustomCallOperation
+where
+    C::Value: CustomCall,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -1510,12 +1513,11 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
 impl<
     C: Domain<
             Type = ArrayIrType,
-            Value: ValueProjection<
-                ArrayType,
-                Projected: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>,
-            > + ValueProjection<DimensionType, Projected = DimensionValue>,
+            Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
 > MemberInterpretableOperation<C> for CustomCallOperation
+where
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>,
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
@@ -1573,9 +1575,6 @@ impl<
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
-            Value: DimensionSize
-                       + DynamicBroadcast
-                       + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Transpose>,
             Operation: OperationPayloadProjection
                            + OperationProjection<
                 ArrayType,
@@ -1590,6 +1589,9 @@ impl<
                            + From<ScanOperation<C::Type>>,
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
+where
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Transpose,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,

@@ -133,9 +133,9 @@ where
     }
 }
 
-impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceNew<C::Value>>> InterpretableOperation<C>
-    for ReferenceNewOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U>> InterpretableOperation<C> for ReferenceNewOperation<T, U>
 where
+    C::Value: ReferenceNew<C::Value>,
     ReferenceNewOperation<T, U>: Operation<Type = U>,
 {
     #[inline]

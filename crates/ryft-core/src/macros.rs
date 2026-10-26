@@ -566,12 +566,10 @@ macro_rules! define_dimension_arithmetic_operation {
             }
         }
 
-        impl<
-            __C: $crate::contexts::Domain<
-                Type = $crate::arrays::DimensionType,
-                Value: $capability,
-            >,
-        > $crate::interpretation::InterpretableOperation<__C> for $operation
+        impl<__C: $crate::contexts::Domain<Type = $crate::arrays::DimensionType>>
+            $crate::interpretation::InterpretableOperation<__C> for $operation
+        where
+            __C::Value: $capability,
         {
             #[inline]
             fn interpret<__D: $crate::interpretation::InterpretationDriver<__C>>(
@@ -843,9 +841,10 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C>
+        impl<__C: $crate::Domain> $crate::InterpretableOperation<__C>
             for $operation<__C::Type>
         where
+            __C::Value: $capability,
             $operation<__C::Type>: $crate::Operation<Type = __C::Type>,
         {
             #[inline]
@@ -956,9 +955,10 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C>
+        impl<__C: $crate::Domain> $crate::InterpretableOperation<__C>
             for $operation<__C::Type>
         where
+            __C::Value: $capability,
             $operation<__C::Type>: $crate::Operation<Type = __C::Type>,
         {
             #[inline]

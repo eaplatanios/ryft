@@ -954,9 +954,14 @@ mod partial {
         }
     }
 
-    /// Stand-in for `ryft_core::partial::PartialEvaluationDriver`.
+    /// Stand-in for `ryft_core::partial::PartialEvaluationDriver`, including the provided `region_programs` of
+    /// `ryft_core::RegionDriver` that the derived partial-evaluation dispatcher calls.
     pub(crate) trait PartialEvaluationDriver<C: Context> {
         fn regions(&self) -> Vec<RegionRef<C::Constant, C::Operation>>;
+
+        fn region_programs(&self) -> Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>> {
+            self.regions().into_iter().map(RegionRef::to_program).collect()
+        }
     }
 
     /// Stand-in for `ryft_core::partial::PartiallyEvaluatableOperation`.

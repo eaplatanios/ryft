@@ -252,32 +252,32 @@ pub(crate) fn hessian_in_context<C, Input, Capture, Output, AuxiliaryOutput, F>(
 >
 where
     C: Context<
-            Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
-            Operation: PartiallyEvaluatableOperation<C>
-                           + PartiallyEvaluatableOperation<LinearizationContext<C>>
-                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                           + DifferentiableOperation<PartialEvaluationContext<C>>
-                           + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-                           + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-                           + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
-                           + TransposableOperation<C::Constant, C::Operation>
-                           + ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
+        Operation: PartiallyEvaluatableOperation<C>
+                       + PartiallyEvaluatableOperation<LinearizationContext<C>>
+                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                       + DifferentiableOperation<PartialEvaluationContext<C>>
+                       + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+                       + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+                       + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
+                       + TransposableOperation<C::Constant, C::Operation>
+                       + ResidualZeroProvider<C::Type, Operation = C::Operation>
+                       + ReferenceAccessOperation<
+            Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+        > + OperationProvider<
+            C::Type,
+            ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + OperationProvider<
+            C::Type,
+            ReferenceAddUpdateOperation<
+                <C::Type as ReferenceMemberType>::Referent,
                 C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
-        >,
+                <C::Operation as ReferenceAccessOperation>::Transform,
+            >,
+            Operation = C::Operation,
+        > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+    >,
+    C::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
     Input: Parameterized<
             C::Value,
             To<C::Value> = Input,

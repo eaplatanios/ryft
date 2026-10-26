@@ -216,13 +216,10 @@ where
     }
 }
 
-impl<
-    T: Type,
-    U: Type,
-    Transform: ReferenceTransform<Type = U, Referent = T>,
-    C: Domain<Type = U, Value: ReferenceWrite<Transform, C::Value, C::Value>>,
-> InterpretableOperation<C> for ReferenceWriteOperation<T, U, Transform>
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>, C: Domain<Type = U>>
+    InterpretableOperation<C> for ReferenceWriteOperation<T, U, Transform>
 where
+    C::Value: ReferenceWrite<Transform, C::Value, C::Value>,
     ReferenceWriteOperation<T, U, Transform>: Operation<Type = U>,
 {
     #[inline]

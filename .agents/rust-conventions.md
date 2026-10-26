@@ -39,6 +39,15 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   identifying bound for each parameter (e.g., `T: Type`, `V: Value<Type = T>`, `O: Operation<T>`, etc.). Move long or
   structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`, into
   `where` clauses.
+- Do not nest a bound on a trait that has a `Self`-referential default type parameter inside an associated-type
+  binding of a generic parameter. This concerns the value capability traits (`Reshape<T = <Self as
+  Capability>::Universe>` and every other `$capability<T = …>` trait) and `PartialEq`/`PartialOrd`/the arithmetic
+  operator traits: write `where C::Value: Reshape`, not `C: Domain<Value: Reshape>`. Both forms mean the same thing to
+  `rustc`, but RustRover cannot resolve `Self` inside the nested form and then reports a false "type does not implement
+  trait" error at every call that must prove such an implementation. Nested bindings on traits without such defaults
+  (`Context<Type: DifferentiableType>`), equalities (`Domain<Type = ArrayType>`), and the supertrait or associated-type
+  declarations of trait definitions (`trait X: Domain<Type: ScanType>`, `type Value: Value<Type = Self::Type>`) are
+  unaffected and stay as they are.
 - Declare the type-descriptor parameter before the value parameter in generic parameter lists (e.g.,
   `<T: Type, V: Value<Type = T>>`, not `<V, T>`). Likewise, declare a parameter type before the structure that is
   parameterized by it (e.g., `Parameterwise<P, S>` and `impl<P: Parameter, S: Parameterized<P>>`).

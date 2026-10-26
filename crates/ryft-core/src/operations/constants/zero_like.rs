@@ -72,7 +72,10 @@ impl ElementwiseOperation for ZeroLikeOperation<ArrayType> {
     }
 }
 
-impl<C: Domain<Value: ZeroLike>> InterpretableOperation<C> for ZeroLikeOperation<C::Type> {
+impl<C: Domain> InterpretableOperation<C> for ZeroLikeOperation<C::Type>
+where
+    C::Value: ZeroLike,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,

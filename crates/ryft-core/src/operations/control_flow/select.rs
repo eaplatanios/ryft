@@ -246,8 +246,9 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
     }
 }
 
-impl<C: Domain<Value: Select>> InterpretableOperation<C> for SelectOperation<C::Type>
+impl<C: Domain> InterpretableOperation<C> for SelectOperation<C::Type>
 where
+    C::Value: Select,
     Self: Operation<Type = C::Type>,
 {
     #[inline]

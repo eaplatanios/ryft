@@ -540,8 +540,8 @@ pub trait ArrayIrOperations:
 impl<
     V: Value<Type = ArrayIrType>
         + ArrayOperations<ArrayIrType>
-        + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
-        + ValueProjection<DimensionType, Projected: DimensionOperations<DimensionType>>
+        + ValueProjection<ArrayType>
+        + ValueProjection<DimensionType>
         + DimensionSize
         + DimensionFromScalar
         + DimensionToScalar
@@ -549,6 +549,9 @@ impl<
         + DynamicManipulationOperations<ArrayIrType>
         + DynamicRngBitGenerator<ArrayIrType>,
 > ArrayIrOperations for V
+where
+    <V as ValueProjection<ArrayType>>::Projected: ArrayOperations<ArrayType>,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionOperations<DimensionType>,
 {
 }
 

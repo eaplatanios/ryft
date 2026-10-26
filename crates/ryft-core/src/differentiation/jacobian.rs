@@ -690,11 +690,14 @@ impl JacobianMode {
 ///   - `types`: Structured parameter types whose leaf coordinate spaces are flattened in parameter order.
 ///   - `transform`: Derivative transform requesting the offsets, used in diagnostics.
 ///   - `role`: Role of `types` in the derivative transform, used in diagnostics.
-fn coordinate_prefix_offsets<C: Context<Type: DenseDifferentiableType<C>>, Types: Parameterized<C::Type>>(
+fn coordinate_prefix_offsets<C: Context, Types: Parameterized<C::Type>>(
     types: &Types,
     transform: DerivativeTransform,
     role: DifferentiationParameterRole,
-) -> Result<Vec<usize>, DifferentiationError> {
+) -> Result<Vec<usize>, DifferentiationError>
+where
+    C::Type: DenseDifferentiableType<C>,
+{
     let mut offsets = Vec::new();
     offsets.push(0usize);
     for (path, r#type) in types.named_parameters() {

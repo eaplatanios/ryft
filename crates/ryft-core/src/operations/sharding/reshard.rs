@@ -231,7 +231,10 @@ impl Operation for ReshardOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for ReshardOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ReshardOperation
+where
+    C::Value: Reshard,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -247,8 +250,10 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
 
 impl<C: Context<Operation: From<ReshardOperation>>> PartiallyEvaluatableOperation<C> for ReshardOperation {}
 
-impl<C: Context<Type = ArrayType, Value: Reshard>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ReshardOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ReshardOperation
+where
+    C::Value: Reshard,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -1157,10 +1162,10 @@ mod tests {
         }
 
         /// Exercises the same capability through a domain's generic value type.
-        fn apply_domain<C: Domain<Value: Reshard>>(
-            input: &C::Value,
-            sharding: &Sharding,
-        ) -> Result<C::Value, ProgramError> {
+        fn apply_domain<C: Domain>(input: &C::Value, sharding: &Sharding) -> Result<C::Value, ProgramError>
+        where
+            C::Value: Reshard,
+        {
             input.reshard(sharding)
         }
 

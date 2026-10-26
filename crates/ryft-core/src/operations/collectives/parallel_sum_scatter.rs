@@ -505,8 +505,9 @@ impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingCollectiveBatching<C>
-    for ParallelSumScatterOperation
+impl<C: Context<Type = ArrayType>> ShapeChangingCollectiveBatching<C> for ParallelSumScatterOperation
+where
+    C::Value: Reduce + Transpose,
 {
     fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
         &self,
@@ -560,7 +561,10 @@ impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingColle
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for ParallelSumScatterOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelSumScatterOperation
+where
+    C::Value: Reshape,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -592,9 +596,11 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>>
 }
 
 impl<
-    C: Context<Type = ArrayType, Value: Reduce + Transpose, Operation: From<ParallelSumScatterOperation>>,
+    C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>,
     P: CollectiveArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelSumScatterOperation
+where
+    C::Value: Reduce + Transpose,
 {
     #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -679,10 +685,11 @@ impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
 impl<
     C: Domain<
             Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
-                       + ValueProjection<DimensionType, Projected = DimensionValue>,
+            Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
 > MemberInterpretableOperation<C> for ParallelSumScatterOperation
+where
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape,
 {
     #[inline]
     fn interpret_in_parent<D: InterpretationDriver<C>>(
@@ -699,14 +706,6 @@ impl<
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
-            Value: Assert
-                       + DimensionSize
-                       + DynamicBroadcast
-                       + ValueProjection<ArrayType, Projected: Reduce + Transpose + Value<Type = ArrayType>>
-                       + ValueProjection<
-                DimensionType,
-                Projected: Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
-            >,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: From<ParallelSumScatterOperation>
                            + From<DynamicBroadcastOperation>
@@ -716,6 +715,11 @@ impl<
                            + OperationProjection<ArrayType>,
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelSumScatterOperation
+where
+    C::Value: Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Reduce + Transpose + Value<Type = ArrayType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     #[inline]
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -937,9 +941,12 @@ impl<
                         + DimensionConstant,
         > + Assert
         + DimensionSize<V>
-        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Div + Rem + Compare<V>>
-        + ValueProjection<ArrayType, Projected: ParallelVary>,
+        + ValueProjection<DimensionType>
+        + ValueProjection<ArrayType>,
 > ParallelSumScatter<ArrayIrType> for V
+where
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Div + Rem + Compare<V>,
+    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
     fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,

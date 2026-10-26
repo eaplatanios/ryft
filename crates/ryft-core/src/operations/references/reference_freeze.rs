@@ -115,9 +115,9 @@ where
     }
 }
 
-impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceFreeze<C::Value>>> InterpretableOperation<C>
-    for ReferenceFreezeOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U>> InterpretableOperation<C> for ReferenceFreezeOperation<T, U>
 where
+    C::Value: ReferenceFreeze<C::Value>,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
 {
     fn interpret<D: InterpretationDriver<C>>(

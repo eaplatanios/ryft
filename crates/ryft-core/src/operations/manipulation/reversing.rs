@@ -86,7 +86,10 @@ impl Operation for ReverseOperation {
 
 impl_reference_dischargeable_operation!(@reference_free ReverseOperation);
 
-impl<C: Domain<Type = ArrayType, Value: Reverse>> InterpretableOperation<C> for ReverseOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ReverseOperation
+where
+    C::Value: Reverse,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -104,8 +107,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ReverseOperation>>> PartiallyE
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Reverse>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ReverseOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ReverseOperation
+where
+    C::Value: Reverse,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,

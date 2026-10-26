@@ -417,7 +417,10 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 
-impl<C: Domain<Type: Into<ArrayIrType>, Value: Assert>> InterpretableOperation<C> for AssertOperation<C::Type> {
+impl<C: Domain<Type: Into<ArrayIrType>>> InterpretableOperation<C> for AssertOperation<C::Type>
+where
+    C::Value: Assert,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -511,10 +514,8 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
 
 impl<C, P> BatchableOperation<C, ArrayBatchingPolicy<P>> for AssertOperation<ArrayType>
 where
-    C: Context<
-            Type = ArrayType,
-            Value: Assert + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
-        >,
+    C: Context<Type = ArrayType>,
+    C::Value: Assert + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
     P: ArrayExtentBatchingPolicy<C> + ArrayAssertionBatchingPolicy<C, P>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -548,9 +549,10 @@ where
     }
 }
 
-impl<C: ContextProjection<ArrayType, Type = ArrayIrType, Value: Assert, Operation: OperationPayloadProjection>>
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType, Operation: OperationPayloadProjection>>
     BatchableOperation<C, ArrayIrBatchingPolicy> for AssertOperation<ArrayIrType>
 where
+    C::Value: Assert,
     <C::Value as ValueProjection<ArrayType>>::Projected:
         ZeroLike + ConvertElementType + Select + DynamicSlice + Reshape + Reduce,
     DynamicArrayExtentBatchingPolicy: ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>, Extent = C::Value>
@@ -696,10 +698,10 @@ pub trait ArrayAssertionBatchingPolicy<C: Context<Type = ArrayType>, P: ArrayExt
     ) -> Result<C::Value, ProgramError>;
 }
 
-impl<
-    C: Context<Type = ArrayType, Value: Reduce, Operation: From<IotaOperation<ArrayType>>>,
-    P: ArrayExtentBatchingPolicy<C>,
-> ArrayAssertionBatchingPolicy<C, P> for StaticArrayExtentBatchingPolicy
+impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
+    ArrayAssertionBatchingPolicy<C, P> for StaticArrayExtentBatchingPolicy
+where
+    C::Value: Reduce,
 {
     fn batch_item_indices(
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
@@ -753,7 +755,8 @@ where
                            + From<CompareOperation<ArrayIrType>>
                            + From<PadOperation<ArrayIrType>>,
         >,
-    V: ValueProjection<ArrayType, Projected: Select>,
+    V: ValueProjection<ArrayType>,
+    V::Projected: Select,
     P: ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>, Extent = C::Value>,
 {
     // A projected dynamic batch uses the same first-class extent as its array IR parent. That extent and the
@@ -2840,7 +2843,10 @@ mod tests {
             }
         }
 
-        impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayExtentBatchingPolicy<C> for CustomExtent {
+        impl<C: Context<Type = ArrayType>> ArrayExtentBatchingPolicy<C> for CustomExtent
+        where
+            C::Value: Broadcast + Transpose,
+        {
             fn axis_dimension(
                 context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
             ) -> Result<Dimension, BatchingError> {
@@ -2872,9 +2878,10 @@ mod tests {
             }
         }
 
-        impl<
-            C: Context<Type = ArrayType, Value: Broadcast + Reduce + Transpose, Operation: From<IotaOperation<ArrayType>>>,
-        > ArrayAssertionBatchingPolicy<C, Self> for CustomExtent
+        impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>>>>
+            ArrayAssertionBatchingPolicy<C, Self> for CustomExtent
+        where
+            C::Value: Broadcast + Reduce + Transpose,
         {
             #[inline]
             fn batch_item_indices(
@@ -3011,10 +3018,8 @@ mod tests {
         // capabilities of the values. Concrete built-in policies alone would hide accidentally stronger bounds.
         fn array_policy<C, P>()
         where
-            C: Context<
-                    Type = ArrayType,
-                    Value: Assert + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
-                >,
+            C: Context<Type = ArrayType>,
+            C::Value: Assert + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
             P: ArrayExtentBatchingPolicy<C> + ArrayAssertionBatchingPolicy<C, P>,
         {
             let _ = <AssertOperation<ArrayType> as BatchableOperation<C, ArrayBatchingPolicy<P>>>::batch::<

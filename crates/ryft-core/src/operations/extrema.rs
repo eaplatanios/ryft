@@ -418,8 +418,9 @@ impl ElementwiseOperation for ClampOperation<ArrayType> {
     }
 }
 
-impl<D: Domain<Value: Clamp>> InterpretableOperation<D> for ClampOperation<D::Type>
+impl<D: Domain> InterpretableOperation<D> for ClampOperation<D::Type>
 where
+    D::Value: Clamp,
     ClampOperation<D::Type>: Operation<Type = D::Type>,
 {
     #[inline]

@@ -436,7 +436,10 @@ impl Operation for PadOperation<ArrayIrType> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> PadOperation<T> where T: Type);
 
-impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation<ArrayType> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for PadOperation<ArrayType>
+where
+    C::Value: Pad,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -454,7 +457,10 @@ impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadO
     }
 }
 
-impl<C: Domain<Type = ArrayIrType, Value: DynamicPad>> InterpretableOperation<C> for PadOperation<ArrayIrType> {
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for PadOperation<ArrayIrType>
+where
+    C::Value: DynamicPad,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -565,7 +571,8 @@ where
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
     for PadOperation<ArrayIrType>
 where
-    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Broadcast + Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: From<DynamicBroadcastOperation>
@@ -1730,8 +1737,10 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
             + DynamicBroadcast
             + DynamicReshape
             + ManualVariationAlignment
-            + ValueProjection<ArrayType, Projected: Add + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + Compare<Self>>,
+            + ValueProjection<ArrayType>
+            + ValueProjection<DimensionType>,
+        <Self as ValueProjection<ArrayType>>::Projected: Add + Scatter + TransferToMemory,
+        <Self as ValueProjection<DimensionType>>::Projected: Add + Compare<Self>,
     {
         // The padding value is aligned first because the fill is broadcast to the input's manual variation,
         // and a varying input may be padded with an invariant scalar.

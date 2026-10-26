@@ -369,8 +369,9 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> RngBitGeneratorOperation<T> where T: Type);
 
-impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation<C>
-    for RngBitGeneratorOperation<ArrayType>
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for RngBitGeneratorOperation<ArrayType>
+where
+    C::Value: RngBitGenerator,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -385,8 +386,9 @@ impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation
     }
 }
 
-impl<C: Domain<Type = ArrayIrType, Value: DynamicRngBitGenerator>> InterpretableOperation<C>
-    for RngBitGeneratorOperation<ArrayIrType>
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for RngBitGeneratorOperation<ArrayIrType>
+where
+    C::Value: DynamicRngBitGenerator,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -410,13 +412,11 @@ where
 }
 
 impl<
-    C: Context<
-            Type = ArrayType,
-            Value: Transpose,
-            Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Type>>,
-        >,
+    C: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Type>>>,
     P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for RngBitGeneratorOperation<ArrayType>
+where
+    C::Value: Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -461,7 +461,8 @@ impl<
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
     for RngBitGeneratorOperation<ArrayIrType>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>

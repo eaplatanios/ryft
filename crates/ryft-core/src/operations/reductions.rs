@@ -475,7 +475,10 @@ impl Operation for ReduceOperation {
     }
 }
 
-impl<D: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<D> for ReduceOperation {
+impl<D: Domain<Type = ArrayType>> InterpretableOperation<D> for ReduceOperation
+where
+    D::Value: Reduce,
+{
     fn interpret<I: InterpretationDriver<D>>(
         &self,
         _context: &D,
@@ -1787,7 +1790,10 @@ impl Operation for ArgMaxOperation {
     }
 }
 
-impl<D: Domain<Type = ArrayType, Value: ArgMax>> InterpretableOperation<D> for ArgMaxOperation {
+impl<D: Domain<Type = ArrayType>> InterpretableOperation<D> for ArgMaxOperation
+where
+    D::Value: ArgMax,
+{
     #[inline]
     fn interpret<I: InterpretationDriver<D>>(
         &self,
@@ -1805,8 +1811,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>> PartiallyEv
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: ArgMax>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ArgMaxOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ArgMaxOperation
+where
+    C::Value: ArgMax,
 {
     #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -2000,7 +2008,10 @@ impl Operation for ArgMinOperation {
     }
 }
 
-impl<D: Domain<Type = ArrayType, Value: ArgMin>> InterpretableOperation<D> for ArgMinOperation {
+impl<D: Domain<Type = ArrayType>> InterpretableOperation<D> for ArgMinOperation
+where
+    D::Value: ArgMin,
+{
     #[inline]
     fn interpret<I: InterpretationDriver<D>>(
         &self,
@@ -2018,8 +2029,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ArgMinOperation>>> PartiallyEv
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: ArgMin>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ArgMinOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ArgMinOperation
+where
+    C::Value: ArgMin,
 {
     #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(

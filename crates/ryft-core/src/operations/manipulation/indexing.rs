@@ -1137,26 +1137,26 @@ impl<
 
 impl<
     V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
-        + ValueProjection<
-            ArrayType,
-            Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
-                           + Broadcast
-                           + Reshape
-                           + Concatenate
-                           + ConvertElementType
-                           + Compare
-                           + Add
-                           + Select
-                           + Slice
-                           + Reverse
-                           + Gather
-                           + TransferToMemory
-                           + ManualVariationAlignment<ArrayType>,
-        > + DimensionSize
+        + ValueProjection<ArrayType>
+        + DimensionSize
         + DimensionToScalar
         + DynamicGather
         + DynamicReshape,
 > Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V::Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
+        + Broadcast
+        + Reshape
+        + Concatenate
+        + ConvertElementType
+        + Compare
+        + Add
+        + Select
+        + Slice
+        + Reverse
+        + Gather
+        + TransferToMemory
+        + ManualVariationAlignment<ArrayType>,
 {
     /// Reads the selection of an array that may have a symbolic shape. A selection whose input and index arrays all
     /// have concrete shapes is served by the implementation for array values, with the result lifted back into this
@@ -1211,25 +1211,25 @@ impl<
 
 impl<
     V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
-        + ValueProjection<
-            ArrayType,
-            Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
-                           + Broadcast
-                           + Reshape
-                           + Concatenate
-                           + ConvertElementType
-                           + Compare
-                           + Add
-                           + Select
-                           + Reverse
-                           + Scatter
-                           + TransferToMemory,
-        > + DimensionSize
+        + ValueProjection<ArrayType>
+        + DimensionSize
         + DimensionToScalar
         + DynamicScatter
         + DynamicReshape
         + DynamicBroadcast,
 > Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V::Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
+        + Broadcast
+        + Reshape
+        + Concatenate
+        + ConvertElementType
+        + Compare
+        + Add
+        + Select
+        + Reverse
+        + Scatter
+        + TransferToMemory,
 {
     /// Overwrites the selected elements of an array that may have a symbolic shape, returning a new value and leaving
     /// the input unchanged. Updates broadcast to the selected shape, using dimension values for symbolic extents.
@@ -1648,21 +1648,16 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<
     }
 }
 
-impl<
-    V: Value<Type = ArrayIrType>
-        + DimensionSize
-        + DimensionToScalar
-        + ValueProjection<
-            ArrayType,
-            Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
-                           + ConvertElementType
-                           + Compare
-                           + Add
-                           + Select
-                           + TransferToMemory
-                           + Reverse,
-        >,
-> Indexed<'_, '_, '_, V, ArrayIrType>
+impl<V: Value<Type = ArrayIrType> + DimensionSize + DimensionToScalar + ValueProjection<ArrayType>>
+    Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V::Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
+        + ConvertElementType
+        + Compare
+        + Add
+        + Select
+        + TransferToMemory
+        + Reverse,
 {
     /// Lifts a host coordinate literal through the array projected out of the input. Refer to the documentation of the
     /// array-valued [`constant`](Indexed::constant) for more information.

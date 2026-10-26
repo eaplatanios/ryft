@@ -148,7 +148,10 @@ impl Operation for DotOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Dot>> InterpretableOperation<C> for DotOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for DotOperation
+where
+    C::Value: Dot,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -392,7 +395,10 @@ impl Operation for RaggedDotOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: RaggedDot>> InterpretableOperation<C> for RaggedDotOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for RaggedDotOperation
+where
+    C::Value: RaggedDot,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,

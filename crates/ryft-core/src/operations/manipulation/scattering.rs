@@ -593,21 +593,7 @@ impl ScatterOperation {
     ///   - `primal_to_tangent`: Imports primal coefficients and indices into the tangent context. It must retain
     ///     their dependence on primal inputs so that subsequent differentiation can recover those dependencies.
     fn linearize_values<
-        C: Context<
-                Type = ArrayType,
-                Value: ZeroLike
-                           + OneLike
-                           + Add
-                           + Mul
-                           + Div
-                           + Compare
-                           + Select
-                           + ConvertElementType
-                           + Broadcast
-                           + Reshape
-                           + Gather
-                           + Scatter,
-            > + Iota<C::Value>,
+        C: Context<Type = ArrayType> + Iota<C::Value>,
         F: Fn(C::Value) -> Result<C::Value, ProgramError>,
     >(
         &self,
@@ -615,7 +601,21 @@ impl ScatterOperation {
         inputs: [&C::Value; 3],
         tangents: [(&C::Value, bool); 2],
         primal_to_tangent: F,
-    ) -> Result<(C::Value, C::Value), ProgramError> {
+    ) -> Result<(C::Value, C::Value), ProgramError>
+    where
+        C::Value: ZeroLike
+            + OneLike
+            + Add
+            + Mul
+            + Div
+            + Compare
+            + Select
+            + ConvertElementType
+            + Broadcast
+            + Reshape
+            + Gather
+            + Scatter,
+    {
         /// Aligns a value with the validated placement required by a derivative term, retaining its context. Equal
         /// types need no operation; otherwise an identity-axis broadcast records the metadata conversion explicitly.
         fn align_linearization_value<V: Value<Type = ArrayType> + Broadcast>(
@@ -1036,7 +1036,10 @@ impl Operation for ScatterOperation {
 
 impl_reference_dischargeable_operation!(@reference_free ScatterOperation);
 
-impl<C: Domain<Type = ArrayType, Value: Scatter>> InterpretableOperation<C> for ScatterOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ScatterOperation
+where
+    C::Value: Scatter,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -1054,9 +1057,10 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScatterO
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ScatterOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ScatterOperation
 where
+    C::Value: Broadcast + Transpose,
     ScatterOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -1368,22 +1372,20 @@ impl_differentiable_operation! {
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType> + Zero<C::Value>> MemberDifferentiableOperation<C>
     for ScatterOperation
 where
-    C::Value: ValueProjection<
-            ArrayType,
-            Projected: Value<Type = ArrayType>
-                           + ZeroLike
-                           + OneLike
-                           + Add
-                           + Mul
-                           + Div
-                           + Compare
-                           + Select
-                           + ConvertElementType
-                           + Broadcast
-                           + Reshape
-                           + Gather
-                           + Scatter,
-        >,
+    C::Value: ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType>
+        + ZeroLike
+        + OneLike
+        + Add
+        + Mul
+        + Div
+        + Compare
+        + Select
+        + ConvertElementType
+        + Broadcast
+        + Reshape
+        + Gather
+        + Scatter,
     C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + OperationProjection<
             ArrayType,
@@ -2282,7 +2284,8 @@ pub trait DynamicScatter<T = <Self as Capability>::Universe>: Capability + Sized
 
 impl<V: Value<Type = ArrayIrType>> DynamicScatter<ArrayIrType> for V
 where
-    V: DimensionSize + DynamicReshape<ArrayIrType> + ValueProjection<ArrayType, Projected: Scatter>,
+    V: DimensionSize + DynamicReshape<ArrayIrType> + ValueProjection<ArrayType>,
+    V::Projected: Scatter,
     V::Domain: Context<Type = ArrayIrType> + DimensionConstant,
 {
     fn dynamic_scatter_axis<A: Into<Axis>>(

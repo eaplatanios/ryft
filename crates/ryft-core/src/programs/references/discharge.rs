@@ -895,8 +895,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Display for ReferenceDischargeVa
     }
 }
 
-impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialEq>> PartialEq
-    for ReferenceDischargeValue<C, P>
+impl<C: Domain, P: ReferenceDischargePolicy<C>> PartialEq for ReferenceDischargeValue<C, P>
+where
+    C::Value: PartialEq,
+    P::Alias: PartialEq,
 {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -1019,8 +1021,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Display for ReferenceDischargeRe
     }
 }
 
-impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialEq>> PartialEq
-    for ReferenceDischargeReference<C, P>
+impl<C: Domain, P: ReferenceDischargePolicy<C>> PartialEq for ReferenceDischargeReference<C, P>
+where
+    C::Value: PartialEq,
+    P::Alias: PartialEq,
 {
     #[inline]
     fn eq(&self, other: &Self) -> bool {

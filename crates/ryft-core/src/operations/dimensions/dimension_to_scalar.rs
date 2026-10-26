@@ -69,8 +69,9 @@ impl Operation for DimensionToScalarOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DimensionToScalarOperation);
 
-impl<C: Domain<Type = ArrayIrType, Value: DimensionToScalar<C::Value>>> InterpretableOperation<C>
-    for DimensionToScalarOperation
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DimensionToScalarOperation
+where
+    C::Value: DimensionToScalar<C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,

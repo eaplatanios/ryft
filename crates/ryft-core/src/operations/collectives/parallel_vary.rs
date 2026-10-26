@@ -136,7 +136,10 @@ impl<O: Operation<Type = ArrayType> + From<ParallelVaryOperation>> OperationProv
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: ParallelVary>> InterpretableOperation<C> for ParallelVaryOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelVaryOperation
+where
+    C::Value: ParallelVary,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -563,8 +566,9 @@ impl<V: Value<Type = DimensionType>> ManualVariationAlignment<DimensionType> for
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: ManualVariationAlignment<ArrayType>>>
-    ManualVariationAlignment<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> ManualVariationAlignment<ArrayIrType> for V
+where
+    V::Projected: ManualVariationAlignment<ArrayType>,
 {
     #[inline]
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {

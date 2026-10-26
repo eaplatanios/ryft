@@ -86,7 +86,10 @@ impl Operation for TransferToMemoryOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: TransferToMemory>> InterpretableOperation<C> for TransferToMemoryOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TransferToMemoryOperation
+where
+    C::Value: TransferToMemory,
+{
     // Interprets the transfer by delegating to the value-level `TransferToMemory` capability. Eager values keep
     // their payload unchanged but must re-place their carried type in the destination `Memory`, so that the
     // interpreted value's type stays faithful to the instruction's declared output type.
@@ -108,8 +111,10 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Transfer
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for TransferToMemoryOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for TransferToMemoryOperation
+where
+    C::Value: TransferToMemory,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,

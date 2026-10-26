@@ -201,7 +201,10 @@ impl Operation for ConstrainShardingOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: ConstrainSharding>> InterpretableOperation<C> for ConstrainShardingOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ConstrainShardingOperation
+where
+    C::Value: ConstrainSharding,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -220,8 +223,10 @@ impl<C: Context<Operation: From<ConstrainShardingOperation>>> PartiallyEvaluatab
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: ConstrainSharding>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ConstrainShardingOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ConstrainShardingOperation
+where
+    C::Value: ConstrainSharding,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -941,10 +946,10 @@ mod tests {
         }
 
         /// Exercises the same capability through a domain's generic value type.
-        fn apply_domain<C: Domain<Value: ConstrainSharding>>(
-            input: &C::Value,
-            sharding: &Sharding,
-        ) -> Result<C::Value, ProgramError> {
+        fn apply_domain<C: Domain>(input: &C::Value, sharding: &Sharding) -> Result<C::Value, ProgramError>
+        where
+            C::Value: ConstrainSharding,
+        {
             input.constrain_sharding(sharding)
         }
 

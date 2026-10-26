@@ -133,7 +133,10 @@ impl Operation for BroadcastOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> for BroadcastOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for BroadcastOperation
+where
+    C::Value: Broadcast,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -172,8 +175,10 @@ impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> Partiall
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for BroadcastOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for BroadcastOperation
+where
+    C::Value: Broadcast,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -238,7 +243,8 @@ impl_differentiable_operation! {
     BroadcastOperation,
     jvp<C>
     where
-        C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>,
+        C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>,
+        C::Value: Broadcast,
     {
         |operation, _context, _driver, inputs| {
             // Forward-mode differentiation rule for `BroadcastOperation`. Broadcasting is structural-linear, and so the
@@ -774,8 +780,8 @@ impl_reference_dischargeable_operation!(@reference_free DynamicBroadcastOperatio
 
 impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DynamicBroadcastOperation
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Broadcast>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Broadcast,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -837,7 +843,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
 
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicBroadcastOperation
 where
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Operation: From<DynamicBroadcastOperation> + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(

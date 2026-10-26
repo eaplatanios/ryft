@@ -587,15 +587,15 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     fn shape_changing_collective_interpret_in_parent<
         C: Domain<
                 Type = ArrayIrType,
-                Value: ValueProjection<
-                    ArrayType,
-                    Projected: Value<Type = ArrayType> + Reshape + DimensionSize<usize>,
-                > + ValueProjection<DimensionType, Projected = DimensionValue>,
+                Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
             >,
     >(
         &self,
         inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
+    ) -> Result<Vec<C::Value>, ProgramError>
+    where
+        <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Reshape + DimensionSize<usize>,
+    {
         // The array IR collective consumes one array followed by a dimension value for each result axis.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
@@ -756,14 +756,6 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         C: ContextProjection<
                 ArrayType,
                 Type = ArrayIrType,
-                Value: Assert
-                           + DimensionSize
-                           + DynamicBroadcast
-                           + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-                           + ValueProjection<
-                    DimensionType,
-                    Projected: Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
-                >,
                 Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
                 Operation: From<Self>
                                + From<ConstantOperation<DimensionValue>>
@@ -778,6 +770,11 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
     where
+        C::Value:
+            Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+        <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
+        <C::Value as ValueProjection<DimensionType>>::Projected:
+            Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
         Self: ShapeChangingCollectiveBatching<ProjectedContext<C, ArrayType>>,
     {
         let Some((array, output_extents)) = inputs.split_first() else {
@@ -905,8 +902,9 @@ trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
     ) -> Result<C::Value, BatchingError>;
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>> CollectiveArrayExtentBatchingPolicy<C>
-    for StaticArrayExtentBatchingPolicy
+impl<C: Context<Type = ArrayType>> CollectiveArrayExtentBatchingPolicy<C> for StaticArrayExtentBatchingPolicy
+where
+    C::Value: Broadcast + Reshape + Transpose,
 {
     type ShapeExtent = usize;
 
@@ -974,14 +972,6 @@ impl<
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
-            Value: Assert
-                       + DimensionSize
-                       + DynamicBroadcast
-                       + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-                       + ValueProjection<
-                DimensionType,
-                Projected: Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
-            >,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: From<DynamicBroadcastOperation>
                            + From<ConstantOperation<DimensionValue>>
@@ -990,6 +980,11 @@ impl<
                            + OperationProjection<ArrayType>,
         >,
 > CollectiveArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
+where
+    C::Value: Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
 {
     type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
 
@@ -1924,13 +1919,12 @@ mod tests {
 
         /// Checks that rearrangement collectives need no reduction capability.
         fn rearranging_collectives_batch<
-            C: Context<
-                    Type = ArrayType,
-                    Value: Transpose,
-                    Operation: From<ParallelAllGatherOperation> + From<ParallelAllToAllOperation>,
-                >,
+            C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation> + From<ParallelAllToAllOperation>>,
             P: CollectiveArrayExtentBatchingPolicy<C>,
-        >() {
+        >()
+        where
+            C::Value: Transpose,
+        {
             requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllGatherOperation>();
             requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllToAllOperation>();
         }

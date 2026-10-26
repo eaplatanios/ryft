@@ -366,7 +366,10 @@ impl Operation for SortOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Sort>> InterpretableOperation<C> for SortOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for SortOperation
+where
+    C::Value: Sort,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -380,8 +383,10 @@ impl<C: Domain<Type = ArrayType, Value: Sort>> InterpretableOperation<C> for Sor
 
 impl<C: Context<Type = ArrayType, Operation: From<SortOperation>>> PartiallyEvaluatableOperation<C> for SortOperation {}
 
-impl<C: Context<Type = ArrayType, Value: Sort + Broadcast + Transpose>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for SortOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for SortOperation
+where
+    C::Value: Sort + Broadcast + Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -767,7 +772,10 @@ impl<
 
 // Array IR values sort through their array views. Sorting has no receiver, which the shared projection macro cannot
 // express, and so this projection is written out. It covers array IR tracers and concrete array IR values alike.
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Sort<ArrayType>>> Sort<ArrayIrType> for V {
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> Sort<ArrayIrType> for V
+where
+    V::Projected: Sort<ArrayType>,
+{
     fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
         axis: A,

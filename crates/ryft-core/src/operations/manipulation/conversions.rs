@@ -227,8 +227,9 @@ impl<T: ElementType> Operation for ConvertElementTypeOperation<T> {
     }
 }
 
-impl<C: Domain<Type: ElementType, Value: ConvertElementType>> InterpretableOperation<C>
-    for ConvertElementTypeOperation<C::Type>
+impl<C: Domain<Type: ElementType>> InterpretableOperation<C> for ConvertElementTypeOperation<C::Type>
+where
+    C::Value: ConvertElementType,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -251,8 +252,10 @@ impl<C: Context<Type: ElementType, Operation: From<ConvertElementTypeOperation<C
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: ConvertElementType + Transpose>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ConvertElementTypeOperation<ArrayType>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ConvertElementTypeOperation<ArrayType>
+where
+    C::Value: ConvertElementType + Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -766,8 +769,9 @@ impl<T: ElementType> Operation for ReducePrecisionOperation<T> {
     }
 }
 
-impl<C: Domain<Type: ElementType, Value: ReducePrecision>> InterpretableOperation<C>
-    for ReducePrecisionOperation<C::Type>
+impl<C: Domain<Type: ElementType>> InterpretableOperation<C> for ReducePrecisionOperation<C::Type>
+where
+    C::Value: ReducePrecision,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -786,8 +790,10 @@ impl<C: Context<Type: ElementType, Operation: From<ReducePrecisionOperation<C::T
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: ReducePrecision>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ReducePrecisionOperation<ArrayType>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ReducePrecisionOperation<ArrayType>
+where
+    C::Value: ReducePrecision,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -810,7 +816,8 @@ impl_differentiable_operation! {
     jvp<C>
     where
         T: DifferentiableType + ElementType,
-        C: Context<Type = T, Value: ReducePrecision>,
+        C: Context<Type = T>,
+        C::Value: ReducePrecision,
     {
         |operation, _context, _driver, inputs| {
             // Precision reduction is treated as linear, so a live tangent is reduced to the same precision as the
@@ -1500,7 +1507,10 @@ impl<T: CastType> Operation for CastOperation<T> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> CastOperation<T> where T: CastType);
 
-impl<C: Domain<Type: CastType, Value: Cast<C::Type>>> InterpretableOperation<C> for CastOperation<C::Type> {
+impl<C: Domain<Type: CastType>> InterpretableOperation<C> for CastOperation<C::Type>
+where
+    C::Value: Cast<C::Type>,
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
