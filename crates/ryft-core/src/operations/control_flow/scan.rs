@@ -3000,6 +3000,136 @@ pub fn scan<
     context.scan(body, carry, inputs, options)
 }
 
+impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>, P: BatchingPolicy<C>> BatchingContext<C, P> {
+    /// Batches an application of `operation` to `inputs`, binding one scan over a batched body in the parent context.
+    /// The program size is independent of the iteration count under eager and staging parents alike. Every
+    /// [`BatchingPolicy`] uses this structural path, with its own carriers and boundary bookkeeping inputs. Carries
+    /// enter and leave each iteration at the same batch axes. Stacked inputs lose their leading scan axis inside the
+    /// body, while stacked outputs gain it after batching. Reference stacks enter as whole roots whose accesses adjust
+    /// their folded transforms through [`batch_reference_transforms`](crate::batch_reference_transforms).
+    fn batch_scan<D: BatchingDriver<C, P>>(
+        &self,
+        operation: &ScanOperation<C::Type>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        let body = driver.region(0)?;
+        let body_input_types = body.input_types();
+        let input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
+
+        // A rewritten batched scan must not legitimize a malformed original index, carry boundary, or stack shape.
+        operation.validate_application(&input_types, body)?;
+        let carry_count = operation.carry_count;
+        let (scan_inputs, iteration_count) = inputs.split_at(body_input_types.len() - 1);
+
+        // Pack mapped array carries at axis 0 and mapped array stacks behind their leading scan axis. Reference
+        // stacks keep the physical axis fixed by their roots, which cannot be moved onto or ahead of the scan axis.
+        let mut carries = canonicalize_carry_axes(self, driver, &scan_inputs[..carry_count])?;
+        let stacks = scan_inputs[carry_count..]
+            .iter()
+            .enumerate()
+            .map(|(position, input)| {
+                if !P::unbatched_type(input).is_reference() {
+                    return match P::batch_axis(input) == BatchAxis::new(0) {
+                        true => driver.align_batch_axis(self, input.clone(), Axis::from(1)),
+                        false => Ok(input.clone()),
+                    };
+                }
+                if P::batch_axis(input) == BatchAxis::new(0) {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "`{}` batching found the reference-typed stacked input at position {} batched on its scan \
+                             axis; a reference stack keeps its batch axis and must be batched at an axis behind its \
+                             leading scan axis",
+                            SCAN_OPERATION_NAME,
+                            carry_count + position,
+                        ),
+                    });
+                }
+                Ok(input.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Batch one iteration at its replicated index, carry axes, and slice axes. Join carry axes to a fixed point
+        // so every carry leaves at the same axis at which it entered, then broadcast any widened initial carries.
+        let mut iteration_axes = std::iter::once(BatchAxis::replicated())
+            .chain(carries.iter().map(P::batch_axis))
+            .chain(stacks.iter().map(|stack| {
+                match P::unbatched_type(stack).is_reference() {
+                    true => P::batch_axis(stack),
+                    false => {
+                        // Removing the leading scan dimension shifts a slice's mapped axis left. A replicated input
+                        // stays replicated; a batch axis in front of the scan axis was already realigned above.
+                        P::batch_axis(stack)
+                            .axis()
+                            .map(|axis| BatchAxis::new(axis.value().saturating_sub(1)))
+                            .unwrap_or_default()
+                    }
+                }
+            }))
+            .collect::<Vec<_>>();
+
+        let carry_inputs = 1..1 + carry_count;
+        let batched_body =
+            stabilize_carry_axes(SCAN_OPERATION_NAME, self, driver, body, &mut iteration_axes, carry_inputs.clone())?
+                .ok_or_else(|| BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` batching failed to stabilize the carry batch axes \
+                     within {carry_count} widening passes",
+                ),
+            })?;
+        let (batched_body, mut output_axes) = batched_body.into_parts();
+        for (carry, axis) in carries.iter_mut().zip(&iteration_axes[carry_inputs]) {
+            if !axis.is_replicated() && P::batch_axis(carry).is_replicated() {
+                *carry = driver.align_batch_axis(self, carry.clone(), Axis::from(0))?;
+            }
+        }
+
+        // Policy bookkeeping values are forwarded as replicated carries immediately after the intrinsic index.
+        // Move that index back to the first slot while preserving every other input and output position.
+        let bookkeeping_inputs = P::boundary_inputs(self.axis_extent());
+        let bookkeeping_count = bookkeeping_inputs.len();
+        let batched_body = match bookkeeping_count {
+            0 => batched_body,
+            _ => {
+                let input_order = std::iter::once(bookkeeping_count)
+                    .chain(0..bookkeeping_count)
+                    .chain(bookkeeping_count + 1..batched_body.input_ids().len())
+                    .collect::<Vec<_>>();
+                let output_order = (0..batched_body.output_ids().len()).collect::<Vec<_>>();
+                batched_body.with_boundary(&input_order, &output_order)?
+            }
+        };
+        let batched_scan = ScanOperation { carry_count: carry_count + bookkeeping_count, ..operation.clone() };
+        let mut packed_inputs = bookkeeping_inputs;
+        packed_inputs.extend(carries.iter().chain(&stacks).chain(iteration_count).map(|batch| P::value(batch).clone()));
+        let mut outputs = self.parent().bind(batched_scan, vec![batched_body], packed_inputs.as_slice())?;
+        check_count!("output", outputs, bookkeeping_count + output_axes.len(), ProgramError);
+
+        // Remove bookkeeping results and account for each stacked output's new leading scan axis.
+        // Stack placement comes from inferred output types, without inheriting optional input sharding
+        // (refer to `ScanType::infer_scan_output_types`).
+        outputs.drain(..bookkeeping_count);
+        for axis in &mut output_axes[carry_count..] {
+            *axis = axis.axis().map(|axis| BatchAxis::new(axis.value() + 1)).unwrap_or_default();
+        }
+
+        let mut outputs = outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| P::batch(output, axis))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // The bound scan checks its complete boundary. Forwarding a carry would detach its value from that check,
+        // so forward only when the input types already prove every relationship and no entry guard is needed.
+        if scan_entry_guard(&operation.declared_input_types(&body_input_types)?, &input_types)?.is_none() {
+            operation.forward_carries(body, inputs, &mut outputs);
+        }
+
+        Ok(outputs)
+    }
+}
+
 // TODO(eaplatanios): Review from here onwards.
 
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
@@ -3832,133 +3962,6 @@ fn reconstruct_partitioned_scan<
             })
             .collect(),
     ))
-}
-
-impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
-    /// Batches an application of `operation` to `inputs`, binding one scan over a batched body in the parent context.
-    /// The program size is independent of the iteration count under eager and staging parents alike. Every
-    /// [`BatchingPolicy`] uses this structural path, with its own carriers and boundary bookkeeping inputs.
-    ///
-    /// Carries enter and leave each iteration at the same batch axes. Stacked inputs lose their leading scan axis
-    /// inside the body, while stacked outputs gain it after batching. Reference stacks enter as whole roots whose
-    /// accesses adjust their folded transforms through `batch_reference_transforms`.
-    fn batch_scan<D: BatchingDriver<C, P>>(
-        &self,
-        operation: &ScanOperation<C::Type>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError>
-    where
-        C::Operation: From<ScanOperation<C::Type>>,
-    {
-        let body = driver.region(0)?;
-        let body_input_types = body.input_types();
-        let input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
-
-        // A rewritten batched scan must not legitimize a malformed original index, carry boundary, or stack shape.
-        operation.validate_application(&input_types, body)?;
-        let carry_count = operation.carry_count;
-        let (scan_inputs, iteration_count) = inputs.split_at(body_input_types.len() - 1);
-
-        // Pack mapped array carries at axis 0 and mapped array stacks behind their leading scan axis. Reference
-        // stacks keep the physical axis fixed by their roots, which cannot be moved onto or ahead of the scan axis.
-        let mut carries = canonicalize_carry_axes(self, driver, &scan_inputs[..carry_count])?;
-        let stacks = scan_inputs[carry_count..]
-            .iter()
-            .enumerate()
-            .map(|(position, input)| {
-                if !P::unbatched_type(input).is_reference() {
-                    return match P::batch_axis(input) == BatchAxis::new(0) {
-                        true => driver.align_batch_axis(self, input.clone(), Axis::from(1)),
-                        false => Ok(input.clone()),
-                    };
-                }
-                if P::batch_axis(input) == BatchAxis::new(0) {
-                    return Err(BatchingError::UnsupportedOperation {
-                        message: format!(
-                            "`{SCAN_OPERATION_NAME}` batching found the reference-typed stacked input at position {} \
-                             batched on its scan axis; a reference stack keeps its batch axis and must be batched at \
-                             an axis behind its leading scan axis",
-                            carry_count + position,
-                        ),
-                    });
-                }
-                Ok(input.clone())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Batch one iteration at its replicated index, carry axes, and slice axes. Join carry axes to a fixed point
-        // so every carry leaves at the same axis at which it entered, then broadcast any widened initial carries.
-        let mut iteration_axes = std::iter::once(BatchAxis::replicated())
-            .chain(carries.iter().map(P::batch_axis))
-            .chain(stacks.iter().map(|stack| {
-                match P::unbatched_type(stack).is_reference() {
-                    true => P::batch_axis(stack),
-                    // Removing the leading scan dimension shifts a slice's mapped axis left. A replicated input stays
-                    // replicated; a batch axis in front of the scan axis was already realigned above.
-                    false => P::batch_axis(stack)
-                        .axis()
-                        .map(|axis| BatchAxis::new(axis.value().saturating_sub(1)))
-                        .unwrap_or_default(),
-                }
-            }))
-            .collect::<Vec<_>>();
-        let carry_inputs = 1..1 + carry_count;
-        let batched_body =
-            stabilize_carry_axes(SCAN_OPERATION_NAME, self, driver, body, &mut iteration_axes, carry_inputs.clone())?
-                .ok_or_else(|| BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{SCAN_OPERATION_NAME}` batching failed to stabilize the carry batch axes within {carry_count} \
-                     widening passes",
-                ),
-            })?;
-        let (batched_body, mut output_axes) = batched_body.into_parts();
-        for (carry, axis) in carries.iter_mut().zip(&iteration_axes[carry_inputs]) {
-            if !axis.is_replicated() && P::batch_axis(carry).is_replicated() {
-                *carry = driver.align_batch_axis(self, carry.clone(), Axis::from(0))?;
-            }
-        }
-
-        // Policy bookkeeping values are forwarded as replicated carries immediately after the intrinsic index.
-        // Move that index back to the first slot while preserving every other input and output position.
-        let bookkeeping_inputs = P::boundary_inputs(self.axis_extent());
-        let bookkeeping_count = bookkeeping_inputs.len();
-        let batched_body = match bookkeeping_count {
-            0 => batched_body,
-            _ => {
-                let input_order = std::iter::once(bookkeeping_count)
-                    .chain(0..bookkeeping_count)
-                    .chain(bookkeeping_count + 1..batched_body.input_ids().len())
-                    .collect::<Vec<_>>();
-                let output_order = (0..batched_body.output_ids().len()).collect::<Vec<_>>();
-                batched_body.with_boundary(&input_order, &output_order)?
-            }
-        };
-        let batched_scan = ScanOperation { carry_count: carry_count + bookkeeping_count, ..operation.clone() };
-        let mut packed_inputs = bookkeeping_inputs;
-        packed_inputs.extend(carries.iter().chain(&stacks).chain(iteration_count).map(|batch| P::value(batch).clone()));
-        let mut outputs = self.parent().bind(batched_scan, vec![batched_body], packed_inputs.as_slice())?;
-        check_count!("output", outputs, bookkeeping_count + output_axes.len(), ProgramError);
-
-        // Remove bookkeeping results and account for each stacked output's new leading scan axis. Stack placement
-        // comes from inferred output types, without inheriting optional input sharding (refer to
-        // `ScanType::infer_scan_output_types`).
-        outputs.drain(..bookkeeping_count);
-        for axis in &mut output_axes[carry_count..] {
-            *axis = axis.axis().map(|axis| BatchAxis::new(axis.value() + 1)).unwrap_or_default();
-        }
-        let mut outputs = outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| P::batch(output, axis))
-            .collect::<Result<Vec<_>, _>>()?;
-        // The bound scan checks its complete boundary. Forwarding a carry would detach its value from that check,
-        // so forward only when the input types already prove every relationship and no entry guard is needed.
-        if scan_entry_guard(&operation.declared_input_types(&body_input_types)?, &input_types)?.is_none() {
-            operation.forward_carries(body, inputs, &mut outputs);
-        }
-        Ok(outputs)
-    }
 }
 
 /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
