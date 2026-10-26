@@ -3183,42 +3183,6 @@ pub(crate) fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Re
     stack.update_slice(&expanded, start_indices.as_slice())
 }
 
-/// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body passes
-/// through unchanged.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum ScanInvariantSource {
-    /// Initial value of the known carry at this index, which the body passes through unchanged.
-    Carry(usize),
-
-    /// Value of this feeder atom of the known program, computed once before the scan.
-    /// Feeders are keyed by atom rather than by residual edge, because a partition can expose the same value through
-    /// several edges, and the unknown scan must thread it once.
-    Hoisted(AtomId),
-}
-
-/// Source of a residual stack supplied to the rebuilt unknown scan, in residual-edge order.
-#[derive(Copy, Clone)]
-enum ScanStackSource {
-    /// An original stacked input whose slices are forwarded unchanged.
-    Input(usize),
-
-    /// A stacked output of the rebuilt known scan.
-    KnownOutput(usize),
-}
-
-/// How the unknown iteration body obtains one residual. Computed values may need per-iteration array storage.
-enum ScanResidual<T: Type> {
-    /// Regenerated from the unknown body's intrinsic index.
-    Index,
-
-    /// Taken from this position in the deduplicated invariant sources.
-    Invariant(usize),
-
-    /// A logical value, optionally supplied by a stack. An omitted stack means an original unknown input already
-    /// carries the value. Even a stacked value may later be recovered from an invariant input instead.
-    Value { r#type: T, stack: Option<ScanStackSource> },
-}
-
 /// Rebuilds two scans from a partitioned iteration body, storing each varying residual once per iteration. Returns
 /// `None` when a reference cannot cross the resulting boundary, the split has no known work, or the split needs a known
 /// scan whose iteration count is not known (binding that scan would only stage a second residual scan).
@@ -3272,6 +3236,42 @@ fn reconstruct_partitioned_scan<
     mut bind_known_fn: BindKnownFn,
     mut bind_residual_fn: BindResidualFn,
 ) -> Result<Option<Vec<Input>>, ProgramError> {
+    /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body
+    /// passes through unchanged.
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum ScanInvariantSource {
+        /// Initial value of the known carry at this index, which the body passes through unchanged.
+        Carry(usize),
+
+        /// Value of this feeder atom of the known program, computed once before the scan.
+        /// Feeders are keyed by atom rather than by residual edge, because a partition can expose the same value
+        /// through several edges, and the unknown scan must thread it once.
+        Hoisted(AtomId),
+    }
+
+    /// Source of a residual stack supplied to the rebuilt unknown scan, in residual-edge order.
+    #[derive(Copy, Clone)]
+    enum ScanStackSource {
+        /// An original stacked input whose slices are forwarded unchanged.
+        Input(usize),
+
+        /// A stacked output of the rebuilt known scan.
+        KnownOutput(usize),
+    }
+
+    /// How the unknown iteration body obtains one residual. Computed values may need per-iteration array storage.
+    enum ScanResidual<T: Type> {
+        /// Regenerated from the unknown body's intrinsic index.
+        Index,
+
+        /// Taken from this position in the deduplicated invariant sources.
+        Invariant(usize),
+
+        /// A logical value, optionally supplied by a stack. An omitted stack means an original unknown input already
+        /// carries the value. Even a stacked value may later be recovered from an invariant input instead.
+        Value { r#type: T, stack: Option<ScanStackSource> },
+    }
+
     // The split classifies each residual edge of the body partition by its role across iterations (e.g., the index,
     // an invariant carry, a stacked input slice, or a value to stack). Forwarding identifies a residual input with a
     // body input or output of a single iteration instead, which is not a value of the enclosing `scan` (e.g., a carry
