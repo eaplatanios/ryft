@@ -336,33 +336,8 @@ impl Array {
         output_type: ArrayType,
         function: impl Fn(Input) -> Result<Output, ProgramError>,
     ) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() != Input::data_type() {
-            return Err(TypeError::invalid(format!(
-                "cannot map elements of data type `{}` as `{}` values",
-                self.r#type.data_type(),
-                Input::data_type(),
-            ))
-            .into());
-        }
-        if output_type.data_type() != Output::data_type() {
-            return Err(TypeError::invalid(format!(
-                "cannot store mapped `{}` values in an array of element data type `{}`",
-                Output::data_type(),
-                output_type.data_type(),
-            ))
-            .into());
-        }
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        if input_addressing.element_count() != output_addressing.element_count() {
-            return Err(TypeError::invalid(format!(
-                "cannot map {} logical elements onto array type `{}` with {} logical elements",
-                input_addressing.element_count(),
-                output_type,
-                output_addressing.element_count(),
-            ))
-            .into());
-        }
+        let (input_addressing, output_addressing) =
+            self.validate_map_elements(&output_type, Input::data_type(), Output::data_type())?;
         let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
         for element in 0..output_addressing.element_count() {
             let input = Input::decode(&self.bytes[input_addressing.byte_range_for_flat_index(element)]);
@@ -390,41 +365,7 @@ impl Array {
         output_type: ArrayType,
         function: impl Fn(Input, Input) -> Result<Output, ProgramError>,
     ) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() != Input::data_type() || rhs.r#type.data_type() != Input::data_type() {
-            return Err(TypeError::invalid(format!(
-                "binary element inputs must both have data type `{}`, got `{}` and `{}`",
-                Input::data_type(),
-                self.r#type.data_type(),
-                rhs.r#type.data_type(),
-            ))
-            .into());
-        }
-
-        if output_type.data_type() != Output::data_type() {
-            return Err(TypeError::invalid(format!(
-                "binary element output must have data type `{}`, got `{}`",
-                Output::data_type(),
-                output_type.data_type(),
-            ))
-            .into());
-        }
-
-        Self::element_count(&output_type)?;
-
-        let broadcast_shape = self
-            .r#type
-            .shape()
-            .broadcast(rhs.r#type.shape())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        if output_type.shape() != &broadcast_shape {
-            return Err(TypeError::invalid(format!(
-                "binary element output shape must be {}, got {}",
-                broadcast_shape,
-                output_type.shape(),
-            ))
-            .into());
-        }
-
+        self.validate_map_element_pairs(rhs, &output_type, Input::data_type(), Output::data_type())?;
         let output_shape = output_type.static_shape().unwrap();
         let lhs_shape = self.r#type.static_shape().unwrap();
         let rhs_shape = rhs.r#type.static_shape().unwrap();
@@ -465,15 +406,7 @@ impl Array {
         r#type: ArrayType,
         function: F,
     ) -> Result<Self, ProgramError> {
-        if r#type.data_type() != T::data_type() {
-            return Err(TypeError::invalid(format!(
-                "cannot store `{}` values in an array of element data type `{}`",
-                T::data_type(),
-                r#type.data_type(),
-            ))
-            .into());
-        }
-        let addressing = ArrayAddressing::new(r#type.clone())?;
+        let addressing = Self::validate_from_fn_elements(&r#type, T::data_type())?;
         let mut bytes = vec![0; addressing.storage_byte_len()];
         for element in 0..addressing.element_count() {
             function(element)?.encode(&mut bytes[addressing.byte_range_for_flat_index(element)]);
@@ -622,6 +555,113 @@ impl Array {
         }
         debug_assert_eq!(written, update_addressing.element_count());
         output
+    }
+
+    /// Validates the types of a [`map_elements`](Self::map_elements) application whose decoded input and encoded
+    /// output elements have the provided data types, and returns the addressing of this array and of the output.
+    /// This part of the kernel depends only on data types and array types, so it is shared by every element-type
+    /// pair and callback that the generic kernel is instantiated for.
+    fn validate_map_elements(
+        &self,
+        output_type: &ArrayType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+    ) -> Result<(ArrayAddressing, ArrayAddressing), ProgramError> {
+        if self.r#type.data_type() != input_data_type {
+            return Err(TypeError::invalid(format!(
+                "cannot map elements of data type `{}` as `{}` values",
+                self.r#type.data_type(),
+                input_data_type,
+            ))
+            .into());
+        }
+
+        if output_type.data_type() != output_data_type {
+            return Err(TypeError::invalid(format!(
+                "cannot store mapped `{}` values in an array of element data type `{}`",
+                output_data_type,
+                output_type.data_type(),
+            ))
+            .into());
+        }
+
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        if input_addressing.element_count() != output_addressing.element_count() {
+            return Err(TypeError::invalid(format!(
+                "cannot map {} logical elements onto array type `{}` with {} logical elements",
+                input_addressing.element_count(),
+                output_type,
+                output_addressing.element_count(),
+            ))
+            .into());
+        }
+
+        Ok((input_addressing, output_addressing))
+    }
+
+    /// Validates the types and shapes of a [`map_element_pairs`](Self::map_element_pairs) application whose decoded
+    /// input and encoded output elements have the provided data types. This part of the kernel depends only on data
+    /// types and array types, so it is shared by every element-type pair and callback that the generic kernel is
+    /// instantiated for. On success, this array, `rhs`, and `output_type` all have static shapes.
+    fn validate_map_element_pairs(
+        &self,
+        rhs: &Self,
+        output_type: &ArrayType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+    ) -> Result<(), ProgramError> {
+        if self.r#type.data_type() != input_data_type || rhs.r#type.data_type() != input_data_type {
+            return Err(TypeError::invalid(format!(
+                "binary element inputs must both have data type `{}`, got `{}` and `{}`",
+                input_data_type,
+                self.r#type.data_type(),
+                rhs.r#type.data_type(),
+            ))
+            .into());
+        }
+
+        if output_type.data_type() != output_data_type {
+            return Err(TypeError::invalid(format!(
+                "binary element output must have data type `{}`, got `{}`",
+                output_data_type,
+                output_type.data_type(),
+            ))
+            .into());
+        }
+
+        Self::element_count(output_type)?;
+
+        let broadcast_shape = self
+            .r#type
+            .shape()
+            .broadcast(rhs.r#type.shape())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        if output_type.shape() != &broadcast_shape {
+            return Err(TypeError::invalid(format!(
+                "binary element output shape must be {}, got {}",
+                broadcast_shape,
+                output_type.shape(),
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Validates the type of a [`from_fn_elements`](Self::from_fn_elements) application whose encoded elements have
+    /// the provided data type, and returns the addressing of the result. This part of the kernel depends only on the
+    /// data type and array type, so it is shared by every element type and callback that the generic kernel is
+    /// instantiated for.
+    fn validate_from_fn_elements(r#type: &ArrayType, data_type: DataType) -> Result<ArrayAddressing, ProgramError> {
+        if r#type.data_type() != data_type {
+            return Err(TypeError::invalid(format!(
+                "cannot store `{}` values in an array of element data type `{}`",
+                data_type,
+                r#type.data_type(),
+            ))
+            .into());
+        }
+        ArrayAddressing::new(r#type.clone())
     }
 }
 
