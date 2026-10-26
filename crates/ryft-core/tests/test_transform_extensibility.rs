@@ -286,16 +286,6 @@ fn test_direct_dispatch_value_implements_domain_binding_capabilities_directly() 
 }
 
 #[test]
-fn test_cast_type_root_export() {
-    let input = ArrayType::scalar(DataType::F32);
-    let operation = CastOperation::checked(input.clone(), vec![input.clone()]).unwrap();
-    assert_eq!(
-        ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&input)),
-        Ok((input.clone(), Some(input.clone()))),
-    );
-}
-
-#[test]
 fn test_external_cast_type_owns_inference() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

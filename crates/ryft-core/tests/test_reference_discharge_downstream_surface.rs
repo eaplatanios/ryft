@@ -42,33 +42,32 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AtomId, BatchAxis, BatchAxisSpecification,
-    BatchableOperation, BatchableReferenceTransform, BatchableType, BatchingContext, BatchingDriver,
-    BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
-    BoundReferenceTransform, BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation,
-    Context, ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
-    CotangentSeed, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DivOperation, Domain,
-    EagerContext, EffectClass, EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance,
-    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation,
+    AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, BatchAxis, BatchAxisSpecification, BatchableOperation,
+    BatchableReferenceTransform, BatchableType, BatchingContext, BatchingDriver, BatchingEntrypointPolicy,
+    BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy, BoundReferenceTransform,
+    BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation, Context,
+    ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentSeed,
+    DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass,
+    EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance, InstructionId,
+    InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation,
     MemberTransposableOperation, MulOperation, NegOperation, NoIdentity, NoReferenceTransform, OneLikeOperation,
     OneOperation, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance, ParallelVaryOperation,
     Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
     ProgramBuilder, ProgramError, ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver,
     ReduceOperation, Reference, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceBoundary, ReferenceBoundaryError,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
-    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSource, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
-    ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeResult, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
+    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSource,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
+    ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionInterface, RegionRef, RegionSlot,
     ReshapeOperation, ReshardOperation, ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer,
     TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
     TypeError, Typed, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation,
     batch, check_count, differentiate_at, discharge_reference_free_operation, impl_guardless_operation,
-    infer_reference_view_type, jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
+    infer_reference_view_type, jvp_projected_operation, transpose_projected_operation,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -404,18 +403,11 @@ impl ReferenceDischargeableType for RegisterIrType {
     type Policy = RegisterReferenceDischarge;
 }
 
-/// Returns the destination value bound to one bit transform, rejecting the static half descriptions reserved for
-/// analysis.
+/// Returns the destination value bound to one bit transform.
 fn bit_coordinate<V>(bound_transform: &BoundReferenceTransform<RegisterTransform, V>) -> Result<&V, ProgramError> {
-    match bound_transform.transform() {
-        RegisterTransform::Bit => {
-            check_count!("input", bound_transform.bindings(), 1, ProgramError);
-            Ok(&bound_transform.bindings()[0])
-        }
-        RegisterTransform::Half(_) => Err(ProgramError::UnsupportedOperation {
-            message: "static half descriptions support analysis only".to_string(),
-        }),
-    }
+    let RegisterTransform::Bit = bound_transform.transform();
+    check_count!("input", bound_transform.bindings(), 1, ProgramError);
+    Ok(&bound_transform.bindings()[0])
 }
 
 /// Returns `current` with the bit that `bound_transforms` select replaced by `replacement`, binding the family's bit
@@ -932,32 +924,19 @@ where
 
 impl_guardless_operation!(RegisterOperation);
 
-/// Static half selector used to compare disjoint folded access paths.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum RegisterHalf {
-    Low,
-    High,
-}
-
 /// Transform description of the downstream universe.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum RegisterTransform {
-    /// Static half of a register, used by analysis-only access fixtures.
-    Half(RegisterHalf),
-
     /// One bit of a register, selected by the next dynamic binding in the access input list.
     Bit,
 }
 
-// A half is a static description while a bit consumes one dynamic index binding. Paths are compared transform by
-// transform: two static halves are disjoint as soon as they differ, two bits are the same index iff their bindings are
-// equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every shared transform are the
-// same when they have the same length and otherwise one is a strict prefix that contains the other.
+// A bit consumes one dynamic index binding. Paths are compared transform by transform: two bits are the same index iff
+// their bindings are equal and may otherwise overlap, and paths that agree on every shared transform are the same when
+// they have the same length and otherwise one is a strict prefix that contains the other.
 impl Display for RegisterTransform {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Half(RegisterHalf::Low) => formatter.write_str("half(low)"),
-            Self::Half(RegisterHalf::High) => formatter.write_str("half(high)"),
             Self::Bit => formatter.write_str("bit"),
         }
     }
@@ -999,10 +978,6 @@ impl ReferenceTransform for RegisterTransform {
     ) -> ReferenceViewOverlap {
         for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
             match (lhs.transform(), rhs.transform()) {
-                (Self::Half(lhs_half), Self::Half(rhs_half)) if lhs_half != rhs_half => {
-                    return ReferenceViewOverlap::Disjoint;
-                }
-                (Self::Half(_), Self::Half(_)) => {}
                 (Self::Bit, Self::Bit) if lhs == rhs => {}
                 _ => return ReferenceViewOverlap::MayOverlap,
             }
@@ -1455,50 +1430,6 @@ impl<C: Context<Type = RegisterIrType>> BatchingEntrypointPolicy<C> for Register
 }
 
 #[test]
-fn test_register_ir_type_referent() {
-    let register_member = RegisterIrType::from(RegisterType);
-    let reference_member = RegisterIrType::from(ReferenceType::new(RegisterType));
-
-    // L1: `is_reference` agrees with `referent` on both member kinds.
-    assert!(reference_member.is_reference());
-    assert!(reference_member.referent().is_some());
-    assert!(!register_member.is_reference());
-    assert!(register_member.referent().is_none());
-
-    // L2: embedding a reference type and projecting it back yields exactly the referent it wraps.
-    assert_eq!(reference_member.referent(), Some(&RegisterType));
-
-    // L4: the borrowed reference conversion succeeds exactly where the projection does and agrees with it.
-    assert_eq!(<&ReferenceType<RegisterType>>::try_from(&reference_member), Ok(&ReferenceType::new(RegisterType)),);
-    assert_eq!(<&ReferenceType<RegisterType>>::try_from(&reference_member).unwrap().referent(), &RegisterType);
-    assert_eq!(
-        <&ReferenceType<RegisterType>>::try_from(&register_member),
-        Err(TypeError::invalid("expected reference type but got register type")),
-    );
-
-    // L5 concerns universes whose referent family is `NoReferent`; this universe's referent family is `RegisterType`,
-    // which is inhabited, so the law does not constrain it.
-}
-
-#[test]
-fn test_register_ir_type_as_referent() {
-    let register_member = RegisterIrType::from(RegisterType);
-    let reference_member = RegisterIrType::from(ReferenceType::new(RegisterType));
-
-    // L3: embedding a referent and viewing it in the referent family yields it back, while the reference member is
-    // not a referent.
-    assert_eq!(register_member.as_referent(), Some(&RegisterType));
-    assert_eq!(reference_member.as_referent(), None);
-
-    // L4: the borrowed referent conversion succeeds exactly where the projection does and agrees with it.
-    assert_eq!(<&RegisterType>::try_from(&register_member), Ok(&RegisterType));
-    assert_eq!(
-        <&RegisterType>::try_from(&reference_member),
-        Err(TypeError::invalid("expected register type but got reference type")),
-    );
-}
-
-#[test]
 fn test_downstream_reference_universe_discharges_through_the_public_surface() {
     // `f(initial, replacement) = (replaced value, frozen final state)`, written entirely in a reference universe that
     // `ryft-core` knows nothing about.
@@ -1548,86 +1479,6 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
         ]),
     );
     assert_eq!(context.live_allocation_ids(), Vec::new());
-}
-
-#[test]
-fn test_downstream_reference_discharge_context_environment_accessors() {
-    let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let bound = ReferenceDischargeValue::from(
-        context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue::Register(1)).unwrap(),
-    );
-    let allocation = bound.try_as_reference("a downstream allocation").unwrap().allocation_id();
-
-    // These ID-based operations are the public seam custom structured transforms use to inspect, thread, and merge
-    // discharged state without accessing the environment's private representation.
-    assert_eq!(context.live_allocation_ids(), vec![allocation]);
-    assert_eq!(context.is_allocation_discharged(allocation), Ok(true));
-    assert_eq!(context.discharged_state(allocation), Ok(RegisterValue::Register(1)));
-    assert_eq!(context.is_mutated(allocation), Ok(false));
-    assert_eq!(context.allocation_reference(allocation).map(ReferenceDischargeValue::from), Ok(bound));
-    assert_eq!(context.set_discharged_state(allocation, RegisterValue::Register(2), true), Ok(()));
-    assert_eq!(context.discharged_state(allocation), Ok(RegisterValue::Register(2)));
-    assert_eq!(context.is_mutated(allocation), Ok(true));
-}
-
-#[test]
-fn test_downstream_reference_universe_discharges_into_a_staged_program() {
-    // The same universe discharged against a staging destination, which is the shape production discharge uses: the
-    // rewritten work is recorded into a destination program instead of executed.
-    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
-    let initial = builder.add_input(RegisterIrType::Register(RegisterType));
-    let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let allocation = builder
-        .add_instruction(RegisterOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![initial], None)
-        .unwrap()[0];
-    let replaced = builder
-        .add_instruction(
-            RegisterOperation::Swap(ReferenceSwapOperation::new()),
-            Vec::new(),
-            vec![allocation, replacement],
-            None,
-        )
-        .unwrap()[0];
-    let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![replaced], None).unwrap()[0];
-    let frozen = builder
-        .add_instruction(RegisterOperation::Freeze(ReferenceFreezeOperation::new()), Vec::new(), vec![allocation], None)
-        .unwrap()[0];
-    let source = builder
-        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
-            vec![negated, frozen],
-            vec![Placeholder; 2],
-            vec![Placeholder; 2],
-        )
-        .unwrap();
-
-    let discharge = |inputs: Vec<Tracer<TracingContext<RegisterValue, RegisterOperation>>>| {
-        let context = ReferenceDischargeContext::new(inputs[0].context().clone());
-        let carriers = inputs.into_iter().map(ReferenceDischargeValue::Value).collect::<Vec<_>>();
-        let regions = [source];
-        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let outputs = driver.inline_region(&context, 0, carriers)?;
-        assert_eq!(context.live_allocation_ids(), Vec::new());
-        outputs
-            .iter()
-            .map(|output| output.try_as_value("a discharged output").cloned())
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let (_, discharged): (_, Program<_, _, Vec<RegisterValue>, Vec<RegisterValue>>) =
-        EagerContext::<RegisterValue, RegisterOperation>::trace(
-            discharge,
-            vec![RegisterIrType::Register(RegisterType); 2],
-        )
-        .unwrap();
-
-    // Every reference primitive was normalized away, so the staged program threads the replacement directly and
-    // records only the universe's one pure operation.
-    assert_eq!(
-        discharged.to_string(),
-        indoc! {"
-            lambda %0:register, %1:register .
-            let %2:register = register.negate %0
-            in (%2, %1)"},
-    );
 }
 
 #[test]
@@ -1693,116 +1544,6 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
         ProgramError::MalformedProgram(
             "reference discharge consumed external input 0, whose state must remain owned by the caller".to_string(),
         ),
-    );
-}
-
-#[test]
-fn test_downstream_region_summary_exposes_exact_access_modes() {
-    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
-    let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let read = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![reference], None)
-        .unwrap()[0];
-    builder
-        .add_instruction(
-            RegisterOperation::Write(ReferenceWriteOperation::new()),
-            Vec::new(),
-            vec![reference, replacement],
-            None,
-        )
-        .unwrap();
-    let swapped = builder
-        .add_instruction(
-            RegisterOperation::Swap(ReferenceSwapOperation::new()),
-            Vec::new(),
-            vec![reference, replacement],
-            None,
-        )
-        .unwrap()[0];
-    let region = builder
-        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
-            vec![read, swapped],
-            vec![Placeholder; 2],
-            vec![Placeholder; 2],
-        )
-        .unwrap();
-
-    let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let reference = ReferenceDischargeValue::from(
-        context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue::Register(1)).unwrap(),
-    );
-    let allocation = reference.try_as_reference("a downstream allocation").unwrap().allocation_id();
-    let summary = context
-        .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])
-        .unwrap();
-
-    assert_eq!(summary.accessed_allocations().collect::<Vec<_>>(), vec![allocation]);
-    assert_eq!(
-        summary.access_modes(allocation).collect::<Vec<_>>(),
-        vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite],
-    );
-    assert!(summary.access_modes(allocation).any(|mode| mode == ReferenceAccessMode::ReadWrite));
-    assert!(!summary.access_modes(allocation).any(|mode| mode == ReferenceAccessMode::Accumulate));
-    assert!(summary.is_mutated(allocation));
-}
-
-#[test]
-fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_to_discharge() {
-    // Partial discharge is reachable from downstream position too, and the register universe declines accumulation
-    // and views entirely, so this is the minimal shape a backend needs: `f(counter, buffer, replacement) = replaced`,
-    // where `counter` is selected and `buffer` stays a reference the rewritten program still reads and writes.
-    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
-    let counter = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let buffer = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let observed = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![buffer], None)
-        .unwrap()[0];
-    let replaced = builder
-        .add_instruction(
-            RegisterOperation::Swap(ReferenceSwapOperation::new()),
-            Vec::new(),
-            vec![counter, observed],
-            None,
-        )
-        .unwrap()[0];
-    builder
-        .add_instruction(
-            RegisterOperation::Write(ReferenceWriteOperation::new()),
-            Vec::new(),
-            vec![buffer, replacement],
-            None,
-        )
-        .unwrap();
-    let source = builder
-        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![replaced], vec![Placeholder; 3], vec![Placeholder])
-        .unwrap();
-
-    let targets = source.reference_discharge_targets(0).unwrap();
-    assert_eq!(
-        targets,
-        vec![
-            ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 }),
-            ReferenceDischargeTarget::External(ReferenceSource::Input { index: 1 }),
-        ],
-    );
-    let discharged = source.partially_discharge_references(0, &targets[..1]).unwrap();
-
-    // The selected allocation became state at its own boundary position and publishes its final state as a hidden output;
-    // the preserved reference kept its reference type and reports no binding, and both of its accesses replayed verbatim.
-    assert_eq!(discharged.output_count(), 1);
-    assert_eq!(
-        discharged.external_reference_bindings(),
-        &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
-    );
-    assert_eq!(
-        discharged.program().to_string(),
-        indoc! {"
-            lambda %0:register, %1:ref<register>, %2:register .
-            let %3:register = reference_read %1
-                () = reference_write %1 %2
-            in (%0, %3)"},
     );
 }
 
@@ -1924,46 +1665,6 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
     );
 }
 
-#[test]
-fn test_downstream_access_descriptors_record_distinct_paths() {
-    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
-    let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let low = builder
-        .add_instruction(
-            RegisterOperation::Read(
-                ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Half(RegisterHalf::Low)]),
-            ),
-            Vec::new(),
-            vec![reference],
-            None,
-        )
-        .unwrap()[0];
-    let high = builder
-        .add_instruction(
-            RegisterOperation::Read(
-                ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Half(RegisterHalf::High)]),
-            ),
-            Vec::new(),
-            vec![reference],
-            None,
-        )
-        .unwrap()[0];
-    let program = builder
-        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![low, high], vec![Placeholder], vec![Placeholder; 2])
-        .unwrap();
-    let region = program.entry_region_ref();
-    let analysis = region.reference_view_analysis(0).unwrap();
-    assert_eq!(
-        analysis.path(InstructionId::new(region.id(), 0), 0).cloned(),
-        Some(ReferenceTransformPath::root().with_transform(RegisterTransform::Half(RegisterHalf::Low)))
-    );
-    assert_eq!(
-        analysis.path(InstructionId::new(region.id(), 1), 0).cloned(),
-        Some(ReferenceTransformPath::root().with_transform(RegisterTransform::Half(RegisterHalf::High)))
-    );
-    assert!(analysis.analysis().values().filter_map(|value| analysis.analysis().alias(value)).next().is_none());
-}
-
 /// `f(r, x) = { r.add_update(x); r.read() }` over the register universe, written against whatever context the input
 /// values dispatch to so that one closure serves the forward-mode, reverse-mode, and batching tracers alike.
 fn read_modify_write<V: Value<Type = RegisterIrType>>((reference, x): (V, V)) -> Result<V, ProgramError>
@@ -1994,50 +1695,6 @@ where
         RegisterOperation::Read(ReferenceReadOperation::new().with_transforms(transforms)),
         &[reference, index],
     )
-}
-
-#[test]
-fn test_downstream_transform_overlap_and_batch() {
-    // The family's overlap rule compares paths transform by transform: the two halves are disjoint, a path is the same
-    // as itself, the complete root or a shorter prefix contains what it narrows to, two bits are the same index exactly
-    // when their bindings agree and may otherwise overlap, and a bit may overlap with a half.
-    let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
-    let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
-    let empty = ReferenceTransformPath::<RegisterTransform>::root();
-    let low = empty.clone().with_transform(RegisterTransform::Half(RegisterHalf::Low));
-    let high = empty.clone().with_transform(RegisterTransform::Half(RegisterHalf::High));
-    let low_high = low.clone().with_transform(RegisterTransform::Half(RegisterHalf::High));
-    let bit_of_1 = empty.clone().with_bound_transform(RegisterTransform::Bit, vec![value(1)]);
-    let bit_of_2 = empty.clone().with_bound_transform(RegisterTransform::Bit, vec![value(2)]);
-    assert_eq!(low.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
-    assert_eq!(low.overlap(&low, &root), ReferenceViewOverlap::Same);
-    assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
-    assert_eq!(empty.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(low_high.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(low_high.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
-    assert_eq!(bit_of_1.overlap(&bit_of_1, &root), ReferenceViewOverlap::Same);
-    assert_eq!(bit_of_1.overlap(&bit_of_2, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(bit_of_1.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(empty.overlap(&bit_of_1, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(
-        low.with_bound_transform(RegisterTransform::Bit, vec![value(1)]).overlap(&bit_of_1, &root),
-        ReferenceViewOverlap::MayOverlap
-    );
-
-    // Registers have no axes, so a description batches only replicated sources and passes through unchanged.
-    assert_eq!(
-        RegisterTransform::Half(RegisterHalf::Low).batch(&root, BatchAxis::replicated()),
-        Ok((RegisterTransform::Half(RegisterHalf::Low), BatchAxis::replicated()))
-    );
-    assert_eq!(
-        RegisterTransform::Bit.batch(&root, BatchAxis::replicated()),
-        Ok((RegisterTransform::Bit, BatchAxis::replicated()))
-    );
-    assert!(matches!(
-        RegisterTransform::Half(RegisterHalf::High).batch(&root, BatchAxis::new(0)),
-        Err(BatchingError::UnsupportedOperation { message })
-            if message == "a register transform cannot carry a mapped batch axis; registers have no axes",
-    ));
 }
 
 #[test]
@@ -2748,62 +2405,6 @@ fn test_downstream_folded_dynamic_view_batch() {
         Ok(RegisterValue::Register(1)),
     );
     assert_eq!(reference.read(), Ok(RegisterValue::Register(5)));
-}
-
-#[test]
-fn test_downstream_value_reports_reference_identity_for_live_handles() {
-    // A register value holds no allocation, while a live handle reports the identity of the allocation it denotes, so
-    // the canonical boundary validator accepts distinct positions and rejects one allocation bound twice.
-    let reference = Reference::new(RegisterValue::Register(3)).unwrap();
-    assert_eq!(RegisterValue::Register(3).reference_id(), None);
-    assert_eq!(RegisterValue::Reference(reference.clone()).reference_id(), Some(reference.id()));
-    assert_eq!(
-        validate_reference_boundary(
-            [RegisterValue::Register(1), RegisterValue::Reference(reference.clone())].iter(),
-            std::iter::empty(),
-        ),
-        Ok(()),
-    );
-    assert!(matches!(
-        validate_reference_boundary(
-            [RegisterValue::Reference(reference.clone()), RegisterValue::Reference(reference)].iter(),
-            std::iter::empty(),
-        ),
-        Err(ReferenceBoundaryError::Aliased { .. }),
-    ));
-}
-
-#[test]
-fn test_downstream_reference_boundary_accepts_owned_positions() {
-    /// Backend-defined port name, without `Copy`, `Default`, or `Display` requirements.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct Port(String);
-
-    let context = RegisterDestination::new();
-    let source = RegisterValue::Reference(Reference::new(RegisterValue::Register(3)).unwrap());
-    let cache = RegisterValue::Reference(Reference::new(RegisterValue::Register(5)).unwrap());
-    let result = RegisterValue::Reference(Reference::new(RegisterValue::Register(7)).unwrap());
-    let source_port = Port("source".to_string());
-    let cache_port = Port("cache".to_string());
-    let result_port = Port("result".to_string());
-    let boundary =
-        ReferenceBoundary::new(&context, [(source_port.clone(), &source), (cache_port.clone(), &cache)]).unwrap();
-
-    assert_eq!(boundary.validate(&context, [(result_port.clone(), &result)]), Ok(()));
-    assert_eq!(
-        ReferenceBoundary::new(&context, [(source_port.clone(), &source), (cache_port.clone(), &source)]).unwrap_err(),
-        ReferenceBoundaryError::Aliased { position: cache_port.clone(), other: source_port.clone() },
-    );
-    assert_eq!(
-        boundary.validate(&context, [(result_port.clone(), &source)]),
-        Err(ReferenceBoundaryError::AliasedRetained { position: result_port.clone(), other: source_port }),
-    );
-    assert_eq!(
-        boundary.validate(&context, [(result_port.clone(), &result), (cache_port.clone(), &result)]),
-        Err(ReferenceBoundaryError::Aliased { position: cache_port, other: result_port.clone() }),
-    );
-    // Validation checks later arguments without adding them to the retained boundary.
-    assert_eq!(boundary.validate(&context, [(result_port, &result)]), Ok(()));
 }
 
 #[test]

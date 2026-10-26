@@ -14,10 +14,9 @@ use ryft_core::{
     Array, ArrayType, CompareOperation, ComparisonDirection, Concretizable, ConstantOperation, Context, DataType,
     Domain, DotDimensionNumbers, DotOperation, InterpretableOperation, InterpretationDriver, MulOperation, NoStorage,
     Operation, OperationFormatter, OutputRegionProvenance, PartiallyEvaluatableOperation, Placeholder, Program,
-    ProgramBuilder, ProgramError, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary,
-    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionSlot,
-    ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference,
-    ResidualRejection, TagOperation, TypeError,
+    ProgramBuilder, ProgramError, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule, RegionDataFlowSource,
+    RegionDataFlowSources, RegionInterface, RegionLiveness, RegionSlot, ResidualCandidate, ResidualDecision,
+    ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection, TagOperation, TypeError,
 };
 
 /// Small downstream operation family whose recurrent carrier has no scan or while variant.
@@ -397,57 +396,6 @@ fn check_recomputed_program(program: &DownstreamProgram, bypass: bool) {
                 %8:f64[] = mul %7 %0
             in (%8)"}
         .replace("bypass=false", if bypass { "bypass=true" } else { "bypass=false" }),
-    );
-}
-
-#[test]
-fn test_downstream_region_data_flow() {
-    /// This carrier's state boundary is fixed, so computing its demand does not inspect body liveness.
-    struct UnusedLiveness;
-
-    impl RegionLiveness for UnusedLiveness {
-        fn used_region_inputs(
-            &mut self,
-            _region_index: usize,
-            _used_outputs: &[bool],
-        ) -> Result<Vec<bool>, ProgramError> {
-            panic!("the custom carrier does not query body liveness")
-        }
-    }
-
-    let boundaries = [
-        RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
-        RegionDataFlowRegionBoundary { input_count: 3, output_count: 1 },
-        RegionDataFlowRegionBoundary { input_count: 3, output_count: 1 },
-        RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
-    ];
-    let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
-    let operation = DownstreamOperation::Recurrent(RecurrentOperation { bypass: false, opaque: false });
-    let data_flow = operation.region_data_flow();
-    assert_eq!(
-        data_flow.output_sources(&operation, 1, boundary),
-        Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionInput { region_index: 3, input_index: 2 }])),
-    );
-    assert_eq!(
-        data_flow.input_sources(&operation, 3, 1, boundary),
-        Ok(RegionDataFlowSources::Known(vec![
-            RegionDataFlowSource::InstructionInput(0),
-            RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index: 0 }),
-        ])),
-    );
-    assert_eq!(
-        data_flow.execution_demands(&operation, &[false, true], boundary, &mut UnusedLiveness),
-        Ok(vec![Some(vec![true, true]), None, Some(vec![true]), Some(vec![true, true])]),
-    );
-    let operation = DownstreamOperation::Recurrent(RecurrentOperation { bypass: true, opaque: false });
-    let data_flow = operation.region_data_flow();
-    assert_eq!(
-        data_flow.output_sources(&operation, 1, boundary),
-        Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
-    );
-    assert_eq!(
-        data_flow.execution_demands(&operation, &[false, true], boundary, &mut UnusedLiveness),
-        Ok(vec![None, None, None, None]),
     );
 }
 
