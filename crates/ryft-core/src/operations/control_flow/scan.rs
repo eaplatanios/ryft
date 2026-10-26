@@ -599,7 +599,7 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
                 dimension.value().ok_or_else(|| {
                     TypeError::invalid(format!(
                         "`{SCAN_OPERATION_NAME}` iteration extraction requires a static stacked type \
-                         but got `{stack_type}`"
+                         but got `{stack_type}`",
                     ))
                     .into()
                 })
@@ -2673,7 +2673,9 @@ impl<V: Value> ScanOptions<V> {
                     None => r#type.as_array_type()?,
                 };
                 if array.rank() == 0 {
-                    return Err(TypeError::invalid("`scan` stacked inputs must have a leading scan axis"));
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` stacked inputs must have a leading scan axis",
+                    )));
                 }
                 Ok(array.dimension(0))
             })
@@ -2682,9 +2684,10 @@ impl<V: Value> ScanOptions<V> {
             ScanIterationCount::Inferred => {
                 let extent = leading_dimensions.iter().find_map(Dimension::value).ok_or_else(|| {
                     ProgramError::InvalidArgument {
-                        message: "`scan` cannot infer a static iteration count; provide an explicit count or a \
-                                  first-class dimension value"
-                            .to_string(),
+                        message: format!(
+                            "`{SCAN_OPERATION_NAME}` cannot infer a static iteration count; provide an \
+                             explicit count or a first-class dimension value",
+                        ),
                     }
                 })?;
                 Dimension::Static(extent)
@@ -2842,8 +2845,10 @@ where
                     let (next_carry, output) = body(index, state, inputs)?;
                     if next_carry.parameter_structure() != carry_structure {
                         return Err(ProgramError::InvalidArgument {
-                            message: "`scan` body must preserve the carry parameter structure and static fields"
-                                .to_string(),
+                            message: format!(
+                                "`{SCAN_OPERATION_NAME}` body must preserve the carry parameter structure and static \
+                                 fields",
+                            ),
                         });
                     }
                     let mut next_carries = Vec::with_capacity(carry_count);
@@ -2873,7 +2878,7 @@ where
             }
             if *capacity == 0 {
                 return Err(ProgramError::InvalidArgument {
-                    message: "`scan` carry manual variation did not reach a fixed point".to_string(),
+                    message: format!("`{SCAN_OPERATION_NAME}` carry manual variation did not reach a fixed point"),
                 });
             }
             *capacity -= 1;
@@ -2969,9 +2974,10 @@ where
         })
         .map(Value::domain)
         .ok_or_else(|| ProgramError::InvalidArgument {
-            message: "`scan` requires an input value to recover its context from; use `Scan::scan` with an explicit \
-                      context when there are no input values"
-                .to_string(),
+            message: format!(
+                "`{SCAN_OPERATION_NAME}` requires an input value to recover its context from; use \
+                 `Scan::scan` with an explicit context when there are no input values",
+            ),
         })?;
     context.scan(body, carry, inputs, options)
 }
@@ -3883,7 +3889,7 @@ impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
                 .ok_or_else(|| BatchingError::UnsupportedOperation {
                 message: format!(
                     "`{SCAN_OPERATION_NAME}` batching failed to stabilize the carry batch axes within {carry_count} \
-                         widening passes",
+                     widening passes",
                 ),
             })?;
         let (batched_body, mut output_axes) = batched_body.into_parts();
@@ -4345,7 +4351,7 @@ mod tests {
             _input_known: &[bool],
             _required_known_outputs: &[usize],
         ) -> Result<PartitionedProgram<C::Constant, C::Operation>, DifferentiationError> {
-            panic!("scan rules do not request fused-body partitioning")
+            panic!("{SCAN_OPERATION_NAME} rules do not request fused-body partitioning")
         }
 
         fn bind_jvp_operation<P: DifferentiationPolicy<C>>(
@@ -4355,7 +4361,7 @@ mod tests {
             _programs: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            panic!("scan rules do not request nested-operation replay")
+            panic!("{SCAN_OPERATION_NAME} rules do not request nested-operation replay")
         }
     }
 
@@ -4879,11 +4885,11 @@ mod tests {
         assert_eq!(TestEagerContext::read_iteration(&stack, 1), Ok(Array::scalar(2.0).unwrap()));
         assert_eq!(
             TestEagerContext::read_iteration(&Array::scalar(1.0f64).unwrap(), 0),
-            Err(TypeError::invalid(
-                "`scan` cannot slice a stacked value of type `f64[]` along its scan axis (cannot remove dimension at \
-                 index 0 for rank-0 array type); reshard it so that its scan axis is not sharded over explicit mesh \
-                 axes",
-            )
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` cannot slice a stacked value of type `f64[]` along its scan axis \
+                 (cannot remove dimension at index 0 for rank-0 array type); reshard it so that its scan axis \
+                 is not sharded over explicit mesh axes",
+            ),)
             .into()),
         );
     }
@@ -4993,7 +4999,9 @@ mod tests {
         // completely.
         assert_eq!(
             TestScanOperation::new(1, 3).with_unroll(0),
-            Err(ProgramError::Type(TypeError::invalid("`scan` unroll factor must be at least 1"))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` unroll factor must be at least 1",
+            )))),
         );
         assert_eq!(TestScanOperation::new(1, 4).with_unroll(1).map(|operation| operation.unroll()), Ok(1));
         assert_eq!(TestScanOperation::new(1, 4).with_unroll(2).map(|operation| operation.unroll()), Ok(2));
@@ -5061,10 +5069,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             operation.declared_output_types(std::slice::from_ref(&other_slice_type)),
-            Err(TypeError::invalid(
-                "`scan` cannot place the stacked axis of an output with slice type \
-                 `f32[3][sharding={mesh<['n'=2:manual]>, [{}]}]` on `{'m'}` (unknown mesh axis name: `m`)",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
+                 `f32[3][sharding={{mesh<['n'=2:manual]>, [{{}}]}}]` on `{{'m'}}` (unknown mesh axis name: `m`)",
+            ),)),
         );
     }
 
@@ -5107,7 +5115,7 @@ mod tests {
         );
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(1, 3).declared_input_types(&[]),
-            Err(TypeError::invalid("`scan` body has no index input")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body has no index input"))),
         );
     }
 
@@ -5140,14 +5148,14 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         assert_eq!(
             operation.declared_output_types(&[carry_type.clone(), reference_type]),
-            Err(TypeError::invalid(
-                "`scan` stacked body output 1 must be an array but got `ref<f32[3]>`; a body cannot return a \
-                 per-iteration reference view",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked body output 1 must be an array but got `ref<f32[3]>`; a body cannot \
+                 return a per-iteration reference view",
+            ),)),
         );
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(2, 3).declared_output_types(&[carry_type]),
-            Err(TypeError::invalid("`scan` carry count 2 exceeds the body output count 1")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` carry count 2 exceeds the body output count 1"))),
         );
     }
 
@@ -5175,7 +5183,9 @@ mod tests {
             builder.build(vec![carry], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         assert_eq!(
             operation.validate_application(&[], mistyped_index_body.entry_region_ref()),
-            Err(ProgramError::Type(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index"))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
+            )))),
         );
 
         // A body that returns its two reference carries swapped violates the reference carry contract.
@@ -5194,10 +5204,10 @@ mod tests {
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(2, 3)
                 .validate_application(&[reference_type.clone(), reference_type], swapping_body.entry_region_ref()),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no fixed \
-                 point",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the loop \
+                 state has no fixed point",
+            ),))),
         );
     }
 
@@ -5278,7 +5288,9 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[scalar_type.clone(), scalar_type.clone()], interfaces.as_slice()),
-            Err(TypeError::invalid("`scan` stacked input 1 must have rank at least 1 but has type `f64[]`")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 1 must have rank at least 1 but has type `f64[]`",
+            ))),
         );
 
         // The body signature must cover the carries on both of its boundaries, keep the carry types invariant, and use
@@ -5286,12 +5298,12 @@ mod tests {
         assert_eq!(
             TestScanOperation::new(3, 3)
                 .infer_output_types(&[scalar_type.clone(), stacked_type.clone()], interfaces.as_slice()),
-            Err(TypeError::invalid("`scan` carry count 3 exceeds the body input count 2")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` carry count 3 exceeds the body input count 2"))),
         );
         assert_eq!(
             TestScanOperation::new(3, 3)
                 .infer_region_input_types(&[scalar_type.clone(), stacked_type.clone()], interfaces.as_slice()),
-            Err(TypeError::invalid("`scan` carry count 3 exceeds the body input count 2")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` carry count 3 exceeds the body input count 2"))),
         );
         let single_output_body = RegionInterface::new(
             vec![index_type.clone(), scalar_type.clone(), scalar_type.clone()],
@@ -5301,7 +5313,7 @@ mod tests {
         assert_eq!(
             TestScanOperation::new(2, 3)
                 .infer_output_types(&[scalar_type.clone(), scalar_type.clone()], &[single_output_body]),
-            Err(TypeError::invalid("`scan` carry count 2 exceeds the body output count 1")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` carry count 2 exceeds the body output count 1"))),
         );
         let mismatched_carry_body = RegionInterface::new(
             vec![index_type.clone(), scalar_type.clone()],
@@ -5310,7 +5322,9 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_type), &[mismatched_carry_body]),
-            Err(TypeError::invalid("`scan` body carry type signature mismatch: expected [f64[]] but got [bool[]]")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f64[]] but got [bool[]]",
+            ))),
         );
         let dynamic_type = ArrayType::new(
             DataType::F64,
@@ -5323,9 +5337,10 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&dynamic_type), &[dynamic_body]),
-            Err(TypeError::invalid(
-                "`scan` body input 1 must have a fully static type but axis 0 of `f64[dynamic]` has size `dynamic`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 1 must have a fully static type but axis 0 of `f64[dynamic]` has \
+                 size `dynamic`",
+            ),)),
         );
 
         // The body index must be a scalar `i64`, and a homogeneous array scan requires a static iteration count.
@@ -5336,16 +5351,17 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_type), &[mistyped_index_body]),
-            Err(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"))),
         );
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         assert_eq!(
             TestScanOperation::new(1, Dimension::Dynamic(length))
                 .infer_output_types(&[scalar_type, stacked_type], interfaces.as_slice()),
-            Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
-                 with a trailing first-class dimension input for a dynamic iteration count",
-            )),
+            Err(TypeError::invalid(format!(
+                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
+                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
+                 count",
+            ),)),
         );
     }
 
@@ -5363,7 +5379,7 @@ mod tests {
         );
         let operation = TestScanOperation::new(1, MAX_DIMENSION_EXTENT + 1);
         let expected = TypeError::invalid(format!(
-            "`scan` iteration count {} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
+            "`{SCAN_OPERATION_NAME}` iteration count {} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
             MAX_DIMENSION_EXTENT + 1,
         ));
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&scalar_type), &[body]), Err(expected.clone()));
@@ -5396,7 +5412,7 @@ mod tests {
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(1, 1)
                 .infer_region_input_types(&[concrete_type.clone().into()], &[body.entry_region_ref().interface()],),
-            Err(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"))),
         );
         assert_eq!(
             TestIrTracingContext::trace(
@@ -5406,7 +5422,9 @@ mod tests {
                 vec![ArrayIrType::Array(concrete_type.clone())],
             )
             .unwrap_err(),
-            ProgramError::from(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            ProgramError::from(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
+            ))),
         );
 
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -5419,9 +5437,9 @@ mod tests {
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(1, 1)
                 .infer_region_input_types(&[concrete_type.into()], &[body.entry_region_ref().interface()],),
-            Err(
-                TypeError::invalid("`scan` body carry type signature mismatch: expected [f64[rows]] but got [f64[2]]",)
-            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f64[rows]] but got [f64[2]]",
+            ),)),
         );
     }
 
@@ -5498,24 +5516,28 @@ mod tests {
         assert_eq!(region_error, output_error);
         assert_eq!(
             region_error,
-            TypeError::invalid(
-                "`scan` cannot slice a stacked value of type `f64[3][sharding={mesh<['e'=3:explicit]>, \
-                 [{'e'}]}]` along \
-                 its scan axis (cannot remove dimension 0 because it is sharded over the non-manual mesh axis `e`); \
-                 reshard it so that its scan axis is not sharded over explicit mesh axes",
-            ),
+            TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` cannot slice a stacked value of type \
+                 `f64[3][sharding={{mesh<['e'=3:explicit]>, [{{'e'}}]}}]` along its scan axis (cannot remove \
+                 dimension 0 because it is sharded over the non-manual mesh axis `e`); reshard it so that its scan \
+                 axis is not sharded over explicit mesh axes",
+            ),),
         );
 
         // Data type and shape mismatches are still rejected.
         assert_eq!(
             operation
                 .infer_output_types(&[ArrayType::scalar(DataType::F32), stacked_type.clone()], interfaces.as_slice()),
-            Err(TypeError::invalid("`scan` input 0 has type `f32[]`, which does not refine its expected type `f64[]`")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `f32[]`, which does not refine its expected type `f64[]`",
+            ))),
         );
         assert_eq!(
             operation
                 .infer_output_types(&[scalar_type, ArrayType::new_static(DataType::F64, [4])], interfaces.as_slice(),),
-            Err(TypeError::invalid("`scan` stacked input 1 must have leading dimension `3` but has type `f64[4]`")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 1 must have leading dimension `3` but has type `f64[4]`",
+            ))),
         );
     }
 
@@ -5535,10 +5557,10 @@ mod tests {
                 Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["e"])]).unwrap(),
             )
             .unwrap();
-        let expected = TypeError::invalid(
-            "`scan` stacked input 0 has type `f64[3, 2]`, whose slice type `f64[2]` does not refine its body input \
-             type `f64[2][sharding={mesh<['e'=2:explicit]>, [{'e'}]}]`",
-        );
+        let expected = TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` stacked input 0 has type `f64[3, 2]`, whose slice type `f64[2]` does not refine \
+             its body input type `f64[2][sharding={{mesh<['e'=2:explicit]>, [{{'e'}}]}}]`",
+        ));
         let interface = RegionInterface::new(
             vec![ArrayType::scalar(DataType::I64), slice_type.clone()],
             vec![slice_type.clone()],
@@ -5708,7 +5730,7 @@ mod tests {
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(3, 3)
                 .infer_region_input_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
-            Err(TypeError::invalid("`scan` carry count 3 exceeds the body input count 2")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` carry count 3 exceeds the body input count 2"))),
         );
         assert_eq!(
             operation.infer_output_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
@@ -5738,9 +5760,9 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[dimension_type.clone(), dimension_type], &[invalid_body_interface]),
-            Err(TypeError::invalid(
-                "`scan` stacked body input 2 must be an array but got `dimension<extent ∈ [1, 8)>`"
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked body input 2 must be an array but got `dimension<extent ∈ [1, 8)>`",
+            ))),
         );
 
         // A fresh dimension produced by the body cannot replace the declared carry identity on each iteration.
@@ -5754,9 +5776,9 @@ mod tests {
             RegionInterface::new(vec![index_type, carry_type.clone()], vec![next_type], EffectClasses::NONE);
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&carry_type), &[shape_varying_body]),
-            Err(TypeError::invalid(
-                "`scan` body carry type signature mismatch: expected [f32[carry]] but got [f32[next]]"
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f32[carry]] but got [f32[next]]",
+            ))),
         );
     }
 
@@ -5873,10 +5895,10 @@ mod tests {
                 &[dimension_type.clone(), symbolic_stacked_type.clone(), DimensionType::from(unrelated).into()],
                 std::slice::from_ref(&body_interface),
             ),
-            Err(TypeError::invalid(
-                "`scan` iteration count input has type `dimension<unrelated ∈ [1, 5)>` but `scan` iteration count \
-                 requires `length`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `dimension<unrelated ∈ [1, 5)>` but \
+                 `{SCAN_OPERATION_NAME}` iteration count requires `length`",
+            ),)),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -5891,9 +5913,10 @@ mod tests {
                 &[dimension_type.clone(), symbolic_stacked_type.clone(), seven.into()],
                 std::slice::from_ref(&body_interface),
             ),
-            Err(TypeError::invalid(
-                "`scan` iteration count input has type `dimension<7>` but `scan` iteration count requires `length`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `dimension<7>` but `{SCAN_OPERATION_NAME}` \
+                 iteration count requires `length`",
+            ),)),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -6001,9 +6024,9 @@ mod tests {
         let other = DimensionVariable::new("m", DimensionBounds::non_negative(Some(8)).unwrap());
         let input_types =
             vec![ArrayType::new(DataType::F32, Shape::new(vec![other.into()])).into(), length_type.clone()];
-        let expected = TypeError::invalid(
-            "`scan` input 0 has type `f32[m]`, which does not refine its expected type `f32[length]`",
-        );
+        let expected = TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` input 0 has type `f32[m]`, which does not refine its expected type `f32[length]`",
+        ));
         assert_eq!(
             operation.infer_output_types(&input_types, &[body.entry_region_ref().interface()]),
             Err(expected.clone()),
@@ -6078,10 +6101,10 @@ mod tests {
         assert_eq!(
             operation
                 .infer_output_types(&[reference.clone(), iteration_count], std::slice::from_ref(&reference_interface),),
-            Err(TypeError::invalid(
-                "`scan` iteration count input has type `dimension<length ∈ [0, 8)>` but stacked input 0 has type \
-                 `ref<f32[3]>` whose leading dimension is not provably equal to `length`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `dimension<length ∈ [0, 8)>` but stacked \
+                 input 0 has type `ref<f32[3]>` whose leading dimension is not provably equal to `length`",
+            ),)),
         );
 
         // Singleton bounds prove equality even when the runtime input keeps its nominal identity, for an array stack
@@ -6147,9 +6170,10 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&stacked_reference), &[dynamic_interface]),
-            Err(TypeError::invalid(
-                "`scan` body input 1 must have a fully static type but axis 0 of `f32[extent]` has size `extent`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 1 must have a fully static type but axis 0 of `f32[extent]` has \
+                 size `extent`",
+            ),)),
         );
 
         // The body must declare a reference stack whose leading axis is the scan axis.
@@ -6159,7 +6183,9 @@ mod tests {
             RegionInterface::new(vec![index_type.clone(), mismatched_reference.clone()], vec![], EffectClasses::NONE);
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&mismatched_reference), &[mismatched_interface]),
-            Err(TypeError::invalid("`scan` reference input 0 must have leading dimension `3`")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` reference input 0 must have leading dimension `3`",
+            ))),
         );
 
         // A body cannot return a per-iteration reference view, because no stacked reference value exists that the scan
@@ -6171,10 +6197,10 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&stacked_reference), &[returning_interface]),
-            Err(TypeError::invalid(
-                "`scan` stacked body output 0 must be an array but got `ref<f32[2]>`; a body cannot return a \
-                 per-iteration reference view",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked body output 0 must be an array but got `ref<f32[2]>`; a body cannot \
+                 return a per-iteration reference view",
+            ),)),
         );
     }
 
@@ -6237,9 +6263,9 @@ mod tests {
         );
         assert_eq!(
             operation.region_data_flow().input_sources(&operation, 1, 0, boundary),
-            Err(ProgramError::MalformedProgram(
-                "operation `scan` declares region 1 but has 1 attached regions".to_owned()
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCAN_OPERATION_NAME}` declares region 1 but has 1 attached regions",
+            ))),
         );
     }
 
@@ -6264,7 +6290,9 @@ mod tests {
         );
         assert_eq!(
             operation.region_data_flow().output_sources(&operation, 3, boundary),
-            Err(ProgramError::MalformedProgram("operation `scan` declares output 3 with 3 outputs".to_owned())),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCAN_OPERATION_NAME}` declares output 3 with 3 outputs",
+            ))),
         );
         let empty = TestScanOperation::new(2, 0);
         assert_eq!(
@@ -6309,18 +6337,17 @@ mod tests {
         assert_eq!(liveness.queries().to_vec(), Vec::<Vec<bool>>::new());
         assert_eq!(
             operation.region_data_flow().execution_demands(&operation, &[true], boundary, &mut liveness),
-            Err(ProgramError::MalformedProgram(
-                "operation `scan` receives used outputs for 1 positions but has 3 outputs".to_owned(),
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCAN_OPERATION_NAME}` receives used outputs for 1 positions but has 3 outputs",
+            ),)),
         );
         let malformed = RegionDataFlowBoundary { input_count: 2, ..boundary };
         assert_eq!(
             operation.execution_demands(&[true, true, true], malformed, &mut liveness),
-            Err(ProgramError::MalformedProgram(
-                "`scan` region data flow requires an index followed by 2 carries and stacked inputs, \
-                 matching body outputs and instruction inputs"
-                    .to_owned(),
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region data flow requires an index followed by 2 carries and stacked inputs, \
+                 matching body outputs and instruction inputs",
+            ),)),
         );
 
         // A body with no outputs whose retained effect consumes its stacked input still executes for a positive
@@ -6449,20 +6476,22 @@ mod tests {
         let carry_types = [scalar_type.clone(), scalar_type.clone()];
         assert_eq!(
             TestScanOperation::new(2, 3).prune_boundary(&carry_types, &[true], &mut liveness),
-            Err(ProgramError::MalformedProgram("`scan` has 1 outputs but carries 2 values".to_owned())),
+            Err(ProgramError::MalformedProgram(format!("`{SCAN_OPERATION_NAME}` has 1 outputs but carries 2 values"))),
         );
         assert_eq!(liveness.queries().to_vec(), Vec::<Vec<bool>>::new());
         let mut liveness = TestRegionLiveness::new(|_| vec![false]);
         assert_eq!(
             TestScanOperation::new(1, 3).prune_boundary(std::slice::from_ref(&scalar_type), &[true], &mut liveness),
-            Err(ProgramError::MalformedProgram("`scan` body has fewer inputs than its index and 1 carries".to_owned())),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` body has fewer inputs than its index and 1 carries",
+            ))),
         );
         let mut liveness = TestRegionLiveness::new(|_| vec![false, true, false]);
         assert_eq!(
             TestScanOperation::new(1, 3).prune_boundary(std::slice::from_ref(&scalar_type), &[true], &mut liveness),
-            Err(ProgramError::MalformedProgram(
-                "`scan` has 1 inputs but its body takes 1 carries and 1 stacked inputs".to_owned(),
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` has 1 inputs but its body takes 1 carries and 1 stacked inputs",
+            ),)),
         );
     }
 
@@ -6532,16 +6561,16 @@ mod tests {
         let mut liveness = TestRegionLiveness::new(|_| vec![false]);
         assert_eq!(
             TestScanOperation::new(0, 3).prune_boundary(&[ArrayType::scalar(DataType::F32)], &[], &mut liveness),
-            Err(ProgramError::MalformedProgram(
-                "`scan` expects 0 trailing iteration count inputs but has 1".to_owned(),
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` expects 0 trailing iteration count inputs but has 1",
+            ),)),
         );
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(0, Dimension::Dynamic(length)).prune_boundary(&[], &[], &mut liveness),
-            Err(ProgramError::MalformedProgram(
-                "`scan` expects 1 trailing iteration count inputs but has 0".to_owned(),
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` expects 1 trailing iteration count inputs but has 0",
+            ),)),
         );
     }
 
@@ -9476,10 +9505,10 @@ mod tests {
             .unwrap();
             assert_eq!(
                 closed.discharge_references().map(|_| ()),
-                Err(ProgramError::Type(TypeError::invalid(
-                    "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no \
-                     fixed point",
-                ))),
+                Err(ProgramError::Type(TypeError::invalid(format!(
+                    "`{SCAN_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the \
+                     loop state has no fixed point",
+                ),))),
             );
         }
     }
@@ -9603,10 +9632,11 @@ mod tests {
                 &EagerInterpretationDriver::new(&region_driver),
                 &[],
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
-                 with a trailing first-class dimension input for a dynamic iteration count",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
+                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
+                 count",
+            ),))),
         );
     }
 
@@ -9654,9 +9684,10 @@ mod tests {
         let body = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let expected =
-            Err(TypeError::invalid("`scan` body carry type signature mismatch: expected [f64[]] but got [bool[]]")
-                .into());
+        let expected = Err(TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f64[]] but got [bool[]]",
+        ))
+        .into());
         let carry = array(Array::scalar(1.0f64).unwrap());
         assert_eq!(
             context.bind(ScanOperation::<ArrayIrType>::new(1, 0), vec![body.clone()], &[carry.clone()]),
@@ -9671,7 +9702,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             context.bind(ScanOperation::<ArrayIrType>::new(0, 0), vec![body], &[]),
-            Err(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index").into()),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"))
+                .into()),
         );
 
         // Direct eager binding must reject actual inputs that type inference rejects, even when the body would not
@@ -9689,11 +9721,11 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let operation = ScanOperation::<ArrayIrType>::new(1, 0);
-        let expected = TypeError::invalid(
-            "`scan` cannot slice a stacked value of type `f64[0][sharding={mesh<['e'=3:explicit]>, [{'e'}]}]` along \
-             its scan axis (cannot remove dimension 0 because it is sharded over the non-manual mesh axis `e`); \
-             reshard it so that its scan axis is not sharded over explicit mesh axes",
-        );
+        let expected = TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` cannot slice a stacked value of type `f64[0][sharding={{mesh<['e'=3:explicit]>, \
+             [{{'e'}}]}}]` along its scan axis (cannot remove dimension 0 because it is sharded over the non-manual \
+             mesh axis `e`); reshard it so that its scan axis is not sharded over explicit mesh axes",
+        ));
         assert_eq!(
             operation.infer_output_types(&[scalar_type, stacked_type.clone().into()], &[body.interface()]),
             Err(expected.clone()),
@@ -9885,10 +9917,10 @@ mod tests {
         };
         assert_eq!(
             bind_scan(operation, body, &[initial, values]),
-            Err(TypeError::invalid(
-                "`scan` cannot place the stacked axis of output 1 over the manual mesh axes `m` for slices that do \
-                 not vary over them",
-            )
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output 1 over the manual mesh axes \
+                 `m` for slices that do not vary over them",
+            ),)
             .into()),
         );
     }
@@ -9990,10 +10022,11 @@ mod tests {
         let operation = TestOperation::Scan(TestScanOperation::new(1, 2));
         assert_eq!(
             context.bind(operation.clone(), vec![body.clone()], &[Array::scalar(1.0).unwrap(), values.clone()]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`scan` body returns a slice of output 1 that varies over `devices` after earlier slices that vary \
-                 over no manual axes; every slice of a stacked output must have the same manual variation",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body returns a slice of output 1 that varies over `devices` after earlier \
+                 slices that vary over no manual axes; every slice of a stacked output must have the same manual \
+                 variation",
+            ),))),
         );
         assert_eq!(
             context.bind(operation, vec![body], &[initial, values]),
@@ -10027,10 +10060,10 @@ mod tests {
         let context = TestIrEagerContext::new();
         let first = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
         let second = TestIrValue::Reference(ArrayReference::new(Array::scalar(2.0f32).unwrap()));
-        let error = Err(ProgramError::Type(TypeError::invalid(
-            "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no fixed \
-             point",
-        )));
+        let error = Err(ProgramError::Type(TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the loop state \
+             has no fixed point",
+        ))));
         assert_eq!(
             context.bind(ScanOperation::<ArrayIrType>::new(2, 0), vec![body.clone()], &[first.clone(), second.clone()]),
             error,
@@ -10476,7 +10509,9 @@ mod tests {
             PartialTracer::new(context.clone(), context.unknown_input(ArrayType::new_static(DataType::F64, [1]), 0));
         assert_eq!(
             context.bind(TestScanOperation::new(1, 1), vec![body], &[carry, stack]).unwrap_err(),
-            ProgramError::Type(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
+            ))),
         );
 
         // It also validates the inputs against that signature before forwarding a known carry.
@@ -10487,9 +10522,9 @@ mod tests {
             PartialTracer::new(context.clone(), context.unknown_input(ArrayType::new_static(DataType::F64, [1]), 0));
         assert_eq!(
             context.bind(TestScanOperation::new(1, 1), vec![body], &[carry, stack]).unwrap_err(),
-            ProgramError::Type(TypeError::invalid(
-                "`scan` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
-            )),
+            ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
+            ),)),
         );
     }
 
@@ -10517,10 +10552,10 @@ mod tests {
                 |_, _, _| panic!("a rejected split binds no known scan"),
                 |_, _, _| panic!("a rejected split binds no residual scan"),
             ),
-            Err(ProgramError::MalformedProgram(
-                "`scan` body partition forwards residual inputs, but splitting a scan requires residual edges"
-                    .to_string(),
-            )),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` body partition forwards residual inputs, but splitting a scan requires \
+                 residual edges",
+            ),)),
         );
     }
 
@@ -14029,14 +14064,21 @@ mod tests {
                 DataType::Boolean,
                 1,
                 Array::scalar(1.0f64).unwrap(),
-                "`scan` body input 0 must be a scalar `i64` slice index",
+                format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"),
             ),
-            (DataType::I64, 2, Array::scalar(1.0f64).unwrap(), "`scan` carry count 2 exceeds the body input count 1"),
+            (
+                DataType::I64,
+                2,
+                Array::scalar(1.0f64).unwrap(),
+                format!("`{SCAN_OPERATION_NAME}` carry count 2 exceeds the body input count 1"),
+            ),
             (
                 DataType::I64,
                 1,
                 Array::scalar(true).unwrap(),
-                "`scan` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
+                format!(
+                    "`{SCAN_OPERATION_NAME}` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
+                ),
             ),
         ] {
             let mut builder = ProgramBuilder::<Array, TestOperation>::new();
@@ -14049,7 +14091,7 @@ mod tests {
                 TestScanOperation::new(carry_count, 0)
                     .batch(&context, &driver, &[ArrayBatch::replicated(input.clone())])
                     .unwrap_err(),
-                BatchingError::from(ProgramError::from(TypeError::invalid(message))),
+                BatchingError::from(ProgramError::from(TypeError::invalid(&message))),
             );
 
             let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -14064,7 +14106,7 @@ mod tests {
                 ScanOperation::<ArrayIrType>::new(carry_count, 0)
                     .batch(&array_ir_context, &driver, &[ArrayIrBatch::replicated(array(input))])
                     .unwrap_err(),
-                BatchingError::from(ProgramError::from(TypeError::invalid(message))),
+                BatchingError::from(ProgramError::from(TypeError::invalid(&message))),
             );
         }
         assert_eq!(
@@ -15687,9 +15729,9 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             ),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "`scan` batching found the reference-typed stacked input at position 1 batched on its \
-                               scan axis; a reference stack keeps its batch axis and must be batched at an axis behind \
-                               its leading scan axis",
+                if message == format!("`{SCAN_OPERATION_NAME}` batching found the reference-typed stacked input at \
+                                       position 1 batched on its scan axis; a reference stack keeps its batch axis \
+                                       and must be batched at an axis behind its leading scan axis",),
         ));
     }
 
@@ -15905,14 +15947,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             TestScanOperation::new(0, 1).jvp(&context, &ScanDifferentiationDriver(&body), &[]).unwrap_err(),
-            DifferentiationError::from(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            DifferentiationError::from(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
+            ))),
         );
 
         let body = scalar_body(1, |_, _| Vec::new());
         let carry = DifferentiationDual::new(Array::scalar(1f64).unwrap(), Array::scalar(1f64).unwrap()).unwrap();
         assert_eq!(
             TestScanOperation::new(1, 1).jvp(&context, &ScanDifferentiationDriver(&body), &[carry]).unwrap_err(),
-            DifferentiationError::from(TypeError::invalid("`scan` carry count 1 exceeds the body output count 0")),
+            DifferentiationError::from(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` carry count 1 exceeds the body output count 0",
+            ))),
         );
 
         // It also validates the primal inputs against that signature.
@@ -15921,9 +15967,9 @@ mod tests {
         let carry = DifferentiationDual::new(Array::scalar(1f32).unwrap(), Array::scalar(1f32).unwrap()).unwrap();
         assert_eq!(
             TestScanOperation::new(1, 1).jvp(&context, &ScanDifferentiationDriver(&body), &[carry]).unwrap_err(),
-            DifferentiationError::from(TypeError::invalid(
-                "`scan` input 0 has type `f32[]`, which does not refine its expected type `f64[]`",
-            )),
+            DifferentiationError::from(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `f32[]`, which does not refine its expected type `f64[]`",
+            ),)),
         );
     }
 
@@ -20619,7 +20665,9 @@ mod tests {
                     &accumulators,
                 )
                 .unwrap_err(),
-            DifferentiationError::from(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            DifferentiationError::from(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
+            ))),
         );
         assert_eq!(
             TestScanOperation::new(1, 1)
@@ -20640,9 +20688,9 @@ mod tests {
                     &accumulators,
                 )
                 .unwrap_err(),
-            DifferentiationError::from(TypeError::invalid(
-                "`scan` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
-            )),
+            DifferentiationError::from(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
+            ),)),
         );
     }
 
@@ -20706,10 +20754,10 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]).map(|pullback| pullback.to_string()),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message:
-                    "`scan` transposition does not support a linear iteration count input; the iteration count is \
-                          not differentiable"
-                        .to_string(),
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` transposition does not support a linear iteration count input; the \
+                     iteration count is not differentiable",
+                ),
             })),
         );
     }
@@ -21125,9 +21173,10 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]).map(|pullback| pullback.to_string()),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "`scan` transposition does not support linear carry 0 of type `i32[]`, whose cotangent is a \
-                          zero space"
-                    .to_owned(),
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` transposition does not support linear carry 0 of type `i32[]`, whose \
+                     cotangent is a zero space",
+                ),
             })),
         );
         assert_eq!(
@@ -21281,8 +21330,9 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`scan` transposition requires known carry 0 to pass through the body unchanged; \
-                               time-varying known values must be supplied as stacked inputs",
+                if message == format!("`{SCAN_OPERATION_NAME}` transposition requires known carry 0 to pass through \
+                                       the body unchanged; time-varying known values must be supplied as stacked \
+                                       inputs",),
         ));
     }
 
@@ -22185,10 +22235,10 @@ mod tests {
         builder.add_instruction(operation, vec![map_body], inputs, None).unwrap();
         let mapped: TestIrProgram = builder.build(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
 
-        let error = ProgramError::Type(TypeError::invalid(
-            "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no fixed \
-             point",
-        ));
+        let error = ProgramError::Type(TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the loop state \
+             has no fixed point",
+        )));
         let initial = array(Array::scalar(1.0f32).unwrap());
         let carry = array(Array::scalar(2.0f32).unwrap());
         assert_eq!(program.interpret(vec![initial.clone(), carry.clone()]), Err(error.clone()));
@@ -22427,10 +22477,11 @@ mod tests {
         );
         assert_eq!(
             <ArrayType as ScanType>::iteration_count_type(&length),
-            Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
-                 with a trailing first-class dimension input for a dynamic iteration count",
-            )),
+            Err(TypeError::invalid(format!(
+                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
+                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
+                 count",
+            ),)),
         );
     }
 
@@ -22446,15 +22497,17 @@ mod tests {
         assert_eq!(ArrayType::validate_scan_body_members(&static_types, &static_types), Ok(()));
         assert_eq!(
             ArrayType::validate_scan_body_members(&[static_type.clone(), dynamic_type.clone()], &[]),
-            Err(TypeError::invalid(
-                "`scan` body input 2 must have a fully static type but axis 1 of `f32[2, extent]` has size `extent`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 2 must have a fully static type but axis 1 of `f32[2, extent]` \
+                 has size `extent`",
+            ),)),
         );
         assert_eq!(
             ArrayType::validate_scan_body_members(&[], &[static_type, dynamic_type.clone()]),
-            Err(TypeError::invalid(
-                "`scan` body output 1 must have a fully static type but axis 1 of `f32[2, extent]` has size `extent`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body output 1 must have a fully static type but axis 1 of `f32[2, extent]` \
+                 has size `extent`",
+            ),)),
         );
         assert_eq!(
             ArrayIrType::validate_scan_body_members(&[dynamic_type.clone().into()], &[dynamic_type.into()]),
@@ -22486,14 +22539,17 @@ mod tests {
                 1,
                 &Dimension::Static(3),
             ),
-            Err(TypeError::invalid("`scan` body carry type signature mismatch: expected [f32[]] but got [i64[]]")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f32[]] but got [i64[]]",
+            ))),
         );
         assert_eq!(
             ArrayType::validate_scan_body_type_signature(&body_input_types[1..], &[scalar_type.clone()], 0, &length),
-            Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
-                 with a trailing first-class dimension input for a dynamic iteration count",
-            )),
+            Err(TypeError::invalid(format!(
+                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
+                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
+                 count",
+            ),)),
         );
         assert_eq!(
             ArrayIrType::validate_scan_body_type_signature(
@@ -22511,7 +22567,7 @@ mod tests {
                 0,
                 &length,
             ),
-            Err(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"))),
         );
     }
 
@@ -22545,7 +22601,9 @@ mod tests {
                 &length,
                 &[ArrayType::scalar(DataType::F64), stacked_type.clone()],
             ),
-            Err(TypeError::invalid("`scan` input 0 has type `f64[]`, which does not refine its expected type `f32[]`")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `f64[]`, which does not refine its expected type `f32[]`",
+            ))),
         );
 
         let variable = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
@@ -22613,9 +22671,9 @@ mod tests {
                 0,
                 &length,
             ),
-            Err(TypeError::invalid(
-                "`scan` stacked input 0 must have leading dimension `3` but has type `ref<f32[4, 2]>`"
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 0 must have leading dimension `3` but has type `ref<f32[4, 2]>`",
+            ))),
         );
         assert_eq!(
             ArrayIrType::infer_scan_body_input_types(
@@ -22624,14 +22682,15 @@ mod tests {
                 0,
                 &length,
             ),
-            Err(TypeError::invalid("`scan` stacked input 0 must have rank at least 1")),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` stacked input 0 must have rank at least 1"))),
         );
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         assert_eq!(
             ArrayIrType::infer_scan_body_input_types(&[DimensionType::from(extent).into()], 2, 0, &length),
-            Err(TypeError::invalid(
-                "`scan` stacked input 0 must be an array or a reference but got `dimension<extent ∈ [1, 8)>`",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 0 must be an array or a reference but got `dimension<extent ∈ \
+                 [1, 8)>`",
+            ),)),
         );
 
         // An iteration count input that pins one exact extent applies the same refinement rule to stacked references as
@@ -22659,10 +22718,10 @@ mod tests {
                 0,
                 &Dimension::Dynamic(dynamic_length),
             ),
-            Err(TypeError::invalid(
-                "`scan` iteration count input has type `dimension<4>` but stacked input 0 has type \
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `dimension<4>` but stacked input 0 has type \
                  `ref<f32[length, 2]>` whose leading dimension is not refined to extent 4",
-            )),
+            ),)),
         );
     }
 
@@ -22700,7 +22759,9 @@ mod tests {
                 &[],
                 &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [4])],
             ),
-            Err(TypeError::invalid("`scan` stacked input 1 must have leading dimension `3` but has type `f64[4]`")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 1 must have leading dimension `3` but has type `f64[4]`",
+            ))),
         );
         // Excess placements are invalid even when they request implicit replication.
         assert_eq!(
@@ -22712,7 +22773,9 @@ mod tests {
                 &[ShardingDimension::Replicated, ShardingDimension::Replicated],
                 &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [3])],
             ),
-            Err(TypeError::invalid("`scan` places 2 stacked axes but its body has 1 stacked outputs")),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` places 2 stacked axes but its body has 1 stacked outputs",
+            ))),
         );
 
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
@@ -22754,7 +22817,9 @@ mod tests {
         assert_eq!(options.stacked_axis_shardings(), &[ShardingDimension::Replicated]);
         assert_eq!(
             ScanOptions::<Array>::new().with_unroll(0).err(),
-            Some(ProgramError::Type(TypeError::invalid("`scan` unroll factor must be at least 1"))),
+            Some(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` unroll factor must be at least 1",
+            )))),
         );
         let count = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let options = ScanOptions::new().with_iteration_count(2).with_iteration_count(count.clone());
@@ -22816,10 +22881,10 @@ mod tests {
         assert_eq!(
             scan(|index, (), ()| Ok(((), index)), (), (), ScanOptions::<Array>::new().with_iteration_count(3)),
             Err(ProgramError::InvalidArgument {
-                message:
-                    "`scan` requires an input value to recover its context from; use `Scan::scan` with an explicit \
-                          context when there are no input values"
-                        .to_string(),
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` requires an input value to recover its context from; use `Scan::scan` \
+                     with an explicit context when there are no input values",
+                ),
             }),
         );
         // A count value is itself a domain-bearing input, including a singleton zero count.
@@ -22912,7 +22977,8 @@ mod tests {
             ScanOptions::new(),
         );
         assert!(matches!(result, Err(ProgramError::InvalidArgument { message })
-            if message == "`scan` body must preserve the carry parameter structure and static fields"));
+            if message == format!("`{SCAN_OPERATION_NAME}` body must preserve the carry parameter structure and \
+                                   static fields",)));
     }
 
     #[test]
@@ -22928,9 +22994,9 @@ mod tests {
                 Array::vector(vec![1f32, 2.0, 3.0]).unwrap(),
                 ScanOptions::new().with_iteration_count(2),
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`scan` stacked input 1 must have leading dimension `2` but has type `f32[3]`",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 1 must have leading dimension `2` but has type `f32[3]`",
+            ),))),
         );
         assert!(!called.get());
         assert_eq!(
@@ -22940,16 +23006,17 @@ mod tests {
                 Array::matrix(3, 2, vec![1f32; 6]).unwrap(),
                 ScanOptions::new(),
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`scan` body carry type signature mismatch: expected [f32[]] but got [f32[2]]",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f32[]] but got [f32[2]]",
+            ),))),
         );
         assert_eq!(
             scan(|_, carry, ()| Ok((carry.clone(), carry)), Array::scalar(0f32).unwrap(), (), ScanOptions::new()),
             Err(ProgramError::InvalidArgument {
-                message: "`scan` cannot infer a static iteration count; provide an explicit count or a first-class \
-                          dimension value"
-                    .to_string(),
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` cannot infer a static iteration count; provide an explicit count or a \
+                     first-class dimension value",
+                ),
             }),
         );
     }
@@ -23070,9 +23137,10 @@ mod tests {
                 (),
                 ScanOptions::new().with_iteration_count(0)
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no fixed point",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the loop \
+                 state has no fixed point",
+            ),))),
         );
     }
 

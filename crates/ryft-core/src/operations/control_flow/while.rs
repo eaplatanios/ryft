@@ -10958,10 +10958,7 @@ mod tests {
             V: Value<Type = ArrayType> + Broadcast + Transpose,
             V::Domain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
             TestDomainOperation: BatchableOperation<V::Domain, ArrayBatchingPolicy>
-                + BatchableOperation<
-                    TracingContext<<V::Domain as Domain>::Constant, <V::Domain as Domain>::Operation>,
-                    ArrayBatchingPolicy,
-                > + From<TransposeOperation>
+                + From<TransposeOperation>
                 + From<BroadcastOperation>,
         {
             let context = x.domain();

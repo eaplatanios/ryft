@@ -128,6 +128,10 @@ struct OperationEnum {
     /// Program-shaped generics after reducing payload-specific value parameters to the program constant space.
     program_generics: syn::Generics,
 
+    /// Program-shaped generics for the batching dispatcher, without the per-payload `Operation` predicates that its
+    /// rule predicates imply through the `BatchableOperation` supertrait.
+    batching_generics: syn::Generics,
+
     /// Program-shaped enum self type after reducing payload-specific value parameters to the program constant space.
     program_self_type: syn::Type,
 
@@ -478,7 +482,13 @@ impl OperationParser {
             .map(|parameter| program_value_substitutions(&value_type_parameters, parameter))
             .unwrap_or_default();
         let program_self_type = substitute_type_idents(&self_type, &program_value_substitutions);
-        let operation_generics = operation_generics(&generics, &variants, &self.ryft_crate, &operation_type);
+        // `BatchableOperation` carries `Operation<Type = C::Type>` as its supertrait, so the batching dispatcher's
+        // per-payload rule predicates already imply the payload `Operation` predicates and do not restate them.
+        let batching_generics = substitute_generics(
+            &operation_generics(&generics, &variants, &self.ryft_crate, &operation_type, false),
+            &program_value_substitutions,
+        );
+        let operation_generics = operation_generics(&generics, &variants, &self.ryft_crate, &operation_type, true);
         let program_generics = substitute_generics(&operation_generics, &program_value_substitutions);
         let variants = variants
             .into_iter()
@@ -513,6 +523,7 @@ impl OperationParser {
             program_constant_type,
             program_constant_parameter,
             program_generics,
+            batching_generics,
             program_self_type,
             variants,
         })
@@ -1419,7 +1430,7 @@ impl OperationEnum {
         } else {
             syn::parse_quote!(#ryft::ArrayBatch<#parent_value_type>)
         };
-        let mut batching_generics = self.program_generics.clone();
+        let mut batching_generics = self.batching_generics.clone();
         batching_generics.params.push(syn::parse_quote!(__ParentContext));
         if has_explicit_operation_family {
             batching_generics.params.push(syn::parse_quote!(__BatchingPolicy));
@@ -1496,6 +1507,13 @@ impl OperationEnum {
                     } else {
                         batching_where_clause.predicates.push(syn::parse_quote! {
                             #batching_policy: #ryft::BatchingPolicyProjection<__ParentContext, #member_type>
+                        });
+                        // State the projected context's domain equalities as assumptions, so that elaborating the
+                        // payload rule predicate's `Operation<Type = C::Type>` supertrait normalizes through the
+                        // parameter environment instead of re-evaluating `ProjectedContext`'s `Domain` impl, whose
+                        // `DomainProjection` bound would recurse through this family's `OperationProjection`.
+                        batching_where_clause.predicates.push(syn::parse_quote! {
+                            #ryft::ProjectedContext<__ParentContext, #member_type>: #ryft::Context<Type = #member_type>
                         });
                         batching_where_clause.predicates.push(syn::parse_quote! {
                             #operation_type: #ryft::BatchableOperation<
@@ -2530,6 +2548,7 @@ fn operation_generics(
     variants: &[OperationVariant],
     ryft: &syn::Path,
     operation_type: &syn::Type,
+    include_payload_operation_bounds: bool,
 ) -> syn::Generics {
     let mut generics = generics.without_defaults();
     let mut seen_payload_contracts = std::collections::HashSet::new();
@@ -2553,7 +2572,9 @@ fn operation_generics(
             }
         })
     });
-    generics.make_where_clause().predicates.extend(payload_operation_bounds);
+    if include_payload_operation_bounds {
+        generics.make_where_clause().predicates.extend(payload_operation_bounds);
+    }
     let mut seen_member_types = std::collections::HashSet::new();
     for member_type in variants
         .iter()

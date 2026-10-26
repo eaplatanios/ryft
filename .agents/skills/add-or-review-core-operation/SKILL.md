@@ -78,6 +78,8 @@ Keep operation payload fields private when constructors, builders, and accessors
 type-universe `PhantomData` marker, use the standard field documentation (adapted as needed):
 ``[`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.``
 
+Interpolate operation names from their `*_OPERATION_NAME` constants in diagnostics and expected diagnostic messages.
+
 ## Terminology
 
 In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,

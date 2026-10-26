@@ -681,7 +681,7 @@ impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType>, P: ArrayExte
     BatchableOperation<C, ArrayBatchingPolicy<P>> for GatherOperation<Stored>
 where
     C::Value: Transpose,
-    GatherOperation<Stored>: InterpretableOperation<C>,
+    GatherOperation<Stored>: Operation<Type = ArrayType> + InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,

@@ -1134,9 +1134,6 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
     }
 }
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
-//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
-//  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
 /// Represents [`Operation`]s that can be batched (i.e., vectorized). The trait is parameterized by the parent
 /// [`Context`] `C` that owns the packed values flowing through the batching transform, and every rule receives
 /// the active durable [`BatchingContext`] plus a [`BatchingDriver`]. Ordinary rules lift their operation to its
@@ -1163,13 +1160,15 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
 ///     requested by higher-order rules through their active [`BatchingDriver`], whose concrete implementation
 ///     establishes the finite program-level bounds at its construction site.
 ///
-/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
-/// cannot discharge that projection equality at implementation heads whose batching context is itself built from
-/// `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a payload
-/// whose [`Operation::Type`] disagrees with `C::Type` cannot be batched in `C`: the requirement is restated by the
-/// derived dispatcher's per-payload predicates and by the generic projected-batching helpers, and any mismatched
-/// payload is rejected with a type-mismatch error at its use site.
-pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
+/// The super-trait is `Operation<Type = C::Type>`, so a payload whose [`Operation::Type`] disagrees with `C::Type`
+/// cannot implement the rule for `C`, and every `Payload: BatchableOperation<C, P>` predicate elaborates to that
+/// equality without restating it. Two trait-solver limitations shape how the equality is written at implementation
+/// heads whose batching context is itself built from `Self` (e.g., `EagerContext<V, Self>`): normalizing
+/// `<C as Domain>::Type` through such a context's `Domain` implementation recurses into `Self`'s own bounds, and an
+/// explicit `Self: Operation<Type = T>` next to the elaborated one leaves two projection candidates that the solver
+/// cannot choose between. Both are avoided by stating the context's type as an assumption instead (i.e.,
+/// `C: Context<Type = T>`), which the derived dispatcher does for its projected-member rules.
+pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::Type> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
     /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
     /// current operation application's regions and has a region count of zero for region-free applications. Packed
@@ -1201,9 +1200,7 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError>
-    where
-        Self: Operation<Type = C::Type>;
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 }
 
 /// Batching rule for a member [`Operation`] whose instruction has a mixed signature in a parent operation universe.
@@ -2222,9 +2219,9 @@ mod tests {
         type Projected = ProjectedMemberBatching<2>;
     }
 
-    // The rule is context-generic so that the per-method `Self: Operation<Type = C::Type>` requirement of
-    // `BatchableOperation::batch` is discharged from the context bound instead of by normalizing an eager
-    // context that is itself built from this operation family.
+    // The rule is context-generic so that the `Operation<Type = C::Type>` super-trait of `BatchableOperation` is
+    // discharged from the context bound instead of by normalizing an eager context that is itself built from this
+    // operation family.
     impl<C> BatchableOperation<C, ProjectedProgramBatching> for ProjectedProgramOperation
     where
         C: Context<
@@ -2239,10 +2236,7 @@ mod tests {
             _context: &BatchingContext<C, ProjectedProgramBatching>,
             _driver: &D,
             inputs: &[ProjectedBatch<C::Value>],
-        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError>
-        where
-            Self: Operation<Type = C::Type>,
-        {
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError> {
             if inputs.len() != 1 {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             }

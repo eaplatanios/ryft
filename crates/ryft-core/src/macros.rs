@@ -7498,8 +7498,8 @@ mod tests {
 
         fn assert_batchable<O>()
         where
-            O: Operation<Type = ArrayType>
-                + InterpretableOperation<EagerContext<Array, O>>
+            EagerContext<Array, O>: Context<Type = ArrayType>,
+            O: InterpretableOperation<EagerContext<Array, O>>
                 + BatchableOperation<EagerContext<Array, O>, ArrayBatchingPolicy>
                 + OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
         {
