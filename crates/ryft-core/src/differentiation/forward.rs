@@ -25,11 +25,11 @@ use crate::partial::{
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, MaybeZero, Operation,
-    OperationPayloadProjection, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType,
-    ReferenceRoot, ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueDomainDispatch, ValueProjection,
+    Atom, AtomId, AttachedRegions, EmptyRegionDriver, FlatProgram, MaybeZero, Operation, OperationPayloadProjection,
+    OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
+    ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot,
+    ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
+    TypeIdentityPosition, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -1320,7 +1320,7 @@ where
         programs: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        context.bind_duals(operation, programs, inputs)
+        context.bind_duals(operation, programs.into(), inputs)
     }
 }
 
@@ -1838,12 +1838,12 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     /// # Parameters
     ///
     ///   - `operation`: Operation whose primal and tangent results are required.
-    ///   - `driver`: Complete ordered regions attached to this application.
+    ///   - `regions`: Complete ordered regions attached to this application.
     ///   - `inputs`: Input duals, in operation input order.
-    fn bind_duals<D: BindingRegionDriver<C::Constant, C::Operation>>(
+    fn bind_duals(
         &self,
         operation: &C::Operation,
-        driver: D,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
     where
@@ -1856,7 +1856,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        operation.validate_region_interfaces(&driver.region_interfaces())?;
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
 
         // All-zero fast path mirroring `Program::jvp`. When an operation consumes at least one input and every input
         // tangent is a structural zero, skip its rule only when each output tangent can later be materialized without
@@ -1876,7 +1876,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             None
         } else if !operation.region_slots().is_empty() {
             let touches_references = inputs.iter().any(|input| input.primal().r#type().is_reference())
-                || driver.regions().any(|region| region.contains_references_in_closure());
+                || regions.regions().any(|region| region.contains_references_in_closure());
             (!touches_references).then_some(Vec::new())
         } else {
             let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
@@ -1907,7 +1907,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         let outputs = if let Some(reusable_zero_outputs) = reusable_zero_outputs {
             let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             self.primal
-                .bind(operation.clone(), driver, &primal_inputs)?
+                .bind(operation.clone(), regions, &primal_inputs)?
                 .into_iter()
                 .enumerate()
                 .map(|(output_index, primal)| {
@@ -1925,16 +1925,20 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         } else {
             // Rules differentiate attached regions structurally, so regions whose types the primal inputs strictly
             // refine are first specialized to those inputs (e.g., a region replayed with a concrete batch extent
-            // whose body still declares the dynamic extent). Otherwise, borrow the complete region driver directly,
-            // preserving operation-defined ordering without collecting it into temporary storage.
+            // whose body still declares the dynamic extent). Otherwise, borrow the complete attached regions directly,
+            // preserving operation-defined ordering without collecting them into temporary storage.
             let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-            match FlatProgram::<C>::specialize_attached_regions(operation, &primal_types, driver.regions())? {
-                Some(regions) => {
-                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &regions, rule: self.rule };
+            match FlatProgram::<C>::specialize_attached_regions(operation, &primal_types, regions.regions())? {
+                Some(specialized_regions) => {
+                    // Attach the specialized programs through the same concrete type as the unspecialized arm,
+                    // so that every rule is compiled once per context rather than once per arm.
+                    let specialized_regions = AttachedRegions::Owned(specialized_regions);
+                    let differentiation_driver =
+                        RecursiveDifferentiationDriver { driver: &specialized_regions, rule: self.rule };
                     self.rule.apply(operation, self, &differentiation_driver, inputs)?
                 }
                 None => {
-                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver, rule: self.rule };
+                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &regions, rule: self.rule };
                     self.rule.apply(operation, self, &differentiation_driver, inputs)?
                 }
             }
@@ -1956,18 +1960,18 @@ where
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
-    /// context, which only converts its input operation, so that this body is compiled once per context and region
-    /// driver rather than once per input operation type.
-    fn bind_operation<D: BindingRegionDriver<C::Constant, C::Operation>>(
+    /// context, which only converts its input operation and regions, so that this body is compiled once per context
+    /// rather than once per input operation type or way of supplying regions.
+    fn bind_operation(
         &self,
         operation: C::Operation,
-        driver: D,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[DifferentiationTracer<C, P>],
     ) -> Result<Vec<DifferentiationTracer<C, P>>, ProgramError> {
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
         let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
-        let output_duals = self.bind_duals(&operation, driver, &input_duals)?;
+        let output_duals = self.bind_duals(&operation, regions, &input_duals)?;
 
         // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
         // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
@@ -2001,13 +2005,17 @@ where
     }
 
     #[inline]
-    fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, O: Into<C::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[DifferentiationTracer<C, P>],
-    ) -> Result<Vec<DifferentiationTracer<C, P>>, ProgramError> {
-        self.bind_operation(operation.into(), driver, inputs)
+    ) -> Result<Vec<DifferentiationTracer<C, P>>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        self.bind_operation(operation.into(), regions.into(), inputs)
     }
 
     #[inline]
@@ -2288,7 +2296,8 @@ where
                     }
                     Ok(true)
                 };
-                let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
+                let regions =
+                    AttachedRegions::from(ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?);
 
                 // Both dispatch paths run inside the replayed instruction's recorded origin so that everything they
                 // stage records where it came from: the one-to-one fast path preserves the source provenance exactly,
@@ -2299,7 +2308,7 @@ where
                     if use_zero_tangent_fast_path {
                         let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
                         context
-                            .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
+                            .stage_operation(instruction.operation().clone(), regions, primal_inputs.as_slice())?
                             .into_iter()
                             .enumerate()
                             .map(|(output_index, primal)| {
@@ -2321,7 +2330,7 @@ where
                             .collect::<Result<Vec<_>, DifferentiationError>>()
                     } else {
                         let differentiation_driver =
-                            RecursiveDifferentiationDriver { driver: &driver, rule: arguments.rule };
+                            RecursiveDifferentiationDriver { driver: &regions, rule: arguments.rule };
                         arguments.rule.apply(
                             instruction.operation(),
                             &differentiation_context,

@@ -2615,7 +2615,7 @@ mod tests {
     use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
     use crate::operations::{Complex, One, Real, Reduce, ReductionKind};
     use crate::parameters::Parameter;
-    use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope, ReferenceType};
+    use crate::programs::{AttachedRegions, Provenance, ProvenanceScope, ReferenceType};
     use crate::tracing::DomainTracingContext;
 
     use super::*;
@@ -3086,13 +3086,17 @@ mod tests {
                 self.0.lift(constant)
             }
 
-            fn bind<Operation: Into<Self::Operation>, Driver: BindingRegionDriver<Array, Self::Operation>>(
+            fn bind<'r, Operation: Into<Self::Operation>, R: Into<AttachedRegions<'r, Array, Self::Operation>>>(
                 &self,
                 operation: Operation,
-                driver: Driver,
+                regions: R,
                 inputs: &[Array],
-            ) -> Result<Vec<Array>, ProgramError> {
-                self.0.bind(operation, driver, inputs)
+            ) -> Result<Vec<Array>, ProgramError>
+            where
+                Array: 'r,
+                Self::Operation: 'r,
+            {
+                self.0.bind(operation, regions, inputs)
             }
 
             fn is_eager(&self) -> bool {

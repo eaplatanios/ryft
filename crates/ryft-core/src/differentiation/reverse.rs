@@ -25,11 +25,11 @@ use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatabl
 use crate::programs::references::LocalReferenceLifecycles;
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero,
-    Operation, OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType,
-    ReferenceRoot, ReferenceTransform, ReferenceType, Region, RegionDriver, RegionRef, RegionReplayMappings,
-    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    Atom, AtomId, AttachedRegions, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero, Operation,
+    OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType, ReferenceRoot,
+    ReferenceTransform, ReferenceType, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -2840,7 +2840,8 @@ where
                             .collect::<Result<Vec<_>, _>>()?;
                         let driver = ReplayRegionDriver::new(program, instruction.regions(), region_mappings)?;
                         let region_input_types = vec![None; instruction.regions().len()];
-                        let regions = driver.import_into(builder, &region_input_types)?;
+                        let regions = AttachedRegions::from(driver).import_into(builder, &region_input_types)?;
+
                         // Replaying an unchanged known producer into the pullback is a structural copy,
                         // so that its provenance is preserved verbatim.
                         let outputs = builder
@@ -3203,7 +3204,8 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
 
             let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
-            let regions = driver.import_into(&builder, &vec![None; instruction.regions().len()])?;
+            let region_input_types = vec![None; instruction.regions().len()];
+            let regions = AttachedRegions::from(driver).import_into(&builder, &region_input_types)?;
             let outputs = builder
                 .borrow_mut()
                 .add_instruction(
