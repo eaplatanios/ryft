@@ -2167,7 +2167,175 @@ fn reconstruct_partitioned_condition<
     mut bind_known_fn: BindKnownFn,
     mut bind_residual_fn: BindResidualFn,
 ) -> Result<Result<Vec<Input>, String>, ProgramError> {
-    reconstruct_partitioned_condition_erased(
+    /// Internal helper that rebuilds a partitioned conditional like [`reconstruct_partitioned_condition`] with the
+    /// callback types erased. This is the body of that function, which only wraps its callbacks, so that this body is
+    /// compiled once per value, operation, and input type rather than once per combination of callback types: every
+    /// partial evaluation and linearization of a conditional would otherwise instantiate this body and every closure
+    /// and iterator adapter in it again. Each callback is invoked exactly as often as by the wrapped function.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn inner<
+        V: Value<Type: ConditionType>,
+        O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
+        Input: Clone,
+    >(
+        predicate_type: &V::Type,
+        branch_input_types: &[V::Type],
+        output_count: usize,
+        inputs: &[Input],
+        input_known: &[bool],
+        partitions: [PartitionedProgram<V, O>; 2],
+        build_placeholder_fn: &mut dyn FnMut(
+            &mut ProgramBuilder<V, O>,
+            &V::Type,
+            &[AtomId],
+        ) -> Result<Option<AtomId>, ProgramError>,
+        bind_known_fn: &mut dyn FnMut(
+            O,
+            Vec<Program<V, O, Vec<V>, Vec<V>>>,
+            &[Input],
+        ) -> Result<Vec<Input>, ProgramError>,
+        bind_residual_fn: &mut dyn FnMut(
+            O,
+            Vec<Program<V, O, Vec<V>, Vec<V>>>,
+            &[Input],
+        ) -> Result<Vec<Input>, ProgramError>,
+    ) -> Result<Result<Vec<Input>, String>, ProgramError> {
+        let [true_partition, false_partition] = partitions;
+        let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
+
+        // Reject reference-typed known feeders and executable reference constants. A reference feeder has no typed zero
+        // for the other branch's edge slot, and splitting branches must not expose a reference through either an edge
+        // or a captured constant without accounting for its identity.
+        if [&true_partition, &false_partition]
+            .into_iter()
+            .any(|partition| partition.has_known_reference_inputs_or_constants())
+        {
+            return Ok(Err("a branch would pass a known reference as a residual".to_string()));
+        }
+
+        // An output is known only when both branches folded it.
+        let output_known = (0..output_count)
+            .map(|index| {
+                [&true_partition, &false_partition]
+                    .into_iter()
+                    .all(|partition| matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_))))
+            })
+            .collect::<Vec<bool>>();
+        let true_split = PartitionedConditionBranch::from_partition(true_partition, input_known, &output_known)?;
+        let false_split = PartitionedConditionBranch::from_partition(false_partition, input_known, &output_known)?;
+        let splits = [&true_split, &false_split];
+
+        // Every residual edge is an output of the known condition. Devices whose predicates differ take different
+        // branches and produce different edge values, so each edge must vary over the predicate's manual axes. An edge
+        // that does not (e.g., a residual computed only from invariant inputs) cannot be retyped without changing the
+        // residual program that consumes it, so the original condition is kept instead of being mistyped.
+        if let Some((edge_type, _)) = splits
+            .iter()
+            .flat_map(|split| &split.edges)
+            .find(|(edge_type, _)| edge_type.validate_condition_output(predicate_type).is_err())
+        {
+            return Ok(Err(format!(
+                "a residual of type `{edge_type}` does not vary over every manual axis that the predicate \
+                 `{predicate_type}` varies over",
+            )));
+        }
+
+        // An empty known side (i.e., no outputs, edges, effects, or deferred work on either branch) folds nothing, and
+        // neither does a known side whose branches only forward known inputs into their edges or compute values that
+        // depend on no input (e.g., a structural zero), because the residual condition could receive those inputs
+        // directly and compute those values itself instead of selecting them through a known condition. Retain a
+        // value-returning condition unchanged in both cases. In particular, the residual condition of separate-context
+        // linearization reaches this rule again when its tangent context is a partial-evaluation context, and must not
+        // be split a second time. Unit-returning branches still need their residual effects reconstructed, without
+        // binding an empty known condition.
+        let known_side_is_inert = !output_known.contains(&true)
+            && splits.iter().all(|split| split.partition.known_program().effects().is_pure());
+        let known_side_is_empty = known_side_is_inert && splits.iter().all(|split| split.edges.is_empty());
+        let known_side_only_forwards = known_side_is_inert
+            && splits.iter().all(|split| {
+                split
+                    .partition
+                    .known_program()
+                    .entry_region_ref()
+                    .instructions()
+                    .iter()
+                    .all(|instruction| instruction.inputs().is_empty() && instruction.regions().is_empty())
+            });
+        if (known_side_is_empty || known_side_only_forwards) && output_count != 0 {
+            return Ok(Err("its known side would fold no work".to_string()));
+        }
+
+        // Build both known branches before binding either condition, so that an unsupported placeholder can retain the
+        // original condition without staging any work in the caller's context. The caller decides how to construct
+        // placeholders: partial evaluation accepts only identity-free typed zeros, while differentiation can obtain
+        // runtime extents from the known branch inputs or forward a known input of the identical type. A unit-returning
+        // condition with no known work still needs its residual branch effects, but binding an empty pure known
+        // condition serves no purpose.
+        let known_output_count = output_known.iter().filter(|&&known| known).count();
+        let edge_count = true_split.edges.len() + false_split.edges.len();
+        let known_outputs = if known_side_is_empty {
+            Vec::new()
+        } else {
+            let known_true = match true_split.known_branch(&false_split, true, &output_known, build_placeholder_fn)? {
+                Ok(branch) => branch,
+                Err(rejection) => return Ok(Err(rejection)),
+            };
+            let known_false = match false_split.known_branch(&true_split, false, &output_known, build_placeholder_fn)? {
+                Ok(branch) => branch,
+                Err(rejection) => return Ok(Err(rejection)),
+            };
+            let mut known_condition_inputs = vec![predicate.clone()];
+            known_condition_inputs.extend(
+                branch_inputs.iter().zip(input_known).filter(|(_, known)| **known).map(|(input, _)| input.clone()),
+            );
+            let known_outputs = bind_known_fn(
+                O::from(ConditionOperation::new()),
+                vec![known_true, known_false],
+                known_condition_inputs.as_slice(),
+            )?;
+            check_count!("output", known_outputs, known_output_count + edge_count, ProgramError);
+            known_outputs
+        };
+
+        // A branch residual with effects or deferred work must survive even when the condition returns no residual
+        // values, because simplification retains that work and dropping the condition would discard it. The known
+        // condition returns the `true` branch's edges and then the `false` branch's edges after its known outputs,
+        // which is the order in which the residual condition receives them after the unknown inputs.
+        let needs_residual_condition = output_known.contains(&false)
+            || splits.iter().any(|split| !split.partition.residual_program().effects().is_pure());
+        let residual_outputs = if needs_residual_condition {
+            let edges = [true_split.edges.as_slice(), false_split.edges.as_slice()];
+            let residual_branches = [(&true_split, true), (&false_split, false)]
+                .into_iter()
+                .map(|(split, is_true_branch)| {
+                    split.residual_branch(is_true_branch, branch_input_types, input_known, &output_known, edges)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut residual_condition_inputs = vec![predicate.clone()];
+            residual_condition_inputs.extend(
+                branch_inputs.iter().zip(input_known).filter(|(_, known)| !**known).map(|(input, _)| input.clone()),
+            );
+            residual_condition_inputs.extend(known_outputs[known_output_count..].iter().cloned());
+            bind_residual_fn(
+                O::from(ConditionOperation::new()),
+                residual_branches,
+                residual_condition_inputs.as_slice(),
+            )?
+        } else {
+            Vec::new()
+        };
+        check_count!("output", residual_outputs, output_count - known_output_count, ProgramError);
+
+        // Reassemble the original output order from the two sides.
+        let mut known_values = known_outputs.into_iter();
+        let mut residual_values = residual_outputs.into_iter();
+        Ok(Ok(output_known
+            .iter()
+            .map(|&known| if known { known_values.next() } else { residual_values.next() }.unwrap())
+            .collect()))
+    }
+
+    inner(
         predicate_type,
         branch_input_types,
         output_count,
@@ -2178,165 +2346,6 @@ fn reconstruct_partitioned_condition<
         &mut bind_known_fn,
         &mut bind_residual_fn,
     )
-}
-
-/// Internal helper that rebuilds a partitioned conditional like [`reconstruct_partitioned_condition`] with the callback
-/// types erased. This is the body of that function, which only wraps its callbacks, so that this body is compiled once
-/// per value, operation, and input type rather than once per combination of callback types: every partial evaluation
-/// and linearization of a conditional would otherwise instantiate this body and every closure and iterator adapter in
-/// it again. Each callback is invoked exactly as often as by the wrapped function.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn reconstruct_partitioned_condition_erased<
-    V: Value<Type: ConditionType>,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
-    Input: Clone,
->(
-    predicate_type: &V::Type,
-    branch_input_types: &[V::Type],
-    output_count: usize,
-    inputs: &[Input],
-    input_known: &[bool],
-    partitions: [PartitionedProgram<V, O>; 2],
-    build_placeholder_fn: &mut dyn FnMut(
-        &mut ProgramBuilder<V, O>,
-        &V::Type,
-        &[AtomId],
-    ) -> Result<Option<AtomId>, ProgramError>,
-    bind_known_fn: &mut dyn FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
-    bind_residual_fn: &mut dyn FnMut(
-        O,
-        Vec<Program<V, O, Vec<V>, Vec<V>>>,
-        &[Input],
-    ) -> Result<Vec<Input>, ProgramError>,
-) -> Result<Result<Vec<Input>, String>, ProgramError> {
-    let [true_partition, false_partition] = partitions;
-    let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
-
-    // Reject reference-typed known feeders and executable reference constants. A reference feeder has no typed zero
-    // for the other branch's edge slot, and splitting branches must not expose a reference through either an edge or
-    // a captured constant without accounting for its identity.
-    if [&true_partition, &false_partition]
-        .into_iter()
-        .any(|partition| partition.has_known_reference_inputs_or_constants())
-    {
-        return Ok(Err("a branch would pass a known reference as a residual".to_string()));
-    }
-
-    // An output is known only when both branches folded it.
-    let output_known = (0..output_count)
-        .map(|index| {
-            [&true_partition, &false_partition]
-                .into_iter()
-                .all(|partition| matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_))))
-        })
-        .collect::<Vec<bool>>();
-    let true_split = PartitionedConditionBranch::from_partition(true_partition, input_known, &output_known)?;
-    let false_split = PartitionedConditionBranch::from_partition(false_partition, input_known, &output_known)?;
-    let splits = [&true_split, &false_split];
-
-    // Every residual edge is an output of the known condition. Devices whose predicates differ take different branches
-    // and produce different edge values, so each edge must vary over the predicate's manual axes. An edge that does not
-    // (e.g., a residual computed only from invariant inputs) cannot be retyped without changing the residual program
-    // that consumes it, so the original condition is kept instead of being mistyped.
-    if let Some((edge_type, _)) = splits
-        .iter()
-        .flat_map(|split| &split.edges)
-        .find(|(edge_type, _)| edge_type.validate_condition_output(predicate_type).is_err())
-    {
-        return Ok(Err(format!(
-            "a residual of type `{edge_type}` does not vary over every manual axis that the predicate \
-             `{predicate_type}` varies over",
-        )));
-    }
-
-    // An empty known side (i.e., no outputs, edges, effects, or deferred work on either branch) folds nothing,
-    // and neither does a known side whose branches only forward known inputs into their edges or compute values that
-    // depend on no input (e.g., a structural zero), because the residual condition could receive those inputs directly
-    // and compute those values itself instead of selecting them through a known condition. Retain a value-returning
-    // condition unchanged in both cases. In particular, the residual condition of separate-context linearization
-    // reaches this rule again when its tangent context is a partial-evaluation context, and must not be split a second
-    // time. Unit-returning branches still need their residual effects reconstructed, without binding an empty known
-    // condition.
-    let known_side_is_inert =
-        !output_known.contains(&true) && splits.iter().all(|split| split.partition.known_program().effects().is_pure());
-    let known_side_is_empty = known_side_is_inert && splits.iter().all(|split| split.edges.is_empty());
-    let known_side_only_forwards = known_side_is_inert
-        && splits.iter().all(|split| {
-            split
-                .partition
-                .known_program()
-                .entry_region_ref()
-                .instructions()
-                .iter()
-                .all(|instruction| instruction.inputs().is_empty() && instruction.regions().is_empty())
-        });
-    if (known_side_is_empty || known_side_only_forwards) && output_count != 0 {
-        return Ok(Err("its known side would fold no work".to_string()));
-    }
-
-    // Build both known branches before binding either condition, so that an unsupported placeholder can retain
-    // the original condition without staging any work in the caller's context. The caller decides how to construct
-    // placeholders: partial evaluation accepts only identity-free typed zeros, while differentiation can obtain runtime
-    // extents from the known branch inputs or forward a known input of the identical type. A unit-returning condition
-    // with no known work still needs its residual branch effects, but binding an empty pure known condition serves no
-    // purpose.
-    let known_output_count = output_known.iter().filter(|&&known| known).count();
-    let edge_count = true_split.edges.len() + false_split.edges.len();
-    let known_outputs = if known_side_is_empty {
-        Vec::new()
-    } else {
-        let known_true = match true_split.known_branch(&false_split, true, &output_known, build_placeholder_fn)? {
-            Ok(branch) => branch,
-            Err(rejection) => return Ok(Err(rejection)),
-        };
-        let known_false = match false_split.known_branch(&true_split, false, &output_known, build_placeholder_fn)? {
-            Ok(branch) => branch,
-            Err(rejection) => return Ok(Err(rejection)),
-        };
-        let mut known_condition_inputs = vec![predicate.clone()];
-        known_condition_inputs
-            .extend(branch_inputs.iter().zip(input_known).filter(|(_, known)| **known).map(|(input, _)| input.clone()));
-        let known_outputs = bind_known_fn(
-            O::from(ConditionOperation::new()),
-            vec![known_true, known_false],
-            known_condition_inputs.as_slice(),
-        )?;
-        check_count!("output", known_outputs, known_output_count + edge_count, ProgramError);
-        known_outputs
-    };
-
-    // A branch residual with effects or deferred work must survive even when the condition returns no residual values,
-    // because simplification retains that work and dropping the condition would discard it. The known condition returns
-    // the `true` branch's edges and then the `false` branch's edges after its known outputs, which is the order in
-    // which the residual condition receives them after the unknown inputs.
-    let needs_residual_condition = output_known.contains(&false)
-        || splits.iter().any(|split| !split.partition.residual_program().effects().is_pure());
-    let residual_outputs = if needs_residual_condition {
-        let edges = [true_split.edges.as_slice(), false_split.edges.as_slice()];
-        let residual_branches = [(&true_split, true), (&false_split, false)]
-            .into_iter()
-            .map(|(split, is_true_branch)| {
-                split.residual_branch(is_true_branch, branch_input_types, input_known, &output_known, edges)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut residual_condition_inputs = vec![predicate.clone()];
-        residual_condition_inputs.extend(
-            branch_inputs.iter().zip(input_known).filter(|(_, known)| !**known).map(|(input, _)| input.clone()),
-        );
-        residual_condition_inputs.extend(known_outputs[known_output_count..].iter().cloned());
-        bind_residual_fn(O::from(ConditionOperation::new()), residual_branches, residual_condition_inputs.as_slice())?
-    } else {
-        Vec::new()
-    };
-    check_count!("output", residual_outputs, output_count - known_output_count, ProgramError);
-
-    // Reassemble the original output order from the two sides.
-    let mut known_values = known_outputs.into_iter();
-    let mut residual_values = residual_outputs.into_iter();
-    Ok(Ok(output_known
-        .iter()
-        .map(|&known| if known { known_values.next() } else { residual_values.next() }.unwrap())
-        .collect()))
 }
 
 #[cfg(test)]

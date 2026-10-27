@@ -95,7 +95,7 @@ pub use scan::{
     SCAN_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation, ScanOptions, ScanType, scan,
 };
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
-pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
+pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileResidualStackOperation, WhileType};
 
 /// Operations for storing a loop's intermediate values in stacks and recovering them when needed. When partial
 /// evaluation or differentiation splits a loop body, the later computation may need values produced by the earlier

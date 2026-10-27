@@ -505,93 +505,87 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        Self::from_widened_boundary_erased(
-            program,
-            output_axes,
-            required_output_axes,
-            widening_output_count,
-            &collapse_fn,
-        )
-    }
-
-    /// Internal helper that constructs a [`BoundaryPreservingBatchedProgram`] like [`Self::from_widened_boundary`]
-    /// with the collapse callback type erased. This is the body of that function, which only wraps its callback, so
-    /// that this body is compiled once per value type and operation family rather than once per callback type: every
-    /// adaptation with a distinct collapse closure would otherwise instantiate this body and every closure and
-    /// iterator adapter in it again. The callback is invoked once per collapsed output.
-    #[allow(clippy::type_complexity)]
-    fn from_widened_boundary_erased(
-        program: Program<V, O, Vec<V>, Vec<V>>,
-        output_axes: Vec<BatchAxis>,
-        required_output_axes: Option<&[BatchAxis]>,
-        widening_output_count: usize,
-        collapse_fn: &dyn Fn(
-            &TracingContext<V, O>,
-            Tracer<TracingContext<V, O>>,
-            Axis,
-        ) -> Result<Tracer<TracingContext<V, O>>, BatchingError>,
-    ) -> Result<Self, BatchingError>
-    where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    {
-        if let Some(required_output_axes) = required_output_axes {
-            check_count!("output", output_axes, required_output_axes.len(), ProgramError);
-        } else if widening_output_count == 0 {
-            return Ok(Self::new(program, output_axes)?);
-        }
-
-        // Replay the program over fresh tracer inputs so that its output boundary can be rebuilt. The block scopes the
-        // tracing context and every traced value because recovering the rebuilt program below requires unique ownership
-        // of the shared builder, and so all other handles to it must have been released by then.
-        let (builder, output_ids) = {
-            let context = TracingContext::<V, O>::new();
-            let builder = context.builder().clone();
-            let inputs = program.input_types().into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
-            let mut outputs = program.interpret_in_context(&context, inputs)?;
-            check_count!("output", outputs, output_axes.len() + widening_output_count, ProgramError);
-
-            // The leading widening outputs carry transform bookkeeping rather than source-region results, so the
-            // rebuilt boundary omits them.
-            outputs.drain(..widening_output_count);
-
-            // Collapse each output that is mapped while its consumer requires it replicated. This is the one
-            // mismatch no structural axis movement can resolve, so it must be reduced away here.
+        /// Internal helper that constructs a [`BoundaryPreservingBatchedProgram`] like [`Self::from_widened_boundary`]
+        /// with the collapse callback type erased. This is the body of that function, which only wraps its callback,
+        /// so that this body is compiled once per value type and operation family rather than once per callback type:
+        /// every adaptation with a distinct collapse closure would otherwise instantiate this body and every closure
+        /// and iterator adapter in it again. The callback is invoked once per collapsed output.
+        #[allow(clippy::type_complexity)]
+        fn inner<V: Value, O: Operation<Type = V::Type>>(
+            program: Program<V, O, Vec<V>, Vec<V>>,
+            output_axes: Vec<BatchAxis>,
+            required_output_axes: Option<&[BatchAxis]>,
+            widening_output_count: usize,
+            collapse_fn: &dyn Fn(
+                &TracingContext<V, O>,
+                Tracer<TracingContext<V, O>>,
+                Axis,
+            ) -> Result<Tracer<TracingContext<V, O>>, BatchingError>,
+        ) -> Result<BoundaryPreservingBatchedProgram<V, O>, BatchingError>
+        where
+            TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+        {
             if let Some(required_output_axes) = required_output_axes {
-                outputs = outputs
-                    .into_iter()
-                    .zip(output_axes.iter().zip(required_output_axes))
-                    .map(|(output, (actual, required))| match (actual.axis(), required.axis()) {
-                        (Some(axis), None) => collapse_fn(&context, output, axis),
-                        _ => Ok(output),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                check_count!("output", output_axes, required_output_axes.len(), ProgramError);
+            } else if widening_output_count == 0 {
+                return Ok(BoundaryPreservingBatchedProgram::new(program, output_axes)?);
             }
 
-            (builder, outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?)
-        };
+            // Replay the program over fresh tracer inputs so that its output boundary can be rebuilt. The block scopes
+            // the tracing context and every traced value because recovering the rebuilt program below requires unique
+            // ownership of the shared builder, and so all other handles to it must have been released by then.
+            let (builder, output_ids) = {
+                let context = TracingContext::<V, O>::new();
+                let builder = context.builder().clone();
+                let inputs = program.input_types().into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+                let mut outputs = program.interpret_in_context(&context, inputs)?;
+                check_count!("output", outputs, output_axes.len() + widening_output_count, ProgramError);
 
-        // With the context and tracers gone, the builder handle is unique and the traced instructions can be sealed
-        // into the rebuilt program behind the adjusted output boundary.
-        let input_count = program.input_count();
-        let output_count = output_ids.len();
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
+                // The leading widening outputs carry transform bookkeeping rather than source-region results,
+                // so the rebuilt boundary omits them.
+                outputs.drain(..widening_output_count);
 
-        // A collapsed output is replicated in the rebuilt program, so the reported axes must say so
-        // instead of repeating the pre-collapse mapped axis.
-        let output_axes = match required_output_axes {
-            Some(required_output_axes) => output_axes
-                .into_iter()
-                .zip(required_output_axes)
-                .map(|(actual, required)| match (actual.axis(), required.axis()) {
-                    (Some(_), None) => BatchAxis::replicated(),
-                    _ => actual,
-                })
-                .collect(),
-            None => output_axes,
-        };
+                // Collapse each output that is mapped while its consumer requires it replicated. This is the one
+                // mismatch no structural axis movement can resolve, so it must be reduced away here.
+                if let Some(required_output_axes) = required_output_axes {
+                    outputs = outputs
+                        .into_iter()
+                        .zip(output_axes.iter().zip(required_output_axes))
+                        .map(|(output, (actual, required))| match (actual.axis(), required.axis()) {
+                            (Some(axis), None) => collapse_fn(&context, output, axis),
+                            _ => Ok(output),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
 
-        Ok(Self::new(program, output_axes)?)
+                (builder, outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?)
+            };
+
+            // With the context and tracers gone, the builder handle is unique and the traced instructions can be sealed
+            // into the rebuilt program behind the adjusted output boundary.
+            let input_count = program.input_count();
+            let output_count = output_ids.len();
+            let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+            let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
+
+            // A collapsed output is replicated in the rebuilt program, so the reported axes must say so
+            // instead of repeating the pre-collapse mapped axis.
+            let output_axes = match required_output_axes {
+                Some(required_output_axes) => output_axes
+                    .into_iter()
+                    .zip(required_output_axes)
+                    .map(|(actual, required)| match (actual.axis(), required.axis()) {
+                        (Some(_), None) => BatchAxis::replicated(),
+                        _ => actual,
+                    })
+                    .collect(),
+                None => output_axes,
+            };
+
+            Ok(BoundaryPreservingBatchedProgram::new(program, output_axes)?)
+        }
+
+        inner(program, output_axes, required_output_axes, widening_output_count, &collapse_fn)
     }
 }
 
@@ -1316,35 +1310,35 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
         inputs: &[P::Batch],
         output_batch_axes: &[BatchAxis],
     ) -> Result<Vec<P::Batch>, BatchingError> {
+        /// Internal helper that unpacks the input values of `inputs`, interprets the operation once through `interpret`
+        /// against the parent context (which owns those packed values), and repackages each output with its requested
+        /// `BatchAxis`. This is the body of the enclosing blanket [`InterpretableBatchableOperation`] implementation,
+        /// which only supplies the operation's interpretation, so that this body is compiled once per context and
+        /// policy rather than once per operation type.
+        fn inner<C: Context, P: BatchingPolicy<C>>(
+            context: &BatchingContext<C, P>,
+            inputs: &[P::Batch],
+            output_batch_axes: &[BatchAxis],
+            interpret: &dyn Fn(&C, &[C::Value]) -> Result<Vec<C::Value>, ProgramError>,
+        ) -> Result<Vec<P::Batch>, BatchingError> {
+            if inputs.is_empty() {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            }
+            let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+            let output_values = interpret(&context.parent().clone(), input_values.as_slice())?;
+            check_count!("output", output_values, output_batch_axes.len(), ProgramError);
+            output_values
+                .into_iter()
+                .zip(output_batch_axes.iter().copied())
+                .map(|(value, axis)| P::batch(value, axis))
+                .collect()
+        }
+
         // Every `InterpretableOperation` over the parent context's values is an `InterpretableBatchableOperation`.
-        interpret_batches(context, inputs, output_batch_axes, &|parent, input_values| {
+        inner(context, inputs, output_batch_axes, &|parent, input_values| {
             self.interpret(parent, &EmptyRegionDriver, input_values)
         })
     }
-}
-
-/// Internal helper that unpacks the input values of `inputs`, interprets the operation once through `interpret`
-/// against the parent context (which owns those packed values), and repackages each output with its requested
-/// `BatchAxis`. This is the body of the blanket [`InterpretableBatchableOperation`] implementation above, which only
-/// supplies the operation's interpretation, so that this body is compiled once per context and policy rather than once
-/// per operation type.
-fn interpret_batches<C: Context, P: BatchingPolicy<C>>(
-    context: &BatchingContext<C, P>,
-    inputs: &[P::Batch],
-    output_batch_axes: &[BatchAxis],
-    interpret: &dyn Fn(&C, &[C::Value]) -> Result<Vec<C::Value>, ProgramError>,
-) -> Result<Vec<P::Batch>, BatchingError> {
-    if inputs.is_empty() {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-    }
-    let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
-    let output_values = interpret(&context.parent().clone(), input_values.as_slice())?;
-    check_count!("output", output_values, output_batch_axes.len(), ProgramError);
-    output_values
-        .into_iter()
-        .zip(output_batch_axes.iter().copied())
-        .map(|(value, axis)| P::batch(value, axis))
-        .collect()
 }
 
 /// Active [`Context`] for one batching level, introducing exactly one logical mapped axis. Its [`BatchingPolicy`]
@@ -1850,8 +1844,74 @@ pub trait Batch: Context {
         output_batch_axes: OutputBatchAxes,
         batch_axis: Specification,
     ) -> Result<O::To<Self::Value>, BatchingError> {
+        /// Internal helper that batches like [`Batch::batch`] with the callback and specification types erased. This
+        /// is the body of that function, which only wraps its callback and converts its specification, so that this
+        /// body is compiled once per context and input, output, and axis structure rather than once per callback type.
+        /// The callback is invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<
+            C: Batch,
+            I: Parameterized<
+                    C::Value,
+                    Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<C, C::Policy>>,
+                >,
+            O: Parameterized<
+                    BatchingTracer<C, C::Policy>,
+                    Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<C::Value>,
+                >,
+            InputBatchAxes: Parameterized<BatchAxis>,
+            OutputBatchAxes: Parameterized<BatchAxis>,
+        >(
+            parent: &C,
+            function: &mut dyn FnMut(I::To<BatchingTracer<C, C::Policy>>) -> Result<O, ProgramError>,
+            input: I,
+            input_batch_axes: InputBatchAxes,
+            output_batch_axes: OutputBatchAxes,
+            batch_axis: BatchAxisSpecification<<C::Policy as BatchingPolicy<C>>::Extent>,
+        ) -> Result<O::To<C::Value>, BatchingError> {
+            let input_structure = input.parameter_structure();
+            let inputs = input.into_parameters().collect::<Vec<_>>();
+
+            // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf
+            // fills every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure
+            // broadcasts based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
+            let input_batch_axes = input_batch_axes
+                .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
+                .into_parameters()
+                .collect::<Vec<_>>();
+
+            // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
+            let (context, inputs) =
+                BatchingContext::<C, C::Policy>::prepare_inputs(parent, inputs, input_batch_axes, batch_axis)?;
+            let inputs =
+                inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
+            let input = I::To::<BatchingTracer<C, C::Policy>>::from_parameters(input_structure, inputs)?;
+            let output = function(input)?;
+
+            // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
+            // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
+            // structure gives one axis per leaf.
+            let output_structure = output.parameter_structure();
+            let output_batch_axis_values = output_batch_axes
+                .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
+                .into_parameters()
+                .collect::<Vec<_>>();
+
+            // The active policy materializes each requested output axis. Unwrapping to parent values preserves any
+            // enclosing batching level's metadata, so nested transforms require no side table.
+            let parent_outputs = output
+                .into_parameters()
+                .zip(output_batch_axis_values)
+                .map(|(output, output_batch_axis)| {
+                    C::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
+                })
+                .collect::<Result<Vec<_>, BatchingError>>()?;
+
+            Ok(O::To::<C::Value>::from_parameters(output_structure, parent_outputs)?)
+        }
+
         let mut function = Some(function);
-        batch_erased(
+        inner(
             self,
             &mut |input| function.take().unwrap()(input),
             input,
@@ -1860,65 +1920,6 @@ pub trait Batch: Context {
             batch_axis.into(),
         )
     }
-}
-
-/// Internal helper that batches like [`Batch::batch`] with the callback and specification types erased. This is the
-/// body of that function, which only wraps its callback and converts its specification, so that this body is compiled
-/// once per context and input, output, and axis structure rather than once per callback type. The callback is invoked
-/// exactly once.
-#[allow(clippy::type_complexity)]
-fn batch_erased<
-    C: Batch,
-    I: Parameterized<C::Value, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<C, C::Policy>>>,
-    O: Parameterized<BatchingTracer<C, C::Policy>, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<C::Value>>,
-    InputBatchAxes: Parameterized<BatchAxis>,
-    OutputBatchAxes: Parameterized<BatchAxis>,
->(
-    parent: &C,
-    function: &mut dyn FnMut(I::To<BatchingTracer<C, C::Policy>>) -> Result<O, ProgramError>,
-    input: I,
-    input_batch_axes: InputBatchAxes,
-    output_batch_axes: OutputBatchAxes,
-    batch_axis: BatchAxisSpecification<<C::Policy as BatchingPolicy<C>>::Extent>,
-) -> Result<O::To<C::Value>, BatchingError> {
-    let input_structure = input.parameter_structure();
-    let inputs = input.into_parameters().collect::<Vec<_>>();
-
-    // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills
-    // every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure broadcasts
-    // based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
-    let input_batch_axes = input_batch_axes
-        .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
-        .into_parameters()
-        .collect::<Vec<_>>();
-
-    // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
-    let (context, inputs) =
-        BatchingContext::<C, C::Policy>::prepare_inputs(parent, inputs, input_batch_axes, batch_axis)?;
-    let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
-    let input = I::To::<BatchingTracer<C, C::Policy>>::from_parameters(input_structure, inputs)?;
-    let output = function(input)?;
-
-    // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
-    // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
-    // structure gives one axis per leaf.
-    let output_structure = output.parameter_structure();
-    let output_batch_axis_values = output_batch_axes
-        .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
-        .into_parameters()
-        .collect::<Vec<_>>();
-
-    // The active policy materializes each requested output axis. Unwrapping to parent values preserves any
-    // enclosing batching level's metadata, so nested transforms require no side table.
-    let parent_outputs = output
-        .into_parameters()
-        .zip(output_batch_axis_values)
-        .map(|(output, output_batch_axis)| {
-            C::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
-        })
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-
-    Ok(O::To::<C::Value>::from_parameters(output_structure, parent_outputs)?)
 }
 
 impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch for C {

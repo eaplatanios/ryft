@@ -5032,110 +5032,112 @@ where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
+    /// Internal helper that traces like [`trace_shard_map_body`] with the callback type erased. This is the body of
+    /// that function, which only wraps its callback, so that this body is compiled once per domain rather than once per
+    /// callback type. The callback is invoked exactly once.
+    fn inner<C: Domain<Type = ArrayIrType>>(
+        shard_map: ShardMap,
+        function: &mut dyn FnMut(
+            &ShardMapContext<C>,
+            Vec<ShardMapTracer<C>>,
+        ) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
+        global_input_types: Vec<ArrayType>,
+        mut outer_named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<TracedShardMap<C, Vec<ArrayType>, Vec<ArrayType>>, ShardMapError>
+    where
+        ShardMapTracer<C>: ParallelVary,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
+    {
+        if global_input_types.len() != shard_map.in_shardings().len() {
+            return Err(ShardMapError::InputTypeCountMismatch {
+                expected: shard_map.in_shardings().len(),
+                actual: global_input_types.len(),
+            });
+        }
+        let global_input_types = global_input_types
+            .iter()
+            .enumerate()
+            .map(|(index, input_type)| shard_map.global_input_type(index, input_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        let local_input_types = global_input_types
+            .iter()
+            .enumerate()
+            .map(|(index, input_type)| shard_map.local_input_type(index, input_type))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // The active manual axes of this map shadow the enclosing bindings of the same names.
+        let mesh = shard_map.mesh();
+        outer_named_axes.retain(|(name, _)| !shard_map.manual_axes().contains(name));
+        outer_named_axes.extend(shard_map.manual_axes().iter().map(|name| {
+            let axis = mesh.axis_index(name).unwrap();
+            let size = mesh.axis_size(name).unwrap();
+            (name.clone(), NamedAxis::Mesh { mesh: mesh.clone(), axis, size })
+        }));
+
+        let (local_output_types, body) = DomainTracingContext::<C>::trace_with_context_and_named_axes(
+            |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
+                let local_inputs = local_inputs
+                    .into_iter()
+                    .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Outputs beyond the output shardings are kept as they are, so that `from_program` reports the count
+                // mismatch below.
+                function(&ShardMapContext::<C>::new(context.clone()), local_inputs)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut output)| {
+                        if let Some(sharding) = shard_map.out_shardings().get(index) {
+                            for axis in ShardMap::sharded_manual_axes(sharding, &shard_map.manual_axis_names()) {
+                                let output_sharding = output.r#type().sharding().cloned();
+                                if !output_sharding
+                                    .is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis))
+                                {
+                                    output = output.parallel_vary(&axis)?;
+                                }
+                            }
+                        }
+                        Ok(output.into_value())
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()
+            },
+            local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
+            outer_named_axes,
+        )?;
+        let body = body.simplified()?;
+        let operation = ShardMapOperation::from_program(
+            &body,
+            global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
+            shard_map,
+        )?;
+        let local_output_types = local_output_types
+            .iter()
+            .map(|r#type| boundary_array_type(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let global_output_types = operation
+            .global_output_types()
+            .iter()
+            .map(|r#type| boundary_array_type(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        Ok(TracedShardMap {
+            operation,
+            global_input_types,
+            local_input_types,
+            global_output_types,
+            local_output_types,
+            body,
+        })
+    }
+
     let mut function = Some(function);
-    trace_shard_map_body_erased(
+    inner(
         shard_map,
         &mut |context, inputs| function.take().unwrap()(context, inputs),
         global_input_types,
         outer_named_axes,
     )
-}
-
-/// Internal helper that traces like [`trace_shard_map_body`] with the callback type erased. This is the body of that
-/// function, which only wraps its callback, so that this body is compiled once per domain rather than once per callback
-/// type. The callback is invoked exactly once.
-fn trace_shard_map_body_erased<C: Domain<Type = ArrayIrType>>(
-    shard_map: ShardMap,
-    function: &mut dyn FnMut(
-        &ShardMapContext<C>,
-        Vec<ShardMapTracer<C>>,
-    ) -> Result<Vec<ShardMapTracer<C>>, ProgramError>,
-    global_input_types: Vec<ArrayType>,
-    mut outer_named_axes: Vec<(String, NamedAxis)>,
-) -> Result<TracedShardMap<C, Vec<ArrayType>, Vec<ArrayType>>, ShardMapError>
-where
-    ShardMapTracer<C>: ParallelVary,
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-{
-    if global_input_types.len() != shard_map.in_shardings().len() {
-        return Err(ShardMapError::InputTypeCountMismatch {
-            expected: shard_map.in_shardings().len(),
-            actual: global_input_types.len(),
-        });
-    }
-    let global_input_types = global_input_types
-        .iter()
-        .enumerate()
-        .map(|(index, input_type)| shard_map.global_input_type(index, input_type))
-        .collect::<Result<Vec<_>, _>>()?;
-    let local_input_types = global_input_types
-        .iter()
-        .enumerate()
-        .map(|(index, input_type)| shard_map.local_input_type(index, input_type))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // The active manual axes of this map shadow the enclosing bindings of the same names.
-    let mesh = shard_map.mesh();
-    outer_named_axes.retain(|(name, _)| !shard_map.manual_axes().contains(name));
-    outer_named_axes.extend(shard_map.manual_axes().iter().map(|name| {
-        let axis = mesh.axis_index(name).unwrap();
-        let size = mesh.axis_size(name).unwrap();
-        (name.clone(), NamedAxis::Mesh { mesh: mesh.clone(), axis, size })
-    }));
-
-    let (local_output_types, body) = DomainTracingContext::<C>::trace_with_context_and_named_axes(
-        |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
-            let local_inputs = local_inputs
-                .into_iter()
-                .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
-                .collect::<Result<Vec<_>, _>>()?;
-            // Outputs beyond the output shardings are kept as they are, so that `from_program` reports the count
-            // mismatch below.
-            function(&ShardMapContext::<C>::new(context.clone()), local_inputs)?
-                .into_iter()
-                .enumerate()
-                .map(|(index, mut output)| {
-                    if let Some(sharding) = shard_map.out_shardings().get(index) {
-                        for axis in ShardMap::sharded_manual_axes(sharding, &shard_map.manual_axis_names()) {
-                            let output_sharding = output.r#type().sharding().cloned();
-                            if !output_sharding.is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis)) {
-                                output = output.parallel_vary(&axis)?;
-                            }
-                        }
-                    }
-                    Ok(output.into_value())
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()
-        },
-        local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
-        outer_named_axes,
-    )?;
-    let body = body.simplified()?;
-    let operation = ShardMapOperation::from_program(
-        &body,
-        global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-        shard_map,
-    )?;
-    let local_output_types = local_output_types
-        .iter()
-        .map(|r#type| boundary_array_type(r#type).cloned())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ProgramError::from)?;
-    let global_output_types = operation
-        .global_output_types()
-        .iter()
-        .map(|r#type| boundary_array_type(r#type).cloned())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ProgramError::from)?;
-    Ok(TracedShardMap {
-        operation,
-        global_input_types,
-        local_input_types,
-        global_output_types,
-        local_output_types,
-        body,
-    })
 }
 
 /// Validates that the outputs that a `shard_map` body closure returns have the structure of its output shardings, whose

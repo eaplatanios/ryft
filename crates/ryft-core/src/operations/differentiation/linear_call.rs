@@ -168,67 +168,68 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
     {
+        /// Internal helper that stages like [`stage`](Self::stage) with the callback types erased. This is the body of
+        /// that function, which only wraps its callbacks, so that this body is compiled once per context rather than
+        /// once per pair of callback types. Each callback is invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<T: DifferentiableType, C: Context<Type = T, Operation: From<LinearCallOperation<T>>>>(
+            context: &C,
+            residuals: Vec<C::Value>,
+            linear_inputs: Vec<C::Value>,
+            forward_fn: &mut dyn FnMut(
+                &[Tracer<NestedTracingContext<C>>],
+                &[Tracer<NestedTracingContext<C>>],
+            ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+            transpose_fn: &mut dyn FnMut(
+                &[Tracer<NestedTracingContext<C>>],
+                &[Tracer<NestedTracingContext<C>>],
+            ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+        ) -> Result<Vec<C::Value>, ProgramError>
+        where
+            TracingContext<C::Constant, C::Operation>:
+                StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
+        {
+            let residual_count = residuals.len();
+            let forward_input_types =
+                residuals.iter().chain(&linear_inputs).map(|value| value.r#type().into_owned()).collect();
+            let (_, forward) = NestedTracingContext::trace(
+                context.clone(),
+                move |inputs| {
+                    let (residuals, linear_inputs) = inputs.split_at(residual_count);
+                    forward_fn(residuals, linear_inputs)
+                },
+                forward_input_types,
+            )?;
+            let mut transpose_input_types =
+                residuals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+            transpose_input_types.extend(
+                forward
+                    .outputs()
+                    .map(|output| output.r#type().cotangent())
+                    .collect::<Result<Vec<_>, DifferentiationError>>()?,
+            );
+            let (_, transpose) = NestedTracingContext::trace(
+                context.clone(),
+                move |inputs| {
+                    let (residuals, output_cotangents) = inputs.split_at(residual_count);
+                    transpose_fn(residuals, output_cotangents)
+                },
+                transpose_input_types,
+            )?;
+            let mut inputs = residuals;
+            inputs.extend(linear_inputs);
+            context.bind(LinearCallOperation::new(residual_count), vec![forward, transpose], inputs.as_slice())
+        }
+
         let mut forward_fn = Some(forward_fn);
         let mut transpose_fn = Some(transpose_fn);
-        Self::stage_erased(
+        inner(
             context,
             residuals,
             linear_inputs,
             &mut |residuals, linear_inputs| forward_fn.take().unwrap()(residuals, linear_inputs),
             &mut |residuals, output_cotangents| transpose_fn.take().unwrap()(residuals, output_cotangents),
         )
-    }
-
-    /// Internal helper that stages like [`stage`](Self::stage) with the callback types erased. This is the body of that
-    /// function, which only wraps its callbacks, so that this body is compiled once per context rather than once per
-    /// pair of callback types. Each callback is invoked exactly once.
-    #[allow(clippy::type_complexity)]
-    fn stage_erased<C: Context<Type = T, Operation: From<LinearCallOperation<T>>>>(
-        context: &C,
-        residuals: Vec<C::Value>,
-        linear_inputs: Vec<C::Value>,
-        forward_fn: &mut dyn FnMut(
-            &[Tracer<NestedTracingContext<C>>],
-            &[Tracer<NestedTracingContext<C>>],
-        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
-        transpose_fn: &mut dyn FnMut(
-            &[Tracer<NestedTracingContext<C>>],
-            &[Tracer<NestedTracingContext<C>>],
-        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
-    ) -> Result<Vec<C::Value>, ProgramError>
-    where
-        TracingContext<C::Constant, C::Operation>:
-            StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
-    {
-        let residual_count = residuals.len();
-        let forward_input_types =
-            residuals.iter().chain(&linear_inputs).map(|value| value.r#type().into_owned()).collect();
-        let (_, forward) = NestedTracingContext::trace(
-            context.clone(),
-            move |inputs| {
-                let (residuals, linear_inputs) = inputs.split_at(residual_count);
-                forward_fn(residuals, linear_inputs)
-            },
-            forward_input_types,
-        )?;
-        let mut transpose_input_types = residuals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        transpose_input_types.extend(
-            forward
-                .outputs()
-                .map(|output| output.r#type().cotangent())
-                .collect::<Result<Vec<_>, DifferentiationError>>()?,
-        );
-        let (_, transpose) = NestedTracingContext::trace(
-            context.clone(),
-            move |inputs| {
-                let (residuals, output_cotangents) = inputs.split_at(residual_count);
-                transpose_fn(residuals, output_cotangents)
-            },
-            transpose_input_types,
-        )?;
-        let mut inputs = residuals;
-        inputs.extend(linear_inputs);
-        context.bind(Self::new(residual_count), vec![forward, transpose], inputs.as_slice())
     }
 
     /// Batches an invocation to this [`LinearCallOperation`] by structurally batching its two attached

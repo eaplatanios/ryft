@@ -3658,7 +3658,668 @@ fn reconstruct_partitioned_scan<
     mut bind_known_fn: BindKnownFn,
     mut bind_residual_fn: BindResidualFn,
 ) -> Result<Option<Vec<Input>>, ProgramError> {
-    reconstruct_partitioned_scan_erased(
+    /// Internal helper that rebuilds a partitioned scan like [`reconstruct_partitioned_scan`] with the callback types
+    /// erased. This is the body of that function, which only wraps its callbacks, so that this body is compiled once
+    /// per value, operation, and input type rather than once per combination of callback types: every partial
+    /// evaluation and linearization of a scan would otherwise instantiate this body and every closure and iterator
+    /// adapter in it again. Each callback is invoked exactly as often as by the wrapped function.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn inner<
+        V: Value<Type: ScanType>,
+        O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
+        Input: Clone,
+    >(
+        scan: &ScanOperation<V::Type>,
+        body_input_types: &[V::Type],
+        inputs: &[Input],
+        body_known: &[bool],
+        iteration_count_known: bool,
+        split_without_known_work: bool,
+        partition: PartitionedProgram<V, O>,
+        lift_known_fn: &mut dyn FnMut(V) -> Result<Input, ProgramError>,
+        resolve_constant_fn: &mut dyn FnMut(&Input) -> Option<V>,
+        bind_known_fn: &mut dyn FnMut(
+            O,
+            Vec<Program<V, O, Vec<V>, Vec<V>>>,
+            &[Input],
+        ) -> Result<Vec<Input>, ProgramError>,
+        bind_residual_fn: &mut dyn FnMut(
+            O,
+            Vec<Program<V, O, Vec<V>, Vec<V>>>,
+            &[Input],
+        ) -> Result<Vec<Input>, ProgramError>,
+    ) -> Result<Option<Vec<Input>>, ProgramError> {
+        /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its
+        /// body passes through unchanged.
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum ScanInvariantSource {
+            /// Initial value of the known carry at this index, which the body passes through unchanged.
+            Carry(usize),
+
+            /// Value of this feeder atom of the known program, computed once before the scan. Feeders are keyed by atom
+            /// rather than by residual edge, because a partition can expose the same value through several edges, and
+            /// the unknown scan must thread it once.
+            Hoisted(AtomId),
+        }
+
+        /// Source of a residual stack supplied to the rebuilt unknown scan, in residual-edge order.
+        #[derive(Copy, Clone)]
+        enum ScanStackSource {
+            /// An original stacked input whose slices are forwarded unchanged.
+            Input(usize),
+
+            /// A stacked output of the rebuilt known scan.
+            KnownOutput(usize),
+        }
+
+        /// How the unknown iteration body obtains one residual. Computed values may need per-iteration array storage.
+        enum ScanResidual<T: Type> {
+            /// Regenerated from the unknown body's intrinsic index.
+            Index,
+
+            /// Taken from this position in the deduplicated invariant sources.
+            Invariant(usize),
+
+            /// A logical value, optionally supplied by a stack. An omitted stack means an original unknown input
+            /// already carries the value. Even a stacked value may later be recovered from an invariant input instead.
+            Value { r#type: T, stack: Option<ScanStackSource> },
+        }
+
+        // The split classifies each residual edge of the body partition by its role across iterations (e.g., the index,
+        // an invariant carry, a stacked input slice, or a value to stack). Forwarding identifies a residual input with
+        // a body input or output of a single iteration instead, which is not a value of the enclosing `scan` (e.g., a
+        // carry changes across iterations), so forwarded body partitions are rejected.
+        if partition.has_forwarded_residual_inputs() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` body partition forwards residual inputs, but splitting a scan requires \
+                 residual edges",
+            )));
+        }
+        if partition.has_known_reference_inputs_or_constants() {
+            return Ok(None);
+        }
+        let carry_count = scan.carry_count;
+        let carry_known = &body_known[1..1 + carry_count];
+        let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_types.len() - 1);
+        partition.validate_known_input_indices(body_known)?;
+        partition.validate_canonical_residual_edges()?;
+        let residual_edges = partition.residual_edges();
+        let (known_program, residual_program, known_input_indices, residual_inputs, partition_outputs) =
+            partition.into_parts();
+
+        // The residual program need not read every residual input (e.g., a partition with no iterations can carry a
+        // dimension edge that no residual instruction reads). Drop such inputs before splicing, so that the rebuilt
+        // body neither restores unused edges nor redefines identities that its own inputs already establish.
+        let residual_input_ids = residual_program.input_ids().to_vec();
+        let residual_output_ids = residual_program.output_ids().to_vec();
+        let (residual_program, live_residual_inputs) =
+            residual_program.into_filtered(&residual_input_ids, &residual_output_ids, &[])?;
+        let mut live_edges = live_residual_inputs
+            .iter()
+            .filter_map(|&input| match residual_inputs[input] {
+                ResidualInputSource::ResidualEdge(edge) => Some(edge),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
+        // Constants, passed-through known carries, and pure region-free work over them are invariant across iterations.
+        // Identify those atoms before assigning storage so they need not become per-iteration residual stacks.
+        let known_region = known_program.entry_region_ref();
+        let mut invariant_atoms =
+            known_region.atoms().iter().map(|atom| atom.as_constant().is_some()).collect::<Vec<_>>();
+        let mut passed_through_carries = vec![None; carry_known.len()];
+        for (index, &known) in carry_known.iter().enumerate() {
+            let Some(position) = known_input_indices.iter().position(|&input| input == index + 1) else {
+                continue;
+            };
+            let carry_input = known_program.input_ids()[position];
+            if known
+                && matches!(
+                    &partition_outputs[index],
+                    PartialEvaluationOutput::Known(carry) if known_program.output_ids()[*carry] == carry_input
+                )
+            {
+                invariant_atoms[carry_input.index()] = true;
+                passed_through_carries[index] = Some(carry_input);
+            }
+        }
+        for instruction in known_region.instructions() {
+            let effects = instruction.operation().effects();
+            if instruction.regions().is_empty()
+                && effects.is_pure()
+                && !effects.summary().has_deferred_work()
+                && instruction.inputs().iter().all(|input| invariant_atoms[input.index()])
+            {
+                for output in instruction.outputs() {
+                    invariant_atoms[output.index()] = true;
+                }
+            }
+        }
+
+        // Classify each edge as an index, invariant, forwarded stack, recovered identity, or value to stack. Computed
+        // invariant work is hoisted only when an iteration is guaranteed, since even pure work may fail on a scan with
+        // no iterations. The known body's outputs are the known next-carries, then the known per-iteration outputs,
+        // then the residuals that it stacks. Absolute positions into this list equal positions into the known scan's
+        // outputs, because the known scan's outputs are its final carries followed by its stacked per-iteration outputs
+        // in the same order.
+        let mut known_program_output_indices = Vec::with_capacity(known_program.output_ids().len());
+        let mut scan_outputs = partition_outputs.to_vec();
+        for (index, output) in partition_outputs.iter().enumerate() {
+            if let PartialEvaluationOutput::Known(output) = output
+                && (index >= carry_count || carry_known[index])
+            {
+                scan_outputs[index] = PartialEvaluationOutput::Known(known_program_output_indices.len());
+                known_program_output_indices.push(*output);
+            }
+        }
+        let known_result_count = known_program_output_indices.len();
+        let known_carry_count = carry_known.iter().filter(|&&known| known).count();
+
+        // A residual whose feeder the known scan already stacks as one of its per-iteration outputs is read from that
+        // output instead of being stacked a second time (the partition may expose one atom through a result output and
+        // a residual edge). Its final carries are no such source: a residual needs the per-iteration values of a
+        // feeder, not the value that the last iteration returns.
+        let known_stacked_position = |known_program_output_indices: &[usize], output: usize| {
+            let feeder = known_program.output_ids()[output];
+            known_program_output_indices[known_carry_count..known_result_count]
+                .iter()
+                .position(|&index| known_program.output_ids()[index] == feeder)
+                .map(|position| position + known_carry_count)
+        };
+
+        // A residual that defines an identity (e.g., a first-class dimension) is recovered from an unknown body input
+        // that already carries its identity (e.g., an array input with an axis of that dimension), instead of being
+        // stored on every iteration and restored, which would define that identity a second time in the rebuilt body.
+        let unknown_input_types = (1..body_input_types.len())
+            .filter(|&index| !body_known[index])
+            .map(|index| &body_input_types[index])
+            .collect::<Vec<_>>();
+        let recovered_from_unknown_input = |residual_type: &V::Type| -> Result<bool, TypeError> {
+            if O::residual_from_storage(residual_type)?.is_none() {
+                return Ok(false);
+            }
+            for &carrier_type in &unknown_input_types {
+                if carrier_type == residual_type || O::residual_from_carrier(residual_type, carrier_type)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        let mut residuals = Vec::new();
+        let mut invariant_sources = Vec::new();
+        for (edge, (output_type, output)) in residual_edges.iter().enumerate() {
+            let feeder = known_program.output_ids()[*output];
+            if feeder == known_program.input_ids()[0] {
+                residuals.push(ScanResidual::Index);
+                continue;
+            }
+
+            let invariant_source = passed_through_carries
+                .iter()
+                .position(|&input| input == Some(feeder))
+                .map(ScanInvariantSource::Carry)
+                .or_else(|| {
+                    (scan.iteration_count.bounds().lower() > 0 && invariant_atoms[feeder.index()])
+                        .then_some(ScanInvariantSource::Hoisted(feeder))
+                });
+            if let Some(source) = invariant_source {
+                let position =
+                    invariant_sources.iter().position(|&candidate| candidate == source).unwrap_or_else(|| {
+                        invariant_sources.push(source);
+                        invariant_sources.len() - 1
+                    });
+                residuals.push(ScanResidual::Invariant(position));
+                continue;
+            }
+
+            // Known reference inputs were rejected before the split, so a known stacked input is an array whose slices
+            // already are their storage representation. Its original stack is forwarded instead of rebuilt.
+            let stacked_input = known_program
+                .input_ids()
+                .iter()
+                .position(|input| *input == feeder)
+                .map(|position| known_input_indices[position])
+                .filter(|&index| index > carry_count);
+            let stack = match stacked_input {
+                Some(input) => Some(ScanStackSource::Input(input - 1)),
+                None => {
+                    let recovered = live_edges.contains(&edge) && recovered_from_unknown_input(output_type)?;
+                    (!recovered).then(|| {
+                        ScanStackSource::KnownOutput(
+                            known_stacked_position(&known_program_output_indices, *output).unwrap_or_else(|| {
+                                known_program_output_indices.push(*output);
+                                known_program_output_indices.len() - 1
+                            }),
+                        )
+                    })
+                }
+            };
+            residuals.push(ScanResidual::Value { r#type: output_type.clone(), stack });
+        }
+
+        let known_program_output_types = known_program.output_types();
+        for (index, &known) in carry_known.iter().enumerate() {
+            if !known && let PartialEvaluationOutput::Known(output) = &partition_outputs[index] {
+                let output_type = &known_program_output_types[*output];
+
+                // This edge supplies a carry result, even though the original residual body never reads it. Like any
+                // other residual, it is recovered from an unknown input that carries its identity (e.g., the unknown
+                // carry itself, whose type the known next value shares) instead of being stacked.
+                live_edges.insert(residuals.len());
+                let stack = (!recovered_from_unknown_input(output_type)?).then(|| {
+                    ScanStackSource::KnownOutput(
+                        known_stacked_position(&known_program_output_indices, *output).unwrap_or_else(|| {
+                            known_program_output_indices.push(*output);
+                            known_program_output_indices.len() - 1
+                        }),
+                    )
+                });
+                residuals.push(ScanResidual::Value { r#type: output_type.clone(), stack });
+            }
+        }
+
+        // An empty known side means the split folds nothing, and the scan stays whole. A known side that only forwards
+        // stacked inputs or known carries that the body passes through, or that only hoists invariant feeders, still
+        // splits, but it needs no known scan. A known carry that the body passes through unchanged ends with its
+        // initial value, so the known scan is needed only for its other outputs or for its effects.
+        let passed_through_carry_count = passed_through_carries.iter().flatten().count();
+        let needs_known_scan = known_program_output_indices.len() > passed_through_carry_count
+            || !known_program.effects().classes().is_empty()
+            || known_program.effects().has_deferred_work();
+        if needs_known_scan && !iteration_count_known {
+            return Ok(None);
+        }
+        let hoists_edges = invariant_sources.iter().any(|source| matches!(source, ScanInvariantSource::Hoisted(_)));
+        let forwards_stacked_inputs = residuals
+            .iter()
+            .any(|residual| matches!(residual, ScanResidual::Value { stack: Some(ScanStackSource::Input(_)), .. }));
+        if !split_without_known_work
+            && !needs_known_scan
+            && !hoists_edges
+            && passed_through_carry_count == 0
+            && !forwards_stacked_inputs
+        {
+            return Ok(None);
+        }
+
+        // Bind the known scan into the enclosing known-side context over the original known inputs.
+        let mut known_scan_inputs = known_input_indices
+            .iter()
+            .filter(|&&index| index != 0)
+            .map(|&index| body_inputs[index - 1].clone())
+            .collect::<Vec<_>>();
+        known_scan_inputs.extend_from_slice(iteration_count_inputs);
+
+        // Project the known iteration body to its retained results and effects, then convert metadata residuals to
+        // array storage. Ordinary arrays already have that representation and need no second replay.
+        let known_body = {
+            let known_output_atoms = known_program_output_indices
+                .iter()
+                .map(|&index| known_program.output_ids()[index])
+                .collect::<Vec<_>>();
+            let (known_body, _) =
+                known_program.filtered(known_program.input_ids(), &known_output_atoms, known_program.input_ids())?;
+            let mut conversions = Vec::new();
+            for (position, &output) in known_program_output_indices.iter().enumerate().skip(known_result_count) {
+                if let Some(operation) = O::residual_to_storage(&known_program_output_types[output])? {
+                    conversions.push((position, operation));
+                }
+            }
+
+            // Arrays already have their storage representation. Keep the projected body directly unless a metadata
+            // value actually needs a storage gateway, avoiding a second replay for ordinary array scans.
+            if conversions.is_empty() {
+                known_body
+            } else {
+                let mut builder = ProgramBuilder::<V, O>::new();
+                let inputs =
+                    known_body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+                let mut outputs = builder.splice_program(&known_body, &inputs)?;
+                for (position, operation) in conversions {
+                    outputs[position] =
+                        builder.add_instruction(operation, Vec::new(), vec![outputs[position]], None)?[0];
+                }
+                builder.build::<Vec<V>, Vec<V>>(
+                    outputs,
+                    vec![Placeholder; inputs.len()],
+                    vec![Placeholder; known_program_output_indices.len()],
+                )?
+            }
+        };
+
+        // The known scan stacks the known stacked outputs at their placements, followed by the residual stacks,
+        // which are replicated.
+        let known_stacked_axis_shardings = partition_outputs
+            .iter()
+            .enumerate()
+            .skip(carry_count)
+            .filter(|(_, output)| matches!(output, PartialEvaluationOutput::Known(_)))
+            .map(|(index, _)| {
+                scan.stacked_axis_shardings
+                    .get(index - carry_count)
+                    .cloned()
+                    .unwrap_or(ShardingDimension::Replicated)
+            })
+            .collect();
+        let known_scan = ScanOperation {
+            carry_count: known_carry_count,
+            ..scan.clone().with_stacked_axis_shardings(known_stacked_axis_shardings)
+        };
+
+        // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original
+        // stacked inputs, including under reverse iteration, so rebuilding another loop would only hide their
+        // producers. Keep scans with a dynamic iteration count explicit because their outputs may refine the stacked
+        // inputs' symbolic extent types.
+        let forwarded_outputs = (matches!(scan.iteration_count(), Dimension::Static(_))
+            && known_carry_count == 0
+            && known_body.instructions().is_empty())
+        .then(|| {
+            known_body
+                .output_ids()
+                .iter()
+                .map(|output| {
+                    known_body
+                        .input_ids()
+                        .iter()
+                        .position(|input| input == output)
+                        .and_then(|index| index.checked_sub(1))
+                        .map(|index| known_scan_inputs[index].clone())
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
+        let known_outputs = match forwarded_outputs {
+            Some(outputs) => outputs,
+            None if !needs_known_scan => Vec::new(),
+            None => bind_known_fn(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
+        };
+
+        // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge
+        // per residual edge, each fed by the known scan's matching stacked output or by a forwarded known stacked
+        // input.
+        let mut residual_outputs = Vec::new();
+        let needs_unknown_scan =
+            partition_outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
+                || carry_known.iter().any(|&known| !known)
+                || !residual_program.effects().classes().is_empty()
+                || residual_program.effects().has_deferred_work();
+        if needs_unknown_scan {
+            // Loop-invariant values are computed once before the scan. A value that resolves to an identity-free
+            // constant of the known-side context is embedded into the unknown body, so that partial evaluation against
+            // known values specializes that body. Every other value is threaded through the unknown scan as a carry
+            // that its body passes through unchanged.
+            let mut hoisted_values = {
+                let region = known_program.entry_region_ref();
+                let mut values = passed_through_carries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, atom)| atom.map(|atom| (atom, body_inputs[index].clone())))
+                    .collect::<HashMap<_, _>>();
+
+                // Unlike filtering a program, this dependency query does not retain unrelated effects
+                // from the iteration body.
+                let feeders = invariant_sources
+                    .iter()
+                    .filter_map(|source| match source {
+                        ScanInvariantSource::Carry(_) => None,
+                        ScanInvariantSource::Hoisted(feeder) => Some(*feeder),
+                    })
+                    .collect::<Vec<_>>();
+                let live = known_program.live_sets_for_atoms(&feeders)?;
+                for (atom, needed) in live.atoms().iter().enumerate() {
+                    if let (true, Some(constant)) = (*needed, region.atoms()[atom].as_constant()) {
+                        values.insert(AtomId::new(atom), lift_known_fn(constant.clone())?);
+                    }
+                }
+                for (instruction, _) in
+                    region.instructions().iter().zip(live.instructions()).filter(|(_, replayed)| **replayed)
+                {
+                    let inputs = instruction.inputs().iter().map(|input| values[input].clone()).collect::<Vec<_>>();
+                    let outputs = bind_known_fn(instruction.operation().clone(), Vec::new(), &inputs)?;
+                    check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                    values.extend(instruction.outputs().iter().copied().zip(outputs));
+                }
+                values
+            };
+
+            let invariant_values = invariant_sources
+                .iter()
+                .map(|source| match source {
+                    ScanInvariantSource::Carry(index) => body_inputs[*index].clone(),
+                    ScanInvariantSource::Hoisted(feeder) => hoisted_values.remove(feeder).unwrap(),
+                })
+                .collect::<Vec<_>>();
+            let invariant_constants = invariant_values
+                .iter()
+                .map(|value| {
+                    resolve_constant_fn(value).filter(|constant| {
+                        let constant_type = constant.r#type();
+                        !constant_type.is_reference() && constant_type.identities().next().is_none()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            // Build the unknown body in boundary order: index, nonconstant invariants, unknown original inputs, then
+            // residual slices. Constant invariants are embedded; other invariants pass through as additional carries.
+            let (unknown_body, unknown_carry_count) = {
+                let mut builder = ProgramBuilder::<V, O>::new();
+                let index_atom = builder.add_input(body_input_types[0].clone());
+                let mut invariant_atoms = invariant_sources
+                    .iter()
+                    .zip(&invariant_constants)
+                    .map(|(source, constant)| {
+                        constant.is_none().then(|| {
+                            builder.add_input(match source {
+                                ScanInvariantSource::Carry(index) => body_input_types[index + 1].clone(),
+                                ScanInvariantSource::Hoisted(feeder) => {
+                                    known_program.entry_region_ref().atoms()[feeder.index()].r#type().into_owned()
+                                }
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let invariant_carry_atoms = invariant_atoms.iter().flatten().copied().collect::<Vec<_>>();
+                let unknown_body_input_atoms = body_input_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input_type)| match index {
+                        0 => Some(index_atom),
+                        _ if body_known[index] => None,
+                        _ => Some(builder.add_input(input_type.clone())),
+                    })
+                    .collect::<Vec<_>>();
+
+                // Every input precedes the restored residuals, so that the identities that the inputs establish are
+                // known before any residual is restored.
+                let mut edge_atoms = residuals
+                    .iter()
+                    .map(|residual| {
+                        Ok(match residual {
+                            ScanResidual::Index => Some(index_atom),
+                            ScanResidual::Value { r#type, stack: Some(_) } => {
+                                Some(builder.add_input(O::residual_storage_type(r#type)?))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, TypeError>>()?;
+                for (atom, constant) in invariant_atoms.iter_mut().zip(&invariant_constants) {
+                    if let Some(constant) = constant {
+                        *atom = Some(builder.add_constant(constant.clone()));
+                    }
+                }
+
+                let invariant_atoms = invariant_atoms.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+
+                // Restore live metadata after all inputs establish their identities. Reuse an input carrier or an
+                // earlier restoration before reading the stored residual, so each nominal identity has one SSA
+                // definition.
+                let carriers = builder
+                    .input_ids()
+                    .iter()
+                    .map(|&input| (input, builder.atoms()[input.index()].r#type().into_owned()))
+                    .collect::<Vec<_>>();
+                let mut restored_identity_edges = Vec::<(V::Type, AtomId)>::new();
+                for (edge, (residual, atom)) in residuals.iter().zip(edge_atoms.iter_mut()).enumerate() {
+                    let edge_type = match residual {
+                        ScanResidual::Index => continue,
+                        ScanResidual::Invariant(position) => {
+                            *atom = Some(invariant_atoms[*position]);
+                            continue;
+                        }
+                        ScanResidual::Value { r#type, .. } => r#type,
+                    };
+
+                    let Some(operation) = O::residual_from_storage(edge_type)? else {
+                        continue;
+                    };
+
+                    if !live_edges.contains(&edge) {
+                        continue;
+                    }
+
+                    let defines_identity =
+                        edge_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
+                    if defines_identity
+                        && let Some((_, restored)) =
+                            restored_identity_edges.iter().find(|(restored_type, _)| restored_type == edge_type)
+                    {
+                        *atom = Some(*restored);
+                        continue;
+                    }
+
+                    let mut restored = None;
+                    for (carrier, carrier_type) in &carriers {
+                        if carrier_type == edge_type {
+                            restored = Some(*carrier);
+                        } else if let Some(operation) = O::residual_from_carrier(edge_type, carrier_type)? {
+                            restored = Some(builder.add_instruction(operation, Vec::new(), vec![*carrier], None)?[0]);
+                        } else {
+                            continue;
+                        }
+                        break;
+                    }
+
+                    let restored = match restored {
+                        Some(restored) => restored,
+                        None => builder.add_instruction(operation, Vec::new(), vec![atom.unwrap()], None)?[0],
+                    };
+
+                    *atom = Some(restored);
+
+                    if defines_identity {
+                        restored_identity_edges.push((edge_type.clone(), restored));
+                    }
+                }
+
+                // Partitions feed only unknown body inputs and residual edges to the residual program, because
+                // forwarded body partitions are rejected before the split.
+                let spliced_inputs = live_residual_inputs
+                    .iter()
+                    .map(|&input| match residual_inputs[input] {
+                        ResidualInputSource::UnknownInput(index) => Ok(unknown_body_input_atoms[index].unwrap()),
+                        ResidualInputSource::ResidualEdge(edge) => Ok(edge_atoms[edge].unwrap()),
+                        ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
+                            Err(ProgramError::MalformedProgram(format!(
+                                "`{SCAN_OPERATION_NAME}` residual body consumes a forwarded known body partition \
+                                 input, which partial evaluation rejects before splitting",
+                            )))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let spliced_outputs = builder.splice_program(&residual_program, &spliced_inputs)?;
+
+                // Original residual edges precede the known next values of unknown carries, appended in carry order.
+                // Consume those extra edges only when the corresponding carry result is restored.
+                let mut instantiated_carry_atoms = edge_atoms[residual_edges.len()..].iter().map(|atom| atom.unwrap());
+                let mut unknown_output_atoms = invariant_carry_atoms.clone();
+                for (index, output) in partition_outputs.iter().enumerate() {
+                    let atom = match output {
+                        PartialEvaluationOutput::Unknown(spliced) => spliced_outputs[*spliced],
+                        PartialEvaluationOutput::Known(_) if index < carry_count && !body_known[index + 1] => {
+                            instantiated_carry_atoms.next().unwrap()
+                        }
+                        PartialEvaluationOutput::Known(_) => continue,
+                    };
+                    scan_outputs[index] = PartialEvaluationOutput::Unknown(unknown_output_atoms.len());
+                    unknown_output_atoms.push(atom);
+                }
+
+                let unknown_carry_count = invariant_carry_atoms.len()
+                    + body_known[1..1 + carry_count].iter().filter(|&&known| !known).count();
+                let input_count = builder.input_ids().len();
+                let output_count = unknown_output_atoms.len();
+                let unknown_body = builder.build::<Vec<V>, Vec<V>>(
+                    unknown_output_atoms,
+                    vec![Placeholder; input_count],
+                    vec![Placeholder; output_count],
+                )?;
+
+                (unknown_body, unknown_carry_count)
+            };
+
+            // The unknown scan stacks the unknown stacked outputs at their placements.
+            let unknown_stacked_axis_shardings = partition_outputs
+                .iter()
+                .enumerate()
+                .skip(carry_count)
+                .filter(|(_, output)| matches!(output, PartialEvaluationOutput::Unknown(_)))
+                .map(|(index, _)| {
+                    scan.stacked_axis_shardings
+                        .get(index - carry_count)
+                        .cloned()
+                        .unwrap_or(ShardingDimension::Replicated)
+                })
+                .collect();
+            let unknown_scan = ScanOperation {
+                carry_count: unknown_carry_count,
+                ..scan.clone().with_stacked_axis_shardings(unknown_stacked_axis_shardings)
+            };
+            let mut unknown_scan_inputs = invariant_values
+                .into_iter()
+                .zip(&invariant_constants)
+                .filter_map(|(value, constant)| constant.is_none().then_some(value))
+                .collect::<Vec<_>>();
+            unknown_scan_inputs.extend(
+                body_inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !body_known[index + 1])
+                    .map(|(_, input)| input.clone()),
+            );
+
+            for residual in &residuals {
+                match residual {
+                    ScanResidual::Value { stack: Some(ScanStackSource::Input(input)), .. } => {
+                        unknown_scan_inputs.push(body_inputs[*input].clone());
+                    }
+                    ScanResidual::Value { stack: Some(ScanStackSource::KnownOutput(position)), .. } => {
+                        unknown_scan_inputs.push(known_outputs[*position].clone());
+                    }
+                    _ => {}
+                }
+            }
+            unknown_scan_inputs.extend_from_slice(iteration_count_inputs);
+            residual_outputs =
+                bind_residual_fn(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
+        }
+
+        // Reassemble the original scan's outputs from the two sides.
+        Ok(Some(
+            scan_outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| match output {
+                    _ if index < carry_count && passed_through_carries[index].is_some() => body_inputs[index].clone(),
+                    PartialEvaluationOutput::Known(position) => known_outputs[*position].clone(),
+                    PartialEvaluationOutput::Unknown(position) => residual_outputs[*position].clone(),
+                })
+                .collect(),
+        ))
+    }
+
+    inner(
         scan,
         body_input_types,
         inputs,
@@ -3671,657 +4332,6 @@ fn reconstruct_partitioned_scan<
         &mut bind_known_fn,
         &mut bind_residual_fn,
     )
-}
-
-/// Internal helper that rebuilds a partitioned scan like [`reconstruct_partitioned_scan`] with the callback types
-/// erased. This is the body of that function, which only wraps its callbacks, so that this body is compiled once per
-/// value, operation, and input type rather than once per combination of callback types: every partial evaluation and
-/// linearization of a scan would otherwise instantiate this body and every closure and iterator adapter in it again.
-/// Each callback is invoked exactly as often as by the wrapped function.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn reconstruct_partitioned_scan_erased<
-    V: Value<Type: ScanType>,
-    O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
-    Input: Clone,
->(
-    scan: &ScanOperation<V::Type>,
-    body_input_types: &[V::Type],
-    inputs: &[Input],
-    body_known: &[bool],
-    iteration_count_known: bool,
-    split_without_known_work: bool,
-    partition: PartitionedProgram<V, O>,
-    lift_known_fn: &mut dyn FnMut(V) -> Result<Input, ProgramError>,
-    resolve_constant_fn: &mut dyn FnMut(&Input) -> Option<V>,
-    bind_known_fn: &mut dyn FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
-    bind_residual_fn: &mut dyn FnMut(
-        O,
-        Vec<Program<V, O, Vec<V>, Vec<V>>>,
-        &[Input],
-    ) -> Result<Vec<Input>, ProgramError>,
-) -> Result<Option<Vec<Input>>, ProgramError> {
-    /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body
-    /// passes through unchanged.
-    #[derive(Copy, Clone, PartialEq, Eq)]
-    enum ScanInvariantSource {
-        /// Initial value of the known carry at this index, which the body passes through unchanged.
-        Carry(usize),
-
-        /// Value of this feeder atom of the known program, computed once before the scan. Feeders are keyed by atom
-        /// rather than by residual edge, because a partition can expose the same value through several edges, and the
-        /// unknown scan must thread it once.
-        Hoisted(AtomId),
-    }
-
-    /// Source of a residual stack supplied to the rebuilt unknown scan, in residual-edge order.
-    #[derive(Copy, Clone)]
-    enum ScanStackSource {
-        /// An original stacked input whose slices are forwarded unchanged.
-        Input(usize),
-
-        /// A stacked output of the rebuilt known scan.
-        KnownOutput(usize),
-    }
-
-    /// How the unknown iteration body obtains one residual. Computed values may need per-iteration array storage.
-    enum ScanResidual<T: Type> {
-        /// Regenerated from the unknown body's intrinsic index.
-        Index,
-
-        /// Taken from this position in the deduplicated invariant sources.
-        Invariant(usize),
-
-        /// A logical value, optionally supplied by a stack. An omitted stack means an original unknown input already
-        /// carries the value. Even a stacked value may later be recovered from an invariant input instead.
-        Value { r#type: T, stack: Option<ScanStackSource> },
-    }
-
-    // The split classifies each residual edge of the body partition by its role across iterations (e.g., the index,
-    // an invariant carry, a stacked input slice, or a value to stack). Forwarding identifies a residual input with a
-    // body input or output of a single iteration instead, which is not a value of the enclosing `scan` (e.g., a carry
-    // changes across iterations), so forwarded body partitions are rejected.
-    if partition.has_forwarded_residual_inputs() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`{SCAN_OPERATION_NAME}` body partition forwards residual inputs, but splitting a scan requires residual \
-             edges",
-        )));
-    }
-    if partition.has_known_reference_inputs_or_constants() {
-        return Ok(None);
-    }
-    let carry_count = scan.carry_count;
-    let carry_known = &body_known[1..1 + carry_count];
-    let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_types.len() - 1);
-    partition.validate_known_input_indices(body_known)?;
-    partition.validate_canonical_residual_edges()?;
-    let residual_edges = partition.residual_edges();
-    let (known_program, residual_program, known_input_indices, residual_inputs, partition_outputs) =
-        partition.into_parts();
-
-    // The residual program need not read every residual input (e.g., a partition with no iterations can carry a
-    // dimension edge that no residual instruction reads). Drop such inputs before splicing, so that the rebuilt
-    // body neither restores unused edges nor redefines identities that its own inputs already establish.
-    let residual_input_ids = residual_program.input_ids().to_vec();
-    let residual_output_ids = residual_program.output_ids().to_vec();
-    let (residual_program, live_residual_inputs) =
-        residual_program.into_filtered(&residual_input_ids, &residual_output_ids, &[])?;
-    let mut live_edges = live_residual_inputs
-        .iter()
-        .filter_map(|&input| match residual_inputs[input] {
-            ResidualInputSource::ResidualEdge(edge) => Some(edge),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-
-    // Constants, passed-through known carries, and pure region-free work over them are invariant across iterations.
-    // Identify those atoms before assigning storage so they need not become per-iteration residual stacks.
-    let known_region = known_program.entry_region_ref();
-    let mut invariant_atoms = known_region.atoms().iter().map(|atom| atom.as_constant().is_some()).collect::<Vec<_>>();
-    let mut passed_through_carries = vec![None; carry_known.len()];
-    for (index, &known) in carry_known.iter().enumerate() {
-        let Some(position) = known_input_indices.iter().position(|&input| input == index + 1) else {
-            continue;
-        };
-        let carry_input = known_program.input_ids()[position];
-        if known
-            && matches!(
-                &partition_outputs[index],
-                PartialEvaluationOutput::Known(carry) if known_program.output_ids()[*carry] == carry_input
-            )
-        {
-            invariant_atoms[carry_input.index()] = true;
-            passed_through_carries[index] = Some(carry_input);
-        }
-    }
-    for instruction in known_region.instructions() {
-        let effects = instruction.operation().effects();
-        if instruction.regions().is_empty()
-            && effects.is_pure()
-            && !effects.summary().has_deferred_work()
-            && instruction.inputs().iter().all(|input| invariant_atoms[input.index()])
-        {
-            for output in instruction.outputs() {
-                invariant_atoms[output.index()] = true;
-            }
-        }
-    }
-
-    // Classify each edge as an index, invariant, forwarded stack, recovered identity, or value to stack. Computed
-    // invariant work is hoisted only when an iteration is guaranteed, since even pure work may fail on a scan with no
-    // iterations. The known body's outputs are the known next-carries, then the known per-iteration outputs, then the
-    // residuals that it stacks. Absolute positions into this list equal positions into the known scan's outputs,
-    // because the known scan's outputs are its final carries followed by its stacked per-iteration outputs in
-    // the same order.
-    let mut known_program_output_indices = Vec::with_capacity(known_program.output_ids().len());
-    let mut scan_outputs = partition_outputs.to_vec();
-    for (index, output) in partition_outputs.iter().enumerate() {
-        if let PartialEvaluationOutput::Known(output) = output
-            && (index >= carry_count || carry_known[index])
-        {
-            scan_outputs[index] = PartialEvaluationOutput::Known(known_program_output_indices.len());
-            known_program_output_indices.push(*output);
-        }
-    }
-    let known_result_count = known_program_output_indices.len();
-    let known_carry_count = carry_known.iter().filter(|&&known| known).count();
-
-    // A residual whose feeder the known scan already stacks as one of its per-iteration outputs is read from that
-    // output instead of being stacked a second time (the partition may expose one atom through a result output and
-    // a residual edge). Its final carries are no such source: a residual needs the per-iteration values of a feeder,
-    // not the value that the last iteration returns.
-    let known_stacked_position = |known_program_output_indices: &[usize], output: usize| {
-        let feeder = known_program.output_ids()[output];
-        known_program_output_indices[known_carry_count..known_result_count]
-            .iter()
-            .position(|&index| known_program.output_ids()[index] == feeder)
-            .map(|position| position + known_carry_count)
-    };
-
-    // A residual that defines an identity (e.g., a first-class dimension) is recovered from an unknown body input that
-    // already carries its identity (e.g., an array input with an axis of that dimension), instead of being stored on
-    // every iteration and restored, which would define that identity a second time in the rebuilt body.
-    let unknown_input_types = (1..body_input_types.len())
-        .filter(|&index| !body_known[index])
-        .map(|index| &body_input_types[index])
-        .collect::<Vec<_>>();
-    let recovered_from_unknown_input = |residual_type: &V::Type| -> Result<bool, TypeError> {
-        if O::residual_from_storage(residual_type)?.is_none() {
-            return Ok(false);
-        }
-        for &carrier_type in &unknown_input_types {
-            if carrier_type == residual_type || O::residual_from_carrier(residual_type, carrier_type)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    };
-
-    let mut residuals = Vec::new();
-    let mut invariant_sources = Vec::new();
-    for (edge, (output_type, output)) in residual_edges.iter().enumerate() {
-        let feeder = known_program.output_ids()[*output];
-        if feeder == known_program.input_ids()[0] {
-            residuals.push(ScanResidual::Index);
-            continue;
-        }
-
-        let invariant_source = passed_through_carries
-            .iter()
-            .position(|&input| input == Some(feeder))
-            .map(ScanInvariantSource::Carry)
-            .or_else(|| {
-                (scan.iteration_count.bounds().lower() > 0 && invariant_atoms[feeder.index()])
-                    .then_some(ScanInvariantSource::Hoisted(feeder))
-            });
-        if let Some(source) = invariant_source {
-            let position = invariant_sources.iter().position(|&candidate| candidate == source).unwrap_or_else(|| {
-                invariant_sources.push(source);
-                invariant_sources.len() - 1
-            });
-            residuals.push(ScanResidual::Invariant(position));
-            continue;
-        }
-
-        // Known reference inputs were rejected before the split, so a known stacked input is an array whose slices
-        // already are their storage representation. Its original stack is forwarded instead of rebuilt.
-        let stacked_input = known_program
-            .input_ids()
-            .iter()
-            .position(|input| *input == feeder)
-            .map(|position| known_input_indices[position])
-            .filter(|&index| index > carry_count);
-        let stack = match stacked_input {
-            Some(input) => Some(ScanStackSource::Input(input - 1)),
-            None => {
-                let recovered = live_edges.contains(&edge) && recovered_from_unknown_input(output_type)?;
-                (!recovered).then(|| {
-                    ScanStackSource::KnownOutput(
-                        known_stacked_position(&known_program_output_indices, *output).unwrap_or_else(|| {
-                            known_program_output_indices.push(*output);
-                            known_program_output_indices.len() - 1
-                        }),
-                    )
-                })
-            }
-        };
-        residuals.push(ScanResidual::Value { r#type: output_type.clone(), stack });
-    }
-
-    let known_program_output_types = known_program.output_types();
-    for (index, &known) in carry_known.iter().enumerate() {
-        if !known && let PartialEvaluationOutput::Known(output) = &partition_outputs[index] {
-            let output_type = &known_program_output_types[*output];
-
-            // This edge supplies a carry result, even though the original residual body never reads it. Like any
-            // other residual, it is recovered from an unknown input that carries its identity (e.g., the unknown
-            // carry itself, whose type the known next value shares) instead of being stacked.
-            live_edges.insert(residuals.len());
-            let stack = (!recovered_from_unknown_input(output_type)?).then(|| {
-                ScanStackSource::KnownOutput(
-                    known_stacked_position(&known_program_output_indices, *output).unwrap_or_else(|| {
-                        known_program_output_indices.push(*output);
-                        known_program_output_indices.len() - 1
-                    }),
-                )
-            });
-            residuals.push(ScanResidual::Value { r#type: output_type.clone(), stack });
-        }
-    }
-
-    // An empty known side means the split folds nothing, and the scan stays whole. A known side that only forwards
-    // stacked inputs or known carries that the body passes through, or that only hoists invariant feeders, still
-    // splits, but it needs no known scan. A known carry that the body passes through unchanged ends with its initial
-    // value, so the known scan is needed only for its other outputs or for its effects.
-    let passed_through_carry_count = passed_through_carries.iter().flatten().count();
-    let needs_known_scan = known_program_output_indices.len() > passed_through_carry_count
-        || !known_program.effects().classes().is_empty()
-        || known_program.effects().has_deferred_work();
-    if needs_known_scan && !iteration_count_known {
-        return Ok(None);
-    }
-    let hoists_edges = invariant_sources.iter().any(|source| matches!(source, ScanInvariantSource::Hoisted(_)));
-    let forwards_stacked_inputs = residuals
-        .iter()
-        .any(|residual| matches!(residual, ScanResidual::Value { stack: Some(ScanStackSource::Input(_)), .. }));
-    if !split_without_known_work
-        && !needs_known_scan
-        && !hoists_edges
-        && passed_through_carry_count == 0
-        && !forwards_stacked_inputs
-    {
-        return Ok(None);
-    }
-
-    // Bind the known scan into the enclosing known-side context over the original known inputs.
-    let mut known_scan_inputs = known_input_indices
-        .iter()
-        .filter(|&&index| index != 0)
-        .map(|&index| body_inputs[index - 1].clone())
-        .collect::<Vec<_>>();
-    known_scan_inputs.extend_from_slice(iteration_count_inputs);
-
-    // Project the known iteration body to its retained results and effects, then convert metadata residuals to array
-    // storage. Ordinary arrays already have that representation and need no second replay.
-    let known_body = {
-        let known_output_atoms = known_program_output_indices
-            .iter()
-            .map(|&index| known_program.output_ids()[index])
-            .collect::<Vec<_>>();
-        let (known_body, _) =
-            known_program.filtered(known_program.input_ids(), &known_output_atoms, known_program.input_ids())?;
-        let mut conversions = Vec::new();
-        for (position, &output) in known_program_output_indices.iter().enumerate().skip(known_result_count) {
-            if let Some(operation) = O::residual_to_storage(&known_program_output_types[output])? {
-                conversions.push((position, operation));
-            }
-        }
-
-        // Arrays already have their storage representation. Keep the projected body directly unless a metadata value
-        // actually needs a storage gateway, avoiding a second replay for ordinary array scans.
-        if conversions.is_empty() {
-            known_body
-        } else {
-            let mut builder = ProgramBuilder::<V, O>::new();
-            let inputs =
-                known_body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-            let mut outputs = builder.splice_program(&known_body, &inputs)?;
-            for (position, operation) in conversions {
-                outputs[position] = builder.add_instruction(operation, Vec::new(), vec![outputs[position]], None)?[0];
-            }
-            builder.build::<Vec<V>, Vec<V>>(
-                outputs,
-                vec![Placeholder; inputs.len()],
-                vec![Placeholder; known_program_output_indices.len()],
-            )?
-        }
-    };
-
-    // The known scan stacks the known stacked outputs at their placements, followed by the residual stacks,
-    // which are replicated.
-    let known_stacked_axis_shardings = partition_outputs
-        .iter()
-        .enumerate()
-        .skip(carry_count)
-        .filter(|(_, output)| matches!(output, PartialEvaluationOutput::Known(_)))
-        .map(|(index, _)| {
-            scan.stacked_axis_shardings
-                .get(index - carry_count)
-                .cloned()
-                .unwrap_or(ShardingDimension::Replicated)
-        })
-        .collect();
-    let known_scan = ScanOperation {
-        carry_count: known_carry_count,
-        ..scan.clone().with_stacked_axis_shardings(known_stacked_axis_shardings)
-    };
-
-    // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original stacked
-    // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep scans
-    // with a dynamic iteration count explicit because their outputs may refine the stacked inputs' symbolic extent
-    // types.
-    let forwarded_outputs = (matches!(scan.iteration_count(), Dimension::Static(_))
-        && known_carry_count == 0
-        && known_body.instructions().is_empty())
-    .then(|| {
-        known_body
-            .output_ids()
-            .iter()
-            .map(|output| {
-                known_body
-                    .input_ids()
-                    .iter()
-                    .position(|input| input == output)
-                    .and_then(|index| index.checked_sub(1))
-                    .map(|index| known_scan_inputs[index].clone())
-            })
-            .collect::<Option<Vec<_>>>()
-    })
-    .flatten();
-    let known_outputs = match forwarded_outputs {
-        Some(outputs) => outputs,
-        None if !needs_known_scan => Vec::new(),
-        None => bind_known_fn(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
-    };
-
-    // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge
-    // per residual edge, each fed by the known scan's matching stacked output or by a forwarded known stacked input.
-    let mut residual_outputs = Vec::new();
-    let needs_unknown_scan =
-        partition_outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
-            || carry_known.iter().any(|&known| !known)
-            || !residual_program.effects().classes().is_empty()
-            || residual_program.effects().has_deferred_work();
-    if needs_unknown_scan {
-        // Loop-invariant values are computed once before the scan. A value that resolves to an identity-free constant
-        // of the known-side context is embedded into the unknown body, so that partial evaluation against known values
-        // specializes that body. Every other value is threaded through the unknown scan as a carry that its body passes
-        // through unchanged.
-        let mut hoisted_values = {
-            let region = known_program.entry_region_ref();
-            let mut values = passed_through_carries
-                .iter()
-                .enumerate()
-                .filter_map(|(index, atom)| atom.map(|atom| (atom, body_inputs[index].clone())))
-                .collect::<HashMap<_, _>>();
-
-            // Unlike filtering a program, this dependency query does not retain unrelated effects
-            // from the iteration body.
-            let feeders = invariant_sources
-                .iter()
-                .filter_map(|source| match source {
-                    ScanInvariantSource::Carry(_) => None,
-                    ScanInvariantSource::Hoisted(feeder) => Some(*feeder),
-                })
-                .collect::<Vec<_>>();
-            let live = known_program.live_sets_for_atoms(&feeders)?;
-            for (atom, needed) in live.atoms().iter().enumerate() {
-                if let (true, Some(constant)) = (*needed, region.atoms()[atom].as_constant()) {
-                    values.insert(AtomId::new(atom), lift_known_fn(constant.clone())?);
-                }
-            }
-            for (instruction, _) in
-                region.instructions().iter().zip(live.instructions()).filter(|(_, replayed)| **replayed)
-            {
-                let inputs = instruction.inputs().iter().map(|input| values[input].clone()).collect::<Vec<_>>();
-                let outputs = bind_known_fn(instruction.operation().clone(), Vec::new(), &inputs)?;
-                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-                values.extend(instruction.outputs().iter().copied().zip(outputs));
-            }
-            values
-        };
-
-        let invariant_values = invariant_sources
-            .iter()
-            .map(|source| match source {
-                ScanInvariantSource::Carry(index) => body_inputs[*index].clone(),
-                ScanInvariantSource::Hoisted(feeder) => hoisted_values.remove(feeder).unwrap(),
-            })
-            .collect::<Vec<_>>();
-        let invariant_constants = invariant_values
-            .iter()
-            .map(|value| {
-                resolve_constant_fn(value).filter(|constant| {
-                    let constant_type = constant.r#type();
-                    !constant_type.is_reference() && constant_type.identities().next().is_none()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // Build the unknown body in boundary order: index, nonconstant invariants, unknown original inputs, then
-        // residual slices. Constant invariants are embedded; other invariants pass through as additional carries.
-        let (unknown_body, unknown_carry_count) = {
-            let mut builder = ProgramBuilder::<V, O>::new();
-            let index_atom = builder.add_input(body_input_types[0].clone());
-            let mut invariant_atoms = invariant_sources
-                .iter()
-                .zip(&invariant_constants)
-                .map(|(source, constant)| {
-                    constant.is_none().then(|| {
-                        builder.add_input(match source {
-                            ScanInvariantSource::Carry(index) => body_input_types[index + 1].clone(),
-                            ScanInvariantSource::Hoisted(feeder) => {
-                                known_program.entry_region_ref().atoms()[feeder.index()].r#type().into_owned()
-                            }
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            let invariant_carry_atoms = invariant_atoms.iter().flatten().copied().collect::<Vec<_>>();
-            let unknown_body_input_atoms = body_input_types
-                .iter()
-                .enumerate()
-                .map(|(index, input_type)| match index {
-                    0 => Some(index_atom),
-                    _ if body_known[index] => None,
-                    _ => Some(builder.add_input(input_type.clone())),
-                })
-                .collect::<Vec<_>>();
-
-            // Every input precedes the restored residuals, so that the identities that the inputs establish are known
-            // before any residual is restored.
-            let mut edge_atoms = residuals
-                .iter()
-                .map(|residual| {
-                    Ok(match residual {
-                        ScanResidual::Index => Some(index_atom),
-                        ScanResidual::Value { r#type, stack: Some(_) } => {
-                            Some(builder.add_input(O::residual_storage_type(r#type)?))
-                        }
-                        _ => None,
-                    })
-                })
-                .collect::<Result<Vec<_>, TypeError>>()?;
-            for (atom, constant) in invariant_atoms.iter_mut().zip(&invariant_constants) {
-                if let Some(constant) = constant {
-                    *atom = Some(builder.add_constant(constant.clone()));
-                }
-            }
-
-            let invariant_atoms = invariant_atoms.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-
-            // Restore live metadata after all inputs establish their identities. Reuse an input carrier or an earlier
-            // restoration before reading the stored residual, so each nominal identity has one SSA definition.
-            let carriers = builder
-                .input_ids()
-                .iter()
-                .map(|&input| (input, builder.atoms()[input.index()].r#type().into_owned()))
-                .collect::<Vec<_>>();
-            let mut restored_identity_edges = Vec::<(V::Type, AtomId)>::new();
-            for (edge, (residual, atom)) in residuals.iter().zip(edge_atoms.iter_mut()).enumerate() {
-                let edge_type = match residual {
-                    ScanResidual::Index => continue,
-                    ScanResidual::Invariant(position) => {
-                        *atom = Some(invariant_atoms[*position]);
-                        continue;
-                    }
-                    ScanResidual::Value { r#type, .. } => r#type,
-                };
-
-                let Some(operation) = O::residual_from_storage(edge_type)? else {
-                    continue;
-                };
-
-                if !live_edges.contains(&edge) {
-                    continue;
-                }
-
-                let defines_identity =
-                    edge_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
-                if defines_identity
-                    && let Some((_, restored)) =
-                        restored_identity_edges.iter().find(|(restored_type, _)| restored_type == edge_type)
-                {
-                    *atom = Some(*restored);
-                    continue;
-                }
-
-                let mut restored = None;
-                for (carrier, carrier_type) in &carriers {
-                    if carrier_type == edge_type {
-                        restored = Some(*carrier);
-                    } else if let Some(operation) = O::residual_from_carrier(edge_type, carrier_type)? {
-                        restored = Some(builder.add_instruction(operation, Vec::new(), vec![*carrier], None)?[0]);
-                    } else {
-                        continue;
-                    }
-                    break;
-                }
-
-                let restored = match restored {
-                    Some(restored) => restored,
-                    None => builder.add_instruction(operation, Vec::new(), vec![atom.unwrap()], None)?[0],
-                };
-
-                *atom = Some(restored);
-
-                if defines_identity {
-                    restored_identity_edges.push((edge_type.clone(), restored));
-                }
-            }
-
-            // Partitions feed only unknown body inputs and residual edges to the residual program, because forwarded
-            // body partitions are rejected before the split.
-            let spliced_inputs = live_residual_inputs
-                .iter()
-                .map(|&input| match residual_inputs[input] {
-                    ResidualInputSource::UnknownInput(index) => Ok(unknown_body_input_atoms[index].unwrap()),
-                    ResidualInputSource::ResidualEdge(edge) => Ok(edge_atoms[edge].unwrap()),
-                    ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
-                        Err(ProgramError::MalformedProgram(format!(
-                            "`{SCAN_OPERATION_NAME}` residual body consumes a forwarded known body partition input, \
-                             which partial evaluation rejects before splitting",
-                        )))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let spliced_outputs = builder.splice_program(&residual_program, &spliced_inputs)?;
-
-            // Original residual edges precede the known next values of unknown carries, appended in carry order.
-            // Consume those extra edges only when the corresponding carry result is restored.
-            let mut instantiated_carry_atoms = edge_atoms[residual_edges.len()..].iter().map(|atom| atom.unwrap());
-            let mut unknown_output_atoms = invariant_carry_atoms.clone();
-            for (index, output) in partition_outputs.iter().enumerate() {
-                let atom = match output {
-                    PartialEvaluationOutput::Unknown(spliced) => spliced_outputs[*spliced],
-                    PartialEvaluationOutput::Known(_) if index < carry_count && !body_known[index + 1] => {
-                        instantiated_carry_atoms.next().unwrap()
-                    }
-                    PartialEvaluationOutput::Known(_) => continue,
-                };
-                scan_outputs[index] = PartialEvaluationOutput::Unknown(unknown_output_atoms.len());
-                unknown_output_atoms.push(atom);
-            }
-
-            let unknown_carry_count =
-                invariant_carry_atoms.len() + body_known[1..1 + carry_count].iter().filter(|&&known| !known).count();
-            let input_count = builder.input_ids().len();
-            let output_count = unknown_output_atoms.len();
-            let unknown_body = builder.build::<Vec<V>, Vec<V>>(
-                unknown_output_atoms,
-                vec![Placeholder; input_count],
-                vec![Placeholder; output_count],
-            )?;
-
-            (unknown_body, unknown_carry_count)
-        };
-
-        // The unknown scan stacks the unknown stacked outputs at their placements.
-        let unknown_stacked_axis_shardings = partition_outputs
-            .iter()
-            .enumerate()
-            .skip(carry_count)
-            .filter(|(_, output)| matches!(output, PartialEvaluationOutput::Unknown(_)))
-            .map(|(index, _)| {
-                scan.stacked_axis_shardings
-                    .get(index - carry_count)
-                    .cloned()
-                    .unwrap_or(ShardingDimension::Replicated)
-            })
-            .collect();
-        let unknown_scan = ScanOperation {
-            carry_count: unknown_carry_count,
-            ..scan.clone().with_stacked_axis_shardings(unknown_stacked_axis_shardings)
-        };
-        let mut unknown_scan_inputs = invariant_values
-            .into_iter()
-            .zip(&invariant_constants)
-            .filter_map(|(value, constant)| constant.is_none().then_some(value))
-            .collect::<Vec<_>>();
-        unknown_scan_inputs.extend(
-            body_inputs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !body_known[index + 1])
-                .map(|(_, input)| input.clone()),
-        );
-
-        for residual in &residuals {
-            match residual {
-                ScanResidual::Value { stack: Some(ScanStackSource::Input(input)), .. } => {
-                    unknown_scan_inputs.push(body_inputs[*input].clone());
-                }
-                ScanResidual::Value { stack: Some(ScanStackSource::KnownOutput(position)), .. } => {
-                    unknown_scan_inputs.push(known_outputs[*position].clone());
-                }
-                _ => {}
-            }
-        }
-        unknown_scan_inputs.extend_from_slice(iteration_count_inputs);
-        residual_outputs = bind_residual_fn(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
-    }
-
-    // Reassemble the original scan's outputs from the two sides.
-    Ok(Some(
-        scan_outputs
-            .iter()
-            .enumerate()
-            .map(|(index, output)| match output {
-                _ if index < carry_count && passed_through_carries[index].is_some() => body_inputs[index].clone(),
-                PartialEvaluationOutput::Known(position) => known_outputs[*position].clone(),
-                PartialEvaluationOutput::Unknown(position) => residual_outputs[*position].clone(),
-            })
-            .collect(),
-    ))
 }
 
 #[cfg(test)]

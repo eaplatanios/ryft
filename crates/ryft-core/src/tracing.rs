@@ -530,59 +530,74 @@ where
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
+        /// Internal helper that traces like
+        /// [`trace_with_named_axes_counting_captures`](Self::trace_with_named_axes_counting_captures) with the callback
+        /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
+        /// once per input and output structure rather than once per callback type: every trace of a distinct closure
+        /// would otherwise instantiate this body and every closure and iterator adapter in it again. The callback is
+        /// invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<
+            V: Value,
+            O: Operation<Type = V::Type>,
+            C,
+            Input: Parameterized<
+                    V::Type,
+                    Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<TracingContext<V, O, C>>>,
+                >,
+            Output: Parameterized<
+                    Tracer<TracingContext<V, O, C>>,
+                    Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+                >,
+        >(
+            function: &mut dyn FnMut(
+                &TracingContext<V, O, C>,
+                Input::To<Tracer<TracingContext<V, O, C>>>,
+            ) -> Result<Output, ProgramError>,
+            input_type: Input,
+            named_axes: Vec<(String, NamedAxis)>,
+        ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError>
+        where
+            TracingContext<V, O, C>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+        {
+            let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+            let captures = Rc::new(RefCell::new(Vec::new()));
+            let input_structure = input_type.parameter_structure();
+
+            let (output_types, outputs, output_structure) = {
+                let context = TracingContext {
+                    builder: builder.clone(),
+                    captures: captures.clone(),
+                    named_axes: Rc::new(named_axes),
+                    provenance: Rc::new(ProvenanceState::new()),
+                };
+                let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
+                let output = function(&context, input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
+
+                // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
+                // whichever atom shares its index in this builder, and so we check for this here.
+                check_builders!(&builder, [output.parameters().map(|output| output.builder())])?;
+
+                builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+                let output_structure = output.parameter_structure();
+                let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;
+                let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(ProgramError::from)?;
+                (output_types, outputs, output_structure)
+            };
+
+            let capture_count = captures.borrow().len();
+            let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+            let program = builder.build(outputs, input_structure, output_structure)?;
+
+            Ok((output_types, program, capture_count))
+        }
+
         let mut function = Some(function);
-        Self::trace_with_named_axes_counting_captures_erased(
+        inner(
             &mut |context: &Self, input: Input::To<Tracer<Self>>| function.take().unwrap()(context, input),
             input_type,
             named_axes,
         )
-    }
-
-    /// Internal helper that traces like
-    /// [`trace_with_named_axes_counting_captures`](Self::trace_with_named_axes_counting_captures) with the callback
-    /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
-    /// once per input and output structure rather than once per callback type: every trace of a distinct closure would
-    /// otherwise instantiate this body and every closure and iterator adapter in it again. The callback is invoked
-    /// exactly once.
-    #[allow(clippy::type_complexity)]
-    fn trace_with_named_axes_counting_captures_erased<
-        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
-        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
-    >(
-        function: &mut dyn FnMut(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
-        input_type: Input,
-        named_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let captures = Rc::new(RefCell::new(Vec::new()));
-        let input_structure = input_type.parameter_structure();
-
-        let (output_types, outputs, output_structure) = {
-            let context = Self {
-                builder: builder.clone(),
-                captures: captures.clone(),
-                named_axes: Rc::new(named_axes),
-                provenance: Rc::new(ProvenanceState::new()),
-            };
-            let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
-            let output = function(&context, input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
-
-            // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
-            // whichever atom shares its index in this builder, and so we check for this here.
-            check_builders!(&builder, [output.parameters().map(|output| output.builder())])?;
-
-            builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
-            let output_structure = output.parameter_structure();
-            let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;
-            let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(ProgramError::from)?;
-            (output_types, outputs, output_structure)
-        };
-
-        let capture_count = captures.borrow().len();
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(outputs, input_structure, output_structure)?;
-
-        Ok((output_types, program, capture_count))
     }
 }
 
@@ -808,67 +823,63 @@ impl<C: Context> NestedTracingContext<C> {
         Output: Parameterized<Tracer<Self>>,
         Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        /// Internal helper that traces like [`trace_with_named_axes`](Self::trace_with_named_axes) with the callback
+        /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
+        /// once per output structure rather than once per callback type. The callback is invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<C: Context, Output>(
+            parent: C,
+            function: &mut dyn FnMut(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Output, ProgramError>,
+            input_types: Vec<C::Type>,
+            named_axes: Vec<(String, NamedAxis)>,
+        ) -> Result<
+            (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
+            ProgramError,
+        >
+        where
+            Output: Parameterized<Tracer<NestedTracingContext<C>>>,
+            NestedTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        {
+            let input_count = input_types.len();
+            let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+            let named_axes = Rc::new(named_axes);
+            let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
+            let context = NestedTracingContext { parent, builder, named_axes, provenance };
+
+            let (output_structure, output_atoms) = {
+                let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+                let output = function(input_tracers)
+                    .map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
+                context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
+                let output_structure = output.parameter_structure();
+
+                // The outputs must belong to this trace. A foreign tracer's atom ID would silently alias whichever
+                // atom shares its index in this builder, so the boundary rejects it with a builder-identity check.
+                check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
+
+                let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+                (output_structure, output_atoms)
+            };
+
+            // Clone out the builder handle and drop the context so that the clone is the sole owner, letting
+            // `Rc::try_unwrap` recover the builder below unless a `Tracer` escaped the trace and still holds
+            // a reference.
+            let builder = context.builder().clone();
+            drop(context);
+            let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+
+            let output_count = output_atoms.len();
+            let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                output_atoms,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )?;
+
+            Ok((output_structure, program))
+        }
+
         let mut function = Some(function);
-        Self::trace_with_named_axes_erased(
-            parent,
-            &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs),
-            input_types,
-            named_axes,
-        )
-    }
-
-    /// Internal helper that traces like [`trace_with_named_axes`](Self::trace_with_named_axes) with the callback type
-    /// erased. This is the body of that function, which only wraps its callback, so that this body is compiled once per
-    /// output structure rather than once per callback type. The callback is invoked exactly once.
-    #[allow(clippy::type_complexity)]
-    fn trace_with_named_axes_erased<Output>(
-        parent: C,
-        function: &mut dyn FnMut(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
-        input_types: Vec<C::Type>,
-        named_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<
-        (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
-        ProgramError,
-    >
-    where
-        Output: Parameterized<Tracer<Self>>,
-        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    {
-        let input_count = input_types.len();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let named_axes = Rc::new(named_axes);
-        let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
-        let context = Self { parent, builder, named_axes, provenance };
-
-        let (output_structure, output_atoms) = {
-            let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
-            let output = function(input_tracers)
-                .map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
-            context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
-            let output_structure = output.parameter_structure();
-
-            // The outputs must belong to this trace. A foreign tracer's atom ID would silently alias whichever atom
-            // shares its index in this builder, so the boundary rejects it with a builder-identity check.
-            check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
-
-            let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-            (output_structure, output_atoms)
-        };
-
-        // Clone out the builder handle and drop the context so that the clone is the sole owner, letting
-        // `Rc::try_unwrap` recover the builder below unless a `Tracer` escaped the trace and still holds a reference.
-        let builder = context.builder().clone();
-        drop(context);
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-
-        let output_count = output_atoms.len();
-        let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-            output_atoms,
-            vec![Placeholder; input_count],
-            vec![Placeholder; output_count],
-        )?;
-
-        Ok((output_structure, program))
+        inner(parent, &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs), input_types, named_axes)
     }
 }
 

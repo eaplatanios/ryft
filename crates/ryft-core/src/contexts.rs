@@ -568,25 +568,6 @@ impl<C: Domain, T: Type> ProjectedContext<C, T> {
 }
 
 impl<C: ContextProjection<T>, T: Type> ProjectedContext<C, T> {
-    /// Internal helper that lifts the member-family `regions` into parent-family [`Program`]s. The regions of a
-    /// member operation are member-family programs, so every value that they carry is of the member kind, and they
-    /// are lifted into the parent family exactly like the operation itself. This is compiled once per projection
-    /// rather than once per input operation type.
-    #[allow(clippy::type_complexity)]
-    #[inline]
-    fn unproject_regions(
-        regions: &AttachedRegions<
-            '_,
-            <C::Constant as ValueProjection<T>>::Projected,
-            <C::Operation as OperationProjection<T>>::Projected,
-        >,
-    ) -> Result<Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, ProgramError> {
-        regions
-            .regions()
-            .map(|region| region.to_program().into_unprojected::<C::Constant, C::Operation>())
-            .collect()
-    }
-
     /// Internal helper that binds an already converted parent-family [`Operation`] with its already unprojected
     /// regions. This is the body of [`Context::bind`] for this context, which only converts its input operation and
     /// lifts its regions, so that this body is compiled once per projection rather than once per input operation type
@@ -663,9 +644,28 @@ impl<C: ContextProjection<T>, T: Type> Context for ProjectedContext<C, T> {
         Self::Constant: 'r,
         Self::Operation: 'r,
     {
+        /// Internal helper that lifts the member-family `regions` into parent-family [`Program`]s. The regions of a
+        /// member operation are member-family programs, so every value that they carry is of the member kind, and they
+        /// are lifted into the parent family exactly like the operation itself. This is compiled once per projection
+        /// rather than once per input operation type.
+        #[allow(clippy::type_complexity)]
+        #[inline]
+        fn inner<C: ContextProjection<T>, T: Type>(
+            regions: &AttachedRegions<
+                '_,
+                <C::Constant as ValueProjection<T>>::Projected,
+                <C::Operation as OperationProjection<T>>::Projected,
+            >,
+        ) -> Result<Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, ProgramError> {
+            regions
+                .regions()
+                .map(|region| region.to_program().into_unprojected::<C::Constant, C::Operation>())
+                .collect()
+        }
+
         // The regions of a member operation are member-family programs, so every value that they carry is
         // of the member kind, and they are lifted into the parent family exactly like the operation itself.
-        self.bind_operation(operation.into().into(), Self::unproject_regions(&regions.into())?, inputs)
+        self.bind_operation(operation.into().into(), inner::<C, T>(&regions.into())?, inputs)
     }
 
     #[inline]
@@ -814,194 +814,149 @@ pub trait StagingContext:
         Self::Constant: 'r,
         Self::Operation: 'r,
     {
-        stage_converted_operation(self, operation.into(), regions.into(), inputs)
-    }
-}
-
-/// Internal helper that stages an already converted [`Operation`] in `context`. This is the body of
-/// [`StagingContext::stage_operation`], which only converts its input operation and regions, so that this body is
-/// compiled once per staging context and input borrow rather than once per input operation type or way of supplying
-/// regions. Keep it free of those type parameters: every closure and iterator adapter in it is instantiated per
-/// distinct signature.
-fn stage_converted_operation<S: StagingContext, I: std::borrow::Borrow<S::Value>>(
-    context: &S,
-    operation: S::Operation,
-    regions: AttachedRegions<'_, S::Constant, S::Operation>,
-    inputs: &[I],
-) -> Result<Vec<S::Value>, ProgramError> {
-    // Every live input atom is local to exactly one builder. Validate that ownership before inspecting regions or
-    // mutating this trace so a foreign tracer cannot alias an unrelated atom with the same numeric identifier.
-    check_builders!(context.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
-        .map_err(|error| context.error(error))?;
-
-    // Region input identities are instantiated from the instruction input types before the regions enter this
-    // builder. First validate the operation's region contract on the original region interfaces, so that later
-    // zips cannot silently omit either a region or its instantiation request, and so that specialization below
-    // cannot make otherwise mismatched region signatures agree (refer to `Operation::validate_region_interfaces`).
-    // Region-free operations avoid collecting input types here as the checked builder path will infer them directly
-    // from its atoms.
-    let declared_region_count = operation.region_slots().len();
-    let region_interfaces = regions.region_interfaces();
-    operation.validate_region_interfaces(&region_interfaces).map_err(|error| context.error(error))?;
-    let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
-        (None, Vec::new(), Vec::new())
-    } else {
-        let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
-        let region_input_types = operation
-            .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())
-            .map_err(|error| context.error(error.into()))?;
-        if region_input_types.len() != declared_region_count {
-            return Err(context.error(ProgramError::MalformedProgram(format!(
-                "operation `{}` returned {} region instantiation entries for {} attached regions",
-                operation.name(),
-                region_input_types.len(),
-                declared_region_count,
-            ))));
-        }
-        (Some(input_types), region_interfaces, region_input_types)
-    };
-
-    if context.builder().borrow().error.is_some() {
-        // A previously failed trace cannot append atoms, regions, or instructions, but callers still need correctly
-        // typed poison tracers so tracing can continue to the boundary that reports the original error. Reconstruct
-        // each hypothetical instantiated interface without importing it, then run ordinary output inference.
-        let input_types = input_types
-            .unwrap_or_else(|| inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>());
-        let region_interfaces = regions
-            .regions()
-            .zip(&region_input_types)
-            .map(|(region, input_types)| match input_types {
-                Some(input_types) => {
-                    // Instantiate the region's type identities at the requested input types when one structural
-                    // substitution expresses them. A valid mixed refinement (e.g., a symbolic `dimension<n>`
-                    // alongside an `f32[3]` that binds `n = 3`) admits none, so keep its declared interface,
-                    // as the healthy path below imports it, and let output inference accept the refined inputs.
-                    // Invalid signatures still return their derivation error.
-                    let renaming = FlatProgram::<S>::region_input_identity_renaming(
-                        region.interface().input_types(),
-                        input_types,
-                    )?;
-                    match renaming {
-                        Some(renaming) => Ok(region.to_program().rename_type_identities(&renaming)?.interface()),
-                        None => Ok(region.interface()),
-                    }
-                }
-                None => Ok(region.interface()),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
-        Ok(output_types
-            .into_iter()
-            .map(|r#type| Tracer::new(context.clone(), TracerState::Poison, r#type))
-            .collect())
-    } else {
-        // Only a healthy trace consumes the regions and mutates the builder. Importing with the operation-derived
-        // input types makes each attached region boundary agree with this invocation before `add_instruction`
-        // derives its output types and records the final instruction.
-        let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
-            Ok(input_atom_ids) => input_atom_ids,
-            Err(error) => return Err(context.error(error)),
-        };
-
-        // Prepare genuine refinements in a separate arena because specializing one region can require replacing
-        // another. For example, specializing a linear call's forward region can change the cotangent shape its
-        // transpose must accept. Importing both the provisional and replacement transpose directly into the final
-        // builder would leave an unreachable region. Import only the finalized reachable closures below, preserving
-        // shared regions. Pure identity renaming uses the regions' ordinary import cache without a separate arena.
-        // Determine which regions require specialization before importing them, because importing instantiates
-        // their type identities, which hides input types that only narrow bounds from the comparison below.
-        // Valid mixed refinements that cannot be specialized (`None`) lack a structural substitution, so they
-        // are imported with their declared boundaries intact. The specialization loop below retains them
-        // without replaying, and final inference validates them.
-        let requires_specialization = region_interfaces
-            .iter()
-            .zip(&region_input_types)
-            .map(|(interface, requested)| match requested {
-                Some(requested) => FlatProgram::<S>::region_requires_specialization(interface.input_types(), requested),
-                None => Ok(Some(false)),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| context.error(error.into()))?;
-        let preparation_builder =
-            requires_specialization.contains(&Some(true)).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
-        let region_builder = preparation_builder.as_ref().unwrap_or(context.builder());
-        let import_input_types = region_input_types
-            .iter()
-            .zip(&requires_specialization)
-            .map(|(requested, requires_specialization)| requires_specialization.and(requested.clone()))
-            .collect::<Vec<_>>();
-
-        let mut region_ids =
-            regions.import_into(region_builder, &import_input_types).map_err(|error| context.error(error))?;
-        let instantiated_region_ids = region_ids.clone();
-
-        // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
-        // reshape, the array portions of its forward and transpose signatures might specialize as follows:
-        //
-        //   - Forward: `Array[n, 4]` -> `Array[2, 2*n]` becomes `Array[4, 4]` -> `Array[2, 8]`
-        //   - Transpose: `Array[2, 2*n] -> Array[n, 4]` becomes `Array[2, 8]` -> `Array[4, 4]`
-        //
-        // The transpose receives the forward output's cotangent. Computing its requested input signature only
-        // from the original symbolic forward interface would leave it stale after the forward is specialized.
-        // Recompute requests from the imported interfaces and visit slots in declaration order, updating later
-        // requests whenever an earlier region changes. The final operation inference still checks the resulting
-        // signatures exactly. Operations without explicit instantiation requests need no reconciliation.
-        if region_input_types.iter().any(Option::is_some) {
-            let input_types = input_types.as_ref().unwrap();
-            let mut interfaces = region_ids
-                .iter()
-                .map(|id| region_builder.borrow().region_ref(*id).map(|region| region.interface()))
-                .collect::<Result<Vec<_>, _>>()
+        /// Internal helper that stages an already converted [`Operation`] in `context`. This is the body of
+        /// [`StagingContext::stage_operation`], which only converts its input operation and regions, so that this body
+        /// is compiled once per staging context and input borrow rather than once per input operation type or way of
+        /// supplying regions. Keep it free of those type parameters: every closure and iterator adapter in it is
+        /// instantiated per distinct signature.
+        fn inner<S: StagingContext, I: std::borrow::Borrow<S::Value>>(
+            context: &S,
+            operation: S::Operation,
+            regions: AttachedRegions<'_, S::Constant, S::Operation>,
+            inputs: &[I],
+        ) -> Result<Vec<S::Value>, ProgramError> {
+            // Every live input atom is local to exactly one builder. Validate that ownership before inspecting
+            // regions or mutating this trace so a foreign tracer cannot alias an unrelated atom with the same
+            // numeric identifier.
+            check_builders!(context.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
                 .map_err(|error| context.error(error))?;
-            let mut requests = operation
-                .infer_region_input_types(input_types, &interfaces)
-                .map_err(|error| context.error(error.into()))?;
-            if requests.len() != declared_region_count {
-                return Err(context.error(ProgramError::MalformedProgram(format!(
-                    "operation `{}` returned {} region instantiation entries for {} attached regions",
-                    operation.name(),
-                    requests.len(),
-                    declared_region_count,
-                ))));
-            }
-            let mut specialized_regions = Vec::new();
-            let mut specialization_failed = false;
-            for index in 0..region_ids.len() {
-                let Some(requested) = &requests[index] else { continue };
-                if interfaces[index].input_types() == requested && requires_specialization[index] != Some(true) {
-                    continue;
-                }
 
-                // Replaying a mixed refinement that admits no structural substitution would erase a shared input
-                // relationship, so retain every instantiated region instead, as `specialize_attached_regions` does.
-                if FlatProgram::<S>::region_input_identity_renaming(interfaces[index].input_types(), requested)
-                    .map_err(|error| context.error(error.into()))?
-                    .is_none()
-                {
-                    specialization_failed = true;
-                    break;
+            // Region input identities are instantiated from the instruction input types before the regions enter this
+            // builder. First validate the operation's region contract on the original region interfaces, so that later
+            // zips cannot silently omit either a region or its instantiation request, and so that specialization below
+            // cannot make otherwise mismatched region signatures agree. Region-free operations avoid collecting input
+            // types here as the checked builder path will infer them directly from its atoms.
+            let declared_region_count = operation.region_slots().len();
+            let region_interfaces = regions.region_interfaces();
+            operation.validate_region_interfaces(&region_interfaces).map_err(|error| context.error(error))?;
+            let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
+                (None, Vec::new(), Vec::new())
+            } else {
+                let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+                let region_input_types = operation
+                    .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())
+                    .map_err(|error| context.error(error.into()))?;
+                if region_input_types.len() != declared_region_count {
+                    return Err(context.error(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returned {} region instantiation entries for {} attached regions",
+                        operation.name(),
+                        region_input_types.len(),
+                        declared_region_count,
+                    ))));
                 }
+                (Some(input_types), region_interfaces, region_input_types)
+            };
 
-                if let Some((_, _, specialized_id)) = specialized_regions
+            if context.builder().borrow().error.is_some() {
+                // A previously failed trace cannot append atoms, regions, or instructions, but callers still need
+                // correctly typed poison tracers so tracing can continue to the boundary that reports the original
+                // error. Reconstruct each hypothetical instantiated interface without importing it, then run ordinary
+                // output inference.
+                let input_types = input_types.unwrap_or_else(|| {
+                    inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>()
+                });
+                let region_interfaces = regions
+                    .regions()
+                    .zip(&region_input_types)
+                    .map(|(region, input_types)| match input_types {
+                        Some(input_types) => {
+                            // Instantiate the region's type identities at the requested input types when one structural
+                            // substitution expresses them. A valid mixed refinement (e.g., a symbolic `dimension<n>`
+                            // alongside an `f32[3]` that binds `n = 3`) admits none, so keep its declared interface,
+                            // as the healthy path below imports it, and let output inference accept the refined inputs.
+                            // Invalid signatures still return their derivation error.
+                            let renaming = FlatProgram::<S>::region_input_identity_renaming(
+                                region.interface().input_types(),
+                                input_types,
+                            )?;
+                            match renaming {
+                                Some(renaming) => {
+                                    Ok(region.to_program().rename_type_identities(&renaming)?.interface())
+                                }
+                                None => Ok(region.interface()),
+                            }
+                        }
+                        None => Ok(region.interface()),
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                let output_types =
+                    operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
+                Ok(output_types
+                    .into_iter()
+                    .map(|r#type| Tracer::new(context.clone(), TracerState::Poison, r#type))
+                    .collect())
+            } else {
+                // Only a healthy trace consumes the regions and mutates the builder. Importing with the
+                // operation-derived input types makes each attached region boundary agree with this invocation
+                // before `add_instruction` derives its output types and records the final instruction.
+                let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
+                    Ok(input_atom_ids) => input_atom_ids,
+                    Err(error) => return Err(context.error(error)),
+                };
+
+                // Prepare genuine refinements in a separate arena because specializing one region can require replacing
+                // another. For example, specializing a linear call's forward region can change the cotangent shape its
+                // transpose must accept. Importing both the provisional and replacement transpose directly into the
+                // final builder would leave an unreachable region. Import only the finalized reachable closures below,
+                // preserving shared regions. Pure identity renaming uses the regions' ordinary import cache without a
+                // separate arena. Determine which regions require specialization before importing them, because
+                // importing instantiates their type identities, which hides input types that only narrow bounds from
+                // the comparison below. Valid mixed refinements that cannot be specialized (i.e., `None`) lack a
+                // structural substitution, so they are imported with their declared boundaries intact. The
+                // specialization loop below retains them without replaying, and final inference validates them.
+                let requires_specialization = region_interfaces
                     .iter()
-                    .find(|(source_id, input_types, _)| *source_id == region_ids[index] && input_types == requested)
-                {
-                    region_ids[index] = *specialized_id;
-                    interfaces[index] = region_builder.borrow().region_ref(*specialized_id)?.interface();
-                } else {
-                    let source_id = region_ids[index];
-                    let region = region_builder.borrow().region_ref(source_id)?.to_program();
-                    let Ok(specialized) = region.specialize_to_region_input_types(requested) else {
-                        specialization_failed = true;
-                        break;
-                    };
-                    interfaces[index] = specialized.interface();
-                    region_ids[index] = region_builder.borrow_mut().import_program(specialized);
-                    specialized_regions.push((source_id, requested.clone(), region_ids[index]));
-                }
+                    .zip(&region_input_types)
+                    .map(|(interface, requested)| match requested {
+                        Some(requested) => {
+                            FlatProgram::<S>::region_requires_specialization(interface.input_types(), requested)
+                        }
+                        None => Ok(Some(false)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| context.error(error.into()))?;
+                let preparation_builder =
+                    requires_specialization.contains(&Some(true)).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
+                let region_builder = preparation_builder.as_ref().unwrap_or(context.builder());
+                let import_input_types = region_input_types
+                    .iter()
+                    .zip(&requires_specialization)
+                    .map(|(requested, requires_specialization)| requires_specialization.and(requested.clone()))
+                    .collect::<Vec<_>>();
 
-                if index + 1 < region_ids.len() {
-                    requests = operation
+                let mut region_ids =
+                    regions.import_into(region_builder, &import_input_types).map_err(|error| context.error(error))?;
+                let instantiated_region_ids = region_ids.clone();
+
+                // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
+                // reshape, the array portions of its forward and transpose signatures might specialize as follows:
+                //
+                //   - Forward: `Array[n, 4]` -> `Array[2, 2*n]` becomes `Array[4, 4]` -> `Array[2, 8]`
+                //   - Transpose: `Array[2, 2*n] -> Array[n, 4]` becomes `Array[2, 8]` -> `Array[4, 4]`
+                //
+                // The transpose receives the forward output's cotangent. Computing its requested input signature only
+                // from the original symbolic forward interface would leave it stale after the forward is specialized.
+                // Recompute requests from the imported interfaces and visit slots in declaration order, updating later
+                // requests whenever an earlier region changes. The final operation inference still checks the resulting
+                // signatures exactly. Operations without explicit instantiation requests need no reconciliation.
+                if region_input_types.iter().any(Option::is_some) {
+                    let input_types = input_types.as_ref().unwrap();
+                    let mut interfaces = region_ids
+                        .iter()
+                        .map(|id| region_builder.borrow().region_ref(*id).map(|region| region.interface()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| context.error(error))?;
+                    let mut requests = operation
                         .infer_region_input_types(input_types, &interfaces)
                         .map_err(|error| context.error(error.into()))?;
                     if requests.len() != declared_region_count {
@@ -1012,45 +967,103 @@ fn stage_converted_operation<S: StagingContext, I: std::borrow::Borrow<S::Value>
                             declared_region_count,
                         ))));
                     }
-                }
-            }
+                    let mut specialized_regions = Vec::new();
+                    let mut specialization_failed = false;
+                    for index in 0..region_ids.len() {
+                        let Some(requested) = &requests[index] else { continue };
+                        if interfaces[index].input_types() == requested && requires_specialization[index] != Some(true)
+                        {
+                            continue;
+                        }
 
-            // Specialization is an optimization. The regions whose type identities were merely instantiated keep
-            // the declared region signatures, so falling back to them is always sound: the operation's final
-            // inference below decides whether the inputs may feed them (e.g., control flow operations accept value
-            // inputs that refine their declared types) and still reports genuine type errors. Specialized regions
-            // can be unusable even though their declared counterparts are fine. For example, a loop body
-            // specialized at a sharded carry may return that carry unsharded, so the specialized body no longer
-            // maps its carries to themselves. Such an application falls back to the instantiated regions.
-            if specialization_failed
-                || (!specialized_regions.is_empty() && operation.infer_output_types(input_types, &interfaces).is_err())
-            {
-                region_ids = instantiated_region_ids;
-            }
-        }
+                        // Replaying a mixed refinement that admits no structural substitution would erase a shared
+                        // input relationship, so retain every instantiated region instead, as
+                        // `specialize_attached_regions` does.
+                        if FlatProgram::<S>::region_input_identity_renaming(interfaces[index].input_types(), requested)
+                            .map_err(|error| context.error(error.into()))?
+                            .is_none()
+                        {
+                            specialization_failed = true;
+                            break;
+                        }
 
-        if preparation_builder.is_some() {
-            let prepared = region_builder.borrow();
-            let roots = region_ids.iter().map(|id| prepared.region_ref(*id).unwrap()).collect::<Vec<_>>();
-            region_ids = context.builder().borrow_mut().import_regions(&roots).map_err(|error| context.error(error))?;
-        }
+                        if let Some((_, _, specialized_id)) =
+                            specialized_regions.iter().find(|(source_id, input_types, _)| {
+                                *source_id == region_ids[index] && input_types == requested
+                            })
+                        {
+                            region_ids[index] = *specialized_id;
+                            interfaces[index] = region_builder.borrow().region_ref(*specialized_id)?.interface();
+                        } else {
+                            let source_id = region_ids[index];
+                            let region = region_builder.borrow().region_ref(source_id)?.to_program();
+                            let Ok(specialized) = region.specialize_to_region_input_types(requested) else {
+                                specialization_failed = true;
+                                break;
+                            };
+                            interfaces[index] = specialized.interface();
+                            region_ids[index] = region_builder.borrow_mut().import_program(specialized);
+                            specialized_regions.push((source_id, requested.clone(), region_ids[index]));
+                        }
 
-        // Snapshot the active provenance and attach it to the recorded instruction. Provenance state lives in
-        // its own cell, separate from the builder, so scope transitions never contend with builder borrows.
-        let provenance = context.provenance();
-        let outputs = {
-            let mut builder = context.builder().borrow_mut();
-            match builder.add_instruction_or_fold(operation, region_ids, inputs, Some(provenance)) {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    if builder.error.is_none() {
-                        builder.error = Some(error.clone());
+                        if index + 1 < region_ids.len() {
+                            requests = operation
+                                .infer_region_input_types(input_types, &interfaces)
+                                .map_err(|error| context.error(error.into()))?;
+                            if requests.len() != declared_region_count {
+                                return Err(context.error(ProgramError::MalformedProgram(format!(
+                                    "operation `{}` returned {} region instantiation entries for {} attached regions",
+                                    operation.name(),
+                                    requests.len(),
+                                    declared_region_count,
+                                ))));
+                            }
+                        }
                     }
-                    return Err(error);
+
+                    // Specialization is an optimization. The regions whose type identities were merely instantiated
+                    // keep the declared region signatures, so falling back to them is always sound: the operation's
+                    // final inference below decides whether the inputs may feed them (e.g., control flow operations
+                    // accept value inputs that refine their declared types) and still reports genuine type errors.
+                    // Specialized regions can be unusable even though their declared counterparts are fine. For
+                    // example, a loop body specialized at a sharded carry may return that carry unsharded, so the
+                    // specialized body no longer maps its carries to themselves. Such an application falls back to the
+                    // instantiated regions.
+                    if specialization_failed
+                        || (!specialized_regions.is_empty()
+                            && operation.infer_output_types(input_types, &interfaces).is_err())
+                    {
+                        region_ids = instantiated_region_ids;
+                    }
                 }
+
+                if preparation_builder.is_some() {
+                    let prepared = region_builder.borrow();
+                    let roots = region_ids.iter().map(|id| prepared.region_ref(*id).unwrap()).collect::<Vec<_>>();
+                    region_ids =
+                        context.builder().borrow_mut().import_regions(&roots).map_err(|error| context.error(error))?;
+                }
+
+                // Snapshot the active provenance and attach it to the recorded instruction. Provenance state lives in
+                // its own cell, separate from the builder, so scope transitions never contend with builder borrows.
+                let provenance = context.provenance();
+                let outputs = {
+                    let mut builder = context.builder().borrow_mut();
+                    match builder.add_instruction_or_fold(operation, region_ids, inputs, Some(provenance)) {
+                        Ok(outputs) => outputs,
+                        Err(error) => {
+                            if builder.error.is_none() {
+                                builder.error = Some(error.clone());
+                            }
+                            return Err(error);
+                        }
+                    }
+                };
+                Ok(outputs.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>())
             }
-        };
-        Ok(outputs.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>())
+        }
+
+        inner(self, operation.into(), regions.into(), inputs)
     }
 }
 
