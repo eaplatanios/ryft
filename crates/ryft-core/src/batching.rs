@@ -2360,6 +2360,15 @@ mod tests {
             inputs: &[ProjectedBatch<C::Value>],
         ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError> {
             check_count!("input", inputs, 1, ProgramError);
+
+            // `Scoped` doubles its input to test transposition provenance. Returning its input unchanged here would
+            // incorrectly batch it as identity, so this fixture explicitly rejects that unsupported operation.
+            if matches!(self, ProjectedMemberOperation::Scoped) {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "the projected member fixture batches only identities".to_string(),
+                });
+            }
+
             Ok(inputs.to_vec())
         }
     }
