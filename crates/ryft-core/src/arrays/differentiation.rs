@@ -644,65 +644,45 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
             Self::Gather(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            operation => {
-                // When the result shape of an implicitly broadcasting elementwise operation carries a runtime extent,
-                // its inputs are first replicated into that shape, so that the projected member rule differentiates
-                // inputs that already have the result shape. The member-family alignment (i.e.,
-                // `ElementwiseDerivativeAlignment`) cannot replicate into a runtime extent itself, because its
-                // `BroadcastOperation` carries the complete output shape as payload metadata and program replay never
-                // refines a payload type. Such an extent is therefore only reachable through an input edge, which this
-                // arm supplies: it reads each runtime extent off the input that owns that axis as a first-class
-                // dimension value and replicates with a `DynamicBroadcastOperation`. Linearization then keeps one
-                // scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
-                // aligned input. The replication yields `None`, and the inputs are differentiated as they are, when the
-                // operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent
-                // space (so no input is ever aligned), its result shape is fully static, or every input already has the
-                // result shape.
-                // TODO(eaplatanios): Can we avoid the use of labels and make the code easier to follow? Could we
-                //  accomplish this by adding more branches to the outer match statement and using helpers or something?
-                let replicated = 'replicated: {
-                    // The variants whose type inference broadcasts several inputs into one result, and whose
-                    // differentiation rules therefore align narrower inputs (both live tangents and primal
-                    // coefficients) with that result type.
-                    if !matches!(
-                        operation,
-                        Self::Add(_)
-                            | Self::Sub(_)
-                            | Self::Mul(_)
-                            | Self::Div(_)
-                            | Self::Rem(_)
-                            | Self::Pow(_)
-                            | Self::Max(_)
-                            | Self::Min(_)
-                            | Self::Clamp(_)
-                            | Self::Atan2(_)
-                            | Self::LogAddExp(_)
-                            | Self::And(_)
-                            | Self::Or(_)
-                            | Self::Xor(_)
-                            | Self::Complex(_)
-                            | Self::Compare(_)
-                            | Self::Select(_),
-                    ) {
-                        break 'replicated None;
-                    }
-
-                    let input_types = inputs
-                        .iter()
-                        .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
-                        .collect::<Result<Vec<_>, TypeError>>()?;
-                    let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
-                    let [output_type] = output_types.as_slice() else {
-                        return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
-                    };
-                    let output_shape = output_type.shape();
-                    if output_type.tangent()?.is_zero_space()
-                        || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
-                        || input_types.iter().all(|input_type| input_type.shape() == output_shape)
-                    {
-                        break 'replicated None;
-                    }
-
+            operation @ (Self::Add(_)
+            | Self::Sub(_)
+            | Self::Mul(_)
+            | Self::Div(_)
+            | Self::Rem(_)
+            | Self::Pow(_)
+            | Self::Max(_)
+            | Self::Min(_)
+            | Self::Clamp(_)
+            | Self::Atan2(_)
+            | Self::LogAddExp(_)
+            | Self::And(_)
+            | Self::Or(_)
+            | Self::Xor(_)
+            | Self::Complex(_)
+            | Self::Compare(_)
+            | Self::Select(_)) => {
+                // These elementwise operations infer a shared result shape from inputs that may broadcast.
+                // The projected member rule must differentiate inputs that already have the dynamic result shape.
+                // Its `ElementwiseDerivativeAlignment` cannot replicate into a runtime extent itself: its
+                // `BroadcastOperation` stores the complete output shape as metadata, which program replay
+                // never refines. Read runtime extents from the inputs that carry them and replicate through
+                // `DynamicBroadcastOperation`, so linearization retains dimension values instead of
+                // result-shaped arrays for aligned inputs.
+                let input_types = inputs
+                    .iter()
+                    .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
+                    .collect::<Result<Vec<_>, TypeError>>()?;
+                let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+                let [output_type] = output_types.as_slice() else {
+                    return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+                };
+                let output_shape = output_type.shape();
+                let replicated = if output_type.tangent()?.is_zero_space()
+                    || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+                    || input_types.iter().all(|input_type| input_type.shape() == output_shape)
+                {
+                    None
+                } else {
                     // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated
                     // dimension denotes one runtime extent, so it is read once and shared by every axis that carries
                     // it.
@@ -726,9 +706,11 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
                                 });
                                 let Some((index, input_axis)) = source else {
                                     return Err(TypeError::invalid(format!(
-                                        "cannot replicate `{}` inputs into result shape {output_shape} because no \
-                                         input carries its runtime axis {axis}",
+                                        "cannot replicate `{}` inputs into result shape {} because no \
+                                         input carries its runtime axis {}",
                                         operation.name(),
+                                        output_shape,
+                                        axis,
                                     ))
                                     .into());
                                 };
@@ -790,9 +772,9 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
                         .collect::<Result<Vec<_>, DifferentiationError>>()?;
                     Some(replicated_inputs)
                 };
-                let inputs = replicated.as_deref().unwrap_or(inputs);
-                rule.apply_projected(context, operation, inputs)?
+                rule.apply_projected(context, operation, replicated.as_deref().unwrap_or(inputs))?
             }
+            operation => rule.apply_projected(context, operation, inputs)?,
         };
         output_duals
             .into_iter()
@@ -866,6 +848,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
+    use crate::arrays::elements::f8e8m0fnu;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::references::ArrayReference;
@@ -875,8 +858,9 @@ mod tests {
     use crate::differentiation::{
         DifferentiableType, Differentiate, ReverseModeDifferentiate, TransposedProgramCotangent,
     };
+    use crate::operations::{MulOperation, StopGradientOperation, TransposeOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::ReferenceType;
+    use crate::programs::{EmptyRegionDriver, ReferenceType};
 
     use super::*;
 
@@ -1624,6 +1608,281 @@ mod tests {
             ),
             Err(BatchingError::Type(error)) if error == TypeError::invalid("expected array type but got dimension type"),
         ));
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let array_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Dynamic(extent)]),
+        );
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(scalar, array)| {
+                let context = DifferentiationContext::fused(array.context().clone());
+                let inputs = [
+                    DifferentiationDual::new_with_zero_tangent(scalar)?,
+                    DifferentiationDual::new(array.clone(), MaybeZero::Value(array))?,
+                ];
+                let output = ArrayOperation::<Array>::Mul(MulOperation::new())
+                    .jvp_in_parent(&context, &EmptyRegionDriver, &inputs)?
+                    .remove(0);
+                let MaybeZero::Value(tangent) = output.tangent() else {
+                    panic!("expected a live output tangent");
+                };
+                Ok((output.primal().clone(), tangent.clone()))
+            },
+            (ArrayIrType::Array(ArrayType::scalar(DataType::F64)), ArrayIrType::Array(array_type)),
+        )
+        .unwrap();
+
+        // A repeated dynamic extent needs one read, and the scalar's structural-zero tangent needs no broadcast.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[extent, extent] .
+                let %2:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %1
+                    %3:f64[extent, extent] = broadcast [output_axes=[]] %0 %2 %2
+                    %4:f64[extent, extent] = mul %3 %1
+                    %5:f64[extent, extent] = mul %3 %1
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+        let array = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f64, 2.0, 3.0, 4.0]).unwrap());
+        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f64, 4.0, 6.0, 8.0]).unwrap());
+        assert_eq!(
+            program.interpret((ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()), array)),
+            Ok((expected.clone(), expected)),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_without_dynamic_replication() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let dynamic_shape = Shape::new(vec![Dimension::Dynamic(extent)]);
+
+        // These cases use ordinary projected rules: static results, aligned dynamic inputs, and zero tangent spaces.
+        for (left_type, right_type, expected) in [
+            (
+                ArrayType::scalar(DataType::F64),
+                ArrayType::new_static(DataType::F64, [3]),
+                indoc! {"
+                    lambda %0:f64[], %1:f64[3] .
+                    let %2:f64[3] = mul %0 %1
+                    in (%2)
+                "}
+                .trim_end(),
+            ),
+            (
+                ArrayType::new(DataType::F64, dynamic_shape.clone()),
+                ArrayType::new(DataType::F64, dynamic_shape.clone()),
+                indoc! {"
+                    lambda %0:f64[extent], %1:f64[extent] .
+                    let %2:f64[extent] = mul %0 %1
+                        %3:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %2
+                        %4:f64[extent] = zero [type=f64[extent]] %3
+                    in (%2)
+                "}
+                .trim_end(),
+            ),
+            (
+                ArrayType::scalar(DataType::I32),
+                ArrayType::new(DataType::I32, dynamic_shape),
+                indoc! {"
+                    lambda %0:i32[], %1:i32[extent] .
+                    let %2:i32[extent] = mul %0 %1
+                        %3:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %2
+                        %4:zero[extent] = zero [type=zero[extent]] %3
+                    in (%2)
+                "}
+                .trim_end(),
+            ),
+        ] {
+            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |(left, right)| {
+                    let context = DifferentiationContext::fused(left.context().clone());
+                    let inputs = [
+                        DifferentiationDual::new_with_zero_tangent(left)?,
+                        DifferentiationDual::new_with_zero_tangent(right)?,
+                    ];
+                    let output = ArrayOperation::<Array>::Mul(MulOperation::new())
+                        .jvp_in_parent(&context, &EmptyRegionDriver, &inputs)?
+                        .remove(0);
+                    Ok(output.primal().clone())
+                },
+                (ArrayIrType::Array(left_type), ArrayIrType::Array(right_type)),
+            )
+            .unwrap();
+            assert_eq!(program.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_dynamic_zero_space_tangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![1.into(), Dimension::Dynamic(extent.clone()), 1.into()]));
+
+        // Invoke the member rule directly: the program-level all-zero fast path deliberately bypasses it. Integer
+        // primals have a zero differential space, and their structural tangents retain the permuted symbolic shape.
+        // Handling that shape must not attempt an invalid conversion from integers to the `zero` element type.
+        let (_, jvp) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| {
+                let context = DifferentiationContext::fused(input.context().clone());
+                let output = ArrayOperation::<Array>::Transpose(TransposeOperation::new([1, 0, 2]))
+                    .jvp_in_parent(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
+                    )
+                    .unwrap()
+                    .remove(0);
+                assert!(matches!(
+                    output.tangent(),
+                    MaybeZero::Zero(r#type) if r#type == &ArrayIrType::Array(ArrayType::new(
+                        DataType::Zero,
+                        Shape::new(vec![Dimension::Dynamic(extent.clone()), 1.into(), 1.into()]),
+                    )),
+                ));
+                Ok(output.primal().clone())
+            },
+            ArrayIrType::Array(input_type),
+        )
+        .unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:i32[1, extent, 1] .
+                let %1:i32[extent, 1, 1] = transpose [permutation=[1, 0, 2]] %0
+                    %2:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %1
+                    %3:zero[extent, 1, 1] = zero [type=zero[extent, 1, 1]] %2
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            jvp.interpret(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 3, 1]), &[2_i32, 0, 1]).unwrap(),
+            )),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3, 1, 1]), &[2_i32, 0, 1]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            jvp.interpret(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 0, 1]), &[] as &[i32]).unwrap(),
+            )),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [0, 1, 1]), &[] as &[i32]).unwrap(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_dynamic_widened_zero() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The projected constant derivative reads the runtime extent from its primal result and constructs a zero
+        // in the wider tangent representation, without converting the primal's element data.
+        let jvp = program.jvp().unwrap();
+
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[extent], %1:f32[extent] .
+                let %2:f8e8m0fnu[extent] = stop_gradient %0
+                    %3:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %2
+                    %4:f32[extent] = zero [type=f32[extent]] %3
+                in (%2, %4)
+            "}
+            .trim_end(),
+        );
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
+            &[1.0, 2.0, 4.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap();
+        let expected_primal = primal.clone();
+        assert_eq!(
+            jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
+            Ok(vec![
+                ArrayIrValue::Array(expected_primal),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_for_transpose_in_parent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(scalar, scalar_tangent, array)| {
+                let context = DifferentiationContext::fused(array.context().clone());
+                let inputs = [
+                    DifferentiationDual::new(scalar, MaybeZero::Value(scalar_tangent))?,
+                    DifferentiationDual::new_with_zero_tangent(array)?,
+                ];
+                let output = ArrayOperation::<Array>::Mul(MulOperation::new())
+                    .jvp_for_transpose_in_parent(&context, &EmptyRegionDriver, &inputs)?
+                    .remove(0);
+                let MaybeZero::Value(tangent) = output.tangent() else {
+                    panic!("expected a live output tangent");
+                };
+                Ok((output.primal().clone(), tangent.clone()))
+            },
+            (scalar_type.clone(), scalar_type, ArrayIrType::Array(array_type)),
+        )
+        .unwrap();
+
+        // Replicate both the scalar primal and its live tangent using the static row count and dynamic column extent.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[2, extent] .
+                let %3:dimension<2> = constant [value=2]
+                    %4:dimension<extent ∈ [0, 5)> = dimension_size [axis=1] %2
+                    %5:f64[2, extent] = broadcast [output_axes=[]] %0 %3 %4
+                    %6:f64[2, extent] = broadcast [output_axes=[]] %1 %3 %4
+                    %7:f64[2, extent] = mul %5 %2
+                    %8:f64[2, extent] = mul %2 %6
+                in (%7, %8)
+            "}
+            .trim_end(),
+        );
+        let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let primal = ArrayIrValue::Array(Array::matrix(2, 3, vec![2.0f64, 4.0, 6.0, 8.0, 10.0, 12.0]).unwrap());
+        let tangent = ArrayIrValue::Array(Array::matrix(2, 3, vec![3.0f64, 6.0, 9.0, 12.0, 15.0, 18.0]).unwrap());
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(3.0f64).unwrap()),
+                array,
+            )),
+            Ok((primal, tangent)),
+        );
     }
 
     #[test]
