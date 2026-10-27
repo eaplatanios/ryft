@@ -46,9 +46,8 @@ use crate::operations::{
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, NoReferenceTransform, NoReferent, Operation, OperationProjection, OperationProvider, ProgramError,
-    ReferenceAccessDescriptor, ReferenceAccessOperation, Type, TypeError, TypeIdentityPosition, Typed, Value,
-    ValueProjection,
+    MaybeZero, Operation, OperationProjection, OperationProvider, ProgramError, Type, TypeError, TypeIdentityPosition,
+    Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -606,34 +605,6 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.lift()),
             operation => Self::Array(operation),
         }
-    }
-}
-
-// The array-only family has no reference inputs and therefore declares no access layout. It still implements the
-// trait because reverse-mode differentiation and the `reference_freeze` transpose name the family's transform type
-// (i.e., `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference
-// cotangents. For this family, that selection resolves to the reference-free provider, which ordinary array gradients
-// never invoke.
-impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> {
-    type Transform = NoReferenceTransform<NoReferent, ArrayType>;
-
-    fn base_input_count(&self) -> usize {
-        0
-    }
-
-    fn reference_access_descriptor(
-        &self,
-        _input_index: usize,
-    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
-        None
-    }
-
-    fn with_reference_access_transforms(
-        &self,
-        _input_index: usize,
-        _transforms: Vec<Self::Transform>,
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
     }
 }
 

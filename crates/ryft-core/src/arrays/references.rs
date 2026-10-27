@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::{ArrayIrContext, ArrayIrValue};
-use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
@@ -24,12 +24,12 @@ use crate::operations::{
 };
 use crate::parameters::Parameter;
 use crate::programs::{
-    BatchableReferenceTransform, BoundReferenceTransform, Concretizable, NoReferenceTransformBinding, Operation,
-    OperationProjection, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceDischargePolicy,
-    ReferenceDischargeableType, ReferenceError, ReferenceId, ReferenceTransform, ReferenceTransformPath, ReferenceType,
-    ReferenceView, ReferenceViewAnalysis, ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueId,
+    BatchableReferenceTransform, BoundReferenceTransform, Concretizable, NoReferenceTransform,
+    NoReferenceTransformBinding, NoReferent, Operation, OperationProjection, ProgramError,
+    ReadyOrPendingReferenceGuard, Reference, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId,
+    ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView, ReferenceViewAnalysis,
+    ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
 };
 
 /// Error produced by an invalid eager array-reference view operation.
@@ -1336,6 +1336,35 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayIrOperation<A
                 message: format!("`{}` cannot replace the reference transforms at input {}", self.name(), input_index),
             }),
         }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> {
+    // The array-only family has no reference inputs and therefore declares no access layout. It still implements the
+    // trait because reverse mode differentiation and the `reference_freeze` transpose name the family's transform type
+    // (i.e., `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference
+    // cotangents. For this family, that selection resolves to the reference-free provider, which ordinary array
+    // gradients never invoke.
+
+    type Transform = NoReferenceTransform<NoReferent, ArrayType>;
+
+    fn base_input_count(&self) -> usize {
+        0
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        None
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        _input_index: usize,
+        _transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
     }
 }
 
