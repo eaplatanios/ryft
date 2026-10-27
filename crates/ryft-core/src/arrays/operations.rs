@@ -557,47 +557,29 @@ where
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ArrayOperation<A>) -> Self {
         match operation {
             ArrayOperation::Zero(operation) => Self::from(operation),
-            ArrayOperation::ParallelRaggedAllToAll(operation) => Self::ParallelRaggedAllToAll(operation),
-            ArrayOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
-            ArrayOperation::While(operation) => {
-                Self::While(WhileOperation::new().with_iteration_bound(operation.iteration_bound()).unwrap())
+            ArrayOperation::ParallelRaggedAllToAll(operation) => Self::from(operation),
+            ArrayOperation::Condition(operation) => Self::from(operation),
+            ArrayOperation::While(operation) => Self::from(operation),
+            ArrayOperation::Scan(operation) => Self::from(operation),
+            ArrayOperation::Composite(operation) => Self::from(operation),
+            ArrayOperation::CompositeTranspose(operation) => Self::from(operation),
+            ArrayOperation::LinearCall(operation) => Self::from(operation),
+            ArrayOperation::Rematerialize(operation) => Self::from(operation),
+            operation => {
+                // Preserve existing instruction inputs. Mixed payload conversions such as `PadOperation` require
+                // extra extent inputs, which lifting an existing homogeneous instruction cannot introduce.
+                Self::Array(operation)
             }
-            ArrayOperation::Scan(operation) => Self::Scan(
-                ScanOperation::new(operation.carry_count(), operation.iteration_count().clone())
-                    .with_reverse(operation.reverse())
-                    .with_unroll(operation.unroll())
-                    .unwrap(),
-            ),
-            // Composite calls and carriers with attached rules store no source, so they follow their regions into the
-            // native variants. Those with retained rules keep their member definition, which specializes their rules
-            // for this family on demand.
-            ArrayOperation::Composite(operation) => match operation.into_attached_family() {
-                Ok(operation) => Self::Composite(operation),
-                Err(operation) => Self::LiftedComposite(operation.into_family(LiftedCustomRules::Member)),
-            },
-            ArrayOperation::CompositeTranspose(operation) => match operation.into_attached_family() {
-                Ok(operation) => Self::CompositeTranspose(operation),
-                Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(LiftedCustomRules::Member)),
-            },
-            // A linear call stores no types, so it reaches the carrier that owns the extent-threaded region rule
-            // unchanged.
-            ArrayOperation::LinearCall(operation) => {
-                Self::LinearCall(LinearCallOperation::new(operation.residual_count()))
-            }
-            // Lifting a rematerialized call lifts its residual policy, which keeps the identity of the policy (refer to
-            // `ResidualPolicyReference::lift`).
-            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.lift()),
-            operation => Self::Array(operation),
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -1490,6 +1472,31 @@ mod tests {
                     .with_memory(Memory::Host { pinned: true })
                     .into()
             ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_lifting_preserves_homogeneous_input_signatures() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let output_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]));
+
+        // Existing homogeneous instructions retain their original inputs. The mixed payload constructors require
+        // additional extent inputs, so their direct `From` implementations cannot lift these instructions.
+        let pad =
+            ArrayIrOperation::<Array>::from(ArrayOperation::Pad(PadOperation::new(vec![1], vec![1], vec![0]).unwrap()));
+        assert!(matches!(pad, ArrayIrOperation::Array(ArrayOperation::Pad(_))));
+        assert_eq!(
+            pad.infer_output_types(&[array_type.clone().into(), scalar_type.into()], &[]),
+            Ok(vec![output_type.clone()]),
+        );
+        let concatenate = ArrayIrOperation::<Array>::from(ArrayOperation::Concatenate(
+            ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(),
+        ));
+        assert!(matches!(concatenate, ArrayIrOperation::Array(ArrayOperation::Concatenate(_))));
+        assert_eq!(
+            concatenate.infer_output_types(&[array_type.clone().into(), array_type.into()], &[]),
+            Ok(vec![output_type]),
         );
     }
 

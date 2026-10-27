@@ -4573,10 +4573,10 @@ pub(crate) mod tests {
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_types, impl_guardless_operation};
     use crate::operations::{
-        AddOperation, CastOperation, ConditionOperation, Constant, GuardOperation, MulOperation, PrintOperation,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, ZeroOperation,
+        AddOperation, CastOperation, ConditionOperation, Constant, MulOperation, PrintOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
+        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -10191,124 +10191,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_transpose_projected_operation_preserves_contribution_provenance() {
-        /// Member rule that submits two identity contributions under different local scopes.
-        #[derive(Clone, Debug)]
-        enum ScopedMemberOperation {
-            Scoped,
-            Add(AddOperation<ArrayType>),
-        }
-
-        impl Operation for ScopedMemberOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                match self {
-                    Self::Scoped => "scoped_member",
-                    Self::Add(operation) => operation.name(),
-                }
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                if let Self::Add(operation) = self {
-                    return operation.infer_output_types(input_types, _region_interfaces);
-                }
-                check_count!("input", input_types, 1, TypeError);
-                Ok(input_types.to_vec())
-            }
-        }
-
-        impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>>>
-            TransposableOperation<V, O> for ScopedMemberOperation
-        where
-            O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
-        {
-            fn transpose<D: TranspositionDriver<V, O>>(
-                &self,
-                context: &mut TranspositionContext<V, O>,
-                _driver: &D,
-                inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-                outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-                accumulators: &[CotangentAccumulator],
-            ) -> Result<(), DifferentiationError> {
-                let input_count = if matches!(self, Self::Add(_)) { 2 } else { 1 };
-                check_count!("input", inputs, input_count, ProgramError);
-                check_count!("output", outputs, 1, ProgramError);
-                check_count!("accumulator", accumulators, input_count, DifferentiationError);
-                if matches!(self, Self::Add(_)) {
-                    for (input, accumulator) in inputs.iter().zip(accumulators) {
-                        if matches!(input, PartialValue::Unknown(_)) {
-                            accumulator.accumulate(context, outputs[0].clone())?;
-                        }
-                    }
-                    return Ok(());
-                }
-                (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("first"), || {
-                    accumulators[0].accumulate(context, outputs[0].clone())
-                })?;
-                (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("second"), || {
-                    accumulators[0].accumulate(context, outputs[0].clone())
-                })
-            }
-        }
-
-        impl_guardless_operation!(ScopedMemberOperation);
-
-        impl From<AddOperation<ArrayType>> for ScopedMemberOperation {
-            fn from(operation: AddOperation<ArrayType>) -> Self {
-                Self::Add(operation)
-            }
-        }
-
-        /// Array IR carrier that preserves additions staged inside the member rule.
-        #[derive(Clone, Debug)]
-        struct ScopedProgramOperation(ScopedMemberOperation);
-
-        impl Operation for ScopedProgramOperation {
-            type Type = ArrayIrType;
-
-            fn name(&self) -> &'static str {
-                self.0.name()
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayIrType],
-                region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Vec<ArrayIrType>, TypeError> {
-                let input_types = input_types
-                    .iter()
-                    .map(|value| <&ArrayType>::try_from(value).cloned())
-                    .collect::<Result<Vec<_>, _>>()?;
-                check_count!("region", region_interfaces, 0, TypeError);
-                Ok(self.0.infer_output_types(&input_types, &[])?.into_iter().map(ArrayIrType::from).collect())
-            }
-        }
-
-        impl_guardless_operation!(ScopedProgramOperation);
-
-        impl From<ScopedMemberOperation> for ScopedProgramOperation {
-            fn from(operation: ScopedMemberOperation) -> Self {
-                Self(operation)
-            }
-        }
-
-        impl From<AddOperation<ArrayIrType>> for ScopedProgramOperation {
-            fn from(_operation: AddOperation<ArrayIrType>) -> Self {
-                Self(ScopedMemberOperation::Add(AddOperation::new()))
-            }
-        }
-
-        impl OperationProjection<ArrayType> for ScopedProgramOperation {
-            type Projected = ScopedMemberOperation;
-        }
-
+        // The member rule submits two identity contributions under different local scopes.
         let mut context =
-            TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ScopedProgramOperation>::new());
-        let r#type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+            TranspositionContext::new(TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
+        let r#type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
         let seed = context.input(r#type.clone());
         let inputs = [PartialValue::Unknown(r#type)];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
@@ -10318,7 +10204,7 @@ pub(crate) mod tests {
             .invoke_with_provenance_origin(origin.clone(), || {
                 transpose_projected_operation(
                     &mut context,
-                    &ScopedMemberOperation::Scoped,
+                    &ProjectedMemberOperation::<2>::Scoped,
                     &inputs,
                     &[MaybeZero::Value(seed.clone())],
                     &accumulators,
@@ -10382,116 +10268,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_transpose_mixed_operation() {
-        /// Test-only linear member operation consuming two member-typed data inputs. No production mixed payload
-        /// interleaves its data and shape inputs, so this fixture is what pins that mixed transposition classifies
-        /// inputs one by one instead of splitting the input list at its first shape input.
-        #[derive(Clone, Debug)]
-        enum InterleavedMemberOperation {
-            Interleaved,
-            Add,
-        }
-
-        impl Operation for InterleavedMemberOperation {
-            type Type = ProjectedMemberType<2>;
-
-            fn name(&self) -> &'static str {
-                match self {
-                    Self::Interleaved => "interleaved_member",
-                    Self::Add => "add",
-                }
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ProjectedMemberType<2>],
-                region_interfaces: &[RegionInterface<ProjectedMemberType<2>>],
-            ) -> Result<Vec<ProjectedMemberType<2>>, TypeError> {
-                check_count!("input", input_types, 2, TypeError);
-                check_count!("region", region_interfaces, 0, TypeError);
-                Ok(vec![ProjectedMemberType])
-            }
-        }
-
-        impl<
-            V: Value<Type = ProjectedMemberType<2>>,
-            O: Operation<Type = ProjectedMemberType<2>> + From<AddOperation<ProjectedMemberType<2>>>,
-        > TransposableOperation<V, O> for InterleavedMemberOperation
-        where
-            O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
-        {
-            fn transpose<D: TranspositionDriver<V, O>>(
-                &self,
-                context: &mut TranspositionContext<V, O>,
-                _driver: &D,
-                inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-                outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-                accumulators: &[CotangentAccumulator],
-            ) -> Result<(), DifferentiationError> {
-                check_count!("input", inputs, 2, ProgramError);
-                check_count!("output", outputs, 1, ProgramError);
-                check_count!("accumulator", accumulators, 2, DifferentiationError);
-                for (input, accumulator) in inputs.iter().zip(accumulators) {
-                    if matches!(input, PartialValue::Unknown(_)) {
-                        accumulator.accumulate(context, outputs[0].clone())?;
-                    }
-                }
-                Ok(())
-            }
-        }
-
-        impl_guardless_operation!(InterleavedMemberOperation);
-
-        impl From<AddOperation<ProjectedMemberType<2>>> for InterleavedMemberOperation {
-            fn from(_operation: AddOperation<ProjectedMemberType<2>>) -> Self {
-                Self::Add
-            }
-        }
-
-        /// Heterogeneous carrier whose canonical third-member projection is [`InterleavedMemberOperation`].
-        #[derive(Clone, Debug)]
-        struct InterleavedProgramOperation(InterleavedMemberOperation);
-
-        impl Operation for InterleavedProgramOperation {
-            type Type = ProjectedProgramType;
-
-            fn name(&self) -> &'static str {
-                self.0.name()
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ProjectedProgramType],
-                region_interfaces: &[RegionInterface<ProjectedProgramType>],
-            ) -> Result<Vec<ProjectedProgramType>, TypeError> {
-                check_count!("region", region_interfaces, 0, TypeError);
-                if matches!(self.0, InterleavedMemberOperation::Add) {
-                    check_count!("input", input_types, 2, TypeError);
-                    check_types!(@same, "addition input", [&input_types[..1], &input_types[1..]]);
-                    return Ok(vec![input_types[0].clone()]);
-                }
-                Ok(vec![ProjectedProgramType::Third(ProjectedMemberType)])
-            }
-        }
-
-        impl_guardless_operation!(InterleavedProgramOperation);
-
-        impl From<InterleavedMemberOperation> for InterleavedProgramOperation {
-            fn from(operation: InterleavedMemberOperation) -> Self {
-                Self(operation)
-            }
-        }
-
-        impl From<AddOperation<ProjectedProgramType>> for InterleavedProgramOperation {
-            fn from(_operation: AddOperation<ProjectedProgramType>) -> Self {
-                Self(InterleavedMemberOperation::Add)
-            }
-        }
-
-        impl OperationProjection<ProjectedMemberType<2>> for InterleavedProgramOperation {
-            type Projected = InterleavedMemberOperation;
-        }
-
-        type Context = TracingContext<ProjectedProgramValue, InterleavedProgramOperation>;
+        // The member addition is linear in its two member-typed data inputs. No production mixed payload interleaves
+        // its data and shape inputs, so this test is what pins that mixed transposition classifies inputs one by one
+        // instead of splitting the input list at its first shape input.
+        type Context = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
 
         // Data inputs at positions 0 and 2 are delegated to the member rule in that order, and the shape inputs
         // between and after them receive structural zeros in their own member universe.
@@ -10508,7 +10288,7 @@ pub(crate) mod tests {
         let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
         transpose_mixed_operation(
             &mut context,
-            &InterleavedMemberOperation::Interleaved,
+            &ProjectedMemberOperation::<2>::Add,
             inputs,
             &[MaybeZero::Value(output_cotangent.clone())],
             &accumulators,
@@ -10540,7 +10320,7 @@ pub(crate) mod tests {
         let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
         transpose_mixed_operation(
             &mut context,
-            &InterleavedMemberOperation::Interleaved,
+            &ProjectedMemberOperation::<2>::Add,
             inputs,
             &[MaybeZero::Value(output_cotangent.clone())],
             &accumulators,
@@ -10566,7 +10346,7 @@ pub(crate) mod tests {
         let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
         transpose_mixed_operation(
             &mut context,
-            &InterleavedMemberOperation::Interleaved,
+            &ProjectedMemberOperation::<2>::Add,
             inputs,
             &[MaybeZero::Value(output_cotangent.clone())],
             &accumulators,

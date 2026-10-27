@@ -1376,19 +1376,17 @@ mod tests {
     use crate::axes::{AxisError, NamedAxes};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
-    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::impl_guardless_operation;
     use crate::operations::{
-        AddOperation, AxisIndex, ConditionOperation, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike,
-        OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite,
-        ZeroLike, ZeroOperation,
+        AddOperation, AssertOperation, AxisIndex, ConditionOperation, DimensionAddOperation, LinearCallOperation,
+        NegOperation, OneLike, OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead,
+        ReferenceSwap, ReferenceWrite, ZeroLike, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, Operation, ProgramError, ReferenceBoundary, ReferenceType, ReferenceView,
-        RegionInterface, TypeError, Typed,
+        TypeError, Typed,
     };
-    use crate::tests::TestArrayContext;
+    use crate::tests::{TestArrayContext, TestArrayTracingContext};
 
     use super::*;
 
@@ -1632,49 +1630,14 @@ mod tests {
 
     #[test]
     fn test_tracer_unary_records_invalid_output_count_and_returns_poisoned_tracer() {
-        // The unary tracer must reject this deliberately empty output signature; ordinary array operations
-        // cannot replace this sentinel without losing the invalid-output contract.
-        #[derive(Copy, Clone, Debug)]
-        struct NoOutputOperation;
-
-        impl Operation for NoOutputOperation {
-            type Type = ArrayType;
-
-            #[inline]
-            fn name(&self) -> &'static str {
-                "no_output"
-            }
-
-            fn infer_output_types(
-                &self,
-                _input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                Ok(Vec::new())
-            }
-        }
-
-        impl<C: Domain<Type = ArrayType, Value = Array>> InterpretableOperation<C> for NoOutputOperation {
-            #[inline]
-            fn interpret<D: InterpretationDriver<C>>(
-                &self,
-                _context: &C,
-                _driver: &D,
-                _inputs: &[Array],
-            ) -> Result<Vec<Array>, ProgramError> {
-                Ok(Vec::new())
-            }
-        }
-
-        impl_guardless_operation!(NoOutputOperation);
-
-        let context = TracingContext::<Array, NoOutputOperation>::new();
+        // The unary tracer must reject the empty output signature of an assertion.
+        let context = TestArrayTracingContext::new();
         let builder = context.builder().clone();
-        let input_type = ArrayType::scalar(DataType::F64);
+        let input_type = ArrayType::scalar(DataType::Boolean);
         let tracer = context.input(input_type);
-        let output = tracer.unary(NoOutputOperation);
+        let output = tracer.unary(AssertOperation::new("condition must hold"));
         assert!(matches!(output.state(), TracerState::Poison));
-        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::Boolean));
         assert_eq!(
             builder.borrow().error().cloned(),
             Some(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),

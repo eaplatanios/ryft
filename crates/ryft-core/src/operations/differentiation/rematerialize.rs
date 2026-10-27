@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::arrays::{ArrayType, DataType};
+use crate::arrays::{ArrayIrType, ArrayType, DataType};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy,
@@ -744,6 +744,14 @@ where
             accumulators[index].accumulate(context, cotangent)?;
         }
         Ok(())
+    }
+}
+
+impl From<RematerializeOperation<ArrayType>> for RematerializeOperation<ArrayIrType> {
+    #[inline]
+    fn from(operation: RematerializeOperation<ArrayType>) -> Self {
+        // The operation's lift preserves policy identity together with its lowering and differentiation flags.
+        operation.lift()
     }
 }
 

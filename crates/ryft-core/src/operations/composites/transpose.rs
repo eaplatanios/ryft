@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use crate::arrays::{ArrayIrOperation, ArrayOperation, ArrayType};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
@@ -25,7 +26,7 @@ use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
     CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward,
-    boundary_input_count, validate_rule_output_types,
+    LiftedCustomRules, boundary_input_count, validate_rule_output_types,
 };
 use crate::operations::composites::{
     describe_composite_transpose, retained_carrier_batching, validate_composite_discharge_inputs,
@@ -1183,6 +1184,17 @@ where
     }
 }
 
+impl<A: Value<Type = ArrayType>> From<CompositeTransposeOperation<A, ArrayOperation<A>>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: CompositeTransposeOperation<A, ArrayOperation<A>>) -> Self {
+        // Attached backward regions use the native carrier; retained rules preserve their original member source.
+        match operation.into_attached_family() {
+            Ok(operation) => Self::CompositeTranspose(operation),
+            Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(LiftedCustomRules::Member)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1202,10 +1214,9 @@ mod tests {
         CotangentDestinationKind, DifferentiationRule, TransposedProgram, TransposedProgramCotangent,
         TranspositionDriver,
     };
-    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::arithmetic::{AddOperation, MulOperation};
-    use crate::operations::composites::call::CompositeOperation;
-    use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleRegistration, LiftedCustomRules};
+    use crate::operations::arithmetic::MulOperation;
+    use crate::operations::composites::call::{CompositeJvpRule, CompositeOperation};
+    use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
         ArrayContext, ConvertedProgram, IrDefinition, IrTracer, RuleCounters, batched_program, cube_definition,
         custom_rule_program, ir_custom_rule_program, member_cube_definition,
@@ -1213,21 +1224,16 @@ mod tests {
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
-    use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::differentiation::linear_call::tests::scalar_multiply_program;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::manipulation::padding::PadOperation;
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::references::ReferenceAddUpdateOperation;
     use crate::parameters::Placeholder;
-    use crate::partial::{
-        PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue,
-        PartialValue, PartiallyEvaluatableOperation,
-    };
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
     use crate::programs::{
-        AtomId, EffectClasses, Effects, FlatProgram, InputRegionProvenance, MaybeZero, OperationProvider,
-        OutputRegionProvenance, Program, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation,
-        RegionDataFlow, RegionDriver, RegionInterface, RegionRef, RegionSlot, ValueProjection,
+        AtomId, EffectClasses, FlatProgram, MaybeZero, Program, ProgramBuilder, RegionDataFlow, RegionDriver,
+        RegionInterface, RegionRef, RegionSlot, ValueProjection,
     };
     use crate::tracing::{Trace, TracingContext};
 
@@ -1292,277 +1298,21 @@ mod tests {
             .unwrap()
     }
 
-    /// Retained-rule definition over [`ReferenceTestOperation`].
-    type ReferenceTestDefinition = CustomRuleDefinition<ArrayIrValue<Array>, ReferenceTestOperation>;
+    /// Registration of a retained-rule definition in the array IR family.
+    type IrRegistration = CustomRuleRegistration<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Registration of a [`ReferenceTestDefinition`].
-    type ReferenceTestRegistration = CustomRuleRegistration<ArrayIrValue<Array>, ReferenceTestOperation>;
-
-    /// Program builder over [`ReferenceTestOperation`].
-    type ReferenceTestBuilder = ProgramBuilder<ArrayIrValue<Array>, ReferenceTestOperation>;
-
-    /// Reverse-mode carrier in the [`ReferenceTestOperation`] family.
-    type ReferenceTestCarrier = CompositeTransposeOperation<ArrayIrValue<Array>, ReferenceTestOperation>;
-
-    /// Reference-capable operation family for the carrier tests that need caller-owned cotangent buffers or reference
-    /// effects, which [`ArrayOperation`] lacks. It hosts the reverse-mode carrier, which tests construct directly
-    /// as reverse-mode linearization would stage it, together with the ordinary array IR operations that backward rules
-    /// emit, a region-carrying computation, and the production condition and linear call. It supports direct
-    /// transposition rather than differentiation.
-    #[derive(Clone, Debug)]
-    enum ReferenceTestOperation {
-        Base(ArrayIrOperation<Array>),
-        Computation,
-        Condition(ConditionOperation<ArrayIrType>),
-        LinearCall(LinearCallOperation<ArrayIrType>),
-        CompositeTranspose(ReferenceTestCarrier),
-    }
-
-    impl Operation for ReferenceTestOperation {
-        type Type = ArrayIrType;
-
-        fn name(&self) -> &'static str {
-            match self {
-                Self::Base(operation) => operation.name(),
-                Self::Computation => "computation",
-                Self::Condition(operation) => operation.name(),
-                Self::LinearCall(operation) => operation.name(),
-                Self::CompositeTranspose(operation) => operation.name(),
-            }
-        }
-
-        fn region_slots(&self) -> &'static [RegionSlot] {
-            match self {
-                Self::Computation => const { &[RegionSlot::computation("body")] },
-                Self::Condition(operation) => operation.region_slots(),
-                Self::LinearCall(operation) => operation.region_slots(),
-                Self::CompositeTranspose(operation) => operation.region_slots(),
-                Self::Base(_) => &[],
-            }
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[ArrayIrType],
-            region_interfaces: &[RegionInterface<ArrayIrType>],
-        ) -> Result<Vec<ArrayIrType>, TypeError> {
-            match self {
-                Self::Base(operation) => operation.infer_output_types(input_types, region_interfaces),
-                Self::Computation => Ok(region_interfaces[0].output_types().to_vec()),
-                Self::Condition(operation) => operation.infer_output_types(input_types, region_interfaces),
-                Self::LinearCall(operation) => operation.infer_output_types(input_types, region_interfaces),
-                Self::CompositeTranspose(operation) => operation.infer_output_types(input_types, region_interfaces),
-            }
-        }
-
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
-            match self {
-                Self::Base(operation) => operation.input_region_provenance(region_index, input_index),
-                Self::Computation => InputRegionProvenance::Input { index: input_index },
-                Self::Condition(operation) => operation.input_region_provenance(region_index, input_index),
-                Self::LinearCall(operation) => operation.input_region_provenance(region_index, input_index),
-                Self::CompositeTranspose(operation) => operation.input_region_provenance(region_index, input_index),
-            }
-        }
-
-        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-            match self {
-                Self::Base(operation) => operation.output_region_provenance(output_index),
-                Self::Computation => vec![OutputRegionProvenance { region_index: 0, output_index }],
-                Self::Condition(operation) => operation.output_region_provenance(output_index),
-                Self::LinearCall(operation) => operation.output_region_provenance(output_index),
-                Self::CompositeTranspose(operation) => operation.output_region_provenance(output_index),
-            }
-        }
-
-        fn effects(&self) -> Cow<'_, Effects> {
-            match self {
-                Self::Base(operation) => operation.effects(),
-                Self::Computation => Cow::Borrowed(Effects::empty()),
-                Self::Condition(operation) => operation.effects(),
-                Self::LinearCall(operation) => operation.effects(),
-                Self::CompositeTranspose(operation) => operation.effects(),
-            }
-        }
-
-        fn rename_type_identities(
-            &self,
-            renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
-        ) -> Result<Self, TypeError> {
-            match self {
-                Self::Base(operation) => operation.rename_type_identities(renaming).map(Self::Base),
-                Self::Computation => Ok(Self::Computation),
-                Self::Condition(operation) => operation.rename_type_identities(renaming).map(Self::Condition),
-                Self::LinearCall(operation) => operation.rename_type_identities(renaming).map(Self::LinearCall),
-                Self::CompositeTranspose(operation) => {
-                    operation.rename_type_identities(renaming).map(Self::CompositeTranspose)
-                }
-            }
-        }
-
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-            match self {
-                Self::Base(operation) => operation.render(formatter, indentation),
-                Self::Computation => write!(formatter, "computation"),
-                Self::Condition(operation) => operation.render(formatter, indentation),
-                Self::LinearCall(operation) => operation.render(formatter, indentation),
-                Self::CompositeTranspose(operation) => operation.render(formatter, indentation),
-            }
-        }
-    }
-
-    impl<Request> OperationProvider<ArrayIrType, Request> for ReferenceTestOperation
-    where
-        ArrayIrOperation<Array>: OperationProvider<ArrayIrType, Request, Operation = ArrayIrOperation<Array>>,
-    {
-        type Operation = Self;
-
-        fn provide(request: Request, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            ArrayIrOperation::<Array>::provide(request, input_types).map(Self::Base)
-        }
-    }
-
-    impl From<AddOperation<ArrayType>> for ReferenceTestOperation {
-        fn from(operation: AddOperation<ArrayType>) -> Self {
-            Self::Base(operation.into())
-        }
-    }
-
-    impl From<ConditionOperation<ArrayIrType>> for ReferenceTestOperation {
-        fn from(operation: ConditionOperation<ArrayIrType>) -> Self {
-            Self::Condition(operation)
-        }
-    }
-
-    impl From<LinearCallOperation<ArrayIrType>> for ReferenceTestOperation {
-        fn from(operation: LinearCallOperation<ArrayIrType>) -> Self {
-            Self::LinearCall(operation)
-        }
-    }
-
-    impl From<ReferenceTestCarrier> for ReferenceTestOperation {
-        fn from(operation: ReferenceTestCarrier) -> Self {
-            Self::CompositeTranspose(operation)
-        }
-    }
-
-    // Only static array shapes are used where structural cotangent zeros must be materialized.
-    impl ResidualZeroProvider<ArrayIrType> for ReferenceTestOperation {}
-
-    impl ReferenceAccessOperation for ReferenceTestOperation {
-        type Transform = ArrayReferenceTransform;
-
-        fn base_input_count(&self) -> usize {
-            match self {
-                Self::Base(operation) => operation.base_input_count(),
-                Self::Computation => 2,
-                Self::Condition(_) => 3,
-                Self::LinearCall(_) => 0,
-                Self::CompositeTranspose(operation) => {
-                    operation.leading_input_count + operation.input_tangent_types.len()
-                }
-            }
-        }
-
-        fn reference_access_descriptor(
-            &self,
-            input_index: usize,
-        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
-            match self {
-                Self::Base(operation) => operation.reference_access_descriptor(input_index),
-                Self::Computation | Self::Condition(_) | Self::LinearCall(_) | Self::CompositeTranspose(_) => None,
-            }
-        }
-
-        fn with_reference_access_transforms(
-            &self,
-            input_index: usize,
-            transforms: Vec<Self::Transform>,
-        ) -> Result<Self, ProgramError> {
-            match self {
-                Self::Base(operation) => {
-                    operation.with_reference_access_transforms(input_index, transforms).map(Self::Base)
-                }
-                Self::Computation | Self::Condition(_) | Self::LinearCall(_) | Self::CompositeTranspose(_) => {
-                    Err(ProgramError::UnsupportedOperation {
-                        message: format!("`{}` has no reference access inputs", self.name()),
-                    })
-                }
-            }
-        }
-    }
-
-    impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, Self>> for ReferenceTestOperation {
-        fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, Self>>>(
-            &self,
-            context: &EagerContext<ArrayIrValue<Array>, Self>,
-            driver: &D,
-            inputs: &[ArrayIrValue<Array>],
-        ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
-            match self {
-                Self::Base(operation) => EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().bind(
-                    operation.clone(),
-                    Vec::new(),
-                    inputs,
-                ),
-                Self::Computation => driver.interpret_region(context, 0, inputs.to_vec()),
-                Self::Condition(operation) => operation.interpret(context, driver, inputs),
-                Self::LinearCall(operation) => operation.interpret(context, driver, inputs),
-                Self::CompositeTranspose(operation) => operation.interpret(context, driver, inputs),
-            }
-        }
-    }
-
-    // Every operation other than the production condition uses the default rule, whose shared folding boundary
-    // residualizes deferred work without carrier-specific checks.
-    impl<C: Context<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = Self>>
-        PartiallyEvaluatableOperation<C> for ReferenceTestOperation
-    {
-        fn partially_evaluate<D: PartialEvaluationDriver<C>>(
-            &self,
-            context: &PartialEvaluationContext<C>,
-            driver: &D,
-            inputs: &[PartialEvaluationValue<C::Value>],
-        ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-            if let Self::Condition(operation) = self {
-                return operation.partially_evaluate(context, driver, inputs);
-            }
-            context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
-        }
-    }
-
-    impl TransposableOperation<ArrayIrValue<Array>, Self> for ReferenceTestOperation {
-        fn transpose<D: TranspositionDriver<ArrayIrValue<Array>, Self>>(
-            &self,
-            context: &mut TranspositionContext<ArrayIrValue<Array>, Self>,
-            driver: &D,
-            inputs: &[PartialValue<CustomRuleTracer<ArrayIrValue<Array>, Self>>],
-            outputs: &[MaybeZero<CustomRuleTracer<ArrayIrValue<Array>, Self>>],
-            accumulators: &[CotangentAccumulator],
-        ) -> Result<(), DifferentiationError> {
-            match self {
-                Self::Condition(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
-                Self::LinearCall(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
-                Self::CompositeTranspose(operation) => {
-                    operation.transpose(context, driver, inputs, outputs, accumulators)
-                }
-                Self::Base(_) | Self::Computation => Err(ProgramError::UnsupportedOperation {
-                    message: format!("`{}` is not transposed by these tests", self.name()),
-                }
-                .into()),
-            }
-        }
-    }
+    /// Program builder in the array IR family.
+    type IrBuilder = ProgramBuilder<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Returns a reverse-mode carrier of `definition`, as reverse-mode linearization of a call would stage it, whose
     /// first `leading_input_count` inputs are known.
-    fn reference_test_carrier(
-        rules: CustomRuleReference<ArrayIrValue<Array>, ReferenceTestOperation>,
+    fn retained_carrier(
+        rules: CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
         leading_input_count: usize,
         input_tangent_types: Vec<ArrayIrType>,
         output_tangent_types: Vec<ArrayIrType>,
-    ) -> ReferenceTestOperation {
-        ReferenceTestOperation::CompositeTranspose(CompositeTransposeOperation::new(
+    ) -> ArrayIrOperation<Array> {
+        ArrayIrOperation::CompositeTranspose(CompositeTransposeOperation::new(
             rules,
             leading_input_count,
             input_tangent_types,
@@ -1573,15 +1323,15 @@ mod tests {
     /// Returns a definition whose backward rule increments the known leading reference by one exactly when its
     /// differentiated input's cotangent is ignored and its output seed is a structural zero, so the effect exists only
     /// in that specialization.
-    fn ignored_zero_effect_definition() -> ReferenceTestRegistration {
-        CustomRuleRegistration::new(ReferenceTestDefinition::new("ignored_zero_effect").with_accumulating_vjp(
+    fn ignored_zero_effect_definition() -> IrRegistration {
+        CustomRuleRegistration::new(IrDefinition::new("ignored_zero_effect").with_accumulating_vjp(
             |_| unreachable!("the tests construct the carrier directly"),
             |context, inputs, seeds, accumulators| {
                 if !accumulators[1].is_needed() && matches!(&seeds[0], MaybeZero::Zero(_)) {
                     let stash = inputs[0].as_known().unwrap().clone();
                     let increment = context.lift(ArrayIrValue::Array(Array::scalar(1.0f64)?))?;
                     context.bind(
-                        ReferenceTestOperation::Base(ReferenceAddUpdateOperation::new().into()),
+                        ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                         Vec::new(),
                         &[stash, increment],
                     )?;
@@ -1592,22 +1342,17 @@ mod tests {
     }
 
     /// Returns the carrier of [`ignored_zero_effect_definition`] over a known reference and a scalar tangent.
-    fn ignored_zero_effect_carrier() -> ReferenceTestOperation {
+    fn ignored_zero_effect_carrier() -> ArrayIrOperation<Array> {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        reference_test_carrier(
-            ignored_zero_effect_definition().reference(),
-            1,
-            vec![scalar_type.clone()],
-            vec![scalar_type],
-        )
+        retained_carrier(ignored_zero_effect_definition().reference(), 1, vec![scalar_type.clone()], vec![scalar_type])
     }
 
     /// Returns a definition whose backward rule adds the output seed to the element at index 1 of its single
     /// differentiated input's cotangent, counting its invocations in `invocations`. A caller buffer receives a slice
     /// update without any full-sized temporary, while a returned cotangent is padded to the input extent.
-    fn slice_at_one_definition(invocations: &Arc<AtomicUsize>) -> ReferenceTestRegistration {
+    fn slice_at_one_definition(invocations: &Arc<AtomicUsize>) -> IrRegistration {
         let invocations = invocations.clone();
-        CustomRuleRegistration::new(ReferenceTestDefinition::new("slice_at_one").with_accumulating_vjp(
+        CustomRuleRegistration::new(IrDefinition::new("slice_at_one").with_accumulating_vjp(
             |_| unreachable!("the tests construct the carrier directly"),
             move |context, inputs, seeds, accumulators| {
                 invocations.fetch_add(1, Ordering::SeqCst);
@@ -1623,7 +1368,7 @@ mod tests {
                             axes: vec![ArraySliceAxis::new(1, 1, 1)],
                         }]);
                     context.bind(
-                        ReferenceTestOperation::Base(operation.into()),
+                        ArrayIrOperation::ReferenceAddUpdate(operation),
                         Vec::new(),
                         &[reference, seed.clone()],
                     )?;
@@ -1636,9 +1381,7 @@ mod tests {
                         vec![extent as i64 - 2],
                         vec![0],
                     )?));
-                    let output = context
-                        .bind(ReferenceTestOperation::Base(operation), Vec::new(), &[seed.clone(), zero])?
-                        .remove(0);
+                    let output = context.bind(operation, Vec::new(), &[seed.clone(), zero])?.remove(0);
                     accumulators[0].accumulate(context, MaybeZero::Value(output))?;
                 }
                 Ok(())
@@ -1648,12 +1391,12 @@ mod tests {
 
     /// Stages the carrier of `definition` over one differentiated input of type `input_type` with an `f64[1]` output.
     fn slice_at_one_program(
-        definition: &ReferenceTestRegistration,
+        definition: &IrRegistration,
         input_type: ArrayType,
-    ) -> Program<ArrayIrValue<Array>, ReferenceTestOperation, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
-        let mut builder = ReferenceTestBuilder::new();
+    ) -> Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
+        let mut builder = IrBuilder::new();
         let input = builder.add_input(input_type.clone().into());
-        let carrier = reference_test_carrier(
+        let carrier = retained_carrier(
             definition.reference(),
             0,
             vec![input_type.into()],
@@ -1935,7 +1678,7 @@ mod tests {
     fn test_composite_transpose_interpretation_retained_rules() {
         // The carrier has no forward program, so ordinary execution and forward mode reject it.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
-        let context = EagerContext::<ArrayIrValue<Array>, ReferenceTestOperation>::new();
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert!(matches!(
             context.bind(
                 ignored_zero_effect_carrier(),
@@ -1980,7 +1723,8 @@ mod tests {
     #[test]
     fn test_composite_transpose_partial_evaluation_retained_rules_disconnected() {
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
-        let context = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ReferenceTestOperation>::new());
+        let context =
+            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let tangent = context.unknown_input(ArrayType::scalar(DataType::F64).into(), 0);
         context
             .residualize(
@@ -2002,7 +1746,7 @@ mod tests {
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
         let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let mut body = ReferenceTestBuilder::new();
+        let mut body = IrBuilder::new();
         let reference = body.add_input(reference_type.clone());
         let tangent = body.add_input(tangent_type.clone());
         body.add_instruction(ignored_zero_effect_carrier(), Vec::new(), vec![reference, tangent], None)
@@ -2014,12 +1758,20 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        let mut builder = ReferenceTestBuilder::new();
+        // A composite call without rules is a plain region-carrying computation whose reference input must be one of
+        // its leading non-differentiated inputs.
+        let call = CompositeOperation::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::from_rule_regions(
+            CompositeJvpRule::Absent,
+            false,
+        )
+        .with_non_differentiated_count(1)
+        .unwrap();
+        let mut builder = IrBuilder::new();
         let region = builder.import_region(body.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let tangent = builder.add_input(tangent_type.clone());
         builder
-            .add_instruction(ReferenceTestOperation::Computation, vec![region], vec![reference, tangent], None)
+            .add_instruction(ArrayIrOperation::Composite(call), vec![region], vec![reference, tangent], None)
             .unwrap();
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2031,7 +1783,7 @@ mod tests {
         assert!(program.entry_region_ref().effects().has_deferred_work());
 
         // Partial evaluation never folds deferred work, even when every input is known.
-        let parent = TracingContext::<ArrayIrValue<Array>, ReferenceTestOperation>::new();
+        let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let evaluation = program
             .partially_evaluate_in_context(
                 &parent,
@@ -2042,8 +1794,8 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:ref<f64[]>, %1:f64[] .
-                let () = computation %0 %1 [
-                    body={
+                let () = composite [non_differentiated_count=1] %0 %1 [
+                    primal={
                         lambda %0:ref<f64[]>, %1:f64[] .
                         let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %0 %1
                         in ()
@@ -2709,7 +2461,7 @@ mod tests {
     #[test]
     fn test_composite_transpose_transposition_retained_rules_disconnected() {
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
-        let mut builder = ReferenceTestBuilder::new();
+        let mut builder = IrBuilder::new();
         let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
         let tangent = builder.add_input(ArrayType::scalar(DataType::F64).into());
         builder
@@ -2747,7 +2499,7 @@ mod tests {
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
         let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let mut true_branch = ReferenceTestBuilder::new();
+        let mut true_branch = IrBuilder::new();
         let tangent = true_branch.add_input(tangent_type.clone());
         let reference = true_branch.add_input(reference_type.clone());
         true_branch
@@ -2760,7 +2512,7 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        let mut false_branch = ReferenceTestBuilder::new();
+        let mut false_branch = IrBuilder::new();
         false_branch.add_input(tangent_type.clone());
         false_branch.add_input(reference_type.clone());
         let false_branch = false_branch
@@ -2770,7 +2522,7 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        let mut builder = ReferenceTestBuilder::new();
+        let mut builder = IrBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayIrValue::Array(Array::scalar(true).unwrap()).r#type().into_owned());
@@ -2778,7 +2530,7 @@ mod tests {
         let reference = builder.add_input(reference_type);
         builder
             .add_instruction(
-                ReferenceTestOperation::Condition(ConditionOperation::new()),
+                ArrayIrOperation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, tangent, reference],
                 None,
@@ -2792,7 +2544,7 @@ mod tests {
             )
             .unwrap();
         assert!(program.entry_region_ref().effects().has_deferred_work());
-        let parent = TracingContext::<ArrayIrValue<Array>, ReferenceTestOperation>::new();
+        let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let known_inputs = program
             .input_types()
             .into_iter()
@@ -2845,16 +2597,17 @@ mod tests {
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
         let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let attached_carrier = CompositeTransposeOperation::from_backward_region(
-            1,
-            vec![tangent_type.clone()],
-            vec![tangent_type.clone()],
-        );
+        let attached_carrier =
+            ArrayIrOperation::<Array>::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
+                1,
+                vec![tangent_type.clone()],
+                vec![tangent_type.clone()],
+            ));
 
         // Builds a backward program over `(reference, seed)` that returns its seed after the instructions that
         // `populate` appends.
-        let backward = |populate: &dyn Fn(&mut ReferenceTestBuilder, AtomId, AtomId)| {
-            let mut builder = ReferenceTestBuilder::new();
+        let backward = |populate: &dyn Fn(&mut IrBuilder, AtomId, AtomId)| {
+            let mut builder = IrBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let seed = builder.add_input(tangent_type.clone());
             populate(&mut builder, reference, seed);
@@ -2866,7 +2619,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let deferred_work = |builder: &mut ReferenceTestBuilder, reference: AtomId, seed: AtomId| {
+        let deferred_work = |builder: &mut IrBuilder, reference: AtomId, seed: AtomId| {
             builder
                 .add_instruction(ignored_zero_effect_carrier(), Vec::new(), vec![reference, seed], None)
                 .unwrap();
@@ -2875,8 +2628,8 @@ mod tests {
         // Builds a program over `(reference, tangent)` that applies a carrier with an attached backward rule, with the
         // reference as its leading input, whose backward program is `backward`.
         let attached_carrier_program =
-            |backward: Program<ArrayIrValue<Array>, ReferenceTestOperation, Vec<_>, Vec<_>>| {
-                let mut builder = ReferenceTestBuilder::new();
+            |backward: Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<_>, Vec<_>>| {
+                let mut builder = IrBuilder::new();
                 let backward = builder.import_program(backward);
                 let reference = builder.add_input(reference_type.clone());
                 let tangent = builder.add_input(tangent_type.clone());
@@ -2958,28 +2711,27 @@ mod tests {
     fn test_composite_transpose_transposition_retained_rules_effectful_buffered_zero_seed() {
         // The backward rule records a reference effect whenever its differentiated input's cotangent goes to a caller
         // buffer, including for a structural-zero seed that contributes nothing to that buffer.
-        let definition =
-            CustomRuleRegistration::new(ReferenceTestDefinition::new("buffered_zero_effect").with_accumulating_vjp(
-                |_| unreachable!("the tests construct the carrier directly"),
-                |context, inputs, seeds, accumulators| {
-                    if accumulators[1].reference(context)?.is_some() && matches!(&seeds[0], MaybeZero::Zero(_)) {
-                        let stash = inputs[0].as_known().unwrap().clone();
-                        let increment = context.lift(ArrayIrValue::Array(Array::scalar(1.0f64)?))?;
-                        context.bind(
-                            ReferenceTestOperation::Base(ReferenceAddUpdateOperation::new().into()),
-                            Vec::new(),
-                            &[stash, increment],
-                        )?;
-                    }
-                    Ok(())
-                },
-            ));
+        let definition = CustomRuleRegistration::new(IrDefinition::new("buffered_zero_effect").with_accumulating_vjp(
+            |_| unreachable!("the tests construct the carrier directly"),
+            |context, inputs, seeds, accumulators| {
+                if accumulators[1].reference(context)?.is_some() && matches!(&seeds[0], MaybeZero::Zero(_)) {
+                    let stash = inputs[0].as_known().unwrap().clone();
+                    let increment = context.lift(ArrayIrValue::Array(Array::scalar(1.0f64)?))?;
+                    context.bind(
+                        ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                        Vec::new(),
+                        &[stash, increment],
+                    )?;
+                }
+                Ok(())
+            },
+        ));
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let mut builder = ReferenceTestBuilder::new();
+        let mut builder = IrBuilder::new();
         let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
         let tangent = builder.add_input(scalar_type.clone());
-        let carrier = reference_test_carrier(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
+        let carrier = retained_carrier(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
         builder.add_instruction(carrier, Vec::new(), vec![reference, tangent], None).unwrap();
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -3126,7 +2878,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct MemberCarrier {
             /// Definition whose backward rule the converted carrier applies.
-            rules: CustomRuleReference<ArrayIrValue<Array>, ReferenceTestOperation>,
+            rules: CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
 
             /// Tangent type of the differentiated input.
             input_tangent_type: ArrayType,
@@ -3148,9 +2900,9 @@ mod tests {
             }
         }
 
-        impl From<MemberCarrier> for ReferenceTestOperation {
+        impl From<MemberCarrier> for ArrayIrOperation<Array> {
             fn from(operation: MemberCarrier) -> Self {
-                reference_test_carrier(
+                retained_carrier(
                     operation.rules,
                     0,
                     vec![operation.input_tangent_type.into()],
@@ -3172,8 +2924,8 @@ mod tests {
 
         // This canonical conversion changes the stored value and type families as well as the operation payload. It
         // carries a definition already typed over array IR values; it does not make a Rust closure family-polymorphic.
-        let converted = member.into_unprojected::<ArrayIrValue<Array>, ReferenceTestOperation>().unwrap();
-        let ReferenceTestOperation::CompositeTranspose(operation) = converted.instructions()[0].operation() else {
+        let converted = member.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+        let ArrayIrOperation::CompositeTranspose(operation) = converted.instructions()[0].operation() else {
             unreachable!()
         };
         assert_eq!(operation.rules(), Some(&definition.reference()));

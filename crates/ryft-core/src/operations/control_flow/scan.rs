@@ -46,8 +46,9 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension, DimensionMemberType,
-    DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding, ShardingDimension,
+    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension,
+    DimensionMemberType, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -2526,6 +2527,20 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<ScanOperation<ArrayType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: ScanOperation<ArrayType>) -> Self {
+        Self::Scan(ScanOperation {
+            carry_count: operation.carry_count,
+            iteration_count: operation.iteration_count,
+            reverse: operation.reverse,
+            unroll: operation.unroll,
+            stacked_axis_shardings: operation.stacked_axis_shardings,
+            marker: PhantomData,
+        })
     }
 }
 
@@ -5779,6 +5794,51 @@ mod tests {
             &mut outputs,
         );
         assert_eq!(outputs, vec!["final scale", "final accumulator", "final reference"]);
+    }
+
+    #[test]
+    fn test_scan_array_ir_conversion() {
+        let source = ScanOperation::<ArrayType>::new(1, 4)
+            .with_reverse(true)
+            .with_unroll(2)
+            .unwrap()
+            .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["m"])]);
+        let direct = ArrayIrOperation::<Array>::from(source.clone());
+        let wrapped = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(source.clone()));
+        assert_eq!(direct, wrapped);
+        let ArrayIrOperation::Scan(lifted) = direct else {
+            panic!("expected a native array IR scan operation");
+        };
+        assert_eq!(lifted.carry_count(), source.carry_count());
+        assert_eq!(lifted.iteration_count(), source.iteration_count());
+        assert_eq!(lifted.reverse(), source.reverse());
+        assert_eq!(lifted.unroll(), source.unroll());
+        assert_eq!(lifted.stacked_axis_shardings(), source.stacked_axis_shardings());
+        assert_eq!(
+            lifted.to_string(),
+            indoc! {"
+                scan [
+                    carry_count=1,
+                    iteration_count=4,
+                    reverse=true,
+                    unroll=2,
+                    stacked_axis_shardings=[{'m'}],
+                ]
+            "}
+            .trim_end(),
+        );
+
+        // Preserving the placement is necessary to preserve the stacked output type, including manual-axis variation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let carry_type = ArrayType::scalar(DataType::F32);
+        let slice_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let source_outputs = source.declared_output_types(&[carry_type.clone(), slice_type.clone()]).unwrap();
+        assert_eq!(
+            lifted.declared_output_types(&[carry_type.into(), slice_type.into()]),
+            Ok(source_outputs.into_iter().map(ArrayIrType::from).collect()),
+        );
     }
 
     #[test]

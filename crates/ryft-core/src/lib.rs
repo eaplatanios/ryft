@@ -175,12 +175,12 @@ pub use operations::{
     TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan,
     TanOperation, Tanh, TanhOperation, Tolerance, TopK, TracedShardMap, TransferToMemory, TransferToMemoryOperation,
     Transpose, TransposeOperation, TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
-    UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation,
-    WhilePredicate, WhileResidualStackOperation, WhileType, XOR_OPERATION_NAME, Xor, XorOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    check_batching_rule_consistency, composite, scan, shard_map, shard_map_in_context, shard_map_with_options,
-    softmax_cross_entropy_with_target_logits, trace_shard_map, trace_shard_map_with_named_axes,
-    trace_shard_map_with_options,
+    UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, While,
+    WhileOperation, WhileOptions, WhilePredicate, WhileResidualStackOperation, WhileType, XOR_OPERATION_NAME, Xor,
+    XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    associative_scan, check_batching_rule_consistency, composite, scan, shard_map, shard_map_in_context,
+    shard_map_with_options, softmax_cross_entropy_with_target_logits, trace_shard_map, trace_shard_map_with_named_axes,
+    trace_shard_map_with_options, while_loop,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -249,13 +249,8 @@ pub(crate) mod tests {
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::sync::{Arc, Weak};
 
-    use ryft_macros::Operation;
-
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::forward::tests::{
-        CustomCubeOperation, CustomWeightedCubeOperation, NestedRuleOperation, RuleMarkerOperation,
-    };
     use crate::differentiation::{
         CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
         DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
@@ -263,22 +258,14 @@ pub(crate) mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::{check_count, impl_guardless_operation};
-    use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, CompositeTransposeOperation, ConcatenateOperation,
-        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, GuardOperation,
-        MulOperation, NegOperation, OneLikeOperation, OneOperation, PadOperation, ParallelVaryOperation,
-        ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
-        SelectOperation, SliceOperation, StopGradientOperation, SubOperation, TransposeOperation, UpdateSliceOperation,
-        ZeroLikeOperation, ZeroOperation,
-    };
+    use crate::operations::{AddOperation, GuardOperation};
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, LiteralIdentity, MaybeZero, NoIdentity, NoReferenceTransform, NoReferent,
-        Operation, OperationProjection, OperationProvider, Program, ProgramError, ReferenceAccessDescriptor,
-        ReferenceAccessOperation, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type,
-        TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
+        EffectClass, EffectClasses, Effects, LiteralIdentity, MaybeZero, NoIdentity, Operation, OperationProjection,
+        OperationProvider, Program, ProgramError, ProvenanceScope, Region, RegionInterface, RegionRef, RegionSlot,
+        Transform, TransformArtifact, Type, TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{Tracer, TracingContext};
@@ -299,90 +286,6 @@ pub(crate) mod tests {
         hasher.finish()
     }
 
-    /// Small array operation family for the tests of `jvp_for_transpose`, which use the scalar and weighted cube
-    /// fixtures, the rule-marker fixtures for nested rule selection, conditional regions, and the composite transpose
-    /// carriers that the fixtures' reverse rules retain. The production [`ArrayOperation`] family cannot host these
-    /// fixtures. Because this family has no entry guard, partial-evaluation tests also use it to check that unproven
-    /// entry relationships are rejected rather than dropped. It pairs the fixtures with the real operations that the
-    /// transform rules require of any family: constant and arithmetic operations; the zero and one operations for
-    /// tracing's static constructors; broadcast and transpose for staged batching alignment; conversion, reduction,
-    /// reshape, and reshard for differentiation's shared alignment rules; comparison, concatenation, division,
-    /// exponentiation, selection, slicing, and subtraction for reduction derivatives; slice updates and padding for
-    /// the transposes of slicing; and gradient barriers for mapped conditional predicates. These dependencies apply
-    /// to the operation family even when a particular test emits none of those operations. All regions use the fixed
-    /// `Array` value family, so no value type parameter is needed.
-    #[derive(Clone, Debug, Operation)]
-    #[ryft(type(ArrayType), constant(Array), dispatch(batching, differentiation, transposition))]
-    pub(crate) enum TestFixtureOperation {
-        Constant(ConstantOperation<Array>),
-        Zero(ZeroOperation<ArrayType>),
-        ZeroLike(ZeroLikeOperation<ArrayType>),
-        One(OneOperation<ArrayType>),
-        OneLike(OneLikeOperation<ArrayType>),
-        Neg(NegOperation<ArrayType>),
-        Add(AddOperation<ArrayType>),
-        Sub(SubOperation<ArrayType>),
-        Mul(MulOperation<ArrayType>),
-        Div(DivOperation<ArrayType>),
-        Exp(ExpOperation<ArrayType>),
-        ConvertElementType(ConvertElementTypeOperation<ArrayType>),
-        Broadcast(BroadcastOperation),
-        Transpose(TransposeOperation),
-        Reshape(ReshapeOperation),
-        Reduce(ReduceOperation),
-        Concatenate(ConcatenateOperation<ArrayType>),
-        Slice(SliceOperation),
-        UpdateSlice(UpdateSliceOperation),
-        Pad(PadOperation<ArrayType>),
-        Reshard(ReshardOperation),
-        Compare(CompareOperation<ArrayType>),
-        Select(SelectOperation<ArrayType>),
-        Condition(ConditionOperation<ArrayType>),
-        StopGradient(StopGradientOperation<ArrayType>),
-        CompositeTranspose(CompositeTransposeOperation<Array, TestFixtureOperation>),
-        CustomCube(CustomCubeOperation),
-        CustomWeightedCube(CustomWeightedCubeOperation),
-        RuleMarker(RuleMarkerOperation),
-        NestedRule(NestedRuleOperation),
-    }
-
-    // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation
-    // and the `reference_freeze` transpose name its transform type to select the reference cotangent accumulation,
-    // which resolves to the reference-free `reference_add_update` provider.
-    impl ReferenceAccessOperation for TestFixtureOperation {
-        type Transform = NoReferenceTransform<NoReferent, ArrayType>;
-
-        fn base_input_count(&self) -> usize {
-            0
-        }
-
-        fn reference_access_descriptor(
-            &self,
-            _input_index: usize,
-        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
-            None
-        }
-
-        fn with_reference_access_transforms(
-            &self,
-            _input_index: usize,
-            _transforms: Vec<Self::Transform>,
-        ) -> Result<Self, ProgramError> {
-            Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
-        }
-    }
-
-    impl OperationProvider<ArrayType, ParallelVaryOperation> for TestFixtureOperation {
-        type Operation = Self;
-
-        fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-            check_count!("input", input_types, 1, ProgramError);
-            Err(ProgramError::UnsupportedOperation {
-                message: "test fixture operation family cannot align manual variation".to_string(),
-            })
-        }
-    }
-
     /// Eager array context over the production [`ArrayOperation`] family for core protocol tests. Tests use that
     /// family over the fixed `Array` value family, so that their transform instantiations are shared with the
     /// production tests; malformed rules and arbitrary region interfaces remain explicit, separate protocol fixtures.
@@ -390,22 +293,6 @@ pub(crate) mod tests {
 
     /// Staging context for the same production array family, used to replay residual programs into an outer trace.
     pub(crate) type TestArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
-
-    /// Small reference-capable family for mixed Intermediate Representation (IR) boundary tests. Keeping its type
-    /// universe explicit avoids treating a reference as an ordinary array or importing the complete production mixed
-    /// operation catalog.
-    #[derive(Clone, Debug, Operation)]
-    #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(ArrayType))]
-    pub(crate) enum TestArrayIrOperation {
-        Constant(Box<ConstantOperation<ArrayIrValue<Array>>>),
-        #[ryft(projected(ArrayType))]
-        Array(Box<ArrayOperation<Array>>),
-        ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
-        ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
-    }
-
-    /// Eager context for mixed array/reference boundary tests using the small mixed operation family.
-    pub(crate) type TestArrayIrContext = EagerContext<ArrayIrValue<Array>, TestArrayIrOperation>;
 
     /// Test-only homogeneous member type used by the generic projected-context fixtures.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -654,14 +541,26 @@ pub(crate) mod tests {
     impl_projected_test_member!(1, Second);
     impl_projected_test_member!(2, Third);
 
-    /// Test-only homogeneous identity and addition operations for one projected member kind.
+    /// Test-only homogeneous identity, addition, and doubling operations for one projected member kind.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum ProjectedMemberOperation<const MEMBER: u8> {
         /// Preserves one value.
         Identity,
 
-        /// Adds two values in the same member family.
+        /// Adds two values in the same member family. As a binary linear operation over member-typed data inputs, it
+        /// also pins that mixed transposition classifies interleaved data and shape inputs one by one.
         Add,
+
+        /// Doubles one value. Its transposition submits the output cotangent twice, once under each of the `first` and
+        /// `second` provenance scopes, which pins that member-local scopes survive projected transposition.
+        Scoped,
+    }
+
+    impl<const MEMBER: u8> ProjectedMemberOperation<MEMBER> {
+        /// Returns the number of inputs of this operation.
+        fn input_count(&self) -> usize {
+            if matches!(self, Self::Add) { 2 } else { 1 }
+        }
     }
 
     impl<const MEMBER: u8> From<AddOperation<ProjectedMemberType<MEMBER>>> for ProjectedMemberOperation<MEMBER> {
@@ -677,6 +576,7 @@ pub(crate) mod tests {
             match self {
                 Self::Identity => "projected_member",
                 Self::Add => "add",
+                Self::Scoped => "scoped",
             }
         }
 
@@ -685,7 +585,7 @@ pub(crate) mod tests {
             input_types: &[ProjectedMemberType<MEMBER>],
             _region_interfaces: &[RegionInterface<ProjectedMemberType<MEMBER>>],
         ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
-            check_count!("input", input_types, if matches!(self, Self::Identity) { 1 } else { 2 }, TypeError);
+            check_count!("input", input_types, self.input_count(), TypeError);
             Ok(vec![ProjectedMemberType])
         }
     }
@@ -699,18 +599,23 @@ pub(crate) mod tests {
             _driver: &D,
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            check_count!("input", inputs, if matches!(self, Self::Identity) { 1 } else { 2 }, ProgramError);
+            check_count!("input", inputs, self.input_count(), ProgramError);
             let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             let primal = context.primal().bind(self.clone(), Vec::new(), &primals)?.remove(0);
-            let tangent = if matches!(self, Self::Identity) {
-                inputs[0].tangent().clone()
-            } else {
-                match (inputs[0].tangent(), inputs[1].tangent()) {
+            let tangent = match self {
+                Self::Identity => inputs[0].tangent().clone(),
+                Self::Add => match (inputs[0].tangent(), inputs[1].tangent()) {
                     (MaybeZero::Zero(_), tangent) | (tangent, MaybeZero::Zero(_)) => tangent.clone(),
                     (MaybeZero::Value(left), MaybeZero::Value(right)) => MaybeZero::Value(
                         context.tangent().bind(self.clone(), Vec::new(), &[left.clone(), right.clone()])?.remove(0),
                     ),
-                }
+                },
+                Self::Scoped => match inputs[0].tangent() {
+                    MaybeZero::Zero(_) => inputs[0].tangent().clone(),
+                    MaybeZero::Value(tangent) => MaybeZero::Value(
+                        context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?.remove(0),
+                    ),
+                },
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -732,9 +637,17 @@ pub(crate) mod tests {
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
             accumulators: &[CotangentAccumulator],
         ) -> Result<(), DifferentiationError> {
-            check_count!("input", inputs, if matches!(self, Self::Identity) { 1 } else { 2 }, ProgramError);
+            check_count!("input", inputs, self.input_count(), ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            if matches!(self, Self::Scoped) {
+                (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("first"), || {
+                    accumulators[0].accumulate(context, outputs[0].clone())
+                })?;
+                return (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("second"), || {
+                    accumulators[0].accumulate(context, outputs[0].clone())
+                });
+            }
             for accumulator in accumulators {
                 accumulator.accumulate(context, outputs[0].clone())?;
             }
@@ -828,14 +741,18 @@ pub(crate) mod tests {
         ) -> Result<Vec<ProjectedProgramValue>, ProgramError> {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             self.infer_output_types(input_types.as_slice(), &[])?;
-            if matches!(
-                self,
+            let summands = match self {
                 Self::Add
-                    | Self::First(ProjectedMemberOperation::Add)
-                    | Self::Second(ProjectedMemberOperation::Add)
-                    | Self::Third(ProjectedMemberOperation::Add)
-            ) {
-                let output = match (&inputs[0], &inputs[1]) {
+                | Self::First(ProjectedMemberOperation::Add)
+                | Self::Second(ProjectedMemberOperation::Add)
+                | Self::Third(ProjectedMemberOperation::Add) => Some((&inputs[0], &inputs[1])),
+                Self::First(ProjectedMemberOperation::Scoped)
+                | Self::Second(ProjectedMemberOperation::Scoped)
+                | Self::Third(ProjectedMemberOperation::Scoped) => Some((&inputs[0], &inputs[0])),
+                _ => None,
+            };
+            if let Some(summands) = summands {
+                let output = match summands {
                     (ProjectedProgramValue::First(left), ProjectedProgramValue::First(right)) => {
                         ProjectedProgramValue::First(ProjectedMemberValue(left.0 + right.0))
                     }
@@ -861,7 +778,11 @@ pub(crate) mod tests {
     /// and rebuild paths) in isolation. Production region-carrying operations (e.g., the control-flow family) impose
     /// their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture declares
     /// arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures whose
-    /// failures cannot be masked by control-flow inference.
+    /// failures cannot be masked by control-flow inference. Staging-context tests also use its staging variant to
+    /// validate region attachment counts and region-input inference results, and its identity-instantiating variant to
+    /// instantiate formal region input identities, including for regions whose inputs depend on another region's
+    /// outputs. Partial-evaluation tests use its preparation-failure variant to check that residualization propagates
+    /// region preparation failures.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub enum TestRegionOperation {
         /// Region-free binary addition stand-in used inside region bodies.
@@ -880,6 +801,20 @@ pub(crate) mod tests {
 
         /// Pure call whose body input types must match its input types, used by builder identity-instantiation tests.
         Call,
+
+        /// Pure call whose body input types must match its input types and whose region-input inference returns
+        /// `region_input_type_count` entries that request no instantiation, or fails when
+        /// `fail_region_input_inference` is set.
+        Staging { region_input_type_count: usize, fail_region_input_inference: bool },
+
+        /// Pure call that instantiates its body from its input types and returns the body's output types. With
+        /// `dependent_regions`, it instead carries a `forward` region instantiated from its inputs and `first` and
+        /// `second` regions instantiated from the `forward` outputs, and returns the `first` region's output types.
+        IdentityInstantiating { dependent_regions: bool },
+
+        /// Unary identity with one body region whose region-input inference always fails, although its output
+        /// inference accepts the application.
+        PreparationFailure,
     }
 
     impl Operation for TestRegionOperation {
@@ -892,6 +827,9 @@ pub(crate) mod tests {
                 Self::Deferred => "deferred",
                 Self::WithRegions(_) => "with_regions",
                 Self::Call => "array_identity",
+                Self::Staging { .. } => "staging_region",
+                Self::IdentityInstantiating { .. } => "identity_instantiating_region",
+                Self::PreparationFailure => "preparation_failure",
             }
         }
 
@@ -899,7 +837,42 @@ pub(crate) mod tests {
             match self {
                 Self::Add | Self::Effectful(_) | Self::Deferred => &[],
                 Self::WithRegions(slots) => slots,
-                Self::Call => const { &[RegionSlot::computation("body")] },
+                Self::Call
+                | Self::Staging { .. }
+                | Self::IdentityInstantiating { dependent_regions: false }
+                | Self::PreparationFailure => const { &[RegionSlot::computation("body")] },
+                Self::IdentityInstantiating { dependent_regions: true } => {
+                    const {
+                        &[
+                            RegionSlot::computation("forward"),
+                            RegionSlot::computation("first"),
+                            RegionSlot::computation("second"),
+                        ]
+                    }
+                }
+            }
+        }
+
+        fn infer_region_input_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
+            match self {
+                Self::Add | Self::Effectful(_) | Self::Deferred | Self::WithRegions(_) | Self::Call => {
+                    Ok(vec![None; region_interfaces.len()])
+                }
+                Self::Staging { fail_region_input_inference: true, .. } => {
+                    Err(TypeError::invalid("failed to infer staging region input types"))
+                }
+                Self::Staging { region_input_type_count, .. } => Ok(vec![None; *region_input_type_count]),
+                Self::IdentityInstantiating { dependent_regions: false } => Ok(vec![Some(input_types.to_vec())]),
+                Self::IdentityInstantiating { dependent_regions: true } => Ok(vec![
+                    Some(input_types.to_vec()),
+                    Some(region_interfaces[0].output_types().to_vec()),
+                    Some(region_interfaces[0].output_types().to_vec()),
+                ]),
+                Self::PreparationFailure => Err(TypeError::invalid("region preparation failed")),
             }
         }
 
@@ -942,12 +915,47 @@ pub(crate) mod tests {
                     }
                     Ok(region_interface.output_types().to_vec())
                 }
+                Self::Staging { .. } => {
+                    let [region_interface] = region_interfaces else {
+                        return Err(TypeError::invalid(format!(
+                            "staging region expects 1 attached region but got {}",
+                            region_interfaces.len(),
+                        )));
+                    };
+                    if region_interface.input_types() != input_types {
+                        return Err(TypeError::invalid(
+                            "staging region input types do not match the instruction input types",
+                        ));
+                    }
+                    Ok(region_interface.output_types().to_vec())
+                }
+                Self::IdentityInstantiating { dependent_regions: false } => {
+                    let [region_interface] = region_interfaces else {
+                        return Err(TypeError::invalid(format!(
+                            "identity-instantiating region expects 1 attached region but got {}",
+                            region_interfaces.len(),
+                        )));
+                    };
+                    Ok(region_interface.output_types().to_vec())
+                }
+                Self::IdentityInstantiating { dependent_regions: true } => {
+                    Ok(region_interfaces[1].output_types().to_vec())
+                }
+                Self::PreparationFailure => {
+                    check_count!("input", input_types, 1, TypeError);
+                    Ok(input_types.to_vec())
+                }
             }
         }
 
         fn effects(&self) -> Cow<'_, Effects> {
             match self {
-                Self::Add | Self::WithRegions(_) | Self::Call => Cow::Borrowed(Effects::empty()),
+                Self::Add
+                | Self::WithRegions(_)
+                | Self::Call
+                | Self::Staging { .. }
+                | Self::IdentityInstantiating { .. }
+                | Self::PreparationFailure => Cow::Borrowed(Effects::empty()),
                 Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
                 Self::Deferred => Cow::Owned(Effects::empty().clone().with_deferred_work()),
             }
@@ -957,7 +965,9 @@ pub(crate) mod tests {
     impl_guardless_operation!(TestRegionOperation);
 
     /// Region-free test [`Operation`] family isolating ordered-state effect handling (i.e., simplification liveness
-    /// and ordering) from reference-operation semantics.
+    /// and ordering) from reference-operation semantics. Because this family has no entry guard, partial-evaluation
+    /// tests also use it to check that unproven entry relationships are rejected rather than dropped. Its unavailable
+    /// variant lets partial-evaluation tests control how eager execution fails and which effects forbid deferring it.
     #[derive(Clone, Debug, PartialEq)]
     pub enum TestOrderedStateOperation {
         /// Pure unary work that transforms may remove when its result is dead.
@@ -965,6 +975,15 @@ pub(crate) mod tests {
 
         /// Unary ordered-state access carrying a stable ordinal used to assert relative order.
         State(u8),
+
+        /// Unary identity with a controlled execution failure and effect classification.
+        Unavailable {
+            /// Error reported by eager execution after successful type inference.
+            error: ProgramError,
+
+            /// Observable effects that forbid deferring a failed execution attempt.
+            effects: Effects,
+        },
     }
 
     impl Operation for TestOrderedStateOperation {
@@ -974,19 +993,26 @@ pub(crate) mod tests {
             match self {
                 Self::Pure => "pure",
                 Self::State(_) => "state",
+                Self::Unavailable { .. } => "unavailable",
             }
         }
 
         fn infer_output_types(
             &self,
             input_types: &[ArrayType],
-            _region_interfaces: &[RegionInterface<ArrayType>],
+            region_interfaces: &[RegionInterface<ArrayType>],
         ) -> Result<Vec<ArrayType>, TypeError> {
             check_count!("input", input_types, 1, TypeError);
+            if matches!(self, Self::Unavailable { .. }) {
+                check_count!("region", region_interfaces, 0, TypeError);
+            }
             Ok(input_types.to_vec())
         }
 
         fn effects(&self) -> Cow<'_, Effects> {
+            if let Self::Unavailable { effects, .. } = self {
+                return Cow::Borrowed(effects);
+            }
             Cow::Owned(Effects::explicit(if matches!(self, Self::State(_)) {
                 EffectClasses::single(EffectClass::OrderedState)
             } else {
@@ -1004,11 +1030,14 @@ pub(crate) mod tests {
             _driver: &D,
             inputs: &[Array],
         ) -> Result<Vec<Array>, ProgramError> {
-            Ok(inputs.to_vec())
+            match self {
+                Self::Unavailable { error, .. } => Err(error.clone()),
+                Self::Pure | Self::State(_) => Ok(inputs.to_vec()),
+            }
         }
     }
 
-    impl PartiallyEvaluatableOperation<EagerContext<Array, Self>> for TestOrderedStateOperation {}
+    impl<C: Context<Type = ArrayType, Operation = Self>> PartiallyEvaluatableOperation<C> for TestOrderedStateOperation {}
 
     /// Transform marker used to observe generic region-cache preservation without depending on a built-in transform.
     pub(crate) struct IdentityTransform;

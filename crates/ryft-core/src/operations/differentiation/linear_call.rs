@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -754,6 +755,14 @@ where
                 accumulator.accumulate(context, MaybeZero::Value(cotangent))
             })?;
         Ok(())
+    }
+}
+
+impl From<LinearCallOperation<ArrayType>> for LinearCallOperation<ArrayIrType> {
+    #[inline]
+    fn from(operation: LinearCallOperation<ArrayType>) -> Self {
+        // The payload stores no types; its attached regions follow the program conversion separately.
+        Self::new(operation.residual_count)
     }
 }
 

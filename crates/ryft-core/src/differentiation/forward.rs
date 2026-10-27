@@ -3947,23 +3947,20 @@ pub(crate) mod tests {
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, Shape, ShardingDimension,
     };
-    use crate::batching::{
-        BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-        ProgramBatchingOutputAxesPolicy,
-    };
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::differentiation::reverse::{
         CotangentDestinationKind, ReverseModeDifferentiate, TransposedProgramCotangent,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::{impl_guardless_operation, impl_non_transposable_operation};
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
-        AddOperation, CompositeTransposeOperation, ConditionOperation, CosOperation, LinearCallOperation, Mul,
+        AddOperation, Composite, ConditionOperation, CosOperation, ExplicitJvp, ExplicitVjp, LinearCallOperation,
         MulOperation, NegOperation, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient,
-        StopGradientOperation, ZeroOperation,
+        StopGradientOperation, ZeroOperation, composite,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -3972,9 +3969,9 @@ pub(crate) mod tests {
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue, TestFixtureOperation,
+        ProjectedProgramType, ProjectedProgramValue,
     };
-    use crate::tracing::{NestedTracingContext, Trace};
+    use crate::tracing::{DomainTracer, NestedTracingContext, Trace};
 
     #[cfg(debug_assertions)]
     use crate::operations::TagOperation;
@@ -4052,515 +4049,109 @@ pub(crate) mod tests {
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
 
-    /// Test operation computing `x³` with independent JVP and JVP-for-transpose rules. Its JVP rule computes
-    /// and saves `3x²`, while its [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule saves only
-    /// `x` and retains a backward program that computes `3x²` when the pullback is applied. Both rules produce the same
-    /// derivative values, but their saved residuals and primal computations differ, allowing tests to detect accidental
-    /// use of the JVP rule during reverse-mode differentiation. The fixture exercises this distinction through reusable
-    /// differentiation, nested control flow, batching, and higher-order differentiation without requiring the unified
-    /// custom-operation registration API.
-    #[derive(Clone, Debug)]
-    pub(crate) struct CustomCubeOperation;
+    /// Tracer over which the rules of the composite fixtures are written.
+    type CompositeTracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 
-    impl Operation for CustomCubeOperation {
-        type Type = ArrayType;
+    /// Composite with an explicit JVP rule and reverse-mode rules that save residuals of type `Residual`.
+    type CompositeWithRules<Input, Residual> = Composite<
+        Input,
+        CompositeTracer,
+        ExplicitJvp<Input, CompositeTracer>,
+        ExplicitVjp<Input, CompositeTracer, Residual>,
+    >;
 
-        fn name(&self) -> &'static str {
-            "custom_cube"
-        }
-
-        fn infer_output_types(
-            &self,
-            inputs: &[ArrayType],
-            _regions: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            assert_eq!(inputs.len(), 1);
-            Ok(inputs.to_vec())
-        }
+    /// Returns the composite computing `x³` with independent JVP and reverse-mode rules. Its JVP rule computes and
+    /// saves `3x²`, while its reverse-mode rules save only `x` and compute `3x²` in the backward rule when the pullback
+    /// is applied. Both produce the same derivative values, but their saved residuals and primal computations differ,
+    /// allowing tests to detect accidental use of the JVP rule by
+    /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) through reusable differentiation,
+    /// nested control flow, batching, and higher-order differentiation.
+    fn custom_cube() -> CompositeWithRules<CompositeTracer, CompositeTracer> {
+        composite(|x: CompositeTracer| Ok(x.clone() * x.clone() * x))
+            .with_name("cube")
+            .with_jvp(|x: CompositeTracer, tangent: CompositeTracer| {
+                let squared = x.clone() * x.clone();
+                let output = squared.clone() * x;
+                let coefficient = squared.clone() + squared.clone() + squared;
+                Ok((output, coefficient * tangent))
+            })
+            .with_vjp(
+                |x: CompositeTracer| Ok((x.clone() * x.clone() * x.clone(), x)),
+                |x: CompositeTracer, cotangent: CompositeTracer| {
+                    let squared = x.clone() * x;
+                    Ok((squared.clone() + squared.clone() + squared) * cotangent)
+                },
+            )
     }
 
-    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CustomCubeOperation
-    where
-        C::Value: Mul,
-    {
-        fn interpret<D: InterpretationDriver<C>>(
-            &self,
-            _context: &C,
-            _driver: &D,
-            inputs: &[C::Value],
-        ) -> Result<Vec<C::Value>, ProgramError> {
-            Ok(vec![inputs[0].mul(&inputs[0])?.mul(&inputs[0])?])
-        }
+    /// Traces one call of `cube` (i.e., of [`custom_cube`]) over a scalar `f64` input.
+    fn custom_cube_program(
+        cube: &CompositeWithRules<CompositeTracer, CompositeTracer>,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<CompositeTracer>| Ok(vec![cube.call(inputs[0].clone())?]),
+            vec![ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap()
+        .1
     }
 
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>> PartiallyEvaluatableOperation<C> for CustomCubeOperation {}
-
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-        for CustomCubeOperation
-    {
-        fn batch<D: BatchingDriver<C, P>>(
-            &self,
-            context: &BatchingContext<C, P>,
-            _driver: &D,
-            inputs: &[P::Batch],
-        ) -> Result<Vec<P::Batch>, BatchingError> {
-            let output = context.parent().bind(self.clone(), vec![], &[P::value(&inputs[0]).clone()])?.remove(0);
-            Ok(vec![P::batch(output, P::batch_axis(&inputs[0]))?].into())
-        }
+    /// Returns the composite computing `w ⊙ x³` elementwise over two inputs of the same type, with independent JVP and
+    /// reverse-mode rules. Its JVP rule saves the coefficients `x³` and `3w ⊙ x²`, while its reverse-mode rules save
+    /// both inputs and compute both coefficients in a backward rule with two cotangent outputs. It extends
+    /// [`custom_cube`] to multiple residuals, multiple differentiated inputs, and non-scalar values.
+    fn custom_weighted_cube()
+    -> CompositeWithRules<(CompositeTracer, CompositeTracer), (CompositeTracer, CompositeTracer)> {
+        composite(|(weight, x): (CompositeTracer, CompositeTracer)| Ok(weight * (x.clone() * x.clone() * x)))
+            .with_name("weighted_cube")
+            .with_jvp(
+                |(weight, x): (CompositeTracer, CompositeTracer),
+                 (weight_tangent, tangent): (CompositeTracer, CompositeTracer)| {
+                    let squared = x.clone() * x.clone();
+                    let cube = squared.clone() * x;
+                    let output = weight.clone() * cube.clone();
+                    let weighted = weight * squared;
+                    let coefficient = weighted.clone() + weighted.clone() + weighted;
+                    Ok((output, cube * weight_tangent + coefficient * tangent))
+                },
+            )
+            .with_vjp(
+                |(weight, x): (CompositeTracer, CompositeTracer)| {
+                    Ok((weight.clone() * (x.clone() * x.clone() * x.clone()), (weight, x)))
+                },
+                // The backward rule recomputes both coefficients from the saved inputs: `(w, x, ȳ) ↦ (x³ ȳ, 3w x² ȳ)`.
+                |(weight, x): (CompositeTracer, CompositeTracer), cotangent: CompositeTracer| {
+                    let squared = x.clone() * x.clone();
+                    let cube = squared.clone() * x;
+                    let weighted = weight * squared;
+                    let coefficient = weighted.clone() + weighted.clone() + weighted;
+                    Ok((cube * cotangent.clone(), coefficient * cotangent))
+                },
+            )
     }
 
-    impl<
-        C: Context<
-                Type = ArrayType,
-                Operation: From<MulOperation<ArrayType>>
-                               + From<AddOperation<ArrayType>>
-                               + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
-            >,
-    > DifferentiableOperation<C> for CustomCubeOperation
-    {
-        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let input = inputs[0].primal();
-            let squared =
-                context.primal().bind(MulOperation::new(), vec![], &[input.clone(), input.clone()])?.remove(0);
-            let primal =
-                context.primal().bind(MulOperation::new(), vec![], &[squared.clone(), input.clone()])?.remove(0);
-            let doubled =
-                context.primal().bind(AddOperation::new(), vec![], &[squared.clone(), squared.clone()])?.remove(0);
-            let coefficient = context.primal().bind(AddOperation::new(), vec![], &[doubled, squared])?.remove(0);
-            let coefficient = context.primal_to_tangent(coefficient)?;
-            let tangent = context
-                .tangent()
-                .bind(MulOperation::new(), vec![], &[coefficient, inputs[0].tangent().as_value().unwrap().clone()])?
-                .remove(0);
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
-        }
-
-        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let input = inputs[0].primal();
-            let squared =
-                context.primal().bind(MulOperation::new(), vec![], &[input.clone(), input.clone()])?.remove(0);
-            let primal = context.primal().bind(MulOperation::new(), vec![], &[squared, input.clone()])?.remove(0);
-            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-            let residual = builder.add_input(input.r#type().into_owned());
-            let seed = builder.add_input(input.r#type().into_owned());
-            let squared = builder.add_instruction(MulOperation::new(), vec![], vec![residual, residual], None)?[0];
-            let doubled = builder.add_instruction(AddOperation::new(), vec![], vec![squared, squared], None)?[0];
-            let coefficient = builder.add_instruction(AddOperation::new(), vec![], vec![doubled, squared], None)?[0];
-            let cotangent = builder.add_instruction(MulOperation::new(), vec![], vec![coefficient, seed], None)?[0];
-            let backward = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                vec![cotangent],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )?;
-            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
-                1,
-                vec![input.r#type().into_owned()],
-                vec![input.r#type().into_owned()],
-            );
-            let residual = context.primal_to_tangent(input.clone())?;
-            let tangent = context
-                .tangent()
-                .bind(carrier, vec![backward], &[residual, inputs[0].tangent().as_value().unwrap().clone()])?
-                .remove(0);
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
-        }
-    }
-
-    impl_non_transposable_operation!(CustomCubeOperation);
-
-    /// Test operation computing `w ⊙ x³` elementwise over two inputs of the same type, with independent
-    /// JVP and JVP-for-transpose rules. Its JVP rule saves the coefficients `x³` and `3w ⊙ x²`, while its
-    /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule saves both inputs and retains a
-    /// backward program with two cotangent outputs. It extends the scalar [`CustomCubeOperation`] to multiple
-    /// residuals, multiple differentiated inputs, and non-scalar values.
-    #[derive(Clone, Debug)]
-    pub(crate) struct CustomWeightedCubeOperation;
-
-    impl Operation for CustomWeightedCubeOperation {
-        type Type = ArrayType;
-
-        fn name(&self) -> &'static str {
-            "custom_weighted_cube"
-        }
-
-        fn infer_output_types(
-            &self,
-            inputs: &[ArrayType],
-            _regions: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            assert_eq!(inputs.len(), 2);
-            Ok(vec![inputs[1].clone()])
-        }
-    }
-
-    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CustomWeightedCubeOperation
-    where
-        C::Value: Mul,
-    {
-        fn interpret<D: InterpretationDriver<C>>(
-            &self,
-            _context: &C,
-            _driver: &D,
-            inputs: &[C::Value],
-        ) -> Result<Vec<C::Value>, ProgramError> {
-            Ok(vec![inputs[0].mul(&inputs[1])?.mul(&inputs[1])?.mul(&inputs[1])?])
-        }
-    }
-
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>> PartiallyEvaluatableOperation<C>
-        for CustomWeightedCubeOperation
-    {
-    }
-
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-        for CustomWeightedCubeOperation
-    {
-        fn batch<D: BatchingDriver<C, P>>(
-            &self,
-            context: &BatchingContext<C, P>,
-            _driver: &D,
-            inputs: &[P::Batch],
-        ) -> Result<Vec<P::Batch>, BatchingError> {
-            let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
-            let output = context.parent().bind(self.clone(), vec![], &values)?.remove(0);
-            Ok(vec![P::batch(output, P::batch_axis(&inputs[1]))?].into())
-        }
-    }
-
-    impl<
-        C: Context<
-                Type = ArrayType,
-                Operation: From<MulOperation<ArrayType>>
-                               + From<AddOperation<ArrayType>>
-                               + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
-            >,
-    > DifferentiableOperation<C> for CustomWeightedCubeOperation
-    {
-        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let (weight, input) = (inputs[0].primal(), inputs[1].primal());
-            let multiply = |left: &C::Value, right: &C::Value| {
-                context
-                    .primal()
-                    .bind(MulOperation::new(), vec![], &[left.clone(), right.clone()])
-                    .map(|mut o| o.remove(0))
-            };
-            let squared = multiply(input, input)?;
-            let cube = multiply(&squared, input)?;
-            let primal = multiply(weight, &cube)?;
-            let weighted = multiply(weight, &squared)?;
-            let doubled =
-                context.primal().bind(AddOperation::new(), vec![], &[weighted.clone(), weighted.clone()])?.remove(0);
-            let coefficient = context.primal().bind(AddOperation::new(), vec![], &[doubled, weighted])?.remove(0);
-            let cube = context.primal_to_tangent(cube)?;
-            let coefficient = context.primal_to_tangent(coefficient)?;
-            let weight_tangent = context
-                .tangent()
-                .bind(MulOperation::new(), vec![], &[cube, inputs[0].tangent().as_value().unwrap().clone()])?
-                .remove(0);
-            let input_tangent = context
-                .tangent()
-                .bind(MulOperation::new(), vec![], &[coefficient, inputs[1].tangent().as_value().unwrap().clone()])?
-                .remove(0);
-            let tangent =
-                context.tangent().bind(AddOperation::new(), vec![], &[weight_tangent, input_tangent])?.remove(0);
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
-        }
-
-        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let (weight, input) = (inputs[0].primal(), inputs[1].primal());
-            let squared =
-                context.primal().bind(MulOperation::new(), vec![], &[input.clone(), input.clone()])?.remove(0);
-            let cube = context.primal().bind(MulOperation::new(), vec![], &[squared, input.clone()])?.remove(0);
-            let primal = context.primal().bind(MulOperation::new(), vec![], &[weight.clone(), cube])?.remove(0);
-
-            // The backward program recomputes both coefficients from the saved inputs: `(w, x, ȳ) ↦ (x³ ȳ, 3w x² ȳ)`.
-            let value_type = input.r#type().into_owned();
-            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-            let weight_residual = builder.add_input(value_type.clone());
-            let input_residual = builder.add_input(value_type.clone());
-            let seed = builder.add_input(value_type.clone());
-            let squared =
-                builder.add_instruction(MulOperation::new(), vec![], vec![input_residual, input_residual], None)?[0];
-            let cube = builder.add_instruction(MulOperation::new(), vec![], vec![squared, input_residual], None)?[0];
-            let weighted =
-                builder.add_instruction(MulOperation::new(), vec![], vec![weight_residual, squared], None)?[0];
-            let doubled = builder.add_instruction(AddOperation::new(), vec![], vec![weighted, weighted], None)?[0];
-            let coefficient = builder.add_instruction(AddOperation::new(), vec![], vec![doubled, weighted], None)?[0];
-            let weight_cotangent = builder.add_instruction(MulOperation::new(), vec![], vec![cube, seed], None)?[0];
-            let input_cotangent =
-                builder.add_instruction(MulOperation::new(), vec![], vec![coefficient, seed], None)?[0];
-            let backward = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                vec![weight_cotangent, input_cotangent],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )?;
-            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
-                2,
-                vec![value_type.clone(); 2],
-                vec![value_type.clone()],
-            );
-            let weight_residual = context.primal_to_tangent(weight.clone())?;
-            let input_residual = context.primal_to_tangent(input.clone())?;
-            let tangent = context
-                .tangent()
-                .bind(
-                    carrier,
-                    vec![backward],
-                    &[
-                        weight_residual,
-                        input_residual,
-                        inputs[0].tangent().as_value().unwrap().clone(),
-                        inputs[1].tangent().as_value().unwrap().clone(),
-                    ],
-                )?
-                .remove(0);
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
-        }
-    }
-
-    impl_non_transposable_operation!(CustomWeightedCubeOperation);
-
-    /// Identity test operation whose JVP rule scales tangents by `2` while its
-    /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule retains a backward program that scales
-    /// cotangents by `3`. The deliberately inconsistent rules reveal which rule a transform selected, which is how
-    /// [`NestedRuleOperation`] tests the rule selection of custom calls nested in a backward program.
-    #[derive(Clone, Debug)]
-    pub(crate) struct RuleMarkerOperation;
-
-    impl Operation for RuleMarkerOperation {
-        type Type = ArrayType;
-
-        fn name(&self) -> &'static str {
-            "rule_marker"
-        }
-
-        fn infer_output_types(
-            &self,
-            inputs: &[ArrayType],
-            _regions: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            assert_eq!(inputs.len(), 1);
-            Ok(inputs.to_vec())
-        }
-    }
-
-    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for RuleMarkerOperation {
-        fn interpret<D: InterpretationDriver<C>>(
-            &self,
-            _context: &C,
-            _driver: &D,
-            inputs: &[C::Value],
-        ) -> Result<Vec<C::Value>, ProgramError> {
-            Ok(inputs.to_vec())
-        }
-    }
-
-    impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RuleMarkerOperation where
-        C::Operation: From<Self>
-    {
-    }
-
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-        for RuleMarkerOperation
-    {
-        fn batch<D: BatchingDriver<C, P>>(
-            &self,
-            context: &BatchingContext<C, P>,
-            _driver: &D,
-            inputs: &[P::Batch],
-        ) -> Result<Vec<P::Batch>, BatchingError> {
-            let output = context.parent().bind(self.clone(), vec![], &[P::value(&inputs[0]).clone()])?.remove(0);
-            Ok(vec![P::batch(output, P::batch_axis(&inputs[0]))?].into())
-        }
-    }
-
-    impl<
-        C: Context<
-                Type = ArrayType,
-                Operation: From<AddOperation<ArrayType>> + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
-            >,
-    > DifferentiableOperation<C> for RuleMarkerOperation
-    {
-        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let tangent = inputs[0].tangent().as_value().unwrap().clone();
-            let tangent = context.tangent().bind(AddOperation::new(), vec![], &[tangent.clone(), tangent])?.remove(0);
-            Ok(vec![DifferentiationDual::new(inputs[0].primal().clone(), tangent)?])
-        }
-
-        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let value_type = inputs[0].primal().r#type().into_owned();
-            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-            let seed = builder.add_input(value_type.clone());
-            let doubled = builder.add_instruction(AddOperation::new(), vec![], vec![seed, seed], None)?[0];
-            let tripled = builder.add_instruction(AddOperation::new(), vec![], vec![doubled, seed], None)?[0];
-            let backward = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                vec![tripled],
-                vec![Placeholder],
-                vec![Placeholder],
-            )?;
-            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
-                0,
-                vec![value_type.clone()],
-                vec![value_type],
-            );
-            let tangent = inputs[0].tangent().as_value().unwrap().clone();
-            let tangent = context.tangent().bind(carrier, vec![backward], &[tangent])?.remove(0);
-            Ok(vec![DifferentiationDual::new(inputs[0].primal().clone(), tangent)?])
-        }
-    }
-
-    impl_non_transposable_operation!(RuleMarkerOperation);
-
-    /// Identity test operation with an identity JVP rule, whose
-    /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule retains the backward program
-    /// `ȳ ↦ rule_marker(ȳ)`. Differentiating the resulting pullback shows which rule of the nested
-    /// [`RuleMarkerOperation`] each subsequent transform selects.
-    #[derive(Clone, Debug)]
-    pub(crate) struct NestedRuleOperation;
-
-    impl Operation for NestedRuleOperation {
-        type Type = ArrayType;
-
-        fn name(&self) -> &'static str {
-            "nested_rule"
-        }
-
-        fn infer_output_types(
-            &self,
-            inputs: &[ArrayType],
-            _regions: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            assert_eq!(inputs.len(), 1);
-            Ok(inputs.to_vec())
-        }
-    }
-
-    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for NestedRuleOperation {
-        fn interpret<D: InterpretationDriver<C>>(
-            &self,
-            _context: &C,
-            _driver: &D,
-            inputs: &[C::Value],
-        ) -> Result<Vec<C::Value>, ProgramError> {
-            Ok(inputs.to_vec())
-        }
-    }
-
-    impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for NestedRuleOperation where
-        C::Operation: From<Self>
-    {
-    }
-
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-        for NestedRuleOperation
-    {
-        fn batch<D: BatchingDriver<C, P>>(
-            &self,
-            context: &BatchingContext<C, P>,
-            _driver: &D,
-            inputs: &[P::Batch],
-        ) -> Result<Vec<P::Batch>, BatchingError> {
-            let output = context.parent().bind(self.clone(), vec![], &[P::value(&inputs[0]).clone()])?.remove(0);
-            Ok(vec![P::batch(output, P::batch_axis(&inputs[0]))?].into())
-        }
-    }
-
-    impl<
-        C: Context<
-                Type = ArrayType,
-                Operation: From<RuleMarkerOperation> + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
-            >,
-    > DifferentiableOperation<C> for NestedRuleOperation
-    {
-        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            _context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            Ok(inputs.to_vec())
-        }
-
-        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-            &self,
-            context: &DifferentiationContext<C, P>,
-            _driver: &D,
-            inputs: &[DifferentiationDual<C::Value>],
-        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            let value_type = inputs[0].primal().r#type().into_owned();
-            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-            let seed = builder.add_input(value_type.clone());
-            let marked = builder.add_instruction(RuleMarkerOperation, vec![], vec![seed], None)?[0];
-            let backward = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                vec![marked],
-                vec![Placeholder],
-                vec![Placeholder],
-            )?;
-            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
-                0,
-                vec![value_type.clone()],
-                vec![value_type],
-            );
-            let tangent = inputs[0].tangent().as_value().unwrap().clone();
-            let tangent = context.tangent().bind(carrier, vec![backward], &[tangent])?.remove(0);
-            Ok(vec![DifferentiationDual::new(inputs[0].primal().clone(), tangent)?])
-        }
-    }
-
-    impl_non_transposable_operation!(NestedRuleOperation);
-
-    // Index 3 is otherwise unused by the shared member fixtures. Its malformed provider tests that the callable
-    // boundary validates residual capture before attempting to construct a zero.
-    impl OperationProvider<ProjectedMemberType<3>, ZeroOperation<ProjectedMemberType<3>>> for ProjectedMemberOperation<3> {
+    // No other test requests a zero of the third shared member kind (index 2). Its malformed provider tests that the
+    // callable boundary validates residual capture before attempting to construct a zero.
+    impl OperationProvider<ProjectedMemberType<2>, ZeroOperation<ProjectedMemberType<2>>> for ProjectedMemberOperation<2> {
         type Operation = Self;
 
         fn provide(
-            _request: ZeroOperation<ProjectedMemberType<3>>,
-            _input_types: &[&ProjectedMemberType<3>],
+            _request: ZeroOperation<ProjectedMemberType<2>>,
+            _input_types: &[&ProjectedMemberType<2>],
         ) -> Result<Self, ProgramError> {
             panic!("the invalid residual capture must be rejected before constructing a zero");
         }
     }
 
-    impl ResidualZeroProvider<ProjectedMemberType<3>> for ProjectedMemberOperation<3> {
-        fn zero_residual_types(r#type: &ProjectedMemberType<3>) -> Vec<ProjectedMemberType<3>> {
+    impl ResidualZeroProvider<ProjectedMemberType<2>> for ProjectedMemberOperation<2> {
+        fn zero_residual_types(r#type: &ProjectedMemberType<2>) -> Vec<ProjectedMemberType<2>> {
             vec![r#type.clone()]
         }
 
-        fn capture_zero_residual_values<C: Context<Type = ProjectedMemberType<3>, Operation = Self>>(
+        fn capture_zero_residual_values<C: Context<Type = ProjectedMemberType<2>, Operation = Self>>(
             _context: &C,
             _source: &C::Value,
-            _type: &ProjectedMemberType<3>,
+            _type: &ProjectedMemberType<2>,
         ) -> Result<Vec<C::Value>, ProgramError> {
             Ok(Vec::new())
         }
@@ -5237,50 +4828,21 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_independent_residuals() {
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
+        let cube = custom_cube();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let input = Array::scalar(3f64).unwrap();
         assert_eq!(
-            context.jvp(
-                |input, ()| input
-                    .context()
-                    .bind(CustomCubeOperation, vec![], &[input.clone()])
-                    .map(|mut outputs| outputs.remove(0)),
-                input.clone(),
-                Array::scalar(2f64).unwrap(),
-                (),
-            ),
+            context.jvp(|input, ()| cube.call(input), input.clone(), Array::scalar(2f64).unwrap(), ()),
             Ok((Array::scalar(27f64).unwrap(), Array::scalar(54f64).unwrap())),
         );
 
-        let (output, pushforward) = context
-            .linearize(
-                |input, ()| {
-                    input
-                        .context()
-                        .bind(CustomCubeOperation, vec![], &[input.clone()])
-                        .map(|mut outputs| outputs.remove(0))
-                },
-                input.clone(),
-                (),
-            )
-            .unwrap();
+        let (output, pushforward) = context.linearize(|input, ()| cube.call(input), input.clone(), ()).unwrap();
         assert_eq!(output, Array::scalar(27f64).unwrap());
         assert_eq!(pushforward.residuals(), &[Array::scalar(27f64).unwrap()]);
         assert_eq!(pushforward.apply(Array::scalar(2f64).unwrap()).unwrap(), Array::scalar(54f64).unwrap());
         assert_eq!(pushforward.apply(Array::scalar(4f64).unwrap()).unwrap(), Array::scalar(108f64).unwrap());
 
-        let (output, pullback) = context
-            .vjp(
-                |input, ()| {
-                    input
-                        .context()
-                        .bind(CustomCubeOperation, vec![], &[input.clone()])
-                        .map(|mut outputs| outputs.remove(0))
-                },
-                input,
-                (),
-            )
-            .unwrap();
+        let (output, pullback) = context.vjp(|input, ()| cube.call(input), input, ()).unwrap();
         assert_eq!(output, Array::scalar(27f64).unwrap());
         assert_eq!(pullback.residuals(), &[Array::scalar(3f64).unwrap()]);
         assert_eq!(
@@ -5295,11 +4857,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_primal_work() {
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let cube = custom_cube();
+        let program = custom_cube_program(&cube);
         let forward_jvp = program.entry_region_ref().jvp_shared(&[0]).unwrap();
         let reverse_jvp =
             program.entry_region_ref().jvp_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose).unwrap();
@@ -5322,16 +4881,7 @@ pub(crate) mod tests {
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %0 %0
                     %3:f64[] = mul %2 %0
-                    %4:f64[] = composite_transpose [leading_input_count=1] %0 %1 [
-                        backward={
-                            lambda %0:f64[], %1:f64[] .
-                            let %2:f64[] = mul %0 %0
-                                %3:f64[] = add %2 %2
-                                %4:f64[] = add %3 %2
-                                %5:f64[] = mul %4 %1
-                            in (%5)
-                        },
-                    ]
+                    %4:f64[] = composite_transpose [name=\"cube\", leading_input_count=1] %0 %1
                 in (%3, %4)
             "}
             .trim_end(),
@@ -5373,17 +4923,27 @@ pub(crate) mod tests {
             reverse.primal().interpret(vec![Array::scalar(3f64).unwrap()]),
             Ok(vec![Array::scalar(27f64).unwrap(), Array::scalar(3f64).unwrap()]),
         );
+
+        // The carrier retains the backward rule, which computes `3x²` from the saved `x` when it is transposed.
+        assert_eq!(
+            reverse.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %1
+                    %3:f64[] = add %2 %2
+                    %4:f64[] = add %3 %2
+                    %5:f64[] = mul %4 %0
+                in (%5)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_nested_condition() {
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
-        let branch =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
-        let branch = builder.import_program(branch);
+        let cube = custom_cube();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let branch = builder.import_program(custom_cube_program(&cube));
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
@@ -5399,23 +4959,14 @@ pub(crate) mod tests {
             indoc! {"
                 lambda %0:bool[], %1:f64[], %2:f64[] .
                 let %3:f64[], %4:f64[] = condition %0 %1 %2 [
-                    true=^1={
+                    true=^0={
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = mul %0 %0
                             %3:f64[] = mul %2 %0
-                            %4:f64[] = composite_transpose [leading_input_count=1] %0 %1 [
-                                backward={
-                                    lambda %0:f64[], %1:f64[] .
-                                    let %2:f64[] = mul %0 %0
-                                        %3:f64[] = add %2 %2
-                                        %4:f64[] = add %3 %2
-                                        %5:f64[] = mul %4 %1
-                                    in (%5)
-                                },
-                            ]
+                            %4:f64[] = composite_transpose [name=\"cube\", leading_input_count=1] %0 %1
                         in (%3, %4)
                     },
-                    false=^1,
+                    false=^0,
                 ]
                 in (%3, %4)
             "}
@@ -5470,12 +5021,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_after_batching() {
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let (batched, output_axes) = program
+        let cube = custom_cube();
+        let (batched, output_axes) = custom_cube_program(&cube)
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
@@ -5500,19 +5047,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_higher_order() {
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
-        let (_, pullback) = context
-            .vjp(
-                |input, ()| {
-                    input
-                        .context()
-                        .bind(CustomCubeOperation, vec![], &[input.clone()])
-                        .map(|mut outputs| outputs.remove(0))
-                },
-                Array::scalar(3f64).unwrap(),
-                (),
-            )
-            .unwrap();
+        let cube = custom_cube();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (_, pullback) = context.vjp(|input, ()| cube.call(input), Array::scalar(3f64).unwrap(), ()).unwrap();
 
         // Differentiate the materialized backward program with respect to its saved x, keeping seed 2 fixed.
         let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap().into_program();
@@ -5536,23 +5073,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_reverse_over_forward() {
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
+        let cube = custom_cube();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (tangent, pullback) = context
             .vjp(
                 |input, ()| {
                     let context = input.context().clone();
                     let direction = context.lift(Array::scalar(2f64).unwrap())?;
-                    let (_, tangent) = context.jvp(
-                        |input, ()| {
-                            input
-                                .context()
-                                .bind(CustomCubeOperation, Vec::new(), &[input.clone()])
-                                .map(|mut outputs| outputs.remove(0))
-                        },
-                        input,
-                        direction,
-                        (),
-                    )?;
+                    let (_, tangent) = context.jvp(|input, ()| cube.call(input), input, direction, ())?;
                     Ok(tangent)
                 },
                 Array::scalar(3f64).unwrap(),
@@ -5567,21 +5095,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_forward_over_reverse() {
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
+        let cube = custom_cube();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (gradient, tangent) = context
             .jvp(
                 |input, ()| {
                     let context = input.context().clone();
-                    let (_, pullback) = context.vjp(
-                        |input, ()| {
-                            input
-                                .context()
-                                .bind(CustomCubeOperation, Vec::new(), &[input.clone()])
-                                .map(|mut outputs| outputs.remove(0))
-                        },
-                        input,
-                        (),
-                    )?;
+                    let (_, pullback) = context.vjp(|input, ()| cube.call(input), input, ())?;
                     pullback.apply_materialized(context.lift(Array::scalar(1f64).unwrap())?)
                 },
                 Array::scalar(3f64).unwrap(),
@@ -5597,21 +5117,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_reverse_over_reverse() {
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
+        let cube = custom_cube();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (gradient, pullback) = context
             .vjp(
                 |input, ()| {
                     let context = input.context().clone();
-                    let (_, pullback) = context.vjp(
-                        |input, ()| {
-                            input
-                                .context()
-                                .bind(CustomCubeOperation, Vec::new(), &[input.clone()])
-                                .map(|mut outputs| outputs.remove(0))
-                        },
-                        input,
-                        (),
-                    )?;
+                    let (_, pullback) = context.vjp(|input, ()| cube.call(input), input, ())?;
                     pullback.apply_materialized(context.lift(Array::scalar(1f64).unwrap())?)
                 },
                 Array::scalar(3f64).unwrap(),
@@ -5624,16 +5136,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_multiple_residuals() {
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
+        let weighted_cube = custom_weighted_cube();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let weight = Array::vector(vec![1f64, 2f64]).unwrap();
         let input = Array::vector(vec![3f64, 4f64]).unwrap();
         // Forward mode uses the JVP rule: `ẏ = x³ ẇ + 3w x² ẋ`.
         let ones = Array::vector(vec![1f64, 1f64]).unwrap();
         let (output, tangent) = context
             .jvp(
-                |(weight, input), ()| {
-                    weight.context().bind(CustomWeightedCubeOperation, vec![], &[weight.clone(), input.clone()])
-                },
+                |(weight, input), ()| Ok(vec![weighted_cube.call((weight, input))?]),
                 (weight.clone(), input.clone()),
                 (ones.clone(), ones.clone()),
                 (),
@@ -5645,9 +5156,7 @@ pub(crate) mod tests {
         // Reverse mode uses the retained backward program with one cotangent per differentiated input.
         let (output, pullback) = context
             .vjp(
-                |(weight, input), ()| {
-                    weight.context().bind(CustomWeightedCubeOperation, vec![], &[weight.clone(), input.clone()])
-                },
+                |(weight, input), ()| Ok(vec![weighted_cube.call((weight, input))?]),
                 (weight.clone(), input.clone()),
                 (),
             )
@@ -5664,14 +5173,11 @@ pub(crate) mod tests {
         // The rules save different residuals: the JVP rule saves both coefficients, while the reverse rule saves the
         // two inputs and defers the coefficients to its backward program.
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
-        let weight = builder.add_input(vector_type.clone());
-        let input = builder.add_input(vector_type);
-        let output =
-            builder.add_instruction(CustomWeightedCubeOperation, vec![], vec![weight, input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<CompositeTracer>| Ok(vec![weighted_cube.call((inputs[0].clone(), inputs[1].clone()))?]),
+            vec![vector_type; 2],
+        )
+        .unwrap();
         let forward = program.linearize().unwrap();
         let reverse = program
             .entry_region_ref()
@@ -5708,10 +5214,22 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_nested_rule_selection() {
-        // The pullback of `nested_rule` is its backward program `ȳ ↦ rule_marker(ȳ)`, an identity whose JVP rule
-        // doubles tangents and whose reverse rule triples cotangents. A transform applied to the pullback starts a
+        // The pullback of `nested` is its backward rule `ȳ ↦ marker(ȳ)`, where `marker` is an identity whose JVP rule
+        // doubles tangents and whose reverse-mode rules triple cotangents. A transform applied to the pullback starts a
         // fresh transform that selects the nested call's rule by its own kind.
-        let context = EagerContext::<Array, TestFixtureOperation>::new();
+        let marker = composite(|seed: CompositeTracer| Ok(seed))
+            .with_jvp(|seed: CompositeTracer, tangent: CompositeTracer| Ok((seed, tangent.clone() + tangent)))
+            .with_vjp(
+                |seed: CompositeTracer| Ok((seed, ())),
+                |(), cotangent: CompositeTracer| Ok(cotangent.clone() + cotangent.clone() + cotangent),
+            );
+        let nested = composite(|input: CompositeTracer| Ok(input))
+            .with_jvp(|input: CompositeTracer, tangent: CompositeTracer| Ok((input, tangent)))
+            .with_vjp(
+                |input: CompositeTracer| Ok((input, ())),
+                move |(), cotangent: CompositeTracer| marker.call(cotangent),
+            );
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         // Forward mode over the pullback selects the nested JVP rule.
         let (cotangent, tangent) = context
@@ -5719,13 +5237,7 @@ pub(crate) mod tests {
                 |seed, ()| {
                     let context = seed.context().clone();
                     let input = context.lift(Array::scalar(5f64).unwrap())?;
-                    let (_, pullback) = context.vjp(
-                        |input, ()| {
-                            input.context().bind(NestedRuleOperation, vec![], &[input.clone()]).map(|mut o| o.remove(0))
-                        },
-                        input,
-                        (),
-                    )?;
+                    let (_, pullback) = context.vjp(|input, ()| nested.call(input), input, ())?;
                     pullback.apply_materialized(seed)
                 },
                 Array::scalar(3f64).unwrap(),
@@ -5742,13 +5254,7 @@ pub(crate) mod tests {
                 |seed, ()| {
                     let context = seed.context().clone();
                     let input = context.lift(Array::scalar(5f64).unwrap())?;
-                    let (_, pullback) = context.vjp(
-                        |input, ()| {
-                            input.context().bind(NestedRuleOperation, vec![], &[input.clone()]).map(|mut o| o.remove(0))
-                        },
-                        input,
-                        (),
-                    )?;
+                    let (_, pullback) = context.vjp(|input, ()| nested.call(input), input, ())?;
                     pullback.apply_materialized(seed)
                 },
                 Array::scalar(3f64).unwrap(),
@@ -8025,9 +7531,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_forward_mode_differentiate_jvp_validates_zero_residual_capture() {
-        let context = TracingContext::<ProjectedMemberValue<3>, ProjectedMemberOperation<3>>::new();
-        let primal = context.input(ProjectedMemberType::<3>);
-        let tangent = context.input(ProjectedMemberType::<3>);
+        let context = TracingContext::<ProjectedMemberValue<2>, ProjectedMemberOperation<2>>::new();
+        let primal = context.input(ProjectedMemberType::<2>);
+        let tangent = context.input(ProjectedMemberType::<2>);
         assert!(matches!(
             context.jvp(
                 |input, ()| {

@@ -12,9 +12,11 @@
 //!     Input shapes broadcast and branch element types promote, so a scalar mask can select a whole array or a shaped
 //!     mask can select individual elements. This does not defer either input's computation.
 //!   - **Predicate-Controlled Loops:** [`WhileOperation`] repeatedly tests its condition region and applies its body to
-//!     loop-carried state while the predicate is true. [`WhilePredicate`] also supports batched predicates through
-//!     per-item masking. An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) additionally permits
-//!     reverse-mode differentiation through a masked tangent scan.
+//!     loop-carried state while the predicate is true. [`While::while_loop`] traces a condition and a body over
+//!     structured state in an explicit context; [`while_loop()`] recovers the context from state values. A batched
+//!     predicate masks the state updates per item, which predicate values implement through [`WhilePredicate`]. An
+//!     explicit [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop by definition and
+//!     additionally permits reverse-mode differentiation through a masked tangent scan.
 //!   - **Shape-Determined Loops:** [`ScanOperation`] threads loop-carried state through a body while consuming slices
 //!     of stacked array inputs and producing stacked outputs. [`Scan::scan`] traces a body over structured state in an
 //!     explicit context; [`scan()`] recovers the context from input values. Its body also receives the slice index;
@@ -22,11 +24,13 @@
 //!     changing the pairing of input and output slices, while [`unroll`](ScanOperation::with_unroll) controls lowering.
 //!
 //! Branch and loop computations are [`Region`](crate::Region)s attached to an instruction, rather than fields of its
-//! operation payload. [`WhileType`] and [`ScanType`] define their type-family contracts. The operation rules provide
-//! interpretation, reference discharge, partial evaluation, batching, differentiation, and transposition.
-//! Mapped-predicate batching evaluates both pure branches and selects their outputs per item, so branch computation
-//! that is only valid when selected needs care under batching. A concrete predicate known during partial evaluation
-//! instead specializes the condition to its selected branch.
+//! operation payload. [`ConditionType`], [`WhileType`], and [`ScanType`] state the type-family contracts of conditions,
+//! while loops, and scans once per type universe, and every rule of these operations validates its complete contract
+//! before it executes, rewrites, or stages the attached regions. The operation rules provide interpretation, reference
+//! discharge, partial evaluation, batching, differentiation, and transposition. Mapped-predicate batching evaluates
+//! both pure branches and selects their outputs per item, so branch computation that is only valid when selected needs
+//! care under batching. A concrete predicate known during partial evaluation instead specializes the condition to its
+//! selected branch.
 //!
 //! XLA lowers conditional execution to [StableHLO `if`](https://openxla.org/stablehlo/spec#if), and both loop forms to
 //! [StableHLO `while`](https://openxla.org/stablehlo/spec#while). Individual operation types document their boundary,
@@ -95,7 +99,10 @@ pub use scan::{
     SCAN_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation, ScanOptions, ScanType, scan,
 };
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
-pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileResidualStackOperation, WhileType};
+pub use r#while::{
+    WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions, WhilePredicate, WhileResidualStackOperation, WhileType,
+    while_loop,
+};
 
 /// Operations for storing a loop's intermediate values in stacks and recovering them when needed. When partial
 /// evaluation or differentiation splits a loop body, the later computation may need values produced by the earlier
