@@ -1,4 +1,19 @@
-// TODO(eaplatanios): Write a module docstring that is consistent with our established conventions.
+//! Multidimensional arrays and the types, values, and operation families used to execute, stage, and transform array
+//! programs. [`ArrayType`] describes an array's element [`DataType`], [`Shape`], storage [`Layout`], [`Memory`] space,
+//! and [`Sharding`]. Shapes can contain static extents or symbolic [`Dimension`]s with bounds tracked during tracing.
+//! The value representations serve different roles:
+//!
+//!   - [`Array`] is an eager reference implementation for tests and examples, with shared immutable storage and fully
+//!     static shapes.
+//!   - [`DimensionValue`] represents one concrete extent and performs checked host-side dimension arithmetic.
+//!   - [`ArrayIrValue`] holds an array, a dimension, or an [`ArrayReference`], so that all three can participate in one
+//!     program. Programs with dynamic shapes pass runtime extents explicitly as dimension inputs.
+//!
+//! [`ArrayOperation`] and [`DimensionOperation`] describe operations within the array and dimension families,
+//! respectively, while [`ArrayIrOperation`] also supports operations that cross those families or access references.
+//! The [`ArrayOperations`], [`DimensionOperations`], and [`ArrayIrOperations`] bundles group those capabilities for
+//! generic code. The remaining modules provide element encodings, broadcasting, addressing, sharding, and
+//! array-specific batching and differentiation support.
 
 pub mod addressing;
 #[allow(clippy::module_inception)]
