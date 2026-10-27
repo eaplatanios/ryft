@@ -591,8 +591,6 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -611,35 +609,30 @@ mod tests {
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
-        Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Shape,
+        Dimension, DimensionBounds, DimensionError, DimensionMemberType, DimensionType, DimensionVariable, Shape,
     };
     use crate::arrays::types::ir::ArrayIrType;
-    use crate::arrays::types::layouts::{Layout, StridedLayout};
-    use crate::arrays::types::memories::Memory;
-    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DifferentiationContext, DotsSavable, ForwardModeDifferentiate,
-        LinearizationTracer, NothingSavable, PartitionedDifferentiationPolicy, ReverseModeDifferentiate,
-        differentiate_at,
+        DOTS_SAVABLE_POLICY_NAME, DifferentiationContext, DotsSavable, LinearizationTracer, NothingSavable,
+        PartitionedDifferentiationPolicy,
     };
-    use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation_partial_evaluation;
+    use crate::macros::check_operation_type_inference;
     use crate::operations::{
         AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation,
         CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
-        DynamicReshapeOperation, MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation,
-        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, ShardMap, SinOperation, WhileOperation,
-        ZeroOperation,
+        DimensionMulOperation, DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+        MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation, ReductionKind,
+        RematerializationOptimizationBarrier, ScanOperation, ShardMap, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
     use crate::programs::{
-        AtomId, EffectClass, EffectClasses, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
-        ProgramBuilder, ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition,
-        TypeIdentityRenaming, Typed, Value, ValueProjection,
+        AtomId, EffectClass, EffectClasses, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
+        ReferenceType, RegionInterface, Type, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
+        ValueProjection,
     };
     use crate::tests::hash_of;
     use crate::tracing::{Trace, Tracer, TracingContext};
@@ -650,46 +643,145 @@ mod tests {
     type TestOperation = ArrayIrOperation<Array>;
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
-    /// Asserts at compile time that `T` implements the complete operation identity contract.
+    /// Asserts at compile time that an operation family implements equality and hashing.
     fn assert_identity<T: Eq + Hash>() {}
 
-    #[test]
-    fn test_array_operations_holds_for_every_canonical_array_value() {
-        // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
-        // compile-time assertion that the listed value families implement the complete `ArrayOperation` surface in
-        // their own universe, including nested tracers over both homogeneous and array IR contexts.
-        fn requires_array_operations<V: ArrayOperations>() {}
-
-        type ArrayIrTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
-        type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type NestedContext<C> = DifferentiationContext<PartialEvaluationContext<C>, PartitionedDifferentiationPolicy>;
-
-        requires_array_operations::<Array>();
-        requires_array_operations::<ArrayIrValue<Array>>();
-        requires_array_operations::<Tracer<TracingContext<Array, ArrayOperation<Array>>>>();
-        requires_array_operations::<Tracer<ArrayIrTracingContext>>();
-        requires_array_operations::<LinearizationTracer<EagerArrayContext>>();
-        requires_array_operations::<LinearizationTracer<EagerArrayIrContext>>();
-        requires_array_operations::<BatchingTracer<EagerArrayContext, ArrayBatchingPolicy>>();
-        requires_array_operations::<BatchingTracer<EagerArrayIrContext, ArrayIrBatchingPolicy>>();
-        requires_array_operations::<
-            BatchingTracer<NestedContext<TracingContext<Array, ArrayOperation<Array>>>, ArrayBatchingPolicy>,
-        >();
-        requires_array_operations::<BatchingTracer<NestedContext<ArrayIrTracingContext>, ArrayIrBatchingPolicy>>();
+    /// Builds an array IR scalar `f64` [`Program`] from `build`, which receives the region builder together with its
+    /// `input_count` scalar inputs and returns the region's output atoms.
+    fn array_ir_scalar_program<BuildFn>(input_count: usize, build: BuildFn) -> TestProgram
+    where
+        BuildFn: FnOnce(&mut ProgramBuilder<TestValue, TestOperation>, &[AtomId]) -> Vec<AtomId>,
+    {
+        let array_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let inputs = (0..input_count).map(|_| builder.add_input(array_type.clone().into())).collect::<Vec<_>>();
+        let outputs = build(&mut builder, inputs.as_slice());
+        let output_count = outputs.len();
+        builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
-    #[test]
-    fn test_array_ir_value_and_gradient_with_captures() {
-        // A captured scalar gradient over array IR values reaches the projected member rules of the capabilities it
-        // uses: `f(x; c) = (x + c) · c` has the gradient `c` with respect to `x`, while `c` is a runtime capture.
-        let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
-        let (value, gradient) = differentiate_at(vector(vec![1.0, 2.0]))
-            .with_captures(vector(vec![3.0, 4.0]))
-            .value_and_gradient(|x, c| x.add(&c)?.dot(&c, &DotDimensionNumbers::inner_product()))
+    /// Stages `input * scale` in `builder` and returns its result atom.
+    fn array_ir_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
+        let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale).unwrap()));
+        builder
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale], None)
+            .unwrap()[0]
+    }
+
+    /// Builds the `["primal", "jvp"]` regions of an array IR `composite` call with a JVP rule, implementing
+    /// `primal(x) = 2 * x` with the deliberately distinct rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving composite
+    /// boundary stays detectable in a transformed program's numbers.
+    fn array_ir_custom_jvp_regions() -> Vec<TestProgram> {
+        vec![
+            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
+            array_ir_scalar_program(2, |builder, inputs| {
+                vec![array_ir_scaled(builder, inputs[0], 2.0), array_ir_scaled(builder, inputs[1], 3.0)]
+            }),
+        ]
+    }
+
+    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `composite` call with reverse-mode rules,
+    /// implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately distinct rule
+    /// `backward(r, ȳ) = 3 * ȳ`.
+    fn array_ir_custom_vjp_regions() -> Vec<TestProgram> {
+        vec![
+            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
+            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0), inputs[0]]),
+            array_ir_scalar_program(2, |builder, inputs| vec![array_ir_scaled(builder, inputs[1], 3.0)]),
+        ]
+    }
+
+    /// Batches one array IR region-carrying payload over a single input mapped along axis zero and returns the
+    /// rendered staged program together with the result's [`BatchAxis`].
+    fn batched_array_ir_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
+        let extent = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let trace = TracingContext::<TestValue, TestOperation>::new();
+        let extent_input = trace.input(DimensionType::from(extent.clone()).into());
+        let mapped = trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent_input);
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0)).unwrap());
+        let output = context.bind(operation, regions, std::slice::from_ref(&input)).unwrap().remove(0);
+        let batch_axis = output.batch().batch_axis();
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![output.batch().value().atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
             .unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0f32 * 3.0 + 6.0 * 4.0).unwrap()));
-        assert_eq!(gradient, vector(vec![3.0, 4.0]));
+        (program.to_string(), batch_axis)
+    }
+
+    /// Builds an array IR program holding one `composite` call with a JVP rule over a scalar input.
+    fn array_ir_custom_jvp_program() -> TestProgram {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let regions = array_ir_custom_jvp_regions()
+            .into_iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                regions,
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a shape-polymorphic program whose dimension product supplies the same explicit extent to a reshape
+    /// and a broadcast. The stored multiplication remains visible until staging or partial evaluation folds it.
+    fn array_ir_shared_extent_program() -> TestProgram {
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
+
+        // Build one stored program in which ordinary dimension arithmetic supplies explicit reshape and broadcast
+        // inputs. The repeated extent edge deliberately feeds both shape operations.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(input_type.into());
+        let extent = builder.add_input(extent_type.clone().into());
+        let one_value = DimensionValue::constant(1).unwrap();
+        let one_type = one_value.r#type().into_owned();
+        let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
+        let repeated_extent = builder
+            .add_instruction(
+                DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &one_type).unwrap()),
+                Vec::new(),
+                vec![extent, one],
+                None,
+            )
+            .unwrap()[0];
+        let two = builder
+            .add_instruction(
+                DimensionOperation::Add(DimensionAddOperation::new(&one_type, &one_type).unwrap()),
+                Vec::new(),
+                vec![one, one],
+                None,
+            )
+            .unwrap()[0];
+        let reshaped = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![0, 1]),
+                Vec::new(),
+                vec![reshaped, two, repeated_extent],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap()
     }
 
     #[test]
@@ -722,19 +814,39 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_operations_holds_for_every_canonical_dimension_value() {
+    fn test_array_operations() {
         // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
-        // compile-time assertion that the listed value families implement the complete `DimensionOperation` surface.
-        fn requires_dimension_operations<V: DimensionOperations>() {}
+        // compile-time assertion that the listed value families implement the complete `ArrayOperation` surface in
+        // their own universe, including nested tracers over both homogeneous and array IR contexts.
+        fn requires_array_operations<V: ArrayOperations>() {}
 
-        requires_dimension_operations::<DimensionValue>();
-        requires_dimension_operations::<Tracer<TracingContext<DimensionValue, DimensionOperation<DimensionValue>>>>();
-
-        // `ArrayIrOperations` pins this bundle on its first-class-dimension member profile, so the dimension member
-        // projected out of every canonical array IR value must satisfy it as well.
-        requires_dimension_operations::<<ArrayIrValue<Array> as ValueProjection<DimensionType>>::Projected>();
-        requires_dimension_operations::<
-            <Tracer<TracingContext<TestValue, TestOperation>> as ValueProjection<DimensionType>>::Projected,
+        requires_array_operations::<Array>();
+        requires_array_operations::<ArrayIrValue<Array>>();
+        requires_array_operations::<Tracer<TracingContext<Array, ArrayOperation<Array>>>>();
+        requires_array_operations::<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>();
+        requires_array_operations::<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>();
+        requires_array_operations::<LinearizationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>();
+        requires_array_operations::<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>();
+        requires_array_operations::<
+            BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatchingPolicy>,
+        >();
+        requires_array_operations::<
+            BatchingTracer<
+                DifferentiationContext<
+                    PartialEvaluationContext<TracingContext<Array, ArrayOperation<Array>>>,
+                    PartitionedDifferentiationPolicy,
+                >,
+                ArrayBatchingPolicy,
+            >,
+        >();
+        requires_array_operations::<
+            BatchingTracer<
+                DifferentiationContext<
+                    PartialEvaluationContext<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>,
+                    PartitionedDifferentiationPolicy,
+                >,
+                ArrayIrBatchingPolicy,
+            >,
         >();
     }
 
@@ -768,125 +880,17 @@ mod tests {
             constant,
             DimensionOperation::Constant(ConstantOperation::new(DimensionValue::constant(4).unwrap()))
         );
-    }
-
-    #[test]
-    fn test_shape_dependencies_are_input_edges_or_dimension_size_reads() {
-        // One representative mixed program: a dynamically shaped input is read with `dimension_size`, the extent is
-        // combined with ordinary dimension arithmetic, and the derived extent is then consumed by two shape-carrying
-        // operations as an explicit input.
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let size_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
-        let size_type = size_operation.output_type().clone();
-        let sum_operation = DimensionAddOperation::new(&size_type, &size_type).unwrap();
-        let sum_type = sum_operation.infer_output_types(&[size_type.clone(), size_type], &[]).unwrap().remove(0);
-        let one_value = DimensionValue::constant(1).unwrap();
-        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
-            0,
-            &[input_type.clone().into(), input_type.clone().into(), sum_type.into()],
-        )
-        .unwrap();
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(input_type.into());
-        let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
-        let size = builder.add_instruction(size_operation, Vec::new(), vec![input], None).unwrap()[0];
-        let sum = builder
-            .add_instruction(DimensionOperation::Add(sum_operation), Vec::new(), vec![size, size], None)
-            .unwrap()[0];
-        let concatenated =
-            builder.add_instruction(concatenate_operation, Vec::new(), vec![input, input, sum], None).unwrap()[0];
-        let reshaped = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![concatenated, sum, one], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<ArrayIrValue<Array>, ArrayIrValue<Array>>(vec![reshaped], Placeholder, Placeholder)
-            .unwrap();
-
-        // Every derived extent is visible in the rendered program: one `dimension_size` read plus explicit input
-        // edges into the shape-carrying operations. No shape is recovered from ambient or type-level metadata.
-        let [size_instruction, sum_instruction, concatenate_instruction, reshape_instruction] = program.instructions()
-        else {
-            panic!("expected a dimension read, dimension arithmetic, a concatenate, and a reshape");
-        };
-        assert_eq!(size_instruction.inputs(), &[input]);
-        assert_eq!(sum_instruction.inputs(), &[size, size]);
-        assert_eq!(concatenate_instruction.inputs(), &[input, input, sum]);
-        assert_eq!(reshape_instruction.inputs(), &[concatenated, sum, one]);
+        let operations = HashMap::from([(add, "addition"), (constant, "constant")]);
+        assert_eq!(operations.get(&same_add), Some(&"addition"));
+        assert_eq!(operations.get(&same_constant), Some(&"constant"));
         assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[rows] .
-                let %1:dimension<1> = const 1
-                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %0
-                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
-                    %4:f32[rows + rows] = concatenate [axis=0, requires_runtime_assertion=true] %0 %0 %3
-                    %5:f32[rows + rows, 1] = reshape %4 %3 %1
-                in (%5)"},
+            operations.get(&DimensionOperation::Mul(DimensionMulOperation::new(&left_type, &right_type).unwrap())),
+            None,
         );
-
-        // Drift gate: an instruction output may only *reference* a dimension identity that one of its own inputs
-        // carries. A rule that recovered extents from stored metadata instead of an input edge would produce a output
-        // type naming an identity that reaches the instruction through no rendered edge.
-        let atoms = program.atoms();
-        for instruction in program.instructions() {
-            let mut input_identities = Vec::new();
-            for input in instruction.inputs() {
-                let r#type = atoms[input.index()].r#type();
-                input_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
-            }
-            for output in instruction.outputs() {
-                let r#type = atoms[output.index()].r#type();
-                for (position, identity) in r#type.identities() {
-                    assert!(
-                        position != TypeIdentityPosition::Reference || input_identities.contains(identity),
-                        "instruction `{}` output type {} references identity {identity} that no input carries",
-                        instruction.operation().name(),
-                        r#type.as_ref(),
-                    );
-                }
-            }
-        }
     }
 
     #[test]
-    fn test_dimension_tracer_projection() {
-        let rows = DimensionType::new("rows", DimensionBounds::new(5, Some(9)).unwrap());
-        let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
-        let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(rows, columns)| {
-                let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
-                let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
-                let padded = Add::add(&Mul::mul(&rows, &columns)?, &columns)?;
-                let trimmed = padded.saturating_sub(&rows)?;
-                Ok((
-                    Div::div(&trimmed, &columns)?.into_value(),
-                    Rem::rem(&trimmed, &columns)?.into_value(),
-                    rows.dimension_pow(&columns)?.into_value(),
-                    Sub::sub(&rows.dimension_max(&columns)?, &rows.dimension_min(&columns)?)?.into_value(),
-                ))
-            },
-            (ArrayIrType::Dimension(rows), ArrayIrType::Dimension(columns)),
-        )
-        .unwrap();
-        assert_eq!(output_type.0.to_string(), "dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)>",);
-        let expected = indoc! {"
-            lambda %0:dimension<rows ∈ [5, 9)>, %1:dimension<columns ∈ [1, 5)> .
-            let %2:dimension<rows * columns ∈ [5, 33)> = dimension_mul %0 %1
-                %3:dimension<rows * columns + columns ∈ [6, 37)> = dimension_add %2 %1
-                %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = saturating_sub %3 %0
-                %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
-                %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
-                %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1
-                %8:dimension<rows - columns ∈ [1, 8)> = dimension_sub %0 %1
-            in (%5, %6, %7, %8)
-        "};
-        assert_eq!(program.to_string(), expected.trim_end());
-    }
-
-    #[test]
-    fn test_dimension_tracer_operators() {
+    fn test_dimension_operation_staging_operators() {
         let left_type = DimensionType::new("left", DimensionBounds::new(3, Some(9)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(4)).unwrap());
         let (output_type, program) = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
@@ -909,15 +913,24 @@ mod tests {
                 .extent(),
             0,
         );
-        assert!(matches!(program.instructions()[0].operation(), DimensionOperation::Add(_)));
-        assert!(matches!(program.instructions()[1].operation(), DimensionOperation::Mul(_)));
-        assert!(matches!(program.instructions()[2].operation(), DimensionOperation::Sub(_)));
-        assert!(matches!(program.instructions()[3].operation(), DimensionOperation::Div(_)));
-        assert!(matches!(program.instructions()[4].operation(), DimensionOperation::Rem(_)));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [3, 9)>, %1:dimension<right ∈ [1, 4)> .
+                let %2:dimension<left + right ∈ [4, 12)> = dimension_add %0 %1
+                    %3:dimension<left + right * right ∈ [4, 34)> = dimension_mul %2 %1
+                    %4:dimension<left + right * right - left ∈ [0, 31)> = \
+                        dimension_sub [requires_runtime_assertion=true] %3 %0
+                    %5:dimension<left + right * right - left / right ∈ [0, 31)> = dimension_div %4 %1
+                    %6:dimension<left + right * right - left / right % left ∈ [0, 8)> = dimension_rem %5 %0
+                in (%6)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
-    fn test_dimension_tracer_operator_propagates_construction_error() {
+    fn test_dimension_operation_staging_operator_error() {
         let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(2)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(3, Some(5)).unwrap());
         let result = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
@@ -937,579 +950,20 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_dimension_from_scalar_multiple_bounded_outputs() {
-        // A data-dependent extent is an ordinary SSA value with one definition. Two sibling shape-carrying constructors
-        // consume that one gateway output as an explicit input instead of each recovering an extent of its own, so both
-        // outputs are governed by a single identity and a single bounds assertion.
-        let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
-        let first_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let second_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(total.into()), Vec::new(), vec![extent_scalar], None)
-            .unwrap()[0];
-        let first = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![first_value, extent], None)
-            .unwrap()[0];
-        let second = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![second_value, extent], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![first, second],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:i32[], %1:f64[], %2:f64[] .
-                let %3:dimension<total ∈ [1, 9)> = dimension_from_scalar [bounds=[1, 9)] %0
-                    %4:f64[total] = broadcast [output_axes=[]] %1 %3
-                    %5:f64[total] = broadcast [output_axes=[]] %2 %3
-                in (%4, %5)"},
-        );
-        let output_types = program.output_types();
-        assert_eq!(output_types[0], output_types[1]);
+    fn test_dimension_operations() {
+        // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
+        // compile-time assertion that the listed value families implement the complete `DimensionOperation` surface.
+        fn requires_dimension_operations<V: DimensionOperations>() {}
 
-        // Both outputs share the lower bound, an interior extent, and the last admitted extent.
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(1_i32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64; 1]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64; 1]).unwrap()),
-            ]),
-        );
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(5_i32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64; 5]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64; 5]).unwrap()),
-            ]),
-        );
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(8_i32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64; 8]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64; 8]).unwrap()),
-            ]),
-        );
-    }
+        requires_dimension_operations::<DimensionValue>();
+        requires_dimension_operations::<Tracer<TracingContext<DimensionValue, DimensionOperation<DimensionValue>>>>();
 
-    #[test]
-    fn test_array_ir_dimension_from_scalar_differentiation_ordered_assertions() {
-        // Both checks require runtime data. Differentiation must preserve their order and execute each once.
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
-        let extent = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(rows.clone().into()),
-                Vec::new(),
-                vec![extent_scalar],
-                None,
-            )
-            .unwrap()[0];
-        let lower = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let upper = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(8).unwrap()));
-        let above_lower = builder
-            .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::GreaterThanOrEqual),
-                Vec::new(),
-                vec![extent, lower],
-                None,
-            )
-            .unwrap()[0];
-        let below_upper = builder
-            .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan),
-                Vec::new(),
-                vec![extent, upper],
-                None,
-            )
-            .unwrap()[0];
-        let condition = builder
-            .add_instruction(ArrayOperation::And(AndOperation::new()), Vec::new(), vec![above_lower, below_upper], None)
-            .unwrap()[0];
-        builder
-            .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`rows` must be in `[2, 8)`").with_labels(vec!["rows".to_owned()]),
-                Vec::new(),
-                vec![condition, extent],
-                None,
-            )
-            .unwrap();
-        let broadcast = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, extent], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::Sin(SinOperation::new())),
-                Vec::new(),
-                vec![broadcast],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(
-            program
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction
-                    .operation()
-                    .effects()
-                    .classes()
-                    .contains(EffectClass::OrderedAssertion))
-                .map(|instruction| instruction.operation().to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                "dimension_from_scalar [bounds=[1, 9)]",
-                r#"assert [message="`rows` must be in `[2, 8)`", labels=["rows"]]"#
-            ],
-        );
-
-        // Dimensions have no tangent, so forward differentiation must not duplicate either assertion.
-        let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(
-            jvp.instructions()
-                .iter()
-                .filter(|instruction| instruction
-                    .operation()
-                    .effects()
-                    .classes()
-                    .contains(EffectClass::OrderedAssertion))
-                .map(|instruction| instruction.operation().to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                "dimension_from_scalar [bounds=[1, 9)]",
-                r#"assert [message="`rows` must be in `[2, 8)`", labels=["rows"]]"#
-            ],
-        );
-
-        // Linearization keeps both assertions in the primal; the tangent consumes the checked extent as a residual.
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(
-            linearization
-                .primal()
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction
-                    .operation()
-                    .effects()
-                    .classes()
-                    .contains(EffectClass::OrderedAssertion))
-                .map(|instruction| instruction.operation().to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                "dimension_from_scalar [bounds=[1, 9)]",
-                r#"assert [message="`rows` must be in `[2, 8)`", labels=["rows"]]"#
-            ],
-        );
-        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
-        assert_eq!(
-            linearization
-                .tangent()
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction
-                    .operation()
-                    .effects()
-                    .classes()
-                    .contains(EffectClass::OrderedAssertion))
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            Vec::<&str>::new()
-        );
-    }
-
-    #[test]
-    fn test_array_ir_operations_holds_for_every_canonical_array_ir_value() {
-        fn requires_array_ir_operations<V: ArrayIrOperations>() {}
-
-        requires_array_ir_operations::<ArrayIrValue<Array>>();
-        requires_array_ir_operations::<Tracer<TracingContext<TestValue, TestOperation>>>();
-        requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
-
-        // The bundle's member profiles make one bound enough to reach ordinary array math through projection, checked
-        // dimension arithmetic, and family-native reference capabilities, with no projection bounds restated here.
-        fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
-            // The array member carries both the fallible capability and its panicking operator sugar, so the
-            // capability is named explicitly here.
-            let array = ValueProjection::<ArrayType>::into_projected(value.clone())?;
-            let square = ValueProjection::<ArrayType>::from_projected(Mul::mul(&array, &array)?);
-            let rows = ValueProjection::<DimensionType>::into_projected(value.dimension_size(0)?)?;
-            let columns = ValueProjection::<DimensionType>::into_projected(value.dimension_size(1)?)?;
-            let elements = ValueProjection::<DimensionType>::from_projected(rows.mul(&columns)?);
-            Ok((square, elements))
-        }
-
-        fn reference_round_trip<V: ArrayIrOperations>(value: &V) -> Result<V, ProgramError> {
-            value.reference_new()?.freeze()
-        }
-
-        let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
-        let (square, elements) = square_and_element_count(&input).unwrap();
-        assert_eq!(
-            square,
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 4.0, 9.0, 16.0, 25.0, 36.0]).unwrap())
-        );
-        let ArrayIrValue::Dimension(elements) = elements else {
-            panic!("expected a first-class dimension member");
-        };
-        assert_eq!(elements.extent(), 6);
-        assert_eq!(reference_round_trip(&input), Ok(input));
-    }
-
-    #[test]
-    fn test_array_ir_pullback_preserves_a_dynamic_zero_space_input_cotangent() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let context = TracingContext::<TestValue, TestOperation>::new();
-        let key = context.input(key_type.clone().into());
-        let accumulator = context.input(ArrayType::scalar(DataType::F64).into());
-        let (_, pullback) =
-            context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![key, accumulator], ()).unwrap();
-        let cotangent = context.input(ArrayType::scalar(DataType::F64).into());
-
-        // The compact pullback has no result slot for the key's zero differential space. The public result preserves
-        // that zero without capturing its extent or constructing an array.
-        let cotangents = pullback.apply(cotangent).unwrap();
-        assert!(pullback.residuals().is_empty());
-        assert_eq!(cotangents[0], MaybeZero::Zero(ArrayIrType::Array(key_type.tangent().unwrap())));
-        assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
-    }
-
-    #[test]
-    fn test_array_ir_pushforward_materializes_a_dynamic_zero_space_output_tangent() {
-        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![extent_type.dimension().clone()]));
-        let context = TracingContext::<TestValue, TestOperation>::new();
-        let extent = context.input(extent_type.into());
-        let key = context.input(key_type.clone().into());
-        let (_, pushforward) =
-            context.linearize(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![extent, key], ()).unwrap();
-        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
-        let key_tangent = context.input(key_type.tangent().unwrap().into());
-
-        // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
-        // result must consume the key extent captured at linearization time.
-        let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
-        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
-    }
-
-    #[test]
-    fn test_array_ir_operation() {
-        fn assert_projection<T: Type, O: Operation<Type = T>, C: OperationProjection<T, Projected = O>>() {}
-
-        assert_projection::<ArrayType, ArrayOperation<Array>, ArrayIrOperation<Array>>();
-        assert_projection::<DimensionType, DimensionOperation<DimensionValue>, ArrayIrOperation<Array>>();
-
-        let array_type = ArrayType::scalar(DataType::F32);
-        let array_operation = ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new()));
-        assert!(matches!(array_operation, ArrayIrOperation::Array(ArrayOperation::Add(_))));
-        assert_eq!(array_operation.name(), "add");
-        assert_eq!(array_operation.to_string(), "add");
-        assert_eq!(
-            array_operation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[],),
-            Ok(vec![array_type.clone().into()]),
-        );
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        assert_eq!(
-            array_operation.infer_output_types(&[reference_type.clone(), reference_type], &[]),
-            Err(TypeError::invalid("expected array type but got reference type")),
-        );
-
-        // Member control-flow operations promote to their direct array IR carriers, preserving every semantic and
-        // lowering attribute.
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new())),
-            ArrayIrOperation::Condition(_),
-        ));
-        let while_operation = WhileOperation::new().with_iteration_bound(7).unwrap();
-        let promoted_while = ArrayIrOperation::<Array>::from(ArrayOperation::While(while_operation.clone()));
-        assert!(matches!(
-            promoted_while,
-            ArrayIrOperation::While(operation)
-                if operation.iteration_bound() == while_operation.iteration_bound()
-        ));
-        let scan_operation = ScanOperation::<ArrayType>::new(1, 4).with_reverse(true).with_unroll(2).unwrap();
-        let promoted_scan = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(scan_operation));
-        let ArrayIrOperation::Scan(promoted_scan) = promoted_scan else {
-            panic!("expected a direct array IR scan operation");
-        };
-        assert_eq!(promoted_scan.carry_count(), 1);
-        assert_eq!(promoted_scan.iteration_count(), &Dimension::Static(4));
-        assert!(promoted_scan.reverse());
-        assert_eq!(promoted_scan.unroll(), 2);
-
-        let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new("left", bounds);
-        let right_type = DimensionType::new("right", bounds);
-        let dimension_operation = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
-            DimensionAddOperation::new(&left_type, &right_type).unwrap(),
-        ));
-        assert!(matches!(dimension_operation, ArrayIrOperation::Dimension(DimensionOperation::Add(_)),));
-        assert_eq!(dimension_operation.name(), "dimension_add");
-        let result_types = dimension_operation
-            .infer_output_types(&[left_type.clone().into(), right_type.clone().into()], &[])
-            .unwrap();
-        let [ArrayIrType::Dimension(result_type)] = result_types.as_slice() else {
-            panic!("expected one dimension result type");
-        };
-        assert_eq!(result_type.bounds(), DimensionBounds::new(2, Some(17)).unwrap());
-        let assertion = ArrayIrOperation::<Array>::from(AssertOperation::<ArrayIrType>::new("dimensions must match"));
-        assert_eq!(assertion.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-
-        // Each dimension operation also lifts directly, so generic array IR code never has to name the member family.
-        let product = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&left_type, &right_type).unwrap());
-        assert!(matches!(product, ArrayIrOperation::Dimension(DimensionOperation::Mul(_))));
-        assert_eq!(product.name(), "dimension_mul");
-
-        // Every wrong-kind path uses the same checked type projection and therefore reports the canonical diagnostic.
-        assert_eq!(
-            array_operation.infer_output_types(&[left_type.clone().into(), right_type.clone().into()], &[]),
-            Err(TypeError::invalid("expected array type but got dimension type")),
-        );
-        assert_eq!(
-            dimension_operation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[]),
-            Err(TypeError::invalid("expected dimension type but got array type")),
-        );
-
-        // The direct array IR condition preserves the complete higher-order interface, including effects.
-        let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let interface = RegionInterface::new(
-            vec![array_type.clone().into()],
-            vec![array_type.clone().into()],
-            EffectClasses::single(EffectClass::OrderedIo),
-        );
-        let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
-        assert!(matches!(condition, ArrayIrOperation::Condition(_)));
-        assert_eq!(
-            condition.infer_output_types(
-                &[predicate_type.into(), array_type.clone().into()],
-                &[interface.clone(), interface],
-            ),
-            Ok(vec![array_type.clone().into()]),
-        );
-        assert_eq!(
-            condition.infer_region_input_types(
-                &[ArrayType::scalar(DataType::Boolean).into(), array_type.clone().into()],
-                &[
-                    RegionInterface::new(vec![array_type.clone().into()], vec![], EffectClasses::NONE),
-                    RegionInterface::new(vec![array_type.clone().into()], vec![], EffectClasses::NONE),
-                ],
-            ),
-            Ok(vec![None, None]),
-        );
-        assert_eq!(condition.region_slots(), ConditionOperation::<ArrayIrType>::new().region_slots());
-        assert_eq!(
-            condition.output_region_provenance(0),
-            ConditionOperation::<ArrayIrType>::new().output_region_provenance(0),
-        );
-
-        // Canonical lifts keep identity-free zeros homogeneous, explicit static mixed constructors are also valid,
-        // and zeros whose types carry identities require the mixed encoding with ordinary identity renaming.
-        let source = DimensionVariable::new("source", bounds);
-        let target = DimensionVariable::new("target", bounds);
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
-        let zero = ArrayIrOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(dynamic_type)));
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(source.clone(), target.clone()).unwrap();
-        let ArrayIrOperation::Zero(zero) = zero.rename_type_identities(&renaming).unwrap() else {
-            panic!("expected a renamed mixed zero operation");
-        };
-        assert_eq!(zero.r#type().shape().dimensions(), &[Dimension::Dynamic(target)]);
-
-        let static_zero_type = ArrayType::scalar(DataType::F32);
-        let static_zero = ArrayIrOperation::<Array>::from(ZeroOperation::new(static_zero_type.clone()));
-        assert!(matches!(static_zero, ArrayIrOperation::Array(ArrayOperation::Zero(_))));
-        let mixed_static_zero = ArrayIrOperation::<Array>::Zero(ZeroOperation::new(static_zero_type.clone()));
-        assert_eq!(mixed_static_zero.infer_output_types(&[], &[]), Ok(vec![static_zero_type.clone().into()]));
-
-        // Canonical lifts keep identity-free ones homogeneous, explicit static mixed constructors are also valid,
-        // and ones whose types carry identities require the mixed encoding.
-        let static_one = ArrayIrOperation::<Array>::from(OneOperation::new(static_zero_type.clone()));
-        assert!(matches!(static_one, ArrayIrOperation::Array(ArrayOperation::One(_))));
-        let mixed_static_one = ArrayIrOperation::<Array>::One(OneOperation::new(static_zero_type.clone()));
-        assert_eq!(mixed_static_one.infer_output_types(&[], &[]), Ok(vec![static_zero_type.into()]));
-        let dynamic_one_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
-        let dynamic_one = ArrayIrOperation::<Array>::from(OneOperation::new(dynamic_one_type.clone()));
-        assert!(matches!(dynamic_one, ArrayIrOperation::One(_)));
-        assert_eq!(
-            dynamic_one.infer_output_types(&[DimensionType::from(source.clone()).into()], &[]),
-            Ok(vec![dynamic_one_type.into()]),
-        );
-        assert_eq!(
-            dynamic_one.infer_output_types(&[], &[]),
-            Err(TypeError::invalid(
-                "`one` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
-            )),
-        );
-        let other = DimensionVariable::new("other", bounds);
-        assert_eq!(
-            dynamic_one.infer_output_types(&[DimensionType::from(other).into()], &[]),
-            Err(TypeError::invalid(
-                "`one` input 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
-                 dimension<source ∈ [1, 9)>",
-            )),
-        );
-        assert_eq!(
-            dynamic_one.infer_output_types(
-                &[DimensionType::from(source.clone()).into()],
-                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
-            ),
-            Err(TypeError::invalid("`one` expects no regions but got 1")),
-        );
-
-        // Iota follows the same static-versus-dynamic routing while retaining and validating its varying axis.
-        let static_iota_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)]));
-        let static_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
-        assert!(matches!(static_iota, ArrayIrOperation::Array(ArrayOperation::Iota(_))));
-        let mixed_static_iota =
-            ArrayIrOperation::<Array>::Iota(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
-        assert_eq!(mixed_static_iota.infer_output_types(&[], &[]), Ok(vec![static_iota_type.into()]));
-        let dynamic_iota_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Static(2)]));
-        let dynamic_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(dynamic_iota_type.clone(), 0).unwrap());
-        assert!(matches!(dynamic_iota, ArrayIrOperation::Iota(_)));
-        assert_eq!(
-            dynamic_iota.infer_output_types(&[DimensionType::from(source.clone()).into()], &[]),
-            Ok(vec![dynamic_iota_type.clone().into()]),
-        );
-        assert_eq!(
-            IotaOperation::new(dynamic_iota_type, 2).unwrap_err(),
-            TypeError::invalid("`iota` dimension 2 is out of bounds for rank 2"),
-        );
-
-        let renamed_left = DimensionVariable::new("renamed_left", bounds);
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(left_type.variable().unwrap().clone(), renamed_left.clone()).unwrap();
-        let ArrayIrOperation::Dimension(DimensionOperation::Add(add)) =
-            dimension_operation.rename_type_identities(&renaming).unwrap()
-        else {
-            panic!("expected a renamed dimension addition operation");
-        };
-        assert_eq!(add.left_type().variable(), Some(&renamed_left));
-        assert_eq!(add.right_type(), &right_type);
-
-        // A genuinely mixed operation is represented directly by the outer family rather than either homogeneous
-        // member projection.
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
-        let dimension_size = ArrayIrOperation::<Array>::from(DimensionSizeOperation::new(&dynamic_type, 0).unwrap());
-        assert!(matches!(dimension_size, ArrayIrOperation::DimensionSize(_)));
-        assert_eq!(dimension_size.name(), "dimension_size");
-        assert_eq!(
-            dimension_size.infer_output_types(&[dynamic_type.into()], &[]),
-            Ok(vec![DimensionType::from(source).into()]),
-        );
-
-        // Canonical reshape derives its entire result shape from its ordered first-class dimension input types.
-        let reshape = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new());
-        assert!(matches!(reshape, ArrayIrOperation::Reshape(_)));
-        let two = DimensionValue::constant(2).unwrap();
-        let three = DimensionValue::constant(3).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(6)]));
-        assert_eq!(
-            reshape.infer_output_types(
-                &[input_type.clone().into(), two.r#type().into_owned().into(), three.r#type().into_owned().into()],
-                &[],
-            ),
-            Ok(vec![
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]),).into()
-            ]),
-        );
-        let output_extent = DimensionType::new("output", DimensionBounds::new(1, Some(7)).unwrap());
-        assert_eq!(
-            reshape.infer_output_types(
-                &[input_type.into(), output_extent.clone().into(), three.r#type().into_owned().into()],
-                &[],
-            ),
-            Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![output_extent.dimension().clone(), Dimension::Static(3)]),
-                )
-                .into()
-            ]),
-        );
-        assert_eq!(
-            reshape.infer_output_types(&[two.r#type().into_owned().into()], &[]),
-            Err(TypeError::invalid("expected array type but got dimension type")),
-        );
-        assert_eq!(
-            reshape.infer_output_types(
-                &[ArrayType::scalar(DataType::F32).into(), ArrayType::scalar(DataType::I64).into()],
-                &[]
-            ),
-            Err(TypeError::invalid("expected dimension type but got array type")),
-        );
-
-        let placed_input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
-                .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
-                .with_memory(Memory::Host { pinned: true });
-        let placed_reshape = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new());
-        assert_eq!(placed_reshape.to_string(), "reshape");
-        assert_eq!(
-            placed_reshape.infer_output_types(
-                &[placed_input_type.into(), DimensionValue::constant(6).unwrap().r#type().into_owned().into(),],
-                &[],
-            ),
-            Ok(vec![
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(6)]))
-                    .with_memory(Memory::Host { pinned: true })
-                    .into()
-            ]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_operation_lifting_preserves_homogeneous_input_signatures() {
-        let array_type = ArrayType::new_static(DataType::F32, [2]);
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let output_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]));
-
-        // Existing homogeneous instructions retain their original inputs. The mixed payload constructors require
-        // additional extent inputs, so their direct `From` implementations cannot lift these instructions.
-        let pad =
-            ArrayIrOperation::<Array>::from(ArrayOperation::Pad(PadOperation::new(vec![1], vec![1], vec![0]).unwrap()));
-        assert!(matches!(pad, ArrayIrOperation::Array(ArrayOperation::Pad(_))));
-        assert_eq!(
-            pad.infer_output_types(&[array_type.clone().into(), scalar_type.into()], &[]),
-            Ok(vec![output_type.clone()]),
-        );
-        let concatenate = ArrayIrOperation::<Array>::from(ArrayOperation::Concatenate(
-            ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(),
-        ));
-        assert!(matches!(concatenate, ArrayIrOperation::Array(ArrayOperation::Concatenate(_))));
-        assert_eq!(
-            concatenate.infer_output_types(&[array_type.clone().into(), array_type.into()], &[]),
-            Ok(vec![output_type]),
-        );
+        // `ArrayIrOperations` pins this bundle on its first-class-dimension member profile, so the dimension member
+        // projected out of every canonical array IR value must satisfy it as well.
+        requires_dimension_operations::<<ArrayIrValue<Array> as ValueProjection<DimensionType>>::Projected>();
+        requires_dimension_operations::<
+            <Tracer<TracingContext<TestValue, TestOperation>> as ValueProjection<DimensionType>>::Projected,
+        >();
     }
 
     #[test]
@@ -1528,7 +982,11 @@ mod tests {
         let dimension_add = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
             DimensionAddOperation::new(&left_type, &right_type).unwrap(),
         ));
-        assert_eq!(dimension_add, dimension_add.clone());
+        let same_dimension_add = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
+            DimensionAddOperation::new(&left_type, &right_type).unwrap(),
+        ));
+        assert_eq!(dimension_add, same_dimension_add);
+        assert_eq!(hash_of(&dimension_add), hash_of(&same_dimension_add));
         assert_ne!(dimension_add, add);
 
         // Region-carrying marker payloads are identical within their family; their regions live on the instruction.
@@ -1552,49 +1010,501 @@ mod tests {
             )))
         };
         assert_eq!(constant(f64::NAN), constant(f64::NAN));
+        assert_eq!(hash_of(&constant(f64::NAN)), hash_of(&constant(f64::NAN)));
         assert_ne!(constant(-0.0), constant(0.0));
+        let operations = HashMap::from([(add, "array"), (dimension_add, "dimension"), (condition, "condition")]);
+        assert_eq!(operations.get(&same_add), Some(&"array"));
+        assert_eq!(operations.get(&same_dimension_add), Some(&"dimension"));
+        assert_eq!(operations.get(&same_condition), Some(&"condition"));
+        assert_eq!(operations.get(&ArrayIrOperation::<Array>::from(ArrayOperation::Mul(MulOperation::new()))), None,);
     }
 
     #[test]
-    fn test_array_ir_operation_reference_conversions() {
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
-            ArrayIrOperation::ReferenceNew(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(
-                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+    fn test_array_ir_operation_member_kinds() {
+        /// Member-kind signature of one [`ArrayIrOperation`] variant, in terms of which member kinds it consumes and
+        /// produces as *values*.
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        enum MemberKindSignature {
+            /// Array-only boundary through the [`ArrayType`] operation projection or an explicit direct carrier.
+            ArrayToArray,
+
+            /// Homogeneous first-class-dimension boundary, reached through the [`DimensionType`] projection.
+            DimensionToDimension,
+
+            /// Converts a first-class dimension value into ordinary array data.
+            DimensionToArrayGateway,
+
+            /// Converts ordinary array data into a first-class dimension value.
+            ArrayToDimensionGateway,
+
+            /// Creates a new reference root initialized from ordinary array data.
+            ArrayToReference,
+
+            /// Reads or consumes ordinary array data from a reference.
+            ReferenceToArray,
+
+            /// Replaces a reference from an ordinary array and returns the previous ordinary array value.
+            ReferenceAndArrayToArray,
+
+            /// Updates a reference from an ordinary array without producing a value.
+            ReferenceAndArrayToUnit,
+
+            /// Consumes first-class dimensions as extents (or reads an array's extent as a dimension) without ever
+            /// converting a value from one member kind into the other.
+            DimensionMixed,
+
+            /// Checks a Boolean array condition with optional scalar array or dimension observations and no outputs.
+            AssertionToUnit,
+
+            /// Returns each input at another type of the same member kind, never converting between member kinds.
+            KindPreserving,
+
+            /// Forwards array IR regions whose bodies may carry every admitted member kind.
+            RegionForwarding,
+        }
+
+        macro_rules! check_member_kinds {
+            // One case declares a variant's fixture and category, generating both exhaustive dispatch and coverage.
+            ($($variant:ident => ($fixture:expr, $signature:ident $(,)?)),+ $(,)?) => {{
+                /// Classifies every admitted array IR operation variant from the fixture list.
+                #[deny(unreachable_patterns)]
+                fn member_kind_signature(operation: &ArrayIrOperation<Array>) -> MemberKindSignature {
+                    match operation {
+                        $(ArrayIrOperation::$variant(_) => MemberKindSignature::$signature,)+
+                    }
+                }
+
+                let operations: Vec<ArrayIrOperation<Array>> = vec![
+                    $({
+                        let operation: ArrayIrOperation<Array> = $fixture;
+                        assert!(
+                            matches!(&operation, ArrayIrOperation::$variant(_)),
+                            "fixture for `{}` has the wrong variant",
+                            stringify!($variant),
+                        );
+                        operation
+                    },)+
+                ];
+                let signatures = operations.iter().map(member_kind_signature).collect::<Vec<_>>();
+
+                // Exhaustive dispatch forbids omissions, and the denied unreachable-pattern lint forbids duplicates.
+                assert_eq!(operations.len(), 40);
+                assert_eq!(
+                    signatures
+                        .iter()
+                        .filter(|signature| **signature == MemberKindSignature::DimensionToArrayGateway)
+                        .count(),
+                    2,
+                );
+                assert_eq!(
+                    signatures
+                        .iter()
+                        .filter(|signature| **signature == MemberKindSignature::ArrayToDimensionGateway)
+                        .count(),
+                    1,
+                );
+                assert_eq!(
+                    signatures.iter().filter(|signature| **signature == MemberKindSignature::AssertionToUnit).count(),
+                    1,
+                );
+                assert_eq!(
+                    signatures.iter().filter(|signature| **signature == MemberKindSignature::KindPreserving).count(),
+                    2,
+                );
+                assert_eq!(
+                    signatures
+                        .iter()
+                        .filter(|signature| **signature == MemberKindSignature::ArrayToReference)
+                        .count(),
+                    1,
+                );
+                assert_eq!(
+                    signatures
+                        .iter()
+                        .filter(|signature| **signature == MemberKindSignature::ReferenceToArray)
+                        .count(),
+                    2,
+                );
+                assert_eq!(
+                    signatures
+                        .iter()
+                        .filter(|signature| **signature == MemberKindSignature::ReferenceAndArrayToArray)
+                        .count(),
+                    1,
+                );
+                assert_eq!(
+                    signatures
+                        .iter()
+                        .filter(|signature| **signature == MemberKindSignature::ReferenceAndArrayToUnit)
+                        .count(),
+                    3,
+                );
+            }};
+        }
+
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let first_type = DimensionType::from(first.clone());
+        let second_type = DimensionType::from(second.clone());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
+        let array_ir_rules = CustomRuleRegistration::new(CustomRuleDefinition::<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+        >::new("ir"));
+        let member_rules =
+            CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("array"));
+        let dynamic_integer_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+
+        // This single declaration-order case list drives the exhaustive classifier and matching fixtures together.
+        // Dimension comparison and conversion are the two dimension-to-data gateways; scalar conversion is the sole
+        // data-to-dimension gateway. Other signatures preserve member kinds, read extents, or forward regions.
+        check_member_kinds!(
+            Zero => (
+                ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())),
+                DimensionMixed,
             ),
-            ArrayIrOperation::ReferenceRead(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(
-                ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+            One => (
+                ArrayIrOperation::One(OneOperation::new(dynamic_type.clone())),
+                DimensionMixed,
             ),
-            ArrayIrOperation::ReferenceWrite(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(
-                ReferenceSwapOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+            Iota => (
+                ArrayIrOperation::Iota(IotaOperation::new(dynamic_integer_type, 0).unwrap()),
+                DimensionMixed,
             ),
-            ArrayIrOperation::ReferenceSwap(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceAddUpdateOperation::<
-                ArrayType,
-                ArrayIrType,
-                ArrayReferenceTransform,
-            >::new()),
-            ArrayIrOperation::ReferenceAddUpdate(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()),
-            ArrayIrOperation::ReferenceFreeze(_),
-        ));
+            Array => (
+                ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                ArrayToArray,
+            ),
+            Dimension => (
+                ArrayIrOperation::Dimension(DimensionOperation::Add(
+                    DimensionAddOperation::new(&first_type, &second_type).unwrap(),
+                )),
+                DimensionToDimension,
+            ),
+            DimensionSize => (
+                ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
+                DimensionMixed,
+            ),
+            DimensionFromScalar => (
+                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone().into())),
+                ArrayToDimensionGateway,
+            ),
+            DimensionToScalar => (
+                ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
+                DimensionToArrayGateway,
+            ),
+            ReferenceNew => (
+                ArrayIrOperation::ReferenceNew(ReferenceNewOperation::new()),
+                ArrayToReference,
+            ),
+            ReferenceRead => (
+                ArrayIrOperation::ReferenceRead(ReferenceReadOperation::new()),
+                ReferenceToArray,
+            ),
+            ReferenceWrite => (
+                ArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new()),
+                ReferenceAndArrayToUnit,
+            ),
+            ReferenceSwap => (
+                ArrayIrOperation::ReferenceSwap(ReferenceSwapOperation::new()),
+                ReferenceAndArrayToArray,
+            ),
+            ReferenceAddUpdate => (
+                ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                ReferenceAndArrayToUnit,
+            ),
+            ReferenceAtomicAddUpdate => (
+                ArrayIrOperation::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new()),
+                ReferenceAndArrayToUnit,
+            ),
+            ReferenceFreeze => (
+                ArrayIrOperation::ReferenceFreeze(ReferenceFreezeOperation::new()),
+                ReferenceToArray,
+            ),
+            ParallelAllGather => (
+                ArrayIrOperation::ParallelAllGather(ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::new(CollectiveMode::Untiled),
+                    ParallelAllGatherOutputVariance::Varying,
+                )),
+                DimensionMixed,
+            ),
+            ParallelSumScatter => (
+                ArrayIrOperation::ParallelSumScatter(ParallelSumScatterOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::new(CollectiveMode::Untiled),
+                )),
+                DimensionMixed,
+            ),
+            ParallelAllToAll => (
+                ArrayIrOperation::ParallelAllToAll(ParallelAllToAllOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    0,
+                    CollectiveOptions::new(CollectiveMode::Untiled),
+                )),
+                DimensionMixed,
+            ),
+            ParallelRaggedAllToAll => (
+                ArrayIrOperation::ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation::new("x".to_string(), 2)),
+                ArrayToArray,
+            ),
+            Compare => (
+                ArrayIrOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                DimensionToArrayGateway,
+            ),
+            Reshape => (
+                ArrayIrOperation::Reshape(DynamicReshapeOperation::new()),
+                DimensionMixed,
+            ),
+            Broadcast => (
+                ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])),
+                DimensionMixed,
+            ),
+            Pad => (
+                ArrayIrOperation::Pad(PadOperation::new(vec![0], vec![0], vec![0]).unwrap()),
+                DimensionMixed,
+            ),
+            Concatenate => (
+                ArrayIrOperation::Concatenate(
+                    ConcatenateOperation::<ArrayIrType>::new(
+                        0,
+                        &[
+                            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
+                            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                            DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                DimensionMixed,
+            ),
+            DynamicSlice => (
+                ArrayIrOperation::DynamicSlice(DynamicSliceOperation::<ArrayIrType>::from_rank(1)),
+                DimensionMixed,
+            ),
+            ShardMap => (
+                {
+                    let body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+                        .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), Vec::new(), Vec::new())
+                        .unwrap();
+                    let shard_map = ShardMap::new(
+                        LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                        Vec::new(),
+                        Vec::new(),
+                        vec!["x".to_string()],
+                    )
+                    .unwrap();
+                    ArrayIrOperation::ShardMap(ShardMapOperation::from_program(&body, Vec::new(), shard_map).unwrap())
+                },
+                RegionForwarding,
+            ),
+            Condition => (
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                RegionForwarding,
+            ),
+            While => (
+                ArrayIrOperation::While(WhileOperation::new()),
+                RegionForwarding,
+            ),
+            Scan => (
+                ArrayIrOperation::Scan(ScanOperation::new(1, 4)),
+                RegionForwarding,
+            ),
+            Rematerialize => (
+                ArrayIrOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(
+                    NothingSavable,
+                ))),
+                RegionForwarding,
+            ),
+            LinearCall => (
+                ArrayIrOperation::LinearCall(LinearCallOperation::new(0)),
+                RegionForwarding,
+            ),
+            RngBitGenerator => (
+                ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
+                    RandomAlgorithm::ThreeFry,
+                    dynamic_type.clone(),
+                )),
+                DimensionMixed,
+            ),
+            Assert => (
+                ArrayIrOperation::Assert(AssertOperation::new("dimensions must match")),
+                AssertionToUnit,
+            ),
+            Guard => (
+                ArrayIrOperation::Guard(GuardOperation::new("region", vec![dynamic_type.clone().into()])),
+                KindPreserving,
+            ),
+            Cast => (
+                ArrayIrOperation::Cast(
+                    CastOperation::unchecked(dynamic_type.clone().into(), vec![dynamic_type.clone().into()]).unwrap(),
+                ),
+                KindPreserving,
+            ),
+            CustomCall => (
+                ArrayIrOperation::CustomCall(
+                    CustomCallOperation::new("ryft.test.identity", vec![scalar_type.clone()]).into(),
+                ),
+                DimensionMixed,
+            ),
+            Composite => (
+                ArrayIrOperation::Composite(CompositeOperation::new(array_ir_rules.reference())),
+                RegionForwarding,
+            ),
+            CompositeTranspose => (
+                ArrayIrOperation::CompositeTranspose(CompositeTransposeOperation::new(
+                    array_ir_rules.reference(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                RegionForwarding,
+            ),
+            LiftedComposite => (
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(member_rules.reference()))),
+                RegionForwarding,
+            ),
+            LiftedCompositeTranspose => (
+                ArrayIrOperation::from(ArrayOperation::CompositeTranspose(CompositeTransposeOperation::new(
+                    member_rules.reference(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                ))),
+                RegionForwarding,
+            ),
+        );
     }
 
     #[test]
-    fn test_array_ir_operation_forwards_payload_effects() {
+    fn test_array_ir_operation_projection() {
+        fn assert_projection<T: Type, O: Operation<Type = T>, Family: OperationProjection<T, Projected = O>>() {}
+
+        assert_projection::<ArrayType, ArrayOperation<Array>, ArrayIrOperation<Array>>();
+        assert_projection::<DimensionType, DimensionOperation<DimensionValue>, ArrayIrOperation<Array>>();
+
+        let array = ArrayOperation::<Array>::Add(AddOperation::new());
+        let lifted = ArrayIrOperation::from(array.clone());
+        assert!(matches!(lifted, ArrayIrOperation::Array(ArrayOperation::Add(_))));
+        assert_eq!(lifted.name(), array.name());
+        assert_eq!(lifted.to_string(), array.to_string());
+
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let left = DimensionType::new("left", bounds);
+        let right = DimensionType::new("right", bounds);
+        let dimension = DimensionOperation::<DimensionValue>::Add(DimensionAddOperation::new(&left, &right).unwrap());
+        let lifted = ArrayIrOperation::<Array>::from(dimension.clone());
+        assert!(matches!(lifted, ArrayIrOperation::Dimension(DimensionOperation::Add(_))));
+        assert_eq!(lifted.name(), dimension.name());
+        assert_eq!(lifted.to_string(), dimension.to_string());
+
+        // Direct dimension payload conversion reaches the same canonical member family.
+        let product = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&left, &right).unwrap());
+        assert!(matches!(product, ArrayIrOperation::Dimension(DimensionOperation::Mul(_))));
+    }
+
+    #[test]
+    fn test_array_ir_operation_infer_output_types() {
+        let array = ArrayType::scalar(DataType::F32);
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let left = DimensionType::new("left", bounds);
+        let right = DimensionType::new("right", bounds);
+        let reference = ArrayIrType::Reference(ReferenceType::new(array.clone()));
+        check_operation_type_inference!(
+            operation = ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())),
+            cases = [
+                {
+                    input_types = [array.clone().into(), array.clone().into()],
+                    output_types = [array.clone().into()],
+                },
+                {
+                    input_types = [left.clone().into(), right.clone().into()],
+                    error = "expected array type but got dimension type",
+                },
+                {
+                    input_types = [array.clone().into(), right.clone().into()],
+                    error = "expected array type but got dimension type",
+                },
+                {
+                    input_types = [reference.clone(), array.clone().into()],
+                    error = "expected array type but got reference type",
+                },
+                {
+                    input_types = [array.clone().into(), reference.clone()],
+                    error = "expected array type but got reference type",
+                },
+            ],
+        );
+
+        // The wrapper delegates inference after projecting every input, and lifts the result back into array IR.
+        let addition = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
+            DimensionAddOperation::new(&left, &right).unwrap(),
+        ));
+        let output_types = addition.infer_output_types(&[left.clone().into(), right.clone().into()], &[]).unwrap();
+        let [ArrayIrType::Dimension(result)] = output_types.as_slice() else {
+            panic!("expected one first-class dimension output");
+        };
+        // Each inference defines a fresh nominal result, so compare its authoritative bounds rather than another ID.
+        assert_eq!(result.bounds(), DimensionBounds::new(2, Some(17)).unwrap());
+        check_operation_type_inference!(
+            operation = addition,
+            cases = [
+                {
+                    input_types = [array.clone().into(), array.clone().into()],
+                    error = "expected dimension type but got array type",
+                },
+                {
+                    input_types = [left.into(), reference],
+                    error = "expected dimension type but got reference type",
+                },
+            ],
+        );
+
+        // A mixed signature remains in the enclosing universe instead of projecting its array-to-dimension boundary.
+        let extent = DimensionVariable::new("extent", bounds);
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        check_operation_type_inference!(
+            operation = ArrayIrOperation::<Array>::from(DimensionSizeOperation::new(&dynamic, 0).unwrap()),
+            cases = [{
+                input_types = [dynamic.into()],
+                output_types = [DimensionType::from(extent).into()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_region_interfaces() {
+        let array = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let input_types = [ArrayType::scalar(DataType::Boolean).into(), array.clone()];
+        let interface = RegionInterface::new(
+            vec![array.clone()],
+            vec![array.clone()],
+            EffectClasses::single(EffectClass::OrderedIo),
+        );
+        let interfaces = [interface.clone(), interface];
+        let payload = ConditionOperation::<ArrayIrType>::new();
+        let operation = ArrayIrOperation::<Array>::Condition(payload.clone());
+
+        assert_eq!(operation.region_slots(), payload.region_slots());
+        assert_eq!(operation.infer_output_types(&input_types, &interfaces), Ok(vec![array.clone()]));
+        assert_eq!(
+            operation.infer_region_input_types(&input_types, &interfaces),
+            payload.infer_region_input_types(&input_types, &interfaces),
+        );
+        assert_eq!(operation.input_region_provenance(0, 0), payload.input_region_provenance(0, 0));
+        assert_eq!(operation.output_region_provenance(0), payload.output_region_provenance(0));
+    }
+
+    #[test]
+    fn test_array_ir_operation_effects() {
         // A statically proven mixed concatenate is pure. The derived dispatcher must read that payload classification
         // rather than declaring the array IR family effectful.
         let concatenate = ConcatenateOperation::<ArrayIrType>::new(
@@ -1635,536 +1545,648 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_operation_rename_type_identities() {
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source.clone(), target.clone()).unwrap();
+
+        // Identity-bearing payloads of a mixed constructor are renamed in the enclosing family.
+        let zero = ArrayIrOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(source.clone())]),
+        ))));
+        let ArrayIrOperation::Zero(zero) = zero.rename_type_identities(&renaming).unwrap() else {
+            panic!("expected a renamed mixed zero operation");
+        };
+        assert_eq!(zero.r#type().shape().dimensions(), &[Dimension::Dynamic(target.clone())]);
+
+        // Projected dimension payloads use the same renaming while preserving unrelated identities.
+        let right = DimensionType::new("right", bounds);
+        let addition = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
+            DimensionAddOperation::new(&DimensionType::from(source), &right).unwrap(),
+        ));
+        let ArrayIrOperation::Dimension(DimensionOperation::Add(addition)) =
+            addition.rename_type_identities(&renaming).unwrap()
+        else {
+            panic!("expected a renamed dimension addition operation");
+        };
+        assert_eq!(addition.left_type().variable(), Some(&target));
+        assert_eq!(addition.right_type(), &right);
+    }
+
+    #[test]
+    fn test_array_ir_operation_type_identity_import_shared_extents() {
+        let program = array_ir_shared_extent_program();
+        let target_type = DimensionType::new("target", DimensionBounds::new(1, Some(5)).unwrap());
+        let target_array_type = ArrayType::new(DataType::F64, Shape::new(vec![target_type.dimension().clone()]));
+        let instantiated = program
+            .with_instantiated_type_identities(&[target_array_type.clone().into(), target_type.clone().into()])
+            .unwrap()
+            .into_owned();
+        assert_eq!(instantiated.input_types(), vec![target_array_type.clone().into(), target_type.clone().into()]);
+        let expected_rendering = indoc! {r#"
+            lambda %0:f64[target], %1:dimension<target ∈ [1, 5)> .
+            let %2:dimension<1> = const 1
+                %3:dimension<extent * 1 ∈ [1, 5)> = dimension_mul %1 %2
+                %4:dimension<2> = dimension_add %2 %2
+                %5:f64[1, extent * 1] = reshape %0 %2 %3
+                %6:f64[2, extent * 1] = broadcast [output_axes=[0, 1]] %5 %4 %3
+            in (%6)
+        "#}
+        .trim_end();
+        assert_eq!(instantiated.to_string(), expected_rendering);
+
+        // Import preserves the renamed boundary and the one arithmetic result shared by both shape consumers.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(target_array_type.into());
+        let extent = builder.add_input(target_type.clone().into());
+        let outputs = builder.splice_program(&instantiated, &[input, extent]).unwrap();
+        let imported = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(imported.to_string(), expected_rendering);
+        assert_eq!(imported.input_types(), instantiated.input_types());
+
+        // Import freshens the internal identity. The final array must refer to that new definition, whose printed
+        // name alone cannot distinguish it from the source program's dimension.
+        let shared_extent_id = imported.instructions()[0].outputs()[0];
+        let shared_extent_type = imported.atoms()[shared_extent_id.index()].r#type();
+        let expected_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), shared_extent_type.as_dimension_type().unwrap().dimension().clone()]),
+        );
+        assert_eq!(imported.output_types(), vec![expected_type.into()]);
+        assert_ne!(imported.output_types(), instantiated.output_types());
+        assert_eq!(
+            imported.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(target_type, 3).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap(),)]),
+        );
+    }
+
+    #[test]
     fn test_array_ir_operation_interpretation() {
-        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = EagerContext::<TestValue, TestOperation>::new();
+
+        // Representative projected array, projected dimension, and direct mixed boundaries all bind in one context.
         assert_eq!(
             context.bind(
                 ArrayOperation::Add(AddOperation::new()),
                 Vec::new(),
                 &[
-                    ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()),
-                    ArrayIrValue::Array(Array::vector(vec![3.0, 4.0]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![1f32, 2.0]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![3f32, 4.0]).unwrap()),
                 ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4f32, 6.0]).unwrap())]),
         );
-
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new("left", bounds);
-        let right_type = DimensionType::new("right", bounds);
-        let operation = DimensionOperation::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap());
-        let result = context
+        let left = DimensionType::new("left", bounds);
+        let right = DimensionType::new("right", bounds);
+        let output = context
             .bind(
-                operation,
+                DimensionOperation::Add(DimensionAddOperation::new(&left, &right).unwrap()),
                 Vec::new(),
                 &[
-                    ArrayIrValue::Dimension(DimensionValue::new(left_type, 3).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(right_type, 4).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(left, 3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(right, 4).unwrap()),
                 ],
             )
             .unwrap();
-        let [ArrayIrValue::Dimension(result)] = result.as_slice() else {
+        let [ArrayIrValue::Dimension(output)] = output.as_slice() else {
             panic!("expected one dimension result");
         };
-        assert_eq!(result.extent(), 7);
-
-        let reshape_input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
-        let reshape = context
-            .bind(
+        assert_eq!(output.extent(), 7);
+        assert_eq!(
+            context.bind(
                 DynamicReshapeOperation::new(),
                 Vec::new(),
                 &[
-                    reshape_input,
+                    ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
                     ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
                     ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
                 ],
-            )
-            .unwrap();
-        assert_eq!(
-            reshape,
-            vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap())],
-        );
-
-        // Dynamic constructors accept exact eager extents for their symbolic axes.
-        let rows_type = DimensionType::new("rows", DimensionBounds::non_negative(Some(9)).unwrap());
-        let columns_type = DimensionType::new("columns", DimensionBounds::non_negative(Some(9)).unwrap());
-        let rows = DimensionValue::new(rows_type.clone(), 2).unwrap();
-        let columns = DimensionValue::new(columns_type.clone(), 3).unwrap();
-        let zero = context
-            .bind(
-                ZeroOperation::new(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![rows_type.dimension().clone(), columns_type.dimension().clone()]),
-                )),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(rows), ArrayIrValue::Dimension(columns)],
-            )
-            .unwrap();
-        assert_eq!(zero, vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())]);
-
-        let extent = DimensionValue::new(columns_type.clone(), 3).unwrap();
-        let one = context
-            .bind(
-                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![columns_type.dimension().clone()]))),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(extent)],
-            )
-            .unwrap();
-        assert_eq!(one, vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap())]);
-        // Explicit static mixed constructors consume no dimension inputs and interpret identically to their preferred
-        // homogeneous encodings.
-        let static_float_type = ArrayType::scalar(DataType::F32);
-        assert_eq!(
-            context.bind(ArrayIrOperation::Zero(ZeroOperation::new(static_float_type.clone())), Vec::new(), &[],),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())]),
-        );
-        assert_eq!(
-            context.bind(ArrayIrOperation::One(OneOperation::new(static_float_type)), Vec::new(), &[],),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]),
-        );
-        let static_iota_type = ArrayType::new_static(DataType::I32, [3]);
-        assert_eq!(
-            context.bind(
-                ArrayIrOperation::Iota(IotaOperation::new(static_iota_type.clone(), 0).unwrap()),
-                Vec::new(),
-                &[],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::from_elements(static_iota_type.clone(), &[0i32, 1, 2]).unwrap(),)]),
-        );
-        assert_eq!(
-            context.bind(
-                ArrayIrOperation::Iota(IotaOperation::new(static_iota_type, 0).unwrap()),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
-        );
-
-        let rows = DimensionValue::new(rows_type.clone(), 2).unwrap();
-        let dynamic_iota = context
-            .bind(
-                IotaOperation::new(
-                    ArrayType::new(
-                        DataType::I32,
-                        Shape::new(vec![rows_type.dimension().clone(), Dimension::Static(3)]),
-                    ),
-                    0,
-                )
-                .unwrap(),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(rows)],
-            )
-            .unwrap();
-        assert_eq!(
-            dynamic_iota,
-            vec![ArrayIrValue::Array(
-                Array::from_elements(
-                    ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]),),
-                    &[0i32, 0, 0, 1, 1, 1],
-                )
-                .unwrap(),
-            )],
-        );
-        let extent_type = DimensionType::new("iota_extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
-        let extent_program_type = extent.r#type().into_owned();
-        let output = ArrayIrValue::Array(
-            Array::from_elements(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])), &[0i32, 1, 2])
-                .unwrap(),
-        );
-        check_operation_partial_evaluation!(
-            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = ArrayIrOperation::from(IotaOperation::new(
-                ArrayType::new(
-                    DataType::I32,
-                    Shape::new(vec![extent_type.dimension().clone()]),
-                ),
-                0,
-            )
-            .unwrap()),
-            cases = [
-                {
-                    inputs = [(@known, extent.clone())],
-                    outputs = [(@known, output.clone())],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [(@unknown(type = extent_program_type, replay = extent))],
-                    outputs = [(@residual, output)],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-
-        // A runtime extent outside the stored output axis's authoritative bounds is rejected before allocation, even
-        // though eager binds skip inference: the input's own variable admits the extent, so only the stored axis's
-        // bounds can catch it. The input may use an equivalent dimension identity supplied by the calling program, so
-        // its identity does not need to exactly match the one stored on the operation.
-        let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(4)).unwrap());
-        let error = context
-            .bind(
-                ZeroOperation::new(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(bounded.clone())]),
-                )),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap())],
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::BindingOutOfBounds {
-                variable: "bounded".to_string(),
-                value: 5,
-                bounds: DimensionBounds::new(1, Some(4)).unwrap(),
-            }),
-        );
-        let error = context
-            .bind(
-                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded.clone())]))),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap())],
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::BindingOutOfBounds {
-                variable: "bounded".to_string(),
-                value: 5,
-                bounds: DimensionBounds::new(1, Some(4)).unwrap(),
-            }),
-        );
-        let error = context
-            .bind(
-                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(bounded)])), 0)
-                    .unwrap(),
-                Vec::new(),
-                &[ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap())],
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::BindingOutOfBounds {
-                variable: "bounded".to_string(),
-                value: 5,
-                bounds: DimensionBounds::new(1, Some(4)).unwrap(),
-            }),
-        );
-
-        let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
-        assert_eq!(
-            condition.interpret(&context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::MalformedProgram("region index 0 is out of range".to_string())),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())]),
         );
     }
 
     #[test]
-    fn test_array_ir_operation_tracing_has_only_explicit_dependencies() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_array_ir_operation_interpretation_shared_extents() {
+        let program = array_ir_shared_extent_program();
+        let extent_type = program.input_types()[1].as_dimension_type().unwrap().clone();
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap(),)]),
+        );
+    }
 
-        let context = TestContext::new();
-        let array = context.input(ArrayType::scalar(DataType::F32).into());
-        let array_atom = array.atom_id().unwrap();
-        let array = <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(array).unwrap();
-        array.domain().bind(AddOperation::new(), Vec::new(), &[array.clone(), array]).unwrap();
-
+    #[test]
+    fn test_array_ir_operation_staging_member_projections() {
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
-        let left = context.input(left_type.clone().into());
-        let right = context.input(right_type.clone().into());
-        let left_atom = left.atom_id().unwrap();
-        let right_atom = right.atom_id().unwrap();
-        let left = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(left).unwrap();
-        let right = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(right).unwrap();
-        left.domain()
-            .bind(DimensionAddOperation::new(&left_type, &right_type).unwrap(), Vec::new(), &[left, right])
-            .unwrap();
-
-        let builder = context.builder().borrow();
-        let [array_instruction, dimension_instruction] = builder.instructions() else {
-            panic!("expected one array instruction and one dimension instruction");
-        };
-        assert_eq!(array_instruction.inputs(), &[array_atom, array_atom]);
-        assert!(array_instruction.regions().is_empty());
-        assert!(matches!(array_instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Add(_))));
-        assert_eq!(dimension_instruction.inputs(), &[left_atom, right_atom]);
-        assert!(dimension_instruction.regions().is_empty());
-        assert!(matches!(dimension_instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Add(_)),));
-
-        let reshape_context = TestContext::new();
-        let reshape_input =
-            reshape_context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(6)])).into());
-        let first_extent = reshape_context.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let second_extent = reshape_context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let reshape_input_atom = reshape_input.atom_id().unwrap();
-        let first_extent_atom = first_extent.atom_id().unwrap();
-        let second_extent_atom = second_extent.atom_id().unwrap();
-        let reshape_input = <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(reshape_input)
-            .unwrap()
-            .into_value();
-        let reshape_output = reshape_context
-            .bind(DynamicReshapeOperation::new(), Vec::new(), &[reshape_input, first_extent, second_extent])
-            .unwrap()
-            .remove(0);
-        let reshape_builder = reshape_context.builder().borrow();
-        let [reshape_instruction] = reshape_builder.instructions() else {
-            panic!("expected one reshape instruction");
-        };
-        assert_eq!(reshape_instruction.inputs(), &[reshape_input_atom, first_extent_atom, second_extent_atom],);
-        assert!(matches!(reshape_instruction.operation(), ArrayIrOperation::Reshape(_)));
-        drop(reshape_builder);
-        let reshape_program = reshape_context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![reshape_output.atom_id().unwrap()],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
+        let addition = DimensionAddOperation::new(&left_type, &right_type).unwrap();
+        let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+            |(array, left, right): (
+                Tracer<TracingContext<TestValue, TestOperation>>,
+                Tracer<TracingContext<TestValue, TestOperation>>,
+                Tracer<TracingContext<TestValue, TestOperation>>,
+            )| {
+                let array = ValueProjection::<ArrayType>::into_projected(array)?;
+                let array_sum =
+                    array.domain().bind(AddOperation::new(), Vec::new(), &[array.clone(), array])?.remove(0);
+                let left = ValueProjection::<DimensionType>::into_projected(left)?;
+                let right = ValueProjection::<DimensionType>::into_projected(right)?;
+                let dimension_sum = left.domain().bind(addition, Vec::new(), &[left.clone(), right])?.remove(0);
+                Ok((array_sum.into_value(), dimension_sum.into_value()))
+            },
+            (
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::Dimension(left_type),
+                ArrayIrType::Dimension(right_type),
+            ),
+        )
+        .unwrap();
         assert_eq!(
-            reshape_program.to_string(),
+            program.to_string(),
             indoc! {"
-                lambda %0:f32[6] .
-                let %1:dimension<2> = const 2
-                    %2:dimension<3> = const 3
-                    %3:f32[2, 3] = reshape %0 %1 %2
-                in (%3)
+                lambda %0:f32[], %1:dimension<left ∈ [1, 9)>, %2:dimension<right ∈ [1, 9)> .
+                let %3:f32[] = add %0 %0
+                    %4:dimension<left + right ∈ [2, 17)> = dimension_add %1 %2
+                in (%3, %4)
             "}
             .trim_end(),
         );
+    }
 
-        let zero_context = TestContext::new();
-        // Dynamic constructors staged with exact constant extents for their symbolic axes have static outputs.
-        let rows_type = DimensionType::new("rows", DimensionBounds::non_negative(Some(9)).unwrap());
-        let columns_type = DimensionType::new("columns", DimensionBounds::non_negative(Some(9)).unwrap());
-        let rows_value = DimensionValue::new(rows_type.clone(), 2).unwrap();
-        let columns_value = DimensionValue::new(columns_type.clone(), 3).unwrap();
-        let zero_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![rows_type.dimension().clone(), columns_type.dimension().clone()]),
+    #[test]
+    fn test_array_ir_operation_staging_dimension_projection() {
+        let rows = DimensionType::new("rows", DimensionBounds::new(5, Some(9)).unwrap());
+        let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(rows, columns)| {
+                let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
+                let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
+                let padded = Add::add(&Mul::mul(&rows, &columns)?, &columns)?;
+                let trimmed = padded.saturating_sub(&rows)?;
+                Ok((
+                    Div::div(&trimmed, &columns)?.into_value(),
+                    Rem::rem(&trimmed, &columns)?.into_value(),
+                    rows.dimension_pow(&columns)?.into_value(),
+                    Sub::sub(&rows.dimension_max(&columns)?, &rows.dimension_min(&columns)?)?.into_value(),
+                ))
+            },
+            (ArrayIrType::Dimension(rows), ArrayIrType::Dimension(columns)),
+        )
+        .unwrap();
+        let expected = indoc! {"
+            lambda %0:dimension<rows ∈ [5, 9)>, %1:dimension<columns ∈ [1, 5)> .
+            let %2:dimension<rows * columns ∈ [5, 33)> = dimension_mul %0 %1
+                %3:dimension<rows * columns + columns ∈ [6, 37)> = dimension_add %2 %1
+                %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = saturating_sub %3 %0
+                %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
+                %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
+                %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1
+                %8:dimension<rows - columns ∈ [1, 8)> = dimension_sub %0 %1
+            in (%5, %6, %7, %8)
+        "};
+        assert_eq!(program.to_string(), expected.trim_end());
+    }
+
+    #[test]
+    fn test_array_ir_operation_staging_extent_dependencies() {
+        // One representative mixed program: a dynamically shaped input is read with `dimension_size`, the extent is
+        // combined with ordinary dimension arithmetic, and the derived extent is then consumed by two shape-carrying
+        // operations as an explicit input.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let size_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
+        let size_type = size_operation.output_type().clone();
+        let sum_operation = DimensionAddOperation::new(&size_type, &size_type).unwrap();
+        let sum_type = sum_operation.infer_output_types(&[size_type.clone(), size_type], &[]).unwrap().remove(0);
+        let one_value = DimensionValue::constant(1).unwrap();
+        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
+            0,
+            &[input_type.clone().into(), input_type.clone().into(), sum_type.into()],
+        )
+        .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
+        let size = builder.add_instruction(size_operation, Vec::new(), vec![input], None).unwrap()[0];
+        let sum = builder
+            .add_instruction(DimensionOperation::Add(sum_operation), Vec::new(), vec![size, size], None)
+            .unwrap()[0];
+        let concatenated =
+            builder.add_instruction(concatenate_operation, Vec::new(), vec![input, input, sum], None).unwrap()[0];
+        let reshaped = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![concatenated, sum, one], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<ArrayIrValue<Array>, ArrayIrValue<Array>>(vec![reshaped], Placeholder, Placeholder)
+            .unwrap();
+
+        // Every derived extent is visible in the rendered program: one `dimension_size` read plus explicit input
+        // edges into the shape-carrying operations. No shape is recovered from ambient or type-level metadata.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows] .
+                let %1:dimension<1> = const 1
+                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
+                    %4:f32[rows + rows] = concatenate [axis=0, requires_runtime_assertion=true] %0 %0 %3
+                    %5:f32[rows + rows, 1] = reshape %4 %3 %1
+                in (%5)"},
         );
-        let rows = zero_context.constant(ArrayIrValue::Dimension(rows_value));
-        let columns = zero_context.constant(ArrayIrValue::Dimension(columns_value));
-        let rows_atom = rows.atom_id().unwrap();
-        let columns_atom = columns.atom_id().unwrap();
-        let zero_output =
-            zero_context.bind(ZeroOperation::new(zero_type), Vec::new(), &[rows, columns]).unwrap().remove(0);
-        let zero_builder = zero_context.builder().borrow();
-        let [zero_instruction] = zero_builder.instructions() else {
-            panic!("expected one shaped-zero instruction");
-        };
-        assert_eq!(zero_instruction.inputs(), &[rows_atom, columns_atom]);
-        assert!(matches!(zero_instruction.operation(), ArrayIrOperation::Zero(_)));
-        drop(zero_builder);
-        let zero_program = zero_context
+
+        // Drift gate: an instruction output may only *reference* a dimension identity that one of its own inputs
+        // carries. A rule that recovered extents from stored metadata instead of an input edge would produce an output
+        // type naming an identity that reaches the instruction through no rendered edge.
+        let atoms = program.atoms();
+        for instruction in program.instructions() {
+            let mut input_identities = Vec::new();
+            for input in instruction.inputs() {
+                let r#type = atoms[input.index()].r#type();
+                input_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+            }
+            for output in instruction.outputs() {
+                let r#type = atoms[output.index()].r#type();
+                for (position, identity) in r#type.identities() {
+                    assert!(
+                        position != TypeIdentityPosition::Reference || input_identities.contains(identity),
+                        "instruction `{}` output type {} references identity {identity} that no input carries",
+                        instruction.operation().name(),
+                        r#type.as_ref(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_ir_operation_staging_shared_extents() {
+        let program = array_ir_shared_extent_program();
+        // Both shape operations consume the same arithmetic output, rather than independently derived extents.
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
+                let %2:dimension<1> = const 1
+                    %3:dimension<extent * 1 ∈ [1, 5)> = dimension_mul %1 %2
+                    %4:dimension<2> = dimension_add %2 %2
+                    %5:f64[1, extent * 1] = reshape %0 %2 %3
+                    %6:f64[2, extent * 1] = broadcast [output_axes=[0, 1]] %5 %4 %3
+                in (%6)
+            "#}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_staging_dimension_member_folding() {
+        let value_type = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let one_type = DimensionValue::constant(1).unwrap().r#type().into_owned();
+        let operation = DimensionMulOperation::new(&value_type, &one_type).unwrap();
+        let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+            |(value, one)| Ok(value.context().bind(operation, Vec::new(), &[value.clone(), one])?.remove(0)),
+            (ArrayIrType::Dimension(value_type), ArrayIrType::Dimension(one_type)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<1> .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_partial_evaluation_shared_extents() {
+        let program = array_ir_shared_extent_program();
+        let input_types = program.input_types();
+        let extent_type = input_types[1].as_dimension_type().unwrap().clone();
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        let expected = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap());
+
+        // Unknown extents retain their boundary identity, and folding substitutes it into both shape consumers.
+        let unknown = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(input_types[0].clone()),
+                PartialValue::Unknown(input_types[1].clone()),
+            ])
+            .unwrap();
+        assert_eq!(
+            unknown.program().to_string(),
+            indoc! {r#"
+                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
+                let %2:dimension<1> = const 1
+                    %3:f64[1, extent] = reshape %0 %2 %1
+                    %4:dimension<2> = const 2
+                    %5:f64[2, extent] = broadcast [output_axes=[0, 1]] %3 %4 %1
+                in (%5)
+            "#}
+            .trim_end(),
+        );
+        assert_eq!(
+            unknown.interpret(&EagerContext::<TestValue, TestOperation>::new(), &[input.clone(), extent.clone()],),
+            Ok(vec![expected.clone()]),
+        );
+
+        // A known extent narrows the array through an entry guard before either shape operation reads its data.
+        let known = program
+            .partially_evaluate(&[PartialValue::Unknown(input_types[0].clone()), PartialValue::Known(extent)])
+            .unwrap();
+        assert_eq!(
+            known.program().to_string(),
+            indoc! {r#"
+                lambda %0:f64[extent], %1:dimension<3> .
+                let %2:f64[3], %3:dimension<3> = guard [
+                    boundary="partial evaluation",
+                    declared_types=[f64[extent], dimension<extent ∈ [1, 5)>],
+                ] %0 %1
+                    %4:dimension<1> = const 1
+                    %5:f64[1, 3] = reshape %2 %4 %1
+                    %6:dimension<2> = const 2
+                    %7:f64[2, 3] = broadcast [output_axes=[0, 1]] %5 %6 %1
+                in (%7)
+            "#}
+            .trim_end(),
+        );
+        assert_eq!(
+            known.interpret(&EagerContext::<TestValue, TestOperation>::new(), std::slice::from_ref(&input)),
+            Ok(vec![expected]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_batching_shared_extents() {
+        let program = array_ir_shared_extent_program();
+        let extent_type = program.input_types()[1].as_dimension_type().unwrap().clone();
+        let trace = TracingContext::<TestValue, TestOperation>::new();
+        let packed = trace.input(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), extent_type.dimension().clone()]))
+                .into(),
+        );
+        let extent = trace.input(extent_type.clone().into());
+        let batch_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+
+        // Only array data gain a leading physical batch axis; the shared shape value remains replicated.
+        let output = program
+            .interpret_in_context(
+                &context,
+                vec![
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(packed, BatchAxis::new(0)).unwrap()),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
+                ],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+        let batched = trace
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![zero_output.atom_id().unwrap()],
-                Vec::new(),
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![output.into_batch().into_value().atom_id().unwrap()],
+                vec![Placeholder; 2],
                 vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
-            zero_program.to_string(),
+            batched.to_string(),
+            indoc! {r#"
+                lambda %0:f64[2, extent], %1:dimension<extent ∈ [1, 5)> .
+                let %2:dimension<2> = const 2
+                    %3:dimension<1> = const 1
+                    %4:dimension<2> = dimension_add %3 %3
+                    %5:f64[2, 1, extent] = reshape [requires_runtime_assertion=false] %0 %2 %3 %1
+                    %6:f64[2, 2, extent] = broadcast [output_axes=[0, 1, 2]] %5 %2 %4 %1
+                in (%6)
+            "#}
+            .trim_end(),
+        );
+        assert_eq!(
+            batched.interpret(vec![
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F64, [2, 2, 3]),
+                    &[1.0f64, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0],
+                )
+                .unwrap(),
+            )]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_batching_composite_jvp() {
+        // The array IR carrier batches both regions structurally and threads the first-class mapped extent into
+        // them as one additional leading non-differentiated input of the batched call.
+        let (program, batch_axis) = batched_array_ir_payload(
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+            array_ir_custom_jvp_regions(),
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
             indoc! {"
-                lambda  .
-                let %0:dimension<2> = const 2
-                    %1:dimension<3> = const 3
-                    %2:f32[2, 3] = zero [type=f32[rows, columns]] %0 %1
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    jvp={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const 2.0
+                            %4:f64[] = const 3.0
+                            %5:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %6:f64[batch] = mul %1 %5
+                            %7:f64[batch] = broadcast [output_axes=[]] %4 %0
+                            %8:f64[batch] = mul %2 %7
+                        in (%6, %8)
+                    },
+                ]
                 in (%2)
             "}
             .trim_end(),
         );
+    }
 
-        let one_context = TestContext::new();
-        let extent_value = DimensionValue::new(columns_type.clone(), 3).unwrap();
-        let extent = one_context.constant(ArrayIrValue::Dimension(extent_value.clone()));
-        let extent_atom = extent.atom_id().unwrap();
-        let one_output = one_context
-            .bind(
-                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![columns_type.dimension().clone()]))),
-                Vec::new(),
-                &[extent],
-            )
-            .unwrap()
-            .remove(0);
-        let one_builder = one_context.builder().borrow();
-        let [one_instruction] = one_builder.instructions() else {
-            panic!("expected one dynamic-one instruction");
-        };
-        assert_eq!(one_instruction.inputs(), &[extent_atom]);
-        assert!(matches!(one_instruction.operation(), ArrayIrOperation::One(_)));
-        drop(one_builder);
-        let one_program = one_context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![one_output.atom_id().unwrap()],
-                Vec::new(),
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            one_program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:dimension<3> = const 3
-                    %1:f32[3] = one [type=f32[columns]] %0
-                in (%1)
-            "}
-            .trim_end(),
+    #[test]
+    fn test_array_ir_operation_batching_composite_vjp() {
+        // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
+        // with the differentiated inputs only.
+        let (program, batch_axis) = batched_array_ir_payload(
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
+            array_ir_custom_vjp_regions(),
         );
-
-        let iota_context = TestContext::new();
-        let extent_value = DimensionValue::new(columns_type.clone(), 3).unwrap();
-        let extent = iota_context.constant(ArrayIrValue::Dimension(extent_value.clone()));
-        let extent_atom = extent.atom_id().unwrap();
-        let output = iota_context
-            .bind(
-                IotaOperation::new(
-                    ArrayType::new(DataType::I32, Shape::new(vec![columns_type.dimension().clone()])),
-                    0,
-                )
-                .unwrap(),
-                Vec::new(),
-                &[extent],
-            )
-            .unwrap()
-            .remove(0);
-        let iota_builder = iota_context.builder().borrow();
-        let [instruction] = iota_builder.instructions() else {
-            panic!("expected one dynamic-iota instruction");
-        };
-        assert_eq!(instruction.inputs(), &[extent_atom]);
-        assert!(matches!(instruction.operation(), ArrayIrOperation::Iota(_)));
-        drop(iota_builder);
-        let iota_program = iota_context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                Vec::new(),
-                vec![Placeholder],
-            )
-            .unwrap();
+        assert_eq!(batch_axis, BatchAxis::new(0));
         assert_eq!(
-            iota_program.to_string(),
+            program,
             indoc! {"
-                lambda  .
-                let %0:dimension<3> = const 3
-                    %1:i32[3] = iota [type=i32[columns], dimension=0] %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-
-        let concatenate_context = TestContext::new();
-        let left =
-            concatenate_context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
-        let right =
-            concatenate_context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into());
-        let extent = concatenate_context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let left_atom = left.atom_id().unwrap();
-        let right_atom = right.atom_id().unwrap();
-        let extent_atom = extent.atom_id().unwrap();
-        let operation = ConcatenateOperation::<ArrayIrType>::new(
-            0,
-            &[left.r#type().into_owned(), right.r#type().into_owned(), extent.r#type().into_owned()],
-        )
-        .unwrap();
-        let output = concatenate_context.bind(operation, Vec::new(), &[left, right, extent]).unwrap().remove(0);
-        let concatenate_builder = concatenate_context.builder().borrow();
-        let [instruction] = concatenate_builder.instructions() else {
-            panic!("expected one concatenate instruction");
-        };
-        assert_eq!(instruction.inputs(), &[left_atom, right_atom, extent_atom]);
-        assert!(matches!(instruction.operation(), ArrayIrOperation::Concatenate(_)));
-        drop(concatenate_builder);
-        let concatenate_program = concatenate_context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            concatenate_program.to_string(),
-            indoc! {"
-                lambda %0:f32[2], %1:f32[1] .
-                let %2:dimension<3> = const 3
-                    %3:f32[3] = concatenate [axis=0] %0 %1 %2
-                in (%3)
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    forward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4, %1)
+                    },
+                    backward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const 3.0
+                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %5:f64[batch] = mul %2 %4
+                        in (%5)
+                    },
+                ]
+                in (%2)
             "}
             .trim_end(),
         );
     }
 
-    /// Builds an array IR scalar `f64` [`Program`] from `build`, which receives the region builder together with its
-    /// `input_count` scalar inputs and returns the region's output atoms.
-    fn array_ir_scalar_program<BuildFn>(input_count: usize, build: BuildFn) -> TestProgram
-    where
-        BuildFn: FnOnce(&mut ProgramBuilder<TestValue, TestOperation>, &[AtomId]) -> Vec<AtomId>,
-    {
-        let array_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let inputs = (0..input_count).map(|_| builder.add_input(array_type.clone().into())).collect::<Vec<_>>();
-        let outputs = build(&mut builder, inputs.as_slice());
-        let output_count = outputs.len();
-        builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
+    #[test]
+    fn test_array_ir_operation_batching_composite() {
+        // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
+        // keeping every rule attached in region order.
+        let mut regions = array_ir_custom_jvp_regions();
+        regions.extend(array_ir_custom_vjp_regions().into_iter().skip(1));
+        let (program, batch_axis) = batched_array_ir_payload(
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true)),
+            regions,
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    jvp={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const 2.0
+                            %4:f64[] = const 3.0
+                            %5:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %6:f64[batch] = mul %1 %5
+                            %7:f64[batch] = broadcast [output_axes=[]] %4 %0
+                            %8:f64[batch] = mul %2 %7
+                        in (%6, %8)
+                    },
+                    forward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4, %1)
+                    },
+                    backward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const 3.0
+                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %5:f64[batch] = mul %2 %4
+                        in (%5)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
-    /// Stages `input * scale` in `builder` and returns its result atom.
-    fn array_ir_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
-        let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale).unwrap()));
-        builder
-            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale], None)
-            .unwrap()[0]
+    #[test]
+    fn test_array_ir_operation_batching_rematerialize() {
+        // The body is rebuilt around the threaded extent, which becomes a leading body input, keeping the
+        // rematerialization boundary intact.
+        let (program, batch_axis) = batched_array_ir_payload(
+            ArrayOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
+            vec![array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)])],
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = rematerialize %0 %1 [
+                    body={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
-    /// Builds the `["primal", "jvp"]` regions of an array IR `composite` call with a JVP rule, implementing
-    /// `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving composite
-    /// boundary stays detectable in a transformed program's numbers.
-    fn array_ir_custom_jvp_regions() -> Vec<TestProgram> {
-        vec![
-            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
-            array_ir_scalar_program(2, |builder, inputs| {
-                vec![array_ir_scaled(builder, inputs[0], 2.0), array_ir_scaled(builder, inputs[1], 3.0)]
-            }),
-        ]
-    }
-
-    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `composite` call with reverse-mode rules,
-    /// implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule
-    /// `backward(r, ȳ) = 3 * ȳ`.
-    fn array_ir_custom_vjp_regions() -> Vec<TestProgram> {
-        vec![
-            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
-            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0), inputs[0]]),
-            array_ir_scalar_program(2, |builder, inputs| vec![array_ir_scaled(builder, inputs[1], 3.0)]),
-        ]
-    }
-
-    /// Batches one array IR region-carrying payload over a single input mapped along axis zero and returns the
-    /// rendered staged program together with the result's [`BatchAxis`].
-    fn batched_array_ir_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
-        let extent = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+    #[test]
+    fn test_array_ir_operation_batching_linear_call() {
+        // Both regions use the known scalar residual; batching threads its symbolic extent as another residual.
+        let multiply = array_ir_scalar_program(2, |builder, inputs| {
+            vec![
+                builder
+                    .add_instruction(
+                        ArrayOperation::Mul(MulOperation::new()),
+                        Vec::new(),
+                        vec![inputs[0], inputs[1]],
+                        None,
+                    )
+                    .unwrap()[0],
+            ]
+        });
+        let extent_type = DimensionType::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let trace = TracingContext::<TestValue, TestOperation>::new();
-        let extent_input = trace.input(DimensionType::from(extent.clone()).into());
-        let mapped = trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent_input);
-        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0)).unwrap());
-        let output = context.bind(operation, regions, std::slice::from_ref(&input)).unwrap().remove(0);
-        let batch_axis = output.batch().batch_axis();
+        let extent = trace.input(extent_type.clone().into());
+        let mapped =
+            trace.input(ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()])).into());
+        let residual = trace.constant(ArrayIrValue::Array(Array::scalar(3.0).unwrap()));
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
+        let residual =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(residual, BatchAxis::replicated()).unwrap());
+        let mapped = BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0)).unwrap());
+        let operation = LinearCallOperation::new(1);
+        let output = context
+            .bind(ArrayOperation::LinearCall(operation.clone()), vec![multiply.clone(), multiply], &[residual, mapped])
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
         let program = trace
             .builder()
             .borrow()
@@ -2175,11 +2197,434 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        (program.to_string(), batch_axis)
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[] = const 3.0
+                    %3:f64[batch] = linear_call [residual_count=2] %0 %2 %1 [
+                        forward={
+                            lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[], %2:f64[batch] .
+                            let %3:f64[batch] = broadcast [output_axes=[]] %1 %0
+                                %4:f64[batch] = mul %3 %2
+                            in (%4)
+                        },
+                        transpose={
+                            lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[], %2:f64[batch] .
+                            let %3:f64[batch] = broadcast [output_axes=[]] %1 %0
+                                %4:f64[batch] = mul %3 %2
+                            in (%4)
+                        },
+                    ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let [instruction] = program.instructions() else {
+            panic!("expected one batched linear call");
+        };
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 2).unwrap());
+        let linear = ArrayIrValue::Array(Array::vector(vec![2.0f64, 5.0]).unwrap());
+        assert_eq!(
+            program.interpret(vec![extent.clone(), linear]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![6.0f64, 15.0]).unwrap())]),
+        );
+        let transpose = program.region_ref(instruction.regions()[1]).unwrap().to_program();
+        assert_eq!(
+            transpose.interpret(vec![
+                extent,
+                ArrayIrValue::Array(Array::scalar(3.0).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0f64, 4.0]).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![3.0f64, 12.0]).unwrap())]),
+        );
     }
 
     #[test]
-    fn test_array_ir_lift_promotes_every_region_carrying_array_payload() {
+    fn test_array_ir_operation_differentiation_homogeneous() {
+        // Family dispatch projects multiplication while preserving the primal and tangent input order.
+        let program = array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 3.0)]);
+        let differentiated = program.jvp().unwrap();
+        assert_eq!(
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = const 3.0
+                    %3:f64[] = mul %0 %2
+                    %4:f64[] = mul %2 %1
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            differentiated.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(2.0).unwrap()),
+                ArrayIrValue::Array(Array::scalar(4.0).unwrap()),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(6.0).unwrap()),
+                ArrayIrValue::Array(Array::scalar(12.0).unwrap())
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_differentiation_custom_jvp() {
+        // The tangent scale of three distinguishes the attached JVP rule from the primal scale of two.
+        let program = array_ir_custom_jvp_program();
+
+        let differentiated = program.jvp().unwrap();
+        assert_eq!(
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = const 2.0
+                    %3:f64[] = const 3.0
+                    %4:f64[] = mul %0 %2
+                    %5:f64[] = mul %1 %3
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            differentiated.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(5.0).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1.0).unwrap()),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(10.0).unwrap()),
+                ArrayIrValue::Array(Array::scalar(3.0).unwrap())
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_differentiation_shared_extents() {
+        let program = array_ir_shared_extent_program();
+        let extent_type = program.input_types()[1].as_dimension_type().unwrap().clone();
+
+        // The explicit dimensions have structural-zero tangents while both shape operations replay on live data.
+        let differentiated = program.jvp().unwrap();
+        assert_eq!(
+            differentiated.to_string(),
+            indoc! {r#"
+                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)>, %2:f64[extent] .
+                let %3:dimension<1> = const 1
+                    %4:dimension<2> = dimension_add %3 %3
+                    %5:f64[1, extent] = reshape [requires_runtime_assertion=false] %0 %3 %1
+                    %6:f64[1, extent] = linear_call [residual_count=2] %3 %1 %2 [
+                        forward={
+                            lambda %0:dimension<1>, %1:dimension<extent ∈ [1, 5)>, %2:f64[extent] .
+                            let %3:f64[1, extent] = reshape [requires_runtime_assertion=false] %2 %0 %1
+                            in (%3)
+                        },
+                        transpose={
+                            lambda %0:dimension<1>, %1:dimension<extent ∈ [1, 5)>, %2:f64[1, extent] .
+                            let %3:f64[extent] = reshape [requires_runtime_assertion=false] %2 %1
+                            in (%3)
+                        },
+                    ]
+                    %7:f64[2, extent] = broadcast [output_axes=[0, 1]] %5 %4 %1
+                    %8:f64[2, extent] = linear_call [residual_count=2] %4 %1 %6 [
+                        forward={
+                            lambda %0:dimension<2>, %1:dimension<extent ∈ [1, 5)>, %2:f64[1, extent] .
+                            let %3:f64[2, extent] = broadcast [output_axes=[0, 1]] %2 %0 %1
+                            in (%3)
+                        },
+                        transpose={
+                            lambda %0:dimension<2>, %1:dimension<extent ∈ [1, 5)>, %2:f64[2, extent] .
+                            let %3:f64[extent] = reduce [kind=sum, axes=[0]] %2
+                                %4:dimension<1> = constant [value=1]
+                                %5:f64[1, extent] = reshape %3 %4 %1
+                            in (%5)
+                        },
+                    ]
+                in (%7, %8)
+            "#}
+            .trim_end(),
+        );
+        assert_eq!(
+            differentiated.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![4.0f64, 5.0, 6.0]).unwrap()),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0f64, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_linearization_homogeneous() {
+        // Reverse mode composes the projected JVP-for-transpose and transposition rules with a known literal factor.
+        let program = array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 3.0)]);
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 3.0
+                    %2:f64[] = mul %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 3.0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 3.0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(2.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0).unwrap())]),
+        );
+        assert_eq!(
+            linearization.tangent().interpret(vec![ArrayIrValue::Array(Array::scalar(4.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(12.0).unwrap())]),
+        );
+        assert_eq!(
+            pullback.program().interpret(vec![ArrayIrValue::Array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(15.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_linearization_custom_jvp() {
+        // Linearization keeps the custom derivative in the tangent program and its derived pullback.
+        let program = array_ir_custom_jvp_program();
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 2.0
+                    %2:f64[] = mul %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 3.0
+                    %2:f64[] = mul %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 3.0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(10.0).unwrap())]),
+        );
+        assert_eq!(
+            linearization.tangent().interpret(vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(3.0).unwrap())]),
+        );
+        assert_eq!(
+            pullback.program().interpret(vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(3.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_transposition_homogeneous() {
+        // Raw transposition projects the homogeneous multiply with its literal factor held known.
+        let program = array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 3.0)]);
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 3.0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.interpret(vec![ArrayIrValue::Array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(15.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_transposition_custom_jvp_primal() {
+        // Raw transposition reaches the primal region before linearization replaces the custom call.
+        let program = array_ir_custom_jvp_program();
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 2.0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.interpret(vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(2.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operations() {
+        fn requires_array_ir_operations<V: ArrayIrOperations>() {}
+
+        requires_array_ir_operations::<ArrayIrValue<Array>>();
+        requires_array_ir_operations::<Tracer<TracingContext<TestValue, TestOperation>>>();
+        requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
+
+        // The bundle's member profiles make one bound enough to reach ordinary array math through projection, checked
+        // dimension arithmetic, and family-native reference capabilities, with no projection bounds restated here.
+        fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
+            // The array member carries both the fallible capability and its panicking operator sugar, so the
+            // capability is named explicitly here.
+            let array = ValueProjection::<ArrayType>::into_projected(value.clone())?;
+            let square = ValueProjection::<ArrayType>::from_projected(Mul::mul(&array, &array)?);
+            let rows = ValueProjection::<DimensionType>::into_projected(value.dimension_size(0)?)?;
+            let columns = ValueProjection::<DimensionType>::into_projected(value.dimension_size(1)?)?;
+            let elements = ValueProjection::<DimensionType>::from_projected(rows.mul(&columns)?);
+            Ok((square, elements))
+        }
+
+        fn reference_round_trip<V: ArrayIrOperations>(value: &V) -> Result<V, ProgramError> {
+            value.reference_new()?.freeze()
+        }
+
+        let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let (square, elements) = square_and_element_count(&input).unwrap();
+        assert_eq!(square, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 4.0, 9.0, 16.0, 25.0, 36.0]).unwrap()));
+        let ArrayIrValue::Dimension(elements) = elements else {
+            panic!("expected a first-class dimension member");
+        };
+        assert_eq!(elements.extent(), 6);
+        assert_eq!(reference_round_trip(&input), Ok(input));
+    }
+
+    #[test]
+    fn test_array_ir_operation_from_array_operation_constructors() {
+        let scalar = ArrayType::scalar(DataType::F32);
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+
+        // Existing array zero instructions choose the mixed carrier only when their type names runtime identities.
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(scalar.clone()))),
+            ArrayIrOperation::Array(ArrayOperation::Zero(operation)) if operation.r#type() == &scalar,
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(dynamic.clone()))),
+            ArrayIrOperation::Zero(operation) if operation.r#type() == &dynamic,
+        ));
+
+        // Direct payload conversions apply the same static/dynamic distinction to one and iota.
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(OneOperation::new(scalar.clone())),
+            ArrayIrOperation::Array(ArrayOperation::One(operation)) if operation.r#type() == &scalar,
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(OneOperation::new(dynamic.clone())),
+            ArrayIrOperation::One(operation) if operation.r#type() == &dynamic,
+        ));
+        let static_iota = ArrayType::new_static(DataType::I32, [3]);
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(IotaOperation::new(static_iota.clone(), 0).unwrap()),
+            ArrayIrOperation::Array(ArrayOperation::Iota(operation))
+                if operation.r#type() == &static_iota && operation.dimension() == 0,
+        ));
+        let dynamic_iota =
+            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(2)]));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(IotaOperation::new(dynamic_iota.clone(), 0).unwrap()),
+            ArrayIrOperation::Iota(operation)
+                if operation.r#type() == &dynamic_iota && operation.dimension() == 0,
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_operation_from_array_operation_homogeneous_inputs() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let output_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]));
+
+        // Existing homogeneous instructions retain their original inputs. The mixed payload constructors require
+        // additional extent inputs, so their direct `From` implementations cannot lift these instructions.
+        let pad =
+            ArrayIrOperation::<Array>::from(ArrayOperation::Pad(PadOperation::new(vec![1], vec![1], vec![0]).unwrap()));
+        assert!(matches!(pad, ArrayIrOperation::Array(ArrayOperation::Pad(_))));
+        assert_eq!(
+            pad.infer_output_types(&[array_type.clone().into(), scalar_type.into()], &[]),
+            Ok(vec![output_type.clone()]),
+        );
+        let concatenate = ArrayIrOperation::<Array>::from(ArrayOperation::Concatenate(
+            ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(),
+        ));
+        assert!(matches!(concatenate, ArrayIrOperation::Array(ArrayOperation::Concatenate(_))));
+        assert_eq!(
+            concatenate.infer_output_types(&[array_type.clone().into(), array_type.into()], &[]),
+            Ok(vec![output_type]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_from_array_operation_regions() {
+        // Member control-flow operations promote to their direct array IR carriers, preserving every semantic and
+        // lowering attribute.
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new())),
+            ArrayIrOperation::Condition(_),
+        ));
+        let while_operation = WhileOperation::new().with_iteration_bound(7).unwrap();
+        let promoted_while = ArrayIrOperation::<Array>::from(ArrayOperation::While(while_operation.clone()));
+        assert!(matches!(
+            promoted_while,
+            ArrayIrOperation::While(operation)
+                if operation.iteration_bound() == while_operation.iteration_bound()
+        ));
+        let scan_operation = ScanOperation::<ArrayType>::new(1, 4).with_reverse(true).with_unroll(2).unwrap();
+        let promoted_scan = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(scan_operation));
+        let ArrayIrOperation::Scan(promoted_scan) = promoted_scan else {
+            panic!("expected a direct array IR scan operation");
+        };
+        assert_eq!(promoted_scan.carry_count(), 1);
+        assert_eq!(promoted_scan.iteration_count(), &Dimension::Static(4));
+        assert!(promoted_scan.reverse());
+        assert_eq!(promoted_scan.unroll(), 2);
+
         // Every region-carrying array payload has an array IR carrier, so none of them reaches the region-free
         // projected `Array` variant. Composite calls carry their rule layout and non-differentiated input split, and
         // rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
@@ -2235,1202 +2680,48 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_of_a_composite_jvp_rule_payload() {
-        // The array IR carrier batches both regions structurally and threads the first-class mapped extent into
-        // them as one additional leading non-differentiated input of the batched call.
-        let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
-            array_ir_custom_jvp_regions(),
-        );
-        assert_eq!(batch_axis, BatchAxis::new(0));
-        assert_eq!(
-            program,
-            indoc! {"
-                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
-                    primal={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4)
-                    },
-                    jvp={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const 2.0
-                            %4:f64[] = const 3.0
-                            %5:f64[batch] = broadcast [output_axes=[]] %3 %0
-                            %6:f64[batch] = mul %1 %5
-                            %7:f64[batch] = broadcast [output_axes=[]] %4 %0
-                            %8:f64[batch] = mul %2 %7
-                        in (%6, %8)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_batching_of_a_composite_vjp_rule_payload() {
-        // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
-        // with the differentiated inputs only.
-        let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
-            array_ir_custom_vjp_regions(),
-        );
-        assert_eq!(batch_axis, BatchAxis::new(0));
-        assert_eq!(
-            program,
-            indoc! {"
-                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
-                    primal={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4)
-                    },
-                    forward={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4, %1)
-                    },
-                    backward={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const 3.0
-                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
-                            %5:f64[batch] = mul %2 %4
-                        in (%5)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_batching_of_a_composite_payload() {
-        // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
-        // keeping every rule attached in region order.
-        let mut regions = array_ir_custom_jvp_regions();
-        regions.extend(array_ir_custom_vjp_regions().into_iter().skip(1));
-        let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true)),
-            regions,
-        );
-        assert_eq!(batch_axis, BatchAxis::new(0));
-        assert_eq!(
-            program,
-            indoc! {"
-                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
-                    primal={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4)
-                    },
-                    jvp={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const 2.0
-                            %4:f64[] = const 3.0
-                            %5:f64[batch] = broadcast [output_axes=[]] %3 %0
-                            %6:f64[batch] = mul %1 %5
-                            %7:f64[batch] = broadcast [output_axes=[]] %4 %0
-                            %8:f64[batch] = mul %2 %7
-                        in (%6, %8)
-                    },
-                    forward={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4, %1)
-                    },
-                    backward={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const 3.0
-                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
-                            %5:f64[batch] = mul %2 %4
-                        in (%5)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_batching_of_a_rematerialize_payload() {
-        // The body is rebuilt around the threaded extent, which becomes a leading body input, keeping the
-        // rematerialization boundary intact.
-        let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
-            vec![array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)])],
-        );
-        assert_eq!(batch_axis, BatchAxis::new(0));
-        assert_eq!(
-            program,
-            indoc! {"
-                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = rematerialize %0 %1 [
-                    body={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_batching_of_a_linear_call_payload() {
-        // The executable linear call threads the mapped extent as one more leading residual, which is the precedent
-        // the composite carriers follow with their non-differentiated input split.
-        let array_type = ArrayType::scalar(DataType::F64);
-        let identity_program = || -> TestProgram {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            builder.add_input(array_type.clone().into());
-            let linear = builder.add_input(array_type.clone().into());
-            builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder]).unwrap()
-        };
-        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]).unwrap());
-        let output: TestValue = batch(
-            |(residual, linear): (
-                BatchingTracer<_, ArrayIrBatchingPolicy>,
-                BatchingTracer<_, ArrayIrBatchingPolicy>,
-            )| {
-                let context = residual.context().clone();
-                Ok(context
-                    .bind(
-                        ArrayOperation::LinearCall(LinearCallOperation::new(1)),
-                        vec![identity_program(), identity_program()],
-                        &[residual, linear],
-                    )?
-                    .remove(0))
-            },
-            (ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()), linear.clone()),
-            (BatchAxis::replicated(), BatchAxis::new(0)),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(output, linear);
-    }
-
-    /// Builds an array IR program holding one `composite` call with a JVP rule over a scalar input.
-    fn array_ir_custom_jvp_program() -> TestProgram {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let regions = array_ir_custom_jvp_regions()
-            .into_iter()
-            .map(|region| builder.import_region(region.entry_region_ref()))
-            .collect::<Vec<_>>();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let output = builder
-            .add_instruction(
-                ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
-                regions,
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    #[test]
-    fn test_array_ir_differentiation_of_a_region_carrying_array_payload() {
-        // Forward mode reaches the array IR carrier with its regions attached, so it replays the user JVP rule
-        // instead of failing without region access. The rule's deliberately wrong tangent scale of three is what
-        // proves the custom derivative governed the staged result.
-        assert_eq!(
-            array_ir_custom_jvp_program().jvp().unwrap().to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = const 2.0
-                    %3:f64[] = const 3.0
-                    %4:f64[] = mul %0 %2
-                    %5:f64[] = mul %1 %3
-                in (%4, %5)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_transposition_of_a_region_carrying_array_payload() {
-        // Reverse mode linearizes first, and the array IR carrier's JVP rule replaces the call with plain staged
-        // operations, so transposition reaches a tangent program the payload has already left. The gradient is the
-        // user rule's deliberately wrong scale of three rather than the primal's true derivative of two.
-        let context = EagerContext::<TestValue, TestOperation>::new();
-        let (value, pullback) = context
-            .vjp(
-                |input: LinearizationTracer<_>, ()| {
-                    let context = input.context().clone();
-                    Ok(context
-                        .bind(
-                            ArrayOperation::Composite(CompositeOperation::from_rule_regions(
-                                CompositeJvpRule::Explicit,
-                                false,
-                            )),
-                            array_ir_custom_jvp_regions(),
-                            &[input],
-                        )?
-                        .remove(0))
-                },
-                ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap()),
-                (),
-            )
-            .unwrap();
-        let gradient = pullback.apply(ArrayIrValue::Array(Array::scalar(1.0_f64).unwrap())).unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64).unwrap()));
-        assert_eq!(gradient, MaybeZero::Value(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())));
-
-        // Transposing the raw, un-linearized call directly transposes its primal region (`2 * x`) with respect to the
-        // linear input, through the array IR payload's own transposition rule rather than a projected adapter that
-        // never received its regions, so the result carries the primal's true scale of two rather than the rule's.
-        let pullback = array_ir_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            pullback.interpret(vec![ArrayIrValue::Array(Array::scalar(1.0_f64).unwrap())]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap())]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_homogeneous_differentiation_dispatch() {
-        type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        let context = TestContext::new();
-        let (primal, tangent) = context
-            .jvp(
-                |input, ()| {
-                    let context = input.context().clone();
-                    let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()))?;
-                    Ok(context
-                        .bind(
-                            ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
-                            Vec::new(),
-                            &[input, factor],
-                        )?
-                        .remove(0))
-                },
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(4.0_f64).unwrap()),
-                (),
-            )
-            .unwrap();
-        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap()));
-        assert_eq!(tangent, ArrayIrValue::Array(Array::scalar(12.0_f64).unwrap()));
-
-        // Reverse mode composes the same projected JVP with projected transposition. The constant factor is a known
-        // replay input to the homogeneous multiply transpose rule.
-        let (primal, pullback) = context
-            .vjp(
-                |input, ()| {
-                    let context = input.context().clone();
-                    let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()))?;
-                    Ok(context
-                        .bind(
-                            ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
-                            Vec::new(),
-                            &[input, factor],
-                        )?
-                        .remove(0))
-                },
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                (),
-            )
-            .unwrap();
-        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap()));
-        assert_eq!(
-            pullback.apply(ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap())),
-            Ok(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap()))),
-        );
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let factor = builder.add_constant(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()));
-        let output = builder
-            .add_instruction(
-                ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
-                Vec::new(),
-                vec![input, factor],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<ArrayIrValue<Array>, ArrayIrValue<Array>>(vec![output], Placeholder, Placeholder)
-            .unwrap();
-        assert_eq!(
-            program
-                .transpose_with_respect_to(&[0], &[])
-                .unwrap()
-                .interpret(vec![ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap())]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap())]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_reduce_differentiation() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(6)).unwrap());
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        for (kind, expected_primal, expected_tangent, expected_cotangent) in
-            [(ReductionKind::Sum, 6.0, 15.0, 6.0), (ReductionKind::Mean, 2.0, 5.0, 2.0)]
-        {
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let input = builder.add_input(input_type.clone().into());
-            let output = builder
-                .add_instruction(
-                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap();
-            let linearization = program.linearize().unwrap();
-
-            assert_eq!(linearization.residual_count(), 1);
-            assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
-            let mut primal_outputs = linearization
-                .primal()
-                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap())])
-                .unwrap();
-            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));
-            let residuals = primal_outputs.split_off(1);
-            let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap())];
-            tangent_inputs.extend(residuals.clone());
-            assert_eq!(
-                linearization.tangent().interpret(tangent_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent).unwrap())]),
-            );
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap())];
-            pullback_inputs.extend(residuals);
-            assert_eq!(
-                linearization.pullback().unwrap().program().interpret(pullback_inputs),
-                Ok(vec![ArrayIrValue::Array(
-                    Array::vector(vec![expected_cotangent, expected_cotangent, expected_cotangent,]).unwrap()
-                )]),
-            );
-        }
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(input_type.into());
-        let output = builder
-            .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        let mut primal_outputs = linearization
-            .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())])
-            .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(0.0_f64).unwrap()));
-        let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())];
-        tangent_inputs.extend(residuals.clone());
-        assert_eq!(
-            linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0_f64).unwrap())]),
-        );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())];
-        pullback_inputs.extend(residuals);
-        assert_eq!(
-            linearization.pullback().unwrap().program().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())]),
-        );
-
-        for (kind, values, expected_primal, expected_tangent, expected_cotangent) in [
-            (ReductionKind::Max, vec![1.0, 5.0, 5.0, 2.0], 5.0, 25.0, vec![0.0, 4.0, 4.0, 0.0]),
-            (ReductionKind::Min, vec![1.0, 1.0, 5.0, 2.0], 1.0, 15.0, vec![4.0, 4.0, 0.0, 0.0]),
-        ] {
-            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let input = builder.add_input(input_type.into());
-            let output = builder
-                .add_instruction(
-                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap();
-            let linearization = program.linearize().unwrap();
-
-            // Extrema retain the runtime extent, the extremum mask, and the tie count by which the tangent is divided.
-            assert_eq!(linearization.residual_count(), 3);
-            let mut primal_outputs =
-                linearization.primal().interpret(vec![ArrayIrValue::Array(Array::vector(values).unwrap())]).unwrap();
-            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));
-            let residuals = primal_outputs.split_off(1);
-            let mut tangent_inputs =
-                vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap())];
-            tangent_inputs.extend(residuals.clone());
-            assert_eq!(
-                linearization.tangent().interpret(tangent_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent).unwrap())]),
-            );
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(8.0_f64).unwrap())];
-            pullback_inputs.extend(residuals);
-            assert_eq!(
-                linearization.pullback().unwrap().program().interpret(pullback_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::vector(expected_cotangent).unwrap())]),
-            );
-        }
-    }
-
-    #[test]
-    fn test_array_ir_dimension_folding() {
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let value_type = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
-        let one_type = DimensionValue::constant(1).unwrap().r#type().into_owned();
-        let value = context.input(value_type.clone().into());
-        let one = context.input(one_type.clone().into());
-        let outputs = context
-            .bind(DimensionMulOperation::new(&value_type, &one_type).unwrap(), Vec::new(), &[value.clone(), one])
-            .unwrap();
-        assert_eq!(outputs[0].atom_id(), value.atom_id());
-        assert_eq!(outputs[0].r#type(), value.r#type());
-        assert!(context.builder().borrow().instructions().is_empty());
-    }
-
-    #[test]
-    fn test_array_ir_explicit_shape_vertical_slice() {
-        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
-        let extent_variable = DimensionVariable::new("extent", bounds);
-        let extent_type = DimensionType::from(extent_variable.clone());
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable.clone())]));
-
-        // Build one stored program in which ordinary dimension arithmetic supplies explicit reshape and broadcast
-        // inputs. The repeated extent edge deliberately feeds both shape operations.
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(input_type.clone().into());
-        let extent = builder.add_input(extent_type.clone().into());
-        let one_value = DimensionValue::constant(1).unwrap();
-        let one_type = one_value.r#type().into_owned();
-        let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
-        let repeated_extent = builder
-            .add_instruction(
-                DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &one_type).unwrap()),
-                Vec::new(),
-                vec![extent, one],
-                None,
-            )
-            .unwrap()[0];
-        let two = builder
-            .add_instruction(
-                DimensionOperation::Add(DimensionAddOperation::new(&one_type, &one_type).unwrap()),
-                Vec::new(),
-                vec![one, one],
-                None,
-            )
-            .unwrap()[0];
-        let reshaped = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                DynamicBroadcastOperation::new(vec![0, 1]),
-                Vec::new(),
-                vec![reshaped, two, repeated_extent],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let [multiply_instruction, add_instruction, reshape_instruction, broadcast_instruction] =
-            program.instructions()
-        else {
-            panic!("expected dimension arithmetic followed by reshape and broadcast");
-        };
-        assert_eq!(reshape_instruction.inputs(), &[input, one, multiply_instruction.outputs()[0]]);
-        assert_eq!(
-            broadcast_instruction.inputs(),
-            &[reshape_instruction.outputs()[0], add_instruction.outputs()[0], multiply_instruction.outputs()[0]],
-        );
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
-                let %2:dimension<1> = const 1
-                    %3:dimension<extent * 1 ∈ [1, 5)> = dimension_mul %1 %2
-                    %4:dimension<2> = dimension_add %2 %2
-                    %5:f64[1, extent * 1] = reshape %0 %2 %3
-                    %6:f64[2, extent * 1] = broadcast [output_axes=[0, 1]] %5 %4 %3
-                in (%6)
-            "}
-            .trim_end(),
-        );
-
-        let extent_value = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
-        let input_value = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
-        let expected = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap());
-        assert_eq!(program.interpret(vec![input_value.clone(), extent_value.clone()]), Ok(vec![expected.clone()]));
-
-        // Array IR partial evaluation folds dimension multiplication and substitutes its output identity in both
-        // shape consumers, even when the extent remains unknown.
-        let unknown = program
-            .partially_evaluate(&[
-                PartialValue::Unknown(input_type.clone().into()),
-                PartialValue::Unknown(extent_type.clone().into()),
-            ])
-            .unwrap();
-        assert_eq!(
-            unknown.program().to_string(),
-            indoc! {"
-                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
-                let %2:dimension<1> = const 1
-                    %3:f64[1, extent] = reshape %0 %2 %1
-                    %4:dimension<2> = const 2
-                    %5:f64[2, extent] = broadcast [output_axes=[0, 1]] %3 %4 %1
-                in (%5)"},
-        );
-        assert_eq!(
-            unknown.interpret(
-                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                &[input_value.clone(), extent_value.clone()],
+    fn test_array_ir_operation_from_reference_operations() {
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceNew(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(
+                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
             ),
-            Ok(vec![expected.clone()]),
-        );
-
-        // Known dimension arithmetic folds during partial evaluation while the two shape operations retain their
-        // explicit extent inputs in the residual program. The residual entry keeps the supplied array type, and an
-        // entry guard checks it against the known extent before the shape operations consume its narrowed copy.
-        let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Unknown(input_type.clone().into()),
-                PartialValue::Known(extent_value.clone()),
-            ])
-            .unwrap();
-        assert_eq!(evaluation.program().instructions().len(), 3);
-        assert!(matches!(evaluation.program().instructions()[0].operation(), ArrayIrOperation::Guard(_),));
-        assert!(matches!(evaluation.program().instructions()[1].operation(), ArrayIrOperation::Reshape(_),));
-        assert!(matches!(evaluation.program().instructions()[2].operation(), ArrayIrOperation::Broadcast(_),));
-        assert_eq!(
-            evaluation.interpret(
-                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                std::slice::from_ref(&input_value),
+            ArrayIrOperation::ReferenceRead(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(
+                ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
             ),
-            Ok(vec![expected.clone()]),
-        );
-
-        // Forward differentiation replays both shape operations over the live array tangent while every dimension
-        // value remains structural.
-        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap());
-        let expected_tangent =
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0_f64, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap());
-        assert_eq!(
-            program.jvp().unwrap().interpret(vec![input_value.clone(), extent_value.clone(), tangent,]),
-            Ok(vec![expected.clone(), expected_tangent]),
-        );
-
-        // Batching inserts one physical leading axis while the extent remains a replicated shape value.
-        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let batched_input = BatchingTracer::new(
-            batching_context.clone(),
-            ArrayIrBatch::new(
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-                BatchAxis::new(0),
-            )
-            .unwrap(),
-        );
-        let batched_extent =
-            BatchingTracer::new(batching_context.clone(), ArrayIrBatch::replicated(extent_value.clone()));
-        let batched_output = program
-            .interpret_in_context(&batching_context, vec![batched_input, batched_extent])
-            .unwrap()
-            .remove(0);
-        assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            batched_output.batch().value(),
-            &ArrayIrValue::Array(
-                Array::from_elements::<f64>(
-                    ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]),
-                    ),
-                    &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0]
-                )
-                .unwrap()
+            ArrayIrOperation::ReferenceWrite(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(
+                ReferenceSwapOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
             ),
-        );
-
-        // Instantiation and import rename the boundary identity while preserving the internal arithmetic result and
-        // both consumers of its SSA value.
-        let target_variable = DimensionVariable::new("target", bounds);
-        let target_type = DimensionType::from(target_variable.clone());
-        let target_array_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(target_variable.clone())]));
-        let instantiated = program
-            .with_instantiated_type_identities(&[target_array_type.clone().into(), target_type.clone().into()])
-            .unwrap()
-            .into_owned();
-        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let imported_input = destination.add_input(target_array_type.into());
-        let imported_extent = destination.add_input(target_type.into());
-        let imported_outputs = destination.splice_program(&instantiated, &[imported_input, imported_extent]).unwrap();
-        assert_eq!(destination.instructions().len(), 4);
-        let [_, _, imported_reshape, imported_broadcast] = destination.instructions() else {
-            panic!("expected the complete imported vertical slice");
-        };
-        assert_eq!(imported_reshape.inputs()[0], imported_input);
-        assert_eq!(imported_broadcast.inputs()[0], imported_reshape.outputs()[0]);
-        assert_eq!(imported_broadcast.outputs(), imported_outputs.as_slice());
-    }
-
-    #[test]
-    fn test_array_ir_batching_stages_one_graph() {
-        // Batching a body that mixes ordinary array arithmetic with first-class dimension arithmetic stages exactly
-        // one array IR graph. The array instructions gain a packed batch axis, the dimension instructions stay
-        // replicated shape values, and both kinds live in the same program with a single flat region: nothing is
-        // split into a second universe and no shape is recovered from ambient metadata.
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
-        let per_item_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let extent_operation = DimensionSizeOperation::new(&per_item_type, 0).unwrap();
-        let extent_type = extent_operation.output_type().clone();
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(per_item_type.clone().into());
-        let doubled = builder
-            .add_instruction(ArrayOperation::Add(AddOperation::new()), Vec::new(), vec![input, input], None)
-            .unwrap()[0];
-        let extent = builder.add_instruction(extent_operation, Vec::new(), vec![doubled], None).unwrap()[0];
-        let total = builder
-            .add_instruction(
-                DimensionOperation::Add(DimensionAddOperation::new(&extent_type, &extent_type).unwrap()),
-                Vec::new(),
-                vec![extent, extent],
-                None,
-            )
-            .unwrap()[0];
-        let widened = builder
-            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![doubled, total, extent], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum)),
-                Vec::new(),
-                vec![widened],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[rows] .
-                let %1:f32[rows] = add %0 %0
-                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %1
-                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
-                    %4:f32[rows + rows, rows] = broadcast [output_axes=[1]] %1 %3 %2
-                    %5:f32[rows] = reduce [kind=sum, axes=[0]] %4
-                in (%5)
-            "}
-            .trim_end(),
-        );
-
-        // Batch the body under a staging parent so that the array IR graph batching produces is observable as a
-        // program rather than as concrete per-item values. The per-item extent stays symbolic, so the batched graph
-        // remains shape polymorphic in `rows` even though the mapped axis itself has a known size.
-        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let trace = TraceContext::new();
-        let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let packed = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(rows.clone())]))
-                .into(),
-        );
-        let axis_extent_id = axis_extent.atom_id().unwrap();
-        let packed_id = packed.atom_id().unwrap();
-        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
-        let batched_output = program
-            .interpret_in_context(
-                &batching_context,
-                vec![BatchingTracer::new(
-                    batching_context.clone(),
-                    ArrayIrBatch::new(packed, BatchAxis::new(0)).unwrap(),
-                )],
-            )
-            .unwrap()
-            .remove(0);
-        assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
-        let batched_output_id = batched_output.into_batch().into_value().atom_id().unwrap();
-
-        // One array IR graph: the batched body is a flat instruction sequence over the single array IR operation
-        // family, in source order, with array and dimension instructions interleaved and no nested region.
-        let builder = trace.builder().borrow();
-        assert_eq!(
-            builder.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["add", "dimension_size", "dimension_add", "broadcast", "reduce"],
-        );
-        assert!(builder.instructions().iter().all(|instruction| instruction.regions().is_empty()));
-        let [add, dimension_size, dimension_add, broadcast, reduce] = builder.instructions() else {
-            panic!("expected one batched array IR graph with five instructions");
-        };
-        assert_eq!(add.inputs(), &[packed_id, packed_id]);
-        assert_eq!(dimension_size.inputs(), &[add.outputs()[0]]);
-        assert_eq!(dimension_add.inputs(), &[dimension_size.outputs()[0], dimension_size.outputs()[0]]);
-        assert_eq!(
-            broadcast.inputs(),
-            &[add.outputs()[0], axis_extent_id, dimension_add.outputs()[0], dimension_size.outputs()[0]],
-        );
-        assert_eq!(reduce.inputs(), &[broadcast.outputs()[0]]);
-        drop(builder);
-
-        let batched_program = trace
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![batched_output_id],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            batched_program.to_string(),
-            indoc! {"
-                lambda %1:f32[2, rows] .
-                let %0:dimension<2> = const 2
-                    %2:f32[2, rows] = add %1 %1
-                    %3:dimension<rows ∈ [1, 5)> = dimension_size [axis=1] %2
-                    %4:dimension<rows + rows ∈ [2, 9)> = dimension_add %3 %3
-                    %5:f32[2, rows + rows, rows] = broadcast [output_axes=[0, 2]] %2 %0 %4 %3
-                    %6:f32[2, rows] = reduce [kind=sum, axes=[1]] %5
-                in (%6)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            batched_program.interpret(vec![ArrayIrValue::Array(
-                Array::from_elements::<f32>(
-                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-                )
-                .unwrap()
-            )]),
-            Ok(vec![ArrayIrValue::Array(
-                Array::from_elements::<f32>(
-                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                    &[12.0, 24.0, 36.0, 48.0, 60.0, 72.0]
-                )
-                .unwrap()
-            )]),
-        );
-    }
-
-    /// Member-kind signature of one [`ArrayIrOperation`] variant, in terms of which member kinds it consumes and
-    /// produces as *values*.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    enum MemberKindSignature {
-        /// Array-only boundary, reached through the [`ArrayType`] operation projection or an explicit direct carrier.
-        ArrayToArray,
-
-        /// Homogeneous first-class-dimension boundary, reached through the [`DimensionType`] projection.
-        DimensionToDimension,
-
-        /// Converts a first-class dimension value into ordinary array data.
-        DimensionToArrayGateway,
-
-        /// Converts ordinary array data into a first-class dimension value.
-        ArrayToDimensionGateway,
-
-        /// Creates a new reference root initialized from ordinary array data.
-        ArrayToReference,
-
-        /// Reads or consumes ordinary array data from a reference.
-        ReferenceToArray,
-
-        /// Replaces a reference from an ordinary array and returns the previous ordinary array value.
-        ReferenceAndArrayToArray,
-
-        /// Updates a reference from an ordinary array without producing a value.
-        ReferenceAndArrayToUnit,
-
-        /// Consumes first-class dimensions as extents (or reads an array's extent as a dimension) without ever
-        /// converting a value from one member kind into the other.
-        DimensionMixed,
-
-        /// Checks a Boolean array condition with optional scalar array or dimension observations and no outputs.
-        AssertionToUnit,
-
-        /// Returns each input at another type of the same member kind, never converting between member kinds.
-        KindPreserving,
-
-        /// Forwards array IR regions whose bodies may carry every admitted member kind.
-        RegionForwarding,
-    }
-
-    /// Classifies one array IR operation by its member-kind signature.
-    ///
-    /// The match is deliberately exhaustive with no wildcard arm, so adding an [`ArrayIrOperation`] variant fails to
-    /// compile until its member-kind signature is declared here and recorded in the expected table of
-    /// `test_array_ir_operation_member_kinds_are_a_closed_family`. That is the compile-forced drift gate for explicit
-    /// member-kind crossings: dimension-to-data and data-to-dimension conversion use their checked gateways, while
-    /// array-to-reference and reference-to-array crossings use their explicitly classified reference operations.
-    fn member_kind_signature(operation: &ArrayIrOperation<Array>) -> MemberKindSignature {
-        match operation {
-            ArrayIrOperation::Zero(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::One(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::Iota(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::Array(_) => MemberKindSignature::ArrayToArray,
-            ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
-            ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
-            ArrayIrOperation::Assert(_) => MemberKindSignature::AssertionToUnit,
-            ArrayIrOperation::Guard(_) => MemberKindSignature::KindPreserving,
-            ArrayIrOperation::Cast(_) => MemberKindSignature::KindPreserving,
-            ArrayIrOperation::DimensionSize(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::ReferenceNew(_) => MemberKindSignature::ArrayToReference,
-            ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
-            ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
-            ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
-            ArrayIrOperation::ReferenceAddUpdate(_) | ArrayIrOperation::ReferenceAtomicAddUpdate(_) => {
-                MemberKindSignature::ReferenceAndArrayToUnit
-            }
-            ArrayIrOperation::ReferenceFreeze(_) => MemberKindSignature::ReferenceToArray,
-            ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
-            ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
-            ArrayIrOperation::Reshape(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::Broadcast(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::Concatenate(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::CustomCall(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::Pad(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::DynamicSlice(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::ParallelAllGather(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::ParallelAllToAll(_) => MemberKindSignature::DimensionMixed,
-            ArrayIrOperation::ParallelRaggedAllToAll(_) => MemberKindSignature::ArrayToArray,
-            ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::Composite(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::Rematerialize(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::ShardMap(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::CompositeTranspose(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::LiftedComposite(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::LiftedCompositeTranspose(_) => MemberKindSignature::RegionForwarding,
-        }
-    }
-
-    #[test]
-    fn test_array_ir_operation_member_kinds_are_a_closed_family() {
-        let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let first = DimensionVariable::new("first", bounds);
-        let second = DimensionVariable::new("second", bounds);
-        let first_type = DimensionType::from(first.clone());
-        let second_type = DimensionType::from(second.clone());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
-        let array_ir_rules = CustomRuleRegistration::new(CustomRuleDefinition::<
-            ArrayIrValue<Array>,
-            ArrayIrOperation<Array>,
-        >::new("ir"));
-        let member_rules =
-            CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("array"));
-        let dynamic_integer_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
-        let scalar_type = ArrayType::scalar(DataType::F32);
-
-        // One instance of every variant, in declaration order, paired with its hand-maintained expected member-kind
-        // signature. Exactly two variants may turn a dimension value into array data (the explicit
-        // `dimension_to_scalar` gateway and the deliberately family-level dimension comparison) and exactly one may
-        // turn array data into a dimension value (the checked `dimension_from_scalar` gateway). Everything else either
-        // stays inside one homogeneous member family, treats dimensions as extents, observes them in an assertion,
-        // returns each input at another type of the same member kind, or forwards regions.
-        let expected: Vec<(ArrayIrOperation<Array>, MemberKindSignature)> = vec![
-            (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::DimensionMixed),
-            (ArrayIrOperation::One(OneOperation::new(dynamic_type.clone())), MemberKindSignature::DimensionMixed),
-            (
-                ArrayIrOperation::Iota(IotaOperation::new(dynamic_integer_type, 0).unwrap()),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())), MemberKindSignature::ArrayToArray),
-            (
-                ArrayIrOperation::Dimension(DimensionOperation::Add(
-                    DimensionAddOperation::new(&first_type, &second_type).unwrap(),
-                )),
-                MemberKindSignature::DimensionToDimension,
-            ),
-            (
-                ArrayIrOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
-                MemberKindSignature::DimensionToArrayGateway,
-            ),
-            (
-                ArrayIrOperation::Assert(AssertOperation::new("dimensions must match")),
-                MemberKindSignature::AssertionToUnit,
-            ),
-            (
-                ArrayIrOperation::Guard(GuardOperation::new("region", vec![dynamic_type.clone().into()])),
-                MemberKindSignature::KindPreserving,
-            ),
-            (
-                ArrayIrOperation::Cast(
-                    CastOperation::unchecked(dynamic_type.clone().into(), vec![dynamic_type.clone().into()]).unwrap(),
-                ),
-                MemberKindSignature::KindPreserving,
-            ),
-            (
-                ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (ArrayIrOperation::ReferenceNew(ReferenceNewOperation::new()), MemberKindSignature::ArrayToReference),
-            (ArrayIrOperation::ReferenceRead(ReferenceReadOperation::new()), MemberKindSignature::ReferenceToArray),
-            (
-                ArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new()),
-                MemberKindSignature::ReferenceAndArrayToUnit,
-            ),
-            (
-                ArrayIrOperation::ReferenceSwap(ReferenceSwapOperation::new()),
-                MemberKindSignature::ReferenceAndArrayToArray,
-            ),
-            (
-                ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                MemberKindSignature::ReferenceAndArrayToUnit,
-            ),
-            (
-                ArrayIrOperation::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new()),
-                MemberKindSignature::ReferenceAndArrayToUnit,
-            ),
-            (ArrayIrOperation::ReferenceFreeze(ReferenceFreezeOperation::new()), MemberKindSignature::ReferenceToArray),
-            (
-                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone().into())),
-                MemberKindSignature::ArrayToDimensionGateway,
-            ),
-            (
-                ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
-                MemberKindSignature::DimensionToArrayGateway,
-            ),
-            (ArrayIrOperation::Reshape(DynamicReshapeOperation::new()), MemberKindSignature::DimensionMixed),
-            (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::DimensionMixed),
-            (
-                ArrayIrOperation::Concatenate(
-                    ConcatenateOperation::<ArrayIrType>::new(
-                        0,
-                        &[
-                            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
-                            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                            DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                        ],
-                    )
-                    .unwrap(),
-                ),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::CustomCall(
-                    CustomCallOperation::new("ryft.test.identity", vec![scalar_type.clone()]).into(),
-                ),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::Pad(PadOperation::new(vec![0], vec![0], vec![0]).unwrap()),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::DynamicSlice(DynamicSliceOperation::<ArrayIrType>::from_rank(1)),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
-                    RandomAlgorithm::ThreeFry,
-                    dynamic_type.clone(),
-                )),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::ParallelAllGather(ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::new(CollectiveMode::Untiled),
-                    ParallelAllGatherOutputVariance::Varying,
-                )),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::ParallelSumScatter(ParallelSumScatterOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::new(CollectiveMode::Untiled),
-                )),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::ParallelAllToAll(ParallelAllToAllOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    0,
-                    CollectiveOptions::new(CollectiveMode::Untiled),
-                )),
-                MemberKindSignature::DimensionMixed,
-            ),
-            (
-                ArrayIrOperation::ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation::new("x".to_string(), 2)),
-                MemberKindSignature::ArrayToArray,
-            ),
-            (ArrayIrOperation::Condition(ConditionOperation::new()), MemberKindSignature::RegionForwarding),
-            (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
-            (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
-            (
-                ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (
-                ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
-            (
-                ArrayIrOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(
-                    NothingSavable,
-                ))),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (
-                ArrayIrOperation::ShardMap(ShardMapOperation::from_boundary(
-                    ShardMap::from_shardings(
-                        LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
-                        Vec::new(),
-                        Vec::new(),
-                        vec!["x".to_string()],
-                    ),
-                    Vec::<ArrayIrType>::new(),
-                    Vec::<ArrayIrType>::new(),
-                )),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (
-                ArrayIrOperation::Composite(CompositeOperation::new(array_ir_rules.reference())),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (
-                ArrayIrOperation::CompositeTranspose(CompositeTransposeOperation::new(
-                    array_ir_rules.reference(),
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                )),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (
-                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(member_rules.reference()))),
-                MemberKindSignature::RegionForwarding,
-            ),
-            (
-                ArrayIrOperation::from(ArrayOperation::CompositeTranspose(CompositeTransposeOperation::new(
-                    member_rules.reference(),
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                ))),
-                MemberKindSignature::RegionForwarding,
-            ),
-        ];
-
-        assert_eq!(
-            expected.iter().map(|(operation, _)| member_kind_signature(operation)).collect::<Vec<_>>(),
-            expected.iter().map(|(_, signature)| *signature).collect::<Vec<_>>(),
-        );
-
-        // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
-        // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 42);
-        assert_eq!(
-            expected
-                .iter()
-                .filter(|(_, signature)| *signature == MemberKindSignature::DimensionToArrayGateway)
-                .count(),
-            2,
-        );
-        assert_eq!(
-            expected
-                .iter()
-                .filter(|(_, signature)| *signature == MemberKindSignature::ArrayToDimensionGateway)
-                .count(),
-            1,
-        );
-        assert_eq!(
-            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::AssertionToUnit).count(),
-            1,
-        );
-        assert_eq!(
-            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::KindPreserving).count(),
-            2,
-        );
-        assert_eq!(
-            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ArrayToReference).count(),
-            1,
-        );
-        assert_eq!(
-            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToArray).count(),
-            2,
-        );
-        assert_eq!(
-            expected
-                .iter()
-                .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceAndArrayToArray)
-                .count(),
-            1,
-        );
-        assert_eq!(
-            expected
-                .iter()
-                .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceAndArrayToUnit)
-                .count(),
-            3,
-        );
+            ArrayIrOperation::ReferenceSwap(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceAddUpdateOperation::<
+                ArrayType,
+                ArrayIrType,
+                ArrayReferenceTransform,
+            >::new()),
+            ArrayIrOperation::ReferenceAddUpdate(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceAtomicAddUpdateOperation::<
+                ArrayType,
+                ArrayIrType,
+                ArrayReferenceTransform,
+            >::new()),
+            ArrayIrOperation::ReferenceAtomicAddUpdate(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceFreeze(_),
+        ));
     }
 }

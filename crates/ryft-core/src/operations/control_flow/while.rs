@@ -3434,7 +3434,6 @@ mod tests {
     use crate::differentiation::{
         ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
-    use crate::interpretation::EagerInterpretationDriver;
     use crate::macros::{check_gradient, check_operation_batching};
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
