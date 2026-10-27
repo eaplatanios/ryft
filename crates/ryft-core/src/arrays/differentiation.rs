@@ -2,20 +2,27 @@ use std::borrow::Cow;
 
 use crate::arrays::batching::{ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy};
 use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
 use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::BatchingError;
-use crate::contexts::{Context, ProjectedContext};
+use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiationDual, DifferentiationError, ResidualZeroProvider,
+    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
+    MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
 use crate::operations::{
-    ConstantOperation, DimensionSizeOperation, GuardOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
-    ReferenceReadOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    AddOperation, ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation,
+    GuardOperation, LinearCallOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
+    ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation, ScatterOperation, Zero,
+    ZeroLikeOperation, ZeroOperation,
 };
+use crate::partial::PartialValue;
 use crate::programs::{
     AtomId, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, Type,
     TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
@@ -211,14 +218,14 @@ where
 }
 
 /// Exact runtime [`Shape`] expressed in the coordinate system of a [`LinearResiduals`] list, so that it can be
-/// reconstructed inside a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region)s.
-/// A [`Shape`] describes an array _type_: each axis is either a static extent or a [`DimensionVariable`] identity.
-/// What a staged region needs is one step more concrete (i.e., where the runtime extent of each axis lives) and the
-/// only values in scope there are the region's residual inputs. [`ExactShape`] is that plan, containing one
-/// [`ExactShapeDimension`] per axis, referring to static extents directly and to dynamic extents by residual slot
-/// index. It is produced by [`LinearResiduals::retain_shape`] next to the residual list that gives those indices
-/// meaning during rule staging or by [`Self::for_residual_zero`] when planning zeros required inside a region.
-/// Consumers that own primal extent sources can also use the plan to materialize structural zeros locally.
+/// reconstructed inside a [`LinearCallOperation`]'s attached [`Region`](crate::Region)s. A [`Shape`] describes an
+/// array _type_: each axis is either a static extent or a [`DimensionVariable`] identity. What a staged region needs
+/// is one step more concrete (i.e., where the runtime extent of each axis lives) and the only values in scope there
+/// are the region's residual inputs. [`ExactShape`] is that plan, containing one [`ExactShapeDimension`] per axis,
+/// referring to static extents directly and to dynamic extents by residual slot index. It is produced by
+/// [`LinearResiduals::retain_shape`] next to the residual list that gives those indices meaning during rule staging
+/// or by [`Self::for_residual_zero`] when planning zeros required inside a region. Consumers that own primal extent
+/// sources can also use the plan to materialize structural zeros locally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactShape(Vec<ExactShapeDimension>);
 
@@ -315,8 +322,8 @@ impl ExactShape {
 }
 
 /// One dimension of an [`ExactShape`] that describes where the runtime extent of the corresponding axis lives, from
-/// the point of view of a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region).
-/// This is the [`ExactShape`] counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
+/// the point of view of a [`LinearCallOperation`]'s attached [`Region`](crate::Region). This is the [`ExactShape`]
+/// counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExactShapeDimension {
     /// Compile-time extent that can be reconstructed as a dimension constant in either attached region.
@@ -327,7 +334,7 @@ pub enum ExactShapeDimension {
 }
 
 /// Ordered residual list accumulated by an extent-sensitive linearization rule (e.g., for slice, reshape, pad, reduce
-/// gather, or a shape-changing collective) while it stages a [`LinearCallOperation`](crate::LinearCallOperation).
+/// gather, or a shape-changing collective) while it stages a [`LinearCallOperation`].
 ///
 /// A linear call's attached forward and transpose [`Region`](crate::Region)s later run without access to the primal
 /// trace, so everything they need from it must cross the call boundary as ordinary trailing Single Static Assignment
@@ -350,7 +357,7 @@ pub enum ExactShapeDimension {
 /// valid differential residuals (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are
 /// purely positional: every retention appends a new slot, and the values themselves are never inspected. References
 /// have no differential representation and are rejected by the fallible differentiation type boundary (i.e., via
-/// [`DifferentiableType`](crate::DifferentiableType)) before a valid linearization can retain them.
+/// [`DifferentiableType`]) before a valid linearization can retain them.
 #[derive(Clone, Debug)]
 pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
     /// Retained residual [`Value`]s, in the trailing-input order of the staged linear call. Indices returned by the
@@ -372,7 +379,7 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
     }
 
     /// Consumes this residual list and returns its values, in residual-slot order. The result is what a rule passes
-    /// as the residual input list when staging its [`LinearCallOperation`](crate::LinearCallOperation).
+    /// as the residual input list when staging its [`LinearCallOperation`].
     #[inline]
     pub fn into_values(self) -> Vec<V> {
         self.values
@@ -481,7 +488,11 @@ impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayExt
         cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
         axis: Axis,
     ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
-        sum_mapped_array_cotangents(cotangent, axis)
+        // Sum the packed per-item cotangents along the mapped axis, removing that axis.
+        let normalized_axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| {
+            BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis }
+        })?;
+        Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?)
     }
 }
 
@@ -508,25 +519,310 @@ impl<
         // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability, whose staged operation
         // lifts back through the array IR operation family.
         let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
-        Ok(ValueProjection::from_projected(sum_mapped_array_cotangents(cotangent, axis)?))
+        let normalized_axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| {
+            BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis }
+        })?;
+        Ok(ValueProjection::from_projected(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?))
     }
 }
 
-/// Sums the per-item cotangents of the array-typed `cotangent` packed along `axis`, removing that axis. This is the
-/// representation-independent core of [`CotangentBatchingPolicy::sum_mapped_cotangents`] for both array policies (the
-/// homogeneous policy applies it to the replayed cotangent directly, while the array IR policy applies it to the
-/// cotangent's projected array member).
-fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
-    cotangent: V,
-    axis: Axis,
-) -> Result<V, BatchingError> {
-    let normalized_axis = axis
-        .normalize(cotangent.r#type().rank())
-        .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis })?;
-    Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?)
+impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
+where
+    A: Value<Type = ArrayType>,
+    C: ContextProjection<
+            ArrayType,
+            Type = ArrayIrType,
+            Constant: ValueProjection<ArrayType, Projected = A>,
+            Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+                           + From<ArrayIrOperation<A>>
+                           + From<DynamicBroadcastOperation>
+                           + From<DimensionSizeOperation>
+                           + From<DimensionToScalarOperation>
+                           + From<LinearCallOperation<ArrayIrType>>
+                           + From<ZeroOperation<ArrayType>>
+                           + From<ConstantOperation<DimensionValue>>
+                           + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+                           + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        > + Zero<C::Value>,
+    ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+    ScatterOperation: MemberDifferentiableOperation<C>,
+{
+    #[inline]
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::Jvp)
+    }
+
+    #[inline]
+    fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::JvpForTranspose)
+    }
 }
 
-/// Materializes one array input's forward-mode tangent as a concrete projected array value, reading whatever runtime
+impl<A, V, O> MemberTransposableOperation<V, O> for ArrayOperation<A>
+where
+    A: Value<Type = ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType>
+        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
+    ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        // Slice rules can update an enclosing reference accumulator, which the array family cannot represent.
+        // Other rules retain the homogeneous projected context and contribute ordinary cotangent values.
+        match self {
+            Self::Slice(operation) => operation.transpose_in_parent(context, driver, inputs, outputs, accumulators),
+            Self::DynamicSlice(operation) => {
+                operation.transpose_in_parent(context, driver, inputs, outputs, accumulators)
+            }
+            operation => transpose_projected_operation::<ArrayType, ArrayOperation<A>, V, O>(
+                context,
+                operation,
+                inputs,
+                outputs,
+                accumulators,
+            ),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
+    /// Applies the explicitly selected member [`DifferentiationRule`] and materializes parent universe
+    /// structural zero values.
+    fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+        rule: DifferentiationRule,
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        C: ContextProjection<
+                ArrayType,
+                Type = ArrayIrType,
+                Constant: ValueProjection<ArrayType, Projected = A>,
+                Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+                               + From<ArrayIrOperation<A>>
+                               + From<DynamicBroadcastOperation>
+                               + From<DimensionSizeOperation>
+                               + From<DimensionToScalarOperation>
+                               + From<LinearCallOperation<ArrayIrType>>
+                               + From<ZeroOperation<ArrayType>>
+                               + From<ConstantOperation<DimensionValue>>
+                               + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+                               + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+            > + Zero<C::Value>,
+        ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+        ScatterOperation: MemberDifferentiableOperation<C>,
+    {
+        let output_duals = match self {
+            Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::DynamicSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::DynamicUpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Gather(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            operation => {
+                // When the result shape of an implicitly broadcasting elementwise operation carries a runtime extent,
+                // its inputs are first replicated into that shape, so that the projected member rule differentiates
+                // inputs that already have the result shape. The member-family alignment (i.e.,
+                // `ElementwiseDerivativeAlignment`) cannot replicate into a runtime extent itself, because its
+                // `BroadcastOperation` carries the complete output shape as payload metadata and program replay never
+                // refines a payload type. Such an extent is therefore only reachable through an input edge, which this
+                // arm supplies: it reads each runtime extent off the input that owns that axis as a first-class
+                // dimension value and replicates with a `DynamicBroadcastOperation`. Linearization then keeps one
+                // scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
+                // aligned input. The replication yields `None`, and the inputs are differentiated as they are, when the
+                // operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent
+                // space (so no input is ever aligned), its result shape is fully static, or every input already has the
+                // result shape.
+                // TODO(eaplatanios): Can we avoid the use of labels and make the code easier to follow? Could we
+                //  accomplish this by adding more branches to the outer match statement and using helpers or something?
+                let replicated = 'replicated: {
+                    // The variants whose type inference broadcasts several inputs into one result, and whose
+                    // differentiation rules therefore align narrower inputs (both live tangents and primal
+                    // coefficients) with that result type.
+                    if !matches!(
+                        operation,
+                        Self::Add(_)
+                            | Self::Sub(_)
+                            | Self::Mul(_)
+                            | Self::Div(_)
+                            | Self::Rem(_)
+                            | Self::Pow(_)
+                            | Self::Max(_)
+                            | Self::Min(_)
+                            | Self::Clamp(_)
+                            | Self::Atan2(_)
+                            | Self::LogAddExp(_)
+                            | Self::And(_)
+                            | Self::Or(_)
+                            | Self::Xor(_)
+                            | Self::Complex(_)
+                            | Self::Compare(_)
+                            | Self::Select(_),
+                    ) {
+                        break 'replicated None;
+                    }
+
+                    let input_types = inputs
+                        .iter()
+                        .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
+                        .collect::<Result<Vec<_>, TypeError>>()?;
+                    let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+                    let [output_type] = output_types.as_slice() else {
+                        return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+                    };
+                    let output_shape = output_type.shape();
+                    if output_type.tangent()?.is_zero_space()
+                        || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+                        || input_types.iter().all(|input_type| input_type.shape() == output_shape)
+                    {
+                        break 'replicated None;
+                    }
+
+                    // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated
+                    // dimension denotes one runtime extent, so it is read once and shared by every axis that carries
+                    // it.
+                    let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
+                    for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
+                        if let Some(previous) =
+                            output_shape.dimensions()[..axis].iter().position(|earlier| earlier == dimension)
+                        {
+                            extents.push(extents[previous].clone());
+                            continue;
+                        }
+                        let extent = match dimension {
+                            Dimension::Static(extent) => {
+                                let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
+                                context.primal().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
+                            }
+                            Dimension::Dynamic(_) => {
+                                let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
+                                    let input_axis = axis.checked_sub(output_shape.rank() - input_type.rank())?;
+                                    (&input_type.dimension(input_axis) == dimension).then_some((index, input_axis))
+                                });
+                                let Some((index, input_axis)) = source else {
+                                    return Err(TypeError::invalid(format!(
+                                        "cannot replicate `{}` inputs into result shape {output_shape} because no \
+                                         input carries its runtime axis {axis}",
+                                        operation.name(),
+                                    ))
+                                    .into());
+                                };
+                                context
+                                    .primal()
+                                    .bind(
+                                        DimensionSizeOperation::new(&input_types[index], input_axis)?,
+                                        Vec::new(),
+                                        std::slice::from_ref(inputs[index].primal()),
+                                    )?
+                                    .remove(0)
+                            }
+                        };
+                        extents.push(extent);
+                    }
+
+                    // Replication is structurally linear, so the primal and the tangent of a narrower input ride the
+                    // same mixed broadcast, and a structural-zero tangent stays structural at the replicated tangent
+                    // type.
+                    let replicated_inputs = inputs
+                        .iter()
+                        .zip(input_types.iter())
+                        .map(|(input, input_type)| {
+                            if input_type.shape() == output_shape {
+                                return Ok(input.clone());
+                            }
+                            let offset = output_shape.rank() - input_type.rank();
+                            let replication = DynamicBroadcastOperation::new(
+                                (0..input_type.rank()).map(|axis| axis + offset).collect(),
+                            );
+                            let mut replication_inputs = Vec::with_capacity(1 + extents.len());
+                            replication_inputs.push(input.primal().clone());
+                            replication_inputs.extend(extents.iter().cloned());
+                            let primal = context
+                                .primal()
+                                .bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?
+                                .remove(0);
+                            let tangent = match input.tangent() {
+                                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                                MaybeZero::Value(tangent) => {
+                                    let mut tangent_inputs = vec![tangent.clone()];
+                                    tangent_inputs.extend(
+                                        extents
+                                            .iter()
+                                            .cloned()
+                                            .map(|value| context.primal_to_tangent(value))
+                                            .collect::<Result<Vec<_>, _>>()?,
+                                    );
+                                    MaybeZero::Value(
+                                        context
+                                            .tangent()
+                                            .bind(replication, Vec::new(), tangent_inputs.as_slice())?
+                                            .remove(0),
+                                    )
+                                }
+                            };
+                            DifferentiationDual::new(primal, tangent)
+                        })
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                    Some(replicated_inputs)
+                };
+                let inputs = replicated.as_deref().unwrap_or(inputs);
+                rule.apply_projected(context, operation, inputs)?
+            }
+        };
+        output_duals
+            .into_iter()
+            .map(|output| {
+                let tangent_type = output.tangent().r#type().into_owned();
+                if !output.tangent().is_zero()
+                    || tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
+                {
+                    return Ok(output);
+                }
+
+                // A projected rule can return a structural zero whose shape still has runtime extents. Capture
+                // those extents from the primal in the tangent context, then let the mixed family's residual-zero
+                // protocol construct the tangent with its own element type. For example, transposing integer indices
+                // of shape `[1, items, 1]` produces a zero-typed tangent of shape `[items, 1, 1]`: converting the
+                // integer primal to `zero` is invalid, but its runtime `items` extent still defines that zero.
+                let (primal, tangent) = output.into_parts();
+                let tangent_primal = context.primal_to_tangent(primal.clone())?;
+                let tangent = C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
+                    tangent,
+                    std::iter::once(&tangent_primal),
+                )?;
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))
+            })
+            .collect()
+    }
+}
+
+/// Materializes one array input's forward mode tangent as a concrete projected array value, reading whatever runtime
 /// extents the tangent type omits from the input's primal. A mixed array rule that has to hand a concrete tangent to a
 /// staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
 /// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary

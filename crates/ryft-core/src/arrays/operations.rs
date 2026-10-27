@@ -5,15 +5,8 @@ use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::dimensions::{Dimension, DimensionType};
+use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
-use crate::contexts::{ContextProjection, ProjectedContext, StagingContext};
-use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
-    MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, transpose_projected_operation,
-};
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
     AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
@@ -42,14 +35,12 @@ use crate::operations::{
     ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
     SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
     TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
-use crate::partial::PartialValue;
-use crate::programs::{
-    MaybeZero, Operation, OperationProjection, OperationProvider, ProgramError, Type, TypeError, TypeIdentityPosition,
-    Typed, Value, ValueProjection,
-};
-use crate::tracing::{Tracer, TracingContext};
+use crate::programs::{Value, ValueProjection};
+
+#[cfg(doc)]
+use crate::programs::{Operation, TypeError, Typed};
 
 /// [`Operation`] family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
@@ -608,297 +599,6 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
     }
 }
 
-impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
-where
-    A: Value<Type = ArrayType>,
-    C: ContextProjection<
-            ArrayType,
-            Type = ArrayIrType,
-            Constant: ValueProjection<ArrayType, Projected = A>,
-            Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
-                           + From<ArrayIrOperation<A>>
-                           + From<DynamicBroadcastOperation>
-                           + From<DimensionSizeOperation>
-                           + From<DimensionToScalarOperation>
-                           + From<LinearCallOperation<ArrayIrType>>
-                           + From<ZeroOperation<ArrayType>>
-                           + From<ConstantOperation<DimensionValue>>
-                           + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-                           + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-        > + Zero<C::Value>,
-    ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
-    ScatterOperation: MemberDifferentiableOperation<C>,
-{
-    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::Jvp)
-    }
-
-    fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::JvpForTranspose)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
-    /// Applies the explicitly selected member rule and materializes parent-universe structural zeros.
-    fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-        rule: DifferentiationRule,
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C: ContextProjection<
-                ArrayType,
-                Type = ArrayIrType,
-                Constant: ValueProjection<ArrayType, Projected = A>,
-                Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
-                               + From<ArrayIrOperation<A>>
-                               + From<DynamicBroadcastOperation>
-                               + From<DimensionSizeOperation>
-                               + From<DimensionToScalarOperation>
-                               + From<LinearCallOperation<ArrayIrType>>
-                               + From<ZeroOperation<ArrayType>>
-                               + From<ConstantOperation<DimensionValue>>
-                               + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-                               + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-            > + Zero<C::Value>,
-        ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
-        ScatterOperation: MemberDifferentiableOperation<C>,
-    {
-        let output_duals = match self {
-            Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            Self::DynamicSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            Self::DynamicUpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            Self::Gather(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
-            operation => {
-                // When the result shape of an implicitly broadcasting elementwise operation carries a runtime extent,
-                // its inputs are first replicated into that shape, so that the projected member rule differentiates
-                // inputs that already have the result shape. The member-family alignment (i.e.,
-                // `ElementwiseDerivativeAlignment`) cannot replicate into a runtime extent itself, because its
-                // `BroadcastOperation` carries the complete output shape as payload metadata and program replay never
-                // refines a payload type. Such an extent is therefore only reachable through an input edge, which this
-                // arm supplies: it reads each runtime extent off the input that owns that axis as a first-class
-                // dimension value and replicates with a `DynamicBroadcastOperation`. Linearization then keeps one
-                // scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
-                // aligned input. The replication yields `None`, and the inputs are differentiated as they are, when the
-                // operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent
-                // space (so no input is ever aligned), its result shape is fully static, or every input already has the
-                // result shape.
-                let replicated = 'replicated: {
-                    // The variants whose type inference broadcasts several inputs into one result, and whose
-                    // differentiation rules therefore align narrower inputs (both live tangents and primal
-                    // coefficients) with that result type.
-                    if !matches!(
-                        operation,
-                        Self::Add(_)
-                            | Self::Sub(_)
-                            | Self::Mul(_)
-                            | Self::Div(_)
-                            | Self::Rem(_)
-                            | Self::Pow(_)
-                            | Self::Max(_)
-                            | Self::Min(_)
-                            | Self::Clamp(_)
-                            | Self::Atan2(_)
-                            | Self::LogAddExp(_)
-                            | Self::And(_)
-                            | Self::Or(_)
-                            | Self::Xor(_)
-                            | Self::Complex(_)
-                            | Self::Compare(_)
-                            | Self::Select(_),
-                    ) {
-                        break 'replicated None;
-                    }
-
-                    let input_types = inputs
-                        .iter()
-                        .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
-                        .collect::<Result<Vec<_>, TypeError>>()?;
-                    let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
-                    let [output_type] = output_types.as_slice() else {
-                        return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
-                    };
-                    let output_shape = output_type.shape();
-                    if output_type.tangent()?.is_zero_space()
-                        || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
-                        || input_types.iter().all(|input_type| input_type.shape() == output_shape)
-                    {
-                        break 'replicated None;
-                    }
-
-                    // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated
-                    // dimension denotes one runtime extent, so it is read once and shared by every axis that carries
-                    // it.
-                    let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
-                    for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
-                        if let Some(previous) =
-                            output_shape.dimensions()[..axis].iter().position(|earlier| earlier == dimension)
-                        {
-                            extents.push(extents[previous].clone());
-                            continue;
-                        }
-                        let extent = match dimension {
-                            Dimension::Static(extent) => {
-                                let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
-                                context.primal().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
-                            }
-                            Dimension::Dynamic(_) => {
-                                let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
-                                    let input_axis = axis.checked_sub(output_shape.rank() - input_type.rank())?;
-                                    (&input_type.dimension(input_axis) == dimension).then_some((index, input_axis))
-                                });
-                                let Some((index, input_axis)) = source else {
-                                    return Err(TypeError::invalid(format!(
-                                        "cannot replicate `{}` inputs into result shape {output_shape} because no \
-                                         input carries its runtime axis {axis}",
-                                        operation.name(),
-                                    ))
-                                    .into());
-                                };
-                                context
-                                    .primal()
-                                    .bind(
-                                        DimensionSizeOperation::new(&input_types[index], input_axis)?,
-                                        Vec::new(),
-                                        std::slice::from_ref(inputs[index].primal()),
-                                    )?
-                                    .remove(0)
-                            }
-                        };
-                        extents.push(extent);
-                    }
-
-                    // Replication is structurally linear, so the primal and the tangent of a narrower input ride the
-                    // same mixed broadcast, and a structural-zero tangent stays structural at the replicated tangent
-                    // type.
-                    let replicated_inputs = inputs
-                        .iter()
-                        .zip(input_types.iter())
-                        .map(|(input, input_type)| {
-                            if input_type.shape() == output_shape {
-                                return Ok(input.clone());
-                            }
-                            let offset = output_shape.rank() - input_type.rank();
-                            let replication = DynamicBroadcastOperation::new(
-                                (0..input_type.rank()).map(|axis| axis + offset).collect(),
-                            );
-                            let mut replication_inputs = Vec::with_capacity(1 + extents.len());
-                            replication_inputs.push(input.primal().clone());
-                            replication_inputs.extend(extents.iter().cloned());
-                            let primal = context
-                                .primal()
-                                .bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?
-                                .remove(0);
-                            let tangent = match input.tangent() {
-                                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                                MaybeZero::Value(tangent) => {
-                                    let mut tangent_inputs = vec![tangent.clone()];
-                                    tangent_inputs.extend(
-                                        extents
-                                            .iter()
-                                            .cloned()
-                                            .map(|value| context.primal_to_tangent(value))
-                                            .collect::<Result<Vec<_>, _>>()?,
-                                    );
-                                    MaybeZero::Value(
-                                        context
-                                            .tangent()
-                                            .bind(replication, Vec::new(), tangent_inputs.as_slice())?
-                                            .remove(0),
-                                    )
-                                }
-                            };
-                            DifferentiationDual::new(primal, tangent)
-                        })
-                        .collect::<Result<Vec<_>, DifferentiationError>>()?;
-                    Some(replicated_inputs)
-                };
-                let inputs = replicated.as_deref().unwrap_or(inputs);
-                rule.apply_projected(context, operation, inputs)?
-            }
-        };
-        output_duals
-            .into_iter()
-            .map(|output| {
-                let tangent_type = output.tangent().r#type().into_owned();
-                if !output.tangent().is_zero()
-                    || tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
-                {
-                    return Ok(output);
-                }
-
-                // A projected rule can return a structural zero whose shape still has runtime extents. Capture
-                // those extents from the primal in the tangent context, then let the mixed family's residual-zero
-                // protocol construct the tangent with its own element type. For example, transposing integer
-                // indices of shape [1, items, 1] produces a zero-typed tangent of shape [items, 1, 1]: converting
-                // the integer primal to `zero` is invalid, but its runtime `items` extent still defines that zero.
-                let (primal, tangent) = output.into_parts();
-                let tangent_primal = context.primal_to_tangent(primal.clone())?;
-                let tangent = C::Operation::materialize_zero_from_residual_sources(
-                    context.tangent(),
-                    tangent,
-                    std::iter::once(&tangent_primal),
-                )?;
-                DifferentiationDual::new(primal, MaybeZero::Value(tangent))
-            })
-            .collect()
-    }
-}
-
-impl<A, V, O> MemberTransposableOperation<V, O> for ArrayOperation<A>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    A: Value<Type = ArrayType>,
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
-    O: Operation<Type = ArrayIrType>
-        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
-        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
-        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
-        + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
-{
-    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        // Slice rules can update an enclosing reference accumulator, which the array family cannot represent.
-        // Other rules retain the homogeneous projected context and contribute ordinary cotangent values.
-        match self {
-            Self::Slice(operation) => operation.transpose_in_parent(context, driver, inputs, outputs, accumulators),
-            Self::DynamicSlice(operation) => {
-                operation.transpose_in_parent(context, driver, inputs, outputs, accumulators)
-            }
-            operation => transpose_projected_operation::<ArrayType, ArrayOperation<A>, V, O>(
-                context,
-                operation,
-                inputs,
-                outputs,
-                accumulators,
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -926,9 +626,9 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DifferentiationContext, DotsSavable, ForwardModeDifferentiate,
-        LinearizationTracer, NothingSavable, PartitionedDifferentiationPolicy, ReverseModeDifferentiate,
-        differentiate_at,
+        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DifferentiationContext, DifferentiationDual, DotsSavable,
+        ForwardModeDifferentiate, LinearizationTracer, MemberDifferentiableOperation, NothingSavable,
+        PartitionedDifferentiationPolicy, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
@@ -944,9 +644,9 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
     use crate::programs::{
-        AtomId, EffectClass, EffectClasses, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder,
-        ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
-        Typed, Value, ValueProjection,
+        AtomId, EffectClass, EffectClasses, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
+        ProgramBuilder, ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition,
+        TypeIdentityRenaming, Typed, Value, ValueProjection,
     };
     use crate::tests::hash_of;
     use crate::tracing::{Trace, Tracer, TracingContext};
