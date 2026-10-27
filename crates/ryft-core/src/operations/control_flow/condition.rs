@@ -5825,6 +5825,15 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_interpretation_rejects_missing_regions() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            ConditionOperation::<ArrayIrType>::new().interpret(&context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::MalformedProgram("region index 0 is out of range".to_string())),
+        );
+    }
+
+    #[test]
     fn test_condition_interpretation_skips_effects_of_the_unselected_branch() {
         // The `true` branch adds `1.0` to the reference, while the `false` branch adds `10.0` and then fails an
         // assertion. Interpretation executes only the selected branch, so the `true` predicate observes neither the

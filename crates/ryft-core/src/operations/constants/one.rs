@@ -329,7 +329,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, Shape, StridedLayout, i4,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, Shape,
+        StridedLayout, i4,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
@@ -337,13 +338,13 @@ mod tests {
         ForwardModeDifferentiate, LinearizationTracer, TransposableOperation, TranspositionContext, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation_partial_evaluation;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::arithmetic::Mul;
     use crate::operations::constants::constant::ConstantOperation;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -402,6 +403,31 @@ mod tests {
         );
         let dimension_type = DimensionType::from(rows);
         assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]));
+    }
+
+    #[test]
+    fn test_one_type_inference_array_ir_static() {
+        let output_type = ArrayType::scalar(DataType::F32);
+        check_operation_type_inference!(
+            operation = ArrayIrOperation::<Array>::One(OneOperation::new(output_type.clone())),
+            cases = [{ input_types = [], output_types = [output_type.into()] }],
+        );
+    }
+
+    #[test]
+    fn test_one_type_inference_array_ir_rejects_regions() {
+        let source = DimensionType::new("source", DimensionBounds::positive(Some(9)).unwrap());
+        let operation = ArrayIrOperation::<Array>::One(OneOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![source.dimension().clone()]),
+        )));
+        assert_eq!(
+            operation.infer_output_types(
+                &[source.into()],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("`one` expects no regions but got 1")),
+        );
     }
 
     #[test]
@@ -537,6 +563,35 @@ mod tests {
         assert_eq!(
             context.one(&dimension_type),
             Err(ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type"))),
+        );
+    }
+
+    #[test]
+    fn test_one_interpretation_array_ir_static() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            context.bind(ArrayIrOperation::One(OneOperation::new(ArrayType::scalar(DataType::F32))), Vec::new(), &[],),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_one_interpretation_rejects_stored_axis_bounds() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let bounds = DimensionBounds::new(1, Some(4)).unwrap();
+        let bounded = DimensionVariable::new("bounded", bounds);
+
+        // Raw eager binding skips inference, so the stored output axis must reject the extent before allocation.
+        let error = context
+            .bind(
+                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded)]))),
+                Vec::new(),
+                &[ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap())],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds { variable: "bounded".to_string(), value: 5, bounds }),
         );
     }
 
@@ -834,6 +889,35 @@ mod tests {
                 lambda  .
                 let %0:f32[2] = one [type=f32[2]]
                 in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_one_staging_constant_dimensions() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let columns_type = DimensionType::new("columns", DimensionBounds::non_negative(Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![columns_type.dimension().clone()]));
+        let extent = context.constant(ArrayIrValue::Dimension(DimensionValue::new(columns_type, 3).unwrap()));
+        let output = context.bind(OneOperation::new(output_type), Vec::new(), &[extent]).unwrap().remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<3> = const 3
+                    %1:f32[3] = one [type=f32[columns]] %0
+                in (%1)
             "}
             .trim_end(),
         );

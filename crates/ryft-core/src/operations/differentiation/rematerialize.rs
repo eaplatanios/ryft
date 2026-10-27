@@ -785,7 +785,7 @@ mod tests {
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
-    use crate::operations::control_flow::r#while::WhileOperation;
+    use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation};
     use crate::operations::debugging::PrintOperation;
     use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::dot::{Dot, DotDimensionNumbers, DotOperation};
@@ -3244,9 +3244,12 @@ mod tests {
         assert!(matches!(
             program.linearize().unwrap().pullback(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message
-                == "`while` does not support transposition (reverse-mode differentiation through staged linear \
-                    `while` loops is not supported; eager differentiation executes concrete duals, and the \
-                    forward-mode rule of loops built with `with_iteration_bound` stages a transposable masked scan)",
+                == format!(
+                    "`{WHILE_OPERATION_NAME}` does not support transposition (reverse-mode differentiation through \
+                     staged linear `{WHILE_OPERATION_NAME}` loops is not supported; eager differentiation executes \
+                     concrete duals, and the forward-mode rule of loops built with `with_iteration_bound` stages a \
+                     transposable masked scan)",
+                ),
         ));
     }
 

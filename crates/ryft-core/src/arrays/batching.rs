@@ -3076,9 +3076,10 @@ mod tests {
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
     use crate::operations::{
         AddOperation, CompareOperation, ConditionOperation, DimensionAddOperation, DimensionDivOperation,
-        DimensionFromScalar, DimensionToScalar, DimensionToScalarOperation, DynamicReshapeOperation, NegOperation,
-        OneLike, ParallelReduceOperation, Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReshardOperation,
+        DimensionFromScalar, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, NegOperation, OneLike, ParallelReduceOperation, Reduce,
+        ReduceOperation, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReshardOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope, ReferenceType};
@@ -5623,6 +5624,125 @@ mod tests {
             .trim_end(),
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_bind_dispatch_mixed_graph() {
+        // Array arithmetic and replicated dimension arithmetic remain interleaved in one graph under batching.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let per_item_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let extent_operation = DimensionSizeOperation::new(&per_item_type, 0).unwrap();
+        let extent_type = extent_operation.output_type().clone();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(per_item_type.clone().into());
+        let doubled = builder
+            .add_instruction(ArrayOperation::Add(AddOperation::new()), Vec::new(), vec![input, input], None)
+            .unwrap()[0];
+        let extent = builder.add_instruction(extent_operation, Vec::new(), vec![doubled], None).unwrap()[0];
+        let total = builder
+            .add_instruction(
+                DimensionOperation::Add(DimensionAddOperation::new(&extent_type, &extent_type).unwrap()),
+                Vec::new(),
+                vec![extent, extent],
+                None,
+            )
+            .unwrap()[0];
+        let widened = builder
+            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![doubled, total, extent], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum)),
+                Vec::new(),
+                vec![widened],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows] .
+                let %1:f32[rows] = add %0 %0
+                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %1
+                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
+                    %4:f32[rows + rows, rows] = broadcast [output_axes=[1]] %1 %3 %2
+                    %5:f32[rows] = reduce [kind=sum, axes=[0]] %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+
+        // Batch the body under a staging parent so that the array IR graph batching produces is observable as a
+        // program rather than as concrete per-item values. The per-item extent stays symbolic, so the batched graph
+        // remains shape polymorphic in `rows` even though the mapped axis itself has a known size.
+        let trace = ArrayIrTraceContext::new();
+        let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let packed = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(rows.clone())]))
+                .into(),
+        );
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
+        let batched_output = program
+            .interpret_in_context(
+                &batching_context,
+                vec![BatchingTracer::new(
+                    batching_context.clone(),
+                    ArrayIrBatch::new(packed, BatchAxis::new(0)).unwrap(),
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
+        let batched_output_id = batched_output.into_batch().into_value().atom_id().unwrap();
+
+        let batched_program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![batched_output_id],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            batched_program.to_string(),
+            indoc! {"
+                lambda %1:f32[2, rows] .
+                let %0:dimension<2> = const 2
+                    %2:f32[2, rows] = add %1 %1
+                    %3:dimension<rows ∈ [1, 5)> = dimension_size [axis=1] %2
+                    %4:dimension<rows + rows ∈ [2, 9)> = dimension_add %3 %3
+                    %5:f32[2, rows + rows, rows] = broadcast [output_axes=[0, 2]] %2 %0 %4 %3
+                    %6:f32[2, rows] = reduce [kind=sum, axes=[1]] %5
+                in (%6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            batched_program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+                )
+                .unwrap()
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                    &[12.0, 24.0, 36.0, 48.0, 60.0, 72.0]
+                )
+                .unwrap()
+            )]),
+        );
     }
 
     #[test]

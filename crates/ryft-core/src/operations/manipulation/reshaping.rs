@@ -3555,6 +3555,23 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_reshape_type_inference_retains_memory_and_clears_layout() {
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
+            .with_memory(Memory::Host { pinned: true });
+        let extent = DimensionValue::constant(6).unwrap();
+        check_operation_type_inference!(
+            operation = DynamicReshapeOperation::new(),
+            cases = [{
+                input_types = [input_type.into(), extent.r#type().into_owned().into()],
+                output_types = [
+                    ArrayType::new_static(DataType::F32, [6]).with_memory(Memory::Host { pinned: true }).into(),
+                ],
+            }],
+        );
+    }
+
+    #[test]
     fn test_dynamic_reshape_type_inference_identity_instantiation() {
         let bounds = DimensionBounds::new(1, Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);

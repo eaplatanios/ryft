@@ -980,18 +980,17 @@ mod tests {
     use crate::kernels::memory::{
         AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, WaitOperation,
     };
-    use crate::kernels::operations::{KernelExtensionMemory, NoKernelExtension};
-    use crate::macros::check_count;
+    use crate::kernels::operations::NoKernelExtension;
+    use crate::kernels::operations::tests::TestExtension;
     use crate::operations::attention::{
         AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionOperation,
     };
     use crate::operations::{
         AddOperation, ConditionOperation, DimensionMulOperation, DimensionToScalarOperation, ReduceOperation,
-        ReductionKind, ReferenceRead, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, SubOperation,
-        WhileOperation,
+        ReductionKind, ReferenceRead, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface};
+    use crate::programs::ProgramBuilder;
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1620,75 +1619,6 @@ mod tests {
         assert_eq!(trace.last().unwrap().operation, "reference_write");
     }
 
-    /// Kernel extension whose interpretation rule subtracts its input from itself by binding a `sub` through its
-    /// interpretation driver, as higher-order rules that execute nested work on their own behalf do.
-    #[derive(Clone, Debug)]
-    struct RebindingExtension;
-
-    impl Operation for RebindingExtension {
-        type Type = ArrayIrType;
-
-        fn name(&self) -> &'static str {
-            "test_rebinding"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[ArrayIrType],
-            _region_interfaces: &[RegionInterface<ArrayIrType>],
-        ) -> Result<Vec<ArrayIrType>, TypeError> {
-            check_count!("input", input_types, 1, TypeError);
-            Ok(input_types.to_vec())
-        }
-    }
-
-    impl ReferenceAccessOperation for RebindingExtension {
-        type Transform = ArrayReferenceTransform;
-
-        fn base_input_count(&self) -> usize {
-            0
-        }
-
-        fn reference_access_descriptor(
-            &self,
-            _input_index: usize,
-        ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
-            None
-        }
-
-        fn with_reference_access_transforms(
-            &self,
-            _input_index: usize,
-            _transforms: Vec<ArrayReferenceTransform>,
-        ) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "test extension has no reference accesses".to_owned() })
-        }
-    }
-
-    impl KernelExtension for RebindingExtension {
-        fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
-            Ok(KernelExtensionMemory::Synchronous)
-        }
-    }
-
-    impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<RebindingExtension>>>
-        for RebindingExtension
-    {
-        fn interpret<
-            D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<RebindingExtension>>>,
-        >(
-            &self,
-            context: &EagerContext<ArrayIrValue<Array>, KernelOperation<RebindingExtension>>,
-            driver: &D,
-            inputs: &[ArrayIrValue<Array>],
-        ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            let operation =
-                KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())));
-            driver.bind(context, operation, AttachedRegions::Empty, &[inputs[0].clone(), inputs[0].clone()])
-        }
-    }
-
     #[test]
     fn test_kernel_definition_interpret_qualifies_operations_bound_by_rules() {
         // An operation that a rule binds through its interpretation driver is qualified like the instructions of the
@@ -1701,11 +1631,11 @@ mod tests {
             ],
         )
         .unwrap();
-        let definition = KernelDefinition::<RebindingExtension>::trace(call, |(references, _coordinates)| {
+        let definition = KernelDefinition::<TestExtension>::trace(call, |(references, _coordinates)| {
             let input = references[0].read()?;
             let output = references[0]
                 .context()
-                .bind(KernelOperation::Extension(RebindingExtension), vec![], &[input])?
+                .bind(KernelOperation::Extension(TestExtension::Rebinding), vec![], &[input])?
                 .remove(0);
             references[1].write(&output)
         })

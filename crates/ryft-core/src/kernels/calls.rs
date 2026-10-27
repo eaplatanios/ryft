@@ -1269,13 +1269,14 @@ mod tests {
     use crate::kernels::authoring::whole_array_parameter;
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
+    use crate::kernels::operations::tests::TestExtension;
     use crate::operations::{
         CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, CustomRuleDefinition,
         CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, EffectClasses, ProgramBuilder, ReferenceAccessDescriptor, RegionId};
+    use crate::programs::{AtomId, EffectClasses, ProgramBuilder, RegionId};
 
     use super::*;
 
@@ -2420,63 +2421,12 @@ mod tests {
         }
     }
 
-    /// Extension whose diagnostic text intentionally omits semantic payload, demonstrating conservative eligibility.
-    #[derive(Clone, Debug)]
-    struct HiddenKeyExtension<const EXACT: bool = false>(u32);
-
-    impl<const EXACT: bool> Operation for HiddenKeyExtension<EXACT> {
-        type Type = ArrayIrType;
-        fn name(&self) -> &'static str {
-            "hidden_key_extension"
-        }
-        fn infer_output_types(
-            &self,
-            _inputs: &[ArrayIrType],
-            _regions: &[RegionInterface<ArrayIrType>],
-        ) -> Result<Vec<ArrayIrType>, TypeError> {
-            Ok(vec![])
-        }
-    }
-
-    impl KernelExtension for HiddenKeyExtension {}
-
-    impl KernelExtension for HiddenKeyExtension<true> {
-        fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
-            let mut key = b"test.hidden_key_extension\0v1\0".to_vec();
-            key.extend_from_slice(&self.0.to_le_bytes());
-            Ok(key)
-        }
-    }
-
-    impl<const EXACT: bool> ReferenceAccessOperation for HiddenKeyExtension<EXACT> {
-        type Transform = ArrayReferenceTransform;
-
-        fn base_input_count(&self) -> usize {
-            0
-        }
-
-        fn reference_access_descriptor(
-            &self,
-            _input_index: usize,
-        ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
-            None
-        }
-
-        fn with_reference_access_transforms(
-            &self,
-            _input_index: usize,
-            _transforms: Vec<ArrayReferenceTransform>,
-        ) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "hidden extension has no reference accesses".to_owned() })
-        }
-    }
-
     #[test]
     fn test_kernel_definition_semantic_key_exact_extension_payload() {
         let keys = [0, 1, 256, u32::MAX].map(|payload| {
-            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<HiddenKeyExtension<true>>>::new();
-            body.add_instruction(KernelOperation::Extension(HiddenKeyExtension(payload)), vec![], vec![], None)
-                .unwrap();
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            let extension = TestExtension::HiddenKey { key: payload, exact: true };
+            body.add_instruction(KernelOperation::Extension(extension), vec![], vec![], None).unwrap();
             let definition = KernelDefinition::new(
                 KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),
                 body.build(vec![], vec![], vec![]).unwrap(),
@@ -2496,9 +2446,9 @@ mod tests {
     #[test]
     fn test_kernel_definition_semantic_key_rejects_extension_without_exact_identity() {
         for payload in [1, 2] {
-            let extension = HiddenKeyExtension(payload);
-            assert_eq!(extension.0, payload);
-            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<HiddenKeyExtension>>::new();
+            let extension = TestExtension::HiddenKey { key: payload, exact: false };
+            assert!(matches!(extension, TestExtension::HiddenKey { key, .. } if key == payload));
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
             body.add_instruction(KernelOperation::Extension(extension), vec![], vec![], None).unwrap();
             let definition = KernelDefinition::new(
                 KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),

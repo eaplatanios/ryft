@@ -379,12 +379,13 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, i4, u4,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Shape, i4, u4,
     };
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
@@ -446,6 +447,15 @@ mod tests {
             Err(TypeError::invalid(format!(
                 "`iota` cannot construct type f64[extent] without inputs because it references identity {variable}",
             ))),
+        );
+    }
+
+    #[test]
+    fn test_iota_type_inference_array_ir_static() {
+        let output_type = ArrayType::new_static(DataType::I32, [3]);
+        check_operation_type_inference!(
+            operation = ArrayIrOperation::<Array>::Iota(IotaOperation::new(output_type.clone(), 0).unwrap()),
+            cases = [{ input_types = [], output_types = [output_type.into()] }],
         );
     }
 
@@ -631,12 +641,76 @@ mod tests {
     }
 
     #[test]
+    fn test_iota_interpretation_array_ir_static() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let output_type = ArrayType::new_static(DataType::I32, [3]);
+        let operation = ArrayIrOperation::Iota(IotaOperation::new(output_type.clone(), 0).unwrap());
+        assert_eq!(
+            context.bind(operation.clone(), Vec::new(), &[]),
+            Ok(vec![ArrayIrValue::Array(Array::from_elements(output_type, &[0i32, 1, 2]).unwrap())]),
+        );
+        assert_eq!(
+            context.bind(operation, Vec::new(), &[ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())]),
+            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
+        );
+    }
+
+    #[test]
+    fn test_iota_interpretation_rejects_stored_axis_bounds() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let bounds = DimensionBounds::new(1, Some(4)).unwrap();
+        let bounded = DimensionVariable::new("bounded", bounds);
+
+        // Raw eager binding skips inference, so the stored output axis must reject the extent before allocation.
+        let error = context
+            .bind(
+                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(bounded)])), 0)
+                    .unwrap(),
+                Vec::new(),
+                &[ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap())],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds { variable: "bounded".to_string(), value: 5, bounds }),
+        );
+    }
+
+    #[test]
     fn test_iota_partial_evaluation() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
         let output = context.iota(&output_type, 1).unwrap();
         let expected = Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap();
         assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_iota_partial_evaluation_dynamic() {
+        let extent_type = DimensionType::new("iota_extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let extent_program_type = extent.r#type().into_owned();
+        let output = ArrayIrValue::Array(Array::vector(vec![0i32, 1, 2]).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = IotaOperation::new(
+                ArrayType::new(DataType::I32, Shape::new(vec![extent_type.dimension().clone()])),
+                0,
+            )
+            .unwrap(),
+            cases = [
+                {
+                    inputs = [(@known, extent.clone())],
+                    outputs = [(@known, output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = extent_program_type, replay = extent))],
+                    outputs = [(@residual, output)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
     }
 
     #[test]
@@ -782,6 +856,36 @@ mod tests {
                 lambda  .
                 let %0:i32[2, 3] = iota [type=i32[2, 3], dimension=1]
                 in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_iota_staging_constant_dimensions() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let columns_type = DimensionType::new("columns", DimensionBounds::non_negative(Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![columns_type.dimension().clone()]));
+        let extent = context.constant(ArrayIrValue::Dimension(DimensionValue::new(columns_type, 3).unwrap()));
+        let output =
+            context.bind(IotaOperation::new(output_type, 0).unwrap(), Vec::new(), &[extent]).unwrap().remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<3> = const 3
+                    %1:i32[3] = iota [type=i32[columns], dimension=0] %0
+                in (%1)
             "}
             .trim_end(),
         );

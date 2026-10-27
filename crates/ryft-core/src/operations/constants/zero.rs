@@ -353,13 +353,14 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType,
-        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, Shape, StridedLayout, i4,
+        Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, Shape,
+        StridedLayout, i4,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation_partial_evaluation;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationValue, PartialValue};
@@ -426,6 +427,15 @@ mod tests {
         );
         let dimension_type = DimensionType::from(rows);
         assert_eq!(ZeroOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]));
+    }
+
+    #[test]
+    fn test_zero_type_inference_array_ir_static() {
+        let output_type = ArrayType::scalar(DataType::F32);
+        check_operation_type_inference!(
+            operation = ArrayIrOperation::<Array>::Zero(ZeroOperation::new(output_type.clone())),
+            cases = [{ input_types = [], output_types = [output_type.into()] }],
+        );
     }
 
     #[test]
@@ -563,6 +573,36 @@ mod tests {
                 "cannot materialize a zero for reference type `ref<f32[2, 3]>`; a reference denotes an allocation and has \
                  no zero value, so tangent and cotangent references are allocated by the differentiation rules",
             ))),
+        );
+    }
+
+    #[test]
+    fn test_zero_interpretation_array_ir_static() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            context
+                .bind(ArrayIrOperation::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F32))), Vec::new(), &[],),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_zero_interpretation_rejects_stored_axis_bounds() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let bounds = DimensionBounds::new(1, Some(4)).unwrap();
+        let bounded = DimensionVariable::new("bounded", bounds);
+
+        // Raw eager binding skips inference, so the stored output axis must reject the extent before allocation.
+        let error = context
+            .bind(
+                ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded)]))),
+                Vec::new(),
+                &[ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap())],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds { variable: "bounded".to_string(), value: 5, bounds }),
         );
     }
 
@@ -891,6 +931,42 @@ mod tests {
                 lambda  .
                 let %0:f32[2] = zero [type=f32[2]]
                 in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_zero_staging_constant_dimensions() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let bounds = DimensionBounds::non_negative(Some(9)).unwrap();
+        let rows_type = DimensionType::new("rows", bounds);
+        let columns_type = DimensionType::new("columns", bounds);
+        let output_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![rows_type.dimension().clone(), columns_type.dimension().clone()]),
+        );
+        let rows = context.constant(ArrayIrValue::Dimension(DimensionValue::new(rows_type, 2).unwrap()));
+        let columns = context.constant(ArrayIrValue::Dimension(DimensionValue::new(columns_type, 3).unwrap()));
+        let output = context.bind(ZeroOperation::new(output_type), Vec::new(), &[rows, columns]).unwrap().remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<2> = const 2
+                    %1:dimension<3> = const 3
+                    %2:f32[2, 3] = zero [type=f32[rows, columns]] %0 %1
+                in (%2)
             "}
             .trim_end(),
         );

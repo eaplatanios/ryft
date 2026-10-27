@@ -856,9 +856,9 @@ mod tests {
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableType, Differentiate, ReverseModeDifferentiate, TransposedProgramCotangent,
+        DifferentiableType, Differentiate, ReverseModeDifferentiate, TransposedProgramCotangent, differentiate_at,
     };
-    use crate::operations::{MulOperation, StopGradientOperation, TransposeOperation};
+    use crate::operations::{Add, Dot, DotDimensionNumbers, MulOperation, StopGradientOperation, TransposeOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ReferenceType};
 
@@ -1238,6 +1238,101 @@ mod tests {
         assert_eq!(dimension_size.inputs(), &[source.atom_id().unwrap()]);
         assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[dimension_size.outputs()[0], dimension_size.outputs()[0]]);
+    }
+
+    #[test]
+    fn test_array_ir_value_and_gradient_with_captures() {
+        // The capture supplies the derivative with respect to `x` in `f(x; c) = (x + c) · c`.
+        let (value, gradient) = differentiate_at(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0]).unwrap()))
+            .with_captures(ArrayIrValue::Array(Array::vector(vec![3f32, 4.0]).unwrap()))
+            .value_and_gradient(|x, c| x.add(&c)?.dot(&c, &DotDimensionNumbers::inner_product()))
+            .unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0f32 * 3.0 + 6.0 * 4.0).unwrap()));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::vector(vec![3f32, 4.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_array_ir_linearize_dynamic_zero_space_output_tangent() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![extent_type.dimension().clone()]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = context.input(extent_type.into());
+        let key = context.input(key_type.clone().into());
+        let (_, pushforward) =
+            context.linearize(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![extent, key], ()).unwrap();
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let key_tangent = context.input(key_type.tangent().unwrap().into());
+
+        // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
+        // result must consume the key extent captured at linearization time.
+        assert_eq!(pushforward.program().to_string(), indoc! {"__RENDER_zero_space_pushforward__"}.trim_end(),);
+        let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![tangent.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.to_string(), indoc! {"__RENDER_zero_space_pushforward_parent__"}.trim_end(),);
+        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+        let zero = ArrayIrValue::Array(Array::from_logical_bytes(zero_type, &[]).unwrap());
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1u64, 2]).unwrap()),
+                ArrayIrValue::Array(Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap()),
+                zero.clone(),
+            ]),
+            Ok(vec![zero]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_vjp_dynamic_zero_space_input_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let key = context.input(key_type.clone().into());
+        let accumulator = context.input(ArrayType::scalar(DataType::F64).into());
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![key, accumulator], ()).unwrap();
+        let cotangent = context.input(ArrayType::scalar(DataType::F64).into());
+
+        // The compact pullback has no result slot for the key's zero differential space. The public result preserves
+        // that zero without capturing its extent or constructing an array.
+        let transposed = pullback.transposed_program(&[]).unwrap();
+        assert_eq!(transposed.program().to_string(), indoc! {"__RENDER_zero_space_pullback__"}.trim_end(),);
+        let cotangents = pullback.apply(cotangent).unwrap();
+        assert!(pullback.residuals().is_empty());
+        assert_eq!(cotangents[0], MaybeZero::Zero(ArrayIrType::Array(key_type.tangent().unwrap())));
+        assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
+        let MaybeZero::Value(cotangent) = &cotangents[1] else {
+            panic!("expected a live scalar cotangent");
+        };
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![cotangent.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.to_string(), indoc! {"__RENDER_zero_space_pullback_parent__"}.trim_end(),);
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1u64, 2]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(3f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(4f64).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(4f64).unwrap())]),
+        );
     }
 
     #[test]

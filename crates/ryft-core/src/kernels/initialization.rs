@@ -892,128 +892,16 @@ mod tests {
         WaitOperation,
     };
     use crate::kernels::operations::NoKernelExtension;
+    use crate::kernels::operations::tests::TestExtension;
     use crate::operations::{
         ConditionOperation, DimensionAddOperation, DimensionMulOperation, NotOperation, ReferenceAddUpdateOperation,
         ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSwapOperation, ReferenceWriteOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation};
+    use crate::programs::{FlatProgram, ProgramBuilder};
 
     use super::*;
-
-    /// Multi-source asynchronous update fixture using canonical effects and reference types.
-    #[derive(Clone, Debug)]
-    enum MemoryExtension {
-        Allocate(ArrayType),
-        MisclassifiedAllocation,
-        Synchronous,
-        Update,
-        Commit,
-        Wait,
-        Release,
-    }
-
-    impl Operation for MemoryExtension {
-        type Type = ArrayIrType;
-
-        fn name(&self) -> &'static str {
-            match self {
-                Self::Allocate(_) => "test_allocate",
-                Self::MisclassifiedAllocation => "test_misclassified_allocation",
-                Self::Synchronous => "test_synchronous",
-                Self::Update => "test_async_update",
-                Self::Commit => "test_commit",
-                Self::Wait => "test_wait",
-                Self::Release => "test_release",
-            }
-        }
-
-        fn infer_output_types(
-            &self,
-            _inputs: &[ArrayIrType],
-            _regions: &[crate::programs::RegionInterface<ArrayIrType>],
-        ) -> Result<Vec<ArrayIrType>, crate::programs::TypeError> {
-            Ok(match self {
-                Self::Allocate(referent) => vec![ArrayIrType::Reference(ReferenceType::new(referent.clone()))],
-                Self::Update => vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
-                Self::MisclassifiedAllocation => {
-                    vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)))]
-                }
-                Self::Synchronous | Self::Commit | Self::Wait | Self::Release => vec![],
-            })
-        }
-
-        fn effects(&self) -> std::borrow::Cow<'_, crate::programs::Effects> {
-            use crate::programs::{EffectClasses, Effects};
-            let declarations = match self {
-                Self::Allocate(_) | Self::MisclassifiedAllocation => {
-                    vec![ReferenceEffect::Allocate { output_index: 0 }]
-                }
-                Self::Synchronous => vec![],
-                Self::Update => vec![
-                    ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
-                    ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Read },
-                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
-                    ReferenceEffect::Allocate { output_index: 0 },
-                ],
-                Self::Commit => vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                Self::Wait | Self::Release => {
-                    vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
-                }
-            };
-            std::borrow::Cow::Owned(Effects::new(EffectClasses::NONE, declarations).unwrap())
-        }
-    }
-
-    impl ReferenceAccessOperation for MemoryExtension {
-        type Transform = ArrayReferenceTransform;
-
-        fn base_input_count(&self) -> usize {
-            match self {
-                Self::Allocate(_) | Self::MisclassifiedAllocation | Self::Synchronous => 0,
-                Self::Update => 3,
-                Self::Commit | Self::Wait | Self::Release => 1,
-            }
-        }
-
-        fn reference_access_descriptor(
-            &self,
-            input_index: usize,
-        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
-            self.effects().accesses().any(|(index, _)| index == input_index).then(|| {
-                let count = self.base_input_count();
-                ReferenceAccessDescriptor::new(&[], count..count)
-            })
-        }
-
-        fn with_reference_access_transforms(
-            &self,
-            input_index: usize,
-            transforms: Vec<Self::Transform>,
-        ) -> Result<Self, ProgramError> {
-            if transforms.is_empty() && self.reference_access_descriptor(input_index).is_some() {
-                Ok(self.clone())
-            } else {
-                Err(ProgramError::UnsupportedOperation {
-                    message: "test extension has no reference transforms".to_owned(),
-                })
-            }
-        }
-    }
-
-    impl KernelExtension for MemoryExtension {
-        fn memory_semantics(&self) -> Result<KernelExtensionMemory, crate::programs::TypeError> {
-            Ok(match self {
-                Self::Allocate(_) => KernelExtensionMemory::Allocation { output_index: 0 },
-                Self::MisclassifiedAllocation | Self::Synchronous => KernelExtensionMemory::Synchronous,
-                Self::Update => KernelExtensionMemory::Asynchronous { completion_output_index: 0 },
-                Self::Commit => KernelExtensionMemory::Commit { completion_input_index: 0 },
-                Self::Wait => KernelExtensionMemory::Wait { completion_input_index: 0 },
-                Self::Release => KernelExtensionMemory::Release { input_index: 0 },
-            })
-        }
-    }
 
     #[test]
     fn test_validate_kernel_initialization_extension_async_update() {
@@ -1026,20 +914,20 @@ mod tests {
             Some("commit after wait"),
             Some("commit after release"),
         ] {
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<MemoryExtension>>::new();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
             let output = builder.add_input(call.parameters()[0].body_type());
             builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
             let r#type = ArrayType::new_static(DataType::I32, vec![1]);
             let source = builder
                 .add_instruction(
-                    KernelOperation::Extension(MemoryExtension::Allocate(r#type.clone())),
+                    KernelOperation::Extension(TestExtension::Allocate(r#type.clone())),
                     vec![],
                     vec![],
                     None,
                 )
                 .unwrap()[0];
             let destination = builder
-                .add_instruction(KernelOperation::Extension(MemoryExtension::Allocate(r#type)), vec![], vec![], None)
+                .add_instruction(KernelOperation::Extension(TestExtension::Allocate(r#type)), vec![], vec![], None)
                 .unwrap()[0];
             let value = builder.add_constant(ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::I32, vec![1]), &[3i32]).unwrap(),
@@ -1049,31 +937,31 @@ mod tests {
             }
             let token = builder
                 .add_instruction(
-                    KernelOperation::Extension(MemoryExtension::Update),
+                    KernelOperation::Extension(TestExtension::Update),
                     vec![],
                     vec![source, source, destination],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .add_instruction(KernelOperation::Extension(MemoryExtension::Commit), vec![], vec![token], None)
+                .add_instruction(KernelOperation::Extension(TestExtension::Commit), vec![], vec![token], None)
                 .unwrap();
             if conflict == Some("read") {
                 builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap();
             }
             if conflict == Some("release") {
                 builder
-                    .add_instruction(KernelOperation::Extension(MemoryExtension::Release), vec![], vec![source], None)
+                    .add_instruction(KernelOperation::Extension(TestExtension::Release), vec![], vec![source], None)
                     .unwrap();
             }
             let completion =
-                if conflict == Some("commit after release") { MemoryExtension::Release } else { MemoryExtension::Wait };
+                if conflict == Some("commit after release") { TestExtension::Release } else { TestExtension::Wait };
             builder.add_instruction(KernelOperation::Extension(completion), vec![], vec![token], None).unwrap();
             if matches!(conflict, Some("commit after wait" | "commit after release")) {
                 let consumer = if conflict == Some("commit after wait") { "test_wait" } else { "test_release" };
                 assert_eq!(
                     builder.add_instruction(
-                        KernelOperation::Extension(MemoryExtension::Commit),
+                        KernelOperation::Extension(TestExtension::Commit),
                         vec![],
                         vec![token],
                         None
@@ -1088,7 +976,7 @@ mod tests {
                 builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap()[0];
             builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], None).unwrap();
             builder
-                .add_instruction(KernelOperation::Extension(MemoryExtension::Release), vec![], vec![destination], None)
+                .add_instruction(KernelOperation::Extension(TestExtension::Release), vec![], vec![destination], None)
                 .unwrap();
             let body = builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -1121,10 +1009,9 @@ mod tests {
     #[test]
     fn test_validate_kernel_initialization_extension_classification() {
         let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
-        for (operation, valid) in
-            [(MemoryExtension::Synchronous, true), (MemoryExtension::MisclassifiedAllocation, false)]
+        for (operation, valid) in [(TestExtension::Synchronous, true), (TestExtension::MisclassifiedAllocation, false)]
         {
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<MemoryExtension>>::new();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
             builder.add_instruction(KernelOperation::Extension(operation), vec![], vec![], None).unwrap();
             let body =
                 builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![], vec![]).unwrap();

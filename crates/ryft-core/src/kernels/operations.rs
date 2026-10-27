@@ -847,16 +847,217 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionVariable};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, ScanOperation, TagOperation};
-    use crate::programs::{EmptyRegionDriver, ReferenceType};
+    use crate::macros::check_count;
+    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, ScanOperation, SubOperation, TagOperation};
+    use crate::programs::{AttachedRegions, EffectClasses, EmptyRegionDriver, ReferenceEffect, ReferenceType};
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    /// Kernel extension family shared by the kernel unit tests, so that they instantiate one extended operation family.
+    ///
+    /// Each variant reproduces one test fixture; the trait implementations dispatch per variant, and variants that
+    /// do not implement a contract fail with the same diagnostics as the corresponding [`KernelExtension`] defaults.
+    #[derive(Clone, Debug)]
+    pub(crate) enum TestExtension {
+        /// Subtracts its input from itself by binding a `sub` through its interpretation driver, as higher-order rules
+        /// that execute nested work on their own behalf do.
+        Rebinding,
+
+        /// Payload intentionally omitted from the diagnostic text, demonstrating conservative eligibility. Only an
+        /// `exact` extension provides a versioned semantic key over its payload.
+        HiddenKey { key: u32, exact: bool },
+
+        /// Creates one uninitialized local reference allocation with the given referent.
+        Allocate(ArrayType),
+
+        /// Allocates a reference while claiming synchronous memory semantics.
+        MisclassifiedAllocation,
+
+        /// Has no accesses and completes synchronously.
+        Synchronous,
+
+        /// Multi-source asynchronous update that reads two references, writes a third, and allocates a completion.
+        Update,
+
+        /// Observes a pending completion reference.
+        Commit,
+
+        /// Consumes a pending completion reference.
+        Wait,
+
+        /// Consumes a local allocation.
+        Release,
+    }
+
+    impl Operation for TestExtension {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Rebinding => "test_rebinding",
+                Self::HiddenKey { .. } => "hidden_key_extension",
+                Self::Allocate(_) => "test_allocate",
+                Self::MisclassifiedAllocation => "test_misclassified_allocation",
+                Self::Synchronous => "test_synchronous",
+                Self::Update => "test_async_update",
+                Self::Commit => "test_commit",
+                Self::Wait => "test_wait",
+                Self::Release => "test_release",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayIrType],
+            _region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            Ok(match self {
+                Self::Rebinding => {
+                    check_count!("input", input_types, 1, TypeError);
+                    input_types.to_vec()
+                }
+                Self::Allocate(referent) => vec![ArrayIrType::Reference(ReferenceType::new(referent.clone()))],
+                Self::Update => vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
+                Self::MisclassifiedAllocation => {
+                    vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)))]
+                }
+                Self::HiddenKey { .. } | Self::Synchronous | Self::Commit | Self::Wait | Self::Release => vec![],
+            })
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            let declarations = match self {
+                Self::Rebinding | Self::HiddenKey { .. } => return Cow::Borrowed(Effects::empty()),
+                Self::Allocate(_) | Self::MisclassifiedAllocation => {
+                    vec![ReferenceEffect::Allocate { output_index: 0 }]
+                }
+                Self::Synchronous => vec![],
+                Self::Update => vec![
+                    ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
+                    ReferenceEffect::Allocate { output_index: 0 },
+                ],
+                Self::Commit => vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                Self::Wait | Self::Release => {
+                    vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
+                }
+            };
+            Cow::Owned(Effects::new(EffectClasses::NONE, declarations).unwrap())
+        }
+    }
+
+    impl ReferenceAccessOperation for TestExtension {
+        type Transform = ArrayReferenceTransform;
+
+        fn base_input_count(&self) -> usize {
+            match self {
+                Self::Rebinding
+                | Self::HiddenKey { .. }
+                | Self::Allocate(_)
+                | Self::MisclassifiedAllocation
+                | Self::Synchronous => 0,
+                Self::Update => 3,
+                Self::Commit | Self::Wait | Self::Release => 1,
+            }
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+            match self {
+                Self::Rebinding | Self::HiddenKey { .. } => None,
+                _ => self.effects().accesses().any(|(index, _)| index == input_index).then(|| {
+                    let count = self.base_input_count();
+                    ReferenceAccessDescriptor::new(&[], count..count)
+                }),
+            }
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            input_index: usize,
+            transforms: Vec<ArrayReferenceTransform>,
+        ) -> Result<Self, ProgramError> {
+            match self {
+                Self::Rebinding => Err(ProgramError::UnsupportedOperation {
+                    message: "test extension has no reference accesses".to_owned(),
+                }),
+                Self::HiddenKey { .. } => Err(ProgramError::UnsupportedOperation {
+                    message: "hidden extension has no reference accesses".to_owned(),
+                }),
+                _ if transforms.is_empty() && self.reference_access_descriptor(input_index).is_some() => {
+                    Ok(self.clone())
+                }
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: "test extension has no reference transforms".to_owned(),
+                }),
+            }
+        }
+    }
+
+    impl KernelExtension for TestExtension {
+        fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+            Ok(match self {
+                Self::HiddenKey { .. } => {
+                    return Err(TypeError::invalid(format!(
+                        "kernel extension `{}` has no initialization contract",
+                        self.name(),
+                    )));
+                }
+                Self::Allocate(_) => KernelExtensionMemory::Allocation { output_index: 0 },
+                Self::Rebinding | Self::MisclassifiedAllocation | Self::Synchronous => {
+                    KernelExtensionMemory::Synchronous
+                }
+                Self::Update => KernelExtensionMemory::Asynchronous { completion_output_index: 0 },
+                Self::Commit => KernelExtensionMemory::Commit { completion_input_index: 0 },
+                Self::Wait => KernelExtensionMemory::Wait { completion_input_index: 0 },
+                Self::Release => KernelExtensionMemory::Release { input_index: 0 },
+            })
+        }
+
+        fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+            match self {
+                Self::HiddenKey { key: payload, exact: true } => {
+                    let mut key = b"test.hidden_key_extension\0v1\0".to_vec();
+                    key.extend_from_slice(&payload.to_le_bytes());
+                    Ok(key)
+                }
+                _ => Err(TypeError::invalid(format!(
+                    "kernel extension `{}` has no exact semantic identity contract",
+                    self.name(),
+                ))),
+            }
+        }
+    }
+
+    impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<TestExtension>>> for TestExtension {
+        fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<TestExtension>>>>(
+            &self,
+            context: &EagerContext<ArrayIrValue<Array>, KernelOperation<TestExtension>>,
+            driver: &D,
+            inputs: &[ArrayIrValue<Array>],
+        ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+            match self {
+                Self::Rebinding => {
+                    check_count!("input", inputs, 1, ProgramError);
+                    let operation =
+                        KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())));
+                    driver.bind(context, operation, AttachedRegions::Empty, &[inputs[0].clone(), inputs[0].clone()])
+                }
+                _ => {
+                    Err(ProgramError::MalformedProgram(format!("test extension `{}` has no interpreter", self.name())))
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_kernel_operation() {

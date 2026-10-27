@@ -2950,6 +2950,283 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_differentiation_dynamic_linearization() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        for (kind, expected_primal, expected_tangent) in
+            [(ReductionKind::Sum, 6.0, 15.0), (ReductionKind::Mean, 2.0, 5.0)]
+        {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(input_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.linearize().unwrap();
+
+            assert_eq!(linearization.residual_count(), 1);
+            assert_eq!(
+                program.to_string(),
+                format!(
+                    indoc! {"
+                        lambda %0:f64[extent] .
+                        let %1:f64[] = reduce [kind={kind}, axes=[0]] %0
+                        in (%1)
+                    "},
+                    kind = kind.name(),
+                )
+                .trim_end(),
+            );
+            assert_eq!(
+                linearization.primal().to_string(),
+                format!(
+                    indoc! {"
+                        lambda %0:f64[extent] .
+                        let %1:f64[] = reduce [kind={kind}, axes=[0]] %0
+                            %2:dimension<extent ∈ [0, 6)> = dimension_size [axis=0] %0
+                        in (%1, %2)
+                    "},
+                    kind = kind.name(),
+                )
+                .trim_end(),
+            );
+            assert_eq!(
+                linearization.tangent().to_string(),
+                (match kind {
+                    ReductionKind::Sum => indoc! {"
+                        lambda %0:f64[extent], %1:dimension<extent ∈ [0, 6)> .
+                        let %2:f64[] = linear_call [residual_count=1] %1 %0 [
+                            forward={
+                                lambda %0:dimension<extent ∈ [0, 6)>, %1:f64[extent] .
+                                let %2:f64[] = reduce [kind=sum, axes=[0]] %1
+                                in (%2)
+                            },
+                            transpose={
+                                lambda %0:dimension<extent ∈ [0, 6)>, %1:f64[] .
+                                let %2:f64[extent] = broadcast [output_axes=[]] %1 %0
+                                in (%2)
+                            },
+                        ]
+                        in (%2)
+                    "},
+                    ReductionKind::Mean => indoc! {"
+                        lambda %0:f64[extent], %1:dimension<extent ∈ [0, 6)> .
+                        let %2:f64[] = linear_call [residual_count=1] %1 %0 [
+                            forward={
+                                lambda %0:dimension<extent ∈ [0, 6)>, %1:f64[extent] .
+                                let %2:f64[] = reduce [kind=mean, axes=[0]] %1
+                                in (%2)
+                            },
+                            transpose={
+                                lambda %0:dimension<extent ∈ [0, 6)>, %1:f64[] .
+                                let %2:f64[extent] = broadcast [output_axes=[]] %1 %0
+                                    %3:i64[] = dimension_to_scalar %0
+                                    %4:f64[] = convert_element_type [data_type=f64] %3
+                                    %5:f64[extent] = div %2 %4
+                                in (%5)
+                            },
+                        ]
+                        in (%2)
+                    "},
+                    _ => unreachable!(),
+                })
+                .trim_end(),
+            );
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap())])
+                .unwrap();
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));
+            let residuals = primal_outputs.split_off(1);
+            let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![4.0f64, 5.0, 6.0]).unwrap())];
+            tangent_inputs.extend(residuals);
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent).unwrap())]),
+            );
+
+            // The same symbolic sum also admits an empty runtime axis.
+            if kind == ReductionKind::Sum {
+                assert_eq!(
+                    linearization.pullback().unwrap().program().to_string(),
+                    indoc! {"
+                        lambda %0:f64[], %1:dimension<extent ∈ [0, 6)> .
+                        let %2:f64[extent] = linear_call [residual_count=1] %1 %0 [
+                            forward={
+                                lambda %0:dimension<extent ∈ [0, 6)>, %1:f64[] .
+                                let %2:f64[extent] = broadcast [output_axes=[]] %1 %0
+                                in (%2)
+                            },
+                            transpose={
+                                lambda %0:dimension<extent ∈ [0, 6)>, %1:f64[extent] .
+                                let %2:f64[] = reduce [kind=sum, axes=[0]] %1
+                                in (%2)
+                            },
+                        ]
+                        in (%2)
+                    "}
+                    .trim_end(),
+                );
+                let mut primal_outputs = linearization
+                    .primal()
+                    .interpret(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())])
+                    .unwrap();
+                assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(0.0f64).unwrap()));
+                let residuals = primal_outputs.split_off(1);
+                let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())];
+                tangent_inputs.extend(residuals.clone());
+                assert_eq!(
+                    linearization.tangent().interpret(tangent_inputs),
+                    Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f64).unwrap())]),
+                );
+                let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(3.0f64).unwrap())];
+                pullback_inputs.extend(residuals);
+                assert_eq!(
+                    linearization.pullback().unwrap().program().interpret(pullback_inputs),
+                    Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_reduce_differentiation_dynamic_ties() {
+        for (kind, values, expected_primal, expected_tangent, expected_cotangent) in [
+            (ReductionKind::Max, vec![1.0, 5.0, 5.0, 2.0], 5.0, 25.0, vec![0.0, 4.0, 4.0, 0.0]),
+            (ReductionKind::Min, vec![1.0, 1.0, 5.0, 2.0], 1.0, 15.0, vec![4.0, 4.0, 0.0, 0.0]),
+        ] {
+            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(input_type.into());
+            let output = builder
+                .add_instruction(
+                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.linearize().unwrap();
+
+            assert_eq!(
+                program.to_string(),
+                format!(
+                    indoc! {"
+                        lambda %0:f64[extent] .
+                        let %1:f64[] = reduce [kind={kind}, axes=[0]] %0
+                        in (%1)
+                    "},
+                    kind = kind.name(),
+                )
+                .trim_end(),
+            );
+            assert_eq!(
+                linearization.primal().to_string(),
+                format!(
+                    indoc! {"
+                        lambda %0:f64[extent] .
+                        let %1:f64[] = reduce [kind={kind}, axes=[0]] %0
+                            %2:dimension<extent ∈ [1, 6)> = dimension_size [axis=0] %0
+                            %3:f64[extent] = broadcast [output_axes=[]] %1 %2
+                            %4:bool[extent] = compare [direction=Equal] %0 %3
+                            %5:f64[extent] = convert_element_type [data_type=f64] %4
+                            %6:f64[] = reduce [kind=sum, axes=[0]] %5
+                        in (%1, %2, %5, %6)
+                    "},
+                    kind = kind.name(),
+                )
+                .trim_end(),
+            );
+            assert_eq!(
+                linearization.tangent().to_string(),
+                indoc! {"
+                    lambda %0:f64[extent], %1:dimension<extent ∈ [1, 6)>, %2:f64[extent], %3:f64[] .
+                    let %4:f64[] = linear_call [residual_count=3] %1 %2 %3 %0 [
+                        forward={
+                            lambda %0:dimension<extent ∈ [1, 6)>, %1:f64[extent], %2:f64[], %3:f64[extent] .
+                            let %4:f64[extent] = mul %1 %3
+                                %5:f64[] = reduce [kind=sum, axes=[0]] %4
+                                %6:f64[] = div %5 %2
+                            in (%6)
+                        },
+                        transpose={
+                            lambda %0:dimension<extent ∈ [1, 6)>, %1:f64[extent], %2:f64[], %3:f64[] .
+                            let %4:f64[] = div %3 %2
+                                %5:f64[extent] = broadcast [output_axes=[]] %4 %0
+                                %6:f64[extent] = mul %1 %5
+                            in (%6)
+                        },
+                    ]
+                    in (%4)
+                "}
+                .trim_end(),
+            );
+            assert_eq!(
+                linearization.pullback().unwrap().program().to_string(),
+                indoc! {"
+                    lambda %0:f64[], %1:dimension<extent ∈ [1, 6)>, %2:f64[extent], %3:f64[] .
+                    let %4:f64[extent] = linear_call [residual_count=3] %1 %2 %3 %0 [
+                        forward={
+                            lambda %0:dimension<extent ∈ [1, 6)>, %1:f64[extent], %2:f64[], %3:f64[] .
+                            let %4:f64[] = div %3 %2
+                                %5:f64[extent] = broadcast [output_axes=[]] %4 %0
+                                %6:f64[extent] = mul %1 %5
+                            in (%6)
+                        },
+                        transpose={
+                            lambda %0:dimension<extent ∈ [1, 6)>, %1:f64[extent], %2:f64[], %3:f64[extent] .
+                            let %4:f64[extent] = mul %1 %3
+                                %5:f64[] = reduce [kind=sum, axes=[0]] %4
+                                %6:f64[] = div %5 %2
+                            in (%6)
+                        },
+                    ]
+                    in (%4)
+                "}
+                .trim_end(),
+            );
+
+            // Extrema retain the runtime extent, the extremum mask, and the tie count by which the tangent is divided.
+            assert_eq!(linearization.residual_count(), 3);
+            let mut primal_outputs =
+                linearization.primal().interpret(vec![ArrayIrValue::Array(Array::vector(values).unwrap())]).unwrap();
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));
+            let residuals = primal_outputs.split_off(1);
+            let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![10.0f64, 20.0, 30.0, 40.0]).unwrap())];
+            tangent_inputs.extend(residuals.clone());
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent).unwrap())]),
+            );
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(8.0f64).unwrap())];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                linearization.pullback().unwrap().program().interpret(pullback_inputs),
+                Ok(vec![ArrayIrValue::Array(Array::vector(expected_cotangent).unwrap())]),
+            );
+        }
+    }
+
+    #[test]
     fn test_reduce_differentiation_dynamic_reduced_axis_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding =
