@@ -11,12 +11,12 @@
 //!   - **Elementwise Selection:** [`Select`] chooses between two already-computed values according to a Boolean mask.
 //!     Input shapes broadcast and branch element types promote, so a scalar mask can select a whole array or a shaped
 //!     mask can select individual elements. This does not defer either input's computation.
-//!   - **Predicate-Controlled Loops:** [`WhileOperation`] repeatedly tests its condition region and applies its body to
-//!     loop-carried state while the predicate is true. [`While::r#while`](While::while) traces a condition and a body
-//!     over structured state in an explicit context; [`r#while()`](fn@while) recovers the context from state values. A
-//!     batched predicate masks the state updates per item, which predicate values implement through [`WhilePredicate`].
-//!     An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop by definition and
-//!     additionally permits reverse-mode differentiation through a masked tangent scan.
+//!   - **Predicate-Controlled Loops:** [`WhileOperation`] repeatedly tests its condition region and applies its body
+//!     to loop-carried state while the predicate is true. The `r#while` function of [`While`] traces a condition and
+//!     a body over structured state in an explicit context; [`r#while()`](fn@while) recovers the context from state
+//!     values. A batched predicate masks the state updates per item, which predicate values implement through
+//!     [`WhilePredicate`]. An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the
+//!     loop by definition and additionally permits reverse-mode differentiation through a masked tangent scan.
 //!   - **Shape-Determined Loops:** [`ScanOperation`] threads loop-carried state through a body while consuming slices
 //!     of stacked array inputs and producing stacked outputs. [`Scan::scan`] traces a body over structured state in an
 //!     explicit context; [`scan()`] recovers the context from input values. Its body also receives the slice index;

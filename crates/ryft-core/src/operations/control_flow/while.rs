@@ -1,6 +1,6 @@
 //! Loops over loop-carried state through [`WhileOperation`], which applies an attached body [`Region`](crate::Region)
 //! to the state while an attached condition [`Region`](crate::Region) over the same state produces a true predicate,
-//! and returns the final state. [`While::r#while`](While::while) traces a condition and a body over structured state
+//! and returns the final state. The `r#while` function of [`While`] traces a condition and a body over structured state
 //! using an explicit context. The global [`r#while()`](fn@while) function recovers that context from the state values.
 //! [`WhileOptions`] selects the iteration bound. Values that a loop uses as predicates implement [`WhilePredicate`],
 //! which decides whether the loop continues and masks state updates per item when the loop is interpreted.
@@ -602,9 +602,9 @@ impl<T: WhileType> WhileOperation<T> {
     /// (refer to the [Deferred Work](crate::Effects#deferred-work) section of [`Effects`](crate::Effects)) can be
     /// masked back out for the finished items the way values can. This mirrors JAX's `_while_loop_batching_rule`, which
     /// rejects IO effects once the predicate is batched.
-    fn validate_interfaces<'i>(
-        region_interfaces: &'i [RegionInterface<T>],
-    ) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
+    fn validate_interfaces(
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<(&RegionInterface<T>, &RegionInterface<T>), TypeError> {
         check_count!("region", region_interfaces, 2, TypeError);
         let condition_interface = &region_interfaces[0];
         let body_interface = &region_interfaces[1];
@@ -1761,8 +1761,8 @@ where
     }
 }
 
-/// Configuration of [`While::r#while`](While::while) and [`r#while()`](fn@while). By default, the loop has no iteration
-/// bound and runs for as long as its condition holds. No option carries a value, so, unlike
+/// Configuration of the `r#while` function of [`While`] and of [`r#while()`](fn@while). By default, the loop has no
+/// iteration bound and runs for as long as its condition holds. No option carries a value, so, unlike
 /// [`ScanOptions`](super::scan::ScanOptions), these options are not generic over a value type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhileOptions {
@@ -2008,9 +2008,9 @@ where
     }
 }
 
-/// Runs [`While::r#while`](While::while) in the execution domain recovered from the first value of the initial `state`.
-/// The condition can only compute its predicate from state values, so the state must contain at least one value
-/// alongside any static fields.
+/// Runs the `r#while` functions of [`While`] in the execution domain recovered from the first value of the initial
+/// `state`. The condition can only compute its predicate from state values, so the state must contain at least one
+/// value alongside any static fields.
 ///
 /// ```
 /// # use ryft_core::{Array, Compare, Context, ProgramError, WhileOptions, r#while};
@@ -2033,8 +2033,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::InvalidArgument`] when the state contains no value that supplies a domain, and the errors of
-/// [`While::r#while`](While::while).
+/// Returns [`ProgramError::InvalidArgument`] when the state contains no value that supplies a domain, and the errors
+/// of the `r#while` function of [`While`].
 #[inline]
 pub fn r#while<
     V: Value<Domain: While>,
@@ -2451,7 +2451,7 @@ where
         let counter_type: C::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
         let boolean_scalar_type: C::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
         let mask_stack_type: C::Type =
-            boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap().into();
+            boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into())?.into();
         let (extended_condition, augmented_body, stack_types) =
             build_bounded_while_programs(condition, &stacked_primal_program, stacked_residual_types.as_slice(), bound)?;
         let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -3217,7 +3217,7 @@ where
     let counter_type: V::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
     let boolean_scalar_type: V::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
     let mask_stack_type: V::Type =
-        boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap().into();
+        boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into())?.into();
     let storage_types = residual_types.iter().map(O::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
     let predicate_axes = predicate_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
     for storage_type in &storage_types {
@@ -7673,7 +7673,7 @@ mod tests {
         // other body output of that type would define its identity twice, and a static carry has a single value.
         let dimension_type = DimensionType::from(Dimension::Static(2));
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
-        let state_types = vec![ArrayIrType::Dimension(dimension_type.clone()), ArrayIrType::Array(vector_type)];
+        let state_types = [ArrayIrType::Dimension(dimension_type.clone()), ArrayIrType::Array(vector_type)];
         let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let condition_inputs =
             state_types.iter().map(|r#type| condition_builder.add_input(r#type.clone())).collect::<Vec<_>>();
@@ -9323,7 +9323,7 @@ mod tests {
         // evaluation (refer to the preceding test): only the counter stays known, and the known and residual programs
         // together compute the source outputs.
         let program = chained_carry_while_program(None);
-        let arguments = vec![
+        let arguments = [
             Array::scalar(3.0).unwrap(),
             Array::scalar(1.0).unwrap(),
             Array::scalar(1.0).unwrap(),
@@ -10161,7 +10161,7 @@ mod tests {
             let mut outputs = state.context().bind(
                 WhileOperation::new(),
                 countdown_while_regions(ArrayType::scalar(DataType::F64)),
-                &[state.clone()],
+                std::slice::from_ref(&state),
             )?;
             Ok(outputs.remove(0))
         };
@@ -10194,7 +10194,8 @@ mod tests {
         let (primal, tangent) = context
             .jvp(
                 move |x, ()| {
-                    let mut outputs = x.context().bind(while_operation, while_regions.clone(), &[x.clone()])?;
+                    let mut outputs =
+                        x.context().bind(while_operation, while_regions.clone(), std::slice::from_ref(&x))?;
                     Ok(outputs.remove(0))
                 },
                 Array::scalar(1.0).unwrap(),
@@ -10809,7 +10810,7 @@ mod tests {
             .value_and_gradient(move |x| {
                 let mut outputs = x
                     .context()
-                    .bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .bind(TestOperation::While(while_operation), while_regions.clone(), std::slice::from_ref(&x))
                     .unwrap();
                 outputs.remove(0)
             })
@@ -10889,7 +10890,10 @@ mod tests {
             |x| {
                 let state = bind_while(while_operation, while_regions.clone(), &[x])?.remove(0);
                 let sum = ReduceOperation::new(vec![0], ReductionKind::Sum);
-                state.domain().bind(sum, Vec::new(), &[state.clone()]).map(|mut outputs| outputs.remove(0))
+                state
+                    .domain()
+                    .bind(sum, Vec::new(), std::slice::from_ref(&state))
+                    .map(|mut outputs| outputs.remove(0))
             },
             at = Array::vector(vec![1.5, 2.0]).unwrap(),
             step = 1e-4,
@@ -10901,12 +10905,16 @@ mod tests {
                 Ok(differentiate_at(x).value_and_gradient(move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestOperation::While(while_operation), while_regions.clone(), std::slice::from_ref(&x))
                         .unwrap();
                     let state = outputs.remove(0);
                     let mut outputs = state
                         .context()
-                        .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[state.clone()])
+                        .bind(
+                            ReduceOperation::new(vec![0], ReductionKind::Sum),
+                            Vec::new(),
+                            std::slice::from_ref(&state),
+                        )
                         .unwrap();
                     outputs.remove(0)
                 })?)
@@ -10971,7 +10979,8 @@ mod tests {
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
         let (value, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(move |x| {
-                let mut outputs = x.context().bind(while_operation, while_regions.clone(), &[x.clone()]).unwrap();
+                let mut outputs =
+                    x.context().bind(while_operation, while_regions.clone(), std::slice::from_ref(&x)).unwrap();
                 outputs.remove(0)
             })
             .unwrap();
@@ -11086,7 +11095,10 @@ mod tests {
             |x| {
                 let state = bind_while(operation, regions.clone(), &[x])?.remove(0);
                 let sum = ReduceOperation::new(vec![0], ReductionKind::Sum);
-                state.domain().bind(sum, Vec::new(), &[state.clone()]).map(|mut outputs| outputs.remove(0))
+                state
+                    .domain()
+                    .bind(sum, Vec::new(), std::slice::from_ref(&state))
+                    .map(|mut outputs| outputs.remove(0))
             },
             at = Array::vector(vec![2.0, 2.0]).unwrap(),
             step = 1e-4,
@@ -11150,7 +11162,7 @@ mod tests {
             let regions = regions.clone();
             assert_eq!(
                 context.jvp(
-                    move |x, ()| Ok(x.context().bind(operation, regions.clone(), &[x.clone()])?.remove(0)),
+                    move |x, ()| Ok(x.context().bind(operation, regions.clone(), std::slice::from_ref(&x))?.remove(0)),
                     input.clone(),
                     Array::vector(vec![1.0, 1.0]).unwrap(),
                     (),
