@@ -1265,7 +1265,14 @@ mod tests {
 
         // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
         // result must consume the key extent captured at linearization time.
-        assert_eq!(pushforward.program().to_string(), indoc! {"__RENDER_zero_space_pushforward__"}.trim_end(),);
+        assert_eq!(
+            pushforward.program().to_string(),
+            indoc! {"
+                lambda  .
+                in ()
+            "}
+            .trim_end(),
+        );
         let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
         let program = context
@@ -1278,7 +1285,16 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        assert_eq!(program.to_string(), indoc! {"__RENDER_zero_space_pushforward_parent__"}.trim_end(),);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<extent ∈ [1, 8)>, %1:u64[extent], %3:zero[], %4:zero[extent] .
+                let %2:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %1
+                    %5:zero[extent] = zero [type=zero[extent]] %2
+                in (%5)
+            "}
+            .trim_end(),
+        );
         let zero_type = ArrayType::new_static(DataType::Zero, [2]);
         let zero = ArrayIrValue::Array(Array::from_logical_bytes(zero_type, &[]).unwrap());
         assert_eq!(
@@ -1306,7 +1322,14 @@ mod tests {
         // The compact pullback has no result slot for the key's zero differential space. The public result preserves
         // that zero without capturing its extent or constructing an array.
         let transposed = pullback.transposed_program(&[]).unwrap();
-        assert_eq!(transposed.program().to_string(), indoc! {"__RENDER_zero_space_pullback__"}.trim_end(),);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
         let cotangents = pullback.apply(cotangent).unwrap();
         assert!(pullback.residuals().is_empty());
         assert_eq!(cotangents[0], MaybeZero::Zero(ArrayIrType::Array(key_type.tangent().unwrap())));
@@ -1324,7 +1347,14 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        assert_eq!(program.to_string(), indoc! {"__RENDER_zero_space_pullback_parent__"}.trim_end(),);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:u64[extent], %1:f64[], %2:f64[] .
+                in (%2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             program.interpret(vec![
                 ArrayIrValue::Array(Array::vector(vec![1u64, 2]).unwrap()),
