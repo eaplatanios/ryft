@@ -4520,33 +4520,6 @@ mod tests {
         })
     }
 
-    /// Binds `operation` with the attached `body` to `inputs` in their domain and returns all of its outputs.
-    fn bind_scan<V: Value<Type = ArrayType>>(
-        operation: TestScanOperation,
-        body: TestProgram,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
-    {
-        inputs[0].domain().bind(TestOperation::Scan(operation), vec![body], inputs)
-    }
-
-    /// Applies the three-iteration cumulative-product scan to `initial` and `values` in their domain and
-    /// returns its final carry.
-    fn apply_product_scan<V: Value<Type = ArrayType>>(initial: V, values: V) -> Result<V, ProgramError>
-    where
-        V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
-    {
-        Ok(bind_scan(TestScanOperation::new(1, 3), product_body(), &[initial, values])?.remove(0))
-    }
-
-    /// Builds a three-carry shift body `[first, second, third, item] -> [second, third, item, first]`. Dependence on an
-    /// unknown third carry reaches the second carry after one fixed-point pass and the first carry after two.
-    fn shifting_carry_body() -> TestProgram {
-        scalar_body(4, |_, inputs| vec![inputs[2], inputs[3], inputs[4], inputs[1]])
-    }
-
     /// Builds a body for scan with no iterations tests that maps `[carry, x]` to `[carry, carry, 7]`: its first stacked
     /// result follows the carry's batch axis and its second stacked result is a replicated constant.
     fn zero_length_body(carry_type: ArrayType, slice_type: ArrayType) -> TestProgram {
@@ -5062,11 +5035,6 @@ mod tests {
                 .collect::<Vec<_>>())
         })?;
         Ok((outputs, pushforward.program().clone()))
-    }
-
-    /// Two devices whose different local values must be tracked by manual variation.
-    fn manual_mesh() -> LogicalMesh {
-        LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap()
     }
 
     #[test]
@@ -10341,7 +10309,10 @@ mod tests {
             TestScanOperation::new(1, 3).with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]);
         let initial = Array::from_elements::<f64>(carry_type, &[1.0]).unwrap();
         let values = Array::from_elements::<f64>(stack_type, &[2.0, 3.0, 4.0]).unwrap();
-        let outputs = bind_scan(operation, product_body(), &[initial, values]).unwrap();
+        let outputs = initial
+            .domain()
+            .bind(TestOperation::Scan(operation), vec![product_body()], &[initial, values])
+            .unwrap();
         let placed_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
@@ -10366,7 +10337,7 @@ mod tests {
         let initial = Array::from_elements::<f64>(scalar_type.clone(), &[1.0]).unwrap();
         let stack_type = scalar_type.with_inserted_dimension(0, Dimension::Static(3)).unwrap();
         let values = Array::from_elements::<f64>(stack_type, &[2.0, 3.0, 4.0]).unwrap();
-        let outputs = bind_scan(operation, body, &[initial, values]).unwrap();
+        let outputs = initial.domain().bind(TestOperation::Scan(operation), vec![body], &[initial, values]).unwrap();
         let placed_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["e"])]).unwrap())
             .unwrap();
@@ -10431,7 +10402,7 @@ mod tests {
             builder.build(vec![product, product], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap()
         };
         assert_eq!(
-            bind_scan(operation, body, &[initial, values]),
+            initial.domain().bind(TestOperation::Scan(operation), vec![body], &[initial, values]),
             Err(TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output 1 over the manual mesh axes \
                  `m` for slices that do not vary over them",
@@ -12361,7 +12332,7 @@ mod tests {
         let stacked_type = ArrayType::new_static(DataType::F64, [4]);
         let program = scan_program(
             TestScanOperation::new(3, 4),
-            shifting_carry_body(),
+            scalar_body(4, |_, inputs| vec![inputs[2], inputs[3], inputs[4], inputs[1]]),
             vec![scalar_type.clone(), scalar_type.clone(), scalar_type.clone(), stacked_type.clone()],
         );
         let evaluation = program
@@ -14735,7 +14706,7 @@ mod tests {
         // fixed point must propagate through all three carries before the stabilized body is staged.
         let program = scan_program(
             TestScanOperation::new(3, 3),
-            shifting_carry_body(),
+            scalar_body(4, |_, inputs| vec![inputs[2], inputs[3], inputs[4], inputs[1]]),
             vec![
                 ArrayType::scalar(DataType::F64),
                 ArrayType::scalar(DataType::F64),
@@ -16197,7 +16168,11 @@ mod tests {
         where
             V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
         {
-            let mut outputs = bind_scan(TestScanOperation::new(1, 3), product_body(), &[initial, values])?;
+            let mut outputs = initial.domain().bind(
+                TestOperation::Scan(TestScanOperation::new(1, 3)),
+                vec![product_body()],
+                &[initial, values],
+            )?;
             let stacked = outputs.remove(1);
             Ok((outputs.remove(0), stacked))
         }
@@ -16222,7 +16197,12 @@ mod tests {
             Ok((Array::scalar(24.0).unwrap(), Array::vector(vec![2.0, 6.0, 24.0]).unwrap())),
         );
         let (final_carry, pullback) = differentiate_at(primals)
-            .vjp(|(initial, values): (TestTracer, TestTracer)| apply_product_scan(initial, values))
+            .vjp(|(initial, values): (TestTracer, TestTracer)| {
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![product_body()], &[initial, values])?
+                    .remove(0))
+            })
             .unwrap();
         assert_eq!(final_carry, Array::scalar(24.0).unwrap());
         assert_eq!(
@@ -16237,7 +16217,10 @@ mod tests {
         check_gradient!(
             |values| {
                 let initial = values.domain().lift(Array::scalar(1f64).unwrap())?;
-                apply_product_scan(initial, values)
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![product_body()], &[initial, values])?
+                    .remove(0))
             },
             at = Array::vector(vec![2f64, 3.0, 4.0]).unwrap(),
             step = 1e-6,
@@ -17076,7 +17059,11 @@ mod tests {
         // `i` of every stacked value stays paired with iteration `i`. With reverse visit order, the carry runs
         // `2 · 5 = 10 → 10 · 4 = 40 → 40 · 3 = 120`, with `y_i` still paired with `x_i`.
         let function = |(carry, values): (TestTracer, TestTracer)| {
-            let outputs = bind_scan(TestScanOperation::new(1, 3).with_reverse(true), product_body(), &[carry, values])?;
+            let outputs = carry.domain().bind(
+                TestOperation::Scan(TestScanOperation::new(1, 3).with_reverse(true)),
+                vec![product_body()],
+                &[carry, values],
+            )?;
             Ok((outputs[0].clone(), outputs[1].clone()))
         };
         let primals = (Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0, 5.0]).unwrap());
@@ -17109,7 +17096,13 @@ mod tests {
         // `∂(2 · 3 · 4 · 5)/∂carry = 60` and `∂/∂x = [40, 30, 24]`.
         let (final_carry, pullback) = differentiate_at(primals)
             .vjp(|(carry, values): (TestTracer, TestTracer)| {
-                Ok(bind_scan(TestScanOperation::new(1, 3).with_reverse(true), product_body(), &[carry, values])?
+                Ok(carry
+                    .domain()
+                    .bind(
+                        TestOperation::Scan(TestScanOperation::new(1, 3).with_reverse(true)),
+                        vec![product_body()],
+                        &[carry, values],
+                    )?
                     .remove(0))
             })
             .unwrap();
@@ -17359,7 +17352,10 @@ mod tests {
         );
         let (final_carry, pullback) = differentiate_at((Array::scalar(2.0).unwrap(), empty.clone()))
             .vjp(|(initial, values): (TestTracer, TestTracer)| {
-                Ok(bind_scan(TestScanOperation::new(1, 0), product_body(), &[initial, values])?.remove(0))
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 0)), vec![product_body()], &[initial, values])?
+                    .remove(0))
             })
             .unwrap();
         assert_eq!(final_carry, Array::scalar(2.0).unwrap());
@@ -18393,7 +18389,14 @@ mod tests {
             Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
         ))
         .vjp(|(accumulator, scale, values): (TestTracer, TestTracer, TestTracer)| {
-            Ok(bind_scan(TestScanOperation::new(2, 3), body.clone(), &[accumulator, scale, values])?.remove(0))
+            Ok(accumulator
+                .domain()
+                .bind(
+                    TestOperation::Scan(TestScanOperation::new(2, 3)),
+                    vec![body.clone()],
+                    &[accumulator, scale, values],
+                )?
+                .remove(0))
         })
         .unwrap();
         assert_eq!(output, Array::scalar(25.0).unwrap());
@@ -18412,8 +18415,11 @@ mod tests {
         check_gradient!(
             |scale, values| {
                 let accumulator = scale.domain().lift(Array::scalar(1f64).unwrap())?;
-                let outputs =
-                    bind_scan(TestScanOperation::new(2, 3), scale_body.clone(), &[accumulator, scale, values])?;
+                let outputs = accumulator.domain().bind(
+                    TestOperation::Scan(TestScanOperation::new(2, 3)),
+                    vec![scale_body.clone()],
+                    &[accumulator, scale, values],
+                )?;
                 Ok::<_, ProgramError>(outputs[0].clone())
             },
             at = Array::scalar(2f64).unwrap(),
@@ -18424,7 +18430,11 @@ mod tests {
         check_gradient!(
             |values, scale| {
                 let accumulator = values.domain().lift(Array::scalar(1f64).unwrap())?;
-                let outputs = bind_scan(TestScanOperation::new(2, 3), body.clone(), &[accumulator, scale, values])?;
+                let outputs = accumulator.domain().bind(
+                    TestOperation::Scan(TestScanOperation::new(2, 3)),
+                    vec![body.clone()],
+                    &[accumulator, scale, values],
+                )?;
                 Ok::<_, ProgramError>(outputs[0].clone())
             },
             at = Array::vector(vec![1f64, 2.0, 3.0]).unwrap(),
@@ -18548,7 +18558,11 @@ mod tests {
             |scale, values| {
                 let accumulator = scale.domain().lift(Array::scalar(1f64).unwrap())?;
                 let reverse = TestScanOperation::new(2, 3).with_reverse(true);
-                let outputs = bind_scan(reverse, scale_body.clone(), &[accumulator, scale, values])?;
+                let outputs = accumulator.domain().bind(
+                    TestOperation::Scan(reverse),
+                    vec![scale_body.clone()],
+                    &[accumulator, scale, values],
+                )?;
                 Ok::<_, ProgramError>(outputs[0].clone())
             },
             at = scalar(2.0),
@@ -18560,7 +18574,11 @@ mod tests {
             |values, scale| {
                 let accumulator = values.domain().lift(Array::scalar(1f64).unwrap())?;
                 let reverse = TestScanOperation::new(2, 3).with_reverse(true);
-                let outputs = bind_scan(reverse, body.clone(), &[accumulator, scale, values])?;
+                let outputs = accumulator.domain().bind(
+                    TestOperation::Scan(reverse),
+                    vec![body.clone()],
+                    &[accumulator, scale, values],
+                )?;
                 Ok::<_, ProgramError>(outputs[0].clone())
             },
             at = vector([1.0, 2.0, 3.0]),
@@ -18584,7 +18602,12 @@ mod tests {
         });
         let e = std::f64::consts::E;
         let (output, pullback) = differentiate_at(Array::scalar(0.0f64).unwrap())
-            .vjp(|initial: TestTracer| Ok(bind_scan(TestScanOperation::new(1, 3), body.clone(), &[initial])?.remove(0)))
+            .vjp(|initial: TestTracer| {
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![body.clone()], &[initial])?
+                    .remove(0))
+            })
             .unwrap();
         assert_eq!(
             pullback.linear_program().to_string(),
@@ -18622,7 +18645,11 @@ mod tests {
         // instead of reusing the initial carry.
         check_gradient!(
             |initial| {
-                let outputs = bind_scan(TestScanOperation::new(1, 3), body.clone(), &[initial])?;
+                let outputs = initial.domain().bind(
+                    TestOperation::Scan(TestScanOperation::new(1, 3)),
+                    vec![body.clone()],
+                    &[initial],
+                )?;
                 Ok::<_, ProgramError>(outputs[0].clone())
             },
             at = Array::scalar(0f64).unwrap(),
@@ -18935,7 +18962,11 @@ mod tests {
             Array::vector(vec![2.0, 3.0, 4.0]).unwrap(),
         ))
         .vjp(|(accumulator, key, values): (TestTracer, TestTracer, TestTracer)| {
-            let mut outputs = bind_scan(TestScanOperation::new(2, 3), body, &[accumulator, key, values])?;
+            let mut outputs = accumulator.domain().bind(
+                TestOperation::Scan(TestScanOperation::new(2, 3)),
+                vec![body],
+                &[accumulator, key, values],
+            )?;
             let stacked = outputs.remove(2);
             Ok((outputs.remove(0), stacked))
         })
@@ -19102,7 +19133,7 @@ mod tests {
             .jvp(
                 (Array::scalar(1.0).unwrap(), Array::from_elements::<f64>(values_type, &[0.0; 8]).unwrap()),
                 |(initial, values)| {
-                    let outputs = bind_scan(scan, body, &[initial, values])?;
+                    let outputs = initial.domain().bind(TestOperation::Scan(scan), vec![body], &[initial, values])?;
                     Ok((outputs[0].clone(), outputs[1].clone()))
                 },
             ),
@@ -19120,7 +19151,10 @@ mod tests {
                 .unwrap();
         let (final_carry, pullback) = differentiate_at((Array::scalar(1.0).unwrap(), values.clone()))
             .vjp(|(initial, values): (TestTracer, TestTracer)| {
-                Ok(bind_scan(scan.clone(), body.clone(), &[initial, values])?.remove(0))
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(scan.clone()), vec![body.clone()], &[initial, values])?
+                    .remove(0))
             })
             .unwrap();
         assert_eq!(
@@ -19184,7 +19218,12 @@ mod tests {
         check_gradient!(
             |values| {
                 let initial = values.domain().lift(Array::scalar(1f64).unwrap())?;
-                Ok::<_, ProgramError>(bind_scan(scan.clone(), body.clone(), &[initial, values])?.remove(0))
+                Ok::<_, ProgramError>(
+                    initial
+                        .domain()
+                        .bind(TestOperation::Scan(scan.clone()), vec![body.clone()], &[initial, values])?
+                        .remove(0),
+                )
             },
             at = values,
             step = 1e-3,
@@ -19200,10 +19239,20 @@ mod tests {
         // `initial` times the remaining value.
         let primals = (Array::scalar(1.0).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]).unwrap());
         let forward = differentiate_at(primals.clone())
-            .jacobian_forward(|(initial, values)| apply_product_scan(initial, values))
+            .jacobian_forward(|(initial, values)| {
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![product_body()], &[initial, values])?
+                    .remove(0))
+            })
             .unwrap();
         let reverse = differentiate_at(primals.clone())
-            .jacobian_reverse(|(initial, values)| apply_product_scan(initial, values))
+            .jacobian_reverse(|(initial, values)| {
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![product_body()], &[initial, values])?
+                    .remove(0))
+            })
             .unwrap();
         for jacobian in [forward, reverse] {
             assert_eq!(
@@ -19211,8 +19260,14 @@ mod tests {
                 vec![Array::scalar(24.0).unwrap(), Array::vector(vec![12.0, 8.0, 6.0]).unwrap()],
             );
         }
-        let hessian =
-            differentiate_at(primals).hessian(|(initial, values)| apply_product_scan(initial, values)).unwrap();
+        let hessian = differentiate_at(primals)
+            .hessian(|(initial, values)| {
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![product_body()], &[initial, values])?
+                    .remove(0))
+            })
+            .unwrap();
         assert_eq!(
             hessian.iter_blocks().map(|block| block.value().to_f64s()).collect::<Vec<_>>(),
             vec![
@@ -19721,7 +19776,10 @@ mod tests {
                             .unwrap()[0];
                         vec![next]
                     });
-                    Ok(bind_scan(TestScanOperation::new(1, 3), body, &[initial, dead, live])?.remove(0))
+                    Ok(initial
+                        .domain()
+                        .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![body], &[initial, dead, live])?
+                        .remove(0))
                 })
                 .unwrap();
         assert_eq!(
@@ -19745,7 +19803,14 @@ mod tests {
                                 .unwrap()[0];
                             vec![next, inputs[2]]
                         });
-                        Ok(bind_scan(TestScanOperation::new(2, 3), body, &[initial, live, dead])?.remove(0))
+                        Ok(initial
+                            .domain()
+                            .bind(
+                                TestOperation::Scan(TestScanOperation::new(2, 3)),
+                                vec![body],
+                                &[initial, live, dead],
+                            )?
+                            .remove(0))
                     })?;
                     Ok(live_gradient)
                 })
@@ -19914,7 +19979,7 @@ mod tests {
         .linearize(|inputs: Vec<TestTracer>| {
             inputs[0].context().bind(
                 ArrayOperation::Scan(ScanOperation::new(3, 4)),
-                vec![shifting_carry_body()],
+                vec![scalar_body(4, |_, inputs| vec![inputs[2], inputs[3], inputs[4], inputs[1]])],
                 &inputs,
             )
         })
@@ -20412,7 +20477,12 @@ mod tests {
         let initial = Array::from_elements::<f64>(carry_type.clone(), &[1.0]).unwrap();
         let values = Array::from_elements::<f64>(stack_type.clone(), &[2.0, 3.0, 4.0]).unwrap();
         let (output, pullback) = differentiate_at((initial, values))
-            .vjp(|(initial, values)| apply_product_scan(initial, values))
+            .vjp(|(initial, values)| {
+                Ok(initial
+                    .domain()
+                    .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![product_body()], &[initial, values])?
+                    .remove(0))
+            })
             .unwrap();
         assert_eq!(
             pullback.linear_program().to_string(),
@@ -20646,7 +20716,12 @@ mod tests {
             let values = Array::from_elements::<f64>(stack_type.clone(), &[2.0, 3.0, 4.0]).unwrap();
             let operation = operation.clone();
             let (output, pullback) = differentiate_at((initial.clone(), values))
-                .vjp(|(initial, values)| Ok(bind_scan(operation, product_body(), &[initial, values])?.remove(0)))
+                .vjp(|(initial, values)| {
+                    Ok(initial
+                        .domain()
+                        .bind(TestOperation::Scan(operation), vec![product_body()], &[initial, values])?
+                        .remove(0))
+                })
                 .unwrap();
             assert_eq!(output.to_f64s(), vec![24.0]);
             let transposed = pullback.transposed_program(&[]).unwrap();
@@ -21022,7 +21097,10 @@ mod tests {
                             .unwrap()[0];
                         vec![next]
                     });
-                    Ok(bind_scan(TestScanOperation::new(1, 3), body, &[initial, dead, live])?.remove(0))
+                    Ok(initial
+                        .domain()
+                        .bind(TestOperation::Scan(TestScanOperation::new(1, 3)), vec![body], &[initial, dead, live])?
+                        .remove(0))
                 })?;
                 let (carry_cotangent, dead_cotangent, live_cotangent) = pullback.apply(seed)?;
                 assert!(matches!(
@@ -21514,7 +21592,7 @@ mod tests {
         // the reversed body needs their carry cotangents to propagate gradients through all three iterations.
         let program = scan_program(
             TestScanOperation::new(3, 3),
-            shifting_carry_body(),
+            scalar_body(4, |_, inputs| vec![inputs[2], inputs[3], inputs[4], inputs[1]]),
             vec![
                 ArrayType::scalar(DataType::F64),
                 ArrayType::scalar(DataType::F64),
@@ -23457,7 +23535,7 @@ mod tests {
 
     #[test]
     fn test_scan_scan_propagates_manual_variation_across_carries() {
-        let mesh = manual_mesh();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"])]).unwrap();
         let invariant_type = ArrayType::new_static(DataType::F32, [1]).with_sharding(replicated.clone()).unwrap();
@@ -23541,7 +23619,7 @@ mod tests {
 
     #[test]
     fn test_scan_scan_transposes_entry_variation_outside_the_loop() {
-        let mesh = manual_mesh();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"])]).unwrap();
         let stacked_sharding =
@@ -23700,7 +23778,11 @@ mod tests {
 
         impl NamedAxes for RecordingContext {
             fn named_axis(&self, name: &str) -> Option<NamedAxis> {
-                (name == "m").then(|| NamedAxis::Mesh { axis: 0, size: 2, mesh: manual_mesh() })
+                (name == "m").then(|| NamedAxis::Mesh {
+                    axis: 0,
+                    size: 2,
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                })
             }
 
             fn named_axes(&self) -> Vec<(String, NamedAxis)> {
@@ -23708,7 +23790,7 @@ mod tests {
             }
         }
 
-        let mesh = manual_mesh();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant_type =
             ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let varying_type = ArrayType::scalar(DataType::F32)
