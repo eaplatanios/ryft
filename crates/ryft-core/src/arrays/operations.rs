@@ -301,10 +301,10 @@ impl<
 // TODO(eaplatanios): Review from here onwards.
 
 /// [`Operation`] family for Ryft's array Intermediate Representation (IR), whose values include arrays, first-class
-/// dimensions, and array references. Homogeneous operations project their complete boundary into [`ArrayOperation`] or
-/// [`DimensionOperation`], delegate to that family's rule, and lift the result types back into [`ArrayIrType`]. Mixed
-/// signatures need explicit variants. For example, [`DimensionSizeOperation`] consumes an array and produces a
-/// dimension. Reference operations also stay family-native so that their array/reference boundaries,
+/// dimensions, and array references. Homogeneous operations project their complete boundary into [`ArrayOperation`]
+/// or [`DimensionOperation`], delegate to that family's rule, and lift the result types back into [`ArrayIrType`].
+/// Mixed signatures need explicit variants. For example, [`DimensionSizeOperation`] consumes an array and produces
+/// a dimension. Reference operations also stay family-native so that their array/reference boundaries,
 /// [`ArrayReferenceTransform`] access paths, and ordered effects remain visible to program passes.
 ///
 /// Mixed array constructors and shape-changing operations receive runtime extents as explicit first-class dimension
@@ -398,7 +398,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Compares two dimensions, producing a rank-zero Boolean array: `(Dimension, Dimension) -> Array(Boolean scalar)`.
     /// This crossing cannot belong to the homogeneous [`DimensionOperation`] family. Array comparisons use
-    /// [`ArrayOperation::Compare`] through [`Array`](Self::Array); array-dimension and dimension-array pairs are rejected.
+    /// [`ArrayOperation::Compare`] through [`Array`](Self::Array) while array-dimension and dimension-array
+    /// pairs are rejected.
     Compare(CompareOperation<ArrayIrType>),
 
     /// Reshapes using one first-class dimension input per output axis.
@@ -416,8 +417,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Slices using first-class dimension inputs for starts and output sizes.
     DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
-    /// Manual SPMD computation whose array IR body runs once per device coordinate along its active manual axes.
-    /// Refer to [`ShardMapOperation`] for array/reference boundaries and first-class dimensions inside the body.
+    /// Manual Single Program Multiple Data (SPMD) computation whose array IR body runs once per device coordinate along
+    /// its active manual axes. Refer to [`ShardMapOperation`] for array/reference boundaries and first-class dimensions
+    /// inside the body.
     ShardMap(ShardMapOperation),
 
     /// Branches between array IR regions.
@@ -426,8 +428,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Loops over array IR condition and body regions.
     While(WhileOperation<ArrayIrType>),
 
-    /// Scans an array IR body, including first-class dimension carries, dynamic trip counts, reference carries, and
-    /// reference stacks; refer to [`ScanOperation`].
+    /// Scans an array IR body, including first-class dimension carries, dynamic trip counts, reference carries,
+    /// and reference stacks.
     Scan(ScanOperation<ArrayIrType>),
 
     /// Rematerialized call with an array IR body.
@@ -456,8 +458,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are rejected.
     Composite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Reverse-mode carrier of [`Composite`](Self::Composite), replaced by the call's backward rule during
-    /// transposition.
+    /// Reverse mode differentiation carrier of [`Composite`](Self::Composite), replaced by the call's backward rule
+    /// during transposition.
     CompositeTranspose(CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
     /// Composite call promoted from [`ArrayOperation`] with retained member-registered rules. [`LiftedCustomRules`]
@@ -465,8 +467,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// [`Composite`](Self::Composite).
     LiftedComposite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>),
 
-    /// Reverse-mode carrier of [`LiftedComposite`](Self::LiftedComposite), whose backward rule is specialized by its
-    /// member definition and converted into this family.
+    /// Reverse mode differentiation carrier of [`LiftedComposite`](Self::LiftedComposite), whose backward rule is
+    /// specialized by its member definition and converted into this family.
     LiftedCompositeTranspose(
         CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
