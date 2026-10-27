@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, NoKernelExtension, VerifiedKernel};
+use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, NoKernelExtension, VerifiedKernel};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 

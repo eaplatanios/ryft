@@ -49,7 +49,7 @@ kernel work changes the support matrix.
 
 | Existing owner | Useful foundation | Boundary |
 |---|---|---|
-| [Core kernels](crates/ryft-core/src/kernels/mod.rs) | `#[kernel]`, canonical Ryft programs, typed tiles and references, bounded control flow, interpretation, verification, scheduling and compilation contracts. | `VerifiedKernel` validates its supported model; it does not certify arbitrary device code or an unmodeled global scheduler. |
+| [Portable kernels](crates/ryft-kernels/src/lib.rs) | `#[kernel]`, canonical Ryft programs, typed tiles and references, bounded control flow, interpretation, verification, scheduling and compilation contracts. | `VerifiedKernel` validates its supported model; it does not certify arbitrary device code or an unmodeled global scheduler. |
 | [XLA kernel integration](crates/ryft-xla/src/kernels/mod.rs) | Embedding compiled kernels as custom calls, executable caching, AOT, and completion ownership. | The compiled region is opaque to general XLA optimization; alias/effect declarations must describe all external accesses. |
 | [Mosaic GPU](crates/ryft-mosaic/src/kernels/gpu/mod.rs) | CTA-local and two-CTA cluster execution, TMA/WGMMA/TMEM capabilities, resource checks, and synchronization simulation. | Local/cluster synchronization does not establish arbitrary cross-SM task scheduling. |
 | [Triton adapter](crates/ryft-triton/src/kernels/mod.rs) | Typed compilation of an admitted portable kernel subset. | Current admission is restricted; upstream Triton capabilities do not establish adapter support for persistent state, barriers, atomics, or scratch. |

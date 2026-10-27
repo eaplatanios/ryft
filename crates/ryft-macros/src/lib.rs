@@ -88,6 +88,27 @@ pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// callable and a same-name module exposing `definition`. Bounded range loops and value-dependent conditionals stage
 /// canonical control-flow regions.
 /// Unbounded control flow and arbitrary host calls are rejected instead of executing as host Rust.
+///
+/// # Kernel namespace
+///
+/// The generated code names the kernel API through a single namespace path and reaches `ryft-core` items through that
+/// namespace's hidden `__private::core` macro-support re-export. Like the derive macros' `ryft` default, the namespace
+/// defaults to the `ryft` facade path `ryft::kernels`, so callers that depend on the facade pass nothing. Callers that
+/// reach `ryft-kernels` through another path pass that path as `crate = "path"`:
+///
+/// ```rust,ignore
+/// #[ryft::kernels::kernel]                                           // `ryft` facade (default namespace).
+/// #[ryft::kernel]                                                    // `ryft` facade's top-level re-export.
+/// #[ryft_kernels::kernel(crate = "ryft_kernels")]                    // Direct `ryft-kernels` dependency.
+/// #[kernels_alias::kernel(crate = "kernels_alias")]                  // Renamed `ryft-kernels` dependency.
+/// #[facade_alias::kernels::kernel(crate = "facade_alias::kernels")]  // Renamed `ryft` facade dependency.
+/// ```
+///
+/// The macro cannot infer the namespace from the attribute path because a re-exported procedural attribute cannot see
+/// the path through which it was invoked. The path always names the kernel namespace; a stale override that names the
+/// core crate (e.g., `crate = "ryft_core"`) is not diagnosed by the macro and instead fails with unresolved-path errors
+/// inside the generated code (the first one being that `__private` cannot be found in `ryft_core`). The attribute
+/// also accepts `requires = expression`, a shape requirement over the input annotations that `definition` validates.
 #[proc_macro_attribute]
 pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
     kernels::expand(attributes.into(), input.into())

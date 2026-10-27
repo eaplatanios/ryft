@@ -373,11 +373,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::kernels::{
+    use ryft_core::{ArrayIrOperation, ArrayOperation, Context as CoreContext, ReferenceRead, ReferenceWrite};
+    use ryft_kernels::{
         Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, KernelSchedule, VerifiedKernel,
         whole_array_parameter,
     };
-    use ryft_core::{ArrayIrOperation, ArrayOperation, Context as CoreContext, ReferenceRead, ReferenceWrite};
     use ryft_mlir::{Context, Operation, Value, WalkOrder, WalkResult};
 
     use crate::kernels::gpu::{Compiler, Mma, Options, Target};

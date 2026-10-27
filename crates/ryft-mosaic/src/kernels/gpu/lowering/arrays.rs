@@ -614,13 +614,13 @@ fn unsupported(operation: &ArrayOperation<Array>, reason: &str) -> Error {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::kernels::{
-        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, KernelSchedule, VerifiedKernel,
-        whole_array_parameter,
-    };
     use ryft_core::{
         AddOperation, ArrayIrOperation, Context, ConvertElementTypeOperation, DotDimensionNumbers, DotOperation,
         ExpOperation, ReduceOperation, ReferenceRead, ReferenceWrite, SaturatingSubOperation,
+    };
+    use ryft_kernels::{
+        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, KernelSchedule, VerifiedKernel,
+        whole_array_parameter,
     };
     use ryft_mlir::{Context as MlirContext, Operation as MlirOperation, WalkOrder, WalkResult};
 

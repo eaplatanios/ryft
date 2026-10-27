@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
-use ryft_core::kernels::KernelReferenceOperation;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayIrOperation, ArrayIrType,
@@ -32,6 +31,7 @@ use ryft_core::{
     TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch,
     ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
+use ryft_kernels::KernelReferenceOperation;
 use ryft_macros::Parameter;
 
 use crate::kernels::XlaKernelOperation;

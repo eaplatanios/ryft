@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ryft_core::kernels::{
-    KERNEL_CALL_OPERATION_NAME, KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel,
-};
 use ryft_core::{EffectClass, Typed};
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
+};
+use ryft_kernels::{
+    KERNEL_CALL_OPERATION_NAME, KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel,
 };
 use ryft_mlir::{Context, StringRef};
 use ryft_rocm::{RocmKernelArtifact, RocmKernelLaunchDimensions};
@@ -541,8 +541,8 @@ fn validate_ptx(source: &str, target: &Target, metadata: &Metadata) -> Result<St
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{KernelCallOperation, KernelDefinition};
     use ryft_core::{ArrayType, DataType};
+    use ryft_kernels::{KernelCallOperation, KernelDefinition};
 
     use super::*;
 
@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// A portable definition used to exercise the native compilation without changing its portable semantics.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -574,7 +574,7 @@ mod tests {
     }
 
     /// Bounded index conversion preserves its ordered assertion even before native lowering.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn matrix(
         #[input(data_type = F32, rank = 2)] left: &Array,
         #[input(data_type = F32, rank = 2)] right: &Array,

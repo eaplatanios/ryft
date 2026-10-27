@@ -52,7 +52,7 @@ as ordinary in-process XLA compilation has no such isolation. Unsupported portab
 compilation, and native failures retain bounded diagnostics.
 
 ```rust,ignore
-use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
+use ryft_kernels::{KernelSchedule, VerifiedKernel};
 use ryft_triton::kernels::{Compiler, Options, Target};
 
 let compiler = Compiler::new();
@@ -65,7 +65,7 @@ let compiled = verified.compile(&compiler, &target, &options, &schedule)?;
 
 For XLA, enable the `triton` feature and pass these choices with `TritonEmbedding` to
 `XlaKernelCompilerBinding::new`, then select the binding through `XlaOptions::with_kernel_compiler`. The root `ryft`
-crate forwards this feature. Compiler and target selection are explicit. `ryft_core::kernels` has no Triton or AMD
+crate forwards this feature. Compiler and target selection are explicit. `ryft_kernels` has no Triton or AMD
 operation family, and the macro-authored portable definition is unchanged.
 
 ## Persistence and deployment

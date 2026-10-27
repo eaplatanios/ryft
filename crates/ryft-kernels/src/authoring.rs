@@ -3,25 +3,21 @@
 //! These functions bind through the value's existing context. They add no operation semantics or host evaluation
 //! path; explicit builders, generated authoring code, and ordinary program replay see the same operation payloads.
 
-use crate::arrays::{
-    Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DimensionBounds,
-    DimensionType, DimensionValue, DimensionVariable,
+use ryft_core::{
+    AddOperation, Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
+    CompareOperation, ComparisonDirection, Context, DimensionBounds, DimensionFromScalarOperation,
+    DimensionMulOperation, DimensionType, DimensionValue, DimensionVariable, Domain, DotOperation,
+    NestedTracingContext, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, ReferenceWriteOperation,
+    StagingContext, Tracer, TypeError, Typed, Value, ValueDomainDispatch, WhileOperation, ZeroOperation,
 };
-use crate::contexts::{Context, Domain, StagingContext};
-use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
-use crate::kernels::grids::{Grid, GridDimension, GridExecution};
-use crate::kernels::indexing::TileLoadOperation;
-use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
-use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-use crate::kernels::operations::KernelOperation;
-use crate::kernels::validation::KernelParameterAccess;
-use crate::operations::{
-    AddOperation, CompareOperation, ComparisonDirection, DimensionFromScalarOperation, DimensionMulOperation,
-    DotOperation, ReferenceWriteOperation, WhileOperation, ZeroOperation,
-};
-use crate::parameters::Placeholder;
-use crate::programs::{ProgramBuilder, ProgramError, ProjectedValue, TypeError, Typed, Value, ValueDomainDispatch};
-use crate::tracing::{NestedTracingContext, Tracer};
+
+use crate::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
+use crate::grids::{Grid, GridDimension, GridExecution};
+use crate::indexing::TileLoadOperation;
+use crate::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
+use crate::mappings::{BlockMapping, BoundaryPolicy};
+use crate::operations::KernelOperation;
+use crate::validation::KernelParameterAccess;
 
 /// Functional kernel invocation capability for array values. Concrete host arrays use the qualified reference
 /// interpreter; projected symbolic arrays bind the same call and immutable body into their existing context.
@@ -358,13 +354,12 @@ where
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArrayReference, DataType, Operation, ReferenceRead, ReferenceType, ReferenceWrite, TracingContext,
+    };
 
-    use crate::arrays::{ArrayReference, DataType};
-    use crate::kernels::calls::KernelCallOperation;
-    use crate::kernels::grids::Grid;
-    use crate::operations::{ReferenceRead, ReferenceWrite};
-    use crate::programs::{Operation, ReferenceType};
-    use crate::tracing::TracingContext;
+    use crate::calls::KernelCallOperation;
+    use crate::grids::Grid;
 
     use super::*;
 

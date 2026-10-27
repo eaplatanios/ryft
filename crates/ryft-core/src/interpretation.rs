@@ -208,7 +208,9 @@ pub struct EagerInterpretationDriver<'r, V: Value, O: Operation<Type = V::Type>>
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> EagerInterpretationDriver<'r, V, O> {
-    /// Creates a new [`EagerInterpretationDriver`].
+    /// Creates a new [`EagerInterpretationDriver`] over `regions`, which must be the [`AttachedRegions`] of the
+    /// operation application being interpreted (i.e., the regions supplied to the same [`Context::bind`] call), so
+    /// that region indices resolve against that operation's region slots.
     #[inline]
     pub fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
         Self { regions }
@@ -895,8 +897,10 @@ impl<T: Type> ReplayTypeIdentities<T> {
 /// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps a resumable instruction state (i.e., the
 /// source position, live runtime values, and remaining-use counts) to retain context-specific validation and binding
 /// between steps. Each step completes one outer instruction; an attached region executes through the context's
-/// ordinary operation rule within that step. The context supplied to [`Self::new`] is retained across every step,
-/// so context-owned invocation state and effect handling survive between steps.
+/// ordinary operation rule within that step. Because completion is not observable from outside this interpreter,
+/// an external driver must call [`Self::step`] exactly once per outer instruction of the region (i.e.,
+/// `region.instructions().len()` times) before calling [`Self::finish`]. The context supplied to [`Self::new`] is
+/// retained across every step, so context-owned invocation state and effect handling survive between steps.
 pub struct RegionInterpreter<'r, C: Context> {
     /// [`Context`] used to lift source constants and bind instructions to runtime values or staged operations. The same
     /// context is retained across every [`Self::step`], so context-owned invocation state and effect handling survive
@@ -937,10 +941,8 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// refinement facts for the complete input signature. When staging, input and constant-owned type identities are
     /// renamed before live constants are lifted through the context. The resulting instruction state retains the inputs
     /// and constants needed by later instructions or region outputs; no instruction has been dispatched when this
-    /// returns.
-    ///
-    /// Construction can fail during boundary validation, identity renaming, or constant lifting. An empty instruction
-    /// list is already complete, but [`Self::finish`] is still required to gather and validate its outputs.
+    /// returns. An empty instruction list is already complete, but [`Self::finish`] is still required to gather and
+    /// validate its outputs.
     ///
     /// # Parameters
     ///
@@ -948,6 +950,13 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     ///   - `region`: Borrowed source region and arena used for replay and boundary validation.
     ///   - `inputs`: Runtime values in the order of the region's input atoms. Their types must satisfy the declared
     ///     input signature, including constraints shared across multiple inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] when `inputs` does not match the region's input count,
+    /// [`ProgramError::UnboundAtomId`] when a region input identifier lies outside its atom table, and a
+    /// [`ProgramError::Type`] error when the input types do not satisfy the declared input signature.
+    /// Failures of type identity renaming and of lifting constants through `context` are propagated.
     pub fn new(
         context: C,
         region: RegionRef<'r, C::Constant, C::Operation>,
@@ -1078,9 +1087,16 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// across bindings.
     ///
     /// A step handles one complete outer binding, including any attached-region work performed by its operation
-    /// rule. Stepping an already complete interpreter is an error. The function consumes `self`, so a failed binding
-    /// or validation cannot resume from inputs already transferred or repeat effects through the same state. This
-    /// interpreter does not roll back effects already performed by the context.
+    /// rule. The function consumes `self`, so a failed binding or validation cannot resume from inputs already
+    /// transferred or repeat effects through the same state. This interpreter does not roll back effects already
+    /// performed by the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when every outer instruction has already been dispatched, and
+    /// [`ProgramError::InvalidOutputCount`] when the binding returns a different number of outputs than the instruction
+    /// declares. Failures of reified boundary-dimension validation, type-identity renaming, and [`Context::bind`] are
+    /// propagated.
     pub fn step(self) -> Result<Self, ProgramError> {
         let Self { context, state, refinements, type_identities, region_mappings } = self;
         let region = state.region;
@@ -1149,9 +1165,14 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// using the interpreter's type-identity renaming. Type identities allowed by the source signature are renamed
     /// consistently, so output validation accepts replayed definitions without admitting unrelated identities.
     ///
-    /// This does not dispatch remaining instructions: an incomplete state is rejected. Output refinement failures
-    /// are reported with the same boundary diagnostics as input failures in [`Self::new`]. Both success and failure
-    /// consume the interpreter and its replay-scoped mappings.
+    /// This does not dispatch remaining instructions. Both success and failure consume the interpreter and its
+    /// replay-scoped mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when outer instructions remain undispatched, and a
+    /// [`ProgramError::Type`] error, with the same boundary diagnostics as input failures in [`Self::new`], when the
+    /// outputs do not satisfy the declared output signature.
     pub fn finish(self) -> Result<Vec<C::Value>, ProgramError> {
         // Replayed values commonly retain the program's exact declared output types. Only a count difference or a more
         // precise output type requires validation. That validation reuses facts established from the inputs and permits

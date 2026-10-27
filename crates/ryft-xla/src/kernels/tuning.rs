@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use ryft_core::kernels::{KernelCompiler, KernelExtension, KernelSchedule, VerifiedKernel};
 use ryft_core::{DiskCache, ReferenceExecution};
+use ryft_kernels::{KernelCompiler, KernelExtension, KernelSchedule, VerifiedKernel};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -392,8 +392,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{Grid, KernelCallOperation, KernelCompilationError, KernelDefinition};
     use ryft_core::{CustomCallOperation, ReferenceCompletion, ReferenceCompletionBackend};
+    use ryft_kernels::{Grid, KernelCallOperation, KernelCompilationError, KernelDefinition};
 
     use super::*;
 

@@ -1,6 +1,6 @@
 //! Backend-independent kernel authoring over ordinary Ryft programs.
 //!
-//! Start with [`kernel`] and ordinary [`Array`](crate::arrays::Array) annotations. The macro constructs canonical
+//! Start with [`kernel`] and ordinary [`Array`](ryft_core::arrays::Array) annotations. The macro constructs canonical
 //! array, dimension, reference, and control-flow operations; it does not run a separate tracing graph or select a
 //! compiler. Native compilation belongs to a [`KernelCompiler`], and execution belongs to its integration backend.
 //! The portable contract is the common authoring surface. Adapter APIs and exact GPU extensions remain experimental;
@@ -10,9 +10,10 @@
 //!
 //! ```
 //! use ryft_core::{Array, ArrayType, DataType};
-//! use ryft_core::kernels::{kernel, VerifiedKernel};
+//! use ryft_kernels::{kernel, VerifiedKernel};
 //!
-//! #[kernel(requires = left.shape()[0] == right.shape()[0])]
+//! // This example depends on `ryft-kernels` directly rather than through the `ryft` facade.
+//! #[kernel(crate = "ryft_kernels", requires = left.shape()[0] == right.shape()[0])]
 //! fn add(
 //!     #[input(data_type = F32, rank = 1)] left: &Array,
 //!     #[input(data_type = F32, rank = 1)] right: &Array,
@@ -34,14 +35,22 @@
 //! `add::definition` function accepts logical types, validates annotations and `requires` constraints, and returns
 //! an inspectable [`KernelDefinition`]. Choose a different compiler by passing the same verified definition to
 //! [`VerifiedKernel::compile`]; backend options do not rewrite the macro body. XLA owns its selected compiler binding,
-//! custom-call ABI, and executable lifecycle. Importing this module requires no XLA, CUDA, PJRT, or Python installation.
+//! custom-call ABI, and executable lifecycle. Using this crate requires no XLA, CUDA, PJRT, or Python installation.
+//!
+//! The code that [`kernel`] generates names this crate through the `ryft` facade path `ryft::kernels` by default, so
+//! `#[ryft::kernels::kernel]` and `#[ryft::kernel]` need no arguments. Crates that depend on `ryft-kernels` directly,
+//! as the example above does, pass `crate = "ryft_kernels"`, and other paths are passed the same way, as in
+//! `#[kernels_alias::kernel(crate = "kernels_alias")]` for a renamed dependency. The macro cannot infer this path
+//! because a re-exported procedural attribute cannot see the path through which it was invoked. The override always
+//! names this kernel namespace, never `ryft-core`; generated code reaches core items through a hidden macro-support
+//! re-export of this crate.
 //!
 //! # Tiles and control flow
 //!
 //! Input annotations constrain dtype and rank; output annotations specify shape, tile shape, and boundary policy.
 //! `output.tile_index()` exposes logical grid coordinates. `input.tiles([width]).pad(0.0).load([index])` expresses a
 //! clipped load with explicit padding. `output.store(value)` uses the declared output window. [`BoundaryPolicy`]
-//! distinguishes proved in-bounds access from masked edge windows: inactive lanes must never read invalid memory.
+//! distinguishes proved in-bounds access from masked edge windows: masked elements must never read invalid memory.
 //! Shapes and annotation expressions specialize the definition. Supported loops and conditions in the body stage
 //! as canonical control flow, not arbitrary host callbacks. Loop-carried arrays retain simultaneous-update semantics;
 //! checked scalar indices preserve observable bounds assertions. Unsupported syntax produces source-span diagnostics.
@@ -63,10 +72,16 @@
 //! run proves only the interpreted case, not target support or native performance. [`VerifiedKernel`] rechecks the
 //! current immutable body before adapter admission. Preserve its semantic identity when comparing compiler outputs.
 //!
-//! See the repository's `crates/ryft-core/src/kernels/SUPPORT.md` for the support and qualification matrix, existing
-//! runnable examples, upgrade procedure, and the distinction between hardware measurements and unavailable counters.
+//! Runnable examples and hardware qualification status live with the compiler adapters (`ryft-xla`, `ryft-mosaic`,
+//! `ryft-triton`, and cuTile in `ryft-cuda`) and their READMEs. No separate support matrix is published; adapter
+//! documentation distinguishes hardware measurements from unavailable counters.
 
 // TODO(eaplatanios): Review this module and all of its submodules.
+
+// The `#[kernel]` macro emits paths under the public `ryft::kernels` facade namespace by default. This `self`-alias,
+// together with the `kernels` alias below, lets those same generated paths resolve when the macro is used inside
+// `ryft-kernels` itself.
+extern crate self as ryft;
 
 pub use ryft_macros::kernel;
 
@@ -115,6 +130,19 @@ pub use validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelParameterSummary, KernelReferenceOperation,
     KernelReferenceSummary, KernelSwapLowering, KernelValidationError, validate_kernel_body,
 };
+
+/// Alias of this crate under the name it has in the `ryft` facade. Not public API: it makes the [`kernel`] macro's
+/// default `ryft::kernels::...` paths resolve inside this crate exactly as they do through the facade.
+#[doc(hidden)]
+pub use crate as kernels;
+
+/// Macro-support re-exports used by the code that [`kernel`] generates. Not public API: the generated code needs
+/// the core crate at a path derived from the kernel namespace, because a re-exported procedural attribute cannot
+/// see which path invoked it.
+#[doc(hidden)]
+pub mod __private {
+    pub use ryft_core as core;
+}
 
 #[cfg(test)]
 mod tests;

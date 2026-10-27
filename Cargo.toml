@@ -5,6 +5,7 @@ members = [
     "crates/ryft",
     "crates/ryft-core",
     "crates/ryft-cuda",
+    "crates/ryft-kernels",
     "crates/ryft-macros",
     "crates/ryft-macros-tests",
     "crates/ryft-mlir",
@@ -34,6 +35,7 @@ include = [
 ryft = { path = "crates/ryft", version = "0.0.3", default-features = false }
 ryft-core = { path = "crates/ryft-core", version = "0.0.3", default-features = false }
 ryft-cuda = { path = "crates/ryft-cuda", version = "0.0.3", default-features = false }
+ryft-kernels = { path = "crates/ryft-kernels", version = "0.0.3", default-features = false }
 ryft-macros = { path = "crates/ryft-macros", version = "0.0.3", default-features = false }
 ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.3", default-features = false }
 ryft-mosaic = { path = "crates/ryft-mosaic", version = "0.0.3", default-features = false }

@@ -3,7 +3,6 @@
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use std::sync::OnceLock;
 
-use ryft_core::kernels::{KernelParameterAccess, VerifiedKernel};
 use ryft_core::{
     ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation, Typed,
 };
@@ -13,6 +12,7 @@ use ryft_cuda::{
 };
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_cuda::{CudaKernelArgument, CudaKernelLauncher, CudaScalarValue};
+use ryft_kernels::{KernelParameterAccess, VerifiedKernel};
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
@@ -45,7 +45,7 @@ pub enum CudaKernelBufferBinding {
 
 /// Physical CUDA argument supplied by a logical array or an exact static scalar.
 ///
-/// Array indices refer to [`KernelCallOperation::parameters`](ryft_core::kernels::KernelCallOperation::parameters),
+/// Array indices refer to [`KernelCallOperation::parameters`](ryft_kernels::KernelCallOperation::parameters),
 /// including read-write parameters. Scalars are copied into each launch frame and never read from device memory.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CudaKernelParameterBinding {
@@ -643,7 +643,7 @@ unsafe extern "C" fn cuda_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::VerifiedKernel;
+    use ryft_kernels::VerifiedKernel;
 
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
@@ -851,11 +851,11 @@ mod tests {
 
     #[test]
     fn test_cuda_kernel_embedding_with_assertions() {
-        use ryft_core::kernels::KernelDefinition;
         use ryft_core::{
             ArrayIrOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable, ReferenceRead,
             ReferenceWrite,
         };
+        use ryft_kernels::KernelDefinition;
 
         let template = definition();
         let definition: KernelDefinition = KernelDefinition::trace(template.operation().clone(), |(references, _)| {
@@ -995,8 +995,8 @@ mod tests {
 
     #[test]
     fn test_cuda_kernel_embedding_custom_call_rejects_host_memory() {
-        use ryft_core::kernels::{KernelCallOperation, KernelDefinition, KernelParameter};
         use ryft_core::{ArrayType, ReferenceRead, ReferenceWrite};
+        use ryft_kernels::{KernelCallOperation, KernelDefinition, KernelParameter};
 
         let template = definition();
         let parameter = KernelParameter::new(

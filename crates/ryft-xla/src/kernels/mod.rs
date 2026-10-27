@@ -34,13 +34,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ryft_core::kernels::{
-    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension, KernelSchedule, NoKernelExtension,
-    VerifiedKernel,
-};
 use ryft_core::{
     ArrayIrType, ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis,
     MeshAxisType, Operation, ProgramError, ShardingDimension, TypeError, Typed,
+};
+use ryft_kernels::{
+    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension, KernelSchedule, NoKernelExtension,
+    VerifiedKernel,
 };
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
@@ -400,13 +400,13 @@ pub(crate) mod tests {
 
     use indoc::formatdoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError, KernelParameter,
-        KernelParameterAccess,
-    };
     use ryft_core::{
         Array, ArrayIrOperation, ArrayIrValue, Context, DataType, Placeholder, ProgramBuilder, ReferenceRead,
         ReferenceWrite,
+    };
+    use ryft_kernels::{
+        BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError, KernelParameter,
+        KernelParameterAccess,
     };
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
@@ -653,7 +653,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_kernel_from_output_rejects_external_body_effects() {
         use ryft_core::ArrayOperation;
-        use ryft_core::kernels::KernelOperation;
+        use ryft_kernels::KernelOperation;
 
         for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
             let logical = definition().operation().clone();

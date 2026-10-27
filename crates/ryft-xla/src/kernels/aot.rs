@@ -8,11 +8,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ryft_core::kernels::{KernelDefinition, VerifiedKernel};
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain,
     CompilationStagingRequest, CompilationTracer, DeviceMesh,
 };
+use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -466,7 +466,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_bundle_compile_without_inputs() {
-        use ryft_core::kernels::{Grid, KernelCallOperation};
+        use ryft_kernels::{Grid, KernelCallOperation};
 
         let operation = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();

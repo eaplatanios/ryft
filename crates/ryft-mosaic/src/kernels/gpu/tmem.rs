@@ -4,12 +4,12 @@ use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::sync::LazyLock;
 
-use ryft_core::kernels::{KernelExtension, KernelExtensionMemory};
 use ryft_core::{
     ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, EffectClasses, Effects, Operation, OperationFormatter,
     ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect,
     ReferenceType, RegionInterface, TypeError,
 };
+use ryft_kernels::{KernelExtension, KernelExtensionMemory};
 
 /// A datacenter Blackwell tensor-memory allocation and its ordered asynchronous operations.
 ///

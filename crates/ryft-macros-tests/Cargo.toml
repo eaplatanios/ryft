@@ -13,6 +13,7 @@ license.workspace = true
 [dependencies]
 ryft = { path = "../ryft" }
 ryft-core = { path = "../ryft-core" }
+ryft-kernels = { path = "../ryft-kernels" }
 trybuild.workspace = true
 
 [dev-dependencies]

@@ -12,7 +12,6 @@ pub mod contexts;
 pub mod differentiation;
 pub mod errors;
 pub mod interpretation;
-pub mod kernels;
 pub mod macros;
 pub mod operations;
 pub mod parameters;

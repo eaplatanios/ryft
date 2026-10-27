@@ -2,14 +2,14 @@
 
 use pretty_assertions::assert_eq;
 
-use ryft_core::kernels::{
+use ryft_core::{Array, ArrayType, Context, DataType, ReferenceRead, ReferenceWrite};
+use ryft_kernels::{
     AsyncCopyOperation, Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, ScratchOperation,
     WaitOperation, whole_array_parameter,
 };
-use ryft_core::{Array, ArrayType, Context, DataType, ReferenceRead, ReferenceWrite};
 
 /// Adds independently loaded tiles, including a partially populated final output tile.
-#[ryft_core::kernels::kernel(requires = left.shape()[0] == right.shape()[0])]
+#[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[0] == right.shape()[0])]
 fn vector_add(
     #[input(data_type = F32, rank = 1)] left: &Array,
     #[input(data_type = F32, rank = 1)] right: &Array,
@@ -22,13 +22,13 @@ fn vector_add(
 }
 
 /// Reduces a complete vector to one scalar through the canonical reduction operation.
-#[ryft_core::kernels::kernel]
+#[ryft_kernels::kernel(crate = "ryft_kernels")]
 fn sum(#[input(data_type = F32, rank = 1)] input: &Array, #[output(data_type = F32, shape = [])] output: &mut Array) {
     output.store(input.load().sum([0]));
 }
 
 /// Carries tiled dot products through a staged reduction loop with partial tiles on every axis.
-#[ryft_core::kernels::kernel(requires = left.shape()[1] == right.shape()[0])]
+#[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[1] == right.shape()[0])]
 fn matmul(
     #[input(data_type = F32, rank = 2)] left: &Array,
     #[input(data_type = F32, rank = 2)] right: &Array,
@@ -394,7 +394,7 @@ fn execute_aot_case<'c>(
     use ryft_xla::{FromPjrt, XlaOptions, XlaSession};
 
     /// Uses the portable source codec's whole-array subset with no hidden captures or runtime references.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn add(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -581,8 +581,8 @@ mod gpu {
     use pretty_assertions::assert_eq;
     use sha2::{Digest, Sha256};
 
-    use ryft_core::kernels::{KernelExtension, KernelOperation, KernelSchedule};
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProgramError, ProjectedValue, Typed};
+    use ryft_kernels::{KernelExtension, KernelOperation, KernelSchedule};
     use ryft_mosaic::kernels::gpu::{Compiler, GpuOperation, Options, Target};
     use ryft_xla::experimental::XlaDomainError;
     use ryft_xla::kernels::{MosaicGpuEmbedding, XlaKernelCompilerBinding, XlaKernelExtension, stage_kernel};
@@ -1166,7 +1166,7 @@ mod gpu {
 
     #[test]
     fn test_attention_wgmma_module() {
-        use ryft_core::kernels::VerifiedKernel;
+        use ryft_kernels::VerifiedKernel;
         use ryft_mlir::{Operation, WalkOrder, WalkResult};
         use ryft_mosaic::kernels::gpu::Mma;
 
@@ -1259,13 +1259,13 @@ mod cutile {
     use pretty_assertions::assert_eq;
     use sha2::{Digest, Sha256};
 
-    use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, CompilationDomain,
         CompilationStagingRequest, ConstantOperation, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
         call_function,
     };
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
+    use ryft_kernels::{KernelSchedule, VerifiedKernel};
     use ryft_xla::experimental::XlaDomainError;
     use ryft_xla::kernels::{CuTileEmbedding, XlaKernelCompilerBinding, stage_kernel};
     use ryft_xla::{FromPjrt, XlaDomain, XlaSession, XlaValue};
@@ -1710,12 +1710,12 @@ mod tuning {
     use std::time::Duration;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_core::{
         ArrayIrType, CompilationCall, CompilationDomain, CompilationStagingRequest, CompilationTracer, Device,
         DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution,
         StatefulCompilationDomain,
     };
+    use ryft_kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{
         KernelOutputEmbedding, KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest,
         KernelTuningRunner, XlaKernelCompilerBinding, XlaKernelExecutionFacts, XlaKernelTarget, stage_kernel,
@@ -2007,7 +2007,7 @@ mod stress {
     // Defines another tile width using the existing portable macro and its canonical valid-lane masking.
     macro_rules! tiled_add {
         ($name:ident, $width:literal) => {
-            #[ryft_core::kernels::kernel]
+            #[ryft_kernels::kernel(crate = "ryft_kernels")]
             fn $name(
                 #[input(data_type = F32, rank = 1)] left: &Array,
                 #[input(data_type = F32, rank = 1)] right: &Array,
@@ -2026,7 +2026,7 @@ mod stress {
     tiled_add!(add128, 128);
 
     /// A codec-supported mutation source, independent of tile-load codec eligibility.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn codec_add(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -2264,11 +2264,11 @@ mod triton {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::kernels::{KernelCompiler, KernelSchedule};
     use ryft_core::{
         ArrayIrType, CompilationCacheDomain, CompilationDomain, CompilationStagingRequest, Device, DeviceMesh,
         LogicalMesh, MeshAxis, MeshAxisType, call_function,
     };
+    use ryft_kernels::{KernelCompiler, KernelSchedule};
     use ryft_triton::kernels::{Compiler, Options, Target};
     use ryft_xla::kernels::{TritonEmbedding, XlaKernelCompilerBinding, stage_kernel};
     use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
@@ -2385,7 +2385,7 @@ mod triton {
             return;
         }
         /// Uses a whole-array contraction without checked loop dimensions or assertion hostcalls.
-        #[ryft_core::kernels::kernel]
+        #[ryft_kernels::kernel(crate = "ryft_kernels")]
         fn dot(
             #[input(data_type = F32, rank = 2)] left: &Array,
             #[input(data_type = F32, rank = 2)] right: &Array,
@@ -2400,7 +2400,7 @@ mod triton {
         for (architecture, definition) in
             [("gfx908", &vector), ("gfx90a", &vector), ("gfx942", &vector), ("gfx942", &dot)]
         {
-            let verified = ryft_core::kernels::VerifiedKernel::new(definition, 1024).unwrap();
+            let verified = ryft_kernels::VerifiedKernel::new(definition, 1024).unwrap();
             let output = verified
                 .compile(
                     &compiler,
@@ -2424,12 +2424,12 @@ mod triton {
     #[test]
     fn test_unsupported_scratch() {
         let case = async_copy_case(&[67]);
-        let verified = ryft_core::kernels::VerifiedKernel::new(&case.definition, 1024).unwrap();
+        let verified = ryft_kernels::VerifiedKernel::new(&case.definition, 1024).unwrap();
         let compiler = Compiler::new();
         assert!(matches!(
             compiler.admit(&verified, &Target::Cuda { major: 12, minor: 1 }, &Options::default(),
                 &KernelSchedule::default()),
-            Err(ryft_core::kernels::KernelCompilationError::Unsupported { operation: "scratch", requested, .. })
+            Err(ryft_kernels::KernelCompilationError::Unsupported { operation: "scratch", requested, .. })
                 if requested == "operation is outside the portable Triton subset",
         ));
     }

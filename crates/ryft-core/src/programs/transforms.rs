@@ -565,13 +565,13 @@ impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
 ///
 /// # Contract
 ///
-///   - Equality and hashing are consistent meaning that equal handles always produce equal hashes.
+///   - Equality and hashing are consistent, meaning that equal handles always produce equal hashes.
 ///   - Content-preserving copies of a sealed region share its identity (e.g., clones of its [`Program`] and
 ///     [`RegionRef::to_program`] materializations), while constructions or rewrites that change a region's complete
 ///     reachable contents mint a new one.
-///   - The identity is conservative meaning that equal handles imply equal contents, but two independently constructed
-///     programs with equal contents may compare unequal. Callers must therefore only use it where a spurious inequality
-///     is harmless, such as a missed cache hit.
+///   - The identity is conservative, meaning that equal handles imply equal contents, but two independently
+///     constructed programs with equal contents may compare unequal. Callers must therefore only use it where a
+///     spurious inequality is harmless, such as a missed cache hit.
 ///   - The identity is process-local and is valid only for comparing regions of live programs. It is neither a
 ///     persistent semantic key (e.g., it cannot be serialized or compared across processes) nor a type identity.
 ///   - A handle may outlive the program it was taken from. It then compares equal only to handles taken from the same
@@ -955,6 +955,7 @@ mod tests {
 
         assert_registry_is_send_and_sync::<Array, TestRegionOperation>();
         assert_send_sync::<RegionTransformCache<Array, TestRegionOperation>>();
+        assert_send_sync::<RegionContentIdentity<Array, TestRegionOperation>>();
     }
 
     #[test]

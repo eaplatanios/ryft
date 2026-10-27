@@ -6,13 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
+use ryft_core::{
+    Axis, AxisError, Dimension, DimensionError, DimensionVariable, MAX_DIMENSION_EXTENT, Parameter, TypeError,
+    TypeIdentityRenaming,
+};
 use ryft_macros::Parameter;
 use thiserror::Error;
-
-use crate::arrays::{Dimension, DimensionError, DimensionVariable, MAX_DIMENSION_EXTENT};
-use crate::axes::{Axis, AxisError};
-use crate::parameters::Parameter;
-use crate::programs::{TypeError, TypeIdentityRenaming};
 
 /// Errors constructing a grid or binding its runtime extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -333,8 +332,7 @@ mod tests {
     use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
-
-    use crate::arrays::DimensionBounds;
+    use ryft_core::DimensionBounds;
 
     use super::*;
 

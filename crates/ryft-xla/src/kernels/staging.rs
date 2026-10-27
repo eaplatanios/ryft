@@ -5,10 +5,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
-use ryft_core::kernels::{
-    KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension, KernelExtensionMemory, KernelOperation,
-    KernelSchedule, NoKernelExtension, VerifiedKernel,
-};
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
     BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeJvpRule, CompositeOperation,
@@ -22,6 +18,10 @@ use ryft_core::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionDataFlow, RegionInterface, RegionLiveness,
     RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
     TypeError, TypeIdentityRenaming, Typed, Value,
+};
+use ryft_kernels::{
+    KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension, KernelExtensionMemory, KernelOperation,
+    KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
 use ryft_mlir::ValueRef;
 
@@ -474,7 +474,7 @@ where
         };
         let definition = definition_from_body(call, driver.region(0)?)?;
         let (definition, axes) = definition
-            .batched_inputs(inputs, ryft_core::kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
+            .batched_inputs(inputs, ryft_kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
             .map_err(ProgramError::custom)?;
         let values = stage_kernel(
             context.parent(),
@@ -1228,8 +1228,8 @@ pub(crate) fn select_kernels(
 pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_core::{CustomCallOperation, EffectClass};
+    use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
 
     use crate::experimental::ops::XlaProgramBuilder;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
@@ -1344,8 +1344,8 @@ pub(crate) mod tests {
 
     /// A scalar floating-point identity whose native body stays opaque to derivative construction.
     fn differentiable_definition() -> KernelDefinition {
-        use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
         use ryft_core::{ArrayType, DataType, ReferenceRead, ReferenceWrite};
+        use ryft_kernels::{Grid, KernelParameterAccess, whole_array_parameter};
 
         let call = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),
@@ -1468,20 +1468,19 @@ pub(crate) mod tests {
         assert!(std::ptr::eq(forwarded, expected));
 
         #[cfg(feature = "mosaic-gpu")]
-        assert!(
-            XlaKernelExtension::Mosaic(ryft_mosaic::kernels::gpu::GpuOperation::Wgmma)
-                .region_data_flow()
-                .is_none()
-        );
+        assert!(matches!(
+            XlaKernelExtension::Mosaic(ryft_mosaic::kernels::gpu::GpuOperation::Wgmma).region_data_flow(),
+            RegionDataFlow::Opaque,
+        ));
     }
 
     #[test]
     fn test_xla_kernel_operation_partially_evaluate_prefetch() {
-        use ryft_core::kernels::{BlockMapping, BoundaryPolicy, Grid, KernelParameter, KernelParameterAccess};
         use ryft_core::{
             ArrayIrOperation, ArrayType, DataType, DimensionBounds, DimensionType, ProgramBuilder, ReferenceWrite,
             StagingContext,
         };
+        use ryft_kernels::{BlockMapping, BoundaryPolicy, Grid, KernelParameter, KernelParameterAccess};
 
         let scalar = ArrayType::scalar(DataType::I32);
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -2012,8 +2011,8 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     #[test]
     fn test_xla_kernel_compiler_binding_new_with_extensions() {
-        use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
         use ryft_core::{ArrayType, DataType, ReferenceRead, ReferenceWrite};
+        use ryft_kernels::{Grid, KernelParameterAccess, whole_array_parameter};
         use ryft_mosaic::kernels::gpu::{Compiler as GpuCompiler, GpuOperation, Mma, Options, Target};
 
         use crate::kernels::MosaicGpuEmbedding;
@@ -2234,11 +2233,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_select_kernels_in_shard_map() {
-        use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
         use ryft_core::{
             ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, ShardMap, ShardMapOperation, Sharding,
             ShardingDimension,
         };
+        use ryft_kernels::{Grid, KernelParameterAccess, whole_array_parameter};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding =

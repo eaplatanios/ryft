@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use ryft_core::kernels::{GridExecution, KernelExtension, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atom, AtomId, ConstantOperation, DataType, InstructionId,
     Operation as CoreOperation, ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed, ValueId,
     validated_reference_access_descriptors,
 };
+use ryft_kernels::{GridExecution, KernelExtension, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_mlir::dialects::{arith, gpu, llvm, memref, nvvm, scf};
 use ryft_mlir::{
     Block, Context, DetachedBlock, DetachedOp, Module, Operation, Type, TypeRef, UnknownLocationRef, Value, ValueRef,
@@ -1459,13 +1459,13 @@ impl<'c, 't> Lowering<'c, 't> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        AsyncCopyOperation, Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess,
-        MaskedLoadOperation, ScratchOperation, WaitOperation, whole_array_parameter,
-    };
     use ryft_core::{
         AddOperation, ArrayIrType, Condition, Context as CoreContext, Dimension, NestedTracingContext, ReferenceRead,
         ReferenceWrite, WhileOperation,
+    };
+    use ryft_kernels::{
+        AsyncCopyOperation, Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess,
+        MaskedLoadOperation, ScratchOperation, WaitOperation, whole_array_parameter,
     };
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_version;
     use ryft_mlir::{WalkOrder, WalkResult};
@@ -1721,7 +1721,7 @@ mod tests {
             let context = references[0].context();
             let first = references[0].read()?;
             let second = context.lift(ArrayIrValue::Array(Array::scalar(11i64)?))?;
-            let outputs = ryft_core::kernels::for_loop(context, 0..1, vec![first, second], |_, inputs| {
+            let outputs = ryft_kernels::for_loop(context, 0..1, vec![first, second], |_, inputs| {
                 Ok(vec![inputs[1].clone(), inputs[0].clone()])
             })?;
             references[0].write(&outputs[0])?;

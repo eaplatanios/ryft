@@ -2,10 +2,10 @@
 
 use std::sync::{Arc, OnceLock};
 
-use ryft_core::kernels::{GridExecution, KernelParameterAccess, VerifiedKernel};
 use ryft_core::{
     ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, Dimension, EffectClass, Memory, Operation, Typed,
 };
+use ryft_kernels::{GridExecution, KernelParameterAccess, VerifiedKernel};
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
     FfiTypeId, FfiTypeInformation, FfiUserData, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
@@ -433,7 +433,7 @@ mod tests {
     use super::*;
 
     /// Uses the same public portable macro and pointer order as the native vector fixture.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -548,8 +548,8 @@ mod tests {
 
     #[test]
     fn test_rocm_kernel_embedding_custom_call_rejects_effects() {
-        use ryft_core::kernels::{KernelDefinition, KernelOperation};
         use ryft_core::{ArrayIrValue, ArrayOperation, Placeholder, ProgramBuilder};
+        use ryft_kernels::{KernelDefinition, KernelOperation};
 
         for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
             let logical = crate::kernels::tests::definition().operation().clone();

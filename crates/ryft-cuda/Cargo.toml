@@ -40,11 +40,12 @@ exactly = 1
 
 [features]
 default = []
-cutile = ["dep:ryft-core", "dep:serde", "dep:serde_json"]
+cutile = ["dep:ryft-core", "dep:ryft-kernels", "dep:serde", "dep:serde_json"]
 cutile-compiler = ["cutile", "dep:tempfile"]
 
 [dependencies]
 ryft-core = { workspace = true, optional = true }
+ryft-kernels = { workspace = true, optional = true }
 hex.workspace = true
 libloading.workspace = true
 serde = { workspace = true, optional = true }

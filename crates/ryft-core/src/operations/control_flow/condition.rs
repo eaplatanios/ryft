@@ -2378,7 +2378,6 @@ mod tests {
     use crate::differentiation::{
         ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, TransposedProgram, differentiate_at,
     };
-    use crate::kernels::{KernelOperation, NoKernelExtension};
     use crate::macros::{check_gradient, check_operation_batching};
     use crate::operations::GuardOperation;
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SqrtOperation};
@@ -3285,7 +3284,7 @@ mod tests {
             )),
         );
 
-        // Inference dispatches through boxed, closed-enum, and kernel operation wrappers exactly like through the bare
+        // Inference dispatches through boxed and closed-enum operation wrappers exactly like through the bare
         // operation. The derive tests own this delegation; this block keeps one representative check per wrapper.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3335,16 +3334,6 @@ mod tests {
         );
         assert_eq!(
             TestIrOperation::Condition(ConditionOperation::new())
-                .infer_output_types(&mismatched_array_ir_input_types, &array_ir_interfaces),
-            Err(mismatch.clone()),
-        );
-        assert_eq!(
-            KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
-                .infer_output_types(&refined_array_ir_input_types, &array_ir_interfaces),
-            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]),
-        );
-        assert_eq!(
-            KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
                 .infer_output_types(&mismatched_array_ir_input_types, &array_ir_interfaces),
             Err(mismatch),
         );
@@ -3906,7 +3895,7 @@ mod tests {
             assert!(context.builder().borrow().instructions().is_empty());
         }
 
-        // Validation dispatches through boxed, closed-enum, and kernel operation wrappers exactly like through the bare
+        // Validation dispatches through boxed and closed-enum operation wrappers exactly like through the bare
         // operation. The derive tests own this delegation; this block keeps one representative check per wrapper.
         assert_eq!(Box::new(ConditionOperation::<ArrayType>::new()).validate_region_interfaces(&interfaces), expected);
         assert_eq!(
@@ -3918,11 +3907,6 @@ mod tests {
         let interfaces = array_ir_branches.each_ref().map(Program::interface);
         assert_eq!(
             TestIrOperation::Condition(ConditionOperation::new()).validate_region_interfaces(&interfaces),
-            expected,
-        );
-        assert_eq!(
-            KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
-                .validate_region_interfaces(&interfaces),
             expected,
         );
     }
@@ -15664,70 +15648,6 @@ mod tests {
         );
         assert!(!traced.get());
         assert!(context.builder().borrow().instructions().is_empty());
-    }
-
-    #[test]
-    fn test_condition_condition_kernel_operations() {
-        // `condition` serves the kernel operation family that the `#[kernel]` macro lowers Rust `if` statements to,
-        // tracing each branch function exactly once and selecting its result at runtime.
-        let true_calls = Cell::new(0);
-        let false_calls = Cell::new(0);
-        let (_, program) = TracingContext::<TestIrValue, KernelOperation>::trace(
-            |inputs: Vec<Tracer<_>>| {
-                inputs[0].condition(
-                    |inputs| {
-                        true_calls.set(true_calls.get() + 1);
-                        inputs[0].context().bind(
-                            TestIrOperation::from(ArrayOperation::Add(AddOperation::new())),
-                            Vec::new(),
-                            &[inputs[0].clone(), inputs[0].clone()],
-                        )
-                    },
-                    |inputs| {
-                        false_calls.set(false_calls.get() + 1);
-                        inputs[0].context().bind(
-                            TestIrOperation::from(ArrayOperation::Neg(NegOperation::new())),
-                            Vec::new(),
-                            &inputs,
-                        )
-                    },
-                    vec![inputs[1].clone()],
-                )
-            },
-            vec![
-                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
-                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
-            ],
-        )
-        .unwrap();
-        assert_eq!((true_calls.get(), false_calls.get()), (1, 1));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:bool[], %1:i64[] .
-                let %2:i64[] = condition %0 %1 [
-                    true={
-                        lambda %0:i64[] .
-                        let %1:i64[] = add %0 %0
-                        in (%1)
-                    },
-                    false={
-                        lambda %0:i64[] .
-                        let %1:i64[] = neg %0
-                        in (%1)
-                    },
-                ]
-                in (%2)"},
-        );
-        for (predicate, expected) in [(true, 6i64), (false, -3i64)] {
-            assert_eq!(
-                program.interpret(vec![
-                    TestIrValue::Array(Array::scalar(predicate).unwrap()),
-                    TestIrValue::Array(Array::scalar(3i64).unwrap()),
-                ]),
-                Ok(vec![TestIrValue::Array(Array::scalar(expected).unwrap())]),
-            );
-        }
     }
 
     #[test]

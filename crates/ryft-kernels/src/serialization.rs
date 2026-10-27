@@ -20,40 +20,34 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use ryft_core::{
+    AbsOperation, Accuracy, AddOperation, AndOperation, Array, ArrayAddressing, ArrayIrOperation, ArrayIrType,
+    ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType,
+    Atom, AtomId, ClampOperation, CompareOperation, ComparisonDirection, ConditionOperation, ConstantOperation,
+    DataType, Dimension, DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation,
+    DimensionMulOperation, DimensionOperation, DimensionRemOperation, DimensionSubOperation,
+    DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, DivOperation, DotDimensionNumbers,
+    DotOperation, EagerContext, ExpOperation, FlatProgram, Instruction, Layout, LogOperation, MAX_DIMENSION_EXTENT,
+    MaxOperation, Memory, MinOperation, MulOperation, NegOperation, NotOperation, Operation, OrOperation, Placeholder,
+    Program, ProgramError, Provenance, ProvenanceScope, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Region, RegionId, RemOperation, RsqrtOperation,
+    SaturatingSubOperation, SelectOperation, Shape, SqrtOperation, StridedLayout, SubOperation, TanhOperation, Tile,
+    TileDimension, TiledLayout, Typed, WhileOperation, XorOperation, ZeroOperation,
+    validated_reference_access_descriptors,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
-    ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
-    DimensionType, DimensionValue, DimensionVariable, Layout, MAX_DIMENSION_EXTENT, Memory, Shape, StridedLayout, Tile,
-    TileDimension, TiledLayout,
-};
-use crate::contexts::EagerContext;
-use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
-use crate::kernels::grids::{Grid, GridDimension, GridExecution};
-use crate::kernels::indexing::TileLoadOperation;
-use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-use crate::kernels::memory::{
+use crate::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
+use crate::grids::{Grid, GridDimension, GridExecution};
+use crate::indexing::TileLoadOperation;
+use crate::mappings::{BlockMapping, BoundaryPolicy};
+use crate::memory::{
     AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation, WaitOperation,
 };
-use crate::kernels::operations::KernelOperation;
-use crate::kernels::validation::KernelParameterAccess;
-use crate::operations::{
-    AbsOperation, Accuracy, AddOperation, AndOperation, ClampOperation, CompareOperation, ComparisonDirection,
-    ConditionOperation, ConstantOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
-    DimensionMulOperation, DimensionRemOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-    DotDimensionNumbers, DotOperation, ExpOperation, LogOperation, MaxOperation, MinOperation, MulOperation,
-    NegOperation, NotOperation, OrOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-    ReferenceWriteOperation, RemOperation, RsqrtOperation, SaturatingSubOperation, SelectOperation, SqrtOperation,
-    SubOperation, TanhOperation, WhileOperation, XorOperation, ZeroOperation,
-};
-use crate::parameters::Placeholder;
-use crate::programs::{
-    Atom, AtomId, FlatProgram, Instruction, Operation, Program, ProgramError, Provenance, ProvenanceScope,
-    ReferenceAccessOperation, ReferenceType, Region, RegionId, Typed, validated_reference_access_descriptors,
-};
+use crate::operations::KernelOperation;
+use crate::validation::KernelParameterAccess;
 
 /// Errors admitting or reconstructing a portable serialized kernel.
 #[derive(Debug, Error)]
@@ -1522,16 +1516,14 @@ fn bounded_dot_dimensions<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use ryft_core::{Context, ProgramBuilder, SinOperation, TanOperation, TanhOperation, TypeIdentityRenaming};
 
-    use crate::contexts::Context;
-    use crate::kernels::authoring::whole_array_parameter;
-    use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
-    use crate::operations::{SinOperation, TanOperation, TanhOperation};
-    use crate::programs::{ProgramBuilder, TypeIdentityRenaming};
+    use crate::authoring::whole_array_parameter;
+    use crate::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
 
     use super::*;
 
-    #[crate::kernels::kernel(crate = "crate", requires = left.shape()[1] == right.shape()[0])]
+    #[crate::kernel(requires = left.shape()[1] == right.shape()[0])]
     fn tiled_matmul(
         #[input(data_type = F32, rank = 2)] left: &Array,
         #[input(data_type = F32, rank = 2)] right: &Array,

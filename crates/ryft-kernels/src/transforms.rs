@@ -5,27 +5,22 @@
 
 use std::collections::BTreeMap;
 
+use ryft_core::{
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, Atom, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, Context,
+    Dimension, DimensionBounds, DimensionType, Operation, Placeholder, ProgramBuilder, ProgramError, Typed, Value,
+    rewrite_reference_access_transforms, validated_reference_access_descriptors,
+};
 use thiserror::Error;
 
-use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
-    ArrayReferenceTransformIndex, Dimension, DimensionBounds, DimensionType,
-};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::Context;
-use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
-use crate::kernels::compilation::VerifiedKernel;
-use crate::kernels::grids::{Grid, GridDimension, GridExecution};
-use crate::kernels::initialization::KernelInitializationError;
-use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
-use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-use crate::kernels::operations::{KernelExtension, KernelOperation};
-use crate::kernels::validation::KernelParameterAccess;
-use crate::parameters::Placeholder;
-use crate::programs::{
-    Atom, Operation, ProgramBuilder, ProgramError, Typed, Value, rewrite_reference_access_transforms,
-    validated_reference_access_descriptors,
-};
+use crate::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
+use crate::compilation::VerifiedKernel;
+use crate::grids::{Grid, GridDimension, GridExecution};
+use crate::initialization::KernelInitializationError;
+use crate::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
+use crate::mappings::{BlockMapping, BoundaryPolicy};
+use crate::operations::{KernelExtension, KernelOperation};
+use crate::validation::KernelParameterAccess;
 
 /// A kernel transform cannot preserve the declared boundary or prove its rewritten accesses.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -286,12 +281,13 @@ where
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArraySliceAxis, ArrayType, ConditionOperation, DataType, ReferenceAccessOperation, ReferenceRead,
+        ReferenceWrite, ReferenceWriteOperation,
+    };
 
-    use crate::arrays::{ArraySliceAxis, ArrayType, DataType};
-    use crate::kernels::authoring::whole_array_parameter;
-    use crate::kernels::memory::{AsyncCopyOperation, WaitOperation};
-    use crate::operations::{ConditionOperation, ReferenceRead, ReferenceWrite, ReferenceWriteOperation};
-    use crate::programs::ReferenceAccessOperation;
+    use crate::authoring::whole_array_parameter;
+    use crate::memory::{AsyncCopyOperation, WaitOperation};
 
     use super::*;
 
@@ -478,8 +474,7 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_batched_inputs_rejects_dynamic_batch_extents() {
-        use crate::arrays::{DimensionVariable, Shape};
-        use crate::tracing::{Tracer, TracingContext};
+        use ryft_core::{DimensionVariable, Shape, Tracer, TracingContext};
 
         // The batch becomes a static grid dimension of the batched kernel, so a dynamic batch extent is rejected.
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -520,10 +515,7 @@ mod tests {
     fn test_kernel_operation_batch() {
         use std::sync::Arc;
 
-        use crate::arrays::DimensionValue;
-        use crate::batching::RecursiveBatchingDriver;
-        use crate::contexts::EagerContext;
-        use crate::programs::AttachedRegions;
+        use ryft_core::{AttachedRegions, DimensionValue, EagerContext, RecursiveBatchingDriver};
 
         let scalar = ArrayType::scalar(DataType::I32);
         let definition: KernelDefinition = KernelDefinition::trace(

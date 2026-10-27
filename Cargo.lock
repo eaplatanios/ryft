@@ -1863,6 +1863,7 @@ name = "ryft"
 version = "0.0.3"
 dependencies = [
  "ryft-core",
+ "ryft-kernels",
  "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",
@@ -1902,6 +1903,7 @@ dependencies = [
  "libloading 0.9.0",
  "pretty_assertions",
  "ryft-core",
+ "ryft-kernels",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1918,6 +1920,7 @@ dependencies = [
  "pretty_assertions",
  "ryft-core",
  "ryft-cuda",
+ "ryft-kernels",
  "ryft-mlir",
  "ryft-mosaic",
  "ryft-pjrt",
@@ -1927,6 +1930,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "ryft-kernels"
+version = "0.0.3"
+dependencies = [
+ "indoc",
+ "num-complex",
+ "pretty_assertions",
+ "ryft-core",
+ "ryft-macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1948,6 +1965,7 @@ dependencies = [
  "pretty_assertions",
  "ryft",
  "ryft-core",
+ "ryft-kernels",
  "trybuild",
 ]
 
@@ -1971,6 +1989,7 @@ dependencies = [
  "indoc",
  "pretty_assertions",
  "ryft-core",
+ "ryft-kernels",
  "ryft-mlir",
  "ryft-xla-sys",
  "sha2 0.11.0",
@@ -2012,6 +2031,7 @@ dependencies = [
  "pretty_assertions",
  "ryft-core",
  "ryft-cuda",
+ "ryft-kernels",
  "ryft-mlir",
  "ryft-rocm",
  "ryft-xla-sys",
@@ -2033,6 +2053,7 @@ dependencies = [
  "prost",
  "ryft-core",
  "ryft-cuda",
+ "ryft-kernels",
  "ryft-macros",
  "ryft-mlir",
  "ryft-mosaic",

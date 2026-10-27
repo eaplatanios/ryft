@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use ryft_core::kernels::{
-    GridExecution, KernelExtension, KernelOperation, KernelParameterAccess, KernelSchedule, VerifiedKernel,
-};
 use ryft_core::{
     ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AtomId, DataType,
     Dimension, InstructionId, Layout, Memory, Operation, RegionId, Typed, ValueId,
+};
+use ryft_kernels::{
+    GridExecution, KernelExtension, KernelOperation, KernelParameterAccess, KernelSchedule, VerifiedKernel,
 };
 
 use crate::kernels::gpu::lowering::memory::{TmaCopyPlan, plan as plan_tma_copies};
@@ -555,12 +555,12 @@ pub(super) fn checked_array(r#type: &ArrayType) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        AsyncCopyOperation, BlockMapping, BoundaryPolicy, Grid, GridDimension, KernelCallOperation, KernelDefinition,
-        KernelParameter, ScratchOperation, WaitOperation, whole_array_parameter,
-    };
     use ryft_core::{
         Array, ArrayIrOperation, ArrayIrValue, Context, ProgramBuilder, ReferenceRead, ReferenceWrite, TiledLayout,
+    };
+    use ryft_kernels::{
+        AsyncCopyOperation, BlockMapping, BoundaryPolicy, Grid, GridDimension, KernelCallOperation, KernelDefinition,
+        KernelParameter, ScratchOperation, WaitOperation, whole_array_parameter,
     };
 
     use super::*;
@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn test_plan_new_counts_each_literal_element() {
         for (operation_constant, required) in [(false, 5), (true, 6)] {
-            let parameter = ryft_core::kernels::whole_array_parameter(
+            let parameter = ryft_kernels::whole_array_parameter(
                 ArrayType::new_static(DataType::I32, [4]),
                 KernelParameterAccess::WriteOnly,
             )

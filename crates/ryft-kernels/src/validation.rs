@@ -28,16 +28,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::sync::Arc;
 
-use thiserror::Error;
-
-use crate::arrays::{
+use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayReferenceAnalysis, ArrayReferenceTransform, ArrayReferenceTransformPath,
-    ArrayType,
-};
-use crate::programs::{
-    AtomId, InstructionId, Operation, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot,
+    ArrayType, AtomId, InstructionId, Operation, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot,
     ReferenceViewAnalysisError, RegionId, RegionRef, Value, ValueId,
 };
+use thiserror::Error;
 
 /// Error produced by [`validate_kernel_body`] when a kernel body or its [`KernelBoundaryContract`] violates the
 /// preserved-reference kernel boundary.
@@ -450,17 +446,12 @@ mod tests {
     use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
-
-    use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceTransformIndex, ArraySliceAxis, DataType,
+    use ryft_core::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceTransformIndex, ArraySliceAxis, CaptureReference,
+        ConditionOperation, DataType, Placeholder, Program, ProgramBuilder, ReferenceAddUpdateOperation,
+        ReferenceAnalysisError, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
     };
-    use crate::captures::CaptureReference;
-    use crate::operations::{
-        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder, ReferenceAnalysisError, ReferenceSource, ReferenceType};
 
     use super::*;
 

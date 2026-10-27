@@ -1,20 +1,16 @@
 //! Bounded generated interpreter cases and shrinking without additional property-testing dependencies.
 
 use pretty_assertions::assert_eq;
-
-use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-    DimensionValue,
+use ryft_core::{
+    Array, ArrayIrOperation, ArrayIrValue, ArrayType, Context, DataType, Dimension, DimensionBounds,
+    DimensionMulOperation, DimensionType, DimensionValue, Placeholder, ProgramBuilder, Typed,
 };
-use crate::contexts::Context;
-use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelParameter};
-use crate::kernels::grids::{Grid, GridDimension, GridExecution};
-use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-use crate::kernels::memory::{MaskedLoadOperation, MaskedStoreOperation};
-use crate::kernels::validation::KernelParameterAccess;
-use crate::operations::DimensionMulOperation;
-use crate::parameters::Placeholder;
-use crate::programs::{ProgramBuilder, Typed};
+
+use crate::calls::{KernelCallOperation, KernelDefinition, KernelParameter};
+use crate::grids::{Grid, GridDimension, GridExecution};
+use crate::mappings::{BlockMapping, BoundaryPolicy};
+use crate::memory::{MaskedLoadOperation, MaskedStoreOperation};
+use crate::validation::KernelParameterAccess;
 
 /// A well-typed masked copy with one repeated lane mask and independently initialized destination storage.
 #[derive(Clone, Debug, PartialEq, Eq)]

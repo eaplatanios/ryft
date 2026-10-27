@@ -9,33 +9,26 @@ use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
-use crate::arrays::{
+use ryft_core::macros::impl_guardless_operation;
+use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
-    DimensionOperation, DimensionType, DimensionValue,
-};
-use crate::contexts::{Context, Domain};
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::kernels::calls::{KernelCallOperation, KernelDefinition};
-use crate::kernels::indexing::TileLoadOperation;
-use crate::kernels::memory::{
-    AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation, WaitOperation,
-};
-use crate::kernels::validation::KernelReferenceOperation;
-use crate::macros::impl_guardless_operation;
-use crate::operations::{
-    ConditionOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-};
-use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
-};
-use crate::programs::{
-    Effects, ErasedOperation, InputRegionProvenance, Operation, OperationBoundaryPruning, OperationPayloadProjection,
-    OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
+    ConditionOperation, ConstantOperation, Context, DimensionOperation, DimensionSizeOperation, DimensionType,
+    DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation, InputRegionProvenance,
+    InterpretableOperation, InterpretationDriver, Operation, OperationBoundaryPruning, OperationPayloadProjection,
+    OperationProjection, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
     TypeIdentityRenaming,
 };
+
+use crate::calls::{KernelCallOperation, KernelDefinition};
+use crate::indexing::TileLoadOperation;
+use crate::memory::{
+    AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation, WaitOperation,
+};
+use crate::validation::KernelReferenceOperation;
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
 ///
@@ -68,7 +61,7 @@ pub enum KernelExtensionMemory {
 /// Implementations are trusted semantic contracts, not target admission. A compiler must still validate the exact
 /// architecture, instruction capabilities, and resource requirements before compiling an extension. Extensions are
 /// `'static` so that kernel interpretation can attach regions of any lifetime to the extended kernel operations
-/// through [`AttachedRegions`](crate::AttachedRegions).
+/// through [`AttachedRegions`](ryft_core::AttachedRegions).
 pub trait KernelExtension:
     ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> + 'static
 {
@@ -848,14 +841,23 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use pretty_assertions::assert_eq;
+    use std::cell::Cell;
 
-    use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionVariable};
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::macros::check_count;
-    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, ScanOperation, SubOperation, TagOperation};
-    use crate::programs::{AttachedRegions, EffectClasses, EmptyRegionDriver, ReferenceEffect, ReferenceType};
-    use crate::tracing::TracingContext;
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+    use ryft_core::macros::check_count;
+    use ryft_core::{
+        AddOperation, ArrayIrValue, ArrayReferenceTransformIndex, AttachedRegions, Condition, DataType, Dimension,
+        DimensionBounds, DimensionVariable, EagerContext, EffectClasses, EmptyRegionDriver, NegOperation,
+        PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder, ReferenceEffect, ReferenceRead,
+        ReferenceSwap, ReferenceType, ReferenceWrite, ScanOperation, Shape, StagingContext, SubOperation, TagOperation,
+        Tracer, TracingContext,
+    };
+
+    use crate::calls::KernelParameter;
+    use crate::grids::Grid;
+    use crate::mappings::{BlockMapping, BoundaryPolicy};
+    use crate::validation::KernelParameterAccess;
 
     use super::*;
 
@@ -1127,6 +1129,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_condition_region_interfaces() {
+        // Type inference and region-interface validation dispatch through the kernel wrapper exactly like through the
+        // bare `condition` operation that it wraps.
+        let bare = ConditionOperation::<ArrayIrType>::new();
+        let operation =
+            KernelOperation::<NoKernelExtension>::Portable(ArrayIrOperation::Condition(ConditionOperation::new()));
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dynamic_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let predicate_type = ArrayIrType::Array(ArrayType::scalar(DataType::Boolean));
+        let three_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let four_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [4]));
+
+        // The identity and constant branches declare different outputs, `f64[extent]` and `f64[3]`, which agree once an
+        // `f64[3]` input refines `f64[extent]`.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.clone());
+        let identity_branch = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(dynamic_type);
+        let output = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![2.0f64; 3]).unwrap()));
+        let constant_branch = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let interfaces = [identity_branch.interface(), constant_branch.interface()];
+        let refined_input_types = [predicate_type.clone(), three_type.clone()];
+        let mismatched_input_types = [predicate_type, four_type];
+        let mismatch =
+            TypeError::invalid("`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]");
+        assert_eq!(operation.infer_output_types(&refined_input_types, &interfaces), Ok(vec![three_type.clone()]));
+        assert_eq!(bare.infer_output_types(&refined_input_types, &interfaces), Ok(vec![three_type.clone()]));
+        assert_eq!(operation.infer_output_types(&mismatched_input_types, &interfaces), Err(mismatch.clone()));
+        assert_eq!(bare.infer_output_types(&mismatched_input_types, &interfaces), Err(mismatch));
+        assert_eq!(operation.validate_region_interfaces(&interfaces), Ok(()));
+        assert_eq!(bare.validate_region_interfaces(&interfaces), Ok(()));
+
+        // Branches must declare the same input types, even when refinement by the actual inputs would make them agree.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(three_type);
+        let static_identity_branch = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let interfaces = [identity_branch.interface(), static_identity_branch.interface()];
+        let expected = Err(ProgramError::Type(TypeError::invalid(
+            "`condition` branch input type signature mismatch: expected [f64[extent]] but got [f64[3]]",
+        )));
+        assert_eq!(operation.validate_region_interfaces(&interfaces), expected);
+        assert_eq!(bare.validate_region_interfaces(&interfaces), expected);
+    }
+
+    #[test]
     fn test_kernel_operation_region_data_flow() {
         let opaque = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
         let ordinary = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Condition(ConditionOperation::new()));
@@ -1188,6 +1255,70 @@ pub(crate) mod tests {
             ]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0f32, 7.0]).unwrap())]),
         );
+    }
+
+    #[test]
+    fn test_kernel_operation_condition() {
+        // `condition` serves the kernel operation family that the `#[kernel]` macro lowers Rust `if` statements to,
+        // tracing each branch function exactly once and selecting its result at runtime.
+        let true_calls = Cell::new(0);
+        let false_calls = Cell::new(0);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                inputs[0].condition(
+                    |inputs| {
+                        true_calls.set(true_calls.get() + 1);
+                        inputs[0].context().bind(
+                            ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())),
+                            Vec::new(),
+                            &[inputs[0].clone(), inputs[0].clone()],
+                        )
+                    },
+                    |inputs| {
+                        false_calls.set(false_calls.get() + 1);
+                        inputs[0].context().bind(
+                            ArrayIrOperation::<Array>::from(ArrayOperation::Neg(NegOperation::new())),
+                            Vec::new(),
+                            &inputs,
+                        )
+                    },
+                    vec![inputs[1].clone()],
+                )
+            },
+            vec![
+                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
+            ],
+        )
+        .unwrap();
+        assert_eq!((true_calls.get(), false_calls.get()), (1, 1));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:i64[] .
+                let %2:i64[] = condition %0 %1 [
+                    true={
+                        lambda %0:i64[] .
+                        let %1:i64[] = add %0 %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:i64[] .
+                        let %1:i64[] = neg %0
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+        for (predicate, expected) in [(true, 6i64), (false, -3i64)] {
+            assert_eq!(
+                program.interpret(vec![
+                    ArrayIrValue::Array(Array::scalar(predicate).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(3i64).unwrap()),
+                ]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(expected).unwrap())]),
+            );
+        }
     }
 
     #[test]
@@ -1306,18 +1437,9 @@ pub(crate) mod tests {
             )),
         );
     }
+
     #[test]
     fn test_kernel_operation_partially_evaluate() {
-        use crate::arrays::DimensionBounds;
-        use crate::kernels::calls::KernelParameter;
-        use crate::kernels::grids::Grid;
-        use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-        use crate::kernels::validation::KernelParameterAccess;
-        use crate::operations::ReferenceWrite;
-        use crate::parameters::Placeholder;
-        use crate::partial::{PartialEvaluationOutput, PartialValue};
-        use crate::programs::ProgramBuilder;
-
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
         let call = KernelCallOperation::new_with_prefetch(

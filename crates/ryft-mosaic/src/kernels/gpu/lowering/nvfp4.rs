@@ -360,12 +360,11 @@ impl<'c, 't> Lowering<'c, 't> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::whole_array_parameter;
-    use ryft_core::kernels::{
-        Grid, KernelCallOperation, KernelDefinition, KernelOperation, KernelParameterAccess, KernelSchedule,
-        VerifiedKernel,
-    };
     use ryft_core::{ArrayType, Context as CoreContext, ReferenceRead, ReferenceWrite};
+    use ryft_kernels::{
+        Grid, KernelCallOperation, KernelDefinition, KernelOperation, KernelParameterAccess, KernelSchedule,
+        VerifiedKernel, whole_array_parameter,
+    };
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_pass_manager;
     use ryft_mlir::{Context, DialectHandle, WalkOrder, WalkResult};
 

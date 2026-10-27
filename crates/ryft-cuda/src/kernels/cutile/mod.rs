@@ -11,10 +11,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ryft_core::kernels::{GridExecution, NoKernelExtension, VerifiedKernel};
 use ryft_core::{
     ArrayType, DataType, Dimension, Layout, Memory, MeshAxisType, ProgramError, ShardingDimension, TypeError, Typed,
 };
+use ryft_kernels::{GridExecution, NoKernelExtension, VerifiedKernel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -564,10 +564,8 @@ fn launch_grid(kernel: &VerifiedKernel<'_, NoKernelExtension>) -> Result<[u32; 3
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
-    };
     use ryft_core::{ReferenceRead, ReferenceWrite};
+    use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
 
     use super::*;
 

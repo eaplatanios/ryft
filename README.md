@@ -13,6 +13,8 @@ crate is an umbrella crate that re-exports functionality from a few different cr
   months. Today, the most complete and usable part of `ryft-core` is the
   [`Parameterized`](https://docs.rs/ryft-core/latest/ryft_core/parameters/trait.Parameterized.html) API.
 - **`ryft-macros`:** Procedural macros used by `ryft` and `ryft-core` (e.g., parameter-related derivation macros).
+- **`ryft-kernels`:** Portable kernel authoring, verification, and interpretation over `ryft-core` programs, plus the
+  `KernelCompiler` contract that native kernel compilers implement. The compiler adapters live in the backend crates.
 - **Backends:**
   - **`ryft-xla`:** XLA backend for `ryft`.
 - **Runtimes:**

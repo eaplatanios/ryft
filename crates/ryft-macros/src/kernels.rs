@@ -81,6 +81,23 @@ impl BodyMetadata {
     }
 }
 
+/// Paths through which generated code reaches the kernel namespace and the core crate that it re-exports.
+struct Paths {
+    /// Kernel namespace path, the `ryft` facade path `ryft::kernels` unless overridden by `crate = "path"`.
+    kernels: syn::Path,
+
+    /// Core crate path re-exported through the kernel namespace's private macro-support module.
+    core: TokenStream,
+}
+
+impl Paths {
+    /// Derives the core crate path from a kernel namespace path.
+    fn new(kernels: syn::Path) -> Self {
+        let core = quote!(#kernels::__private::core);
+        Self { kernels, core }
+    }
+}
+
 /// Expands one annotated function into a functional callable and an inspectable definition constructor.
 pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let function: ItemFn = syn::parse2(item)?;
@@ -98,7 +115,7 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
             "kernel functions must be safe, synchronous, non-generic, and return through output parameters",
         ));
     }
-    let mut core: syn::Path = syn::parse_quote!(::ryft_core);
+    let mut kernels: syn::Path = syn::parse_quote!(ryft::kernels);
     // Body attributes must not disappear when statements and expressions become tracing calls.
     /// Retains the first unsupported body attribute for a source-positioned diagnostic.
     struct BodyAttributes {
@@ -128,16 +145,18 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
             requirement = Some(attribute.value);
         } else if attribute.path.is_ident("crate") {
             let Expr::Lit(value) = attribute.value else {
-                return Err(syn::Error::new_spanned(attribute, "expected a crate path string"));
+                return Err(syn::Error::new_spanned(attribute, "expected a kernel namespace path string"));
             };
             let syn::Lit::Str(value) = value.lit else {
-                return Err(syn::Error::new_spanned(value, "expected a crate path string"));
+                return Err(syn::Error::new_spanned(value, "expected a kernel namespace path string"));
             };
-            core = value.parse()?;
+            kernels = value.parse()?;
         } else {
             return Err(syn::Error::new_spanned(attribute.path, "unsupported kernel attribute"));
         }
     }
+    let paths = Paths::new(kernels);
+    let Paths { kernels, core } = &paths;
     let mut names_seen = Vec::new();
     let mut inputs = Vec::new();
     let mut output = None;
@@ -260,21 +279,21 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
     let output =
         output.ok_or_else(|| syn::Error::new_spanned(&function.sig, "a kernel requires one output parameter"))?;
     let names = inputs.iter().map(|parameter| parameter.name.clone()).collect::<Vec<_>>();
-    let shape = metadata(output.shape.as_ref().unwrap(), &names, &core)?;
-    let requirement = requirement.as_ref().map(|expression| metadata(expression, &names, &core)).transpose()?;
+    let shape = metadata(output.shape.as_ref().unwrap(), &names, &paths)?;
+    let requirement = requirement.as_ref().map(|expression| metadata(expression, &names, &paths)).transpose()?;
     let checks = inputs.iter().map(|parameter| {
         let name = &parameter.name;
         let data_type = &parameter.data_type;
         let rank = parameter.rank.unwrap();
         let message = format!("kernel input `{name}` requires data type `{data_type}` and rank `{rank}`");
         quote! { if #name.data_type() != #core::arrays::DataType::#data_type || #name.rank() != #rank {
-            return Err(#core::kernels::KernelError::Type(#core::programs::TypeError::invalid(#message)));
+            return Err(#kernels::KernelError::Type(#core::programs::TypeError::invalid(#message)));
         } }
     });
     let require_check = requirement.map(|requirement| {
         quote! {
             if !(#requirement) {
-                return Err(#core::kernels::KernelError::Type(#core::programs::TypeError::invalid(
+                return Err(#kernels::KernelError::Type(#core::programs::TypeError::invalid(
                     "kernel shape requirement is not satisfied",
                 )));
             }
@@ -300,7 +319,7 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
         tiled: output.tile.is_some(),
         tiles: Vec::new(),
     };
-    let body = body(&function.block.stmts, &core, &mut bindings, &names, &mut body_metadata)?;
+    let body = body(&function.block.stmts, &paths, &mut bindings, &names, &mut body_metadata)?;
     let metadata_names = names.iter().map(|name| format_ident!("__kernel_{}_metadata", name)).collect::<Vec<_>>();
     let input_bindings = names
         .iter()
@@ -315,10 +334,10 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
         .filter(|attribute| attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr"));
     let types = names.iter().map(|name| format_ident!("__kernel_{}_type", name)).collect::<Vec<_>>();
     let operation = if let Some(tile) = &output.tile {
-        let tile = metadata(tile, &names, &core)?;
+        let tile = metadata(tile, &names, &paths)?;
         let boundary = match output.boundary.as_ref().unwrap().to_string().as_str() {
-            "masked" => quote!(#core::kernels::BoundaryPolicy::Masked),
-            "in_bounds" => quote!(#core::kernels::BoundaryPolicy::InBounds),
+            "masked" => quote!(#kernels::BoundaryPolicy::Masked),
+            "in_bounds" => quote!(#kernels::BoundaryPolicy::InBounds),
             _ => {
                 return Err(syn::Error::new_spanned(
                     output.boundary.as_ref().unwrap(),
@@ -326,26 +345,26 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
                 ));
             }
         };
-        quote!(#core::kernels::tiled_call(&[#(#names.clone()),*], __kernel_output_type, (#tile).to_vec(), #boundary)?)
+        quote!(#kernels::tiled_call(&[#(#names.clone()),*], __kernel_output_type, (#tile).to_vec(), #boundary)?)
     } else {
         quote!({
             let __kernel_parameters = vec![
-                #(#core::kernels::whole_array_parameter(
-                    #names.clone(), #core::kernels::KernelParameterAccess::ReadOnly,
+                #(#kernels::whole_array_parameter(
+                    #names.clone(), #kernels::KernelParameterAccess::ReadOnly,
                 )?,)*
-                #core::kernels::whole_array_parameter(
-                    __kernel_output_type, #core::kernels::KernelParameterAccess::WriteOnly,
+                #kernels::whole_array_parameter(
+                    __kernel_output_type, #kernels::KernelParameterAccess::WriteOnly,
                 )?,
             ];
-            #core::kernels::KernelCallOperation::new(
-                #core::kernels::Grid::new(vec![])?,
+            #kernels::KernelCallOperation::new(
+                #kernels::Grid::new(vec![])?,
                 __kernel_parameters,
             )?
         })
     };
     Ok(quote! {
         #(#attributes)*
-        #visibility fn #function_name<__KernelValue: #core::kernels::KernelCall>(#(#names: &__KernelValue),*)
+        #visibility fn #function_name<__KernelValue: #kernels::KernelCall>(#(#names: &__KernelValue),*)
             -> ::core::result::Result<__KernelValue, #core::programs::ProgramError>
         {
             #(let #types = #core::programs::Typed::r#type(#names);)*
@@ -365,7 +384,7 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
         #visibility mod #function_name {
             /// Validates the full signature, then traces one whole-array kernel body through Ryft.
             pub fn definition(#(#names: &#core::arrays::ArrayType),*)
-                -> ::core::result::Result<#core::kernels::KernelDefinition, #core::kernels::KernelError>
+                -> ::core::result::Result<#kernels::KernelDefinition, #kernels::KernelError>
             {
                 #(#checks)*
                 #require_check
@@ -374,7 +393,7 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
                 );
                 let __kernel_operation = #operation;
                 #(let #metadata_names = #names.clone();)*
-                #core::kernels::KernelDefinition::trace(__kernel_operation,
+                #kernels::KernelDefinition::trace(__kernel_operation,
                     |(__kernel_references, __kernel_coordinates)| {
                     use #core::contexts::Context as _;
                     let __kernel_context = __kernel_references[0].context().clone();
@@ -389,33 +408,34 @@ pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<
 }
 
 /// Lowers pure shape metadata, rejecting host callbacks and checking every shape index.
-fn metadata(expression: &Expr, inputs: &[Ident], core: &syn::Path) -> syn::Result<TokenStream> {
-    shape_metadata(expression, inputs, core, false)
+fn metadata(expression: &Expr, inputs: &[Ident], paths: &Paths) -> syn::Result<TokenStream> {
+    shape_metadata(expression, inputs, paths, false)
 }
 
 /// Shape metadata inside a trace uses captured immutable type descriptors and preserves typed errors.
-fn shape_metadata(expression: &Expr, inputs: &[Ident], core: &syn::Path, in_trace: bool) -> syn::Result<TokenStream> {
+fn shape_metadata(expression: &Expr, inputs: &[Ident], paths: &Paths, in_trace: bool) -> syn::Result<TokenStream> {
+    let Paths { kernels, core } = paths;
     match expression {
         Expr::Lit(value) => Ok(quote!(#value)),
         Expr::Array(array) => {
             let elements = array
                 .elems
                 .iter()
-                .map(|element| shape_metadata(element, inputs, core, in_trace))
+                .map(|element| shape_metadata(element, inputs, paths, in_trace))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(quote!([#(#elements),*]))
         }
         Expr::Paren(value) => {
-            let value = shape_metadata(&value.expr, inputs, core, in_trace)?;
+            let value = shape_metadata(&value.expr, inputs, paths, in_trace)?;
             Ok(quote!((#value)))
         }
         Expr::Group(value) => {
-            let value = shape_metadata(&value.expr, inputs, core, in_trace)?;
+            let value = shape_metadata(&value.expr, inputs, paths, in_trace)?;
             Ok(quote!((#value)))
         }
         Expr::Binary(binary) => {
-            let left = shape_metadata(&binary.left, inputs, core, in_trace)?;
-            let right = shape_metadata(&binary.right, inputs, core, in_trace)?;
+            let left = shape_metadata(&binary.left, inputs, paths, in_trace)?;
+            let right = shape_metadata(&binary.right, inputs, paths, in_trace)?;
             let operator = &binary.op;
             if !matches!(
                 operator,
@@ -454,19 +474,19 @@ fn shape_metadata(expression: &Expr, inputs: &[Ident], core: &syn::Path, in_trac
             }
             if in_trace {
                 let name = format_ident!("__kernel_{}_metadata", name);
-                Ok(quote!(#core::kernels::static_extent(&#name, #axis).map_err(#core::programs::ProgramError::custom)?))
+                Ok(quote!(#kernels::static_extent(&#name, #axis).map_err(#core::programs::ProgramError::custom)?))
             } else {
-                Ok(quote!(#core::kernels::static_extent(#name, #axis)?))
+                Ok(quote!(#kernels::static_extent(#name, #axis)?))
             }
         }
         Expr::MethodCall(call) if call.method == "div_ceil" && call.args.len() == 1 && call.turbofish.is_none() => {
-            let extent = shape_metadata(&call.receiver, inputs, core, in_trace)?;
-            let divisor = shape_metadata(&call.args[0], inputs, core, in_trace)?;
+            let extent = shape_metadata(&call.receiver, inputs, paths, in_trace)?;
+            let divisor = shape_metadata(&call.args[0], inputs, paths, in_trace)?;
             if in_trace {
-                Ok(quote!(#core::kernels::shape_div_ceil(#extent, #divisor)
+                Ok(quote!(#kernels::shape_div_ceil(#extent, #divisor)
                         .map_err(#core::programs::ProgramError::custom)?))
             } else {
-                Ok(quote!(#core::kernels::shape_div_ceil(#extent, #divisor)?))
+                Ok(quote!(#kernels::shape_div_ceil(#extent, #divisor)?))
             }
         }
         _ => Err(syn::Error::new_spanned(expression, "unsupported shape metadata expression")),
@@ -476,11 +496,12 @@ fn shape_metadata(expression: &Expr, inputs: &[Ident], core: &syn::Path, in_trac
 /// Lowers supported statements to fallible canonical staging calls; host control flow never executes by accident.
 fn body(
     statements: &[Stmt],
-    core: &syn::Path,
+    paths: &Paths,
     bindings: &mut Vec<Binding>,
     inputs: &[Ident],
     metadata: &mut BodyMetadata,
 ) -> syn::Result<TokenStream> {
+    let Paths { kernels, core } = paths;
     let mut output = TokenStream::new();
     for statement in statements {
         let tokens = match statement {
@@ -585,7 +606,7 @@ fn body(
                     });
                     continue;
                 }
-                let value = value(&initializer.expr, core, inputs, metadata)?;
+                let value = value(&initializer.expr, paths, inputs, metadata)?;
                 bindings.retain(|binding| binding.name != pattern.ident);
                 bindings.push(Binding { name: pattern.ident.clone(), mutable: pattern.mutability.is_some() });
                 quote!(let #pattern = #value;)
@@ -594,7 +615,7 @@ fn body(
                 let Expr::Path(name) = assignment.left.as_ref() else {
                     return Err(syn::Error::new_spanned(assignment, "kernel assignment requires a local name"));
                 };
-                let value = value(&assignment.right, core, inputs, metadata)?;
+                let value = value(&assignment.right, paths, inputs, metadata)?;
                 quote!(#name = #value;)
             }
             Stmt::Expr(Expr::Binary(binary), _)
@@ -613,7 +634,7 @@ fn body(
                     BinOp::MulAssign(_) => syn::parse_quote!(#name * #right),
                     _ => syn::parse_quote!(#name / #right),
                 };
-                let value = value(&expression, core, inputs, metadata)?;
+                let value = value(&expression, paths, inputs, metadata)?;
                 quote!(#name = #value;)
             }
             Stmt::Expr(Expr::ForLoop(loop_expression), _) => {
@@ -638,8 +659,8 @@ fn body(
                         "kernel loops require an unlabeled half-open range",
                     ));
                 }
-                let start = shape_metadata(start, inputs, core, true)?;
-                let end = shape_metadata(end, inputs, core, true)?;
+                let start = shape_metadata(start, inputs, paths, true)?;
+                let end = shape_metadata(end, inputs, paths, true)?;
                 let names = bindings.iter().map(|binding| &binding.name).collect::<Vec<_>>();
                 if names.contains(&&index.ident)
                     || metadata.tiles.iter().any(|tile| tile.name == index.ident)
@@ -657,14 +678,14 @@ fn body(
                 let restoration = restore_bindings(bindings);
                 let mut nested = bindings.clone();
                 nested.push(Binding { name: index.ident.clone(), mutable: false });
-                let body = body(&loop_expression.body.stmts, core, &mut nested, inputs, &mut metadata.in_region())?;
+                let body = body(&loop_expression.body.stmts, paths, &mut nested, inputs, &mut metadata.in_region())?;
                 let source_scope = quote_spanned!(loop_expression.span()=> #core::programs::ProvenanceScope::new(
                     format!("{}:{}:{}", file!(), line!(), column!()),
                 ));
                 let index = &index.ident;
                 quote! {
                     let __kernel_carried = __kernel_context.invoke_with_provenance_scope(#source_scope,
-                        || #core::kernels::for_loop(&__kernel_context, #start..#end,
+                        || #kernels::for_loop(&__kernel_context, #start..#end,
                         vec![#(#names.clone()),*], |#index, __kernel_values| {
                             let __kernel_context = #index.context().clone();
                             #initialization
@@ -675,20 +696,25 @@ fn body(
                 }
             }
             Stmt::Expr(Expr::If(condition), _) => {
-                let predicate = value(&condition.cond, core, inputs, metadata)?;
+                let predicate = value(&condition.cond, paths, inputs, metadata)?;
                 let names = bindings.iter().map(|binding| &binding.name).collect::<Vec<_>>();
                 let initialization = initialize_bindings(bindings);
                 let restoration = restore_bindings(bindings);
-                let then_body =
-                    body(&condition.then_branch.stmts, core, &mut bindings.clone(), inputs, &mut metadata.in_region())?;
+                let then_body = body(
+                    &condition.then_branch.stmts,
+                    paths,
+                    &mut bindings.clone(),
+                    inputs,
+                    &mut metadata.in_region(),
+                )?;
                 let else_body = if let Some((_, branch)) = &condition.else_branch {
                     match branch.as_ref() {
                         Expr::Block(block) => {
-                            body(&block.block.stmts, core, &mut bindings.clone(), inputs, &mut metadata.in_region())?
+                            body(&block.block.stmts, paths, &mut bindings.clone(), inputs, &mut metadata.in_region())?
                         }
                         Expr::If(_) => body(
                             &[Stmt::Expr(branch.as_ref().clone(), None)],
-                            core,
+                            paths,
                             &mut bindings.clone(),
                             inputs,
                             &mut metadata.in_region(),
@@ -731,7 +757,7 @@ fn body(
                 }
             }
             Stmt::Expr(expression, _) => {
-                let value = value(expression, core, inputs, metadata)?;
+                let value = value(expression, paths, inputs, metadata)?;
                 quote!(#value;)
             }
             _ => {
@@ -766,8 +792,9 @@ fn restore_bindings(bindings: &[Binding]) -> TokenStream {
 }
 
 /// Rewrites expressions to existing capability operations while retaining source spans for Rust diagnostics.
-fn value(expression: &Expr, core: &syn::Path, inputs: &[Ident], metadata: &BodyMetadata) -> syn::Result<TokenStream> {
-    let generated = value_inner(expression, core, inputs, metadata)?;
+fn value(expression: &Expr, paths: &Paths, inputs: &[Ident], metadata: &BodyMetadata) -> syn::Result<TokenStream> {
+    let core = &paths.core;
+    let generated = value_inner(expression, paths, inputs, metadata)?;
     let span = expression.span();
     Ok(quote_spanned!(span=> __kernel_context.invoke_with_provenance_scope(
         #core::programs::ProvenanceScope::new(format!("{}:{}:{}", file!(), line!(), column!())),
@@ -778,14 +805,15 @@ fn value(expression: &Expr, core: &syn::Path, inputs: &[Ident], metadata: &BodyM
 /// Lowers one expression before adding its canonical source provenance scope.
 fn value_inner(
     expression: &Expr,
-    core: &syn::Path,
+    paths: &Paths,
     inputs: &[Ident],
     metadata: &BodyMetadata,
 ) -> syn::Result<TokenStream> {
+    let Paths { kernels, core } = paths;
     let span = expression.span();
     match expression {
         Expr::Path(path) if path.path.get_ident().is_some() => Ok(quote_spanned!(span=> #path.clone())),
-        Expr::Paren(value_expression) => value(&value_expression.expr, core, inputs, metadata),
+        Expr::Paren(value_expression) => value(&value_expression.expr, paths, inputs, metadata),
         Expr::MethodCall(call) => {
             if call.turbofish.is_some() {
                 return Err(syn::Error::new_spanned(
@@ -804,9 +832,9 @@ fn value_inner(
                 let indices = indices
                     .elems
                     .iter()
-                    .map(|index| value(index, core, inputs, metadata))
+                    .map(|index| value(index, paths, inputs, metadata))
                     .collect::<syn::Result<Vec<_>>>()?;
-                let shape = shape_metadata(&tile.shape, inputs, core, true)?;
+                let shape = shape_metadata(&tile.shape, inputs, paths, true)?;
                 let source = &tile.source;
                 let other = &tile.other;
                 if !matches!(other, Expr::Lit(_))
@@ -835,19 +863,19 @@ fn value_inner(
                         ));
                     }
                 };
-                return Ok(quote_spanned!(span=> #core::kernels::tile_load::<#element, _>(
+                return Ok(quote_spanned!(span=> #kernels::tile_load::<#element, _>(
                         &__kernel_context, &#source, (#shape).to_vec(), &[#(#indices),*], #other,
                     )?));
             }
-            let receiver = value(&call.receiver, core, inputs, metadata)?;
+            let receiver = value(&call.receiver, paths, inputs, metadata)?;
             match call.method.to_string().as_str() {
                 "load" if call.args.is_empty() => {
                     Ok(quote_spanned!(span=> #core::operations::ReferenceRead::read(&(#receiver))?))
                 }
                 "store" if call.args.len() == 1 => {
-                    let replacement = value(&call.args[0], core, inputs, metadata)?;
+                    let replacement = value(&call.args[0], paths, inputs, metadata)?;
                     if metadata.tiled {
-                        Ok(quote_spanned!(span=> #core::kernels::tile_store(
+                        Ok(quote_spanned!(span=> #kernels::tile_store(
                                 &__kernel_context, &(#receiver), &(#replacement),
                             )?))
                     } else {
@@ -857,8 +885,8 @@ fn value_inner(
                     }
                 }
                 "dot" if call.args.len() == 1 => {
-                    let right = value(&call.args[0], core, inputs, metadata)?;
-                    Ok(quote_spanned!(span=> #core::kernels::dot(&(#receiver), &(#right))?))
+                    let right = value(&call.args[0], paths, inputs, metadata)?;
+                    Ok(quote_spanned!(span=> #kernels::dot(&(#receiver), &(#right))?))
                 }
                 "sum" if call.args.len() == 1 => {
                     let Expr::Array(axes) = &call.args[0] else {
@@ -907,12 +935,12 @@ fn value_inner(
                 return Err(syn::Error::new_spanned(arguments, "kernel zeros requires one element type"));
             }
             let element_type = &arguments.args[0];
-            let shape = shape_metadata(&call.args[0], inputs, core, true)?;
-            Ok(quote_spanned!(span=> #core::kernels::zeros::<#element_type, _>(&__kernel_context, #shape)?))
+            let shape = shape_metadata(&call.args[0], inputs, paths, true)?;
+            Ok(quote_spanned!(span=> #kernels::zeros::<#element_type, _>(&__kernel_context, #shape)?))
         }
         Expr::Binary(binary) => {
-            let left = value(&binary.left, core, inputs, metadata)?;
-            let right = value(&binary.right, core, inputs, metadata)?;
+            let left = value(&binary.left, paths, inputs, metadata)?;
+            let right = value(&binary.right, paths, inputs, metadata)?;
             let (variant, operation) = match binary.op {
                 BinOp::Add(_) => (format_ident!("Add"), format_ident!("AddOperation")),
                 BinOp::Sub(_) => (format_ident!("Sub"), format_ident!("SubOperation")),
@@ -942,13 +970,14 @@ fn value_inner(
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use quote::ToTokens;
 
     use super::*;
 
     #[test]
     fn test_expand() {
         let expanded = expand(
-            quote!(crate = "core_alias", requires = left.shape()[0] == right.shape()[0]),
+            quote!(crate = "kernels_alias", requires = left.shape()[0] == right.shape()[0]),
             quote! {
                 pub fn add(
                     #[input(data_type = F32, rank = 1)] left: &Array,
@@ -965,6 +994,15 @@ mod tests {
         };
         assert_eq!(function.sig.ident, "add");
         assert_eq!(function.sig.inputs.len(), 2);
+        assert_eq!(
+            function.sig.generics.to_token_stream().to_string(),
+            quote!(<__KernelValue: kernels_alias::KernelCall>).to_string(),
+        );
+        assert_eq!(
+            function.sig.output.to_token_stream().to_string(),
+            quote!(-> ::core::result::Result<__KernelValue, kernels_alias::__private::core::programs::ProgramError>)
+                .to_string(),
+        );
         let syn::Item::Mod(module) = &file.items[1] else {
             panic!("expected definition module");
         };
@@ -974,6 +1012,40 @@ mod tests {
         };
         assert_eq!(definition.sig.ident, "definition");
         assert_eq!(definition.sig.inputs.len(), 2);
+        assert_eq!(
+            definition.sig.inputs[0].to_token_stream().to_string(),
+            quote!(left: &kernels_alias::__private::core::arrays::ArrayType).to_string(),
+        );
+        assert_eq!(
+            definition.sig.output.to_token_stream().to_string(),
+            quote!(-> ::core::result::Result<kernels_alias::KernelDefinition, kernels_alias::KernelError>).to_string(),
+        );
+    }
+
+    #[test]
+    fn test_expand_default_namespace() {
+        let expanded = expand(
+            quote!(),
+            quote! {
+                fn zero(#[output(data_type = F32, shape = [2])] output: &mut Array) {
+                    output.store(zeros::<f32>([2]));
+                }
+            },
+        )
+        .unwrap();
+        let file: syn::File = syn::parse2(expanded).unwrap();
+        let syn::Item::Fn(function) = &file.items[0] else {
+            panic!("expected generated callable");
+        };
+        assert_eq!(
+            function.sig.generics.to_token_stream().to_string(),
+            quote!(<__KernelValue: ryft::kernels::KernelCall>).to_string(),
+        );
+        assert_eq!(
+            function.sig.output.to_token_stream().to_string(),
+            quote!(-> ::core::result::Result<__KernelValue, ryft::kernels::__private::core::programs::ProgramError>)
+                .to_string(),
+        );
     }
 
     #[test]
@@ -1144,13 +1216,17 @@ mod tests {
         let group = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(32));
         let expression: Expr = syn::parse2(TokenStream::from(proc_macro2::TokenTree::Group(group))).unwrap();
         assert_eq!(
-            shape_metadata(&expression, &[], &syn::parse_quote!(::ryft_core), true).unwrap().to_string(),
+            shape_metadata(&expression, &[], &Paths::new(syn::parse_quote!(ryft::kernels)), true)
+                .unwrap()
+                .to_string(),
             "(32)"
         );
         let group = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(host_callback()));
         let expression: Expr = syn::parse2(TokenStream::from(proc_macro2::TokenTree::Group(group))).unwrap();
         assert_eq!(
-            shape_metadata(&expression, &[], &syn::parse_quote!(::ryft_core), true).unwrap_err().to_string(),
+            shape_metadata(&expression, &[], &Paths::new(syn::parse_quote!(ryft::kernels)), true)
+                .unwrap_err()
+                .to_string(),
             "unsupported shape metadata expression"
         );
     }

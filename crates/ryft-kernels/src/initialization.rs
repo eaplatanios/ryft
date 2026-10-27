@@ -9,22 +9,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use ryft_core::{
+    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
+    ArrayReferenceTransformPath, ArraySliceAxis, ArrayType, Atom, AtomId, DataType, Dimension, DimensionValue,
+    InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceRoot, ReferenceType,
+    ReferenceViewOverlap, RegionRef, Typed, ValueId,
+};
 use thiserror::Error;
 
-use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
-    ArrayReferenceTransformPath, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionValue,
-};
-use crate::kernels::calls::{KernelCallOperation, KernelError};
-use crate::kernels::grids::GridExecution;
-use crate::kernels::mappings::{BlockMappingError, BoundaryPolicy};
-use crate::kernels::memory::KernelMemoryError;
-use crate::kernels::operations::{KernelExtension, KernelExtensionMemory, KernelOperation};
-use crate::kernels::validation::{KernelParameterAccess, KernelReferenceSummary, KernelSwapLowering};
-use crate::programs::{
-    Atom, AtomId, InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceRoot,
-    ReferenceType, ReferenceViewOverlap, RegionRef, Typed, ValueId,
-};
+use crate::calls::{KernelCallOperation, KernelError};
+use crate::grids::GridExecution;
+use crate::mappings::{BlockMappingError, BoundaryPolicy};
+use crate::memory::KernelMemoryError;
+use crate::operations::{KernelExtension, KernelExtensionMemory, KernelOperation};
+use crate::validation::{KernelParameterAccess, KernelReferenceSummary, KernelSwapLowering};
 
 /// A body or launch lacks a definite initialization or disjointness proof.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -879,27 +877,23 @@ fn intersect_states(
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-
-    use crate::arrays::{
-        ArrayOperation, ArrayReferenceTransformIndex, ArraySliceAxis, DataType, DimensionBounds, DimensionType,
+    use ryft_core::{
+        ArrayOperation, ArrayReferenceTransformIndex, ArraySliceAxis, ConditionOperation, DataType,
+        DimensionAddOperation, DimensionBounds, DimensionMulOperation, DimensionType, EagerContext, FlatProgram,
+        NotOperation, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation, WhileOperation,
     };
-    use crate::contexts::EagerContext;
-    use crate::kernels::calls::KernelParameter;
-    use crate::kernels::grids::{Grid, GridDimension, GridExecution};
-    use crate::kernels::mappings::BlockMapping;
-    use crate::kernels::memory::{
+
+    use crate::calls::KernelParameter;
+    use crate::grids::{Grid, GridDimension, GridExecution};
+    use crate::mappings::BlockMapping;
+    use crate::memory::{
         AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation,
         WaitOperation,
     };
-    use crate::kernels::operations::NoKernelExtension;
-    use crate::kernels::operations::tests::TestExtension;
-    use crate::operations::{
-        ConditionOperation, DimensionAddOperation, DimensionMulOperation, NotOperation, ReferenceAddUpdateOperation,
-        ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceWriteOperation, WhileOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, ProgramBuilder};
+    use crate::operations::NoKernelExtension;
+    use crate::operations::tests::TestExtension;
 
     use super::*;
 
@@ -2311,7 +2305,7 @@ mod tests {
 
     #[test]
     fn test_intersect_states() {
-        let root = ReferenceRoot::RegionInput { region: crate::programs::RegionId::new(0), input_index: 0 };
+        let root = ReferenceRoot::RegionInput { region: ryft_core::programs::RegionId::new(0), input_index: 0 };
         assert_eq!(
             intersect_states(BTreeMap::from([(root, vec![0..4, 6..10])]), &BTreeMap::from([(root, vec![2..8])])),
             BTreeMap::from([(root, vec![2..4, 6..8])]),

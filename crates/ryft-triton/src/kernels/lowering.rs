@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 
-use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation,
     DimensionValue, DotDimensionNumbers, Layout, Memory, Operation as CoreOperation, ReductionKind,
     ReferenceAccessOperation, RegionRef, Typed, validated_reference_access_descriptors,
 };
+use ryft_kernels::{GridExecution, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_mlir::dialects::{arith, scf, triton::tt};
 use ryft_mlir::{
     Block, Context, DetachedBlock, DetachedOp, DialectHandle, Module, Operation, Size, Type, TypeRef,
@@ -338,7 +338,7 @@ impl<'c, 't> Lowering<'c, 't> {
     fn mapping(
         &mut self,
         block: &mut DetachedBlock<'c, 't>,
-        mapping: &ryft_core::kernels::BlockMapping,
+        mapping: &ryft_kernels::BlockMapping,
         inputs: &[Native<'c, 't>],
     ) -> Result<Vec<Native<'c, 't>>, Error> {
         let program = mapping.program();
@@ -1141,16 +1141,14 @@ fn unsupported(operation: &'static str, reason: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
-    };
     use ryft_core::{ArraySliceAxis, Placeholder, ProgramBuilder, ReferenceReadOperation, ReferenceWriteOperation};
+    use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
     use ryft_mlir::{OpRef, Region};
 
     use super::*;
 
     /// Covers global windows and the partially populated final tile through the public macro.
-    #[ryft_core::kernels::kernel(requires = left.shape()[0] == right.shape()[0])]
+    #[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[0] == right.shape()[0])]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -1163,7 +1161,7 @@ mod tests {
     }
 
     /// Covers physical padding in an odd-length reduction.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn sum(
         #[input(data_type = F32, rank = 1)] input: &Array,
         #[output(data_type = F32, shape = [])] output: &mut Array,
@@ -1172,7 +1170,7 @@ mod tests {
     }
 
     /// Covers invariant global references and an ordinary tile accumulator in a bounded loop.
-    #[ryft_core::kernels::kernel(requires = left.shape()[1] == right.shape()[0])]
+    #[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[1] == right.shape()[0])]
     fn matrix(
         #[input(data_type = F32, rank = 2)] left: &Array,
         #[input(data_type = F32, rank = 2)] right: &Array,
@@ -1190,11 +1188,9 @@ mod tests {
     }
 
     /// The condition writes one and the body writes two; a bound of one must leave two in the output.
-    fn condition_write_definition() -> ryft_core::kernels::KernelDefinition {
-        use ryft_core::kernels::{
-            Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
-        };
+    fn condition_write_definition() -> ryft_kernels::KernelDefinition {
         use ryft_core::{Placeholder, ProgramBuilder, ReferenceWriteOperation, WhileOperation};
+        use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
 
         let call = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),

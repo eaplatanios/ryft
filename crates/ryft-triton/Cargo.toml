@@ -11,6 +11,7 @@ license.workspace = true
 
 [dependencies]
 ryft-core.workspace = true
+ryft-kernels.workspace = true
 ryft-cuda.workspace = true
 ryft-mlir.workspace = true
 ryft-rocm.workspace = true

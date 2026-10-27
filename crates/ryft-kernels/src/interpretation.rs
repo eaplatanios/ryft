@@ -16,9 +16,8 @@
 //! canonical operations; diagnostics do not substitute a wider-precision execution model.
 //!
 //! ```
-//! use ryft_core::arrays::Array;
-//! use ryft_core::kernels::{KernelDebugOptions, KernelDefinition};
-//! use ryft_core::programs::ProgramError;
+//! use ryft_core::{Array, ProgramError};
+//! use ryft_kernels::{KernelDebugOptions, KernelDefinition};
 //!
 //! # fn inspect(definition: &KernelDefinition, inputs: Vec<Array>) -> Result<(), ProgramError> {
 //! let options = KernelDebugOptions { check_nans: true, maximum_steps: 10_000, ..Default::default() };
@@ -38,27 +37,21 @@ use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 
 use num_complex::Complex;
+use ryft_core::{
+    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+    ArraySliceAxis, ArrayType, AttachedRegions, Context, DataType, DimensionValue, Domain, EagerContext,
+    EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, Operation, ProgramError, Provenance,
+    ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, RegionDriver, RegionInterpreter, RegionRef,
+    TypeError, Typed, ValueResolution, Zero, validated_reference_access_descriptors,
+};
 use thiserror::Error;
 
-use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-    ArraySliceAxis, ArrayType, DataType, DimensionValue,
-};
-use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
-use crate::interpretation::{
-    EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, RegionInterpreter,
-};
-use crate::kernels::calls::{KernelCallOperation, KernelDefinition};
-use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
-use crate::kernels::mappings::BoundaryPolicy;
-use crate::kernels::memory::{KernelMemoryError, ScratchOperation};
-use crate::kernels::operations::{KernelExtension, KernelOperation};
-use crate::kernels::validation::KernelParameterAccess;
-use crate::operations::Zero;
-use crate::programs::{
-    AttachedRegions, Operation, ProgramError, Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode,
-    ReferenceId, RegionDriver, RegionRef, TypeError, Typed, validated_reference_access_descriptors,
-};
+use crate::calls::{KernelCallOperation, KernelDefinition};
+use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
+use crate::mappings::BoundaryPolicy;
+use crate::memory::{KernelMemoryError, ScratchOperation};
+use crate::operations::{KernelExtension, KernelOperation};
+use crate::validation::KernelParameterAccess;
 
 /// Host debugging limits exceeded while replaying a kernel; these limits do not alter its device semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -197,7 +190,7 @@ struct KernelTraceState {
 pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS: usize = 1_000_000;
 
 /// Maximum number of logical programs qualified by an ordinary
-/// [`Program::interpret`](crate::programs::Program::interpret) kernel call. [`KernelDefinition::interpret`] accepts
+/// [`Program::interpret`](ryft_core::programs::Program::interpret) kernel call. [`KernelDefinition::interpret`] accepts
 /// an explicit budget for larger debug launches. This is a host resource limit, not part of a kernel's semantic
 /// identity or a device launch limit.
 pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS: usize = 10_000;
@@ -967,31 +960,24 @@ where
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-
-    use crate::arrays::{
-        ArrayIrOperation, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        Layout, Memory, StridedLayout,
+    use ryft_core::operations::attention::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature};
+    use ryft_core::{
+        AddOperation, ArrayIrOperation, ArrayReferenceTransformIndex, ArrayType, ConditionOperation, Context, DataType,
+        Dimension, DimensionBounds, DimensionMulOperation, DimensionToScalarOperation, DimensionType,
+        DotProductAttentionOperation, Layout, Memory, Placeholder, ProgramBuilder, ReduceOperation, ReductionKind,
+        ReferenceRead, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, StridedLayout, TracingContext,
+        WhileOperation,
     };
-    use crate::contexts::Context;
-    use crate::kernels::authoring::whole_array_parameter;
-    use crate::kernels::calls::KernelParameter;
-    use crate::kernels::grids::{Grid, GridDimension, GridExecution};
-    use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-    use crate::kernels::memory::{
+
+    use crate::authoring::whole_array_parameter;
+    use crate::calls::KernelParameter;
+    use crate::grids::{Grid, GridDimension, GridExecution};
+    use crate::mappings::{BlockMapping, BoundaryPolicy};
+    use crate::memory::{
         AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, WaitOperation,
     };
-    use crate::kernels::operations::NoKernelExtension;
-    use crate::kernels::operations::tests::TestExtension;
-    use crate::operations::attention::{
-        AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionOperation,
-    };
-    use crate::operations::{
-        AddOperation, ConditionOperation, DimensionMulOperation, DimensionToScalarOperation, ReduceOperation,
-        ReductionKind, ReferenceRead, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, WhileOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::ProgramBuilder;
-    use crate::tracing::TracingContext;
+    use crate::operations::NoKernelExtension;
+    use crate::operations::tests::TestExtension;
 
     use super::*;
 

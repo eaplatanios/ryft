@@ -8,8 +8,8 @@
 //! The `10.1` target spelling is restricted to the pinned CUDA 12.9 runtime; `11.0` requires the pinned CUDA 13.2
 //! runtime and PTX 9.0. These target names are checked against actual device facts rather than silently normalized.
 
-use ryft_core::kernels::{KernelExtension, KernelParameterAccess, VerifiedKernel};
 use ryft_core::{CustomCallOperation, EffectClass, Typed};
+use ryft_kernels::{KernelExtension, KernelParameterAccess, VerifiedKernel};
 use ryft_mosaic::kernels::gpu::{CompiledKernel, Target};
 use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
     MOSAIC_GPU_FFI_TARGET, MOSAIC_GPU_RESOURCE_SCHEMA_VERSION, MOSAIC_GPU_SERDE_VERSION,
@@ -155,8 +155,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
     use ryft_core::{ArrayType, CustomCallAttribute, DataType};
+    use ryft_kernels::{KernelSchedule, VerifiedKernel};
     use ryft_mosaic::kernels::gpu::{Compiler, Options};
 
     use crate::kernels::staging::XlaKernelDeviceFacts;
@@ -224,13 +224,13 @@ mod tests {
 
     #[test]
     fn test_mosaic_gpu_embedding_custom_call_preserves_assertions() {
-        use ryft_core::kernels::{
-            Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, NoKernelExtension,
-            whole_array_parameter,
-        };
         use ryft_core::{
             ArrayIrOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable, ReferenceRead,
             ReferenceWrite,
+        };
+        use ryft_kernels::{
+            Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, NoKernelExtension,
+            whole_array_parameter,
         };
         let call = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),

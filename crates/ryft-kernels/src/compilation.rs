@@ -6,13 +6,12 @@
 
 use std::num::NonZeroUsize;
 
+use ryft_core::{ArrayIrType, Operation};
 use thiserror::Error;
 
-use crate::arrays::ArrayIrType;
-use crate::kernels::calls::KernelDefinition;
-use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
-use crate::kernels::operations::{KernelExtension, NoKernelExtension};
-use crate::programs::Operation;
+use crate::calls::KernelDefinition;
+use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
+use crate::operations::{KernelExtension, NoKernelExtension};
 
 /// Compiler admission and invocation failures, distinct from invalid core semantics.
 #[derive(Debug, Error)]
@@ -54,8 +53,8 @@ pub enum KernelCompilationError<E: std::error::Error> {
 /// These hints never define execution-agent membership, synchronization, atomics, or numerical precision. Those
 /// remain semantic operations and cannot be erased with a schedule. Adapters may ignore a performance hint or reject
 /// an unavailable resource budget, but must not change kernel results. Target-specific layouts belong to adapter
-/// options. Portable [`Layout`](crate::arrays::Layout) and [`Memory`](crate::arrays::Memory) constraints use the
-/// existing [`ArrayType`](crate::arrays::ArrayType) metadata, including scratch types; no parallel placement or
+/// options. Portable [`Layout`](ryft_core::Layout) and [`Memory`](ryft_core::Memory) constraints use the
+/// existing [`ArrayType`](ryft_core::arrays::ArrayType) metadata, including scratch types; no parallel placement or
 /// layout descriptor is introduced. Those type constraints retain their ordinary meaning when hints are erased.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct KernelSchedule {
@@ -208,14 +207,14 @@ mod tests {
     use std::convert::Infallible;
 
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, ProgramBuilder, ReferenceRead, ReferenceWrite,
+    };
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType};
-    use crate::kernels::calls::{KernelCallOperation, KernelParameter};
-    use crate::kernels::grids::Grid;
-    use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
-    use crate::kernels::validation::KernelParameterAccess;
-    use crate::operations::{ReferenceRead, ReferenceWrite};
-    use crate::programs::ProgramBuilder;
+    use crate::calls::{KernelCallOperation, KernelParameter};
+    use crate::grids::Grid;
+    use crate::mappings::{BlockMapping, BoundaryPolicy};
+    use crate::validation::KernelParameterAccess;
 
     use super::*;
 

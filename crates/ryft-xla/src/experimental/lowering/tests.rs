@@ -1229,8 +1229,8 @@ fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
 
 #[test]
 fn test_xla_lowering_rejects_preserved_reference_entries() {
-    use ryft_core::kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_core::{ReferenceReadOperation, ReferenceType};
+    use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
 
     let mut builder = ArrayIrXlaProgramBuilder::new();
     let scalar_type = ArrayType::scalar(DataType::F32);

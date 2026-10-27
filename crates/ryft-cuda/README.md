@@ -94,16 +94,16 @@ but slow module operations can delay other partitions.
 
 ## Optional cuTile Compiler
 
-`ryft_cuda::kernels::cutile` compiles verified portable `ryft_core::kernels` definitions through NVIDIA's official
-cuTile Python AOT interface. This optional module owns source generation, compiler admission, tool isolation, and
-the adapter-authored manifest. It reuses this crate's producer-neutral artifacts and launcher without depending on
-XLA, PJRT, or MLIR.
+`ryft_cuda::kernels::cutile` compiles verified portable `ryft_kernels` definitions through NVIDIA's official cuTile
+Python AOT interface. This optional module owns source generation, compiler admission, tool isolation, and the
+adapter-authored manifest. It reuses this crate's producer-neutral artifacts and launcher without depending on XLA,
+PJRT, or MLIR.
 
 Enable `cutile` for the target, immutable output, and validated manifest decoder; it adds optional `ryft-core`,
-`serde`, and `serde_json` dependencies. Enable `cutile-compiler` where ahead-of-time compilation runs; it includes
-`cutile` and adds the compiler and `tempfile` dependency. Both features are disabled by default, preserving the
-existing lightweight CUDA APIs. Python is not needed for manifest validation, CUDA loading, invocation, or executable
-reload. XLA selection and `CuTileEmbedding` remain owned by `ryft-xla`.
+`ryft-kernels`, `serde`, and `serde_json` dependencies. Enable `cutile-compiler` where ahead-of-time compilation runs;
+it includes `cutile` and adds the compiler and `tempfile` dependency. Both features are disabled by default, preserving
+the existing lightweight CUDA APIs. Python is not needed for manifest validation, CUDA loading, invocation, or
+executable reload. XLA selection and `CuTileEmbedding` remain owned by `ryft-xla`.
 
 ### Installation and identity
 

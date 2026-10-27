@@ -8,31 +8,24 @@
 use std::borrow::Cow;
 use std::fmt::{Display, Write};
 
+use ryft_core::operations::attention::AttentionConfiguration;
+use ryft_core::{
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis,
+    ArrayType, ArrayTypeRefinements, Atom, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME,
+    CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, Dimension, DimensionBounds,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionType, DimensionVariable, EagerContext, FlatProgram,
+    InputRegionProvenance, InstructionId, Operation, OperationFormatter, PadOperation, Placeholder, ProgramBuilder,
+    ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
+    Tracer, TracingContext, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+};
 use thiserror::Error;
 
-use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis,
-    ArrayType, ArrayTypeRefinements, Dimension, DimensionBounds, DimensionType, DimensionVariable,
-};
-use crate::contexts::EagerContext;
-use crate::kernels::grids::{Grid, GridError, GridExecution};
-use crate::kernels::mappings::{BlockMapping, BlockMappingError, BoundaryPolicy};
-use crate::kernels::operations::{KernelExtension, KernelOperation, NoKernelExtension};
-use crate::kernels::validation::{
+use crate::grids::{Grid, GridError, GridExecution};
+use crate::mappings::{BlockMapping, BlockMappingError, BoundaryPolicy};
+use crate::operations::{KernelExtension, KernelOperation, NoKernelExtension};
+use crate::validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelReferenceSummary, KernelValidationError, validate_kernel_body,
 };
-use crate::operations::attention::AttentionConfiguration;
-use crate::operations::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute,
-    CustomCallOperation, DimensionFromScalar, DimensionFromScalarOperation, PadOperation,
-};
-use crate::parameters::Placeholder;
-use crate::programs::{
-    Atom, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter, ProgramBuilder,
-    ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
-};
-use crate::tracing::{Tracer, TracingContext};
 
 /// Invalid kernel signature or body boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -931,8 +924,8 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
     fn region_semantic_fields(
         key: &mut String,
         atoms: &[Atom<ArrayIrValue<Array>>],
-        inputs: &[crate::programs::AtomId],
-        outputs: &[crate::programs::AtomId],
+        inputs: &[ryft_core::programs::AtomId],
+        outputs: &[ryft_core::programs::AtomId],
     ) -> Result<(), TypeError> {
         Self::semantic_field(key, &format!("region {:?}", (inputs, outputs)));
         for atom in atoms {
@@ -1260,23 +1253,19 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeJvpRule, CompositeOperation,
+        CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
+        DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape, ShardMap,
+        ShardMapOperation, Sharding, TiledLayout, ZeroOperation,
+    };
 
-    use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, DataType, DimensionError, DimensionType,
-        DimensionValue, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, TiledLayout,
-    };
-    use crate::contexts::Context;
-    use crate::kernels::authoring::whole_array_parameter;
-    use crate::kernels::grids::{GridDimension, GridExecution};
-    use crate::kernels::mappings::BoundaryPolicy;
-    use crate::kernels::operations::tests::TestExtension;
-    use crate::operations::{
-        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, CustomRuleDefinition,
-        CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation, ZeroOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, EffectClasses, ProgramBuilder, RegionId};
+    use crate::authoring::whole_array_parameter;
+    use crate::grids::{GridDimension, GridExecution};
+    use crate::mappings::BoundaryPolicy;
+    use crate::operations::tests::TestExtension;
 
     use super::*;
 
@@ -1858,7 +1847,7 @@ mod tests {
         assert!(matches!(operation.grid().dimensions()[0].extent(), Dimension::Dynamic(_)));
         assert_eq!(
             operation.specialize_grid(&[2, 3]).unwrap_err(),
-            KernelError::Grid(GridError::Dimension(crate::arrays::DimensionError::InputDimensionMismatch {
+            KernelError::Grid(GridError::Dimension(ryft_core::arrays::DimensionError::InputDimensionMismatch {
                 dimension: "count".to_owned(),
                 expected: 2,
                 actual: 3,
@@ -2342,7 +2331,7 @@ mod tests {
             let reference = body.add_input(operation.body_input_types()[0].clone());
             let value = body
                 .add_instruction(
-                    ArrayOperation::Constant(crate::operations::ConstantOperation::new(
+                    ArrayOperation::Constant(ryft_core::operations::ConstantOperation::new(
                         Array::scalar(f32::from_bits(bits)).unwrap(),
                     )),
                     vec![],

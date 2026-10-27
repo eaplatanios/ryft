@@ -1,7 +1,7 @@
 //! Direct Triton artifacts embedded through the existing concrete platform runtime.
 
-use ryft_core::kernels::VerifiedKernel;
 use ryft_core::{CustomCallOperation, EffectClass, Typed};
+use ryft_kernels::VerifiedKernel;
 use ryft_triton::kernels::{Artifact, COMPILER_SCHEMA_VERSION, CompiledKernel, Target};
 use sha2::{Digest, Sha256};
 
@@ -117,7 +117,7 @@ mod tests {
     use super::*;
 
     /// Exercises the native compiler and embedding contracts without requiring a device runtime.
-    #[ryft_core::kernels::kernel]
+    #[ryft_kernels::kernel(crate = "ryft_kernels")]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &ryft_core::Array,
         #[input(data_type = F32, rank = 1)] right: &ryft_core::Array,
@@ -137,8 +137,8 @@ mod tests {
 
     #[test]
     fn test_triton_embedding_custom_call() {
-        use ryft_core::kernels::{KernelCompiler, KernelSchedule};
         use ryft_core::{ArrayType, CustomCallAttribute, DataType};
+        use ryft_kernels::{KernelCompiler, KernelSchedule};
         use ryft_triton::kernels::{Compiler, Options};
 
         if std::env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1") {

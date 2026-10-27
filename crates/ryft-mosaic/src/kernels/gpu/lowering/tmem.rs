@@ -902,11 +902,11 @@ mod tests {
 
     #[test]
     fn test_tmem_native_lifetime() {
-        use ryft_core::kernels::{
+        use ryft_core::{Context as CoreContext, ReferenceRead, ReferenceWrite};
+        use ryft_kernels::{
             Grid, KernelCallOperation, KernelDefinition, KernelOperation, KernelParameterAccess, KernelSchedule,
             VerifiedKernel, whole_array_parameter,
         };
-        use ryft_core::{Context as CoreContext, ReferenceRead, ReferenceWrite};
         use ryft_mlir::{Context, Operation, WalkOrder, WalkResult};
 
         use crate::kernels::gpu::{Compiler, GpuOperation, Options, TmemOperation};
@@ -1037,13 +1037,13 @@ mod tests {
 
     #[test]
     fn test_tmem_native_block_scaled_lifetime() {
-        use ryft_core::kernels::{
-            Grid, KernelCallOperation, KernelDefinition, KernelOperation, KernelParameterAccess, KernelSchedule,
-            VerifiedKernel, whole_array_parameter,
-        };
         use ryft_core::{
             AddOperation, Array, ArrayIrValue, ArrayOperation, Context as CoreContext, MulOperation, ReferenceRead,
             ReferenceWrite,
+        };
+        use ryft_kernels::{
+            Grid, KernelCallOperation, KernelDefinition, KernelOperation, KernelParameterAccess, KernelSchedule,
+            VerifiedKernel, whole_array_parameter,
         };
         use ryft_mlir::{Context, Operation, WalkOrder, WalkResult};
 

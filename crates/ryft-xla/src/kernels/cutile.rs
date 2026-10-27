@@ -4,11 +4,11 @@
 //! logical array types and actual execution devices, then delegates artifact persistence and launch to the existing
 //! CUDA embedding. Neither loading an executable nor executing it requires the Python compiler.
 
-use ryft_core::kernels::VerifiedKernel;
 use ryft_core::{CustomCallOperation, EffectClass, Typed};
 use ryft_cuda::kernels::cutile::{
     Argument, COMPILER_SCHEMA_VERSION, CUDA_TILE_VERSION, CompiledKernel, TILEIRAS_VERSION, Target,
 };
+use ryft_kernels::VerifiedKernel;
 use sha2::{Digest, Sha256};
 
 use crate::kernels::cuda::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, CudaKernelParameterBinding};

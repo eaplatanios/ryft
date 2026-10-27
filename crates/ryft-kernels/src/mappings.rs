@@ -7,17 +7,12 @@
 
 use std::hash::{Hash, Hasher};
 
+use ryft_core::{
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, Atom,
+    DimensionOperation, DimensionRefinements, DimensionValue, EagerContext, FlatProgram, MAX_DIMENSION_EXTENT,
+    Operation, Placeholder, ProgramBuilder, ProgramError, ReferenceViewOverlap, TypeError, Typed,
+};
 use thiserror::Error;
-
-use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, DimensionOperation,
-    DimensionRefinements, DimensionValue, MAX_DIMENSION_EXTENT,
-};
-use crate::contexts::EagerContext;
-use crate::parameters::Placeholder;
-use crate::programs::{
-    Atom, FlatProgram, Operation, ProgramBuilder, ProgramError, ReferenceViewOverlap, TypeError, Typed,
-};
 
 /// Invalid mapping program, index arithmetic, or full array window.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -371,11 +366,10 @@ mod tests {
     use std::hash::DefaultHasher;
 
     use pretty_assertions::assert_eq;
-
-    use crate::arrays::{ArrayType, DataType, DimensionBounds, DimensionError, DimensionType};
-    use crate::operations::{DimensionMulOperation, ZERO_OPERATION_NAME, ZeroOperation};
-    use crate::parameters::{ParameterError, Placeholder};
-    use crate::programs::{ProgramBuilder, ReferenceType};
+    use ryft_core::{
+        ArrayType, DataType, DimensionBounds, DimensionError, DimensionMulOperation, DimensionType, ParameterError,
+        Placeholder, ProgramBuilder, ReferenceType, ZERO_OPERATION_NAME, ZeroOperation,
+    };
 
     use super::*;
 
@@ -495,20 +489,20 @@ mod tests {
 
     #[test]
     fn test_block_mapping_specialize_checks_shared_identity() {
-        let variable = crate::arrays::DimensionVariable::new(
+        let variable = ryft_core::arrays::DimensionVariable::new(
             "offset",
-            crate::arrays::DimensionBounds::non_negative(Some(4)).unwrap(),
+            ryft_core::arrays::DimensionBounds::non_negative(Some(4)).unwrap(),
         );
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let first = builder.add_input(crate::arrays::DimensionType::from(variable.clone()).into());
-        let second = builder.add_input(crate::arrays::DimensionType::from(variable.clone()).into());
+        let first = builder.add_input(ryft_core::arrays::DimensionType::from(variable.clone()).into());
+        let second = builder.add_input(ryft_core::arrays::DimensionType::from(variable.clone()).into());
         let mapping = BlockMapping::new(
             builder.build(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap(),
             vec![1, 1],
             BoundaryPolicy::InBounds,
         )
         .unwrap();
-        let expected = TypeError::from(crate::arrays::DimensionError::InputDimensionMismatch {
+        let expected = TypeError::from(ryft_core::arrays::DimensionError::InputDimensionMismatch {
             dimension: "offset".to_owned(),
             expected: 1,
             actual: 2,
@@ -519,7 +513,7 @@ mod tests {
                 .unwrap_err(),
             BlockMappingError::Program(ProgramError::from(expected)),
         );
-        let expected = TypeError::from(crate::arrays::DimensionError::BindingOutOfBounds {
+        let expected = TypeError::from(ryft_core::arrays::DimensionError::BindingOutOfBounds {
             variable: "offset".to_owned(),
             value: 4,
             bounds: variable.bounds(),
@@ -534,13 +528,13 @@ mod tests {
 
     #[test]
     fn test_block_mapping_specialize_rejects_identity_shared_with_remaining_input() {
-        let variable = crate::arrays::DimensionVariable::new(
+        let variable = ryft_core::arrays::DimensionVariable::new(
             "coordinate",
-            crate::arrays::DimensionBounds::non_negative(Some(4)).unwrap(),
+            ryft_core::arrays::DimensionBounds::non_negative(Some(4)).unwrap(),
         );
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        builder.add_input(crate::arrays::DimensionType::from(variable.clone()).into());
-        let output = builder.add_input(crate::arrays::DimensionType::from(variable).into());
+        builder.add_input(ryft_core::arrays::DimensionType::from(variable.clone()).into());
+        let output = builder.add_input(ryft_core::arrays::DimensionType::from(variable).into());
         let mapping = BlockMapping::new(
             builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap(),
             vec![1],

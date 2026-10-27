@@ -18086,13 +18086,11 @@ mod tests {
     fn test_xla_session_cuda_kernel_execution_and_persistence() {
         use std::convert::Infallible;
 
-        use ryft_core::kernels::{
-            KernelCompilationError, KernelCompiler, KernelDefinition, KernelSchedule, VerifiedKernel,
-        };
         use ryft_core::{Add, OneLike, ProjectedValue, Tracer};
         use ryft_cuda::{
             CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
         };
+        use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelDefinition, KernelSchedule, VerifiedKernel};
 
         use crate::kernels::{
             CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, XlaKernelCompilerBinding, stage_kernel,

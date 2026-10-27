@@ -1,7 +1,7 @@
 //! Lowering of bound-proven canonical dimension arithmetic and block mappings.
 
-use ryft_core::kernels::BlockMapping;
 use ryft_core::{ArrayIrOperation, ArrayIrValue, Atom, DimensionOperation, DimensionValue, Operation};
+use ryft_kernels::BlockMapping;
 use ryft_mlir::DetachedBlock;
 use ryft_mlir::dialects::arith;
 
@@ -87,11 +87,11 @@ mod tests {
     use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::BoundaryPolicy;
     use ryft_core::{
         Array, ArrayIrType, ConstantOperation, DimensionAddOperation, DimensionBounds, DimensionSubOperation,
         DimensionType, Placeholder, ProgramBuilder, SaturatingSubOperation,
     };
+    use ryft_kernels::BoundaryPolicy;
     use ryft_mlir::{Block, Context, Operation as MlirOperation, Value};
 
     use super::*;

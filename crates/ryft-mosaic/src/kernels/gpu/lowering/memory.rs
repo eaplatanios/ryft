@@ -1,11 +1,11 @@
 //! Native global-to-shared copy groups and their emitted CTA communication contract.
 
-use ryft_core::kernels::{
-    ASYNC_COPY_OPERATION_NAME, KernelExtension, KernelOperation, KernelParameterAccess, VerifiedKernel,
-};
 use ryft_core::{
     ArrayAddressing, ArrayIrOperation, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Operation, Typed,
     ValueId,
+};
+use ryft_kernels::{
+    ASYNC_COPY_OPERATION_NAME, KernelExtension, KernelOperation, KernelParameterAccess, VerifiedKernel,
 };
 use ryft_mlir::dialects::{arith, llvm, memref, nvgpu, nvvm, scf};
 use ryft_mlir::{Attribute, Block, DetachedBlock, TypeRef, UnknownLocationRef};
@@ -394,8 +394,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{AsyncCopyOperation, WaitOperation};
     use ryft_core::{Array, ArrayOperation, ArrayType, AtomId, ConstantOperation, InstructionId, RegionId, ValueId};
+    use ryft_kernels::{AsyncCopyOperation, WaitOperation};
     use ryft_mlir::{Block, Context, Module, Operation, Value, WalkOrder, WalkResult};
 
     use crate::kernels::gpu::Target;

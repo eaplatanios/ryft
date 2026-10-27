@@ -1473,7 +1473,6 @@ macro_rules! define_elementwise_capability {
 ///
 /// ```rust,ignore
 /// impl_guardless_operation!(<V> ConstantOperation<V> where V: Value);
-/// impl_guardless_operation!(<Extension> KernelOperation<Extension> where Extension: Operation<Type = ArrayIrType>);
 /// impl_guardless_operation!(<const MEMBER: u8> ProjectedMemberOperation<MEMBER>);
 /// impl_guardless_operation!(TestRegionOperation);
 /// ```

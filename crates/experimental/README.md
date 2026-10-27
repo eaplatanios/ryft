@@ -32,11 +32,11 @@ verify that artifact. Worker failures and timeouts retain diagnostics without re
 
 The macro-authored Mosaic experiments in `src/kernels.rs` retain a separate source path from those handwritten ABI
 probes. They declare vector addition, a scalar sum reduction, and tiled matrix multiplication with the portable
-`#[kernel]` macro. The shared cases use partial tiles and independent scalar oracles; the core reference interpreter
+`#[kernel]` macro. The shared cases use partial tiles and independent scalar oracles; the portable reference interpreter
 checks the same definitions before native execution. The GPU runner uses the generated `definition`, ordinary XLA
 tracing with `stage_kernel`, and an explicit Mosaic compiler binding. Each native case has an independent test, so a
-failure does not hide the other cases. Adapter errors fail the test; GPU requests do not select a host interpreter as
-a replacement backend.
+failure does not hide the other cases. Adapter errors fail the test; GPU requests do not select a host interpreter as a
+replacement backend.
 
 An additional explicit-builder case copies 67 elements from an input reference into aligned scratch storage, waits
 for the copy, and publishes the result. This qualifies the adapter's asynchronous memory operations independently

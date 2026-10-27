@@ -34,8 +34,8 @@
 //! operations cannot access their physical storage. The compiler consumes the emitted communication events through
 //! [`synchronization`] before accepting a module.
 
-use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelExtension, KernelSchedule, VerifiedKernel};
 use ryft_core::{ArrayType, ProgramError, TypeError};
+use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelExtension, KernelSchedule, VerifiedKernel};
 use ryft_mlir::{Context, Module};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -392,13 +392,11 @@ mod tests {
     use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
-    };
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, Context as CoreContext, DataType, DimensionBounds,
         DimensionFromScalarOperation, DimensionVariable, ReferenceRead, ReferenceWrite, SqrtOperation,
     };
+    use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_version;
     use ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_SERDE_VERSION;
 

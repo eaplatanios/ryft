@@ -1,6 +1,6 @@
 # Ryft Mosaic
 
-Experimental Mosaic GPU compilation of portable `ryft_core::kernels` definitions. The adapter owns typed GPU target
+Experimental Mosaic GPU compilation of portable `ryft_kernels` definitions. The adapter owns typed GPU target
 contracts, lowering, compiler payloads and communication simulation. It emits binary Mosaic source for the existing
 native runtime; it does not own an executable cache, CUDA launcher or PJRT client. TPU support is not enabled.
 
@@ -20,10 +20,10 @@ runtime assertions is rejected before native construction.
 Asynchronous copies currently require whole, statically known global source roots and shared scratch destinations, with
 matching 4- or 8-byte elements. Each thread issues its assigned copies, commits a group and waits before a block-wide
 publication barrier. Cooperative work between an outstanding copy and its wait is rejected. The adapter checks emitted
-copy groups and barriers with its deterministic synchronization simulator; core qualification retains responsibility for
-logical initialization and reference lifetimes. This baseline mode does not select TMA, warpgroup or cluster
-communication. Advanced options and exact `GpuOperation`/`TmemOperation` families admit those mechanisms under their
-separate dtype, geometry, architecture and lifetime contracts; see [the GPU module](src/kernels/gpu/mod.rs).
+copy groups and barriers with its deterministic synchronization simulator; portable kernel qualification retains
+responsibility for logical initialization and reference lifetimes. This baseline mode does not select TMA, warpgroup
+or cluster communication. Advanced options and exact `GpuOperation`/`TmemOperation` families admit those mechanisms
+under their separate dtype, geometry, architecture and lifetime contracts; see [the GPU module](src/kernels/gpu/mod.rs).
 
 The compiler reports conservative shared-memory requirements for all live source allocations and temporary arrays.
 `Target` and `KernelSchedule` constrain these allocations before compilation. Generated shared allocations have explicit
@@ -36,8 +36,8 @@ hash. XLA execution is configured separately through `ryft_xla::kernels::MosaicG
 feature. Macro-authored vector addition, reduction and tiled matrix multiplication are in
 [`experimental/src/kernels.rs`](../experimental/src/kernels.rs), alongside an explicit asynchronous-copy fixture.
 
-The [kernel support and qualification matrix](../ryft-core/src/kernels/SUPPORT.md) distinguishes baseline, advanced GPU,
-native-execution and offline target-code evidence. [Pinned surface review tooling](tools/README.md) detects upstream GPU
-source changes without accepting them automatically. Implementation status and hardware qualification are tracked in
-[`plan-pallas.md`](../../plan-pallas.md), Phases 14–15 and 20; no documentation claim stabilizes an experimental
-upstream ABI.
+The portable authoring, verification and interpretation contract that this adapter compiles is documented by the
+[`ryft-kernels`](../ryft-kernels/README.md) crate and its rustdoc. [Pinned surface review tooling](tools/README.md)
+detects upstream GPU source changes without accepting them automatically. Implementation status and hardware
+qualification are tracked in [`plan-pallas.md`](../../plan-pallas.md), Phases 14–15 and 20; no documentation claim
+stabilizes an experimental upstream ABI.

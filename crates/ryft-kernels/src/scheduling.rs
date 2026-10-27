@@ -5,18 +5,18 @@
 //! This is an executable concurrency specification for small kernels, not a model of device timing. Nested regions
 //! and masked private windows remain executable by ordinary host interpretation but are outside this explorer.
 
+use ryft_core::{
+    Array, ArrayIrType, ArrayIrValue, Domain, EagerContext, InterpretableOperation, Operation, ProgramError,
+    ReferenceAccessMode, Typed,
+};
 use thiserror::Error;
 
-use crate::arrays::{Array, ArrayIrType, ArrayIrValue};
-use crate::contexts::{Domain, EagerContext};
-use crate::interpretation::InterpretableOperation;
-use crate::kernels::calls::KernelDefinition;
-use crate::kernels::grids::{Grid, GridExecution};
-use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
-use crate::kernels::interpretation::{KernelDebugOptions, KernelTraceEntry};
-use crate::kernels::mappings::BoundaryPolicy;
-use crate::kernels::operations::{KernelExtension, KernelOperation};
-use crate::programs::{Operation, ProgramError, ReferenceAccessMode, Typed};
+use crate::calls::KernelDefinition;
+use crate::grids::{Grid, GridExecution};
+use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
+use crate::interpretation::{KernelDebugOptions, KernelTraceEntry};
+use crate::mappings::BoundaryPolicy;
+use crate::operations::{KernelExtension, KernelOperation};
 
 /// Admission and resource-limit failures before interleaving execution begins.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -242,22 +242,17 @@ mod tests {
     use std::collections::BTreeSet;
 
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArrayIrOperation, ArrayOperation, ArrayType, CompareOperation, ComparisonDirection, ConditionOperation,
+        Context, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, Placeholder, ProgramBuilder,
+        Provenance, ReferenceAtomicAddUpdate, SelectOperation,
+    };
 
-    use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue,
-    };
-    use crate::contexts::Context;
-    use crate::kernels::calls::{KernelCallOperation, KernelParameter};
-    use crate::kernels::grids::GridDimension;
-    use crate::kernels::interpretation::KernelInterpretationError;
-    use crate::kernels::mappings::BlockMapping;
-    use crate::kernels::validation::KernelParameterAccess;
-    use crate::operations::{
-        CompareOperation, ComparisonDirection, ConditionOperation, ReferenceAtomicAddUpdate, SelectOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, Provenance};
+    use crate::calls::{KernelCallOperation, KernelParameter};
+    use crate::grids::GridDimension;
+    use crate::interpretation::KernelInterpretationError;
+    use crate::mappings::BlockMapping;
+    use crate::validation::KernelParameterAccess;
 
     use super::*;
 

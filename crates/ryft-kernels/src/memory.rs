@@ -4,20 +4,15 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::LazyLock;
 
-use thiserror::Error;
-
-use crate::arrays::{
+use ryft_core::macros::check_count;
+use ryft_core::{
     Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform, ArraySliceAxis,
-    ArrayType, DataType, DimensionVariable,
+    ArrayType, DataType, DimensionVariable, Domain, EagerContext, EffectClasses, Effects, InterpretableOperation,
+    InterpretationDriver, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, infer_reference_view_type,
 };
-use crate::contexts::{Domain, EagerContext};
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
-use crate::programs::{
-    EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, ReferenceType, RegionInterface,
-    Type, TypeError, TypeIdentityRenaming, Typed, infer_reference_view_type,
-};
+use thiserror::Error;
 
 /// Errors encountered when declaring or accessing kernel memory.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -48,7 +43,7 @@ pub const SCRATCH_OPERATION_NAME: &str = "scratch";
 ///
 /// The referent's canonical [`ArrayType`] carries its shape, layout, and memory placement. Alignment is a minimum byte
 /// alignment required of native storage; the abstract reference interpreter does not expose physical addresses.
-/// Initialized scratch uses the existing [`ReferenceNewOperation`](crate::operations::ReferenceNewOperation).
+/// Initialized scratch uses the existing [`ReferenceNewOperation`](ryft_core::operations::ReferenceNewOperation).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScratchOperation {
     /// Canonical type of the allocated array.
@@ -851,10 +846,11 @@ fn interpret_masked_memory(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArrayReferenceTransformIndex, Context, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+    };
 
-    use crate::arrays::{ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::contexts::Context;
-    use crate::kernels::operations::KernelOperation;
+    use crate::operations::KernelOperation;
 
     use super::*;
 

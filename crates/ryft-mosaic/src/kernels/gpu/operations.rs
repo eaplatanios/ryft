@@ -3,12 +3,12 @@
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
-use ryft_core::kernels::{KernelExtension, KernelExtensionMemory, NoKernelExtension};
 use ryft_core::{
     ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DotOperation, EffectClass, EffectClasses, Effects,
     Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface,
     TypeError,
 };
+use ryft_kernels::{KernelExtension, KernelExtensionMemory, NoKernelExtension};
 
 use crate::kernels::gpu::tmem::TmemOperation;
 

@@ -1,17 +1,17 @@
 //! Dynamically selected kernel tiles over canonical reference views and array padding.
 //!
-//! Broadcast advanced indexing composes the existing [`BroadcastOperation`](crate::operations::BroadcastOperation),
-//! [`ConcatenateOperation`](crate::operations::ConcatenateOperation),
-//! [`GatherOperation`](crate::operations::GatherOperation), and
-//! [`ScatterOperation`](crate::operations::ScatterOperation). Broadcast signed integer query components to a common
+//! Broadcast advanced indexing composes the existing [`BroadcastOperation`](ryft_core::operations::BroadcastOperation),
+//! [`ConcatenateOperation`](ryft_core::operations::ConcatenateOperation),
+//! [`GatherOperation`](ryft_core::operations::GatherOperation), and
+//! [`ScatterOperation`](ryft_core::operations::ScatterOperation). Broadcast signed integer query components to a common
 //! shape, append their index-vector axis, then concatenate the components. Use
-//! [`SelectOperation`](crate::operations::SelectOperation) to replace an inactive query with a negative index and
-//! [`GatherMode::Fill`](crate::operations::GatherMode::Fill) to fill loads or
-//! [`ScatterMode::Drop`](crate::operations::ScatterMode::Drop) to drop stores.
+//! [`SelectOperation`](ryft_core::operations::SelectOperation) to replace an inactive query with a negative index and
+//! [`GatherMode::Fill`](ryft_core::operations::GatherMode::Fill) to fill loads or
+//! [`ScatterMode::Drop`](ryft_core::operations::ScatterMode::Drop) to drop stores.
 //! Negative indices never wrap to the opposite array edge. Gather's explicit scalar fill preserves its exact encoding.
 //!
-//! Read the qualified reference with [`ReferenceRead`](crate::operations::ReferenceRead) before gathering or
-//! scattering; publish the result with [`ReferenceWrite`](crate::operations::ReferenceWrite). This composition reads
+//! Read the qualified reference with [`ReferenceRead`](ryft_core::operations::ReferenceRead) before gathering or
+//! scattering; publish the result with [`ReferenceWrite`](ryft_core::ReferenceWrite). This composition reads
 //! the complete source window. Indexed stores are full-window read-modify-write operations and require an already
 //! initialized destination, even when the selected indices happen to cover every element. Existing reference effects
 //! enforce that contract and reject unordered overlapping mutable windows. It does not establish partial write-only
@@ -22,19 +22,15 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::LazyLock;
 
-use crate::arrays::{
-    Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, MAX_DIMENSION_EXTENT,
+use ryft_core::macros::check_count;
+use ryft_core::{
+    Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, EagerContext, EffectClasses,
+    Effects, InterpretableOperation, InterpretationDriver, MAX_DIMENSION_EXTENT, Operation, OperationFormatter, Pad,
+    PadOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceEffect, ReferenceTransform, RegionInterface, TypeError, Typed, infer_reference_view_type,
 };
-use crate::contexts::EagerContext;
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::kernels::mappings::BoundaryPolicy;
-use crate::macros::check_count;
-use crate::operations::{Pad, PadOperation};
-use crate::programs::{
-    EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, RegionInterface, TypeError,
-    Typed, infer_reference_view_type,
-};
+
+use crate::mappings::BoundaryPolicy;
 
 /// Canonical operation name for [`TileLoadOperation`].
 pub const TILE_LOAD_OPERATION_NAME: &str = "tile_load";
@@ -247,23 +243,19 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+    use ryft_core::{
+        AddOperation, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex,
+        BroadcastOperation, ConcatenateOperation, Context, DataType, DimensionValue, DotOperation,
+        GatherDimensionNumbers, GatherMode, GatherOperation, Placeholder, ProgramBuilder, ReferenceReadOperation,
+        ReferenceType, ReferenceWriteOperation, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
+        ScatterReductionKind, SelectOperation,
+    };
 
-    use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex, DataType, DimensionValue,
-    };
-    use crate::contexts::Context;
-    use crate::kernels::authoring::{tiled_call, whole_array_parameter};
-    use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelError};
-    use crate::kernels::grids::Grid;
-    use crate::kernels::operations::KernelOperation;
-    use crate::kernels::validation::{KernelParameterAccess, KernelValidationError};
-    use crate::operations::{
-        AddOperation, BroadcastOperation, ConcatenateOperation, DotOperation, GatherDimensionNumbers, GatherMode,
-        GatherOperation, ReferenceReadOperation, ReferenceWriteOperation, ScatterDimensionNumbers, ScatterMode,
-        ScatterOperation, ScatterReductionKind, SelectOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ReferenceType};
+    use crate::authoring::{tiled_call, whole_array_parameter};
+    use crate::calls::{KernelCallOperation, KernelDefinition, KernelError};
+    use crate::grids::Grid;
+    use crate::operations::KernelOperation;
+    use crate::validation::{KernelParameterAccess, KernelValidationError};
 
     use super::*;
 

@@ -3,13 +3,13 @@
 //! Global windows use bounds-checked gather/scatter, including completely empty edge windows. Tile values use
 //! power-of-two physical shapes; reductions mask logical padding with the reduction identity before arithmetic.
 
-use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation,
     DimensionValue, DotDimensionNumbers, Operation, ProgramError, ReductionKind, ReferenceAccessOperation, RegionRef,
     Typed, validated_reference_access_descriptors,
 };
+use ryft_kernels::{GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
 
 use crate::kernels::cutile::{Error, Options, Parameter, data_type_name, launch_grid};
 
@@ -191,7 +191,7 @@ impl Lowering {
     }
 
     /// Emits a checked dimension-only block mapping using its existing arena.
-    fn mapping(&mut self, mapping: &ryft_core::kernels::BlockMapping, inputs: &[String]) -> Result<Vec<String>, Error> {
+    fn mapping(&mut self, mapping: &ryft_kernels::BlockMapping, inputs: &[String]) -> Result<Vec<String>, Error> {
         let program = mapping.program();
         let mut values = vec![String::new(); program.atoms().len()];
         for (id, input) in program.input_ids().iter().zip(inputs) {
@@ -810,12 +810,10 @@ fn unsupported(operation: &'static str, reason: &str) -> Error {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::kernels::{
-        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
-    };
     use ryft_core::{
         ArraySliceAxis, DimensionBounds, DimensionMulOperation, DimensionType, ReferenceRead, ReferenceWrite,
     };
+    use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
 
     use super::*;
 
