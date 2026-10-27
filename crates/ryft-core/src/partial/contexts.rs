@@ -2003,8 +2003,6 @@ mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
-    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{
         AddOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation, DimensionSubOperation,
         LinearCallOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation,
@@ -2029,10 +2027,7 @@ mod tests {
         ProgramError, Provenance, ProvenanceScope, ReferenceError, ReferenceIdentity, ReferenceType, RegionInterface,
         TypeError, Typed,
     };
-    use crate::tests::{
-        TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayTracingContext, TestFixtureOperation,
-        TestOrderedStateOperation,
-    };
+    use crate::tests::{TestArrayContext, TestArrayTracingContext, TestOrderedStateOperation, TestRegionOperation};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -2277,7 +2272,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_import_known() {
-        let parent = TracingContext::<TestValue, TestArrayIrOperation>::new();
+        let parent = TracingContext::<TestValue, TestOperation>::new();
         let source = PartialEvaluationContext::new(parent.clone());
         let target = source.deferred_sibling();
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
@@ -2309,7 +2304,7 @@ mod tests {
         let unknown = PartialTracer::new(source.clone(), source.unknown_input(scalar_type.clone(), 0));
         assert!(matches!(target.import_known(&unknown), Err(ProgramError::MalformedProgram(message))
             if message == "cannot import an unknown value from another partial-evaluation context",),);
-        let other_parent = TracingContext::<TestValue, TestArrayIrOperation>::new();
+        let other_parent = TracingContext::<TestValue, TestOperation>::new();
         let foreign = PartialTracer::new(
             PartialEvaluationContext::new(other_parent.clone()),
             PartialEvaluationValue::known(other_parent.input(scalar_type)),
@@ -2439,55 +2434,11 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_unsupported_eager_execution() {
-        /// Operation with a controlled execution failure and effect classification.
-        #[derive(Clone, Debug)]
-        struct UnavailableOperation {
-            /// Error reported by eager execution after successful type inference.
-            error: ProgramError,
-
-            /// Observable effects that forbid deferring a failed execution attempt.
-            effects: Effects,
-        }
-
-        impl Operation for UnavailableOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "unavailable"
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                check_count!("input", input_types, 1, TypeError);
-                check_count!("region", region_interfaces, 0, TypeError);
-                Ok(input_types.to_vec())
-            }
-
-            fn effects(&self) -> Cow<'_, Effects> {
-                Cow::Borrowed(&self.effects)
-            }
-        }
-
-        impl InterpretableOperation<EagerContext<Array, Self>> for UnavailableOperation {
-            fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(
-                &self,
-                _context: &EagerContext<Array, Self>,
-                _driver: &D,
-                _inputs: &[Array],
-            ) -> Result<Vec<Array>, ProgramError> {
-                Err(self.error.clone())
-            }
-        }
-
-        impl_guardless_operation!(UnavailableOperation);
-
         let unsupported = ProgramError::UnsupportedOperation { message: "kernel is unavailable".to_string() };
-        let operation = UnavailableOperation { error: unsupported.clone(), effects: Effects::empty().clone() };
+        let operation =
+            TestOrderedStateOperation::Unavailable { error: unsupported.clone(), effects: Effects::empty().clone() };
         let inputs = [PartialEvaluationValue::known(Array::scalar(2.0_f32).unwrap())];
-        let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &inputs).unwrap();
         assert!(outputs[0].is_unknown());
         assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F32));
@@ -2496,7 +2447,7 @@ mod tests {
         assert_eq!(evaluation.program.instructions()[0].operation().name(), "unavailable");
 
         // Staging a known operation does not attempt execution, so its outputs stay known.
-        let parent = TracingContext::<Array, UnavailableOperation>::new();
+        let parent = TracingContext::<Array, TestOrderedStateOperation>::new();
         let input = PartialEvaluationValue::known(parent.input(ArrayType::scalar(DataType::F32)));
         let context = PartialEvaluationContext::new(parent);
         let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &[input]).unwrap();
@@ -2504,11 +2455,11 @@ mod tests {
         assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F32));
 
         // A failed effectful execution cannot be retried later because it might have already performed effects.
-        let effectful = UnavailableOperation {
+        let effectful = TestOrderedStateOperation::Unavailable {
+            error: unsupported.clone(),
             effects: Effects::new(EffectClasses::single(EffectClass::OrderedIo), Vec::new()).unwrap(),
-            ..operation.clone()
         };
-        let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         assert_eq!(context.fold_or_residualize(effectful, Vec::new(), &inputs).unwrap_err(), unsupported);
 
         // Unsupported execution does not conceal malformed boundaries or other runtime errors.
@@ -2516,9 +2467,10 @@ mod tests {
             context.fold_or_residualize(operation.clone(), Vec::new(), &[]).unwrap_err(),
             ProgramError::Type(TypeError::invalid("expected 1 input but got 0")),
         );
-        let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         let invalid = ProgramError::Type(TypeError::invalid("invalid kernel input"));
-        let operation = UnavailableOperation { error: invalid.clone(), ..operation };
+        let operation =
+            TestOrderedStateOperation::Unavailable { error: invalid.clone(), effects: Effects::empty().clone() };
         assert_eq!(context.fold_or_residualize(operation, Vec::new(), &inputs).unwrap_err(), invalid);
     }
 
@@ -2660,17 +2612,19 @@ mod tests {
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         frozen.freeze().unwrap();
         let other = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
-        let context = PartialEvaluationContext::new(TestArrayIrContext::new());
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let reference = context.unknown_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into(), 0);
-        let read = TestArrayIrOperation::ReferenceRead(ReferenceReadOperation::new());
+        let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
         let output = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
         let target = PartialEvaluationValue::known(TestValue::Reference(other.clone()));
         let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7.0_f32).unwrap()));
-        let write = TestArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new());
+        let write = TestOperation::ReferenceWrite(ReferenceWriteOperation::new());
         assert!(context.fold_or_residualize(write, Vec::new(), &[target, value]).unwrap().is_empty());
         assert_eq!(other.read(), Ok(Array::scalar(2.0_f32).unwrap()));
         let evaluation = context.into_evaluation(output).unwrap();
-        let error = evaluation.interpret(&TestArrayIrContext::new(), &[TestValue::Reference(frozen)]).unwrap_err();
+        let error = evaluation
+            .interpret(&EagerContext::<TestValue, TestOperation>::new(), &[TestValue::Reference(frozen)])
+            .unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         assert_eq!(other.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
@@ -2678,7 +2632,6 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_excludes_dormant_effects() {
         use crate::programs::RegionSlot;
-        use crate::tests::TestRegionOperation;
 
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
@@ -2702,7 +2655,6 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_residualizes_deferred_work() {
         use crate::programs::RegionSlot;
-        use crate::tests::TestRegionOperation;
 
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
@@ -2894,56 +2846,19 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_residualize_propagates_region_preparation_errors() {
-        use crate::programs::RegionSlot;
-
-        /// Valid identity application whose specialization request reports a distinct preparation failure.
-        #[derive(Clone)]
-        struct PreparationFailureOperation;
-
-        impl Operation for PreparationFailureOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "preparation_failure"
-            }
-
-            fn region_slots(&self) -> &'static [RegionSlot] {
-                const { &[RegionSlot::computation("body")] }
-            }
-
-            fn infer_region_input_types(
-                &self,
-                _input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
-                Err(TypeError::invalid("region preparation failed"))
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(input_types.to_vec())
-            }
-        }
-
-        impl_guardless_operation!(PreparationFailureOperation);
-
         // Ordinary output validation accepts this application, but must not conceal a failed preparation request.
         let state_type = ArrayType::scalar(DataType::F32);
-        let mut body = ProgramBuilder::<Array, PreparationFailureOperation>::new();
+        let mut body = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = body.add_input(state_type.clone());
         let body = body.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let context = PartialEvaluationContext::new(TracingContext::<Array, PreparationFailureOperation>::new());
+        let context = PartialEvaluationContext::new(TracingContext::<Array, TestRegionOperation>::new());
         let input = context.unknown_input(state_type.clone(), 0);
         assert_eq!(
-            PreparationFailureOperation.infer_output_types(&[state_type], &[body.interface()]),
+            TestRegionOperation::PreparationFailure.infer_output_types(&[state_type], &[body.interface()]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         assert!(matches!(
-            context.residualize(PreparationFailureOperation, vec![body], &[input]),
+            context.residualize(TestRegionOperation::PreparationFailure, vec![body], &[input]),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == "region preparation failed",
         ));
         assert!(context.builder.borrow().instructions().is_empty());
@@ -3212,13 +3127,13 @@ mod tests {
         // program with a mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let first = builder.add_input(vector_type.clone());
         builder.add_input(vector_type.clone());
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let context = PartialEvaluationContext::new(EagerContext::<Array, TestFixtureOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         assert_eq!(
             context
                 .inline_program(
@@ -3888,13 +3803,13 @@ mod tests {
         // mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let first = builder.add_input(vector_type.clone());
         builder.add_input(vector_type.clone());
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let context = PartialEvaluationContext::new(EagerContext::<Array, TestFixtureOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         assert_eq!(
             context
                 .prepare_root_inputs(

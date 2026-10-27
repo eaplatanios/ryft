@@ -8,7 +8,6 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-use crate::arrays::{ArrayIrOperation, ArrayOperation, ArrayType};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
@@ -26,7 +25,7 @@ use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
     CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward,
-    LiftedCustomRules, boundary_input_count, validate_rule_output_types,
+    boundary_input_count, validate_rule_output_types,
 };
 use crate::operations::composites::{
     describe_composite_transpose, retained_carrier_batching, validate_composite_discharge_inputs,
@@ -1181,17 +1180,6 @@ where
             }
         }
         Ok(())
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<CompositeTransposeOperation<A, ArrayOperation<A>>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: CompositeTransposeOperation<A, ArrayOperation<A>>) -> Self {
-        // Attached backward regions use the native carrier; retained rules preserve their original member source.
-        match operation.into_attached_family() {
-            Ok(operation) => Self::CompositeTranspose(operation),
-            Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(LiftedCustomRules::Member)),
-        }
     }
 }
 

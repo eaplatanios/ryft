@@ -46,9 +46,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension,
-    DimensionMemberType, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding,
-    ShardingDimension,
+    ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension, DimensionMemberType,
+    DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -2530,17 +2529,17 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<ScanOperation<ArrayType>> for ArrayIrOperation<A> {
+impl From<ScanOperation<ArrayType>> for ScanOperation<ArrayIrType> {
     #[inline]
     fn from(operation: ScanOperation<ArrayType>) -> Self {
-        Self::Scan(ScanOperation {
+        Self {
             carry_count: operation.carry_count,
             iteration_count: operation.iteration_count,
             reverse: operation.reverse,
             unroll: operation.unroll,
             stacked_axis_shardings: operation.stacked_axis_shardings,
             marker: PhantomData,
-        })
+        }
     }
 }
 
@@ -4359,9 +4358,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType,
-        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        Array, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
+        DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -5803,7 +5802,8 @@ mod tests {
             .with_unroll(2)
             .unwrap()
             .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["m"])]);
-        let direct = ArrayIrOperation::<Array>::from(source.clone());
+        let converted = ScanOperation::<ArrayIrType>::from(source.clone());
+        let direct = ArrayIrOperation::<Array>::from(converted);
         let wrapped = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(source.clone()));
         assert_eq!(direct, wrapped);
         let ArrayIrOperation::Scan(lifted) = direct else {

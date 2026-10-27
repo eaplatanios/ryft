@@ -35,8 +35,8 @@ use std::sync::Arc;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
-    ArrayIrType, ArrayType, DimensionValue, ShardableType, Sharding,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, DimensionValue, ShardableType, Sharding,
 };
 use crate::batching::{
     BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -1461,10 +1461,10 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<ConditionOperation<ArrayType>> for ArrayIrOperation<A> {
+impl From<ConditionOperation<ArrayType>> for ConditionOperation<ArrayIrType> {
     #[inline]
     fn from(_operation: ConditionOperation<ArrayType>) -> Self {
-        Self::Condition(ConditionOperation::new())
+        Self::new()
     }
 }
 

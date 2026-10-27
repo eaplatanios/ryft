@@ -1188,7 +1188,6 @@ mod tests {
         EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, ProgramBuilder, ProgramError,
         ReferenceType,
     };
-    use crate::tests::TestArrayIrOperation;
 
     use super::*;
 
@@ -1501,7 +1500,7 @@ mod tests {
     fn test_partitioned_program_known_reference_inputs() {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let mut builder = ProgramBuilder::<TestValue, TestArrayIrOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let value = builder.add_input(scalar_type.clone());
         let reference = builder.add_input(reference_type.clone());
         builder
@@ -1531,7 +1530,7 @@ mod tests {
 
         // A known reference consumed entirely on the known side does not cross the partition. This does not prove
         // it is disjoint from the unknown reference supplied at invocation.
-        let mut builder = ProgramBuilder::<TestValue, TestArrayIrOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let source = builder.add_input(reference_type.clone());
         let destination = builder.add_input(reference_type.clone());
         let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap()[0];

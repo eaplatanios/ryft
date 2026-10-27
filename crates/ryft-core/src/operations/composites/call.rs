@@ -8,7 +8,6 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrOperation, ArrayOperation, ArrayType};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingLevelExtent,
@@ -26,7 +25,7 @@ use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey,
     CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey,
-    CustomRuleSpecializer, CustomRuleTracer, LiftedCustomRules, derive_bijective_identity_renaming,
+    CustomRuleSpecializer, CustomRuleTracer, derive_bijective_identity_renaming,
 };
 use crate::operations::composites::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 use crate::operations::composites::{
@@ -1731,18 +1730,6 @@ where
             }
         }
         Ok(())
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<CompositeOperation<A, ArrayOperation<A>>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: CompositeOperation<A, ArrayOperation<A>>) -> Self {
-        // Attached rules follow their regions into the native carrier. Retained rules keep their member definition,
-        // which specializes and converts the rule programs into this family on demand.
-        match operation.into_attached_family() {
-            Ok(operation) => Self::Composite(operation),
-            Err(operation) => Self::LiftedComposite(operation.into_family(LiftedCustomRules::Member)),
-        }
     }
 }
 

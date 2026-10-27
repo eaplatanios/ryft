@@ -43,8 +43,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType, DataType,
-    MAX_DIMENSION_EXTENT, ShardableType, Sharding,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType, DataType, MAX_DIMENSION_EXTENT,
+    ShardableType, Sharding,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -1594,10 +1594,10 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<WhileOperation<ArrayType>> for ArrayIrOperation<A> {
+impl From<WhileOperation<ArrayType>> for WhileOperation<ArrayIrType> {
     #[inline]
     fn from(operation: WhileOperation<ArrayType>) -> Self {
-        Self::While(WhileOperation { iteration_bound: operation.iteration_bound, marker: PhantomData })
+        Self { iteration_bound: operation.iteration_bound, marker: PhantomData }
     }
 }
 

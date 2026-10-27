@@ -284,9 +284,9 @@ mod tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
-        AddOperation, ConditionOperation, ConstantOperation, DimensionAddOperation, DimensionSizeOperation,
-        DotDimensionNumbers, DotOperation, GuardOperation, MulOperation, PrintOperation, ReferenceAddUpdateOperation,
-        ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, ZeroOperation,
+        AddOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation, DotDimensionNumbers,
+        DotOperation, MulOperation, PrintOperation, ReferenceAddUpdateOperation, ReferenceReadOperation,
+        ReferenceWriteOperation, ScanOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::tests::{TestOperation, TestValue};
@@ -294,9 +294,7 @@ mod tests {
     use crate::programs::{
         AtomId, Operation, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, TypeError, Typed,
     };
-    use crate::tests::{
-        TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayTracingContext, TestFixtureOperation,
-    };
+    use crate::tests::{TestArrayContext, TestArrayTracingContext, TestOrderedStateOperation};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -313,7 +311,7 @@ mod tests {
             PartialEvaluationInput::Unknown(1),
             PartialEvaluationInput::Known(reference.clone()),
         ];
-        let mut builder = ProgramBuilder::<TestValue, TestArrayIrOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let outputs = inputs
             .iter()
             .map(|input| {
@@ -326,7 +324,7 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
             .unwrap();
-        let evaluation = PartialEvaluation::<TestArrayIrContext> {
+        let evaluation = PartialEvaluation::<EagerContext<TestValue, TestOperation>> {
             program,
             inputs,
             outputs: (0..5).map(PartialEvaluationOutput::Unknown).collect(),
@@ -1524,37 +1522,19 @@ mod tests {
 
     #[test]
     fn test_program_partially_evaluate_prepares_mixed_reference_reads_without_retype() {
-        // Existing projected array operations plus a read and an entry guard suffice; no Cast capability is required.
-        /// Minimal native array family used by the read fixture's computational projection.
-        #[derive(Clone, Debug, ryft_macros::Operation)]
-        #[ryft(type(ArrayType), constant(Array))]
-        enum ArrayAdditionOperation {
-            Constant(ConstantOperation<Array>),
-            Add(AddOperation<ArrayType>),
-        }
-
-        /// Minimal projected family that supports entry checks without proof casts.
-        #[derive(Clone, Debug, ryft_macros::Operation)]
-        #[ryft(type(ArrayIrType), constant(TestValue), members(ArrayType))]
-        enum ReadOperation {
-            Constant(ConstantOperation<TestValue>),
-            #[ryft(projected(ArrayType))]
-            Array(ArrayAdditionOperation),
-            ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
-            Guard(GuardOperation<ArrayIrType>),
-        }
+        // Reads of references whose declared extents are related only by the entry guard need no proof casts.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let reference: ArrayIrType =
             ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]))).into();
         let exact: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into();
-        let mut builder = ProgramBuilder::<TestValue, ReadOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let first = builder.add_input(reference.clone());
         let second = builder.add_input(reference.clone());
         let first = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
         let second = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second], None).unwrap()[0];
         let sum = builder
             .add_instruction(
-                ReadOperation::Array(ArrayAdditionOperation::Add(AddOperation::new())),
+                TestOperation::Array(ArrayOperation::Add(AddOperation::new())),
                 Vec::new(),
                 vec![first, second],
                 None,
@@ -1584,7 +1564,7 @@ mod tests {
         );
         let reference = || TestValue::Reference(ArrayReference::new(Array::vector(vec![1f32; 3]).unwrap()));
         assert_eq!(
-            evaluation.interpret(&EagerContext::<TestValue, ReadOperation>::new(), &[reference(), reference()]),
+            evaluation.interpret(&EagerContext::<TestValue, TestOperation>::new(), &[reference(), reference()]),
             Ok(vec![TestValue::Array(Array::vector(vec![2f32; 3]).unwrap())]),
         );
     }
@@ -1934,7 +1914,7 @@ mod tests {
         // evaluating a program with a mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<Array, TestFixtureOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let first = builder.add_input(vector_type.clone());
         builder.add_input(vector_type.clone());
         let program = builder
