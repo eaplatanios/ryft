@@ -298,8 +298,6 @@ impl<
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Operation`] family for Ryft's array Intermediate Representation (IR), whose values include arrays, first-class
 /// dimensions, and array references. Homogeneous operations project their complete boundary into [`ArrayOperation`]
 /// or [`DimensionOperation`], delegate to that family's rule, and lift the result types back into [`ArrayIrType`].
@@ -473,6 +471,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
         CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level capability bundle that groups every operation Ryft supports on array IR values, so that generic array
 /// IR code can state one bound instead of listing each capability it uses. It is implemented automatically for every
