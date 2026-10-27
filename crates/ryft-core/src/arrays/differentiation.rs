@@ -856,7 +856,8 @@ mod tests {
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableType, Differentiate, ReverseModeDifferentiate, TransposedProgramCotangent, differentiate_at,
+        DifferentiableType, Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate,
+        TransposedProgramCotangent, differentiate_at,
     };
     use crate::operations::{Add, Dot, DotDimensionNumbers, MulOperation, StopGradientOperation, TransposeOperation};
     use crate::parameters::Placeholder;

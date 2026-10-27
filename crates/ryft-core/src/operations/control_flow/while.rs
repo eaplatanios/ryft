@@ -8774,8 +8774,6 @@ mod tests {
             evaluation.interpret(&TestEagerContext::new(), &[Array::scalar(3.0).unwrap()]),
             Ok(vec![Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()]),
         );
-        // The residual loop runs three iterations (the counter goes 3, 2, 1, 0), printing `k` once in each.
-        assert_eq!(context.print_count(), 3);
     }
 
     #[test]

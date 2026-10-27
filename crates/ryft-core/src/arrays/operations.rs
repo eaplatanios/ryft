@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(hash_of(&constant), hash_of(&same_constant));
         assert_ne!(
             constant,
-            DimensionOperation::Constant(ConstantOperation::new(DimensionValue::constant(4).unwrap()))
+            DimensionOperation::Constant(ConstantOperation::new(DimensionValue::constant(4).unwrap())),
         );
         let operations = HashMap::from([(add, "addition"), (constant, "constant")]);
         assert_eq!(operations.get(&same_add), Some(&"addition"));
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(operations.get(&same_add), Some(&"array"));
         assert_eq!(operations.get(&same_dimension_add), Some(&"dimension"));
         assert_eq!(operations.get(&same_condition), Some(&"condition"));
-        assert_eq!(operations.get(&ArrayIrOperation::<Array>::from(ArrayOperation::Mul(MulOperation::new()))), None,);
+        assert_eq!(operations.get(&ArrayIrOperation::<Array>::from(ArrayOperation::Mul(MulOperation::new()))), None);
     }
 
     #[test]
@@ -2613,7 +2613,7 @@ mod tests {
         assert!(matches!(
             promoted_while,
             ArrayIrOperation::While(operation)
-                if operation.iteration_bound() == while_operation.iteration_bound()
+                if operation.iteration_bound() == while_operation.iteration_bound(),
         ));
         let scan_operation = ScanOperation::<ArrayType>::new(1, 4).with_reverse(true).with_unroll(2).unwrap();
         let promoted_scan = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(scan_operation));
@@ -2626,8 +2626,8 @@ mod tests {
         assert_eq!(promoted_scan.unroll(), 2);
 
         // Every region-carrying array payload has an array IR carrier, so none of them reaches the region-free
-        // projected `Array` variant. Composite calls carry their rule layout and non-differentiated input split, and
-        // rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
+        // projected `Array` variant. Composite calls preserve their rule layout and non-differentiated input split.
+        // Rematerialization preserves its policy's identity, optimization barrier, and differentiation state.
         for jvp_rule in [CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Primal] {
             for has_vjp_rule in [false, true] {
                 let operation = CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule)

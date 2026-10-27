@@ -2365,10 +2365,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, ArrayReference,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds, DimensionError,
-        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
+        DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, RecursiveBatchingDriver, batch};
