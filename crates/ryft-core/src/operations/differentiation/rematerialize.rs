@@ -162,8 +162,8 @@ impl<T: Type> RematerializeOperation<T> {
     }
 
     /// Returns this [`RematerializeOperation`] lifted into a type universe `U` whose types project into `T` (e.g.,
-    /// from [`ArrayType`] into [`ArrayIrType`](crate::ArrayIrType)), with its policy lifted through
-    /// [`ResidualPolicyReference::lift`], which keeps the identity of the policy, and with its flags unchanged.
+    /// from [`ArrayType`] into [`ArrayIrType`]), with its policy lifted through [`ResidualPolicyReference::lift`],
+    /// which keeps the identity of the policy, and with its flags unchanged.
     #[inline]
     pub fn lift<U: 'static + Type>(&self) -> RematerializeOperation<U>
     where

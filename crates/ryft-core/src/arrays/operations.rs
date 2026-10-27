@@ -563,13 +563,25 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
         match operation {
             ArrayOperation::Zero(operation) => Self::from(operation),
             ArrayOperation::ParallelRaggedAllToAll(operation) => Self::from(operation),
-            ArrayOperation::Condition(operation) => Self::from(operation),
-            ArrayOperation::While(operation) => Self::from(operation),
-            ArrayOperation::Scan(operation) => Self::from(operation),
-            ArrayOperation::Composite(operation) => Self::from(operation),
-            ArrayOperation::CompositeTranspose(operation) => Self::from(operation),
-            ArrayOperation::LinearCall(operation) => Self::from(operation),
-            ArrayOperation::Rematerialize(operation) => Self::from(operation),
+            ArrayOperation::Condition(operation) => Self::Condition(operation.into()),
+            ArrayOperation::While(operation) => Self::While(operation.into()),
+            ArrayOperation::Scan(operation) => Self::Scan(operation.into()),
+            ArrayOperation::LinearCall(operation) => Self::LinearCall(operation.into()),
+            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.into()),
+            ArrayOperation::Composite(operation) => {
+                // The family chooses the native or lifted carrier; payload retyping preserves its rule metadata.
+                match operation.into_attached_family() {
+                    Ok(operation) => Self::Composite(operation),
+                    Err(operation) => Self::LiftedComposite(operation.into_family(LiftedCustomRules::Member)),
+                }
+            }
+            ArrayOperation::CompositeTranspose(operation) => {
+                // The family chooses the native or lifted carrier; payload retyping preserves its rule metadata.
+                match operation.into_attached_family() {
+                    Ok(operation) => Self::CompositeTranspose(operation),
+                    Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(LiftedCustomRules::Member)),
+                }
+            }
             operation => {
                 // Preserve existing instruction inputs. Mixed payload conversions such as `PadOperation` require
                 // extra extent inputs, which lifting an existing homogeneous instruction cannot introduce.

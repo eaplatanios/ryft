@@ -54,15 +54,26 @@ Load the references that apply before editing:
 
 Group each operation in this order, omitting only implementations that do not apply:
 
-1. Its `*_OPERATION_NAME` constant.
-2. Its operation type, inherent functions, and formatting implementations, followed by `Operation`,
+1. Its type-family contract trait (e.g., `ConditionType`, `ScanType`, or `WhileType`), if any, and built-in
+   implementations, followed by any runtime domain or value contract that its rules require, if any (e.g.,
+  `ScanInterpretationDomain` or `WhilePredicate`) and its implementations.
+2. Its `*_OPERATION_NAME` constant.
+3. Its operation type, inherent functions, and formatting implementations, followed by `Operation`,
    `ReferenceDischargeableOperation`, `InterpretableOperation` using the appropriate capability bound,
    `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`, `TransposableOperation`,
    `MemberOperation`, and `MemberInterpretableOperation` implementations.
-3. Its operation provider trait and implementations where relevant.
-4. Its capability trait and implementations. Order explicit context implementations as `EagerContext` for `Array`,
-   `EagerContext` for `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`,
-   `BatchingContext`, `DifferentiationContext`, and `TranspositionContext`.
+4. Its operation provider trait and implementations where relevant.
+5. Its capability or frontend trait and implementations, preceded by its options types (e.g., `ScanOptions` or
+   `WhileOptions`) and followed by its global function where one exists (e.g., `scan()` or `while_loop()`). Order
+   explicit context implementations as `EagerContext` for `Array`, `EagerContext` for `ArrayIrValue`,
+   `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`, `DifferentiationContext`, and
+   `TranspositionContext`.
+6. The private machinery of its rules: `BatchingContext` implementations, private rule structs (e.g., `ScanJvp`), and
+   free helper functions in call order.
+
+Downstream customization points that bound public rule implementations (e.g., `ScanInterpretationDomain`,
+`ResidualStackOperation`, and `WhileResidualStackOperation`) must be public, documented with what their blanket
+implementations cover and the coherence limit that those impose, and re-exported through the module facades.
 
 Keep shared blanket implementations and substantial helper submodules shared; do not duplicate them to reproduce
 this ordering. Keep additional universe-specific implementations of a shared operation type and their tests in its

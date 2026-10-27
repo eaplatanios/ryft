@@ -9654,6 +9654,30 @@ mod tests {
                 in (%0, %7)"},
         );
 
+        // Batching the discharged program carries the per-item referent as an ordinary array carry.
+        let (discharged, _) = discharged.into_parts();
+        assert_eq!(
+            discharged.to_string(),
+            indoc! {"
+                lambda %0:dimension<2>, %1:f32[], %2:f32[2] .
+                let %3:dimension<2>, %4:f32[], %5:f32[2] = while %0 %1 %2 [
+                    condition={
+                        lambda %0:dimension<2>, %1:f32[], %2:f32[2] .
+                        let %3:f32[] = zero_like %1
+                            %4:bool[] = compare [direction=GreaterThan] %1 %3
+                        in (%4)
+                    },
+                    body={
+                        lambda %0:dimension<2>, %1:f32[], %2:f32[2] .
+                        let %3:f32[] = const -1.0
+                            %4:f32[] = add %1 %3
+                            %5:f32[2] = add %2 %2
+                        in (%0, %4, %5)
+                    },
+                ]
+                in (%0, %5)"},
+        );
+
         // Both batched programs run the loop to the same values: three iterations double each item's referent.
         let inputs = vec![
             TestIrValue::Dimension(axis_extent.clone()),
@@ -9662,7 +9686,7 @@ mod tests {
         ];
         let expected = vec![TestIrValue::Dimension(axis_extent), array(Array::vector(vec![8.0f32, 80.0]).unwrap())];
         assert_eq!(direct.interpret(inputs.clone()), Ok(expected.clone()));
-        assert_eq!(discharged.into_parts().0.interpret(inputs), Ok(expected));
+        assert_eq!(discharged.interpret(inputs), Ok(expected));
     }
 
     #[test]
