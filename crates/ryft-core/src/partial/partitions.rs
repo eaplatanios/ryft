@@ -172,7 +172,7 @@ impl PartitionMetadata {
 /// Result of partitioning a [`Program`] into a known-side program and a residual program based on which original
 /// inputs are known. Unlike [`PartialEvaluation`], this representation carries only programs and [`PartitionMetadata`]
 /// describing their positional wiring and effect-ordering constraints. It does not retain values from a parent
-/// [`Context`]. It is returned by [`Program::partition`] and is typically passed to
+/// [`Context`](crate::Context). It is returned by [`Program::partition`] and is typically passed to
 /// [`PartialEvaluationContext::inline_partitioned_program`] when recursively
 /// transforming an attached region.
 ///
@@ -231,7 +231,7 @@ impl PartitionMetadata {
 /// The wiring renders on one line when it is short enough. The effect-ordering constraints are not rendered, because
 /// reference analysis derives them from the two programs, and neither is the
 /// [`original_input_count`](Self::original_input_count).
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
     known_program: Program<V, O, Vec<V>, Vec<V>>,

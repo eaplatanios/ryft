@@ -1,6 +1,7 @@
 use proc_macro::TokenStream;
 
 mod capabilities;
+mod diagrams;
 mod helpers;
 mod kernels;
 mod operations;
@@ -112,6 +113,55 @@ pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
     kernels::expand(attributes.into(), input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Renders the [Mermaid](https://mermaid.js.org/) diagrams in the documentation of the item that it is applied on.
+///
+/// The attribute rewrites every ```` ```mermaid ```` code fence (or `~~~mermaid` fence) in the outer documentation
+/// attributes of the item, which include its `///` comments, into a `<pre class="mermaid">` HTML block, and inserts a
+/// small module script before the first diagram of the item that loads Mermaid and renders the diagrams of the page in
+/// the browser. The script renders each page once even when several of its items carry diagrams, and it selects the
+/// dark Mermaid theme when the browser prefers a dark color scheme. All other documentation lines, including other code
+/// fences, are preserved verbatim and in order, and items without diagrams are returned unchanged. The attribute takes
+/// no arguments, and it rejects unterminated diagrams, code fences nested inside diagrams, and attributes other than
+/// literal documentation attributes placed between the lines of a diagram.
+///
+/// Diagram text reaches Mermaid as written, except that HTML character references in it are decoded first, so that
+/// labels can contain HTML elements spelled with entities (e.g., `&lt;code&gt;` for a `code` element).
+///
+/// The attribute is meant to be applied only when building documentation, so that ordinary builds never run it:
+///
+/// ```rust,ignore
+/// /// Graph with a single edge.
+/// ///
+/// /// ```mermaid
+/// /// flowchart LR
+/// ///   source --> target
+/// /// ```
+/// #[cfg_attr(doc, ryft_macros::mermaid)]
+/// pub struct Graph;
+/// ```
+///
+/// # Mermaid Bundle
+///
+/// When it expands an item with diagrams and the rustdoc output directory `<target>/doc` already exists, the attribute
+/// writes a vendored Mermaid bundle to `<target>/doc/static.files.mermaid/mermaid.min.js` (unless that file already
+/// exists with the same size), where `<target>` is `$CARGO_TARGET_DIR` or, when that variable is unset, `./target`
+/// relative to the working directory of the compiler. Failing to write the bundle does not fail the build. The loader
+/// script first requests this bundle relative to the rustdoc root path, which also works for documentation opened
+/// directly from the file system, and then falls back to `https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js`.
+/// If neither loads, each diagram is replaced by a note saying that it could not be rendered.
+///
+/// Because the output directory is derived only from `CARGO_TARGET_DIR` and `./target`, documentation written
+/// elsewhere (e.g., by `cargo doc --target <triple>`, which writes to `<target>/<triple>/doc`, or into a target
+/// directory configured through `--target-dir` or `build.target-dir`) does not receive the bundle and renders its
+/// diagrams through the CDN. The same holds when the bundle is deleted while the documentation of the crate is fresh,
+/// since rustdoc only expands the attribute when it documents the crate again.
+#[proc_macro_attribute]
+pub fn mermaid(attributes: TokenStream, input: TokenStream) -> TokenStream {
+    diagrams::expand(attributes.into(), input.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

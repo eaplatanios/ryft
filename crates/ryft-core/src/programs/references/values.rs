@@ -151,7 +151,7 @@ impl ReferenceGeneration {
 /// bidirectionally at the shared-state boundary. Because exact clones share that metadata, `Reference<V>` is [`Send`]
 /// and [`Sync`] only when the referent value and its type and identity metadata are all safe to share across threads
 /// (i.e., they are all `Send + Sync`).
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Parameter)]
 pub struct Reference<V: Value> {
     /// Immutable [`ReferenceHandle`] shared by exact clones. All runtime mutability lives behind its shared state lock.
@@ -800,7 +800,7 @@ enum ReferenceState<V: Value> {
 /// guard proven to protect the `Ready` state. [`ReadyReferenceGuard::take`] returns the value and the only typestate
 /// that can resolve the resulting `Taken` state. Dropping that [`TakenReferenceGuard`] poisons the reference because
 /// the previous value is no longer available and may already have been consumed by backend work.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct ReadyOrPendingReferenceGuard<'g, V: Value> {
     /// Underlying [`ReferenceGuard`].
     guard: ReferenceGuard<'g, V>,

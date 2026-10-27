@@ -243,7 +243,7 @@ fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type
 /// The diagram includes both direct forward mode and the reverse-mode path built from this structural split. Concrete
 /// [`Pushforward`] and [`Pullback`](crate::Pullback) callables additionally retain residual values from one
 /// linearization point; this [`Linearization`] itself does not.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Clone, Debug)]
 pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs

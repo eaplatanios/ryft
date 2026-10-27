@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ReplicatedBatchingPolicyProjection`, so their member operation families need no batching rules of their own. The
   earlier `#[ryft(identity)]`, `#[ryft(type = T)]`, and `#[ryft(constant = V)]` spellings are rejected with diagnostics
   that name their replacements.
+- Added the `#[mermaid]` attribute, which renders the Mermaid diagrams in rustdoc comments (i.e., ```` ```mermaid ````
+  code fences) in the browser. It is meant to be applied as `#[cfg_attr(doc, ryft_macros::mermaid)]`, and it copies a
+  vendored Mermaid bundle into the rustdoc output directory so that locally built documentation renders offline, with
+  a CDN fallback.
 
 ### Fixed
 

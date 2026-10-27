@@ -696,7 +696,7 @@ pub enum DataTypeError {
 /// Ordinary scalar types may also support explicit element-type conversion between pairs that do not promote. Such
 /// conversions remain explicit because they may lose precision. [`DataType::Token`] and [`DataType::Zero`] are not
 /// ordinary scalar representations and cannot be converted to or from other types.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum DataType {
     /// [`DataType`] that represents token values that are threaded between side-effecting operations.

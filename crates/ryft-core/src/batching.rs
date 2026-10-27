@@ -1380,7 +1380,7 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
 ///
 /// One context instance is shared by every tracer at this batching level. Its parent may itself be eager, staging, or
 /// another transform context, which is what makes batching compose without changing this pipeline.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Debug, Clone)]
 pub struct BatchingContext<C: Context, P: BatchingPolicy<C>> {
     /// [`Context`] that this [`BatchingContext`] is nested into.

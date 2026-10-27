@@ -469,7 +469,7 @@ impl<P> InFlightCompilation<P> {
 ///
 /// Same-key misses coordinate one backend producer, while requests for different keys remain concurrent. Every
 /// successful source publishes to memory; persistent and exchange writes remain best-effort or policy-controlled.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompilationContext<D: CompilationCacheDomain> {
     /// In-memory LRU keyed by the domain's structural [`CompilationCacheDomain::CacheKey`].
     programs: Mutex<LruCache<D::CacheKey, Arc<D::CompiledProgram>>>,

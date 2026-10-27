@@ -16,8 +16,10 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
-- Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
-  `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as `crate::Operation::name(self)` or
+- For a function that queries or validates a particular instance, including a type descriptor, use a receiver such as
+  `&self` rather than a named first argument of type `&Self`. Prefer normal method-call syntax for receiver-based calls
+  (for example, `self.name()`, `operation.result(0)`, or `attribute.cast::<TypeAttributeRef>()`), and avoid
+  UFCS/static-like syntax such as `crate::Operation::name(self)` or
   `crate::Attribute::cast::<TypeAttributeRef>(&attribute)` unless disambiguation is actually required.
 - When replacing a bespoke cross-cutting capability with something more general, prefer a small named trait over a
   higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).

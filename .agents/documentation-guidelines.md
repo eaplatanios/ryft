@@ -53,7 +53,8 @@ code comments. Preserve the documented contract, technical rationale, and links 
 - When using ASCII diagrams or Markdown tables in doc comments, align columns for source readability and indent the
   block content slightly so that the raw Rust file remains easy to scan.
 - When a `rustdoc` diagram would materially improve documentation clarity, prefer a rendered Mermaid diagram via
-  `aquamarine` over a large ASCII graph, while keeping any supporting tables aligned in the raw source.
+  `#[cfg_attr(doc, ryft_macros::mermaid)]` over a large ASCII graph, while keeping any supporting tables aligned in the
+  raw source.
 - When a large `rustdoc` table needs color or layout that Markdown cannot express cleanly, prefer theme-aware raw HTML
   with colors derived from rustdoc CSS variables instead of hard-coded light-theme colors, and prefer a small local
   `<style>` block with namespaced classes over repeating large inline styles on every cell.

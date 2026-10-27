@@ -353,7 +353,7 @@ pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
 /// owned key, and a miss continues through [`Self::try_entry`] with the owned key, which counts the miss and authorizes
 /// production. Statistics are exposed as ordinary value snapshots, while private atomics accumulate events without
 /// participating in cache correctness.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct SpecializationCache<Key, Artifact> {
     /// Retained artifacts in Least-Recently-Used (LRU) order.
     entries: Mutex<LruCache<Key, Artifact>>,

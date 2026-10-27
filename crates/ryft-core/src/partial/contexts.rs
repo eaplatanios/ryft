@@ -120,7 +120,7 @@ pub enum ReferencePlacement {
 /// Mutable state is shared behind `Rc<RefCell<...>>` handles. Cloning this context therefore keeps every clone writing
 /// to the same residual program, input descriptors, staged-feeder table, and ordering state, and lets rules re-enter
 /// the context (e.g., to inline a selected condition branch through [`inline_program`](Self::inline_program)).
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct PartialEvaluationContext<C: Context> {
     /// Parent context in which known operations are evaluated or staged. An `Rc` shares the exact parent object across
     /// clones and deferred siblings instead of cloning `C`, whose `Clone` implementation need not preserve object

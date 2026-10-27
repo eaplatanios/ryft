@@ -30,7 +30,6 @@ pre-release-replacements = [
 [dependencies]
 ryft-macros.workspace = true
 approx.workspace = true
-aquamarine.workspace = true
 convert_case.workspace = true
 dyn-eq.workspace = true
 dyn-hash.workspace = true

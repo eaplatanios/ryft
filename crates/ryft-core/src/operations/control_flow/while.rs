@@ -165,8 +165,8 @@ pub trait WhileType: Type + ArrayMemberType + From<ArrayType> {
 impl WhileType for ArrayType {
     #[inline]
     fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError> {
-        validate_while_array_predicate(self, state_types)?;
-        validate_while_state_variation(self, state_types)
+        validate_while_predicate_type_and_shape(self, state_types)?;
+        validate_while_state_manual_variation(self, state_types)
     }
 
     #[inline]
@@ -190,7 +190,7 @@ impl WhileType for ArrayIrType {
         // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such a
         // carry must instead be passed through the body unchanged, which `WhileOperation::validate_application`
         // enforces structurally (refer to the documentation of `WhileType`).
-        validate_while_array_predicate(
+        validate_while_predicate_type_and_shape(
             predicate,
             state_types.iter().filter_map(|state_type| match state_type {
                 Self::Array(state_type) => Some(state_type),
@@ -199,7 +199,7 @@ impl WhileType for ArrayIrType {
         )?;
         // A reference's referent changes with every iteration that writes it, so it follows the same variation rule
         // as array state.
-        validate_while_state_variation(
+        validate_while_state_manual_variation(
             predicate,
             state_types.iter().filter_map(|state_type| match state_type {
                 Self::Array(state_type) => Some(state_type),
@@ -313,7 +313,7 @@ impl WhilePredicate for Array {
                 ),
             });
         }
-        validate_while_array_predicate(self.r#type().as_ref(), [on_true.r#type().as_ref()])?;
+        validate_while_predicate_type_and_shape(self.r#type().as_ref(), [on_true.r#type().as_ref()])?;
         // Both candidates share the state type, which the selection keeps. A scalar predicate selects one candidate
         // wholesale, and the `while` interpreter only calls this function once that predicate is true, so its manual
         // variation never mixes candidate items and does not constrain the state type. A batched predicate selects per
@@ -2726,7 +2726,7 @@ where
 /// Validates that `predicate` is a Boolean [`while`](WhileOperation) predicate for array state of types
 /// `state_types`: a scalar predicate is always valid, and a batched predicate's shape must be a prefix of every array
 /// state shape, so that it broadcasts against each state element along its leading axes.
-fn validate_while_array_predicate<'t>(
+fn validate_while_predicate_type_and_shape<'t>(
     predicate: &ArrayType,
     state_types: impl IntoIterator<Item = &'t ArrayType>,
 ) -> Result<(), TypeError> {
@@ -2756,7 +2756,7 @@ fn validate_while_array_predicate<'t>(
 /// # Errors
 ///
 /// Returns a [`TypeError`] naming the first state type that lacks one of the predicate's varying manual axes.
-fn validate_while_state_variation<'t>(
+fn validate_while_state_manual_variation<'t>(
     predicate: &ArrayType,
     state_types: impl IntoIterator<Item = &'t ArrayType>,
 ) -> Result<(), TypeError> {

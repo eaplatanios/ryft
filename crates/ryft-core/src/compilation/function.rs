@@ -1216,7 +1216,7 @@ where
 ///
 /// The cache-hit edge skips tracing, lowering, and compilation. The dotted edge is the alternative staging path: a
 /// staged function can become a nested call boundary instead of continuing immediately toward an executable.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompiledFunctionDispatcher<
     D: CompilationDomain<Type: Eq + Hash>,
     F,

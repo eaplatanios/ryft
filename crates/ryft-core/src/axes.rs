@@ -306,7 +306,7 @@ impl NamedAxis {
 ///
 /// Lookup (i.e., [`NamedAxes::named_axis`]) checks local bindings before delegating outward unless the context is a
 /// leaf. Enumeration (i.e., [`NamedAxes::named_axes`]) includes the enclosing bindings with the same shadowing rules.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.

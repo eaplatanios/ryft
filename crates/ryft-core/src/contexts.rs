@@ -215,7 +215,7 @@ impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
 /// them (refer to [`needs_guards`](Self::needs_guards)). A guard that replay does construct is enforced by the
 /// family's rule under a transform, by interpretation in an eager context, or by staging, according to the contract in
 /// [the `GuardOperation` documentation](GuardOperation#enforcement).
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait Context:
     Clone + Domain<Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>>
 {

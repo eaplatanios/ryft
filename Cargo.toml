@@ -46,7 +46,6 @@ ryft-xla = { path = "crates/ryft-xla", version = "0.0.3", default-features = fal
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.3", default-features = false }
 anyhow = "1.0.102"
 approx = "0.5.1"
-aquamarine = "0.6.0"
 bindgen = "0.72.1"
 convert_case = "0.11.0"
 dirs = "6.0.0"

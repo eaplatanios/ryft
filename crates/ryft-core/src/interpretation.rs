@@ -130,7 +130,7 @@ use crate::programs::{
 ///
 /// The driver is application-scoped rather than stored in the operation payload, so the same operation can receive
 /// owned, borrowed, replayed, or shared attached computations through one ordered region contract.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Constant, C::Operation> {
     /// Interprets the [`Region`](crate::Region) at `index` over the provided input values, re-entering the active
     /// program interpreter, and returns the region's output values.

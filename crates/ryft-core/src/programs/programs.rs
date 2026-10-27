@@ -75,7 +75,7 @@ pub enum ProgramRenderingMode {
 ///
 /// Construction through [`ProgramBuilder`](crate::ProgramBuilder) is the only mutable phase. Every consumer starts
 /// from a program whose region graph and structured boundaries have already been validated.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 #[derive(Debug)]
 pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.

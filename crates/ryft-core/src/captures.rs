@@ -334,7 +334,7 @@ where
 ///
 /// One capture table scopes the entry region and every attached region. Immediate constants participate in the program
 /// but not in the table, while repeated capture references continue to name one table slot and one lifted input.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct ClosedProgram<
     C: Value,
     V: CaptureConstant<Type = C::Type>,

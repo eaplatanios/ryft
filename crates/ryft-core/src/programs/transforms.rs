@@ -218,7 +218,7 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 ///   typed_cache --> executable
 ///   dispatcher --> backend
 /// ```
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub trait Transform<Source> {
     /// Complete equality and hash identity of one specialization within the owning transform cache.
     type Arguments: Clone + Eq + Hash;
@@ -677,7 +677,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     ///   derive --> sanitize["Detach Source Cache Identity"]
     ///   sanitize --> publish["Publish and Return &lt;code&gt;TransformArtifact&lt;/code&gt;"]
     /// ```
-    #[cfg_attr(doc, aquamarine::aquamarine)]
+    #[cfg_attr(doc, ryft_macros::mermaid)]
     pub fn transform<
         T: 'static
             + Transform<

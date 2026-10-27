@@ -309,7 +309,7 @@ where
 /// Both paths use the same staging protocol after creating their context. The root path owns capture storage. The
 /// nested path expresses its program in the parent's type, constant, and operation universe and delegates capture
 /// registration to that parent.
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
     /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
