@@ -1885,43 +1885,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionError,
-        DimensionType, DimensionValue, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
+        DimensionError, DimensionType, DimensionValue, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::impl_guardless_operation;
-    use crate::operations::ZeroOperation;
+    use crate::operations::{NegOperation, ZeroOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, RegionInterface, Type, TypeError};
+    use crate::programs::{EmptyRegionDriver, Operation, Type, TypeError};
 
     use super::*;
-
-    #[derive(Clone, Debug)]
-    struct NegateOperation;
-
-    impl Operation for NegateOperation {
-        type Type = ArrayType;
-
-        fn name(&self) -> &'static str {
-            "test_negate"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[ArrayType],
-            _region_interfaces: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError::invalid(format!("test_negate expects 1 input but got {}", input_types.len())));
-            }
-            Ok(input_types.to_vec())
-        }
-    }
-
-    impl_guardless_operation!(NegateOperation);
 
     #[derive(Clone)]
     struct TestLoweredProgram {
@@ -1965,7 +1940,7 @@ mod tests {
         type Type = ArrayType;
         type Value = Array;
         type Constant = CaptureReference<ArrayType>;
-        type Operation = NegateOperation;
+        type Operation = ArrayOperation<Array>;
     }
 
     impl CompilationDomain for TestDomain {
@@ -2239,7 +2214,7 @@ mod tests {
     ) -> CompiledFunction<TestDomain, ArrayType, ArrayType> {
         let staged = stage_function(
             domain,
-            |input| if negate { input.unary(NegateOperation) } else { input },
+            |input| if negate { input.unary(NegOperation::new()) } else { input },
             ArrayType::scalar(DataType::F64),
             TestOptions::default(),
         )
@@ -2337,7 +2312,7 @@ mod tests {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
             &domain,
-            |input: CompilationTracer<TestDomain>| input.unary(NegateOperation),
+            |input: CompilationTracer<TestDomain>| input.unary(NegOperation::new()),
             ArrayType::scalar(DataType::F64),
             TestOptions::default(),
         )
@@ -2523,7 +2498,7 @@ mod tests {
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate { input.unary(NegOperation::new()) } else { input }
             },
         );
 
@@ -2745,7 +2720,7 @@ mod tests {
         let function: CompiledFunctionDispatcher<TestDomain, _, CollidingStatic, ArrayType, ArrayType> = jit(
             &domain,
             |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
-                if static_parameters.0 { input.unary(NegateOperation) } else { input }
+                if static_parameters.0 { input.unary(NegOperation::new()) } else { input }
             },
         );
 
@@ -2808,7 +2783,7 @@ mod tests {
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate { input.unary(NegOperation::new()) } else { input }
             },
         );
         function.call(true, Array::scalar(2.0).unwrap()).unwrap();
@@ -2905,7 +2880,7 @@ mod tests {
             try_jit_with_options_and_capacity(
                 &domain,
                 |negate, input: CompilationTracer<TestDomain>| {
-                    Ok(if negate { input.unary(NegateOperation) } else { input })
+                    Ok(if negate { input.unary(NegOperation::new()) } else { input })
                 },
                 TestOptions::default(),
                 1,
@@ -3025,7 +3000,7 @@ mod tests {
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate { input.unary(NegOperation::new()) } else { input }
             },
         );
         assert_dispatcher_send_and_sync(&function);
@@ -3037,7 +3012,7 @@ mod tests {
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate { input.unary(NegOperation::new()) } else { input }
             },
         );
         function.call(true, Array::scalar(1.0).unwrap()).unwrap();
@@ -3066,7 +3041,7 @@ mod tests {
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate { input.unary(NegOperation::new()) } else { input }
             },
         );
 

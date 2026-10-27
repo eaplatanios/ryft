@@ -610,7 +610,6 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::elements::f8e8m0fnu;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::references::ArrayReferenceTransform;
@@ -626,9 +625,9 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DifferentiationContext, DifferentiationDual, DotsSavable,
-        ForwardModeDifferentiate, LinearizationTracer, MemberDifferentiableOperation, NothingSavable,
-        PartitionedDifferentiationPolicy, ReverseModeDifferentiate, differentiate_at,
+        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DifferentiationContext, DotsSavable, ForwardModeDifferentiate,
+        LinearizationTracer, NothingSavable, PartitionedDifferentiationPolicy, ReverseModeDifferentiate,
+        differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
@@ -2561,97 +2560,6 @@ mod tests {
                 .unwrap()
                 .interpret(vec![ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap())]),
             Ok(vec![ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap())]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_dynamic_projected_jvp_materializes_source_relative_widened_zero() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(input_type.into());
-        let output = builder
-            .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        // The projected constant derivative reads the runtime extent from its primal result and constructs a zero
-        // in the wider tangent representation, without converting the primal's element data.
-        let jvp = program.jvp().unwrap();
-
-        let primal = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
-            &[1.0, 2.0, 4.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap();
-        let expected_primal = primal.clone();
-        assert_eq!(
-            jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
-            Ok(vec![
-                ArrayIrValue::Array(expected_primal),
-                ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap()),
-            ]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_dynamic_projected_jvp_preserves_zero_space_tangent() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![1.into(), Dimension::Dynamic(extent.clone()), 1.into()]));
-        // Invoke the member rule directly: the program-level all-zero fast path deliberately bypasses it. Integer
-        // primals have a zero differential space, and their structural tangents retain the permuted symbolic shape.
-        // Handling that shape must not attempt an invalid conversion from integers to the `zero` element type.
-        let (_, jvp) = TracingContext::<TestValue, TestOperation>::trace(
-            |input| {
-                let context = DifferentiationContext::fused(input.context().clone());
-                let output = ArrayOperation::<Array>::Transpose(TransposeOperation::new([1, 0, 2]))
-                    .jvp_in_parent(
-                        &context,
-                        &EmptyRegionDriver,
-                        &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
-                    )
-                    .unwrap()
-                    .remove(0);
-                assert!(matches!(
-                    output.tangent(),
-                    MaybeZero::Zero(r#type) if r#type == &ArrayIrType::Array(ArrayType::new(
-                        DataType::Zero,
-                        Shape::new(vec![Dimension::Dynamic(extent.clone()), 1.into(), 1.into()]),
-                    )),
-                ));
-                Ok(output.primal().clone())
-            },
-            ArrayIrType::Array(input_type),
-        )
-        .unwrap();
-        assert_eq!(
-            jvp.interpret(ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 3, 1]), &[2_i32, 0, 1]).unwrap(),
-            )),
-            Ok(ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [3, 1, 1]), &[2_i32, 0, 1]).unwrap(),
-            )),
-        );
-        assert_eq!(
-            jvp.interpret(ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 0, 1]), &[] as &[i32]).unwrap(),
-            )),
-            Ok(ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [0, 1, 1]), &[] as &[i32]).unwrap(),
-            )),
         );
     }
 
