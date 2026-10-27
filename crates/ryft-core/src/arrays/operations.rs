@@ -452,21 +452,33 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
 
-    /// Composite call with an array IR primal region and attached rules or retained rules registered in this family.
-    /// Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are rejected.
+    /// Calls an array IR primal region with custom transform rules, supplied as attached program regions or retained
+    /// callbacks registered for this array IR family. Converting an [`ArrayOperation::Composite`] with attached rules
+    /// uses this variant because those regions convert with the primal. Calls with retained array-only callbacks
+    /// instead use [`LiftedComposite`](Self::LiftedComposite). Reference inputs are allowed only in the leading
+    /// non-differentiated segment and reference outputs are rejected.
     Composite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Reverse mode differentiation carrier of [`Composite`](Self::Composite), replaced by the call's backward rule
-    /// during transposition.
+    /// Temporary reverse-mode carrier of [`Composite`](Self::Composite) calls with custom backward rules. It represents
+    /// the tangent map whose transpose is the backward rule, and has no executable forward program. Transposition
+    /// replaces it with the backward computation. The corresponding carrier for retained array-only rules is
+    /// [`LiftedCompositeTranspose`](Self::LiftedCompositeTranspose).
     CompositeTranspose(CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Composite call promoted from [`ArrayOperation`] with retained member-registered rules. [`LiftedCustomRules`]
-    /// specializes and converts those rules into this family. Calls with attached rules instead use
-    /// [`Composite`](Self::Composite).
+    /// Calls an array IR primal region while retaining custom transform callbacks registered for the original
+    /// [`ArrayOperation`] family. The primal region has already been converted into array IR, but the callbacks still
+    /// accept array-only tracers. When a rule is needed, [`LiftedCustomRules`] requests its specialization from the
+    /// original definition and converts the resulting program into array IR, caching the conversion for reuse.
+    ///
+    /// This uses the same [`CompositeOperation`] as [`Composite`](Self::Composite), with a different rule-source type
+    /// that adapts the retained array-only rules. Calls with attached rule programs need no such adapter: their rules
+    /// convert with the primal, so they use [`Composite`](Self::Composite) even when promoted from [`ArrayOperation`].
     LiftedComposite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>),
 
-    /// Reverse mode differentiation carrier of [`LiftedComposite`](Self::LiftedComposite), whose backward rule is
-    /// specialized by its member definition and converted into this family.
+    /// Temporary reverse-mode carrier of [`LiftedComposite`](Self::LiftedComposite), with the same role as
+    /// [`CompositeTranspose`](Self::CompositeTranspose). It retains the original array-only rule definition through
+    /// [`LiftedCustomRules`], which specializes and converts the backward program into array IR during transposition.
+    /// Like the native carrier, it has no executable forward program and is replaced by the backward computation.
     LiftedCompositeTranspose(
         CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
