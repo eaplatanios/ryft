@@ -18,7 +18,6 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
 };
 
-// TODO(eaplatanios): Do we have a problem here with the sizes of the variants?
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
 /// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the array value representation,
 /// which can be a backend array or a context-carrying value such as a tracer. Dimensions use the common
@@ -30,6 +29,7 @@ use crate::programs::{
 /// it understands. Reference operations remain family-native because their signatures cross member kinds. Ordinary
 /// numeric operations still project only the array member.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+#[allow(clippy::large_enum_variant, reason = "keep member values inline to avoid extra allocation and indirection")]
 pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
     /// Ordinary backend [`ArrayType`]-typed [`Value`].
     Array(A),
