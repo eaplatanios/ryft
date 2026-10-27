@@ -156,10 +156,10 @@ pub use references::{
     validate_reference_boundary, validated_reference_access_descriptors,
 };
 pub use regions::{
-    AttachedRegions, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
-    RegionArena, RegionArenaIterator, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary,
-    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionDriver, RegionId, RegionInterface,
-    RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
+    AttachedRegions, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region, RegionArena,
+    RegionArenaIterator, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary, RegionDataFlowRule,
+    RegionDataFlowSource, RegionDataFlowSources, RegionDriver, RegionId, RegionInterface, RegionKey, RegionLiveness,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

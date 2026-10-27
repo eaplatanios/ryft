@@ -6943,8 +6943,8 @@ mod tests {
     use ryft_core::{
         AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
-        Assert, AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation,
-        BatchingContext, CalleeRegionDriver, CaptureReference, Cast, CastOperation, CollectiveOptions,
+        Assert, AssertOperation, Atan2Operation, AtomId, AttachedRegions, AxisIndexOperation, BatchAxis,
+        BatchableOperation, BatchingContext, CaptureReference, Cast, CastOperation, CollectiveOptions,
         CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
         CompiledFunctionDispatcher, CompositeJvpRule, CompositeOperation, ConcatenateOperation, ConditionOperation,
         ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
@@ -17114,14 +17114,14 @@ mod tests {
 
         let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let first = domain
-            .bind(operation.clone(), CalleeRegionDriver::new(&[callee.clone()]), &[XlaValue::Array(input.clone())])
+            .bind(operation.clone(), AttachedRegions::Callees(&[callee.clone()]), &[XlaValue::Array(input.clone())])
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch-cache hit.
-        let second = domain.bind(operation, CalleeRegionDriver::new(&[callee]), &[XlaValue::Array(input)]).unwrap();
+        let second = domain.bind(operation, AttachedRegions::Callees(&[callee]), &[XlaValue::Array(input)]).unwrap();
         assert_eq!(read_f32s(&client, program_array(&second[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "a repeated eager jit_call must be a compile-cache hit");
     }

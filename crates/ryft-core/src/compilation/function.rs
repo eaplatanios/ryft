@@ -14,7 +14,7 @@ use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
-    CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
+    AttachedRegions, Operation, Program, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
     Value, validate_reference_boundary,
 };
 use crate::specialization::SpecializationCacheEntry;
@@ -651,7 +651,7 @@ where
             &callee.input_types(),
             &callee.output_types(),
         )?;
-        let outputs = context.bind(operation, CalleeRegionDriver::new(&[callee]), flat_inputs.as_slice())?;
+        let outputs = context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
@@ -716,7 +716,7 @@ where
             &callee.input_types(),
             &callee.output_types(),
         )?;
-        context.bind(operation, CalleeRegionDriver::new(&[callee]), flat_inputs.as_slice())
+        context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
     /// Returns the source program with its runtime captures lifted into leading flat inputs, in the

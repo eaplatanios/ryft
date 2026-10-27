@@ -523,7 +523,7 @@ mod tests {
         use crate::arrays::DimensionValue;
         use crate::batching::RecursiveBatchingDriver;
         use crate::contexts::EagerContext;
-        use crate::programs::CalleeRegionDriver;
+        use crate::programs::AttachedRegions;
 
         let scalar = ArrayType::scalar(DataType::I32);
         let definition: KernelDefinition = KernelDefinition::trace(
@@ -544,7 +544,7 @@ mod tests {
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         );
         let callees = [Arc::new(definition.body().clone())];
-        let regions = CalleeRegionDriver::new(&callees);
+        let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
         let value = ArrayIrValue::Array(
             Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[2i32, 5, 9]).unwrap(),

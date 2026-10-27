@@ -941,7 +941,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 let index = instruction_index.get();
                 instruction_index.set(index + 1);
                 let driver = RecursivePartialEvaluationDriver {
-                    driver: &regions,
+                    regions: &regions,
                     repeated_residual: reference_analysis.is_some(),
                 };
 
@@ -1631,7 +1631,7 @@ where
         let error = match input_values {
             Ok(input_values) => {
                 let input_values = input_values.into_iter().cloned().collect::<Vec<_>>();
-                let driver = RecursivePartialEvaluationDriver { driver: &regions, repeated_residual: false };
+                let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
                 let outputs = operation.partially_evaluate(self, &driver, input_values.as_slice());
                 match outputs {
                     Ok(outputs) => {

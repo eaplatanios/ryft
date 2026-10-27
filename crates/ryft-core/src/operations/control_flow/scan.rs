@@ -84,9 +84,9 @@ use crate::partial::{
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
-    OperationFormatter, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    AtomId, AttachedRegions, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
+    OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceMemberType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule, RegionDataFlowSource,
     RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError,
@@ -2474,7 +2474,7 @@ where
             };
             let scan_cotangents = context.stage_operation(
                 O::from(reversed),
-                CalleeRegionDriver::new(std::slice::from_ref(&reversed_body)),
+                AttachedRegions::Callees(std::slice::from_ref(&reversed_body)),
                 reversed_inputs.as_slice(),
             )?;
 
@@ -5499,11 +5499,11 @@ mod tests {
         ));
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&scalar_type), &[body]), Err(expected.clone()));
         let bodies = [Arc::new(scalar_body(1, |_, inputs| vec![inputs[1]]))];
-        let region_driver = CalleeRegionDriver::new(&bodies);
+        let regions = AttachedRegions::Callees(&bodies);
         assert_eq!(
             operation.interpret(
                 &TestEagerContext::new(),
-                &EagerInterpretationDriver::new(&region_driver),
+                &EagerInterpretationDriver::new(&regions),
                 &[Array::scalar(1f64).unwrap()],
             ),
             Err(ProgramError::from(expected)),
@@ -9744,11 +9744,11 @@ mod tests {
         // A homogeneous array scan has no iteration count input, so its application rejects a dynamic iteration count.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let bodies = [Arc::new(product_body())];
-        let region_driver = CalleeRegionDriver::new(&bodies);
+        let regions = AttachedRegions::Callees(&bodies);
         assert_eq!(
             TestScanOperation::new(1, Dimension::Dynamic(length)).interpret(
                 &context,
-                &EagerInterpretationDriver::new(&region_driver),
+                &EagerInterpretationDriver::new(&regions),
                 &[],
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
@@ -9764,8 +9764,8 @@ mod tests {
         // Direct application validates the input count in both universes, including the trailing iteration count of a
         // dynamic scan.
         let bodies = [Arc::new(product_body())];
-        let region_driver = CalleeRegionDriver::new(&bodies);
-        let driver = EagerInterpretationDriver::new(&region_driver);
+        let regions = AttachedRegions::Callees(&bodies);
+        let driver = EagerInterpretationDriver::new(&regions);
         assert_eq!(
             TestScanOperation::new(1, 0).interpret(&TestEagerContext::new(), &driver, &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -9777,8 +9777,8 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry, carry], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let bodies = [Arc::new(body)];
-        let region_driver = CalleeRegionDriver::new(&bodies);
-        let driver = EagerInterpretationDriver::new(&region_driver);
+        let regions = AttachedRegions::Callees(&bodies);
+        let driver = EagerInterpretationDriver::new(&regions);
         let context = TestIrEagerContext::new();
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(1, 0).interpret(&context, &driver, &[]),
@@ -10298,7 +10298,7 @@ mod tests {
                 .bind(TestScanOperation::new(0, MAX_DIMENSION_EXTENT).with_reverse(reverse), vec![body.clone()], &[])
                 .unwrap_err();
             assert_eq!(error.downcast_custom::<AssertionError>(), Some(&expected));
-            let regions = [body.clone()];
+            let regions = AttachedRegions::from([body.clone()]);
             let error = TestScanOperation::new(0, MAX_DIMENSION_EXTENT)
                 .with_reverse(reverse)
                 .batch(&BatchingContext::new(TestEagerContext::new(), 2), &RecursiveBatchingDriver::new(&regions), &[])
@@ -14094,7 +14094,7 @@ mod tests {
         // Batching stages one scan over the batched body, so each batch item runs its own cumulative product. Stacked
         // inputs mapped at axis 0 are read along their per-item leading axis (packed axis 1), and stacked outputs gain
         // the scan axis in front of their per-iteration batch axis.
-        let regions = vec![product_body()];
+        let regions = AttachedRegions::from(vec![product_body()]);
         check_operation_batching!(
             @exact,
             context = TestEagerContext::new(),
@@ -14204,7 +14204,7 @@ mod tests {
             builder.add_input(ArrayType::scalar(index_type));
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
             let body = builder.build(vec![carry], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-            let regions = [body];
+            let regions = AttachedRegions::from([body]);
             let driver = RecursiveBatchingDriver::new(&regions);
             assert_eq!(
                 TestScanOperation::new(carry_count, 0)
@@ -14219,7 +14219,7 @@ mod tests {
             let body = builder
                 .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let regions = [body];
+            let regions = AttachedRegions::from([body]);
             let driver = RecursiveBatchingDriver::new(&regions);
             assert_eq!(
                 ScanOperation::<ArrayIrType>::new(carry_count, 0)
@@ -14248,7 +14248,7 @@ mod tests {
         let _index = builder.add_input(ArrayType::scalar(DataType::I64));
         let value = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
         let body = builder.build(vec![value], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-        let regions = vec![body];
+        let regions = AttachedRegions::from(vec![body]);
         let values = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2, 3, 2]),
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
@@ -14382,7 +14382,7 @@ mod tests {
             ],
         );
 
-        let regions = vec![body];
+        let regions = AttachedRegions::from(vec![body]);
         let parent = DomainTracingContext::<TestEagerContext>::new();
         let builder = parent.builder().clone();
         let scale_atom = builder.borrow_mut().add_input(ArrayType::new_static(DataType::F64, [3, 2]));
@@ -14496,7 +14496,7 @@ mod tests {
         // The structural rule iterates the body's carry axes to a fixed point, instantiating the next-carry outputs at
         // the carry axes on every pass (`AlignEachTo`, which keeps the natural axes of the stacked outputs), so the
         // stabilizing pass is the aligned body and is never rebuilt.
-        let regions = vec![product_body()];
+        let regions = AttachedRegions::from(vec![product_body()]);
 
         // Both carries and stacked slices are batched from the start, and the stacked input already carries its batch
         // axis off the leading scan dimension, so the first pass widens nothing and its discovered axes already equal
@@ -15339,7 +15339,7 @@ mod tests {
         let body = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next, next], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
-        let regions = [body];
+        let regions = AttachedRegions::from([body]);
         let driver = RecursiveBatchingDriver::new(&regions);
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             TestIrEagerContext::new(),
@@ -15553,7 +15553,7 @@ mod tests {
         // scalar-to-dimension gateway rejects the first structural pass over the body and its error propagates
         // unchanged before the parent stages anything.
         let iteration_variable = DimensionVariable::new("iteration", DimensionBounds::positive(Some(4)).unwrap());
-        let regions = vec![counter_repeat_body(iteration_variable.clone())];
+        let regions = AttachedRegions::from(vec![counter_repeat_body(iteration_variable.clone())]);
         let driver = CountingBatchingDriver::new(&regions);
 
         // Both carries are mapped under a staging parent, whose trace must stay empty after the rejection.

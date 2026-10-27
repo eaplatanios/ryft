@@ -1095,8 +1095,8 @@ impl<V> ValueResolution<V> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::cell::Cell;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use half::{bf16, f16};
     use indoc::indoc;
@@ -1115,7 +1115,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
     use crate::programs::{
-        Atom, AtomId, CalleeRegionDriver, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
+        Atom, AtomId, AttachedRegions, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
         RegionInterface, RegionReplayMappings, RegionSlot, ReplayRegionDriver, TypeError, TypeIdentityRenaming, Typed,
         ValueProjection,
     };
@@ -1222,7 +1222,7 @@ mod tests {
         assert!(matches!(
             context.bind(
                 AddOperation::new(),
-                CalleeRegionDriver::new(std::slice::from_ref(&condition)),
+                AttachedRegions::Callees(std::slice::from_ref(&condition)),
                 &[Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()],
             ),
             Err(ProgramError::MalformedProgram(message))
@@ -1231,7 +1231,7 @@ mod tests {
         assert!(matches!(
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
-                CalleeRegionDriver::new(&[]),
+                AttachedRegions::Callees(&[]),
                 &[Array::scalar(1.0).unwrap()],
             ),
             Err(ProgramError::MalformedProgram(message))
@@ -1240,7 +1240,7 @@ mod tests {
         assert!(matches!(
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
-                CalleeRegionDriver::new(&[condition.clone(), body.clone(), body.clone()]),
+                AttachedRegions::Callees(&[condition.clone(), body.clone(), body.clone()]),
                 &[Array::scalar(1.0).unwrap()],
             ),
             Err(ProgramError::MalformedProgram(message))
@@ -1249,7 +1249,7 @@ mod tests {
         assert_eq!(
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
-                CalleeRegionDriver::new(&[condition, body]),
+                AttachedRegions::Callees(&[condition, body]),
                 &[Array::scalar(1.0).unwrap()],
             ),
             Ok(vec![Array::scalar(8.0).unwrap()]),
@@ -1766,7 +1766,7 @@ mod tests {
         let outputs = context
             .stage_operation(
                 IdentityInstantiatingRegionOperation { dependent_regions: true },
-                CalleeRegionDriver::new(&callees),
+                AttachedRegions::Callees(&callees),
                 &[input],
             )
             .unwrap();
@@ -1787,7 +1787,7 @@ mod tests {
         #[derive(Clone)]
         enum NarrowingOperation {
             /// Dimension addition whose inference is observed by the test.
-            Add { operation: DimensionAddOperation, inference_count: Rc<Cell<usize>> },
+            Add { operation: DimensionAddOperation, inference_count: Arc<AtomicUsize> },
 
             /// One attached body instantiated from the supplied dimension input.
             Call,
@@ -1828,7 +1828,7 @@ mod tests {
             ) -> Result<Vec<DimensionType>, TypeError> {
                 match self {
                     Self::Add { operation, inference_count } => {
-                        inference_count.set(inference_count.get() + 1);
+                        inference_count.fetch_add(1, Ordering::Relaxed);
                         operation.infer_output_types(inputs, regions)
                     }
                     Self::Call => {
@@ -1857,14 +1857,14 @@ mod tests {
         /// Stages one narrowed body through the chosen driver and checks its result, inference count, and closure.
         fn check_narrowed_body(
             regions: AttachedRegions<'_, DimensionValue, NarrowingOperation>,
-            inference_count: &Cell<usize>,
+            inference_count: &AtomicUsize,
         ) {
-            inference_count.set(0);
+            inference_count.store(0, Ordering::Relaxed);
             let context = TracingContext::<DimensionValue, NarrowingOperation>::new();
             let input = context.input(DimensionValue::constant(3).unwrap().r#type().into_owned());
             let outputs = context.stage_operation(NarrowingOperation::Call, regions, &[input]).unwrap();
             assert_eq!(outputs[0].r#type().bounds(), DimensionBounds::new(5, Some(6)).unwrap());
-            assert_eq!(inference_count.get(), 1);
+            assert_eq!(inference_count.load(Ordering::Relaxed), 1);
             context
                 .builder()
                 .borrow()
@@ -1877,7 +1877,7 @@ mod tests {
                 .unwrap();
         }
 
-        let inference_count = Rc::new(Cell::new(0));
+        let inference_count = Arc::new(AtomicUsize::new(0));
         let dimension = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
         let two = DimensionValue::constant(2).unwrap();
         let operation = DimensionAddOperation::new(&dimension, two.r#type().as_ref()).unwrap();
@@ -1897,7 +1897,7 @@ mod tests {
             .unwrap();
         check_narrowed_body(vec![source.clone()].into(), &inference_count);
         let callees = [Arc::new(source.clone())];
-        check_narrowed_body(CalleeRegionDriver::new(&callees).into(), &inference_count);
+        check_narrowed_body(AttachedRegions::Callees(&callees), &inference_count);
         let mappings = RegionReplayMappings::new();
         let roots = [source.entry()];
         check_narrowed_body(

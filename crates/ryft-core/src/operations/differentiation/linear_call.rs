@@ -783,8 +783,8 @@ pub(crate) mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef,
-        RegionSlot,
+        AttachedRegions, EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver,
+        RegionRef, RegionSlot,
     };
     use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
     use crate::tracing::TracingContext;
@@ -1080,7 +1080,7 @@ pub(crate) mod tests {
     fn test_linear_call_operation_batching_rewrites_replicated_regions_naming_the_batch_axis() {
         // Both regions of `u ↦ u · axis_index("items")` address the enclosing named batching level, so the call's
         // value varies per batch item even though its single input is replicated.
-        let regions = vec![axis_scaled_multiply_program(), axis_scaled_multiply_program()];
+        let regions = AttachedRegions::from(vec![axis_scaled_multiply_program(), axis_scaled_multiply_program()]);
         let driver = RecursiveBatchingDriver::new(&regions);
         let context =
             BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
@@ -1151,7 +1151,7 @@ pub(crate) mod tests {
         // A *named* level is conservatively structural even for regions that name no axis, because the level's name is
         // all this rule can decide on. The rewritten regions are semantically the source regions, so the batched call
         // still computes `r · u` and reports its output replicated.
-        let regions = vec![scalar_multiply_program(), scalar_multiply_program()];
+        let regions = AttachedRegions::from(vec![scalar_multiply_program(), scalar_multiply_program()]);
         let driver = RecursiveBatchingDriver::new(&regions);
         let context =
             BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)

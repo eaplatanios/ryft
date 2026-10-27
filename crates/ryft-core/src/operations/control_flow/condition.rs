@@ -73,7 +73,7 @@ use crate::partial::{
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
+    AtomId, AttachedRegions, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
     OperationBoundaryPruning, OperationPayloadProjection, OperationProjection, OperationProvider,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceMemberType,
@@ -1065,7 +1065,7 @@ where
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             context
                 .primal()
-                .bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), &condition_inputs)?
+                .bind(ConditionOperation::new(), AttachedRegions::Callees(&branches), &condition_inputs)?
         } else {
             // Separate contexts require a primal condition that records the selected residuals and a tangent condition
             // that consumes them. Treat the primals as known and the live input tangents as unknown in both partitions.
@@ -1423,7 +1423,7 @@ where
             // intern by `Arc` identity instead of copying it again.
             let branch_cotangents = context.bind(
                 O::from(ConditionOperation::new()),
-                CalleeRegionDriver::new(&[
+                AttachedRegions::Callees(&[
                     transposed_branches[0].program().clone(),
                     transposed_branches[1].program().clone(),
                 ]),
@@ -8181,7 +8181,7 @@ mod tests {
                 Array: 'r,
                 ArrayOperation<Array>: 'r,
             {
-                self.branches.regions()
+                self.branches.iter().map(Program::entry_region_ref)
             }
         }
 
@@ -9459,7 +9459,7 @@ mod tests {
             let predicate = parent.input(predicate_type);
             let input = parent.input(ArrayType::new_static(DataType::F64, [2, 3]));
             let context = BatchingContext::new(parent, 2);
-            let regions = refinable_dynamic_branches().to_vec();
+            let regions = AttachedRegions::from(refinable_dynamic_branches().to_vec());
             let driver = CountingBatchingDriver::new(&regions);
             let output = ConditionOperation::new()
                 .batch(
@@ -9492,7 +9492,7 @@ mod tests {
             let predicate = parent.input(predicate_type);
             let input = parent.input(ArrayType::new_static(DataType::F64, [2, 4]));
             let context = BatchingContext::new(parent, 2);
-            let regions = refinable_dynamic_branches().to_vec();
+            let regions = AttachedRegions::from(refinable_dynamic_branches().to_vec());
             let driver = CountingBatchingDriver::new(&regions);
             let output = ConditionOperation::new().batch(
                 &context,
@@ -9566,9 +9566,11 @@ mod tests {
             let input = parent.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
             let batch_extent = parent.lift(TestIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
             let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent, batch_extent);
-            let regions = refinable_dynamic_branches()
-                .map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap())
-                .to_vec();
+            let regions = AttachedRegions::from(
+                refinable_dynamic_branches()
+                    .map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap())
+                    .to_vec(),
+            );
             let driver = CountingBatchingDriver::new(&regions);
             let output = ConditionOperation::new()
                 .batch(
@@ -9602,9 +9604,11 @@ mod tests {
             let input = parent.input(ArrayType::new_static(DataType::F64, [2, 4]).into());
             let batch_extent = parent.lift(TestIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
             let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent, batch_extent);
-            let regions = refinable_dynamic_branches()
-                .map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap())
-                .to_vec();
+            let regions = AttachedRegions::from(
+                refinable_dynamic_branches()
+                    .map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap())
+                    .to_vec(),
+            );
             let driver = CountingBatchingDriver::new(&regions);
             let output = ConditionOperation::new().batch(
                 &context,
@@ -9698,7 +9702,7 @@ mod tests {
         let branch_input = parent.tracer(branch_input_atom, None);
         let context = BatchingContext::new(parent, 2);
         let inputs = vec![ArrayBatch::replicated(predicate), ArrayBatch::new(branch_input, BatchAxis::new(0)).unwrap()];
-        let regions = vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)];
+        let regions = AttachedRegions::from(vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)]);
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
         assert_eq!(driver.batch_program_calls(), 2);
@@ -9753,7 +9757,8 @@ mod tests {
         let branch_input = parent.tracer(branch_input_atom, None);
         let context = BatchingContext::new(parent, 2);
         let inputs = vec![ArrayBatch::replicated(predicate), ArrayBatch::new(branch_input, BatchAxis::new(0)).unwrap()];
-        let regions = vec![vector_scale_branch(3, 2.0), constant_vector_branch(vec![10.0, 20.0, 30.0])];
+        let regions =
+            AttachedRegions::from(vec![vector_scale_branch(3, 2.0), constant_vector_branch(vec![10.0, 20.0, 30.0])]);
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
         assert_eq!(driver.batch_program_calls(), 3);
@@ -9888,8 +9893,10 @@ mod tests {
         let x = parent.input(ArrayType::new_static(DataType::F64, [2, 3]));
         let y = parent.input(ArrayType::new_static(DataType::F64, [3, 2]));
         let context = BatchingContext::new(parent, 2);
-        let regions =
-            vec![branch(ArrayOperation::Add(AddOperation::new())), branch(ArrayOperation::Mul(MulOperation::new()))];
+        let regions = AttachedRegions::from(vec![
+            branch(ArrayOperation::Add(AddOperation::new())),
+            branch(ArrayOperation::Mul(MulOperation::new())),
+        ]);
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = ConditionOperation::new()
             .batch(
@@ -9964,7 +9971,7 @@ mod tests {
         let predicate = parent.input(ArrayType::scalar(DataType::Boolean));
         let input = parent.input(ArrayType::new_static(DataType::F64, [3]));
         let context = BatchingContext::new(parent, 3);
-        let regions = vec![branch("true", 2.0), branch("false", 3.0)];
+        let regions = AttachedRegions::from(vec![branch("true", 2.0), branch("false", 3.0)]);
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = ConditionOperation::new()
             .batch(
@@ -10023,7 +10030,7 @@ mod tests {
     fn test_condition_batching_mapped_predicate() {
         // A batch-varying predicate cannot select one branch for the whole batch, so batching runs both pure branches
         // and merges their outputs per batch item through the `Select` batching rule.
-        let regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+        let regions = AttachedRegions::from(vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)]);
         check_operation_batching!(
             @exact,
             context = EagerContext::<Array, ArrayOperation<Array>>::new(),
@@ -10044,7 +10051,7 @@ mod tests {
         // first case, so the Boolean `[2]` predicate must become `[2, 1]` before selecting between the `[2, 3]` branch
         // values. In the second case the predicate's physical axis is 0 while the input's physical batch axis is 1, so
         // selection must keep columns as batch items while reconciling those axes, and it returns them along axis 0.
-        let regions = vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)];
+        let regions = AttachedRegions::from(vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)]);
         check_operation_batching!(
             @exact,
             context = EagerContext::<Array, ArrayOperation<Array>>::new(),
@@ -10075,7 +10082,7 @@ mod tests {
         );
 
         // Equal batch and item sizes must still select rows (i.e., batch items) rather than columns.
-        let regions = vec![vector_scale_branch(2, 2.0), vector_scale_branch(2, 3.0)];
+        let regions = AttachedRegions::from(vec![vector_scale_branch(2, 2.0), vector_scale_branch(2, 3.0)]);
         check_operation_batching!(
             @exact,
             context = EagerContext::<Array, ArrayOperation<Array>>::new(),
@@ -10094,7 +10101,8 @@ mod tests {
 
         // A replicated output of one branch is broadcast across the batch before it is joined with the mapped output
         // of the other branch.
-        let regions = vec![constant_vector_branch(vec![10.0, 20.0, 30.0]), vector_scale_branch(3, 3.0)];
+        let regions =
+            AttachedRegions::from(vec![constant_vector_branch(vec![10.0, 20.0, 30.0]), vector_scale_branch(3, 3.0)]);
         check_operation_batching!(
             @exact,
             context = EagerContext::<Array, ArrayOperation<Array>>::new(),
@@ -10257,7 +10265,7 @@ mod tests {
         let unit_branch = ProgramBuilder::<Array, ArrayOperation<Array>>::new()
             .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
             .unwrap();
-        let regions = vec![unit_branch.clone(), unit_branch];
+        let regions = AttachedRegions::from(vec![unit_branch.clone(), unit_branch]);
         let driver = CountingBatchingDriver::new(&regions);
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         assert_eq!(
@@ -10387,7 +10395,7 @@ mod tests {
             ArrayIrBatch::replicated(array(Array::scalar(true).unwrap())),
             ArrayIrBatch::new(TestIrValue::Reference(reference.clone()), BatchAxis::new(0)).unwrap(),
         ];
-        let regions = vec![branch.clone(), branch];
+        let regions = AttachedRegions::from(vec![branch.clone(), branch]);
         let driver = CountingBatchingDriver::new(&regions);
         assert_eq!(
             ConditionOperation::new().batch(&context, &driver, &inputs),
@@ -10423,7 +10431,7 @@ mod tests {
             .unwrap();
             program.into_flat_program()
         };
-        let regions = vec![computed_branch(false), computed_branch(true)];
+        let regions = AttachedRegions::from(vec![computed_branch(false), computed_branch(true)]);
         let driver = CountingBatchingDriver::new(&regions);
         let inputs = [
             predicate,
@@ -10913,7 +10921,7 @@ mod tests {
         let second = parent.input(reference_type);
         let batch_extent = parent.lift(TestIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent, batch_extent);
-        let regions = branch_dependent_reference_branches().to_vec();
+        let regions = AttachedRegions::from(branch_dependent_reference_branches().to_vec());
         let driver = CountingBatchingDriver::new(&regions);
         assert_eq!(
             ConditionOperation::<ArrayIrType>::new()

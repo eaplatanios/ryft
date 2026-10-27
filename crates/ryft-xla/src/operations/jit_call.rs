@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, BatchAxis,
-    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CalleeRegionDriver,
-    CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinations, DifferentiableOperation,
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Dimension, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero,
-    Operation, OperationBoundaryPruning, OperationFormatter, OperationProvider, OutputRegionProvenance, Parameterized,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, AttachedRegions,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
+    CompiledCallOperation, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Dimension, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
+    OperationBoundaryPruning, OperationFormatter, OperationProvider, OutputRegionProvenance, Parameterized,
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
@@ -1182,10 +1182,11 @@ where
         };
         let operation = Self::new(self.capture_count())
             .with_callee_type_signature(&batched_callee.input_types(), &batched_callee.output_types())?;
-        let outputs =
-            context
-                .parent()
-                .bind(operation, CalleeRegionDriver::new(&[Arc::new(batched_callee)]), &physical_inputs)?;
+        let outputs = context.parent().bind(
+            operation,
+            AttachedRegions::Callees(&[Arc::new(batched_callee)]),
+            &physical_inputs,
+        )?;
         Ok(outputs
             .into_iter()
             .zip(output_axes)
@@ -1317,7 +1318,7 @@ where
             let callee = Arc::new(callee.to_program());
             return context
                 .primal()
-                .bind(XlaOperation::JitCall(self.clone()), CalleeRegionDriver::new(&[callee]), &primal_operands)?
+                .bind(XlaOperation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &primal_operands)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect();
@@ -1334,7 +1335,7 @@ where
                 .with_callee_type_signature(&primal_program.input_types(), &primal_program.output_types())?,
         );
         let mut primal_call_outputs =
-            context.primal().bind(primal_call, CalleeRegionDriver::new(&[primal_program]), &primal_operands)?;
+            context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -1371,7 +1372,7 @@ where
         let tangent_outputs =
             context
                 .tangent()
-                .bind(tangent_call, CalleeRegionDriver::new(&[tangent_program]), &tangent_operands)?;
+                .bind(tangent_call, AttachedRegions::Callees(&[tangent_program]), &tangent_operands)?;
         let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
         check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
@@ -1542,7 +1543,7 @@ pub fn transpose_primal_jit_call<
     )?);
     let input_cotangents = context.bind(
         transposed_call,
-        CalleeRegionDriver::new(&[transposed_callee.program().clone()]),
+        AttachedRegions::Callees(&[transposed_callee.program().clone()]),
         operands.as_slice(),
     )?;
     let cotangent_types = input_indices
@@ -2458,7 +2459,7 @@ mod tests {
                 )
                 .unwrap();
             let callees = [Arc::new(callee)];
-            let regions = CalleeRegionDriver::new(&callees);
+            let regions = AttachedRegions::Callees(&callees);
             let driver = RecursiveBatchingDriver::new(&regions);
             let (_, program) = TracingContext::<Array, NamedAxisCallOperation>::trace_with_context_and_named_axes(
                 |parent, inputs: Vec<Tracer<TracingContext<Array, NamedAxisCallOperation>>>| {
@@ -2507,7 +2508,7 @@ mod tests {
     #[test]
     fn test_jit_call_operation_batch() {
         use ryft_core::{
-            ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, CalleeRegionDriver,
+            ArrayIrBatch, ArrayIrBatchingPolicy, AttachedRegions, BatchableOperation, BatchingContext,
             RecursiveBatchingDriver,
         };
 
@@ -2517,7 +2518,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let callees = [Arc::new(callee)];
-        let regions = CalleeRegionDriver::new(&callees);
+        let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
         let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
         let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(

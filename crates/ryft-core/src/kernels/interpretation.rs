@@ -814,7 +814,7 @@ where
                     inputs[mask_index] = ArrayIrValue::Array(Array::from_elements(mask.r#type().into_owned(), &lanes)?);
                     return operation.interpret(
                         &self.eager,
-                        &QualifiedKernelDriver { context: self, driver: &regions, operation: operation.name() },
+                        &QualifiedKernelDriver { context: self, regions: &regions, operation: operation.name() },
                         &inputs,
                     );
                 }
@@ -868,7 +868,7 @@ where
                 }
                 _ => operation.interpret(
                     &self.eager,
-                    &QualifiedKernelDriver { context: self, driver: &regions, operation: operation.name() },
+                    &QualifiedKernelDriver { context: self, regions: &regions, operation: operation.name() },
                     inputs,
                 ),
             }
@@ -899,28 +899,39 @@ where
 }
 
 /// Adapts unchanged eager higher-order rules to recursive replay in the private qualified context.
-struct QualifiedKernelDriver<'r, Extension: Operation<Type = ArrayIrType>, D> {
+struct QualifiedKernelDriver<'r, Extension: Operation<Type = ArrayIrType>> {
     /// Qualification authority for this immutable invocation body.
     context: &'r QualifiedKernelContext<Extension>,
     /// Actual regions attached to the operation currently being interpreted.
-    driver: &'r D,
+    regions: &'r AttachedRegions<'r, ArrayIrValue<Array>, KernelOperation<Extension>>,
     /// Canonical operation whose region entry consumes a replay step.
     operation: &'static str,
 }
 
-impl<Extension: Operation<Type = ArrayIrType>, D: RegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>>
-    RegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>> for QualifiedKernelDriver<'_, Extension, D>
+impl<Extension: Operation<Type = ArrayIrType>> RegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>
+    for QualifiedKernelDriver<'_, Extension>
 {
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, ArrayIrValue<Array>, KernelOperation<Extension>>>
     where
         Extension: 'r,
     {
-        self.driver.regions()
+        self.regions.regions()
+    }
+
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    fn region(
+        &self,
+        index: usize,
+    ) -> Result<RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>, ProgramError> {
+        self.regions.region(index)
     }
 }
 
-impl<Extension, D> InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>
-    for QualifiedKernelDriver<'_, Extension, D>
+impl<Extension> InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>
+    for QualifiedKernelDriver<'_, Extension>
 where
     EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
             Type = ArrayIrType,
@@ -929,7 +940,6 @@ where
             Operation = KernelOperation<Extension>,
         >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
-    D: RegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>,
 {
     fn interpret_region(
         &self,

@@ -2041,8 +2041,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, OutputRegionProvenance,
-        ProgramBuilder, ReferenceType, RegionInterface, RegionRole, RegionSlot,
+        AttachedRegions, EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero,
+        OutputRegionProvenance, ProgramBuilder, ReferenceType, RegionInterface, RegionRole, RegionSlot,
     };
     use crate::tests::hash_of;
     use crate::tracing::{DomainTracer, Trace};
@@ -4538,7 +4538,7 @@ mod tests {
             let tangent = builder.add_constant(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
             builder.build(vec![index, tangent], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
         };
-        let regions = vec![primal, jvp];
+        let regions = AttachedRegions::from(vec![primal, jvp]);
         let driver = RecursiveBatchingDriver::new(&regions);
         let context =
             BatchingContext::<_, ArrayBatchingPolicy>::new(ArrayContext::new(), 3).with_axis_name("items".to_string());

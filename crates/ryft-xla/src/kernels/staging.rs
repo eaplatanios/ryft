@@ -1522,12 +1522,12 @@ pub(crate) mod tests {
     #[test]
     fn test_xla_kernel_operation_batch() {
         use ryft_core::{
-            ArrayType, CalleeRegionDriver, DataType, DimensionValue, RecursiveBatchingDriver, StagingContext,
+            ArrayType, AttachedRegions, DataType, DimensionValue, RecursiveBatchingDriver, StagingContext,
         };
 
         let definition = differentiable_definition();
         let callees = [Arc::new(stage_body(&definition).unwrap())];
-        let regions = CalleeRegionDriver::new(&callees);
+        let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
         let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
         let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(

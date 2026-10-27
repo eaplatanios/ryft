@@ -206,7 +206,7 @@ use crate::partial::{
     PartiallyEvaluatableOperation, ResidualInputSource,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, Operation,
+    AtomId, AttachedRegions, EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, Operation,
     OperationBoundaryPruning, OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ProjectedValue, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
@@ -4463,7 +4463,7 @@ where
         } else {
             context.stage_operation(
                 transposed_operation,
-                CalleeRegionDriver::new(&[transposed_body]),
+                AttachedRegions::Callees(&[transposed_body]),
                 transposed_inputs.as_slice(),
             )?
         };

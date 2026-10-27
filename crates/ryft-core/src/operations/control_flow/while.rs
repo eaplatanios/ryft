@@ -70,7 +70,7 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
+    AtomId, AttachedRegions, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
     OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
     ReferenceAccessMode, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
@@ -2251,7 +2251,7 @@ where
     }
     let fused_regions = [Arc::new(fused_condition), fused_body];
     let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-        context.primal().bind(fused_while, CalleeRegionDriver::new(&fused_regions), &fused_inputs)?
+        context.primal().bind(fused_while, AttachedRegions::Callees(&fused_regions), &fused_inputs)?
     } else {
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let arguments =
@@ -3020,7 +3020,7 @@ mod tests {
     use crate::partial::{PartialTracer, ResidualInputSource};
     use crate::programs::{
         AttachedRegions, EffectClasses, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
-        ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary,
+        ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary, RegionDriver,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
@@ -8678,10 +8678,11 @@ mod tests {
         // Batching a loop whose predicate reads only a replicated counter keeps that predicate replicated and binds one
         // plain loop over the batched body, in which every batch item doubles its mapped value once per iteration.
         let (operation, regions) = counter_doubling_while_operation();
+        let attached_regions = AttachedRegions::from(regions.clone());
         check_operation_batching!(
             @exact,
             context = EagerContext::<Array, ArrayOperation<Array>>::new(),
-            driver = &CountingBatchingDriver::new(&regions),
+            driver = &CountingBatchingDriver::new(&attached_regions),
             operation = operation,
             axis_size = 3,
             axis_sharding = ShardingDimension::Replicated,
@@ -8828,6 +8829,7 @@ mod tests {
         let state = parent.tracer(state_atom, None);
         let context = BatchingContext::new(parent, 3);
         let inputs = vec![ArrayBatch::new(state, BatchAxis::new(0)).unwrap()];
+        let countdown_regions = AttachedRegions::from(countdown_regions);
         let driver = CountingBatchingDriver::new(&countdown_regions);
         let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap();
         assert_eq!(driver.batch_program_calls(), 2);
@@ -8880,7 +8882,7 @@ mod tests {
         // pass per region.
         type EagerParent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let countdown_regions = array_ir_countdown_while_regions();
+        let countdown_regions = AttachedRegions::from(array_ir_countdown_while_regions());
 
         // Batching batch items [3, 1, 2] under an eager parent performs exactly one structural pass per region (the
         // fixed-point discovery body and the natural condition) and interprets the loop with its masked per-item
@@ -8917,19 +8919,14 @@ mod tests {
                     %3:f64[3] = sub %1 %2
                 in (%0, %3)"},
         ];
-        for (region, expected) in countdown_regions.iter().zip(expected) {
+        for (region, expected) in countdown_regions.regions().zip(expected) {
             let natural = driver
-                .batch_program(
-                    &context,
-                    region.entry_region_ref(),
-                    state_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )
+                .batch_program(&context, region, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)
                 .unwrap();
             let aligned = driver
                 .batch_program(
                     &context,
-                    region.entry_region_ref(),
+                    region,
                     state_axes.as_slice(),
                     ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
                 )
@@ -9419,7 +9416,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let regions = vec![condition, body];
+        let regions = AttachedRegions::from(vec![condition, body]);
         let driver = CountingBatchingDriver::new(&regions);
 
         // Both carries are mapped under a staging parent, whose trace must stay empty after the rejection.

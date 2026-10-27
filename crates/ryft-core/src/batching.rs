@@ -1058,44 +1058,46 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDrive
     }
 }
 
-/// [`BatchingDriver`] scoped to one [`Operation`] application. It borrows the application's complete region driver,
-/// which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees without
-/// materializing a combined region collection. Recursive requests re-enter the active batching transform or batch a
-/// selected region structurally.
-pub struct RecursiveBatchingDriver<'r, D> {
-    /// Application-scoped [`RegionDriver`].
-    driver: &'r D,
+/// [`BatchingDriver`] scoped to one [`Operation`] application. It borrows the application's complete
+/// [`AttachedRegions`], which preserve the operation-defined ordering of owned regions, borrowed regions, and shared
+/// callees without materializing a combined region collection. Recursive requests re-enter the active batching
+/// transform or batch a selected region structurally.
+pub struct RecursiveBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// Application-scoped [`AttachedRegions`].
+    regions: &'r AttachedRegions<'r, V, O>,
 }
 
-impl<'r, D> RecursiveBatchingDriver<'r, D> {
-    /// Creates a new [`RecursiveBatchingDriver`] over the provided application-scoped [`RegionDriver`].
+impl<'r, V: Value, O: Operation<Type = V::Type>> RecursiveBatchingDriver<'r, V, O> {
+    /// Creates a new [`RecursiveBatchingDriver`] over the provided application-scoped [`AttachedRegions`].
     #[inline]
-    pub fn new(driver: &'r D) -> Self {
-        Self { driver }
-    }
-
-    /// Returns the underlying application-scoped [`RegionDriver`].
-    #[inline]
-    pub fn driver(&self) -> &'r D {
-        self.driver
+    pub fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
+        Self { regions }
     }
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, D: RegionDriver<V, O>> RegionDriver<V, O>
-    for RecursiveBatchingDriver<'_, D>
-{
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveBatchingDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r,
     {
-        self.driver().regions()
+        self.regions.regions()
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        self.regions.region(index)
     }
 }
 
-impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::Operation>> BatchingDriver<C, P>
-    for RecursiveBatchingDriver<'_, D>
+impl<C: Context, P: RecursiveBatchingPolicy<C>> BatchingDriver<C, P>
+    for RecursiveBatchingDriver<'_, C::Constant, C::Operation>
 {
     #[inline]
     fn batching_level(&self, context: &BatchingContext<C, P>) -> Result<BatchingLevel<C::Type>, BatchingError> {
@@ -2580,7 +2582,7 @@ mod tests {
 
         // The recursive driver delegates to the policy, which moves a mapped axis and broadcasts a replicated batch
         // along the context's extent.
-        let driver = RecursiveBatchingDriver::new(&EmptyRegionDriver);
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
         let moved = driver.align_batch_axis(&context, mapped, Axis::from(1))?;
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
         assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap());
@@ -2658,7 +2660,7 @@ mod tests {
 
         // Requiring axis 0 instead causes one aligned replay of the source region. The input retains its axis-1 packed
         // layout, while the live output is transposed to the requested axis-0 layout.
-        let regions = vec![source_program];
+        let regions = AttachedRegions::from(vec![source_program]);
         let driver = RecursiveBatchingDriver::new(&regions);
         let region = driver.region(0).unwrap();
         let batched_program = region

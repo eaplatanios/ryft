@@ -1856,7 +1856,7 @@ mod tests {
 
     use ryft_core::{
         Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
+        ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, Broadcast, CaptureReference, Compare,
         ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind,
         Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
         Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div, DomainTracer, DomainTracingContext,
@@ -5802,7 +5802,7 @@ mod tests {
                 let outputs = context
                     .bind(
                         XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(extent.clone()))),
-                        CalleeRegionDriver::new(std::slice::from_ref(&body)),
+                        AttachedRegions::Callees(std::slice::from_ref(&body)),
                         &inputs,
                     )
                     .unwrap();
@@ -6351,7 +6351,7 @@ mod tests {
                 let mut primal_outputs = context
                     .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new(0)),
-                        CalleeRegionDriver::new(&[primal_half.clone()]),
+                        AttachedRegions::Callees(&[primal_half.clone()]),
                         &[primal_input.into_value()],
                     )
                     .expect("primal jit_call should stage");
@@ -6363,7 +6363,7 @@ mod tests {
                 let tangent_output = context
                     .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new(0)),
-                        CalleeRegionDriver::new(&[tangent_half.clone()]),
+                        AttachedRegions::Callees(&[tangent_half.clone()]),
                         tangent_inputs.as_slice(),
                     )
                     .expect("tangent jit_call should stage")

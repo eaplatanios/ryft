@@ -1477,7 +1477,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClass, EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed,
+        AttachedRegions, EffectClass, EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed,
     };
 
     use super::*;
@@ -2738,7 +2738,7 @@ mod tests {
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let driver = RecursiveBatchingDriver::new(&EmptyRegionDriver);
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let operation = ArrayIrOperation::<Array>::from(
             ConcatenateOperation::<ArrayIrType>::new(

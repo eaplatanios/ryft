@@ -161,7 +161,7 @@ use crate::programs::references::analysis::{ReferenceAnalysis, ReferenceRoot};
 use crate::programs::references::transforms::ReferenceTransform;
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
-    EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings,
+    AttachedRegions, EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings,
     ReplayRegionDriver,
 };
 use crate::programs::types::{Type, Typed};
@@ -1976,33 +1976,41 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> f
 }
 
 /// [`ReferenceDischargeDriver`] scoped to one [`Operation`] application. It borrows the application's
-/// [`RegionDriver`], which preserves the operation-defined region order without materializing a region collection.
-pub struct RecursiveReferenceDischargeDriver<'r, D> {
-    /// Application-scoped [`RegionDriver`].
-    driver: &'r D,
+/// [`AttachedRegions`], which preserve the operation-defined region order without materializing a region collection.
+pub struct RecursiveReferenceDischargeDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// Application-scoped [`AttachedRegions`].
+    regions: &'r AttachedRegions<'r, V, O>,
 
     /// Source [`Program`] location of the [`Operation`] application, or [`None`] for an application
     /// that replays no [`Instruction`](crate::Instruction).
     source_instruction_id: Option<InstructionId>,
 }
 
-impl<'r, D> RecursiveReferenceDischargeDriver<'r, D> {
+impl<'r, V: Value, O: Operation<Type = V::Type>> RecursiveReferenceDischargeDriver<'r, V, O> {
     /// Creates a new [`RecursiveReferenceDischargeDriver`].
-    pub const fn new(driver: &'r D, source_instruction_id: Option<InstructionId>) -> Self {
-        Self { driver, source_instruction_id }
+    pub const fn new(regions: &'r AttachedRegions<'r, V, O>, source_instruction_id: Option<InstructionId>) -> Self {
+        Self { regions, source_instruction_id }
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
-    for RecursiveReferenceDischargeDriver<'_, D>
-{
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveReferenceDischargeDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r,
     {
-        self.driver.regions()
+        self.regions.regions()
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        self.regions.region(index)
     }
 }
 
@@ -2028,8 +2036,7 @@ impl<
             TracingContext<C::Constant, C::Operation>,
             Referent = <P as ReferenceDischargePolicy<C>>::Referent,
         >,
-    D: RegionDriver<C::Constant, C::Operation>,
-> ReferenceDischargeDriver<C, P> for RecursiveReferenceDischargeDriver<'_, D>
+> ReferenceDischargeDriver<C, P> for RecursiveReferenceDischargeDriver<'_, C::Constant, C::Operation>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -3372,7 +3379,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                         return Ok(outputs);
                     }
 
-                    let regions = ReplayRegionDriver::new(region, instruction.regions(), &mappings)?;
+                    let regions =
+                        AttachedRegions::from(ReplayRegionDriver::new(region, instruction.regions(), &mappings)?);
                     let driver = RecursiveReferenceDischargeDriver::new(&regions, Some(position));
                     instruction.operation().discharge_references(self, &driver, instruction_inputs)
                 })
@@ -4075,7 +4083,7 @@ where
             // own boundary.
             let context = context.with_captures(ReferenceDischargeCaptureScope::new(capture_allocations));
 
-            let regions = [self];
+            let regions = AttachedRegions::from([self]);
             let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
             let outputs = driver.inline_region(&context, 0, inputs)?;
             let (output_ids, external_reference_bindings) =
@@ -6336,7 +6344,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7195,9 +7203,9 @@ mod tests {
 
     #[test]
     fn test_recursive_reference_discharge_driver_new() {
-        let regions = [ProgramBuilder::<ListIrValue, ListOperation>::new()
+        let regions = AttachedRegions::from([ProgramBuilder::<ListIrValue, ListOperation>::new()
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), Vec::new(), Vec::new())
-            .unwrap()];
+            .unwrap()]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         assert_eq!(driver.region_count(), 1);
@@ -7206,8 +7214,8 @@ mod tests {
     #[test]
     fn test_recursive_reference_discharge_driver_source_instruction_id() {
         let source_instruction_id = InstructionId::new(RegionId::new(0), 3);
-        let without_source = RecursiveReferenceDischargeDriver::new(&EmptyRegionDriver, None);
-        let with_source = RecursiveReferenceDischargeDriver::new(&EmptyRegionDriver, Some(source_instruction_id));
+        let without_source = RecursiveReferenceDischargeDriver::new(&AttachedRegions::Empty, None);
+        let with_source = RecursiveReferenceDischargeDriver::new(&AttachedRegions::Empty, Some(source_instruction_id));
 
         assert_eq!(
             ReferenceDischargeDriver::<ListDestination, ListReferenceDischarge>::source_instruction_id(&without_source),
@@ -7228,7 +7236,7 @@ mod tests {
             .unwrap();
         let context = ListDischargeContext::new(ListDestination::new());
         let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         assert_eq!(driver.inline_region(&context, 0, vec![input.clone()]), Ok(vec![input]));
 
@@ -7240,7 +7248,7 @@ mod tests {
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![stored], Vec::new(), vec![Placeholder])
             .unwrap();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         assert_eq!(
             driver.inline_region(&context, 0, Vec::new()),
@@ -7273,7 +7281,7 @@ mod tests {
             context.bind_discharged(ReferenceType::new(ListType { length: 2 }), state).unwrap(),
         );
         let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7317,7 +7325,7 @@ mod tests {
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![failing], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         assert!(matches!(
             driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
@@ -7345,7 +7353,7 @@ mod tests {
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
 
         // The rebuilt region therefore receives the allocation's entering state and hands it to its own callee.
-        let regions = [program.clone()];
+        let regions = AttachedRegions::from([program.clone()]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7398,7 +7406,7 @@ mod tests {
         assert!(!summary.is_mutated(allocation));
         assert_eq!(summary.output_allocations(), &[None]);
 
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7437,7 +7445,7 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let region_id = program.entry_region_ref().id();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         let viewed = context
@@ -7565,8 +7573,8 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the viewed allocation").unwrap().allocation_id();
-        let regions = [program];
-        let region = regions[0].entry_region_ref().id();
+        let regions = AttachedRegions::from([program]);
+        let region = regions.region(0).unwrap().id();
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7659,8 +7667,8 @@ mod tests {
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
-        let regions = [program];
-        let region = regions[0].entry_region_ref().id();
+        let regions = AttachedRegions::from([program]);
+        let region = regions.region(0).unwrap().id();
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7683,8 +7691,8 @@ mod tests {
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
             .unwrap();
-        let regions = [program];
-        let region = regions[0].entry_region_ref().id();
+        let regions = AttachedRegions::from([program]);
+        let region = regions.region(0).unwrap().id();
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7717,7 +7725,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the added allocation").unwrap().allocation_id();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7731,7 +7739,7 @@ mod tests {
             driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge adds {allocation} to region `{}` more than once",
-                regions[0].entry_region_ref().id(),
+                regions.region(0).unwrap().id(),
             )),
         );
     }
@@ -7754,7 +7762,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the declared allocation").unwrap().allocation_id();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7768,7 +7776,7 @@ mod tests {
             driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge adds {allocation} to region `{}`, which already carries it at a declared input",
-                regions[0].entry_region_ref().id(),
+                regions.region(0).unwrap().id(),
             )),
         );
     }
@@ -7793,7 +7801,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7846,7 +7854,7 @@ mod tests {
 
         // The added input goes between the two declared inputs and the added output goes before the declared output,
         // which is the insertion arithmetic a scan's carry prefix depends on.
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
@@ -7884,7 +7892,7 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let region_id = region.entry_region_ref().id();
-        let regions = [region];
+        let regions = AttachedRegions::from([region]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         let allocation = context
@@ -7972,7 +7980,7 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![local], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let region_id = region.entry_region_ref().id();
-        let regions = [region];
+        let regions = AttachedRegions::from([region]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         let boundary = ReferenceDischargeRegionBoundary::new(
@@ -7996,7 +8004,7 @@ mod tests {
         // as unconditionally discharged, and returns a discharged handle bound in the context.
         let context = ListDischargeContext::new(ListDestination::new());
         let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
-        let driver = RecursiveReferenceDischargeDriver::new(&EmptyRegionDriver, None);
+        let driver = RecursiveReferenceDischargeDriver::new(&AttachedRegions::Empty, None);
         let outputs = ListOperation::ReferenceNew.discharge_references(&context, &driver, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let allocated = outputs[0].try_as_reference("the discharged allocation").unwrap();
@@ -8058,7 +8066,7 @@ mod tests {
         OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
         let context = ListDischargeContext::new(ListDestination::new());
         let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2, 3, 4]));
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let outputs = driver.inline_region(&context, 0, vec![input]).unwrap();
         assert_eq!(
@@ -10246,7 +10254,7 @@ mod tests {
         let stateful = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![read], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [stateful];
+        let regions = AttachedRegions::from([stateful]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let inputs = [
             ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2])),
@@ -10273,7 +10281,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let inputs = [
             ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2])),
@@ -10290,7 +10298,7 @@ mod tests {
         let reference_free = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [reference_free];
+        let regions = AttachedRegions::from([reference_free]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &driver, &inputs),
@@ -10314,7 +10322,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         assert_eq!(
@@ -10344,7 +10352,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         let reference = context
@@ -10370,7 +10378,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         assert_eq!(
@@ -10396,7 +10404,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         let reference = context
@@ -10424,7 +10432,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let context = ListDischargeContext::new(ListDestination::new());
         let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
@@ -10452,7 +10460,7 @@ mod tests {
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let regions = [callee];
+        let regions = AttachedRegions::from([callee]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         let context = ListDischargeContext::new(ListDestination::new());
@@ -10527,7 +10535,7 @@ mod tests {
         );
         let allocation = allocated.try_as_reference("the capture-scoped allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         // The captured allocation enters through one input appended after the declared ones.
@@ -10569,7 +10577,7 @@ mod tests {
         );
         let allocation = preserved.try_as_reference("the preserved capture-scoped allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0, |_, _| {

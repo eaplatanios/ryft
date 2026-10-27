@@ -629,8 +629,8 @@ mod tests {
     use crate::contexts::Context;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Atom, Operation, Program, ProgramError, ReferenceType, Region, RegionDriver, RegionLiveness, RegionRef,
-        TypeError, Value,
+        Atom, AttachedRegions, Operation, Program, ProgramError, ReferenceType, Region, RegionDriver, RegionLiveness,
+        RegionRef, TypeError, Value,
     };
 
     use super::{ResidualStackOperation, SCAN_OPERATION_NAME, validate_reference_carry_axis};
@@ -744,7 +744,7 @@ mod tests {
     pub(super) struct CountingBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
         /// [`Region`](crate::programs::Region)s attached to the operation application under test,
         /// in operation-defined order.
-        regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>,
+        regions: &'r AttachedRegions<'r, V, O>,
 
         /// Number of structural program-batching requests observed so far.
         batch_program_calls: Cell<usize>,
@@ -752,7 +752,7 @@ mod tests {
 
     impl<'r, V: Value, O: Operation<Type = V::Type>> CountingBatchingDriver<'r, V, O> {
         /// Creates a new [`CountingBatchingDriver`] over the provided attached regions.
-        pub(super) fn new(regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>) -> Self {
+        pub(super) fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
             Self { regions, batch_program_calls: Cell::new(0) }
         }
 
@@ -769,6 +769,14 @@ mod tests {
             O: 'r,
         {
             self.regions.regions()
+        }
+
+        fn region_count(&self) -> usize {
+            self.regions.region_count()
+        }
+
+        fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+            self.regions.region(index)
         }
     }
 

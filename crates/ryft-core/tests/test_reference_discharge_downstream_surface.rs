@@ -42,15 +42,15 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, BatchAxis, BatchAxisSpecification, BatchableOperation,
-    BatchableReferenceTransform, BatchableType, BatchingContext, BatchingDriver, BatchingEntrypointPolicy,
-    BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy, BoundReferenceTransform,
-    BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation, Context,
-    ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentSeed,
-    DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass,
-    EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance, InstructionId,
-    InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation,
+    AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AttachedRegions, BatchAxis, BatchAxisSpecification,
+    BatchableOperation, BatchableReferenceTransform, BatchableType, BatchingContext, BatchingDriver,
+    BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
+    BoundReferenceTransform, BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation,
+    Context, ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
+    CotangentSeed, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DivOperation, Domain,
+    EagerContext, EffectClass, EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance,
+    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation,
     MemberTransposableOperation, MulOperation, NegOperation, NoIdentity, NoReferenceTransform, OneLikeOperation,
     OneOperation, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance, ParallelVaryOperation,
     Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
@@ -1464,7 +1464,7 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
     // Discharging through the region driver rewrites every reference primitive into explicit state threading, so the
     // downstream universe reaches the same outputs an eager reference execution would have produced.
     let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let regions = [program];
+    let regions = AttachedRegions::from([program]);
     let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
     let inputs = vec![
         RegisterDischargeValue::Value(RegisterValue::Register(4)),
@@ -1899,7 +1899,7 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
     let expected = vec![RegisterValue::Register(0), RegisterValue::Register(1), RegisterValue::Register(7)];
     assert_eq!(source.interpret(inputs.clone()), Ok(expected.clone()));
     let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let regions = [source.clone()];
+    let regions = AttachedRegions::from([source.clone()]);
     let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
     let carriers = inputs.into_iter().map(RegisterDischargeValue::Value).collect::<Vec<_>>();
     assert_eq!(
@@ -1913,7 +1913,7 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
     let discharge = |inputs: Vec<Tracer<TracingContext<RegisterValue, RegisterOperation>>>| {
         let context = ReferenceDischargeContext::new(inputs[0].context().clone());
         let carriers = inputs.into_iter().map(ReferenceDischargeValue::Value).collect::<Vec<_>>();
-        let regions = [source.clone()];
+        let regions = AttachedRegions::from([source.clone()]);
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let outputs = driver.inline_region(&context, 0, carriers)?;
         outputs

@@ -2,13 +2,14 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use crate::contexts::Context;
+use crate::operations::GuardOperation;
 use crate::partial::contexts::{PartialEvaluationContext, ReferencePlacement};
 use crate::partial::evaluations::PartialEvaluation;
 use crate::partial::partitions::{EffectOrdering, PartitionedProgram};
 use crate::partial::values::{PartialEvaluationValue, PartialValue};
 use crate::programs::{
-    EmptyRegionDriver, InstructionId, Operation, ProgramError, ReferenceAnalysis, ReferenceRoot, RegionDriver,
-    RegionRef, Value, ValueId,
+    AttachedRegions, EmptyRegionDriver, InstructionId, Operation, OperationProvider, ProgramError, ReferenceAnalysis,
+    ReferenceRoot, RegionDriver, RegionRef, Value, ValueId,
 };
 use crate::tracing::TracingContext;
 
@@ -96,12 +97,12 @@ impl<C: Context> PartialEvaluationDriver<C> for EmptyRegionDriver {
 }
 
 /// [`PartialEvaluationDriver`] scoped to one [`Operation`] application. It borrows the application's complete
-/// [`RegionDriver`], preserving the operation-defined ordering of owned [`Region`](crate::Region)s, borrowed regions,
-/// and shared callees without collecting [`Program`]s or region views. Recursive requests re-enter partial evaluation
-/// for a selected region or partition it into known and residual programs.
-pub(super) struct RecursivePartialEvaluationDriver<'r, D> {
-    /// Application-scoped [`RegionDriver`], in [`Operation`]-defined order.
-    pub(super) driver: &'r D,
+/// [`AttachedRegions`], preserving the operation-defined ordering of owned [`Region`](crate::Region)s, borrowed
+/// regions, and shared callees without collecting [`Program`]s or region views. Recursive requests re-enter partial
+/// evaluation for a selected region or partition it into known and residual programs.
+pub(super) struct RecursivePartialEvaluationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// Application-scoped [`AttachedRegions`], in [`Operation`]-defined order.
+    pub(super) regions: &'r AttachedRegions<'r, V, O>,
 
     /// Specifies whether partitioning must account for a known computation running once and its results being reused
     /// across separate residual calls. The same requirement applies when recursively partitioning nested computations.
@@ -121,7 +122,7 @@ pub(super) struct RecursivePartialEvaluationDriver<'r, D> {
     pub(super) repeated_residual: bool,
 }
 
-impl<D> RecursivePartialEvaluationDriver<'_, D> {
+impl<V: Value, O: Operation<Type = V::Type>> RecursivePartialEvaluationDriver<'_, V, O> {
     /// Evaluates one source instruction while preserving the ordering and allocation requirements of its replay.
     /// Without reference analysis, this dispatches through the active context unless the caller explicitly requires
     /// residual execution. With analysis, independent allocations may be evaluated separately, but an instruction
@@ -148,7 +149,7 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
     ///   - `reference_analysis`: Canonical source-reference analysis for repeated residual calls. Omitting it retains
     ///     the active context's ordering rules without performing source-reference analysis.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn partially_evaluate_instruction<C: Context>(
+    pub(super) fn partially_evaluate_instruction<C: Context<Constant = V, Operation = O>>(
         &self,
         context: &PartialEvaluationContext<C>,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -160,7 +161,7 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
         reference_analysis: Option<&ReferenceAnalysis>,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
     where
-        D: RegionDriver<C::Constant, C::Operation>,
+        O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
         C::Operation:
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
@@ -227,21 +228,28 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
-    for RecursivePartialEvaluationDriver<'_, D>
-{
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursivePartialEvaluationDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r,
     {
-        self.driver.regions()
+        self.regions.regions()
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        self.regions.region(index)
     }
 }
 
-impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> PartialEvaluationDriver<C>
-    for RecursivePartialEvaluationDriver<'_, D>
+impl<C: Context> PartialEvaluationDriver<C> for RecursivePartialEvaluationDriver<'_, C::Constant, C::Operation>
 where
     C::Operation:
         PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
@@ -359,8 +367,8 @@ where
 /// deferring to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior
 /// can be customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
 ///
-/// Inlining and region specialization preserve boundary checks by staging [`GuardOperation`](crate::GuardOperation)s
-/// through the guard provider that every [`Context`]'s operation family carries, so neither this trait nor
+/// Inlining and region specialization preserve boundary checks by staging [`GuardOperation`]s through
+/// the guard provider that every [`Context`]'s operation family carries, so neither this trait nor
 /// [`partially_evaluate`](Self::partially_evaluate) states a separate guard-provider bound.
 ///
 /// # Type Parameters
@@ -464,7 +472,7 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
             .unwrap();
-        let regions = vec![program];
+        let regions = AttachedRegions::from(vec![program.clone()]);
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let knowledge = [
             PartialValue::Known(TestValue::Dimension(DimensionValue::constant(2).unwrap())),
@@ -477,9 +485,9 @@ mod tests {
         // array is not narrowed either), so the residual entry relates them, and an entry guard relates them to the
         // known extent. A matching array is written, and a mismatching array or reference is rejected before the write.
         let check = |repeated_residual: bool| {
-            let driver = RecursivePartialEvaluationDriver { driver: &regions, repeated_residual };
+            let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual };
             let evaluation =
-                driver.partially_evaluate_program(&context, regions[0].entry_region_ref(), &knowledge).unwrap();
+                driver.partially_evaluate_program(&context, program.entry_region_ref(), &knowledge).unwrap();
             let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
             let inputs =
                 [TestValue::Array(Array::vector(vec![4f32; 2]).unwrap()), TestValue::Reference(reference.clone())];
@@ -532,19 +540,19 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![read], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let regions = vec![program];
-        let driver = RecursivePartialEvaluationDriver { driver: &regions, repeated_residual: false };
+        let regions = AttachedRegions::from(vec![program.clone()]);
+        let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
             .with_defer_ordered_effects(true);
 
         // A fresh partition inherits configuration, but not the active context's recorded ordering constraints.
-        let partition = driver.partition_program(&context, regions[0].entry_region_ref(), &[true, true, true]).unwrap();
+        let partition = driver.partition_program(&context, program.entry_region_ref(), &[true, true, true]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
         assert!(context.defer_ordered_effects());
 
         // The same driver uses the effect placement passed to each call.
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new()).deferred_sibling();
-        let partition = driver.partition_program(&context, regions[0].entry_region_ref(), &[true, true, true]).unwrap();
+        let partition = driver.partition_program(&context, program.entry_region_ref(), &[true, true, true]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert!(!context.defer_ordered_effects());
     }

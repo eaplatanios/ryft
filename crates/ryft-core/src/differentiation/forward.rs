@@ -1224,38 +1224,45 @@ impl<C: Context> DifferentiationDriver<C> for EmptyRegionDriver {
     }
 }
 
-/// [`DifferentiationDriver`] scoped to one [`Operation`] application. It borrows the application's complete region
-/// driver, which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees
-/// without materializing a combined region collection. Recursive requests are answered through rule-specific cached
-/// fused and partitioned construction. Public region transforms always select forward rules; recursive requests from
-/// reverse-mode differentiation retain separate artifacts.
-struct RecursiveDifferentiationDriver<'r, D> {
-    /// Application-scoped region driver, in operation-defined order.
-    driver: &'r D,
+/// [`DifferentiationDriver`] scoped to one [`Operation`] application. It borrows the application's complete
+/// [`AttachedRegions`], which preserve the operation-defined ordering of owned regions, borrowed regions, and shared
+/// callees without materializing a combined region collection. Recursive requests are answered through rule-specific
+/// cached fused and partitioned construction. Public region transforms always select forward rules; recursive requests
+/// from reverse-mode differentiation retain separate artifacts.
+struct RecursiveDifferentiationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// Application-scoped [`AttachedRegions`], in operation-defined order.
+    regions: &'r AttachedRegions<'r, V, O>,
 
     /// Rule selection inherited from the enclosing differentiation context.
     rule: DifferentiationRule,
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
-    for RecursiveDifferentiationDriver<'_, D>
-{
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveDifferentiationDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r,
     {
-        self.driver.regions()
+        self.regions.regions()
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        self.regions.region(index)
     }
 }
 
-impl<C, D> DifferentiationDriver<C> for RecursiveDifferentiationDriver<'_, D>
+impl<C> DifferentiationDriver<C> for RecursiveDifferentiationDriver<'_, C::Constant, C::Operation>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type: DifferentiableType>,
-    D: RegionDriver<C::Constant, C::Operation>,
     C::Operation: DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
@@ -1937,11 +1944,11 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
                     // so that every rule is compiled once per context rather than once per arm.
                     let specialized_regions = AttachedRegions::Owned(specialized_regions);
                     let differentiation_driver =
-                        RecursiveDifferentiationDriver { driver: &specialized_regions, rule: self.rule };
+                        RecursiveDifferentiationDriver { regions: &specialized_regions, rule: self.rule };
                     self.rule.apply(operation, self, &differentiation_driver, inputs)?
                 }
                 None => {
-                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &regions, rule: self.rule };
+                    let differentiation_driver = RecursiveDifferentiationDriver { regions: &regions, rule: self.rule };
                     self.rule.apply(operation, self, &differentiation_driver, inputs)?
                 }
             }
@@ -2333,7 +2340,7 @@ where
                             .collect::<Result<Vec<_>, DifferentiationError>>()
                     } else {
                         let differentiation_driver =
-                            RecursiveDifferentiationDriver { driver: &regions, rule: arguments.rule };
+                            RecursiveDifferentiationDriver { regions: &regions, rule: arguments.rule };
                         arguments.rule.apply(
                             instruction.operation(),
                             &differentiation_context,
@@ -5026,15 +5033,18 @@ pub(crate) mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let region = program.entry_region_ref();
-        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
+        let driver =
+            RecursiveDifferentiationDriver { regions: &AttachedRegions::Empty, rule: DifferentiationRule::Jvp };
         let differentiated =
             DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::jvp_program(&driver, region, &[1, 0])
                 .unwrap();
 
         // The driver preserves the requested order and shares the region's existing cached program.
         assert!(Arc::ptr_eq(&differentiated, &region.jvp_shared(&[1, 0]).unwrap()));
-        let reverse_driver =
-            RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::JvpForTranspose };
+        let reverse_driver = RecursiveDifferentiationDriver {
+            regions: &AttachedRegions::Empty,
+            rule: DifferentiationRule::JvpForTranspose,
+        };
         let reverse = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::jvp_program(
             &reverse_driver,
             region,
@@ -5077,15 +5087,18 @@ pub(crate) mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let region = program.entry_region_ref();
-        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
+        let driver =
+            RecursiveDifferentiationDriver { regions: &AttachedRegions::Empty, rule: DifferentiationRule::Jvp };
         let linearization = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::linearize_program(
             &driver,
             region,
             &[1, 0],
         )
         .unwrap();
-        let reverse_driver =
-            RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::JvpForTranspose };
+        let reverse_driver = RecursiveDifferentiationDriver {
+            regions: &AttachedRegions::Empty,
+            rule: DifferentiationRule::JvpForTranspose,
+        };
         let reverse = DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::linearize_program(
             &reverse_driver,
             region,
@@ -8534,7 +8547,8 @@ pub(crate) mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![second, metadata, first], vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
-        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
+        let driver =
+            RecursiveDifferentiationDriver { regions: &AttachedRegions::Empty, rule: DifferentiationRule::Jvp };
         let activity = TangentActivity::<EagerContext<Array, ArrayOperation<Array>>>::new(
             &driver,
             program.entry_region_ref(),
@@ -8569,7 +8583,8 @@ pub(crate) mod tests {
                 vec![Placeholder; 4],
             )
             .unwrap();
-        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
+        let driver =
+            RecursiveDifferentiationDriver { regions: &AttachedRegions::Empty, rule: DifferentiationRule::Jvp };
 
         // Activity reaches the two inactive carries on successive iterations. The source carry resets to a constant
         // but must retain its tangent slot, while the extra output follows the newly active second carry.

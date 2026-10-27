@@ -23,7 +23,7 @@ use crate::partial::{
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource, ResidualPolicyReference,
 };
 use crate::programs::{
-    CalleeRegionDriver, ErasedOperation, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
+    AttachedRegions, ErasedOperation, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
     OperationFormatter, OperationPayloadProjection, OperationProvider, OutputRegionProvenance, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceMemberType, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
@@ -722,7 +722,7 @@ where
         });
         let input_cotangents = context.bind(
             O::from(operation),
-            CalleeRegionDriver::new(&[transposed_body.program().clone()]),
+            AttachedRegions::Callees(&[transposed_body.program().clone()]),
             call_inputs.as_slice(),
         )?;
         let cotangent_types = linear_input_indices

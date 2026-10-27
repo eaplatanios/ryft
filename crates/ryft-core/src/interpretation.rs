@@ -56,8 +56,9 @@
 //!
 //! # Nested Regions
 //!
-//! Every [`Context::bind`] receives one instruction-scoped [`AttachedRegions`]. Eager binding adapts those regions
-//! into an [`InterpretationDriver`] for the operation's eager rule. Region-free applications use an empty driver.
+//! Every [`Context::bind`] receives one instruction-scoped [`AttachedRegions`]. Eager binding adapts those
+//! regions into an [`InterpretationDriver`] for the operation's eager rule. Region-free applications carry
+//! [`AttachedRegions::Empty`], while direct rule invocations outside a context use [`EmptyRegionDriver`].
 //! Higher-order eager rules select attached regions by index and recursively replay them through the same active
 //! context. Borrowed regions remain in the source arena, and shared replay mappings preserve repeated roots and
 //! descendants when another active context stages them into a destination arena. No standalone program is materialized
@@ -201,35 +202,41 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
 /// interpretation-specific recursion provided by [`InterpretationDriver`]. Its regions are exactly the nested
 /// computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a selected
 /// region through the active [`Context`] without taking ownership of it, lifting stored constants into runtime values.
-pub(crate) struct EagerInterpretationDriver<'r, D> {
-    /// Binding [`RegionDriver`] supplied to the active [`Operation`] application.
-    driver: &'r D,
+pub(crate) struct EagerInterpretationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// [`AttachedRegions`] supplied to the active [`Operation`] application.
+    regions: &'r AttachedRegions<'r, V, O>,
 }
 
-impl<'r, D> EagerInterpretationDriver<'r, D> {
+impl<'r, V: Value, O: Operation<Type = V::Type>> EagerInterpretationDriver<'r, V, O> {
     /// Creates a new [`EagerInterpretationDriver`].
     #[inline]
-    pub(crate) fn new(driver: &'r D) -> Self {
-        Self { driver }
+    pub(crate) fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
+        Self { regions }
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
-    for EagerInterpretationDriver<'_, D>
-{
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EagerInterpretationDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r,
     {
-        self.driver.regions()
+        self.regions.regions()
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        self.regions.region(index)
     }
 }
 
-impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> InterpretationDriver<C>
-    for EagerInterpretationDriver<'_, D>
-{
+impl<C: Context> InterpretationDriver<C> for EagerInterpretationDriver<'_, C::Constant, C::Operation> {
     #[inline]
     fn interpret_region(
         &self,
@@ -1539,7 +1546,7 @@ mod tests {
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let regions = [program];
+        let regions = AttachedRegions::from([program]);
         let driver = EagerInterpretationDriver::new(&regions);
         assert_eq!(
             driver.interpret_region(&TestArrayContext::new(), 0, vec![Array::scalar(2f32).unwrap()]),
@@ -1575,7 +1582,7 @@ mod tests {
     fn test_eager_interpretation_driver_bind() {
         // The eager driver binds through the eager context that it serves, which interprets the operation.
         let context = TestArrayContext::new();
-        let regions = Vec::<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>::new();
+        let regions = AttachedRegions::<Array, ArrayOperation<Array>>::Empty;
         let driver = EagerInterpretationDriver::new(&regions);
         let input = Array::scalar(2.0f32).unwrap();
         assert_eq!(
