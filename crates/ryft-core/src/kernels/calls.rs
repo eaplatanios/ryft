@@ -1971,30 +1971,38 @@ mod tests {
     /// rejected, whether its result is used, unused, or produced inside a nested region.
     #[test]
     fn test_kernel_definition_new_rejects_shard_maps() {
-        // Identity `shard_map` over a replicated scalar, whose body is attached as a kernel-family region.
-        fn identity_shard_map() -> (KernelOperation, FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>>) {
+        // Identity `shard_map` over an `i32` scalar that is replicated along the manual mesh axis `x`, whose body is
+        // attached as a kernel-family region. Its global input and output types carry the replicated sharding.
+        fn identity_shard_map() -> (ShardMapOperation, FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>>)
+        {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-            let scalar_type = ArrayType::scalar(DataType::I32);
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-            let input = builder.add_input(scalar_type.clone().into());
-            let body = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-            let shard_map = ShardMap::from_shardings(
+            let shard_map = ShardMap::new(
                 mesh.clone(),
                 vec![Sharding::replicated(mesh.clone(), 0)],
                 vec![Sharding::replicated(mesh, 0)],
                 vec!["x".to_string()],
-            );
-            let operation = ShardMapOperation::from_boundary(shard_map, vec![scalar_type.clone()], vec![scalar_type]);
-            (KernelOperation::Portable(ArrayIrOperation::ShardMap(operation)), body)
+            )
+            .unwrap();
+            let scalar_type = ArrayType::scalar(DataType::I32);
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = builder.add_input(shard_map.local_input_type(0, &scalar_type).unwrap().into());
+            let body = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+            let operation = ShardMapOperation::from_program(&body, vec![scalar_type.into()], shard_map).unwrap();
+            (operation, body)
         }
 
-        // Copy kernel `output = f(input)`, where `apply` stages `f` and returns the written value.
+        // Copy kernel `output = f(input)` over parameters of type `r#type`, where `apply` stages `f` and returns the
+        // written value.
         fn definition(
+            r#type: &ArrayType,
             apply: impl FnOnce(&mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, AtomId) -> AtomId,
         ) -> (Result<KernelDefinition, KernelError>, RegionId) {
             let operation = KernelCallOperation::new(
                 Grid::new(vec![]).unwrap(),
-                vec![parameter(KernelParameterAccess::ReadOnly), parameter(KernelParameterAccess::WriteOnly)],
+                vec![
+                    KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadOnly, scalar_mapping()).unwrap(),
+                    KernelParameter::new(r#type.clone(), KernelParameterAccess::WriteOnly, scalar_mapping()).unwrap(),
+                ],
             )
             .unwrap();
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
@@ -2008,11 +2016,19 @@ mod tests {
             (KernelDefinition::new(operation, body), entry)
         }
 
+        // Every case stages a well-typed body: the kernel parameters, the value read from the input, the `shard_map`
+        // input and output, and the written value all have the global type of the identity `shard_map` boundary.
+        let (operation, _) = identity_shard_map();
+        assert_eq!(operation.global_output_types(), operation.global_input_types());
+        let global_type = <&ArrayType>::try_from(&operation.global_input_types()[0]).unwrap().clone();
+
         // An array-only `shard_map` whose result the kernel writes.
-        let (result, entry) = definition(|builder, value| {
+        let (result, entry) = definition(&global_type, |builder, value| {
             let (operation, body) = identity_shard_map();
             let body = builder.import_program(body);
-            builder.add_instruction(operation, vec![body], vec![value], None).unwrap()[0]
+            builder
+                .add_instruction(ArrayIrOperation::ShardMap(operation), vec![body], vec![value], None)
+                .unwrap()[0]
         });
         let error = result.unwrap_err();
         assert_eq!(
@@ -2028,10 +2044,12 @@ mod tests {
         );
 
         // A `shard_map` whose result is unused is rejected too, because the kernel body still contains it.
-        let (result, entry) = definition(|builder, value| {
+        let (result, entry) = definition(&global_type, |builder, value| {
             let (operation, body) = identity_shard_map();
             let body = builder.import_program(body);
-            builder.add_instruction(operation, vec![body], vec![value], None).unwrap();
+            builder
+                .add_instruction(ArrayIrOperation::ShardMap(operation), vec![body], vec![value], None)
+                .unwrap();
             value
         });
         assert_eq!(
@@ -2042,14 +2060,16 @@ mod tests {
         // A `shard_map` inside a nested region of the body is found through the attached-region closure, and the error
         // names its instruction in that nested region.
         let mut nested_region = None;
-        let (result, _) = definition(|builder, value| {
+        let (result, _) = definition(&global_type, |builder, value| {
             let branch = |nested: bool| {
                 let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-                let input = branch.add_input(ArrayType::scalar(DataType::I32).into());
+                let input = branch.add_input(global_type.clone().into());
                 let output = if nested {
                     let (operation, body) = identity_shard_map();
                     let body = branch.import_program(body);
-                    branch.add_instruction(operation, vec![body], vec![input], None).unwrap()[0]
+                    branch
+                        .add_instruction(ArrayIrOperation::ShardMap(operation), vec![body], vec![input], None)
+                        .unwrap()[0]
                 } else {
                     input
                 };

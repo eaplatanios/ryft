@@ -42,7 +42,7 @@ use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, Ty
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::transforms::RegionTransformCache;
+use crate::programs::transforms::{RegionContentIdentity, RegionTransformCache};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{LiteralIdentity, Value};
 
@@ -158,6 +158,14 @@ impl<V: Typed + Parameter, O> Region<V, O> {
             }
         }
         instruction_by_output
+    }
+
+    /// Returns the [`RegionContentIdentity`] of this [`Region`]'s complete reachable contents, which lets callers key
+    /// structures derived from this region without comparing region bodies. Refer to [`RegionContentIdentity`] for
+    /// when copies share an identity and when it may be compared.
+    #[inline]
+    pub fn content_identity(&self) -> RegionContentIdentity<V, O> {
+        self.transform_cache.identity()
     }
 
     /// Returns this [`Region`] after simultaneously renaming [`TypeIdentity`](crate::TypeIdentity)s in its [`Atom`]s,
@@ -1099,6 +1107,13 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     #[inline]
     pub fn type_identity_signature(self) -> &'r TypeIdentitySignature<<V::Type as Type>::Identity> {
         self.arena.type_identity_signature(self.id).unwrap()
+    }
+
+    /// Returns the [`RegionContentIdentity`] of the sealed [`Region`] this view points at, which is the same handle
+    /// that [`Region::content_identity`] returns. Refer to [`RegionContentIdentity`] for its contract.
+    #[inline]
+    pub fn content_identity(self) -> RegionContentIdentity<V, O> {
+        self.arena.get(self.id).unwrap().content_identity()
     }
 
     /// Returns the [`RegionTransformCache`] that contains the structural transforms already derived from this
@@ -4020,6 +4035,42 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(access.entry_region_ref().has_observable_effects_in_closure());
+    }
+
+    #[test]
+    fn test_region_ref_content_identity() {
+        // Content-preserving copies share the identity of the region they copy.
+        let program = program_with_reused_region();
+        let identity = program.entry_region_ref().content_identity();
+        assert_eq!(identity, program.entry_region().content_identity());
+        assert_eq!(identity, program.clone().entry_region_ref().content_identity());
+        assert_eq!(identity, program.entry_region_ref().to_program().entry_region_ref().content_identity());
+        assert_eq!(hash_of(&identity), hash_of(&program.clone().entry_region_ref().content_identity()));
+        let leaf = program.region_ref(RegionId::new(0)).unwrap().content_identity();
+        assert_ne!(identity, leaf);
+
+        // Constructions with different contents, and sealings that cannot prove that the reachable contents are
+        // preserved, mint new identities.
+        let other = identity_program(ArrayType::scalar(DataType::F32));
+        assert_ne!(identity, other.entry_region_ref().content_identity());
+        let mut arena = RegionArena::new();
+        arena.push(program.regions().get(RegionId::new(0)).unwrap().clone()).unwrap();
+        let root_id = arena.push(program.entry_region().clone()).unwrap();
+        assert_ne!(identity, RegionRef::new(&arena, root_id).unwrap().content_identity());
+
+        // The identity is conservative: independently constructed programs with equal contents compare unequal.
+        let first = identity_program(ArrayType::scalar(DataType::F64));
+        let second = identity_program(ArrayType::scalar(DataType::F64));
+        assert_eq!(first.to_string(), second.to_string());
+        assert_ne!(first.entry_region_ref().content_identity(), second.entry_region_ref().content_identity());
+
+        // A handle that outlives its program keeps comparing equal only to handles of that same region.
+        let first_identity = first.entry_region_ref().content_identity();
+        let copied_identity = first.clone().entry_region_ref().content_identity();
+        drop(first);
+        let later = identity_program(ArrayType::scalar(DataType::F64));
+        assert_eq!(first_identity, copied_identity);
+        assert_ne!(first_identity, later.entry_region_ref().content_identity());
     }
 
     #[test]

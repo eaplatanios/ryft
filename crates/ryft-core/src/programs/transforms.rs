@@ -170,7 +170,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use dyn_eq::DynEq;
 use dyn_hash::DynHash;
@@ -436,7 +436,8 @@ pub(crate) type RegionTransformRegistry<V, O> =
 /// is the region-content identity: construction and rewriting code in [`regions`](crate::programs::regions) mints a
 /// fresh handle whenever a region's complete reachable contents change and preserves the handle across
 /// content-preserving copies, while artifact sanitization compares handles by pointer. External transforms
-/// never touch that provenance; they can only request typed artifacts through [`RegionRef::transform`].
+/// never touch that provenance; they can only request typed artifacts through [`RegionRef::transform`], and external
+/// callers observe the identity only through the opaque [`RegionContentIdentity`] returned by [`Self::identity`].
 pub(crate) struct RegionTransformCache<V: Typed + Parameter, O> {
     /// Shared state carried by content-preserving [`Region`] copies.
     pub(crate) state: Arc<RegionTransformRegistry<V, O>>,
@@ -454,11 +455,11 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
-    /// Feeds the [`Region`]-content identity of this [`RegionTransformCache`] into `state`, consistently with
-    /// [`Self::ptr_eq`]. The identity is the address of the shared handle, which stays unique while it is alive.
+    /// Returns the public [`RegionContentIdentity`] of the [`Region`] contents that share this
+    /// [`RegionTransformCache`], consistent with [`Self::ptr_eq`].
     #[inline]
-    pub(crate) fn hash_identity<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.state).cast::<()>().hash(state);
+    pub(crate) fn identity(&self) -> RegionContentIdentity<V, O> {
+        RegionContentIdentity { registry: Arc::downgrade(&self.state) }
     }
 
     /// Returns the [`SpecializationCache`] (i.e., namespace) for [`Transform`] `T`, creating it with `capacity`
@@ -553,6 +554,68 @@ impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
             .field("namespace_count", &namespace_count)
             .field("artifact_count", &artifact_count)
             .finish()
+    }
+}
+
+/// Opaque identity of the complete reachable contents of one sealed [`Region`], obtained through
+/// [`Region::content_identity`] or [`RegionRef::content_identity`]. The complete reachable contents of a region are its
+/// own body together with the bodies of every region reachable through its instructions. Comparing or hashing these
+/// handles lets callers key structures derived from a region (e.g., caches of compiled or analyzed programs) in
+/// constant time, without walking or rendering region bodies.
+///
+/// # Contract
+///
+///   - Equality and hashing are consistent meaning that equal handles always produce equal hashes.
+///   - Content-preserving copies of a sealed region share its identity (e.g., clones of its [`Program`] and
+///     [`RegionRef::to_program`] materializations), while constructions or rewrites that change a region's complete
+///     reachable contents mint a new one.
+///   - The identity is conservative meaning that equal handles imply equal contents, but two independently constructed
+///     programs with equal contents may compare unequal. Callers must therefore only use it where a spurious inequality
+///     is harmless, such as a missed cache hit.
+///   - The identity is process-local and is valid only for comparing regions of live programs. It is neither a
+///     persistent semantic key (e.g., it cannot be serialized or compared across processes) nor a type identity.
+///   - A handle may outlive the program it was taken from. It then compares equal only to handles taken from the same
+///     region (including its content-preserving copies), never to handles of regions constructed afterwards, and it
+///     does not keep the region or anything derived from it alive.
+pub struct RegionContentIdentity<V: Typed + Parameter, O> {
+    /// Weak reference to the shared state of the [`RegionTransformCache`] whose [`Arc`] identity is the region-content
+    /// identity. The weak reference keeps the allocation, and therefore its address, reserved so that no later region
+    /// can reuse it while this handle lives, but it lets the retained transform artifacts be dropped with their region.
+    /// It is never upgraded: only its address is compared and hashed.
+    registry: Weak<RegionTransformRegistry<V, O>>,
+}
+
+impl<V: Typed + Parameter, O> Clone for RegionContentIdentity<V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { registry: self.registry.clone() }
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for RegionContentIdentity<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RegionContentIdentity")
+            .field(&Weak::as_ptr(&self.registry).cast::<()>())
+            .finish()
+    }
+}
+
+impl<V: Typed + Parameter, O> PartialEq for RegionContentIdentity<V, O> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.registry, &other.registry)
+    }
+}
+
+impl<V: Typed + Parameter, O> Eq for RegionContentIdentity<V, O> {}
+
+impl<V: Typed + Parameter, O> Hash for RegionContentIdentity<V, O> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hashing the address that `Weak::ptr_eq` compares keeps hashing consistent with equality.
+        Weak::as_ptr(&self.registry).cast::<()>().hash(state);
     }
 }
 
@@ -702,7 +765,7 @@ mod tests {
     use crate::programs::regions::RegionSlot;
     use crate::programs::{Operation, ProgramBuilder, Region, RegionId, RegionRef, Value};
     use crate::specialization::SpecializationCacheStatistics;
-    use crate::tests::{IdentityTransform, TestRegionOperation};
+    use crate::tests::{IdentityTransform, TestRegionOperation, hash_of};
 
     use super::*;
 
@@ -855,6 +918,25 @@ mod tests {
         assert!(cache.ptr_eq(&cloned));
         assert!(!cache.ptr_eq(&independent));
         assert_eq!(format!("{cache:?}"), "RegionTransformCache { namespace_count: 0, artifact_count: 0 }");
+    }
+
+    #[test]
+    fn test_region_transform_cache_identity() {
+        let cache = RegionTransformCache::<Array, TestRegionOperation>::new();
+        let identity = cache.identity();
+        let independent = RegionTransformCache::<Array, TestRegionOperation>::new().identity();
+        assert_eq!(identity, identity.clone());
+        assert_eq!(identity, cache.clone().identity());
+        assert_ne!(identity, independent);
+        assert_eq!(hash_of(&identity), hash_of(&identity.clone()));
+        assert_eq!(hash_of(&identity), hash_of(&cache.identity()));
+        let identities = HashMap::from([(identity.clone(), "cache")]);
+        assert_eq!(identities.get(&cache.identity()), Some(&"cache"));
+        assert_eq!(identities.get(&independent), None);
+        assert_eq!(
+            format!("{identity:?}"),
+            format!("RegionContentIdentity({:?})", Arc::as_ptr(&cache.state).cast::<()>()),
+        );
     }
 
     #[test]

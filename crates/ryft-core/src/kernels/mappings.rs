@@ -292,13 +292,13 @@ impl BlockMapping {
     }
 }
 
-// Two mappings are identical when their programs have the same region-content identity (which every content-changing
+// Two mappings are identical when their programs have the same `RegionContentIdentity` (which every content-changing
 // construction re-mints and every content-preserving copy keeps, so it is a conservative but exact identity of the
 // mapping program) and their block shapes and boundary policies agree. Separately constructed mappings with equal
 // programs therefore compare unequal, which only affects caching, never correctness.
 impl PartialEq for BlockMapping {
     fn eq(&self, other: &Self) -> bool {
-        self.program.entry_region().transform_cache().ptr_eq(other.program.entry_region().transform_cache())
+        self.program.entry_region().content_identity() == other.program.entry_region().content_identity()
             && self.block_shape == other.block_shape
             && self.boundary_policy == other.boundary_policy
     }
@@ -308,7 +308,7 @@ impl Eq for BlockMapping {}
 
 impl Hash for BlockMapping {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.program.entry_region().transform_cache().hash_identity(state);
+        self.program.entry_region().content_identity().hash(state);
         self.block_shape.hash(state);
         self.boundary_policy.hash(state);
     }
@@ -368,6 +368,7 @@ impl BlockWindow {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::hash::DefaultHasher;
 
     use pretty_assertions::assert_eq;
 
@@ -375,9 +376,15 @@ mod tests {
     use crate::operations::{DimensionMulOperation, ZERO_OPERATION_NAME, ZeroOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{ProgramBuilder, ReferenceType};
-    use crate::tests::hash_of;
 
     use super::*;
+
+    /// Returns the hash of `value` under the standard library's default hasher.
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
 
     /// Builds a dimension-only identity mapping with independently bounded coordinate inputs.
     fn identity_program(rank: usize) -> FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>> {

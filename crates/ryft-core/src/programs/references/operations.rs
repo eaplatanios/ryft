@@ -224,7 +224,6 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayIrType, ArrayReferenceTransform, ArrayType};
-    use crate::kernels::AsyncCopyOperation;
     use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::transforms::tests::{dynamic, index};
@@ -299,6 +298,81 @@ pub(crate) mod tests {
         }
     }
 
+    /// Copy-like access family that reads its source reference at input 0 and writes its destination reference at
+    /// input 1, each through its own transform path. Unlike [`DescribedAccess`], it derives the binding range of each
+    /// access from the transform paths in the canonical [`ReferenceAccessOperation`] layout, so that replacing one path
+    /// shifts the binding group of the other access.
+    #[derive(Clone, Debug, Default)]
+    struct CopyAccess {
+        /// Transforms applied to the source reference at input 0.
+        source_transforms: Vec<ArrayReferenceTransform>,
+
+        /// Transforms applied to the destination reference at input 1.
+        destination_transforms: Vec<ArrayReferenceTransform>,
+    }
+
+    impl Operation for CopyAccess {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "copy_access"
+        }
+
+        fn infer_output_types(
+            &self,
+            _inputs: &[ArrayIrType],
+            _regions: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            Ok(Vec::new())
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            let source = ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read };
+            let destination = ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Write };
+            Cow::Owned(Effects::new(EffectClasses::NONE, vec![source, destination]).unwrap())
+        }
+    }
+
+    impl ReferenceAccessOperation for CopyAccess {
+        type Transform = ArrayReferenceTransform;
+
+        fn base_input_count(&self) -> usize {
+            2
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+            let binding_count = |transforms: &[ArrayReferenceTransform]| {
+                transforms.iter().map(|transform| transform.binding_count()).sum::<usize>()
+            };
+            let source_end = 2 + binding_count(&self.source_transforms);
+            let destination_end = source_end + binding_count(&self.destination_transforms);
+            match input_index {
+                0 => Some(ReferenceAccessDescriptor::new(&self.source_transforms, 2..source_end)),
+                1 => Some(ReferenceAccessDescriptor::new(&self.destination_transforms, source_end..destination_end)),
+                _ => None,
+            }
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            input_index: usize,
+            transforms: Vec<Self::Transform>,
+        ) -> Result<Self, ProgramError> {
+            let mut operation = self.clone();
+            match input_index {
+                0 => operation.source_transforms = transforms,
+                1 => operation.destination_transforms = transforms,
+                _ => {
+                    return Err(ProgramError::MalformedProgram(format!("no reference access at input {input_index}")));
+                }
+            }
+            Ok(operation)
+        }
+    }
+
     #[test]
     fn test_reference_access_descriptor_new() {
         let transforms = [dynamic()];
@@ -323,9 +397,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validated_reference_access_descriptors() {
-        let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![dynamic()])
-            .with_destination_transforms(vec![dynamic()]);
+        let operation = CopyAccess { source_transforms: vec![dynamic()], destination_transforms: vec![dynamic()] };
         assert_eq!(
             validated_reference_access_descriptors(&operation, 4),
             Ok(vec![
@@ -539,9 +611,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_rewrite_reference_access_transforms() {
-        let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![dynamic()])
-            .with_destination_transforms(vec![dynamic()]);
+        let operation = CopyAccess { source_transforms: vec![dynamic()], destination_transforms: vec![dynamic()] };
         let source = AtomId::new(0);
         let destination = AtomId::new(1);
         let source_index = AtomId::new(2);
@@ -588,19 +658,19 @@ pub(crate) mod tests {
 
     #[test]
     fn test_rewrite_reference_access_transforms_rejects_non_access_inputs() {
-        let operation = AsyncCopyOperation::new().with_source_transforms(vec![dynamic()]);
+        let operation = CopyAccess { source_transforms: vec![dynamic()], destination_transforms: Vec::new() };
         let instruction =
             Instruction::new(operation, vec![AtomId::new(0), AtomId::new(1), AtomId::new(2)], Vec::new(), Vec::new());
         assert_eq!(
             rewrite_reference_access_transforms(&instruction, 2, Vec::new(), Vec::new()).unwrap_err(),
-            ProgramError::MalformedProgram("operation `async_copy` has no reference access at input 2".to_string()),
+            ProgramError::MalformedProgram("operation `copy_access` has no reference access at input 2".to_string()),
         );
     }
 
     #[test]
     fn test_rewrite_reference_access_transforms_rejects_mismatched_bindings() {
         let instruction =
-            Instruction::new(AsyncCopyOperation::new(), vec![AtomId::new(0), AtomId::new(1)], Vec::new(), Vec::new());
+            Instruction::new(CopyAccess::default(), vec![AtomId::new(0), AtomId::new(1)], Vec::new(), Vec::new());
         assert_eq!(
             rewrite_reference_access_transforms(&instruction, 0, Vec::new(), vec![AtomId::new(2)]).unwrap_err(),
             ProgramError::MalformedProgram("reference transform path has 1 extra bindings".to_string()),
@@ -614,11 +684,11 @@ pub(crate) mod tests {
     #[test]
     fn test_rewrite_reference_access_transforms_rejects_malformed_layouts() {
         // The input layout is validated before any descriptor is read.
-        let truncated = Instruction::new(AsyncCopyOperation::new(), vec![AtomId::new(0)], Vec::new(), Vec::new());
+        let truncated = Instruction::new(CopyAccess::default(), vec![AtomId::new(0)], Vec::new(), Vec::new());
         assert_eq!(
             rewrite_reference_access_transforms(&truncated, 0, Vec::new(), Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
-                "operation `async_copy` declares reference access at input 1 but has only 1 inputs".to_string(),
+                "operation `copy_access` declares reference access at input 1 but has only 1 inputs".to_string(),
             ),
         );
 
@@ -643,9 +713,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_reference_access_layout() {
-        let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![dynamic()])
-            .with_destination_transforms(vec![dynamic()]);
+        let operation = CopyAccess { source_transforms: vec![dynamic()], destination_transforms: vec![dynamic()] };
         assert_eq!(
             reference_access_layout(&operation, 4),
             Ok(vec![
@@ -662,7 +730,7 @@ pub(crate) mod tests {
             reference_access_layout(&operation, 5),
             Err((
                 1,
-                "operation `async_copy` reference transforms require 4 inputs but the instruction has 5".to_string(),
+                "operation `copy_access` reference transforms require 4 inputs but the instruction has 5".to_string(),
             )),
         );
         let missing = DescribedAccess {

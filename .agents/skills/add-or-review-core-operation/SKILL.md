@@ -64,7 +64,7 @@ Group each operation in this order, omitting only implementations that do not ap
    `MemberOperation`, and `MemberInterpretableOperation` implementations.
 4. Its operation provider trait and implementations where relevant.
 5. Its capability or frontend trait and implementations, preceded by its options types (e.g., `ScanOptions` or
-   `WhileOptions`) and followed by its global function where one exists (e.g., `scan()` or `while_loop()`). Order
+   `WhileOptions`) and followed by its global function where one exists (e.g., `scan()` or `r#while()`). Order
    explicit context implementations as `EagerContext` for `Array`, `EagerContext` for `ArrayIrValue`,
    `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`, `DifferentiationContext`, and
    `TranspositionContext`.

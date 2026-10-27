@@ -1,7 +1,7 @@
 //! Loops over loop-carried state through [`WhileOperation`], which applies an attached body [`Region`](crate::Region)
 //! to the state while an attached condition [`Region`](crate::Region) over the same state produces a true predicate,
-//! and returns the final state. [`While::while_loop`] traces a condition and a body over structured state using an
-//! explicit context. The global [`while_loop()`] function recovers that context from the state values.
+//! and returns the final state. [`While::r#while`](While::while) traces a condition and a body over structured state
+//! using an explicit context. The global [`r#while()`](fn@while) function recovers that context from the state values.
 //! [`WhileOptions`] selects the iteration bound. Values that a loop uses as predicates implement [`WhilePredicate`],
 //! which decides whether the loop continues and masks state updates per item when the loop is interpreted.
 //!
@@ -29,7 +29,7 @@
 //!     batched widens every array state element, and the bound loop masks its updates per item.
 //!   - **Differentiation:** An eager loop runs its duals directly and resumes with the staged rule from the current
 //!     duals once its predicate stops concretizing to one scalar Boolean. A bounded staged loop stores per-iteration
-//!     residuals in `[bound, …]` stacks and stages one masked tangent `scan`, whose transposition gives reverse mode,
+//!     residuals in `[bound, ...]` stacks and stages one masked tangent `scan`, whose transposition gives reverse mode,
 //!     after rewriting a batched predicate into a scalar-predicate masked form over the same state. An unbounded staged
 //!     loop stages one fused doubled-state loop, which supports forward mode only, because staged linear `while` loops
 //!     do not support transposition.
@@ -91,8 +91,6 @@ use crate::programs::{
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this since it is mostly vibe coded.
-
 /// Type-family predicate and state semantics for [`WhileOperation`].
 ///
 /// Implementations define which types represent valid predicates for a given loop-carried state, which predicates are
@@ -100,7 +98,7 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// and which state has no per-item value that a batched predicate could mask. These rules are independent of the
 /// execution domain, so inference, transforms, and lowering can validate loops without requiring any runtime value
 /// representation. The [`WhilePredicate`] values of a domain supply the matching runtime semantics: the loop continues
-/// while any item of its predicate is true, and the items whose predicate is false keep their carried state.
+/// while any item of its predicate is `true`, and the items whose predicate is `false` keep their carried state.
 ///
 /// [`WhileOperation`] validates the rest of the loop contract separately and identically for every type family. The
 /// condition and the body consume the same state signature, the condition returns exactly one predicate, and the body
@@ -112,8 +110,8 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 ///
 /// # Array Type Families
 ///
-/// [`ArrayType`] predicates are Boolean arrays whose shape is a prefix of every state shape. A rank-zero predicate is
-/// the ordinary whole-loop condition, while a batched predicate broadcasts against every state element along its
+/// [`ArrayType`] predicates are Boolean arrays whose shape is a prefix of every state shape. A rank-zero predicate
+/// is the ordinary whole-loop condition, while a batched predicate broadcasts against every state element along its
 /// leading axes, which makes the per-item masking well-defined. Batching produces such loops when a predicate becomes
 /// batched, and the consumers of the loop (i.e., interpretation, differentiation, and lowering) implement the masked
 /// semantics. Array state is always maskable.
@@ -132,6 +130,7 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// every reference referent) must vary over each manual mesh axis that the predicate varies over (refer to
 /// [`Sharding::varying_manual_axes`]). A first-class dimension carries no manual variation and is not checked.
 pub trait WhileType: Type + ArrayMemberType + From<ArrayType> {
+    // TODO(eaplatanios): Review from here onwards.
     /// Validates the type family's restrictions on using a value of type `condition_output` as the predicate of a loop
     /// over state of types `state_types`. [`WhileOperation`] validates the predicate count and the state signatures
     /// separately.
@@ -1762,9 +1761,9 @@ where
     }
 }
 
-/// Configuration of [`While::while_loop`] and [`while_loop()`]. By default, the loop has no iteration bound and runs
-/// for as long as its condition holds. No option carries a value, so, unlike [`ScanOptions`](super::scan::ScanOptions),
-/// these options are not generic over a value type.
+/// Configuration of [`While::r#while`](While::while) and [`r#while()`](fn@while). By default, the loop has no iteration
+/// bound and runs for as long as its condition holds. No option carries a value, so, unlike
+/// [`ScanOptions`](super::scan::ScanOptions), these options are not generic over a value type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhileOptions {
     /// Optional semantic iteration bound of the loop.
@@ -1809,8 +1808,8 @@ impl Default for WhileOptions {
 
 /// Context construction capability for a structured [`WhileOperation`], the Ryft analogue of JAX's
 /// [`lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html). The loop is bound in this
-/// explicit context, which need not be the domain of the state values; the global [`while_loop()`] function instead
-/// recovers its context from the first state value.
+/// explicit context, which need not be the domain of the state values; the global [`r#while()`](fn@while) function
+/// instead recovers its context from the first state value.
 ///
 /// The condition receives the loop state and returns one Boolean predicate; the body receives the same state and
 /// returns the next state. The state may be a [`Parameterized`] structure with static fields; the body must return the
@@ -1842,7 +1841,7 @@ pub trait While: Context {
     ///
     /// Returns errors for invalid predicates, state structure/static-field changes, state signature changes, reference
     /// identities, or nonconvergent manual variation, and errors from tracing, alignment, or binding.
-    fn while_loop<
+    fn r#while<
         State: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         ConditionFn: FnMut(
             State::To<Tracer<NestedTracingContext<Self>>>,
@@ -1865,7 +1864,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Whil
 where
     Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
 {
-    fn while_loop<
+    fn r#while<
         State: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         ConditionFn: FnMut(
             State::To<Tracer<NestedTracingContext<Self>>>,
@@ -2009,14 +2008,14 @@ where
     }
 }
 
-/// Runs [`While::while_loop`] in the execution domain recovered from the first value of the initial `state`. The
-/// condition can only compute its predicate from state values, so the state must contain at least one value alongside
-/// any static fields.
+/// Runs [`While::r#while`](While::while) in the execution domain recovered from the first value of the initial `state`.
+/// The condition can only compute its predicate from state values, so the state must contain at least one value
+/// alongside any static fields.
 ///
 /// ```
-/// # use ryft_core::{Array, Compare, Context, ProgramError, WhileOptions, while_loop};
+/// # use ryft_core::{Array, Compare, Context, ProgramError, WhileOptions, r#while};
 /// # fn main() -> Result<(), ProgramError> {
-/// let (count, value) = while_loop(
+/// let (count, value) = r#while(
 ///     |(count, _)| count.less_than(&count.context().lift(Array::scalar(3i64)?)?),
 ///     |(count, value)| {
 ///         let one = count.context().lift(Array::scalar(1i64)?)?;
@@ -2035,9 +2034,9 @@ where
 /// # Errors
 ///
 /// Returns [`ProgramError::InvalidArgument`] when the state contains no value that supplies a domain, and the errors of
-/// [`While::while_loop`].
+/// [`While::r#while`](While::while).
 #[inline]
-pub fn while_loop<
+pub fn r#while<
     V: Value<Domain: While>,
     State: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
     ConditionFn: FnMut(
@@ -2058,7 +2057,7 @@ where
     let context = state.parameters().next().map(Value::domain).ok_or_else(|| ProgramError::InvalidArgument {
         message: format!("`{WHILE_OPERATION_NAME}` requires a state value to recover its context from"),
     })?;
-    context.while_loop(condition_fn, body_fn, state, options)
+    context.r#while(condition_fn, body_fn, state, options)
 }
 
 impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: BatchingPolicy<C>>
@@ -14277,10 +14276,10 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop() {
+    fn test_while_while() {
         // The loop doubles `value` while `count < 3`, and an iteration bound truncates it after that many iterations.
         assert_eq!(
-            while_loop(
+            r#while(
                 |(count, _)| count.less_than(&StagingContext::constant(count.context(), Array::scalar(3i64).unwrap())),
                 |(count, value)| {
                     let one = StagingContext::constant(count.context(), Array::scalar(1i64).unwrap());
@@ -14293,7 +14292,7 @@ mod tests {
             Ok((Array::scalar(3i64).unwrap(), Array::scalar(8f32).unwrap())),
         );
         assert_eq!(
-            while_loop(
+            r#while(
                 |(count, _)| count.less_than(&StagingContext::constant(count.context(), Array::scalar(3i64).unwrap())),
                 |(count, value)| {
                     let one = StagingContext::constant(count.context(), Array::scalar(1i64).unwrap());
@@ -14308,16 +14307,16 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_empty_state() {
+    fn test_while_while_empty_state() {
         // Without state values, the global function has no domain to recover. An explicit context traces the condition
         // over the empty state, but the condition has no value to compute a predicate from, so its own error surfaces.
         let error = ProgramError::InvalidArgument { message: "the empty state has no predicate".to_string() };
         assert_eq!(
-            TestEagerContext::new().while_loop(|()| Err(error.clone()), |()| Ok(()), (), WhileOptions::new()),
+            TestEagerContext::new().r#while(|()| Err(error.clone()), |()| Ok(()), (), WhileOptions::new()),
             Err(error.clone()),
         );
         assert_eq!(
-            while_loop::<Array, (), _, _>(|()| Err(error.clone()), |()| Ok(()), (), WhileOptions::new()),
+            r#while::<Array, (), _, _>(|()| Err(error.clone()), |()| Ok(()), (), WhileOptions::new()),
             Err(ProgramError::InvalidArgument {
                 message: format!("`{WHILE_OPERATION_NAME}` requires a state value to recover its context from"),
             }),
@@ -14325,12 +14324,12 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_staging() {
+    fn test_while_while_staging() {
         // Under tracing, the frontend stages one `while` whose regions are the traced condition and body, with the
         // iteration bound of its options.
         let (_, program) = TestTracingContext::trace(
             |(count, value)| {
-                while_loop(
+                r#while(
                     |(count, _)| {
                         count.less_than(&StagingContext::constant(count.context(), Array::scalar(3i64).unwrap()))
                     },
@@ -14375,7 +14374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_structure() {
+    fn test_while_while_structure() {
         /// A state whose static tag must survive tracing, without requiring `Clone` on runtime structures.
         #[derive(ryft_macros::Parameterized)]
         struct State<P: Parameter> {
@@ -14399,7 +14398,7 @@ mod tests {
         }
 
         // Tuples and custom structures nest, and the static tag reaches both functions and the final state.
-        let (count, state) = while_loop(
+        let (count, state) = r#while(
             |(count, state)| {
                 assert_eq!(state.tag, "state");
                 count.less_than(&StagingContext::constant(count.context(), Array::scalar(2i64).unwrap()))
@@ -14417,7 +14416,7 @@ mod tests {
         assert_eq!(state.tag, "state");
 
         // The body must return the static fields that it received.
-        let result = while_loop(
+        let result = r#while(
             |state| state.value.less_than(&state.value),
             |state| Ok(State { value: state.value, tag: "changed" }),
             State { value: Array::scalar(0f32).unwrap(), tag: "state" },
@@ -14433,11 +14432,11 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_validation() {
+    fn test_while_while_validation() {
         // The traced regions are validated as a whole before binding: the predicate must be Boolean, and the body must
         // return every reference carry as the reference that it received.
         assert_eq!(
-            while_loop(|value| Ok(value), |value| Ok(value), Array::scalar(0f32).unwrap(), WhileOptions::new()),
+            r#while(|value| Ok(value), |value| Ok(value), Array::scalar(0f32).unwrap(), WhileOptions::new()),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `f32[]`",
             )))),
@@ -14445,7 +14444,7 @@ mod tests {
         let first = TestIrValue::Reference(ArrayReference::new(Array::scalar(1f32).unwrap()));
         let second = TestIrValue::Reference(ArrayReference::new(Array::scalar(2f32).unwrap()));
         assert_eq!(
-            while_loop(
+            r#while(
                 |(_, _, flag)| Ok(flag),
                 |(first, second, flag)| Ok((second, first, flag)),
                 (first, second, array(Array::scalar(false).unwrap())),
@@ -14456,12 +14455,12 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_batched_predicate() {
+    fn test_while_while_batched_predicate() {
         // A vector predicate over vector state masks the state per item: each item stops being updated once its own
         // predicate is false, while the loop runs as long as any item continues, up to the iteration bound.
         let limits = Array::vector(vec![2f32, 4.0, 1.0]).unwrap();
         assert_eq!(
-            while_loop(
+            r#while(
                 |x| x.less_than(&StagingContext::constant(x.context(), limits.clone())),
                 |x| Ok(x.clone() + StagingContext::constant(x.context(), Array::scalar(1f32).unwrap())),
                 Array::vector(vec![0f32, 0.0, 5.0]).unwrap(),
@@ -14470,7 +14469,7 @@ mod tests {
             Ok(Array::vector(vec![2f32, 4.0, 5.0]).unwrap()),
         );
         assert_eq!(
-            while_loop(
+            r#while(
                 |x| x.less_than(&StagingContext::constant(x.context(), limits.clone())),
                 |x| Ok(x.clone() + StagingContext::constant(x.context(), Array::scalar(1f32).unwrap())),
                 Array::vector(vec![0f32, 0.0, 5.0]).unwrap(),
@@ -14481,12 +14480,12 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_references() {
+    fn test_while_while_references() {
         // A reference leaf enters the loop whole: the condition increments the counter that it holds before comparing
         // it with 3, and the body returns the reference that it received.
         let reference = ArrayReference::new(Array::scalar(0f32).unwrap());
         assert_eq!(
-            while_loop(
+            r#while(
                 |counter| {
                     counter.add_update(&StagingContext::constant(
                         counter.context(),
@@ -14507,7 +14506,7 @@ mod tests {
         // constants precede the other instructions of the condition, and both programs leave the same counter behind.
         let (_, program) = TestIrTracingContext::trace(
             |reference: Tracer<_>| {
-                let reference = while_loop(
+                let reference = r#while(
                     |counter| {
                         let one = StagingContext::constant(counter.context(), array(Array::scalar(1f32).unwrap()));
                         counter.add_update(&one)?;
@@ -14557,7 +14556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_propagates_manual_variation_across_state() {
+    fn test_while_while_propagates_manual_variation_across_state() {
         // The manual variation of one state element propagates to the elements that the body rotates it into, so the
         // frontend widens the initial state to the fixed point of that propagation before it binds the loop.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -14576,7 +14575,7 @@ mod tests {
         for (continues, first, second) in [(false, [1f32, 1.0], [2f32, 2.0]), (true, [3f32, 4.0], [3f32, 4.0])] {
             let (_, program) = TestIrTracingContext::trace_with_named_axes(
                 |inputs: Vec<Tracer<_>>| {
-                    let (first, second, source) = while_loop(
+                    let (first, second, source) = r#while(
                         |(first, _, _)| {
                             Ok(StagingContext::constant(first.context(), array(Array::scalar(continues).unwrap())))
                         },
@@ -14649,7 +14648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_widens_state_to_a_varying_predicate() {
+    fn test_while_while_widens_state_to_a_varying_predicate() {
         // The counter varies over `m`, and so does the predicate computed from it. Devices whose counters differ run
         // different numbers of iterations, so the invariant value is widened to vary over `m` before the loop, even
         // though the body alone would keep it invariant.
@@ -14665,7 +14664,7 @@ mod tests {
         let predicate = "bool[1][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]";
         let (_, program) = TestIrTracingContext::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
-                let (counter, value) = while_loop(
+                let (counter, value) = r#while(
                     |(counter, _)| {
                         let limit = Array::from_elements(varying_type.clone(), &[3f32]).unwrap();
                         counter.less_than(&StagingContext::constant(counter.context(), array(limit)))
@@ -14729,7 +14728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_replays_entry_alignment_in_the_explicit_context() {
+    fn test_while_while_replays_entry_alignment_in_the_explicit_context() {
         /// Executes arrays through an explicit domain distinct from `Array::Domain`, recording every parent bind.
         #[derive(Clone)]
         struct RecordingContext {
@@ -14817,7 +14816,7 @@ mod tests {
             .unwrap();
         let context = RecordingContext { binds: Rc::new(RefCell::new(Vec::new())) };
         assert_eq!(
-            context.while_loop(
+            context.r#while(
                 |(counter, _)| {
                     let limit = Array::from_elements(varying_type.clone(), &[3f32]).unwrap();
                     counter.less_than(&StagingContext::constant(counter.context(), limit))
@@ -14841,7 +14840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_while_loop_differentiation_and_batching() {
+    fn test_while_while_differentiation_and_batching() {
         // `while (x < 100, iteration_bound = 4) { x = x * x }` through the frontend agrees with the primitive loop that
         // `squaring_while_operation` builds by hand: at `x = 2` it squares three times, so locally `f(x) = x⁸`
         // with value 256 and derivative `8 x⁷ = 1024`.
@@ -14849,7 +14848,7 @@ mod tests {
         let expected = Ok((Array::scalar(256.0).unwrap(), Array::scalar(1024.0).unwrap()));
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
-                while_loop(
+                r#while(
                     |x| x.less_than(&StagingContext::constant(x.context(), Array::scalar(100.0).unwrap())),
                     |x| Ok(x.clone() * x),
                     x,
@@ -14866,7 +14865,7 @@ mod tests {
         );
         let (output, pullback) = differentiate_at(Array::scalar(2.0).unwrap())
             .vjp(|x| {
-                while_loop(
+                r#while(
                     |x| x.less_than(&StagingContext::constant(x.context(), Array::scalar(100.0).unwrap())),
                     |x| Ok(x.clone() * x),
                     x,
@@ -14877,7 +14876,7 @@ mod tests {
         assert_eq!(output, Array::scalar(256.0).unwrap());
         assert_eq!(pullback.apply(Array::scalar(1.0).unwrap()), Ok(MaybeZero::Value(Array::scalar(1024.0).unwrap())));
         check_gradient!(
-            |x| while_loop(
+            |x| r#while(
                 |x| x.less_than(&StagingContext::constant(x.context(), Array::scalar(100.0).unwrap())),
                 |x| Ok(x.clone() * x),
                 x,
@@ -14894,7 +14893,7 @@ mod tests {
         assert_eq!(
             batch(
                 |x| {
-                    while_loop(
+                    r#while(
                         |x| x.less_than(&StagingContext::constant(x.context(), Array::scalar(100.0).unwrap())),
                         |x| Ok(x.clone() * x),
                         x,

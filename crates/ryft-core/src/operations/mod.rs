@@ -84,7 +84,7 @@ pub use constants::{
     Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use control_flow::scan::scan;
-pub use control_flow::r#while::while_loop;
+pub use control_flow::r#while::r#while;
 pub use control_flow::{
     CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, ResidualStackOperation,
     SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation,

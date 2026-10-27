@@ -222,7 +222,7 @@ The transform stack was rebuilt around a single builder entry point:
 - [x] `dot_general` (+ accumulation type and output sharding), `scaled_dot` (block-scaled, §4)
 - [x] fused `dot_product_attention` (+ backward) with causal mask, sliding window, GQA, dropout, bias, sequence lengths, cuDNN FMHA lowering
 - [x] Device-side RNG (`rng_bit_generator` with ThreeFry/Philox; `split_rng_key`, `random_normal`, `random_uniform`, `random_categorical`)
-- [x] `condition`, `while_loop`, `scan`
+- [x] `condition`, `r#while`, `scan`
 - [x] Collectives (`parallel_sum`/`parallel_mean`/`parallel_max`, `parallel_all_gather`, `parallel_sum_scatter`, `parallel_permute`, `parallel_all_to_all`) + `shard_map`, `reshard`, sharding constraints
 - [x] Activation checkpointing (`rematerialize` with JAX-parity policies and offload)
 - [x] `custom_function` (JVP, VJP, and batching rules), `stop_gradient`, `tag`, `print`, `custom_call`, `transfer_to_memory`
@@ -321,7 +321,7 @@ Pick a stateless PRNG (threefry-2x32 is the obvious choice, since it lowers clea
 `stablehlo.rng_bit_generator`). Add a `PrngKey` value type, a `split(key, n) -> Vec<PrngKey>`
 helper, and `random_normal(key, shape, dtype) -> Array` / `random_uniform(key, shape, dtype, [lo,
 hi])`. Truncated-normal initialization (Flax's default for Linen) can be built on top via
-rejection sampling inside a `while_loop`, or as a `pjit`-time host helper for the first cut.
+rejection sampling inside a `r#while`, or as a `pjit`-time host helper for the first cut.
 
 ### Phase 6 — Activation checkpointing & optimizer — ⚠️ HALF DONE (remat ✅, optimizer ❌)
 

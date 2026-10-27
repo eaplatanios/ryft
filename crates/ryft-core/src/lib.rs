@@ -92,7 +92,8 @@ pub use differentiation::{
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
-    InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
+    EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, MemberInterpretableOperation,
+    RegionInterpreter, interpret_projected_operation,
 };
 pub use operations::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME,
@@ -180,7 +181,7 @@ pub use operations::{
     XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
     associative_scan, check_batching_rule_consistency, composite, scan, shard_map, shard_map_in_context,
     shard_map_with_options, softmax_cross_entropy_with_target_logits, trace_shard_map, trace_shard_map_with_named_axes,
-    trace_shard_map_with_options, while_loop,
+    trace_shard_map_with_options, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -218,11 +219,11 @@ pub use programs::{
     ReferenceRegionInputBinding, ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot,
     ReferenceSource, ReferenceTransform, ReferenceTransformPath, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOverlap,
-    Region, RegionArena, RegionArenaIterator, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary,
-    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionDriver, RegionId, RegionInterface,
-    RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics,
-    ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError,
-    TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
+    Region, RegionArena, RegionArenaIterator, RegionContentIdentity, RegionDataFlow, RegionDataFlowBoundary,
+    RegionDataFlowRegionBoundary, RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionDriver,
+    RegionId, RegionInterface, RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot,
+    RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
+    TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
     TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch,
     ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms,
     discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,

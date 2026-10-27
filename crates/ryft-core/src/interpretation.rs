@@ -202,7 +202,7 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
 /// interpretation-specific recursion provided by [`InterpretationDriver`]. Its regions are exactly the nested
 /// computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a selected
 /// region through the active [`Context`] without taking ownership of it, lifting stored constants into runtime values.
-pub(crate) struct EagerInterpretationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+pub struct EagerInterpretationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// [`AttachedRegions`] supplied to the active [`Operation`] application.
     regions: &'r AttachedRegions<'r, V, O>,
 }
@@ -210,7 +210,7 @@ pub(crate) struct EagerInterpretationDriver<'r, V: Value, O: Operation<Type = V:
 impl<'r, V: Value, O: Operation<Type = V::Type>> EagerInterpretationDriver<'r, V, O> {
     /// Creates a new [`EagerInterpretationDriver`].
     #[inline]
-    pub(crate) fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
+    pub fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
         Self { regions }
     }
 }
@@ -892,10 +892,12 @@ impl<T: Type> ReplayTypeIdentities<T> {
 }
 
 /// Resumable context-driven interpreter with the same boundary refinements, provenance, identity renaming, and
-/// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps [`RegionInterpreterState`] to retain
-/// context-specific validation and binding between steps. Each step completes one outer instruction; an attached
-/// region executes through the context's ordinary operation rule within that step.
-pub(crate) struct RegionInterpreter<'r, C: Context> {
+/// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps a resumable instruction state (i.e., the
+/// source position, live runtime values, and remaining-use counts) to retain context-specific validation and binding
+/// between steps. Each step completes one outer instruction; an attached region executes through the context's
+/// ordinary operation rule within that step. The context supplied to [`Self::new`] is retained across every step,
+/// so context-owned invocation state and effect handling survive between steps.
+pub struct RegionInterpreter<'r, C: Context> {
     /// [`Context`] used to lift source constants and bind instructions to runtime values or staged operations. The same
     /// context is retained across every [`Self::step`], so context-owned invocation state and effect handling survive
     /// suspension. Nested regions are interpreted or staged through its ordinary binding rules and the instruction's
@@ -933,7 +935,7 @@ pub(crate) struct RegionInterpreter<'r, C: Context> {
 impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// Creates a new [`RegionInterpreter`] by validating input arity and source identifiers, then establishing
     /// refinement facts for the complete input signature. When staging, input and constant-owned type identities are
-    /// renamed before live constants are lifted through the context. The resulting [`Self::state`] retains the inputs
+    /// renamed before live constants are lifted through the context. The resulting instruction state retains the inputs
     /// and constants needed by later instructions or region outputs; no instruction has been dispatched when this
     /// returns.
     ///
@@ -946,7 +948,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     ///   - `region`: Borrowed source region and arena used for replay and boundary validation.
     ///   - `inputs`: Runtime values in the order of the region's input atoms. Their types must satisfy the declared
     ///     input signature, including constraints shared across multiple inputs.
-    pub(crate) fn new(
+    pub fn new(
         context: C,
         region: RegionRef<'r, C::Constant, C::Operation>,
         mut inputs: Vec<C::Value>,
@@ -1055,8 +1057,8 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
 
     /// Returns the context used by this interpreter's constant lifting and instruction binding. Schedulers can
     /// inspect its invocation state or perform context-specific checks between steps without replacing the context
-    /// or advancing [`Self::state`]. This borrows the retained context rather than creating another replay scope.
-    pub(crate) fn context(&self) -> &C {
+    /// or advancing the instruction state. This borrows the retained context rather than creating another replay scope.
+    pub fn context(&self) -> &C {
         &self.context
     }
 
@@ -1068,17 +1070,18 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         self.state.is_complete()
     }
 
-    /// Dispatches the next outer instruction and returns the interpreter positioned after it. [`Self::state`]
+    /// Dispatches the next outer instruction and returns the interpreter positioned after it. The instruction state
     /// supplies the inputs; this interpreter validates reified boundary dimensions, applies the appropriate type
     /// identity substitutions, and binds through [`Self::context`] with the source instruction's provenance and a
-    /// [`ReplayRegionDriver`]. Fresh region-owned definitions extend [`Self::type_identities`] before later steps
-    /// can use them, while [`Self::region_mappings`] preserves attached-region sharing across bindings.
+    /// [`ReplayRegionDriver`]. Fresh region-owned definitions extend the interpreter's type-identity renaming before
+    /// later steps can use them, while its replay-scoped [`RegionReplayMappings`] preserve attached-region sharing
+    /// across bindings.
     ///
     /// A step handles one complete outer binding, including any attached-region work performed by its operation
     /// rule. Stepping an already complete interpreter is an error. The function consumes `self`, so a failed binding
     /// or validation cannot resume from inputs already transferred or repeat effects through the same state. This
     /// interpreter does not roll back effects already performed by the context.
-    pub(crate) fn step(self) -> Result<Self, ProgramError> {
+    pub fn step(self) -> Result<Self, ProgramError> {
         let Self { context, state, refinements, type_identities, region_mappings } = self;
         let region = state.region;
         let state = state.step::<ProgramError, _>(|instruction, inputs| {
@@ -1141,15 +1144,15 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         Ok(Self { context, state, refinements, type_identities, region_mappings })
     }
 
-    /// Consumes a completed interpreter and returns values in the source region's output order. [`Self::state`]
+    /// Consumes a completed interpreter and returns values in the source region's output order. The instruction state
     /// gathers those values using its remaining-use counts; this function then checks the declared output contract
-    /// using [`Self::type_identities`]. Type identities allowed by the source signature are renamed consistently,
-    /// so output validation accepts replayed definitions without admitting unrelated identities.
+    /// using the interpreter's type-identity renaming. Type identities allowed by the source signature are renamed
+    /// consistently, so output validation accepts replayed definitions without admitting unrelated identities.
     ///
     /// This does not dispatch remaining instructions: an incomplete state is rejected. Output refinement failures
     /// are reported with the same boundary diagnostics as input failures in [`Self::new`]. Both success and failure
     /// consume the interpreter and its replay-scoped mappings.
-    pub(crate) fn finish(self) -> Result<Vec<C::Value>, ProgramError> {
+    pub fn finish(self) -> Result<Vec<C::Value>, ProgramError> {
         // Replayed values commonly retain the program's exact declared output types. Only a count difference or a more
         // precise output type requires validation. That validation reuses facts established from the inputs and permits
         // a previously unbound output identity only when it belongs to this program's closed identity signature

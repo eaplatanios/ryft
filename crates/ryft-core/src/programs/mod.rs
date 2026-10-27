@@ -162,7 +162,7 @@ pub use regions::{
     RegionRef, RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
-pub use transforms::{Transform, TransformArtifact, TransformCache};
+pub use transforms::{RegionContentIdentity, Transform, TransformArtifact, TransformCache};
 pub use types::{Type, TypeError, TypeRefinements, Typed, type_identities_needing_runtime_checks};
 pub use values::{
     Concretizable, LiteralIdentity, ParameterProjection, ProjectedValue, Value, ValueDirectDispatch, ValueDispatch,
