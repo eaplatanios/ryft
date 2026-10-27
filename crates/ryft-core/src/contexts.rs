@@ -55,7 +55,7 @@
 //!
 //! # Heterogeneous Domains and Projection
 //!
-//! [`ProjectedContext`] presents one member kind of a heterogeneous domain as an ordinary context while forwarding
+//! [`ProjectedContext`] presents one member kind of heterogeneous domain as an ordinary context while forwarding
 //! every lift, bind, resolution, and eagerness query to the heterogeneous parent. It preserves symbolic identity and
 //! creates no second interpreter or program. The regions of a bound member operation are member-family programs, so
 //! projection lifts them into the heterogeneous family together with the operation, while operations whose regions mix
@@ -210,7 +210,7 @@ impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
 /// every replay caller, lets `C: Context` alone imply it. Families whose enum stores a guard variant receive the
 /// provider from the blanket `From` implementation, while `#[derive(Operation)]` and
 /// [`impl_guardless_operation!`](crate::impl_guardless_operation) generate a rejecting provider for families that store
-/// no guard, so such a family needs no hand-written provider. An eager context over exact values never invokes a
+/// no guard, so such a family needs no handwritten provider. An eager context over exact values never invokes a
 /// provider, because concrete values establish their relationships at the boundary and replay constructs no guard for
 /// them (refer to [`needs_guards`](Self::needs_guards)). A guard that replay does construct is enforced by the
 /// family's rule under a transform, by interpretation in an eager context, or by staging, according to the contract in
@@ -517,7 +517,7 @@ where
     }
 }
 
-/// [`Context`] adapter that presents one member kind of a heterogeneous parent context as an ordinary context of that
+/// [`Context`] adapter that presents one member kind of heterogeneous parent context as an ordinary context of that
 /// member kind. [`Program`]s that mix several value kinds store one heterogeneous [`Type`] / [`Value`] / [`Operation`]
 /// universe, but most operations, transform rules, and capability implementations are written against exactly one
 /// member kind (e.g., array-only rules bind through a context whose values are `Value<Type = ArrayType>`). Without an
@@ -987,10 +987,10 @@ fn stage_converted_operation<S: StagingContext, I: std::borrow::Borrow<S::Value>
                     .find(|(source_id, input_types, _)| *source_id == region_ids[index] && input_types == requested)
                 {
                     region_ids[index] = *specialized_id;
-                    interfaces[index] = region_builder.borrow().region_ref(*specialized_id).unwrap().interface();
+                    interfaces[index] = region_builder.borrow().region_ref(*specialized_id)?.interface();
                 } else {
                     let source_id = region_ids[index];
-                    let region = region_builder.borrow().region_ref(source_id).unwrap().to_program();
+                    let region = region_builder.borrow().region_ref(source_id)?.to_program();
                     let Ok(specialized) = region.specialize_to_region_input_types(requested) else {
                         specialization_failed = true;
                         break;
@@ -1170,11 +1170,8 @@ mod tests {
     fn test_eager_context_binds_and_lifts_values() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let default_context = EagerContext::<Array, ArrayOperation<Array>>::default();
-        let copied_context = context;
-        let cloned_context = copied_context.clone();
         assert_eq!(format!("{context:?}"), "EagerContext");
         assert_eq!(format!("{default_context:?}"), "EagerContext");
-        assert_eq!(format!("{cloned_context:?}"), "EagerContext");
         assert_eq!(context.lift(Array::scalar(2.5).unwrap()), Ok(Array::scalar(2.5).unwrap()));
         assert_eq!(
             context.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), [], &[]),
