@@ -668,7 +668,7 @@ where
                 }
                 stack
             }
-            None => self.zero(&placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?)?,
+            None => self.zero(&scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?)?,
         };
 
         // A placement over manual mesh axes makes the stack vary over them, and so must every written slice, which
@@ -779,7 +779,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
         let stack = match stack {
             Some(stack) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stack)?,
             None => {
-                let stack_type = placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?;
+                let stack_type = scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?;
                 EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
             }
         };
@@ -3421,41 +3421,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
     }
 }
 
-/// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
-/// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is
-/// only a hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the
-/// compiler remains free to place the slice. A scan axis sharded over [`Manual`](MeshAxisType::Manual) mesh axes makes
-/// those axes vary across the slice (refer to [`ArrayType::without_dimension`]), while one sharded over
-/// [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit reshard can
-/// remove an explicit placement.
-fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, Dimension), TypeError> {
-    let mut stacked_type = stacked_type.clone();
-    if let Some(sharding) = stacked_type.sharding()
-        && let Some(ShardingDimension::Sharded(axis_names)) = sharding.dimensions().get(axis)
-        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
-    {
-        let axis_names = axis_names
-            .iter()
-            .filter(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut dimensions = sharding.dimensions().to_vec();
-        dimensions[axis] =
-            if axis_names.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axis_names) };
-        let sharding = sharding.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()))?;
-        stacked_type = stacked_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-    }
-    stacked_type.without_dimension(axis).map_err(|error| {
-        TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` cannot slice a stacked value of type `{stacked_type}` along its scan axis \
-             ({error}); reshard it so that its scan axis is not sharded over explicit mesh axes",
-        ))
-    })
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Validates the runtime dimension's identity or singleton refinement independently of stacked-axis equality.
+/// Validates the runtime dimension's identity or singleton refinement independently of stacked axis equality.
 fn validate_scan_iteration_count_type<T: ScanType>(
     iteration_count: &Dimension,
     input_types: &[T],
@@ -3484,8 +3450,8 @@ fn validate_scan_iteration_count_type<T: ScanType>(
 /// `iteration_count` and the reference stacks among the actual input types, and returns the concrete iteration count
 /// when the iteration count input only refines `iteration_count`'s bounds instead of carrying its nominal identity.
 ///
-/// An iteration count input that carries `iteration_count`'s own [`DimensionVariable`] defines the iteration count, and
-/// [`None`] is returned. An iteration count input of an unrelated identity is admissible only when its bounds pin
+/// An iteration count input that carries `iteration_count`'s own [`DimensionVariable`] defines the iteration count,
+/// and [`None`] is returned. An iteration count input of an unrelated identity is admissible only when its bounds pin
 /// exactly one extent inside `iteration_count`'s bounds, and the iteration count is then that extent. The leading axes
 /// of stacked arrays are related to the iteration count through the declared input types of the scan (refer to
 /// [`ScanOperation::declared_input_types`]), so that conflicting static extents are type errors and the scan boundary
@@ -3497,8 +3463,8 @@ fn validate_scan_iteration_count_type<T: ScanType>(
 /// # Parameters
 ///
 ///   - `iteration_count`: Declared iteration count.
-///   - `input_types`: All scan input types, whose last entry is the iteration count input when `iteration_count` is
-///     dynamic.
+///   - `input_types`: All scan input types, whose last entry is the iteration count input
+///     when `iteration_count` is dynamic.
 ///   - `carry_count`: Number of leading loop-carried inputs, which are not stacked.
 fn validate_scan_iteration_count<T: ScanType>(
     iteration_count: &Dimension,
@@ -3542,6 +3508,54 @@ fn validate_scan_iteration_count<T: ScanType>(
     Ok(extent)
 }
 
+/// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
+/// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is
+/// only a hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the
+/// compiler remains free to place the slice. A scan axis sharded over [`Manual`](MeshAxisType::Manual) mesh axes makes
+/// those axes vary across the slice (refer to [`ArrayType::without_dimension`]), while one sharded over
+/// [`Explicit`](MeshAxisType::Explicit) mesh axes is rejected, because only an explicit reshard can
+/// remove an explicit placement.
+fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, Dimension), TypeError> {
+    let mut stacked_type = stacked_type.clone();
+    if let Some(sharding) = stacked_type.sharding()
+        && let Some(ShardingDimension::Sharded(axis_names)) = sharding.dimensions().get(axis)
+        && axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
+    {
+        let axis_names = axis_names
+            .iter()
+            .filter(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut dimensions = sharding.dimensions().to_vec();
+        dimensions[axis] =
+            if axis_names.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axis_names) };
+        let sharding = sharding.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()))?;
+        stacked_type = stacked_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+    }
+    stacked_type.without_dimension(axis).map_err(|error| {
+        TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` cannot slice a stacked value of type `{stacked_type}` along its scan axis \
+             ({error}); reshard it so that its scan axis is not sharded over explicit mesh axes",
+        ))
+    })
+}
+
+/// Returns the type of the stack of `iteration_count` slices of type `slice_type` that an eager scan assembles. When
+/// `slice_type` has sharding, the new leading axis uses `axis_sharding` on the same mesh; otherwise, the stack stays
+/// unsharded, exactly as in output inference (refer to [`ScanOperation::declared_output_types`]).
+fn scan_stack_type(
+    slice_type: &ArrayType,
+    iteration_count: usize,
+    axis_sharding: &ShardingDimension,
+) -> Result<ArrayType, TypeError> {
+    slice_type.batched(0, iteration_count.into(), axis_sharding.clone()).map_err(|error| {
+        TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type `{slice_type}` \
+             on `{axis_sharding}` ({error})",
+        ))
+    })
+}
+
 /// Returns the entry guard that checks a scan application whose inputs have the `actual` types against the `declared`
 /// input types of the scan (refer to [`ScanOperation::declared_input_types`]), together with the positions of its
 /// members among those inputs (refer to [`GuardOperation::for_entry`]), or [`None`] when the actual types prove every
@@ -3562,23 +3576,7 @@ fn scan_entry_guard<T: ScanType>(
     Ok(Some((guard.retaining(&member_types, &[])?, members)))
 }
 
-/// Returns the type of the stack of `iteration_count` slices of type `slice_type` that an eager scan assembles. When
-/// `slice_type` has sharding, the new leading axis uses `axis_sharding` on the same mesh; otherwise, the stack stays
-/// unsharded, exactly as in output inference (refer to [`ScanOperation::declared_output_types`]).
-fn placed_scan_stack_type(
-    slice_type: &ArrayType,
-    iteration_count: usize,
-    axis_sharding: &ShardingDimension,
-) -> Result<ArrayType, TypeError> {
-    slice_type.batched(0, iteration_count.into(), axis_sharding.clone()).map_err(|error| {
-        TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type `{slice_type}` on \
-             `{axis_sharding}` ({error})",
-        ))
-    })
-}
-
-/// Writes `value` as slice `iteration` of `stack` by prepending a unit axis to `value`. If `value` has sharding, the
+/// Writes `value` as slice `iteration` of `stack` by prepending a unit axis to `value`. If `value` is sharded, the
 /// unit axis uses `axis_sharding` on the same mesh. An in-place update must agree with the stack on explicit mesh axes
 /// and on the variation that manual mesh axes introduce, so the unit axis carries such sharding; sharding over auto
 /// mesh axes is a hint that the update need not repeat (and that a reshape cannot request).
@@ -3592,7 +3590,7 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
     axis_sharding: &ShardingDimension,
 ) -> Result<V, ProgramError> {
     let value_type = value.r#type().into_owned();
-    let expanded_type = placed_scan_stack_type(&value_type, 1, axis_sharding)?;
+    let expanded_type = scan_stack_type(&value_type, 1, axis_sharding)?;
     let requests_sharding = expanded_type.sharding().is_some_and(|sharding| {
         matches!(axis_sharding, ShardingDimension::Sharded(axis_names)
             if axis_names.iter().all(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto)))
@@ -3608,8 +3606,8 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
 }
 
 /// Rebuilds two scans from a partitioned iteration body, storing each varying residual once per iteration. Returns
-/// `None` when a reference cannot cross the resulting boundary, the split has no known work, or the split needs a known
-/// scan whose iteration count is not known (binding that scan would only stage a second residual scan).
+/// [`None`] when a reference cannot cross the resulting boundary, the split has no known work, or the split needs a
+/// known scan whose iteration count is not known (binding that scan would only stage a second residual scan).
 ///
 /// Computed invariant residuals are hoisted only when the declared iteration count guarantees an iteration. Direct
 /// input forwarding never evaluates body work and remains valid when the iteration count admits zero.
@@ -3637,7 +3635,6 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
 ///     embed it instead of threading the value through the residual scan.
 ///   - `bind_known_fn`: Binds the known scan and any hoisted invariant work.
 ///   - `bind_residual_fn`: Binds the residual scan, preserving deferred work and effects.
-// These arguments keep source validation, boundary wiring, and the two binding destinations explicit.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn reconstruct_partitioned_scan<
@@ -3681,7 +3678,6 @@ fn reconstruct_partitioned_scan<
 /// value, operation, and input type rather than once per combination of callback types: every partial evaluation and
 /// linearization of a scan would otherwise instantiate this body and every closure and iterator adapter in it again.
 /// Each callback is invoked exactly as often as by the wrapped function.
-// These arguments keep source validation, boundary wiring, and the two binding destinations explicit.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn reconstruct_partitioned_scan_erased<
     V: Value<Type: ScanType>,
@@ -3711,9 +3707,9 @@ fn reconstruct_partitioned_scan_erased<
         /// Initial value of the known carry at this index, which the body passes through unchanged.
         Carry(usize),
 
-        /// Value of this feeder atom of the known program, computed once before the scan.
-        /// Feeders are keyed by atom rather than by residual edge, because a partition can expose the same value
-        /// through several edges, and the unknown scan must thread it once.
+        /// Value of this feeder atom of the known program, computed once before the scan. Feeders are keyed by atom
+        /// rather than by residual edge, because a partition can expose the same value through several edges, and the
+        /// unknown scan must thread it once.
         Hoisted(AtomId),
     }
 
@@ -3763,8 +3759,8 @@ fn reconstruct_partitioned_scan_erased<
         partition.into_parts();
 
     // The residual program need not read every residual input (e.g., a partition with no iterations can carry a
-    // dimension edge that no residual instruction reads). Drop such inputs before splicing, so that the rebuilt body
-    // neither restores unused edges nor redefines identities that its own inputs already establish.
+    // dimension edge that no residual instruction reads). Drop such inputs before splicing, so that the rebuilt
+    // body neither restores unused edges nor redefines identities that its own inputs already establish.
     let residual_input_ids = residual_program.input_ids().to_vec();
     let residual_output_ids = residual_program.output_ids().to_vec();
     let (residual_program, live_residual_inputs) =
@@ -3814,8 +3810,8 @@ fn reconstruct_partitioned_scan_erased<
     // invariant work is hoisted only when an iteration is guaranteed, since even pure work may fail on a scan with no
     // iterations. The known body's outputs are the known next-carries, then the known per-iteration outputs, then the
     // residuals that it stacks. Absolute positions into this list equal positions into the known scan's outputs,
-    // because the known scan's outputs are its final carries followed by its stacked per-iteration outputs in the same
-    // order.
+    // because the known scan's outputs are its final carries followed by its stacked per-iteration outputs in
+    // the same order.
     let mut known_program_output_indices = Vec::with_capacity(known_program.output_ids().len());
     let mut scan_outputs = partition_outputs.to_vec();
     for (index, output) in partition_outputs.iter().enumerate() {
@@ -3828,6 +3824,7 @@ fn reconstruct_partitioned_scan_erased<
     }
     let known_result_count = known_program_output_indices.len();
     let known_carry_count = carry_known.iter().filter(|&&known| known).count();
+
     // A residual whose feeder the known scan already stacks as one of its per-iteration outputs is read from that
     // output instead of being stacked a second time (the partition may expose one atom through a result output and
     // a residual edge). Its final carries are no such source: a residual needs the per-iteration values of a feeder,
@@ -3858,6 +3855,7 @@ fn reconstruct_partitioned_scan_erased<
         }
         Ok(false)
     };
+
     let mut residuals = Vec::new();
     let mut invariant_sources = Vec::new();
     for (edge, (output_type, output)) in residual_edges.iter().enumerate() {
@@ -3866,6 +3864,7 @@ fn reconstruct_partitioned_scan_erased<
             residuals.push(ScanResidual::Index);
             continue;
         }
+
         let invariant_source = passed_through_carries
             .iter()
             .position(|&input| input == Some(feeder))
@@ -3882,6 +3881,7 @@ fn reconstruct_partitioned_scan_erased<
             residuals.push(ScanResidual::Invariant(position));
             continue;
         }
+
         // Known reference inputs were rejected before the split, so a known stacked input is an array whose slices
         // already are their storage representation. Its original stack is forwarded instead of rebuilt.
         let stacked_input = known_program
@@ -3906,13 +3906,15 @@ fn reconstruct_partitioned_scan_erased<
         };
         residuals.push(ScanResidual::Value { r#type: output_type.clone(), stack });
     }
+
     let known_program_output_types = known_program.output_types();
     for (index, &known) in carry_known.iter().enumerate() {
         if !known && let PartialEvaluationOutput::Known(output) = &partition_outputs[index] {
             let output_type = &known_program_output_types[*output];
-            // This edge supplies a carry result, even though the original residual body never reads it. Like any other
-            // residual, it is recovered from an unknown input that carries its identity (e.g., the unknown carry
-            // itself, whose type the known next value shares) instead of being stacked.
+
+            // This edge supplies a carry result, even though the original residual body never reads it. Like any
+            // other residual, it is recovered from an unknown input that carries its identity (e.g., the unknown
+            // carry itself, whose type the known next value shares) instead of being stacked.
             live_edges.insert(residuals.len());
             let stack = (!recovered_from_unknown_input(output_type)?).then(|| {
                 ScanStackSource::KnownOutput(
@@ -3957,6 +3959,7 @@ fn reconstruct_partitioned_scan_erased<
         .map(|&index| body_inputs[index - 1].clone())
         .collect::<Vec<_>>();
     known_scan_inputs.extend_from_slice(iteration_count_inputs);
+
     // Project the known iteration body to its retained results and effects, then convert metadata residuals to array
     // storage. Ordinary arrays already have that representation and need no second replay.
     let known_body = {
@@ -3972,6 +3975,7 @@ fn reconstruct_partitioned_scan_erased<
                 conversions.push((position, operation));
             }
         }
+
         // Arrays already have their storage representation. Keep the projected body directly unless a metadata value
         // actually needs a storage gateway, avoiding a second replay for ordinary array scans.
         if conversions.is_empty() {
@@ -3991,8 +3995,9 @@ fn reconstruct_partitioned_scan_erased<
             )?
         }
     };
-    // The known scan stacks the known stacked outputs at their placements, followed by the residual stacks, which
-    // are replicated.
+
+    // The known scan stacks the known stacked outputs at their placements, followed by the residual stacks,
+    // which are replicated.
     let known_stacked_axis_shardings = partition_outputs
         .iter()
         .enumerate()
@@ -4009,6 +4014,7 @@ fn reconstruct_partitioned_scan_erased<
         carry_count: known_carry_count,
         ..scan.clone().with_stacked_axis_shardings(known_stacked_axis_shardings)
     };
+
     // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original stacked
     // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep scans
     // with a dynamic iteration count explicit because their outputs may refine the stacked inputs' symbolic extent
@@ -4037,8 +4043,8 @@ fn reconstruct_partitioned_scan_erased<
         None => bind_known_fn(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
     };
 
-    // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge per
-    // residual edge, each fed by the known scan's matching stacked output or by a forwarded known stacked input.
+    // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge
+    // per residual edge, each fed by the known scan's matching stacked output or by a forwarded known stacked input.
     let mut residual_outputs = Vec::new();
     let needs_unknown_scan =
         partition_outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
@@ -4058,8 +4064,8 @@ fn reconstruct_partitioned_scan_erased<
                 .filter_map(|(index, atom)| atom.map(|atom| (atom, body_inputs[index].clone())))
                 .collect::<HashMap<_, _>>();
 
-            // Unlike filtering a program, this dependency query does not retain unrelated effects from the iteration
-            // body.
+            // Unlike filtering a program, this dependency query does not retain unrelated effects
+            // from the iteration body.
             let feeders = invariant_sources
                 .iter()
                 .filter_map(|source| match source {
@@ -4083,6 +4089,7 @@ fn reconstruct_partitioned_scan_erased<
             }
             values
         };
+
         let invariant_values = invariant_sources
             .iter()
             .map(|source| match source {
@@ -4099,6 +4106,7 @@ fn reconstruct_partitioned_scan_erased<
                 })
             })
             .collect::<Vec<_>>();
+
         // Build the unknown body in boundary order: index, nonconstant invariants, unknown original inputs, then
         // residual slices. Constant invariants are embedded; other invariants pass through as additional carries.
         let (unknown_body, unknown_carry_count) = {
@@ -4128,6 +4136,7 @@ fn reconstruct_partitioned_scan_erased<
                     _ => Some(builder.add_input(input_type.clone())),
                 })
                 .collect::<Vec<_>>();
+
             // Every input precedes the restored residuals, so that the identities that the inputs establish are known
             // before any residual is restored.
             let mut edge_atoms = residuals
@@ -4147,7 +4156,9 @@ fn reconstruct_partitioned_scan_erased<
                     *atom = Some(builder.add_constant(constant.clone()));
                 }
             }
+
             let invariant_atoms = invariant_atoms.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+
             // Restore live metadata after all inputs establish their identities. Reuse an input carrier or an earlier
             // restoration before reading the stored residual, so each nominal identity has one SSA definition.
             let carriers = builder
@@ -4165,12 +4176,15 @@ fn reconstruct_partitioned_scan_erased<
                     }
                     ScanResidual::Value { r#type, .. } => r#type,
                 };
+
                 let Some(operation) = O::residual_from_storage(edge_type)? else {
                     continue;
                 };
+
                 if !live_edges.contains(&edge) {
                     continue;
                 }
+
                 let defines_identity =
                     edge_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
                 if defines_identity
@@ -4180,6 +4194,7 @@ fn reconstruct_partitioned_scan_erased<
                     *atom = Some(*restored);
                     continue;
                 }
+
                 let mut restored = None;
                 for (carrier, carrier_type) in &carriers {
                     if carrier_type == edge_type {
@@ -4191,11 +4206,14 @@ fn reconstruct_partitioned_scan_erased<
                     }
                     break;
                 }
+
                 let restored = match restored {
                     Some(restored) => restored,
                     None => builder.add_instruction(operation, Vec::new(), vec![atom.unwrap()], None)?[0],
                 };
+
                 *atom = Some(restored);
+
                 if defines_identity {
                     restored_identity_edges.push((edge_type.clone(), restored));
                 }
@@ -4233,6 +4251,7 @@ fn reconstruct_partitioned_scan_erased<
                 scan_outputs[index] = PartialEvaluationOutput::Unknown(unknown_output_atoms.len());
                 unknown_output_atoms.push(atom);
             }
+
             let unknown_carry_count =
                 invariant_carry_atoms.len() + body_known[1..1 + carry_count].iter().filter(|&&known| !known).count();
             let input_count = builder.input_ids().len();
@@ -4242,8 +4261,10 @@ fn reconstruct_partitioned_scan_erased<
                 vec![Placeholder; input_count],
                 vec![Placeholder; output_count],
             )?;
+
             (unknown_body, unknown_carry_count)
         };
+
         // The unknown scan stacks the unknown stacked outputs at their placements.
         let unknown_stacked_axis_shardings = partition_outputs
             .iter()
@@ -4273,6 +4294,7 @@ fn reconstruct_partitioned_scan_erased<
                 .filter(|(index, _)| !body_known[index + 1])
                 .map(|(_, input)| input.clone()),
         );
+
         for residual in &residuals {
             match residual {
                 ScanResidual::Value { stack: Some(ScanStackSource::Input(input)), .. } => {
