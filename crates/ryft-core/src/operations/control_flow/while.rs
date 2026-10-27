@@ -3415,7 +3415,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
 
@@ -3432,13 +3432,13 @@ mod tests {
     use crate::captures::ClosedProgram;
     use crate::contexts::{Domain, EagerContext, StagingContext, ValueResolution};
     use crate::differentiation::{
-        Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
+        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::interpretation::EagerInterpretationDriver;
     use crate::macros::{check_gradient, check_operation_batching};
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
-    use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
+    use crate::operations::comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection};
     use crate::operations::composites::CompositeTransposeOperation;
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
@@ -3451,7 +3451,7 @@ mod tests {
         CountingBatchingDriver, DischargeCapture, DischargeCaptureOperation, TestIrOperation, TestIrValue,
         TestRegionLiveness, array, dimension,
     };
-    use crate::operations::debugging::PrintOperation;
+    use crate::operations::debugging::{PRINT_OPERATION_NAME, PrintOperation};
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::logical::{AndOperation, OrOperation};
     use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
@@ -3487,6 +3487,9 @@ mod tests {
     /// Staging homogeneous array context.
     type TestTracingContext = TracingContext<Array, TestOperation>;
 
+    /// Staged homogeneous array value of [`TestTracingContext`].
+    type TestStagedTracer = Tracer<TestTracingContext>;
+
     /// Linearization tracer over [`TestEagerContext`].
     type TestTracer = LinearizationTracer<TestEagerContext>;
 
@@ -3502,133 +3505,36 @@ mod tests {
     /// Staged array IR value of [`TestIrTracingContext`].
     type TestIrStagedTracer = Tracer<TestIrTracingContext>;
 
-    /// Eager interpreting domain over [`Array`] values that reports no support for primal concretization. Hybrid
-    /// rules (in particular the while JVP rule) therefore take their staged, non-concretizing paths while every
-    /// primal bind still computes concrete values, which lets the tests interpret linear while bodies numerically
-    /// without abstract tracers.
-    #[derive(Copy, Clone, Debug)]
-    struct StagedDispatchTestDomain;
-
-    impl Domain for StagedDispatchTestDomain {
-        type Type = ArrayType;
-        type Value = Array;
-        type Constant = Array;
-        type Operation = TestOperation;
-    }
-
-    impl NamedAxes for StagedDispatchTestDomain {
-        fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
-            None
-        }
-
-        fn named_axes(&self) -> Vec<(String, NamedAxis)> {
-            Vec::new()
-        }
-    }
-
-    impl Context for StagedDispatchTestDomain {
-        fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
-            Ok(constant)
-        }
-
-        fn bind<'r, P: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
-            &self,
-            operation: P,
-            regions: R,
-            inputs: &[Self::Value],
-        ) -> Result<Vec<Self::Value>, ProgramError>
-        where
-            Self::Constant: 'r,
-            Self::Operation: 'r,
-        {
-            // Region-carrying binds route through the eager context's own bind, which grants application-scoped region
-            // access.
-            EagerContext::<Array, Self::Operation>::new().bind(operation, regions, inputs)
-        }
-
-        fn is_eager(&self) -> bool {
-            false
-        }
-
-        // This test domain executes values directly and records no instructions, so provenance is a no-op.
-        fn provenance(&self) -> Provenance {
-            Provenance::unknown()
-        }
-
-        fn resolve(&self, value: &Array) -> ValueResolution<Array> {
-            ValueResolution::Constant(value.clone())
-        }
-
-        fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
-            function()
-        }
-
-        fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
-            function()
-        }
-    }
-
-    // Eager-domain context capabilities, delegating to the zero-state `EagerContext` exactly like
-    // `TestEagerContext`'s.
-    impl Zero<Array> for StagedDispatchTestDomain {
-        fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-            Zero::zero(&EagerContext::<Array>::new(), r#type)
-        }
-    }
-
-    impl One<Array> for StagedDispatchTestDomain {
-        fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-            One::one(&EagerContext::<Array>::new(), r#type)
-        }
-    }
-
-    impl<S: ArrayElement> Fill<S, Array> for StagedDispatchTestDomain {
-        fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
-            Fill::fill(&EagerContext::<Array>::new(), r#type, value)
-        }
-    }
-
-    impl Iota<Array> for StagedDispatchTestDomain {
-        fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
-            Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
-        }
-    }
-
-    impl Constant<Array, Array> for StagedDispatchTestDomain {
-        fn constant(&self, value: Array) -> Result<Array, ProgramError> {
-            Ok(value)
-        }
-    }
-
-    /// Eager test context that counts each interpreted [`PrintOperation`]. Clones share the counter so nested
-    /// transformation contexts and region replay contribute to one observation, and every operation is interpreted
-    /// through this context, so the regions of control-flow operations replay their prints through it as well.
+    /// Eager test context that records the name and inputs of every operation bound through it before executing the
+    /// operation in [`TestEagerContext`]. Clones share the record, so nested transformation contexts and region replay
+    /// contribute to one observation.
     #[derive(Clone, Debug)]
-    struct CountingPrintContext {
-        /// Number of print operations bound through this context.
-        print_count: Rc<Cell<usize>>,
+    struct BindRecordingContext {
+        /// Names and inputs of the operations bound through this context, in binding order.
+        binds: Rc<RefCell<Vec<(&'static str, Vec<Array>)>>>,
     }
 
-    impl CountingPrintContext {
-        /// Creates a context whose print count starts at zero.
+    impl BindRecordingContext {
+        /// Creates a context that has recorded no binds.
         fn new() -> Self {
-            Self { print_count: Rc::new(Cell::new(0)) }
+            Self { binds: Rc::new(RefCell::new(Vec::new())) }
         }
 
-        /// Returns the number of print operations bound so far.
-        fn print_count(&self) -> usize {
-            self.print_count.get()
+        /// Returns the inputs of each operation named `name` bound so far, in binding order.
+        fn inputs_of(&self, name: &str) -> Vec<Vec<Array>> {
+            let binds = self.binds.borrow();
+            binds.iter().filter(|(bound, _)| *bound == name).map(|(_, inputs)| inputs.clone()).collect()
         }
     }
 
-    impl Domain for CountingPrintContext {
+    impl Domain for BindRecordingContext {
         type Type = ArrayType;
         type Value = Array;
         type Constant = Array;
         type Operation = TestOperation;
     }
 
-    impl Context for CountingPrintContext {
+    impl Context for BindRecordingContext {
         fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
             Ok(constant)
         }
@@ -3644,12 +3550,8 @@ mod tests {
             Self::Operation: 'r,
         {
             let operation = operation.into();
-            if matches!(operation, ArrayOperation::Print(_)) {
-                self.print_count.set(self.print_count.get() + 1);
-            }
-            let regions = regions.into();
-            operation.validate_region_interfaces(&regions.region_interfaces())?;
-            operation.interpret(self, &EagerInterpretationDriver::new(&regions), inputs)
+            self.binds.borrow_mut().push((operation.name(), inputs.to_vec()));
+            TestEagerContext::new().bind(operation, regions, inputs)
         }
 
         fn is_eager(&self) -> bool {
@@ -3674,31 +3576,31 @@ mod tests {
         }
     }
 
-    impl Zero<Array> for CountingPrintContext {
+    impl Zero<Array> for BindRecordingContext {
         fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
             Zero::zero(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl One<Array> for CountingPrintContext {
+    impl One<Array> for BindRecordingContext {
         fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
             One::one(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl<S: ArrayElement> Fill<S, Array> for CountingPrintContext {
+    impl<S: ArrayElement> Fill<S, Array> for BindRecordingContext {
         fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
             Fill::fill(&EagerContext::<Array>::new(), r#type, value)
         }
     }
 
-    impl Iota<Array> for CountingPrintContext {
+    impl Iota<Array> for BindRecordingContext {
         fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
             Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
         }
     }
 
-    impl Constant<Array, Array> for CountingPrintContext {
+    impl Constant<Array, Array> for BindRecordingContext {
         fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }
@@ -3730,6 +3632,51 @@ mod tests {
         V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
     {
         inputs[0].domain().bind(TestOperation::While(operation), regions, inputs)
+    }
+
+    /// Traces the value and gradient of the final state of the `while` `operation` with its condition and body
+    /// `regions` through [`TestTracingContext`] at an initial state of type `state_type`. The staged primal makes reverse
+    /// mode take the staged (non-concretizing) paths of the `while` rules, and the returned program maps the initial
+    /// state to the value and the gradient.
+    fn trace_while_value_and_gradient(
+        operation: WhileOperation<ArrayType>,
+        regions: Vec<TestProgram>,
+        state_type: ArrayType,
+    ) -> Program<Array, TestOperation, Array, (Array, Array)> {
+        let function = move |state: TestStagedTracer| {
+            Ok(differentiate_at(state).value_and_gradient(move |state| {
+                bind_while(operation, regions.clone(), &[state]).map(|mut outputs| outputs.remove(0))
+            })?)
+        };
+        TestTracingContext::trace(function, state_type).unwrap().1
+    }
+
+    /// Traces reverse mode through the final state of the `while` `operation` with its condition and body `regions`
+    /// through [`TestTracingContext`] at a scalar `f64` initial state, so that it takes the staged (non-concretizing)
+    /// paths of the `while` rules. Returns the transposed pullback program, which maps the output cotangent followed by
+    /// the residuals to the input cotangent, together with the traced program, which maps the initial state to the
+    /// final state followed by those residuals.
+    #[allow(clippy::type_complexity)]
+    fn trace_while_vjp(
+        operation: WhileOperation<ArrayType>,
+        regions: Vec<TestProgram>,
+    ) -> (Arc<TestProgram>, Program<Array, TestOperation, Array, (Array, Vec<Array>)>) {
+        let mut pullback = None;
+        let (_, program) = TestTracingContext::trace(
+            |state: TestStagedTracer| {
+                let (output, staged_pullback) = state.context().clone().vjp(
+                    move |state, ()| Ok(bind_while(operation, regions.clone(), &[state])?.remove(0)),
+                    state,
+                    (),
+                )?;
+                let (staged_pullback, residuals) = staged_pullback.into_transposed_parts()?;
+                pullback = Some(staged_pullback.into_program());
+                Ok((output, residuals))
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        (pullback.unwrap(), program)
     }
 
     /// Stages `while_operation` over one batched item (mapped at axis 0 with `batch_size` batch items) under tracing
@@ -7212,7 +7159,26 @@ mod tests {
                 .program()
                 .to_string(),
             indoc! {"
-            PLACEHOLDER_A"},
+                lambda %0:f32[] .
+                let %1:f32[] = const 1.0
+                    %2:f32[] = const 3.0
+                    %3:f32[] = add %0 %1
+                    %4:bool[] = compare [direction=LessThan] %3 %2
+                    %5:f32[], %6:bool[] = while [iteration_bound=1] %3 %4 [
+                        condition={
+                            lambda %0:f32[], %1:bool[] .
+                            in (%1)
+                        },
+                        body={
+                            lambda %0:f32[], %1:bool[] .
+                            let %2:f32[] = const 1.0
+                                %3:f32[] = const 3.0
+                                %4:f32[] = add %0 %2
+                                %5:bool[] = compare [direction=LessThan] %4 %3
+                            in (%4, %5)
+                        },
+                    ]
+                in (%5, %5)"},
         );
     }
 
@@ -7302,12 +7268,66 @@ mod tests {
         assert_eq!(
             partially_discharge(&source(1)).program().to_string(),
             indoc! {"
-            PLACEHOLDER_B1"},
+                lambda %0:f32[], %1:f32[] .
+                let %2:ref<f32[]> = reference_new %1
+                    %3:f32[] = const 1.0
+                    %4:f32[] = const 3.0
+                    %5:f32[] = add %0 %3
+                    %6:bool[] = compare [direction=LessThan] %5 %4
+                    () = condition %6 %5 %2 [
+                        true={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = const 1.0
+                                () = reference_add_update %1 %2
+                            in ()
+                        },
+                        false={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            in ()
+                        },
+                    ]
+                    %7:f32[] = reference_freeze %2
+                in (%5, %7)"},
         );
         assert_eq!(
             partially_discharge(&source(2)).program().to_string(),
             indoc! {"
-            PLACEHOLDER_B2"},
+                lambda %0:f32[], %1:f32[] .
+                let %2:ref<f32[]> = reference_new %1
+                    %3:f32[] = const 1.0
+                    %4:f32[] = const 3.0
+                    %5:f32[] = add %0 %3
+                    %6:bool[] = compare [direction=LessThan] %5 %4
+                    %7:f32[], %8:ref<f32[]>, %9:bool[] = while [iteration_bound=1] %5 %2 %6 [
+                        condition={
+                            lambda %0:f32[], %1:ref<f32[]>, %2:bool[] .
+                            in (%2)
+                        },
+                        body={
+                            lambda %0:f32[], %1:ref<f32[]>, %2:bool[] .
+                            let %3:f32[] = const 1.0
+                                %4:f32[] = const 1.0
+                                %5:f32[] = const 3.0
+                                () = reference_add_update %1 %3
+                                %6:f32[] = add %0 %4
+                                %7:bool[] = compare [direction=LessThan] %6 %5
+                            in (%6, %1, %7)
+                        },
+                    ]
+                    () = condition %9 %7 %8 [
+                        true={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = const 1.0
+                                () = reference_add_update %1 %2
+                            in ()
+                        },
+                        false={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            in ()
+                        },
+                    ]
+                    %10:f32[] = reference_freeze %2
+                in (%7, %10)"},
         );
     }
 
@@ -8682,7 +8702,9 @@ mod tests {
         // a second time. One effects gate therefore skips both, and the loop residualizes unchanged with every output
         // unknown even though `k` is loop-invariant known: the loop carries `[counter, k]`, runs while `counter > 0`,
         // and its body prints `k` and returns `[counter - k * k, k]`, so a probe would print the known `k`, whereas
-        // partial evaluation prints nothing and the residual body still squares `k`.
+        // partial evaluation prints nothing and the residual body still squares `k`. Partial evaluation over a tracing
+        // known-side context makes that observable, because every print that a probe or the split binds on the known
+        // side stages an instruction into the known-side trace.
         let scalar = || ArrayType::scalar(DataType::F64);
         let condition = {
             let mut builder = ProgramBuilder::<Array, TestOperation>::new();
@@ -8716,38 +8738,41 @@ mod tests {
         };
         let program = while_program(WhileOperation::new(), &[condition, body], vec![scalar(); 2]);
 
-        let context = CountingPrintContext::new();
+        let context = TestTracingContext::new();
+        let k = context.lift(Array::scalar(1.0).unwrap()).unwrap();
         let evaluation = program
-            .partially_evaluate_in_context(
-                &context,
-                &[PartialValue::Unknown(scalar()), PartialValue::Known(Array::scalar(1.0).unwrap())],
-            )
+            .partially_evaluate_in_context(&context, &[PartialValue::Unknown(scalar()), PartialValue::Known(k)])
             .unwrap();
-        assert_eq!(context.print_count(), 0);
+        assert!(context.builder().borrow().instructions().is_empty());
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
+        let expected_program = indoc! {"
+            lambda %0:f64[], %1:f64[] .
+            let %2:f64[], %3:f64[] = while %0 %1 [
+                condition={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = zero_like %0
+                        %3:bool[] = compare [direction=GreaterThan] %0 %2
+                    in (%3)
+                },
+                body={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = print [label=k] %1
+                        %3:f64[] = mul %2 %2
+                        %4:f64[] = sub %0 %3
+                    in (%4, %1)
+                },
+            ]
+            in (%2, %3)"};
+        assert_eq!(evaluation.program().to_string(), expected_program);
+
+        // Eager partial evaluation residualizes the same loop, which interprets to the final state.
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(scalar()), PartialValue::Known(Array::scalar(1.0).unwrap())])
+            .unwrap();
+        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
+        assert_eq!(evaluation.program().to_string(), expected_program);
         assert_eq!(
-            evaluation.program().to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[], %3:f64[] = while %0 %1 [
-                    condition={
-                        lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = zero_like %0
-                            %3:bool[] = compare [direction=GreaterThan] %0 %2
-                        in (%3)
-                    },
-                    body={
-                        lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = print [label=k] %1
-                            %3:f64[] = mul %2 %2
-                            %4:f64[] = sub %0 %3
-                        in (%4, %1)
-                    },
-                ]
-                in (%2, %3)"},
-        );
-        assert_eq!(
-            evaluation.interpret(&context, &[Array::scalar(3.0).unwrap()]),
+            evaluation.interpret(&TestEagerContext::new(), &[Array::scalar(3.0).unwrap()]),
             Ok(vec![Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()]),
         );
         // The residual loop runs three iterations (the counter goes 3, 2, 1, 0), printing `k` once in each.
@@ -10171,7 +10196,7 @@ mod tests {
         // Eager forward mode runs the loop once over its duals instead of re-executing the primal, so the body's
         // `print` runs exactly once per iteration: from `x = 1`, `while (x < 8) { print(x); x = 2 * x }` prints three
         // times and computes `f(x) = 8 x`.
-        let context = CountingPrintContext::new();
+        let context = BindRecordingContext::new();
         let observed_context = context.clone();
         let (while_operation, while_regions) = effectful_doubling_while_operation();
         let (primal, tangent) = context
@@ -10188,7 +10213,7 @@ mod tests {
 
         assert_eq!(primal, Array::scalar(8.0).unwrap());
         assert_eq!(tangent, Array::scalar(8.0).unwrap());
-        assert_eq!(observed_context.print_count(), 3);
+        assert_eq!(observed_context.inputs_of(PRINT_OPERATION_NAME).len(), 3);
     }
 
     #[test]
@@ -10337,9 +10362,10 @@ mod tests {
 
     #[test]
     fn test_while_differentiation_eager_jvp_rejects_resuming_effectful_conditions() {
-        // The unbounded loop of the preceding tests with a condition that prints `i`. Its predicate stops concretizing on
-        // the second iteration as well, but resuming under the staged rule would evaluate the condition, and therefore its
-        // print, on the current state a second time, so the eager rule reports the concretization error instead.
+        // The unbounded loop of the preceding tests with a condition that prints `i`. Its predicate stops concretizing
+        // on the second iteration as well, but resuming under the staged rule would evaluate the condition, and
+        // therefore its print, on the current state a second time, so the eager rule reports the concretization error
+        // instead.
         let (operation, regions) = stepping_counter_while_operation(true);
         assert_eq!(
             batch(
@@ -10684,19 +10710,8 @@ mod tests {
         // their mask entries are false, so they must pass tangents through unchanged in the forward scan and cotangents
         // through unchanged in the transposed scan. Locally `f(x) = 8 x`: value 8, gradient 8.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (output, pullback) = StagedDispatchTestDomain
-            .vjp(
-                move |x, ()| {
-                    let mut outputs =
-                        x.context().bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])?;
-                    Ok(outputs.remove(0))
-                },
-                Array::scalar(1.0).unwrap(),
-                (),
-            )
-            .unwrap();
-        let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
+        let (pullback, program) = trace_while_vjp(while_operation, while_regions);
+        let (output, residuals) = program.interpret(Array::scalar(1.0).unwrap()).unwrap();
         assert_eq!(output, Array::scalar(8.0).unwrap());
 
         // The pullback contains the transposed (reversed) linear scan and no while loop, and every cotangent seed
@@ -10741,18 +10756,11 @@ mod tests {
 
         // `value_and_gradient` composes the same machinery end to end.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (value, gradient) = StagedDispatchTestDomain
-            .differentiate_at(Array::scalar(1.0).unwrap())
-            .value_and_gradient(move |x| {
-                let mut outputs = x
-                    .context()
-                    .bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                    .unwrap();
-                outputs.remove(0)
-            })
-            .unwrap();
-        assert_eq!(value, Array::scalar(8.0).unwrap());
-        assert_eq!(gradient, Array::scalar(8.0).unwrap());
+        let program = trace_while_value_and_gradient(while_operation, while_regions, ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            program.interpret(Array::scalar(1.0).unwrap()),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(8.0).unwrap())),
+        );
     }
 
     #[test]
@@ -10764,19 +10772,8 @@ mod tests {
         // slot beyond the last iteration, which the mask must keep inert in both directions. Locally `f(x) = x⁸`: value
         // 256 and gradient `8 x⁷ = 1024`.
         let (while_operation, while_regions) = squaring_while_operation(100.0, Some(4));
-        let (output, pullback) = StagedDispatchTestDomain
-            .vjp(
-                move |x, ()| {
-                    let mut outputs =
-                        x.context().bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])?;
-                    Ok(outputs.remove(0))
-                },
-                Array::scalar(2.0).unwrap(),
-                (),
-            )
-            .unwrap();
-        let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
+        let (pullback, program) = trace_while_vjp(while_operation, while_regions);
+        let (output, residuals) = program.interpret(Array::scalar(2.0).unwrap()).unwrap();
         assert_eq!(output, Array::scalar(256.0).unwrap());
         assert_eq!(
             pullback.to_string(),
@@ -10854,14 +10851,11 @@ mod tests {
                 step = 1e-4,
                 tolerance = 1e-6,
             );
-            let (value, gradient) = StagedDispatchTestDomain
-                .differentiate_at(Array::scalar(initial).unwrap())
-                .value_and_gradient(move |state| {
-                    state.context().bind(operation, regions.clone(), &[state.clone()]).unwrap().remove(0)
-                })
-                .unwrap();
-            assert_eq!(value, Array::scalar(expected_value).unwrap());
-            assert_eq!(gradient, Array::scalar(expected_gradient).unwrap());
+            let program = trace_while_value_and_gradient(operation, regions, ArrayType::scalar(DataType::F64));
+            assert_eq!(
+                program.interpret(Array::scalar(initial).unwrap()),
+                Ok((Array::scalar(expected_value).unwrap(), Array::scalar(expected_gradient).unwrap())),
+            );
         }
     }
 
@@ -10910,23 +10904,28 @@ mod tests {
             tolerance = 1e-3,
         );
 
-        let (value, gradient) = StagedDispatchTestDomain
-            .differentiate_at(Array::vector(vec![1.5, 2.0]).unwrap())
-            .value_and_gradient(move |x| {
-                let mut outputs = x
-                    .context()
-                    .bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                    .unwrap();
-                let state = outputs.remove(0);
-                let mut outputs = state
-                    .context()
-                    .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[state.clone()])
-                    .unwrap();
-                outputs.remove(0)
-            })
-            .unwrap();
-        assert_eq!(value, Array::scalar(21.0625).unwrap());
-        assert_eq!(gradient, Array::vector(vec![13.5, 32.0]).unwrap());
+        let (_, program) = TestTracingContext::trace(
+            move |x: TestStagedTracer| {
+                Ok(differentiate_at(x).value_and_gradient(move |x| {
+                    let mut outputs = x
+                        .context()
+                        .bind(TestOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .unwrap();
+                    let state = outputs.remove(0);
+                    let mut outputs = state
+                        .context()
+                        .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[state.clone()])
+                        .unwrap();
+                    outputs.remove(0)
+                })?)
+            },
+            vector_f64,
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret(Array::vector(vec![1.5, 2.0]).unwrap()),
+            Ok((Array::scalar(21.0625).unwrap(), Array::vector(vec![13.5, 32.0]).unwrap())),
+        );
     }
 
     #[test]
@@ -10951,14 +10950,10 @@ mod tests {
             Ok(vec![Array::scalar(1.0).unwrap()]),
         );
 
-        // The staged domain composes the same masked scan end to end, and finite differences confirm the identity.
-        let staged_regions = regions.clone();
+        // Staged reverse mode composes the same masked scan end to end, and finite differences confirm the identity.
+        let program = trace_while_value_and_gradient(operation, regions.clone(), ArrayType::scalar(DataType::F64));
         assert_eq!(
-            StagedDispatchTestDomain
-                .differentiate_at(Array::scalar(200.0).unwrap())
-                .value_and_gradient(move |x| {
-                    bind_while(operation, staged_regions.clone(), &[x]).unwrap().remove(0)
-                }),
+            program.interpret(Array::scalar(200.0).unwrap()),
             Ok((Array::scalar(200.0).unwrap(), Array::scalar(1.0).unwrap())),
         );
         check_gradient!(
@@ -10973,7 +10968,7 @@ mod tests {
     fn test_while_differentiation_truncates_bounded_loops_consistently_across_paths() {
         // A loop whose condition never turns false truncates at the bound by definition: with bound 3 the doubling
         // loop computes `f(x) = 8 x`, so at `x = 2` plain interpretation computes the value 16, and the eager-domain
-        // entry point and the staged domain (whose validity mask is true for every iteration) both compute the value
+        // entry point and staged reverse mode (whose validity mask is true for every iteration) both compute the value
         // 16 and the gradient 8.
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
         assert_eq!(
@@ -10992,15 +10987,11 @@ mod tests {
         assert_eq!(gradient, Array::scalar(8.0).unwrap());
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let (value, gradient) = StagedDispatchTestDomain
-            .differentiate_at(Array::scalar(2.0).unwrap())
-            .value_and_gradient(move |x| {
-                let mut outputs = x.context().bind(while_operation, while_regions.clone(), &[x.clone()]).unwrap();
-                outputs.remove(0)
-            })
-            .unwrap();
-        assert_eq!(value, Array::scalar(16.0).unwrap());
-        assert_eq!(gradient, Array::scalar(8.0).unwrap());
+        let program = trace_while_value_and_gradient(while_operation, while_regions, ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            program.interpret(Array::scalar(2.0).unwrap()),
+            Ok((Array::scalar(16.0).unwrap(), Array::scalar(8.0).unwrap())),
+        );
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
         check_gradient!(
             |x| bind_while(while_operation, while_regions.clone(), &[x]).map(|mut outputs| outputs.remove(0)),
@@ -11122,93 +11113,6 @@ mod tests {
         // the recorded states must be those on which interpretation evaluates the condition: with the bound 1 or 2,
         // never the state after the last admitted body application, and with the bound 10, every state up to the one
         // where both items have stopped.
-        #[derive(Clone, Debug)]
-        struct ComparisonRecordingContext {
-            /// Left inputs of the comparisons bound through this context, in binding order.
-            compared: Rc<RefCell<Vec<Array>>>,
-        }
-
-        impl Domain for ComparisonRecordingContext {
-            type Type = ArrayType;
-            type Value = Array;
-            type Constant = Array;
-            type Operation = TestOperation;
-        }
-
-        impl Context for ComparisonRecordingContext {
-            fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
-                Ok(constant)
-            }
-
-            fn bind<'r, P: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
-                &self,
-                operation: P,
-                regions: R,
-                inputs: &[Self::Value],
-            ) -> Result<Vec<Self::Value>, ProgramError>
-            where
-                Self::Constant: 'r,
-                Self::Operation: 'r,
-            {
-                let operation = operation.into();
-                if matches!(operation, ArrayOperation::Compare(_)) {
-                    self.compared.borrow_mut().push(inputs[0].clone());
-                }
-                EagerContext::<Array, Self::Operation>::new().bind(operation, regions, inputs)
-            }
-
-            fn is_eager(&self) -> bool {
-                true
-            }
-
-            // This test context executes eagerly and records no instructions, so provenance is a no-op.
-            fn provenance(&self) -> Provenance {
-                Provenance::unknown()
-            }
-
-            fn resolve(&self, value: &Array) -> ValueResolution<Array> {
-                ValueResolution::Constant(value.clone())
-            }
-
-            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
-                function()
-            }
-
-            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
-                function()
-            }
-        }
-
-        impl Zero<Array> for ComparisonRecordingContext {
-            fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-                Zero::zero(&EagerContext::<Array>::new(), r#type)
-            }
-        }
-
-        impl One<Array> for ComparisonRecordingContext {
-            fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-                One::one(&EagerContext::<Array>::new(), r#type)
-            }
-        }
-
-        impl<S: ArrayElement> Fill<S, Array> for ComparisonRecordingContext {
-            fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
-                Fill::fill(&EagerContext::<Array>::new(), r#type, value)
-            }
-        }
-
-        impl Iota<Array> for ComparisonRecordingContext {
-            fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
-                Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
-            }
-        }
-
-        impl Constant<Array, Array> for ComparisonRecordingContext {
-            fn constant(&self, value: Array) -> Result<Array, ProgramError> {
-                Ok(value)
-            }
-        }
-
         let state_type = ArrayType::new_static(DataType::F64, [2]);
         let mut condition_builder = ProgramBuilder::<Array, TestOperation>::new();
         let state = condition_builder.add_input(state_type.clone());
@@ -11250,7 +11154,7 @@ mod tests {
             let program = while_program(operation, &regions, vec![state_type.clone()]);
             let primal = Array::vector(primal).unwrap();
             assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![primal.clone()]));
-            let context = ComparisonRecordingContext { compared: Rc::new(RefCell::new(Vec::new())) };
+            let context = BindRecordingContext::new();
             let regions = regions.clone();
             assert_eq!(
                 context.jvp(
@@ -11261,7 +11165,11 @@ mod tests {
                 ),
                 Ok((primal, Array::vector(tangent).unwrap())),
             );
-            let mut compared = context.compared.borrow().clone();
+            let mut compared = context
+                .inputs_of(COMPARE_OPERATION_NAME)
+                .into_iter()
+                .map(|mut inputs| inputs.remove(0))
+                .collect::<Vec<_>>();
             compared.dedup();
             assert_eq!(
                 compared,
@@ -12610,16 +12518,22 @@ mod tests {
         // locally `f(x) = x⁴`: primal 16, tangent `4 x³ = 32`.
         let (while_operation, while_regions) = squaring_while_operation(16.0, None);
         let staged_regions = while_regions.clone();
-        let (output, tangent) = StagedDispatchTestDomain
-            .jvp(
-                move |x, ()| Ok(bind_while(while_operation, staged_regions.clone(), &[x])?.remove(0)),
-                Array::scalar(2.0).unwrap(),
-                Array::scalar(1.0).unwrap(),
-                (),
-            )
-            .unwrap();
-        assert_eq!(output, Array::scalar(16.0).unwrap());
-        assert_eq!(tangent, Array::scalar(32.0).unwrap());
+        let (_, program) = TestTracingContext::trace(
+            move |(x, tangent): (TestStagedTracer, TestStagedTracer)| {
+                Ok(x.context().clone().jvp(
+                    move |x, ()| Ok(bind_while(while_operation, staged_regions.clone(), &[x])?.remove(0)),
+                    x,
+                    tangent,
+                    (),
+                )?)
+            },
+            (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap())),
+            Ok((Array::scalar(16.0).unwrap(), Array::scalar(32.0).unwrap())),
+        );
 
         // The fused forward-mode program contains exactly one while loop over the doubled state `[primal, tangent]`,
         // with no unrolling and no residual stacks, and its number of iterations stays data-dependent: interpreting the
@@ -12809,17 +12723,25 @@ mod tests {
         // reads only it, so the split rebinds the primal loop on the known (primal) side while the tangent program
         // keeps the fused loop whole, recomputing primal state internally. For `while (x < 16) { x = x * x }` at
         // `x = 2`, the primal is 16 and the pushforward scales tangents by 32.
+        // One staged linearization pushes both tangents `1` and `2` forward.
         let (while_operation, while_regions) = squaring_while_operation(16.0, None);
-        let (output, pushforward) = StagedDispatchTestDomain
-            .linearize(
-                move |x, ()| Ok(bind_while(while_operation, while_regions.clone(), &[x])?.remove(0)),
-                Array::scalar(2.0).unwrap(),
-                (),
-            )
-            .unwrap();
-        assert_eq!(output, Array::scalar(16.0).unwrap());
-        assert_eq!(pushforward.apply(Array::scalar(1.0).unwrap()), Ok(Array::scalar(32.0).unwrap()));
-        assert_eq!(pushforward.apply(Array::scalar(2.0).unwrap()), Ok(Array::scalar(64.0).unwrap()));
+        let scalar = ArrayType::scalar(DataType::F64);
+        let (_, program) = TestTracingContext::trace(
+            move |(x, first, second): (TestStagedTracer, TestStagedTracer, TestStagedTracer)| {
+                let (output, pushforward) = x.context().clone().linearize(
+                    move |x, ()| Ok(bind_while(while_operation, while_regions.clone(), &[x])?.remove(0)),
+                    x,
+                    (),
+                )?;
+                Ok((output, pushforward.apply(first)?, pushforward.apply(second)?))
+            },
+            (scalar.clone(), scalar.clone(), scalar),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap())),
+            Ok((Array::scalar(16.0).unwrap(), Array::scalar(32.0).unwrap(), Array::scalar(64.0).unwrap())),
+        );
 
         // The staged linearization pins that structure: the primal program binds the primal loop alone and forwards
         // its initial state as the residual, and the tangent program keeps the fused loop whole.
@@ -13514,7 +13436,7 @@ mod tests {
 
     #[test]
     fn test_while_differentiation_composes_with_earlier_batching() {
-        // Forward mode through a batched bounded loop under the non-concretizing staged domain: batching stages one
+        // Forward mode through a batched bounded loop under the non-concretizing tracing context: batching stages one
         // bounded loop with the per-item predicate `x < 8` and the iteration bound 5, so the JVP rule takes the
         // bounded staged path over its masked normal form, storing residual stacks and staging a masked linear scan.
         // Batch items [1, 5, 9] double 3, 1, and 0 times, so the primal is [8, 10, 9] and the per-item tangent scale
@@ -13543,16 +13465,20 @@ mod tests {
             )?;
             Ok(mapped)
         }
-        let (primal, tangent) = StagedDispatchTestDomain
-            .jvp(
-                |input, ()| batched_bounded_while(input),
-                Array::vector(vec![1.0, 5.0, 9.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
-                (),
-            )
-            .unwrap();
-        assert_eq!(primal, Array::vector(vec![8.0, 10.0, 9.0]).unwrap());
-        assert_eq!(tangent, Array::vector(vec![8.0, 2.0, 1.0]).unwrap());
+        let vector_f64 = ArrayType::new_static(DataType::F64, [3]);
+        let input = Array::vector(vec![1.0, 5.0, 9.0]).unwrap();
+        let ones = Array::vector(vec![1.0, 1.0, 1.0]).unwrap();
+        let (_, program) = TestTracingContext::trace(
+            |(x, tangent): (TestStagedTracer, TestStagedTracer)| {
+                Ok(x.context().clone().jvp(|input, ()| batched_bounded_while(input), x, tangent, ())?)
+            },
+            (vector_f64.clone(), vector_f64.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((input.clone(), ones.clone())),
+            Ok((Array::vector(vec![8.0, 10.0, 9.0]).unwrap(), Array::vector(vec![8.0, 2.0, 1.0]).unwrap())),
+        );
 
         // The plain eager domain produces the same numbers.
         let (primal, tangent) = differentiate_at(Array::vector(vec![1.0, 5.0, 9.0]).unwrap())
@@ -13563,17 +13489,28 @@ mod tests {
 
         // Reverse mode composes through the masked linear scan: the pullback transposes the scan without any `while`
         // loop, and the per-item gradients match the tangent scales.
-        let (output, pullback) = StagedDispatchTestDomain
-            .vjp(|input, ()| batched_bounded_while(input), Array::vector(vec![1.0, 5.0, 9.0]).unwrap(), ())
-            .unwrap();
-        assert_eq!(output, Array::vector(vec![8.0, 10.0, 9.0]).unwrap());
+        let mut transposed = None;
+        let (_, program) = TestTracingContext::trace(
+            |(x, cotangent): (TestStagedTracer, TestStagedTracer)| {
+                let (output, pullback) = x.context().clone().vjp(|input, ()| batched_bounded_while(input), x, ())?;
+                transposed = Some(
+                    pullback
+                        .linear_program()
+                        .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])?
+                        .program()
+                        .to_string(),
+                );
+                Ok((output, pullback.apply_materialized(cotangent)?))
+            },
+            (vector_f64.clone(), vector_f64),
+        )
+        .unwrap();
         assert_eq!(
-            pullback
-                .linear_program()
-                .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
-                .unwrap()
-                .program()
-                .to_string(),
+            program.interpret((input.clone(), ones.clone())),
+            Ok((Array::vector(vec![8.0, 10.0, 9.0]).unwrap(), Array::vector(vec![8.0, 2.0, 1.0]).unwrap())),
+        );
+        assert_eq!(
+            transposed.unwrap(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[5], %2:f64[5, 3], %3:bool[5, 3] .
                 let %4:f64[3] = scan [carry_count=1, iteration_count=5, reverse=true] %0 %1 %2 %3 [
@@ -13598,10 +13535,6 @@ mod tests {
                     },
                 ]
                 in (%4)"},
-        );
-        assert_eq!(
-            pullback.apply_materialized(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
-            Ok(Array::vector(vec![8.0, 2.0, 1.0]).unwrap()),
         );
     }
 
@@ -13858,14 +13791,19 @@ mod tests {
         // Transposition is late-bound, so the error surfaces on the pullback's first application rather than from
         // `vjp` itself.
         let (while_operation, while_regions) = squaring_while_operation(16.0, None);
-        let (_, pullback) = StagedDispatchTestDomain
-            .vjp(
-                move |x, ()| Ok(bind_while(while_operation, while_regions.clone(), &[x])?.remove(0)),
-                Array::scalar(2.0).unwrap(),
-                (),
-            )
-            .unwrap();
-        assert_eq!(pullback.apply(Array::scalar(1.0).unwrap()), Err(while_transposition_error()));
+        let scalar = ArrayType::scalar(DataType::F64);
+        let traced = TestTracingContext::trace(
+            move |(x, cotangent): (TestStagedTracer, TestStagedTracer)| {
+                let (_, pullback) = x
+                    .context()
+                    .clone()
+                    .vjp(move |x, ()| Ok(bind_while(while_operation, while_regions.clone(), &[x])?.remove(0)), x, ())
+                    .unwrap();
+                pullback.apply(cotangent).map(|_| ())
+            },
+            (scalar.clone(), scalar),
+        );
+        assert_eq!(traced.map(|_| ()), Err(while_transposition_error()));
     }
 
     #[test]
