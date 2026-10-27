@@ -4326,18 +4326,17 @@ fn reconstruct_partitioned_scan_erased<
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
-
-    use std::cell::RefCell;
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        Array, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -4345,12 +4344,14 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext, ValueResolution};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
-        CotangentDestination, CotangentSeed, Differentiate, DifferentiationTracer, Linearization, LinearizationTracer,
-        ReverseModeDifferentiate, TransposedProgram, TransposedProgramCotangent, differentiate_at,
+        CotangentDestination, CotangentSeed, DifferentiationTracer, Linearization, LinearizationTracer,
+        TransposedProgram, TransposedProgramCotangent, differentiate_at,
     };
     use crate::interpretation::EagerInterpretationDriver;
     use crate::macros::{check_gradient, check_operation_batching};
-    use crate::operations::arithmetic::{Add, AddOperation, DivOperation, MulOperation, NegOperation};
+    use crate::operations::arithmetic::{
+        Add, AddOperation, DivOperation, MUL_OPERATION_NAME, MulOperation, NegOperation,
+    };
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::composites::CompositeTransposeOperation;
@@ -4366,11 +4367,12 @@ mod tests {
     use crate::operations::exponential::ExpOperation;
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
-    use crate::operations::manipulation::slicing::DynamicSliceOperation;
+    use crate::operations::manipulation::slicing::{DYNAMIC_SLICE_OPERATION_NAME, DynamicSliceOperation};
     use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWriteOperation,
+        REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceWriteOperation,
     };
     use crate::operations::sharding::shard_map::{ShardMap, ShardMapOperation};
     use crate::operations::trigonometric::SinOperation;
@@ -4436,8 +4438,6 @@ mod tests {
         C::Operation: DifferentiableOperation<C>
             + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>,
-        // The nested context rules are stated on each context's own operation projection so that only one
-        // `Operation<Type = ..>` equality elaborates for `C::Operation` (refer to `ReverseModeDifferentiate`).
         <TracingContext<C::Constant, C::Operation> as Domain>::Operation:
             DifferentiableOperation<TracingContext<C::Constant, C::Operation>>,
         <PartialEvaluationContext<TracingContext<C::Constant, C::Operation>> as Domain>::Operation:
@@ -4628,6 +4628,80 @@ mod tests {
                 vec![Placeholder; 3],
                 vec![Placeholder; 3],
             )
+            .unwrap()
+    }
+
+    /// Builds a scan over an external scalar `f32` reference carry that increments it by one per iteration and
+    /// stacks the value it observes after each increment. The program returns the final observed value and the stacked
+    /// history; discharge also publishes the reference's final state through its external binding.
+    fn incrementing_reference_scan_program(operation: ScanOperation<ArrayIrType>) -> TestIrProgram {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar(1.0f32).unwrap()));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![reference, value],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let outputs = builder.add_instruction(operation, vec![body], vec![reference], None).unwrap();
+        let final_reference = outputs[0];
+        let stacked_values = outputs[1];
+        let final_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference], None)
+            .unwrap()[0];
+        builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![final_value, stacked_values],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap()
+    }
+
+    /// Builds a zero-output body whose backward rule adds one to every element of a whole reference stack.
+    fn deferred_reference_stack_body() -> TestIrProgram {
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F64, [3])).into();
+        let mut backward_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = backward_builder.add_input(reference_type.clone());
+        let update = backward_builder.add_constant(array(Array::vector(vec![1.0f64; 3]).unwrap()));
+        backward_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let backward = backward_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let reference = body_builder.add_input(reference_type.clone());
+        let backward_region = body_builder.import_program(backward);
+        body_builder
+            .add_instruction(
+                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                vec![backward_region],
+                vec![reference],
+                None,
+            )
+            .unwrap();
+        body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
             .unwrap()
     }
 
@@ -4990,6 +5064,353 @@ mod tests {
         Ok((outputs, pushforward.program().clone()))
     }
 
+    /// Two devices whose different local values must be tracked by manual variation.
+    fn manual_mesh() -> LogicalMesh {
+        LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap()
+    }
+
+    #[test]
+    fn test_scan_type_iteration_count_type() {
+        // An array IR scan takes a dynamic iteration count from a trailing `dimension<length>` input, which a
+        // homogeneous array scan does not admit.
+        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
+        assert_eq!(
+            <ArrayIrType as ScanType>::iteration_count_type(&length),
+            Ok(ArrayIrType::Dimension(DimensionType::from(length.clone()))),
+        );
+        assert_eq!(
+            <ArrayType as ScanType>::iteration_count_type(&length),
+            Err(TypeError::invalid(format!(
+                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
+                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
+                 count",
+            ),)),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_validate_scan_body_members() {
+        // Homogeneous array bodies must be fully static, and their errors report body positions (i.e., counting the
+        // index input), while array IR bodies admit dynamic shapes.
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let static_type = ArrayType::new_static(DataType::F32, [2]);
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(extent)]));
+        let static_types = [static_type.clone()];
+        assert_eq!(ArrayType::validate_scan_body_members(&static_types, &static_types), Ok(()));
+        assert_eq!(
+            ArrayType::validate_scan_body_members(&[static_type.clone(), dynamic_type.clone()], &[]),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 2 must have a fully static type but axis 1 of `f32[2, extent]` \
+                 has size `extent`",
+            ),)),
+        );
+        assert_eq!(
+            ArrayType::validate_scan_body_members(&[], &[static_type, dynamic_type.clone()]),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body output 1 must have a fully static type but axis 1 of `f32[2, extent]` \
+                 has size `extent`",
+            ),)),
+        );
+        assert_eq!(
+            ArrayIrType::validate_scan_body_members(&[dynamic_type.clone().into()], &[dynamic_type.into()]),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_validate_scan_body_type_signature() {
+        // A declared body needs a scalar `i64` index and the same carry types on both of its boundaries, independently
+        // of the inputs that bind it, and a dynamic iteration count requires a family that admits an iteration count.
+        let index_type = ArrayType::scalar(DataType::I64);
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
+        let body_input_types = [index_type.clone(), scalar_type.clone(), scalar_type.clone()];
+        assert_eq!(
+            ArrayType::validate_scan_body_type_signature(
+                &body_input_types,
+                &[scalar_type.clone(), scalar_type.clone()],
+                1,
+                &Dimension::Static(3),
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            ArrayType::validate_scan_body_type_signature(
+                &body_input_types,
+                &[index_type.clone(), scalar_type.clone()],
+                1,
+                &Dimension::Static(3),
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f32[]] but got [i64[]]",
+            ))),
+        );
+        assert_eq!(
+            ArrayType::validate_scan_body_type_signature(
+                &body_input_types[1..],
+                std::slice::from_ref(&scalar_type),
+                0,
+                &length,
+            ),
+            Err(TypeError::invalid(format!(
+                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
+                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
+                 count",
+            ),)),
+        );
+        assert_eq!(
+            ArrayIrType::validate_scan_body_type_signature(
+                &[index_type.into(), scalar_type.clone().into()],
+                &[scalar_type.clone().into()],
+                1,
+                &length,
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            ArrayIrType::validate_scan_body_type_signature(
+                &[scalar_type.clone().into()],
+                &[scalar_type.into()],
+                0,
+                &length,
+            ),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"))),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_validate_scan_input_type_signature() {
+        // The inputs must refine the declared carries and supply stacks whose slices refine the declared slices,
+        // followed by an iteration count of the declared identity, or of one exact extent within its bounds, for a
+        // dynamic iteration count. How that iteration count relates to the stacked axes is not validated here.
+        let index_type = ArrayType::scalar(DataType::I64);
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let stacked_type = ArrayType::new_static(DataType::F32, [3]);
+        let body_input_types = [index_type.clone(), scalar_type.clone(), scalar_type.clone()];
+        let length = Dimension::Static(3);
+        assert_eq!(
+            ArrayType::validate_scan_input_type_signature(
+                &body_input_types,
+                1,
+                &length,
+                &[scalar_type.clone(), stacked_type.clone()],
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            ArrayType::validate_scan_input_type_signature(
+                &body_input_types,
+                1,
+                &length,
+                std::slice::from_ref(&scalar_type),
+            ),
+            Err(TypeError::invalid("expected 2 inputs but got 1")),
+        );
+        assert_eq!(
+            ArrayType::validate_scan_input_type_signature(
+                &body_input_types,
+                1,
+                &length,
+                &[ArrayType::scalar(DataType::F64), stacked_type.clone()],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `f64[]`, which does not refine its expected type `f32[]`",
+            ))),
+        );
+
+        let variable = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let length = Dimension::Dynamic(variable.clone());
+        let body_input_types = [ArrayIrType::from(index_type), scalar_type.into()];
+        let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
+        assert_eq!(
+            ArrayIrType::validate_scan_input_type_signature(
+                &body_input_types,
+                0,
+                &length,
+                &[stacked_type.clone().into(), DimensionType::from(variable).into()],
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            ArrayIrType::validate_scan_input_type_signature(
+                &body_input_types,
+                0,
+                &length,
+                &[stacked_type.clone().into(), four.into()],
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            ArrayIrType::validate_scan_input_type_signature(
+                &body_input_types,
+                0,
+                &length,
+                &[stacked_type.clone().into(), stacked_type.into()],
+            ),
+            Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_infer_scan_body_input_types() {
+        // The body inputs are the intrinsic `i64` index, then the carries, then one slice per stacked array. A stacked
+        // reference enters whole instead, as a root whose leading axis is the scan axis.
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let stacked_reference =
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
+        let length = Dimension::Static(3);
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(
+                &[scalar_type.clone(), ArrayType::new_static(DataType::F32, [3, 2]).into()],
+                3,
+                1,
+                &length,
+            ),
+            Ok(vec![index_type.clone(), scalar_type, ArrayType::new_static(DataType::F32, [2]).into()]),
+        );
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(std::slice::from_ref(&stacked_reference), 2, 0, &length),
+            Ok(vec![index_type.clone(), stacked_reference.clone()]),
+        );
+
+        // The stacked referent must be a stack over the iteration count, and a first-class dimension is neither an
+        // array nor a reference.
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(
+                &[ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4, 2])))],
+                2,
+                0,
+                &length,
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 0 must have leading dimension `3` but has type `ref<f32[4, 2]>`",
+            ))),
+        );
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(
+                &[ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))],
+                2,
+                0,
+                &length,
+            ),
+            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` stacked input 0 must have rank at least 1"))),
+        );
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(&[DimensionType::from(extent).into()], 2, 0, &length),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 0 must be an array or a reference but got `dimension<extent ∈ \
+                 [1, 8)>`",
+            ),)),
+        );
+
+        // An iteration count input that pins one exact extent applies the same refinement rule to stacked references as
+        // to stacked arrays.
+        let dynamic_length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
+        let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(
+                &[stacked_reference.clone(), three.into()],
+                2,
+                0,
+                &Dimension::Dynamic(dynamic_length.clone()),
+            ),
+            Ok(vec![index_type, stacked_reference]),
+        );
+        let symbolic_reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(dynamic_length.clone()), Dimension::Static(2)]),
+        )));
+        let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(
+                &[symbolic_reference, four.into()],
+                2,
+                0,
+                &Dimension::Dynamic(dynamic_length),
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `dimension<4>` but stacked input 0 has type \
+                 `ref<f32[length, 2]>` whose leading dimension is not refined to extent 4",
+            ),)),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_infer_scan_output_types() {
+        // The outputs are the carries followed by the stacked body outputs along a leading axis of the iteration count,
+        // placed as declared and refined by the facts that the inputs establish, including the iteration count that an
+        // exact iteration count fixes.
+        let index_type = ArrayType::scalar(DataType::I64);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let slice_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        assert_eq!(
+            ArrayType::infer_scan_output_types(
+                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
+                &[scalar_type.clone(), slice_type],
+                1,
+                &Dimension::Static(3),
+                &[ShardingDimension::sharded(["x"])],
+                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [3])],
+            ),
+            Ok(vec![
+                scalar_type.clone(),
+                ArrayType::new_static(DataType::F64, [3])
+                    .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+                    .unwrap(),
+            ]),
+        );
+        assert_eq!(
+            ArrayType::infer_scan_output_types(
+                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
+                &[scalar_type.clone(), scalar_type.clone()],
+                1,
+                &Dimension::Static(3),
+                &[],
+                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [4])],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 1 must have leading dimension `3` but has type `f64[4]`",
+            ))),
+        );
+        // Excess placements are invalid even when they request implicit replication.
+        assert_eq!(
+            ArrayType::infer_scan_output_types(
+                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
+                &[scalar_type.clone(), scalar_type.clone()],
+                1,
+                &Dimension::Static(3),
+                &[ShardingDimension::Replicated, ShardingDimension::Replicated],
+                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [3])],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` places 2 stacked axes but its body has 1 stacked outputs",
+            ))),
+        );
+
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![rows.into()])));
+        let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
+        assert_eq!(
+            ArrayIrType::infer_scan_output_types(
+                &[index_type.into(), vector_type.clone()],
+                &[vector_type.clone(), vector_type],
+                1,
+                &Dimension::Dynamic(length),
+                &[],
+                &[ArrayType::new_static(DataType::F64, [2]).into(), three.into()],
+            ),
+            Ok(vec![
+                ArrayType::new_static(DataType::F64, [2]).into(),
+                ArrayType::new_static(DataType::F64, [3, 2]).into(),
+            ]),
+        );
+    }
+
     #[test]
     fn test_scan_interpretation_domain_read_iteration() {
         // Reading an iteration selects the slice at that index along the leading axis and drops that axis.
@@ -5036,6 +5457,11 @@ mod tests {
 
         // `Display` renders every semantic field and the unroll factor only when it is greater than 1.
         assert_eq!(operation.to_string(), "scan [carry_count=1, iteration_count=3, reverse=false]");
+        assert_eq!(
+            format!("{operation:?}"),
+            "ScanOperation { carry_count: 1, iteration_count: Static(3), reverse: false, unroll: 1, \
+             stacked_axis_shardings: [], marker: PhantomData<fn() -> ryft_core::arrays::types::arrays::ArrayType> }",
+        );
         assert_eq!(
             TestScanOperation::new(2, 4).with_reverse(true).with_unroll(2).unwrap().to_string(),
             "scan [carry_count=2, iteration_count=4, reverse=true, unroll=2]",
@@ -5118,7 +5544,14 @@ mod tests {
                 "`{SCAN_OPERATION_NAME}` unroll factor must be at least 1",
             )))),
         );
-        assert_eq!(TestScanOperation::new(1, 4).with_unroll(1).map(|operation| operation.unroll()), Ok(1));
+        assert_eq!(
+            TestScanOperation::new(1, 4)
+                .with_unroll(2)
+                .unwrap()
+                .with_unroll(1)
+                .map(|operation| operation.unroll()),
+            Ok(1),
+        );
         assert_eq!(TestScanOperation::new(1, 4).with_unroll(2).map(|operation| operation.unroll()), Ok(2));
         assert_eq!(TestScanOperation::new(1, 4).with_unroll(3).map(|operation| operation.unroll()), Ok(3));
         assert_eq!(TestScanOperation::new(1, 4).with_unroll(5).map(|operation| operation.unroll()), Ok(5));
@@ -5146,15 +5579,14 @@ mod tests {
         // Declared stacked-axis placements render (without trailing replicated entries, so that alike placements
         // compare alike), and each stacked output gains its placement through `ArrayType::batched`, which records the
         // variation that a placement over manual mesh axes introduces. Unsharded slices stack without placement, and
-        // a placement over a mesh axis that the slice's sharding does not know is rejected, as is a list with more
-        // placements than stacked outputs.
+        // a placement over a mesh axis that the slice's sharding does not know is rejected.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let operation = TestScanOperation::new(0, 2)
             .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
         assert_eq!(operation.stacked_axis_shardings(), &[ShardingDimension::sharded(["m"])]);
         assert_eq!(
             operation.to_string(),
-            "scan [carry_count=0, iteration_count=2, reverse=false, stacked_axis_shardings=[{'m'}]]"
+            "scan [carry_count=0, iteration_count=2, reverse=false, stacked_axis_shardings=[{'m'}]]",
         );
         assert_ne!(operation, TestScanOperation::new(0, 2));
         assert_eq!(
@@ -5722,17 +6154,34 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![replacement], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let (output_type, _) = TestIrTracingContext::trace(
+        let (output_type, program) = TestIrTracingContext::trace(
             |input: TestIrStagedTracer| {
                 let context = input.context().clone();
                 Ok(context
                     .bind(ScanOperation::<ArrayIrType>::new(1, 3), vec![body.clone()], std::slice::from_ref(&input))?
                     .remove(0))
             },
-            ArrayIrType::Array(sharded_type),
+            ArrayIrType::Array(sharded_type.clone()),
         )
         .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(carry_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:auto]>, []}] .
+                let %1:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[] .
+                        let %2:f32[] = const 1.0
+                        in (%2)
+                    },
+                ]
+                in (%1)"},
+        );
+        assert_eq!(
+            program.interpret(array(Array::from_elements::<f32>(sharded_type, &[7.0]).unwrap())),
+            Ok(array(Array::scalar(1f32).unwrap())),
+        );
     }
 
     #[test]
@@ -5930,8 +6379,8 @@ mod tests {
             trace(ScanOperation::new(1, 3), vec![other_type.clone(), stacked_type(Dimension::Static(3))]),
             Ok(indoc! {"
                 lambda %0:dimension<other ∈ [1, 8)>, %1:f32[3, other] .
-                let %2:dimension<other ∈ [1, 8)>, %3:f32[3, other] = scan [carry_count=1, iteration_count=3, reverse=false] \
-                 %0 %1 [
+                let %2:dimension<other ∈ [1, 8)>, %3:f32[3, other] = scan [carry_count=1, iteration_count=3, \
+                reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:dimension<other ∈ [1, 8)>, %2:f32[other] .
                         in (%1, %2)
@@ -5947,8 +6396,8 @@ mod tests {
             ),
             Ok(indoc! {"
                 lambda %0:dimension<other ∈ [1, 8)>, %1:f32[length, other], %2:dimension<length ∈ [1, 5)> .
-                let %3:dimension<other ∈ [1, 8)>, %4:f32[length, other] = scan [carry_count=1, iteration_count=length, \
-                 reverse=false] %0 %1 %2 [
+                let %3:dimension<other ∈ [1, 8)>, %4:f32[length, other] = scan [carry_count=1, \
+                iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<other ∈ [1, 8)>, %2:f32[other] .
                         in (%1, %2)
@@ -6272,8 +6721,8 @@ mod tests {
 
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
 
-        // The per-iteration view is an in-bounds static slice of the referent, so a dynamically shaped referent is
-        // rejected even though a stacked array of the same shape would be admitted.
+        // A stacked reference must have a fully static referent, even though a stacked array may have symbolic
+        // slice dimensions.
         let dynamic_reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(extent.clone())]),
@@ -6352,133 +6801,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_region_data_flow_input_sources() {
-        // A scan declares custom region data flow, because its carried body inputs are fed by its body outputs too.
-        let operation = TestScanOperation::new(2, 3);
-        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Custom(_)));
-        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
-        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
-        assert_eq!(operation.input_sources(0, 0, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
-        assert_eq!(
-            operation.input_sources(0, 2, boundary),
-            Ok(RegionDataFlowSources::Known(vec![
-                RegionDataFlowSource::InstructionInput(1),
-                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index: 1 }),
-            ])),
-        );
-        assert_eq!(
-            operation.input_sources(0, 3, boundary),
-            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
-        );
-
-        // A statically empty scan never feeds a body output back, so a carried body input has only its initial value.
-        assert_eq!(
-            TestScanOperation::new(2, 0).input_sources(0, 2, boundary),
-            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(1)])),
-        );
-        assert_eq!(
-            operation.region_data_flow().input_sources(&operation, 1, 0, boundary),
-            Err(ProgramError::MalformedProgram(format!(
-                "operation `{SCAN_OPERATION_NAME}` declares region 1 but has 1 attached regions",
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_scan_region_data_flow_output_sources() {
-        let operation = TestScanOperation::new(2, 3);
-        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
-        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
-        assert_eq!(
-            operation.output_sources(1, boundary),
-            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionInput {
-                region_index: 0,
-                input_index: 2,
-            }])),
-        );
-        assert_eq!(
-            operation.output_sources(2, boundary),
-            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionOutput(OutputRegionProvenance {
-                region_index: 0,
-                output_index: 2,
-            })])),
-        );
-        assert_eq!(
-            operation.region_data_flow().output_sources(&operation, 3, boundary),
-            Err(ProgramError::MalformedProgram(format!(
-                "operation `{SCAN_OPERATION_NAME}` declares output 3 with 3 outputs",
-            ))),
-        );
-        let empty = TestScanOperation::new(2, 0);
-        assert_eq!(
-            empty.output_sources(1, boundary),
-            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(1)])),
-        );
-        assert_eq!(empty.output_sources(2, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
-
-        // A dynamic iteration count can be zero, so its carried outputs retain the initial input source through
-        // feedback.
-        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dynamic = ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length));
-        let dynamic_boundary = RegionDataFlowBoundary { input_count: 4, ..boundary };
-        assert_eq!(dynamic.output_sources(1, dynamic_boundary), operation.output_sources(1, boundary));
-    }
-
-    #[test]
-    fn test_scan_region_data_flow_execution_demands() {
-        // The body's stacked result uses its first carry, which in turn uses its second carry, so demanding the stacked
-        // output extends the demanded outputs over both carries, one fixed-point pass at a time.
-        let operation = TestScanOperation::new(2, 3);
-        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
-        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
-        let mut liveness =
-            TestRegionLiveness::new(|used_outputs| vec![false, used_outputs[2], used_outputs[0], used_outputs[2]]);
-        assert_eq!(
-            operation.execution_demands(&[false, false, true], boundary, &mut liveness),
-            Ok(vec![Some(vec![true, true, true])]),
-        );
-        assert_eq!(
-            liveness.queries().to_vec(),
-            vec![vec![false, false, true], vec![true, false, true], vec![true, true, true]],
-        );
-
-        // A scan with no iterations never executes its body, so it demands nothing from it and queries nothing.
-        let mut liveness =
-            TestRegionLiveness::new(|used_outputs| vec![false, used_outputs[2], used_outputs[0], used_outputs[2]]);
-        assert_eq!(
-            TestScanOperation::new(2, 0).execution_demands(&[true, true, true], boundary, &mut liveness),
-            Ok(vec![None]),
-        );
-        assert_eq!(liveness.queries().to_vec(), Vec::<Vec<bool>>::new());
-        assert_eq!(
-            operation.region_data_flow().execution_demands(&operation, &[true], boundary, &mut liveness),
-            Err(ProgramError::MalformedProgram(format!(
-                "operation `{SCAN_OPERATION_NAME}` receives used outputs for 1 positions but has 3 outputs",
-            ),)),
-        );
-        let malformed = RegionDataFlowBoundary { input_count: 2, ..boundary };
-        assert_eq!(
-            operation.execution_demands(&[true, true, true], malformed, &mut liveness),
-            Err(ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` region data flow requires an index followed by 2 carries and stacked inputs, \
-                 matching body outputs and instruction inputs",
-            ),)),
-        );
-
-        // A body with no outputs whose retained effect consumes its stacked input still executes for a positive
-        // iteration count. `Some(empty)` keeps that retained body work, whereas `None` skips the body altogether.
-        let mut liveness = TestRegionLiveness::new(|_| vec![false, true]);
-        let regions = [RegionDataFlowRegionBoundary { input_count: 2, output_count: 0 }];
-        let boundary = RegionDataFlowBoundary { input_count: 1, output_count: 0, regions: &regions };
-        assert_eq!(
-            TestScanOperation::new(0, 3).execution_demands(&[], boundary, &mut liveness),
-            Ok(vec![Some(Vec::new())]),
-        );
-        assert_eq!(TestScanOperation::new(0, 0).execution_demands(&[], boundary, &mut liveness), Ok(vec![None]));
-        assert_eq!(liveness.queries().to_vec(), vec![Vec::<bool>::new()]);
-    }
-
-    #[test]
     fn test_scan_boundary_pruning() {
         // The body maps `[sum, square, unused, factor, angle]` to
         // `[sum + square, square * square, unused * unused, sum * factor, sin(angle)]`. Using only the final `sum` and
@@ -6510,7 +6832,8 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3] .
-                let %5:f64[], %6:f64[], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true, unroll=2] %0 %1 %3 [
+                let %5:f64[], %6:f64[], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true, unroll=2] \
+                %0 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = add %1 %2
@@ -6535,6 +6858,24 @@ mod tests {
         let expected = vec![Array::scalar(1.8125f64).unwrap(), Array::vector(vec![1.75f64, 3.0, 3.0]).unwrap()];
         assert_eq!(pruned.interpret(inputs.clone()), Ok(expected.clone()));
         assert_eq!(program.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_scan_boundary_pruning_preserves_stacked_axis_shardings() {
+        // Removing the first stacked output shifts the second output's sharding into its new position; the implicit
+        // replicated third output remains replicated, and the operation drops that trailing default from its payload.
+        let operation = TestScanOperation::new(0, 3)
+            .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]);
+        let mut liveness = TestRegionLiveness::new(|_| vec![false]);
+        assert_eq!(
+            operation.prune_boundary(&[], &[false, true, true], &mut liveness),
+            Ok(Some(OperationBoundaryPruning {
+                operation: TestScanOperation::new(0, 3)
+                    .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["y"])]),
+                kept_inputs: Vec::new(),
+                kept_outputs: vec![false, true, true],
+            })),
+        );
     }
 
     #[test]
@@ -7101,14 +7442,143 @@ mod tests {
                 .with_reverse(true)
                 .with_unroll(3)
                 .unwrap()
+                .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])])
                 .rename_type_identities(&renaming),
             Ok(ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(renamed))
                 .with_reverse(true)
                 .with_unroll(3)
-                .unwrap()),
+                .unwrap()
+                .with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])])),
         );
         let operation = ScanOperation::<ArrayIrType>::new(1, 3);
         assert_eq!(operation.rename_type_identities(&renaming), Ok(operation.clone()));
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_input_sources() {
+        // A scan declares custom region data flow, because its carried body inputs are fed by its body outputs too.
+        let operation = TestScanOperation::new(2, 3);
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Custom(_)));
+        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
+        assert_eq!(operation.input_sources(0, 0, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
+        assert_eq!(
+            operation.input_sources(0, 2, boundary),
+            Ok(RegionDataFlowSources::Known(vec![
+                RegionDataFlowSource::InstructionInput(1),
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index: 1 }),
+            ])),
+        );
+        assert_eq!(
+            operation.input_sources(0, 3, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
+        );
+
+        // A statically empty scan never feeds a body output back, so a carried body input has only its initial value.
+        assert_eq!(
+            TestScanOperation::new(2, 0).input_sources(0, 2, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(1)])),
+        );
+        assert_eq!(
+            operation.region_data_flow().input_sources(&operation, 1, 0, boundary),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCAN_OPERATION_NAME}` declares region 1 but has 1 attached regions",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_output_sources() {
+        let operation = TestScanOperation::new(2, 3);
+        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
+        assert_eq!(
+            operation.output_sources(1, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionInput {
+                region_index: 0,
+                input_index: 2,
+            }])),
+        );
+        assert_eq!(
+            operation.output_sources(2, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionOutput(OutputRegionProvenance {
+                region_index: 0,
+                output_index: 2,
+            })])),
+        );
+        assert_eq!(
+            operation.region_data_flow().output_sources(&operation, 3, boundary),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCAN_OPERATION_NAME}` declares output 3 with 3 outputs",
+            ))),
+        );
+        let empty = TestScanOperation::new(2, 0);
+        assert_eq!(
+            empty.output_sources(1, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(1)])),
+        );
+        assert_eq!(empty.output_sources(2, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
+
+        // A dynamic iteration count can be zero, so its carried outputs retain the initial input source through
+        // feedback.
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dynamic = ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length));
+        let dynamic_boundary = RegionDataFlowBoundary { input_count: 4, ..boundary };
+        assert_eq!(dynamic.output_sources(1, dynamic_boundary), operation.output_sources(1, boundary));
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_execution_demands() {
+        // The body's stacked result uses its first carry, which in turn uses its second carry, so demanding the stacked
+        // output extends the demanded outputs over both carries, one fixed-point pass at a time.
+        let operation = TestScanOperation::new(2, 3);
+        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
+        let mut liveness =
+            TestRegionLiveness::new(|used_outputs| vec![false, used_outputs[2], used_outputs[0], used_outputs[2]]);
+        assert_eq!(
+            operation.execution_demands(&[false, false, true], boundary, &mut liveness),
+            Ok(vec![Some(vec![true, true, true])]),
+        );
+        assert_eq!(
+            liveness.queries().to_vec(),
+            vec![vec![false, false, true], vec![true, false, true], vec![true, true, true]],
+        );
+
+        // A scan with no iterations never executes its body, so it demands nothing from it and queries nothing.
+        let mut liveness =
+            TestRegionLiveness::new(|used_outputs| vec![false, used_outputs[2], used_outputs[0], used_outputs[2]]);
+        assert_eq!(
+            TestScanOperation::new(2, 0).execution_demands(&[true, true, true], boundary, &mut liveness),
+            Ok(vec![None]),
+        );
+        assert_eq!(liveness.queries().to_vec(), Vec::<Vec<bool>>::new());
+        assert_eq!(
+            operation.region_data_flow().execution_demands(&operation, &[true], boundary, &mut liveness),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCAN_OPERATION_NAME}` receives used outputs for 1 positions but has 3 outputs",
+            ),)),
+        );
+        let malformed = RegionDataFlowBoundary { input_count: 2, ..boundary };
+        assert_eq!(
+            operation.execution_demands(&[true, true, true], malformed, &mut liveness),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region data flow requires an index followed by 2 carries and stacked inputs, \
+                 matching body outputs and instruction inputs",
+            ),)),
+        );
+
+        // A body with no outputs whose retained effect consumes its stacked input still executes for a positive
+        // iteration count. `Some(empty)` keeps that retained body work, whereas `None` skips the body altogether.
+        let mut liveness = TestRegionLiveness::new(|_| vec![false, true]);
+        let regions = [RegionDataFlowRegionBoundary { input_count: 2, output_count: 0 }];
+        let boundary = RegionDataFlowBoundary { input_count: 1, output_count: 0, regions: &regions };
+        assert_eq!(
+            TestScanOperation::new(0, 3).execution_demands(&[], boundary, &mut liveness),
+            Ok(vec![Some(Vec::new())]),
+        );
+        assert_eq!(TestScanOperation::new(0, 0).execution_demands(&[], boundary, &mut liveness), Ok(vec![None]));
+        assert_eq!(liveness.queries().to_vec(), vec![Vec::<bool>::new()]);
     }
 
     #[test]
@@ -7122,7 +7592,7 @@ mod tests {
             TestIrValue::Array(Array::scalar(10.0f32).unwrap()),
             TestIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
         ];
-        let expected = source.clone().interpret(inputs.clone()).unwrap();
+        let expected = source.interpret(inputs.clone()).unwrap();
         assert_eq!(
             expected,
             vec![
@@ -7137,7 +7607,8 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[3] .
-                let %3:f32[], %4:f32[], %5:f32[3] = scan [carry_count=2, iteration_count=3, reverse=true, unroll=3] %0 %1 %2 [
+                let %3:f32[], %4:f32[], %5:f32[3] = scan [carry_count=2, iteration_count=3, reverse=true, unroll=3] \
+                %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[] .
                         let %4:f32[] = add %2 %3
@@ -7245,42 +7716,8 @@ mod tests {
         // A body that accumulates into its reference carry and stacks the state it observes keeps the discharged state
         // carry in the declared carry prefix, separate from the stacked output, and the rewrite preserves the visit
         // order and unroll factor of the source scan.
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar(1.0f32).unwrap()));
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let value = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![reference, value],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(reference_type.into());
-        let operation = ScanOperation::<ArrayIrType>::new(1, 3).with_reverse(true).with_unroll(3).unwrap();
-        let outputs = builder.add_instruction(operation, vec![body], vec![reference], None).unwrap();
-        let final_reference = outputs[0];
-        let stacked_values = outputs[1];
-        let final_value = builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference], None)
-            .unwrap()[0];
-        let source = builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![final_value, stacked_values],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
+        let source =
+            incrementing_reference_scan_program(ScanOperation::new(1, 3).with_reverse(true).with_unroll(3).unwrap());
 
         // The synthesized state joins the declared carry prefix on both boundaries instead of being appended after the
         // stacked outputs, and every unrelated scan attribute survives the rewrite unchanged.
@@ -7377,7 +7814,7 @@ mod tests {
         );
         assert_eq!(
             discharged.external_reference_bindings()[0].source().flat_input_index(discharged.capture_count()),
-            Ok(0)
+            Ok(0),
         );
     }
 
@@ -7472,7 +7909,7 @@ mod tests {
         );
         assert_eq!(
             discharged.external_reference_bindings()[0].source().flat_input_index(discharged.capture_count()),
-            Ok(0)
+            Ok(0),
         );
         assert_eq!(
             discharged.program().to_string(),
@@ -7664,14 +8101,14 @@ mod tests {
             TestIrValue::Array(Array::scalar(1.0f32).unwrap()),
             TestIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
         ];
-        let eager = source.clone().interpret(inputs.clone()).unwrap();
+        let eager = source.interpret(inputs.clone()).unwrap();
         assert_eq!(
             eager,
             vec![
                 TestIrValue::Array(Array::scalar(11.0f32).unwrap()),
                 TestIrValue::Array(Array::vector(vec![4.0f32, 8.0, 14.0, 22.0]).unwrap()),
                 TestIrValue::Array(Array::vector(vec![2.0f32, 4.0, 7.0, 11.0]).unwrap()),
-            ]
+            ],
         );
         assert_eq!(
             source.to_string(),
@@ -7959,43 +8396,7 @@ mod tests {
     fn test_scan_reference_discharge_preserves_zero_iteration_count_state_identity() {
         // A scan with no iterations never runs the body that would update its reference carry, so the discharged state
         // carry publishes the entering state unchanged as the allocation's final state.
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar(1.0f32).unwrap()));
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let value = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![reference, value],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(reference_type.into());
-        let outputs = builder
-            .add_instruction(ScanOperation::<ArrayIrType>::new(1, 0), vec![body], vec![reference], None)
-            .unwrap();
-        let final_reference = outputs[0];
-        let stacked_values = outputs[1];
-        let final_value = builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference], None)
-            .unwrap()[0];
-        let source = builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![final_value, stacked_values],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
+        let source = incrementing_reference_scan_program(ScanOperation::new(1, 0));
 
         assert_eq!(
             source.to_string(),
@@ -8116,15 +8517,15 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[0] .
                 let %3:ref<f32[0]> = reference_new %2
-                    %4:f32[], %5:f32[3], %6:f32[0, 3] = scan [carry_count=2, iteration_count=0, reverse=false] %0 %1 %3 [
+                    %4:f32[], %5:f32[3], %6:f32[0, 3] = scan [carry_count=2, iteration_count=0, reverse=false] %0 %1 \
+                    %3 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[rows], %3:ref<f32[0]> .
                             let %4:bool[] = const true
                                 %5:f32[] = condition %4 %0 %3 [
                                     true=^0={
                                         lambda %0:i64[], %1:ref<f32[0]> .
-                                        let %2:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] \
-                %1 %0
+                                        let %2:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %1 %0
                                         in (%2)
                                     },
                                     false=^0,
@@ -8242,13 +8643,13 @@ mod tests {
             discharged
                 .program()
                 .interpret(vec![TestIrValue::Array(Array::scalar(0.0f32).unwrap()), iteration_count]),
-            Ok(eager)
+            Ok(eager),
         );
     }
 
     #[test]
     fn test_scan_reference_discharge_dynamic_iteration_count_with_an_empty_reference_carry() {
-        // The body indexes an empty reference carry with its index, which is valid only when no iteration runs. A
+        // The body indexes an empty reference carry with its index, which is valid only when no iteration runs. An
         // iteration count that admits iterations keeps the body, whose discharged access would slice the empty axis, so
         // discharge (which every compiled execution performs before lowering) rejects the scan with that typed error
         // even though eager interpretation succeeds at iteration count 0.
@@ -8312,9 +8713,9 @@ mod tests {
         );
         assert_eq!(
             program.discharge_references(0).map(|discharged| discharged.program().to_string()),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`dynamic_slice` size 1 is out of bounds for axis 0 with size 0",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` size 1 is out of bounds for axis 0 with size 0",
+            )))),
         );
     }
 
@@ -8444,12 +8845,13 @@ mod tests {
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[n] .
                 let %1:dimension<2> = const 2
                     %2:f32[0] = const []
-                    %3:dimension<2>, %4:f32[2] = guard [boundary="scan", declared_types=[dimension<n ∈ [1, 8)>, f32[n]]] %1 %0
-                in ()"#},
+                    %3:dimension<2>, %4:f32[2] = guard [boundary=\"scan\", declared_types=[dimension<n ∈ [1, 8)>, \
+                    f32[n]]] %1 %0
+                in ()"},
         );
         let result = discharged.program().interpret(vec![input]);
         assert_eq!(result, Err(input_dimension_mismatch("n", 2, 3)));
@@ -8505,11 +8907,11 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_zero_iteration_count_guards_preserved_reference_members() {
-        // As in `test_scan_reference_discharge_zero_length_preserves_entry_relationships`, a constant `f32[2]` carry
-        // must agree with the referent of the `ref<f32[n]>` carry allocated from the program input, and discharging the
-        // empty reference carry elides the scan with no iterations. Here, partial discharge preserves the `ref<f32[n]>`
-        // carry, so the entry guard relates the array carry to the preserved reference itself. The guard retains `n`,
-        // which the preserved reference still carries, so the array carry leaves it as `f32[n]`.
+        // As in `test_scan_reference_discharge_zero_iteration_count_preserves_entry_relationships`, a constant `f32[2]`
+        // carry must agree with the referent of the `ref<f32[n]>` carry allocated from the program input, and
+        // discharging the empty reference carry elides the scan with no iterations. Here, partial discharge preserves
+        // the `ref<f32[n]>` carry, so the entry guard relates the array carry to the preserved reference itself. The
+        // guard retains `n`, which the preserved reference still carries, so the array carry leaves it as `f32[n]`.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()]));
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
@@ -8557,14 +8959,15 @@ mod tests {
         let discharged = program.partially_discharge_references(0, &targets[1..]).unwrap();
         assert_eq!(
             discharged.program().to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[n] .
                 let %1:f32[2] = const [7.0, 8.0]
                     %2:f32[0] = const []
                     %3:ref<f32[n]> = reference_new %0
-                    %4:f32[n] = guard [boundary="scan", declared_types=[f32[n], ref<f32[n]>], retained_identities=[n]] %1 %3
+                    %4:f32[n] = guard [boundary=\"scan\", declared_types=[f32[n], ref<f32[n]>], \
+                    retained_identities=[n]] %1 %3
                     %5:f32[n] = reference_freeze %3
-                in (%4, %5)"#},
+                in (%4, %5)"},
         );
         assert_eq!(discharged.program().interpret(vec![three]), Err(input_dimension_mismatch("n", 2, 3)));
         assert_eq!(discharged.program().interpret(vec![two.clone()]), Ok(vec![constant, two]));
@@ -8721,8 +9124,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[0], %1:f32[rows] .
                 let %2:ref<f32[rows]> = reference_new %1
-                    %3:f32[0], %4:ref<f32[rows]>, %5:f32[0, rows] = scan [carry_count=2, iteration_count=0, reverse=false] %0 \
-                    %2 [
+                    %3:f32[0], %4:ref<f32[rows]>, %5:f32[0, rows] = scan [carry_count=2, iteration_count=0, \
+                    reverse=false] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[0], %2:ref<f32[rows]> .
                             let %3:f32[rows] = reference_read %2
@@ -8904,8 +9307,7 @@ mod tests {
                                 %3:f32[] = condition %2 %0 %1 [
                                     true=^0={
                                         lambda %0:i64[], %1:ref<f32[3]> .
-                                        let %2:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] \
-                %1 %0
+                                        let %2:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %1 %0
                                             %3:f32[] = mul %2 %2
                                         in (%3)
                                     },
@@ -8970,10 +9372,9 @@ mod tests {
                                     true=^0={
                                         lambda %0:i64[], %1:ref<f32[3]> .
                                         let %2:f32[] = const 1.0
-                                            () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] \
-                %1 %2 %0
-                                            %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] \
-                %1 %0
+                                            () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %1 \
+                                            %2 %0
+                                            %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %1 %0
                                             %4:f32[] = mul %3 %3
                                         in (%4)
                                     },
@@ -9079,10 +9480,9 @@ mod tests {
         );
         assert_eq!(linearization.primal().output_types()[2..], vec![ArrayType::new_static(DataType::F32, [3]).into()]);
         let mut tangent_inputs = vec![TestIrValue::Array(Array::vector(vec![1.0f32, 1.0, 1.0]).unwrap())];
-        tangent_inputs
-            .extend(linearization.primal().as_ref().clone().interpret(vec![input]).unwrap().into_iter().skip(2));
+        tangent_inputs.extend(linearization.primal().interpret(vec![input]).unwrap().into_iter().skip(2));
         assert_eq!(
-            linearization.tangent().as_ref().clone().interpret(tangent_inputs),
+            linearization.tangent().interpret(tangent_inputs),
             Ok(vec![
                 TestIrValue::Array(Array::vector(vec![2.0f32, 4.0, 6.0]).unwrap()),
                 TestIrValue::Array(Array::vector(vec![1.0f32, 1.0, 1.0]).unwrap()),
@@ -9109,10 +9509,9 @@ mod tests {
                                     true=^0={
                                         lambda %0:i64[], %1:ref<f32[0]> .
                                         let %2:f32[] = const 1.0
-                                            () = reference_add_update [transforms=[index(axis=0, \
-                index=dynamic)]] %1 %2 %0
-                                            %3:f32[] = reference_read [transforms=[index(axis=0, \
-                index=dynamic)]] %1 %0
+                                            () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %1 \
+                                            %2 %0
+                                            %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %1 %0
                                             %4:f32[] = mul %3 %3
                                         in (%4)
                                     },
@@ -9186,8 +9585,8 @@ mod tests {
                         body={
                             lambda %0:i64[], %1:ref<f32[3]@Host[Pinned]> .
                             let %2:i64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %0
-                                %3:f32[]@Host[Pinned] = reference_read [transforms=[index(axis=0, index=dynamic)]] \
-                %1 %2
+                                %3:f32[]@Host[Pinned] = reference_read [transforms=[index(axis=0, index=dynamic)]] %1 \
+                                %2
                             in (%3)
                         },
                     ]
@@ -9198,8 +9597,8 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3]@Host[Pinned] .
-                let %1:f32[3]@Host[Pinned], %2:f32[3]@Host[Pinned] = scan [carry_count=1, iteration_count=3, reverse=false] \
-                %0 [
+                let %1:f32[3]@Host[Pinned], %2:f32[3]@Host[Pinned] = scan [carry_count=1, iteration_count=3, \
+                reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3]@Host[Pinned] .
                         let %2:i64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %0
@@ -9359,7 +9758,7 @@ mod tests {
                         in (%7, %9)
                     },
                 ]
-                in (%2, %1)"}
+                in (%2, %1)"},
         );
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
     }
@@ -9478,7 +9877,8 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[3], %3:dimension<3> .
-                let %4:f32[], %5:f32[3], %6:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 %3 [
+                let %4:f32[], %5:f32[3], %6:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %0 \
+                %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3], %3:f32[] .
                         let %4:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -9725,7 +10125,7 @@ mod tests {
             context.bind(
                 TestOperation::Scan(TestScanOperation::new(1, 3)),
                 vec![doubling_body],
-                std::slice::from_ref(&initial)
+                std::slice::from_ref(&initial),
             ),
             Ok(vec![Array::scalar(8.0).unwrap()]),
         );
@@ -9810,7 +10210,7 @@ mod tests {
         let carry = array(Array::scalar(1.0f64).unwrap());
         assert_eq!(
             context.bind(ScanOperation::<ArrayIrType>::new(1, 0), vec![body.clone()], std::slice::from_ref(&carry)),
-            expected
+            expected,
         );
         assert_eq!(context.bind(ScanOperation::<ArrayIrType>::new(1, 1), vec![body], &[carry]), expected);
 
@@ -9857,7 +10257,7 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_dimension_carries() {
-        // A constant or renamed dimension of extent 3 refines the body's `dimension<n>` carry. Direct eager binding
+        // An eager dimension value of extent 3 refines the body's `dimension<n>` carry. Direct eager binding
         // must allocate the stacked `f32[n]` output through that accepted refinement, exactly as program replay does.
         // This is the only way in which an eager empty stack can keep a symbolic dimension: eager inputs, including the
         // iteration count, have exact types whose facts refine every other identity, and type inference rejects outputs
@@ -9866,17 +10266,18 @@ mod tests {
         // "cannot eagerly allocate" error of `ArrayIrType::empty_stack` is unreachable.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let body = dimension_carry_body(&n_type, true);
-        let renamed_type = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let vector = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         let context = TestIrEagerContext::new();
-        for dimension in [TestIrValue::Dimension(DimensionValue::constant(3).unwrap()), dimension(&renamed_type, 3)] {
-            for length in [0, 2] {
-                let inputs = [dimension.clone(), vector.clone()];
-                let outputs =
-                    context.bind(ScanOperation::<ArrayIrType>::new(2, length), vec![body.clone()], &inputs).unwrap();
-                assert_eq!(outputs[1], vector);
-                assert_eq!(
-                    outputs[2],
+        let count = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        for length in [0, 2] {
+            let inputs = [count.clone(), vector.clone()];
+            let outputs =
+                context.bind(ScanOperation::<ArrayIrType>::new(2, length), vec![body.clone()], &inputs).unwrap();
+            assert_eq!(
+                outputs,
+                vec![
+                    count.clone(),
+                    vector.clone(),
                     array(
                         Array::from_elements::<f32>(
                             ArrayType::new_static(DataType::F32, [length, 3]),
@@ -9884,12 +10285,12 @@ mod tests {
                         )
                         .unwrap(),
                     ),
-                );
+                ],
+            );
 
-                // Program replay of the same scan at the declared body types produces the same values.
-                let program = single_scan_program(&body, 2, length);
-                assert_eq!(program.interpret(inputs.to_vec()).unwrap()[1..], outputs[1..]);
-            }
+            // Program replay of the same scan at the declared body types produces the same values.
+            let program = single_scan_program(&body, 2, length);
+            assert_eq!(program.interpret(inputs.to_vec()), Ok(outputs));
         }
 
         // A dimension value of extent 2 contradicts the `f32[3]` carry, because the body declares both carries with
@@ -9923,12 +10324,7 @@ mod tests {
         for length in [0, 2] {
             let operation = ScanOperation::<ArrayIrType>::new(2, length);
             let expected = operation.infer_output_types(&input_types, &[body.interface()]).unwrap_err();
-            assert_eq!(context.bind(operation.clone(), vec![body.clone()], &inputs), Err(expected.into()));
-            let inputs = [dimension(&wide_type, 3), vector.clone()];
-            assert_eq!(
-                context.bind(operation, vec![body.clone()], &inputs).map(|outputs| outputs[..2].to_vec()),
-                Ok(inputs.to_vec()),
-            );
+            assert_eq!(context.bind(operation, vec![body.clone()], &inputs), Err(expected.into()));
         }
     }
 
@@ -10223,11 +10619,7 @@ mod tests {
         let carry = array(Array::scalar(7.0f64).unwrap());
         let stack = array(Array::vector(vec![1.0f64, 2.0]).unwrap());
         assert_eq!(
-            program.clone().interpret(vec![
-                carry.clone(),
-                stack.clone(),
-                dimension(&DimensionType::from(length.clone()), 2)
-            ]),
+            program.interpret(vec![carry.clone(), stack.clone(), dimension(&DimensionType::from(length.clone()), 2)]),
             Ok(vec![carry.clone(), stack.clone()]),
         );
         // Program entry rejects an iteration count payload that disagrees with the stack sharing its identity. Binding
@@ -10235,7 +10627,7 @@ mod tests {
         for extent in [3, 1] {
             let inputs = vec![carry.clone(), stack.clone(), dimension(&DimensionType::from(length.clone()), extent)];
             let expected = Err(input_dimension_mismatch("length", 2, extent));
-            assert_eq!(program.clone().interpret(inputs.clone()), expected);
+            assert_eq!(program.interpret(inputs.clone()), expected);
             assert_eq!(
                 TestIrEagerContext::new().bind(
                     ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length.clone())),
@@ -10470,7 +10862,7 @@ mod tests {
             Ok(vec![array(
                 Array::from_elements::<f32>(
                     ArrayType::new_static(DataType::F32, [2, 3]),
-                    &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+                    &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
                 )
                 .unwrap(),
             )]),
@@ -10567,7 +10959,6 @@ mod tests {
             .unwrap();
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
         assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1)]);
-        assert_eq!(evaluation.program.to_string(), program.to_string());
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
@@ -10834,9 +11225,7 @@ mod tests {
                 &[PartialValue::Known(carry.clone()), PartialValue::Unknown(stacked_type.clone())],
             )
             .unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
+        let residual = indoc! {"
                 lambda %0:f64[2], %1:f64[] .
                 let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %0 [
                     body={
@@ -10848,8 +11237,8 @@ mod tests {
                 ]
                 in (%3)
             "}
-            .trim_end(),
-        );
+        .trim_end();
+        assert_eq!(evaluation.program.to_string(), residual);
 
         let known_program = outer
             .builder()
@@ -10867,7 +11256,7 @@ mod tests {
         );
         assert_eq!(
             evaluation.outputs,
-            vec![PartialEvaluationOutput::Known(carry), PartialEvaluationOutput::Unknown(0)]
+            vec![PartialEvaluationOutput::Known(carry), PartialEvaluationOutput::Unknown(0)],
         );
 
         // The same placement holds under an eager parent, so specialization cannot execute the known prints before
@@ -10878,22 +11267,7 @@ mod tests {
                 PartialValue::Unknown(stacked_type.clone()),
             ])
             .unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
-                lambda %0:f64[2], %1:f64[] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %0 [
-                    body={
-                        lambda %0:i64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = print [label=known] %1
-                            %4:f64[] = print [label=unknown] %2
-                        in (%1, %4)
-                    },
-                ]
-                in (%3)
-            "}
-            .trim_end(),
-        );
+        assert_eq!(evaluation.program.to_string(), residual);
         assert_eq!(
             evaluation.outputs,
             vec![PartialEvaluationOutput::Known(Array::scalar(3.0).unwrap()), PartialEvaluationOutput::Unknown(0)],
@@ -10942,6 +11316,72 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_scan_partial_evaluation_preserves_zero_output_deferred_work() {
+        // A known pass-through carry permits splitting. With no unknown carry, output or forward effect, only the
+        // dormant backward rule keeps the residual scan; its update must still run once per reversed iteration.
+        let deferred = deferred_reference_stack_body();
+        let reference_type = deferred.input_types()[1].clone();
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = builder.add_input(scalar_type.clone());
+        let reference = builder.add_input(reference_type.clone());
+        builder.splice_program(&deferred, &[index, reference]).unwrap();
+        let body = builder.build(vec![carry], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+        let source = scan_program(ScanOperation::new(1, 3), body, vec![scalar_type, reference_type.clone()])
+            .with_outputs(&[])
+            .unwrap();
+        let evaluation = source
+            .partially_evaluate(&[
+                PartialValue::Known(array(Array::scalar(2.0f64).unwrap())),
+                PartialValue::Unknown(reference_type),
+            ])
+            .unwrap();
+        assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(1)]);
+        assert_eq!(evaluation.outputs, Vec::new());
+        assert!(evaluation.program.effects().classes().is_empty());
+        assert!(evaluation.program.effects().has_deferred_work());
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:ref<f64[3]> .
+                let () = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:ref<f64[3]> .
+                        let () = composite_transpose [leading_input_count=1] %1 [
+                            backward={
+                                lambda %0:ref<f64[3]> .
+                                let %1:f64[3] = const [1.0, 1.0, 1.0]
+                                    () = reference_add_update %0 %1
+                                in ()
+                            },
+                        ]
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let transposed = evaluation.program.transpose_with_respect_to(&[], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:ref<f64[3]> .
+                let () = scan [carry_count=0, iteration_count=3, reverse=true] %0 [
+                    body={
+                        lambda %0:i64[], %1:ref<f64[3]> .
+                        let %2:f64[3] = const [1.0, 1.0, 1.0]
+                            () = reference_add_update %1 %2
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let reference = ArrayReference::new(Array::vector(vec![4.0f64; 3]).unwrap());
+        assert_eq!(transposed.interpret(vec![TestIrValue::Reference(reference.clone())]), Ok(Vec::new()));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![7.0f64; 3]).unwrap()));
     }
 
     #[test]
@@ -11149,6 +11589,56 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_partial_evaluation_regenerates_intrinsic_index_residuals() {
+        // The known carry passes through, while the unknown accumulator consumes the intrinsic index directly.
+        // The split regenerates that edge from the residual body's index instead of storing an index stack.
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+        let index = builder.add_input(scalar_type.clone());
+        let scale = builder.add_input(scalar_type.clone());
+        let accumulator = builder.add_input(scalar_type.clone());
+        let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![accumulator, index], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![scale, next, accumulator], vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+        let program = scan_program(
+            TestScanOperation::new(2, 3).with_reverse(true),
+            body,
+            vec![scalar_type.clone(), scalar_type.clone()],
+        );
+        let scale = Array::scalar(2i64).unwrap();
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(scale.clone()), PartialValue::Unknown(scalar_type)])
+            .unwrap();
+        assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(1)]);
+        assert_eq!(
+            evaluation.outputs,
+            vec![
+                PartialEvaluationOutput::Known(scale.clone()),
+                PartialEvaluationOutput::Unknown(0),
+                PartialEvaluationOutput::Unknown(1),
+            ],
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:i64[] .
+                let %1:i64[], %2:i64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
+                    body={
+                        lambda %0:i64[], %1:i64[] .
+                        let %2:i64[] = add %1 %0
+                        in (%2, %1)
+                    },
+                ]
+                in (%1, %2)"},
+        );
+        let initial = Array::scalar(10i64).unwrap();
+        let expected = vec![scale.clone(), Array::scalar(13i64).unwrap(), Array::vector(vec![13i64, 12, 10]).unwrap()];
+        assert_eq!(program.interpret(vec![scale, initial.clone()]), Ok(expected.clone()));
+        assert_eq!(evaluation.interpret(&TestEagerContext::new(), &[initial]), Ok(expected));
+    }
+
+    #[test]
     fn test_scan_partial_evaluation_retains_unproven_relationships() {
         // A known dimension carry of extent 2 contradicts the `f32[3]` carry, because the body declares both carries
         // with the identity `n`. Partial evaluation must not eliminate the known carry before that check: the scan
@@ -11174,8 +11664,8 @@ mod tests {
     fn test_scan_partial_evaluation_retains_unproven_relationships_of_known_dimensions() {
         // A known dimension of extent 2 constrains an unknown carry that the body declares as `f32[n]`. The residual
         // entry keeps the supplied `f32[n]`, and its entry guard rejects an `f32[3]` carry with the source program's
-        // error, whether or not the scan iterates and however the known dimension was constructed. The known dimension
-        // passes through the body, so it is forwarded and the guard leaves no residual scan to run.
+        // error, whether or not the scan iterates. The known dimension passes through the body, so it is forwarded and
+        // the guard leaves no residual scan to run.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let body = dimension_carry_body(&n_type, false);
         let vector_type: ArrayIrType =
@@ -11185,12 +11675,12 @@ mod tests {
         let mismatch = Err(input_dimension_mismatch("n", 2, 3));
         let residual = indoc! {"
             lambda %0:f32[n], %1:dimension<2> .
-            let %2:dimension<2>, %3:f32[2] = guard [boundary=\"partial evaluation\", \
-             declared_types=[dimension<n ∈ [1, 8)>, f32[n]]] %1 %0
+            let %2:dimension<2>, %3:f32[2] = guard [boundary=\"partial evaluation\", declared_types=[dimension<n ∈ \
+            [1, 8)>, f32[n]]] %1 %0
             in (%3)"};
         let context = TestIrEagerContext::new();
 
-        // A dimension of type `dimension<n>` with extent 2 is the same eager value as a constant dimension of extent 2.
+        // Eager dimension values have their exact singleton types, so the guard retains a `dimension<2>` input.
         let program = single_scan_program(&body, 2, 2);
         assert_eq!(program.interpret(vec![dimension(&n_type, 2), vector.clone()]), mismatch);
         let evaluation = program
@@ -11210,26 +11700,11 @@ mod tests {
         );
         assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&vector)), mismatch);
 
-        let evaluation = program
-            .partially_evaluate(&[PartialValue::Known(known.clone()), PartialValue::Unknown(vector_type.clone())])
-            .unwrap();
-        assert_eq!(evaluation.program.to_string(), residual);
-        assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&vector)), mismatch);
-
         // A scan with no iterations is guarded the same way.
         let program = single_scan_program(&body, 2, 0);
         assert_eq!(program.interpret(vec![dimension(&n_type, 2), vector.clone()]), mismatch);
         let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Known(dimension(&n_type, 2)),
-                PartialValue::Unknown(vector_type.clone()),
-            ])
-            .unwrap();
-        assert_eq!(evaluation.program.to_string(), residual);
-        assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&vector)), mismatch);
-
-        let evaluation = program
-            .partially_evaluate(&[PartialValue::Known(known), PartialValue::Unknown(vector_type)])
+            .partially_evaluate(&[PartialValue::Known(dimension(&n_type, 2)), PartialValue::Unknown(vector_type)])
             .unwrap();
         assert_eq!(evaluation.program.to_string(), residual);
         assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&vector)), mismatch);
@@ -11488,7 +11963,7 @@ mod tests {
         }
         let three = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         let four = array(Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap());
-        assert_eq!(evaluation.program().interpret(vec![four, three.clone()]), Err(input_dimension_mismatch("n", 4, 3)),);
+        assert_eq!(evaluation.program().interpret(vec![four, three.clone()]), Err(input_dimension_mismatch("n", 4, 3)));
         assert_eq!(
             evaluation.program().interpret(vec![three.clone(), three]),
             Ok(vec![
@@ -11555,7 +12030,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<length ∈ [1, 8)>, %1:f32[], %2:f32[3] .
                 let %3:dimension<length ∈ [1, 8)>, %4:f32[], %5:f32[3] = scan [carry_count=3, iteration_count=2, \
-                 reverse=false] %0 %1 %2 [
+                reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<length ∈ [1, 8)>, %2:f32[], %3:f32[3] .
                         let %4:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %3 %1 [
@@ -11593,7 +12068,7 @@ mod tests {
                 indoc! {"
                     lambda %0:dimension<length ∈ [1, 8)>, %1:f32[3] .
                     let %2:dimension<length ∈ [1, 8)>, %3:f32[3], %4:i64[2] = scan [carry_count=2, iteration_count=2, \
-                     reverse=false] %0 %1 [
+                    reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:dimension<length ∈ [1, 8)>, %2:f32[3] .
                             let %3:f32[3], %4:dimension<3> = guard [
@@ -11901,8 +12376,8 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[4], %2:f64[], %3:f64[] .
-                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, iteration_count=4, reverse=false] %2 %3 %0 \
-                 %1 [
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, iteration_count=4, reverse=false] \
+                %2 %3 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         in (%2, %3, %4, %1)
@@ -12097,7 +12572,7 @@ mod tests {
             evaluation.outputs,
             vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(squares.clone())],
         );
-        assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(squares)],);
+        assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(squares)]);
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
@@ -12117,9 +12592,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_splits_varying_edges_in_a_manual_region() {
-        // Body `[c, w] -> [c * sin(w), c * sin(w)]` inside a manual region, where the carry `c` and the stacked weights
-        // `w` both vary over `devices`. A symbolic known `w` splits the scan: the known scan, staged into the outer
+    fn test_scan_partial_evaluation_preserves_manual_variation_of_split_edges() {
+        // Body `[c, w] -> [c * sin(w), c * sin(w)]` over a carry and stacked weights whose types both vary over
+        // `devices`. A symbolic known `w` splits the scan: the known scan, staged into the outer
         // trace, stacks `sin(w)` per iteration as a varying residual edge, and the residual scan multiplies the unknown
         // carry by it. Both sides keep the manual variation of their types, and replaying the residual program next to
         // the known side reproduces the source scan. No operation here needs an active manual region, so the combined
@@ -12195,7 +12670,8 @@ mod tests {
         );
         let weights = Array::from_elements::<f64>(stacked_type, &[0.5, 1.0, 1.5]).unwrap();
         let carry = Array::from_elements::<f64>(scalar_type, &[2.0]).unwrap();
-        assert_eq!(combined.interpret(vec![weights.clone(), carry.clone()]), program.interpret(vec![carry, weights]));
+        let expected = program.interpret(vec![carry.clone(), weights.clone()]).unwrap();
+        assert_eq!(combined.interpret(vec![weights, carry]), Ok(expected));
     }
 
     #[test]
@@ -12553,9 +13029,7 @@ mod tests {
         let evaluation = program
             .partially_evaluate(&[PartialValue::Unknown(carry_type.clone()), PartialValue::Known(arguments[1].clone())])
             .unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
+        let residual = indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3] .
                 let %2:f64[3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
@@ -12564,8 +13038,8 @@ mod tests {
                         in (%3)
                     },
                 ]
-                in (%2)"},
-        );
+                in (%2)"};
+        assert_eq!(evaluation.program.to_string(), residual);
         assert_eq!(
             evaluation.outputs,
             vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(expected[1].clone())],
@@ -12581,21 +13055,7 @@ mod tests {
                 &[PartialValue::Unknown(carry_type), PartialValue::Known(outer.input(stacked_type))],
             )
             .unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
-                lambda %0:f64[3], %1:f64[2, 3] .
-                let %2:f64[3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[3], %2:f64[3] .
-                        let %3:f64[3] = add %1 %2
-                        in (%3)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
+        assert_eq!(evaluation.program.to_string(), residual);
 
         let known_program = outer
             .builder()
@@ -12660,7 +13120,7 @@ mod tests {
         );
         assert_eq!(
             evaluation.outputs,
-            vec![PartialEvaluationOutput::Known(scale), PartialEvaluationOutput::Unknown(0)]
+            vec![PartialEvaluationOutput::Known(scale), PartialEvaluationOutput::Unknown(0)],
         );
         let PartialEvaluationInput::Known(coefficient) = &evaluation.inputs[1] else { panic!("missing coefficient") };
         let outer_program = outer
@@ -13197,7 +13657,7 @@ mod tests {
         );
         assert_eq!(
             evaluation.outputs,
-            vec![PartialEvaluationOutput::Known(scale), PartialEvaluationOutput::Unknown(0)]
+            vec![PartialEvaluationOutput::Known(scale), PartialEvaluationOutput::Unknown(0)],
         );
         assert_eq!(
             evaluation.program.to_string(),
@@ -13928,7 +14388,7 @@ mod tests {
         );
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(elements)]
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(elements)],
         );
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
         assert_eq!(
@@ -14196,7 +14656,8 @@ mod tests {
                 1,
                 Array::scalar(true).unwrap(),
                 format!(
-                    "`{SCAN_OPERATION_NAME}` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
+                    "`{SCAN_OPERATION_NAME}` input 0 has type `bool[]`, which does not refine its expected type \
+                     `f64[]`",
                 ),
             ),
         ] {
@@ -14303,7 +14764,7 @@ mod tests {
                     %5:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %1
                     %6:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %2
                     %7:f64[2], %8:f64[2], %9:f64[2], %10:f64[3, 2] = scan [carry_count=3, iteration_count=3, \
-                     reverse=false] %4 %5 %6 %3 [
+                    reverse=false] %4 %5 %6 %3 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2], %3:f64[2], %4:f64[2] .
                             in (%2, %3, %4, %1)
@@ -14328,10 +14789,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_reconciles_stacked_outputs_that_become_batched_eagerly() {
+    fn test_scan_batching_stacks_mapped_pre_update_carries() {
         // Body `[carry, x] -> [carry + x, carry]` over a replicated initial carry and stacked inputs mapped at axis 0.
-        // The first stacked carry slice is replicated; when a later iteration maps it, the existing accumulator
-        // must gain the same batch axis before the mapped slice is written.
+        // Structural discovery widens the initial carry before binding the scan, so every stacked pre-update carry
+        // is mapped, including the initial value written by the first iteration.
         let body = scalar_body(2, |builder, inputs| {
             let next =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None).unwrap()[0];
@@ -14348,7 +14809,7 @@ mod tests {
                 ArrayBatch::new(Array::vector(vec![10.0f64, 19.0]).unwrap(), BatchAxis::new(0)).unwrap(),
                 ArrayBatch::new(
                     Array::matrix(3, 2, vec![1.0f64, 1.0, 3.0, 6.0, 6.0, 12.0]).unwrap(),
-                    BatchAxis::new(1)
+                    BatchAxis::new(1),
                 )
                 .unwrap(),
             ],
@@ -14597,183 +15058,103 @@ mod tests {
 
     #[test]
     fn test_scan_batching_zero_iteration_count() {
-        // A scan with no iterations batched under a staging parent still batches its body structurally: the carry keeps
-        // its mapped axis, the stacked carry output is mapped behind the leading scan dimension, and the stacked
-        // constant output stays replicated.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let carry_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(carry_sharding).unwrap();
-        let stack_type = ArrayType::new_static(DataType::F64, [0])
-            .with_sharding(Sharding::replicated(mesh.clone(), 1))
-            .unwrap();
-        let parent = TracingContext::<Array, TestOperation>::new();
-        let builder = parent.builder().clone();
-        let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
-        let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
-        let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
-        let carries = ArrayBatch::new(parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
-        let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
-        // The body's boundary types derive from the carry's unbatched per-item type (like a traced-over-inputs body
-        // would), so its metadata matches the actual carries.
-        let logical_type = carries.unbatched_type();
-        let tracer_inputs =
-            [BatchingTracer::new(context.clone(), carries), BatchingTracer::new(context.clone(), stacked_inputs)];
-        let outputs = context
-            .bind(
-                TestOperation::Scan(TestScanOperation::new(1, 0)),
-                [zero_length_body(logical_type, scan_slice_type(&stack_type, 0).unwrap().0)],
-                &tracer_inputs,
-            )
-            .unwrap();
-        let output_axes = outputs.iter().map(|output| output.batch().batch_axis()).collect::<Vec<_>>();
-        let output_atoms = outputs.iter().map(|output| output.batch().value().atom_id().unwrap()).collect::<Vec<_>>();
-        drop(outputs);
-        drop(tracer_inputs);
-        drop(context);
-        drop(parent);
-        let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(
-                output_atoms,
-                vec![Placeholder, Placeholder],
-                vec![Placeholder, Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %1:f64[0][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                let %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %3:f64[0, 2][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}], %4:f64[0][sharding={mesh<['x'=2:explicit]>, [{}]}] = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %2:f64[][sharding={mesh<['x'=2:explicit]>, []}] .
-                        let %3:f64[][sharding={mesh<['x'=2:explicit]>, []}] = const 7.0
-                        in (%1, %1, %3)
-                    },
-                ]
-                in (%0, %3, %4)"#},
-        );
-        assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
-
-        // Under an eager parent, the scan runs no iteration, but batching its body structurally still determines which
-        // empty stacked outputs are mapped and where their packed batch dimensions and shardings live.
-        let logical_type =
-            ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        let carries =
-            ArrayBatch::new(Array::from_elements::<f64>(carry_type, &[1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let stacked_inputs = ArrayBatch::replicated(Array::from_elements::<f64>(stack_type.clone(), &[]).unwrap());
-        let context =
-            BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
-        let stacked_carry_sharding =
-            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
-        let stacked_carry_type =
-            ArrayType::new_static(DataType::F64, [0, 2]).with_sharding(stacked_carry_sharding).unwrap();
-        assert_eq!(
-            bind_batched_scan(
-                &context,
-                TestScanOperation::new(1, 0),
-                zero_length_body(carries.unbatched_type(), logical_type),
-                vec![carries.clone(), stacked_inputs],
-            ),
-            vec![
-                carries,
-                ArrayBatch::new(Array::from_elements::<f64>(stacked_carry_type, &[]).unwrap(), BatchAxis::new(1))
-                    .unwrap(),
-                ArrayBatch::replicated(Array::from_elements::<f64>(stack_type, &[]).unwrap()),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_scan_batching_zero_iteration_count_with_manual_axes() {
-        // A scan with no iterations over values that vary over a manual mesh axis batches its body structurally like
-        // one over explicit mesh axes: the carry and the stacked carry output keep the carry's manual variation, while
-        // the stacked constant output stays replicated and invariant.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
-            .unwrap()
-            .with_varying_manual_axes(["x"])
-            .unwrap();
-        let carry_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(carry_sharding).unwrap();
-        let stack_type = ArrayType::new_static(DataType::F64, [0])
-            .with_sharding(Sharding::replicated(mesh.clone(), 1))
-            .unwrap();
-        let parent = TracingContext::<Array, TestOperation>::new();
-        let builder = parent.builder().clone();
-        let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
-        let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
-        let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
-        let carries = ArrayBatch::new(parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
-        let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
-        // The body's boundary types derive from the carry's unbatched per-item type (like a traced-over-inputs body
-        // would), so its metadata, including its varying manual axes, matches the actual carries.
-        let logical_type = carries.unbatched_type();
-        let tracer_inputs =
-            [BatchingTracer::new(context.clone(), carries), BatchingTracer::new(context.clone(), stacked_inputs)];
-        let outputs = context
-            .bind(
-                TestOperation::Scan(TestScanOperation::new(1, 0)),
-                [zero_length_body(logical_type, scan_slice_type(&stack_type, 0).unwrap().0)],
-                &tracer_inputs,
-            )
-            .unwrap();
-        let output_axes = outputs.iter().map(|output| output.batch().batch_axis()).collect::<Vec<_>>();
-        let output_atoms = outputs.iter().map(|output| output.batch().value().atom_id().unwrap()).collect::<Vec<_>>();
-        drop(outputs);
-        drop(tracer_inputs);
-        drop(context);
-        drop(parent);
-        let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(
-                output_atoms,
-                vec![Placeholder, Placeholder],
-                vec![Placeholder, Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %1:f64[0][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                let %2:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %3:f64[0, 2][sharding={mesh<['x'=2:manual]>, [{}, {'x'}], varying_manual={'x'}}], %4:f64[0][sharding={mesh<['x'=2:manual]>, [{}]}] = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %2:f64[][sharding={mesh<['x'=2:manual]>, []}] .
-                        let %3:f64[][sharding={mesh<['x'=2:manual]>, []}] = const 7.0
-                        in (%1, %1, %3)
-                    },
-                ]
-                in (%0, %3, %4)"#},
-        );
-        assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
-
-        // Under an eager parent, the empty stacked carry output also carries the carry's manual variation.
-        let logical_type =
-            ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        let carries =
-            ArrayBatch::new(Array::from_elements::<f64>(carry_type, &[1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let stacked_inputs = ArrayBatch::replicated(Array::from_elements::<f64>(stack_type.clone(), &[]).unwrap());
-        let context =
-            BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
-        let stacked_carry_sharding =
-            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+        // With no iterations, structural batching still determines the empty outputs' batch axes and sharding.
+        // Manual variation stays on the mapped carry and its stack; the stacked constant remains invariant.
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
                 .unwrap()
-                .with_varying_manual_axes(["x"])
+                .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                 .unwrap();
-        let stacked_carry_type =
-            ArrayType::new_static(DataType::F64, [0, 2]).with_sharding(stacked_carry_sharding).unwrap();
-        assert_eq!(
-            bind_batched_scan(
-                &context,
-                TestScanOperation::new(1, 0),
-                zero_length_body(carries.unbatched_type(), logical_type),
-                vec![carries.clone(), stacked_inputs],
-            ),
-            vec![
-                carries,
-                ArrayBatch::new(Array::from_elements::<f64>(stacked_carry_type, &[]).unwrap(), BatchAxis::new(1))
-                    .unwrap(),
-                ArrayBatch::replicated(Array::from_elements::<f64>(stack_type, &[]).unwrap()),
-            ],
-        );
+            let carry_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(carry_sharding).unwrap();
+            let stack_type = ArrayType::new_static(DataType::F64, [0])
+                .with_sharding(Sharding::replicated(mesh.clone(), 1))
+                .unwrap();
+            let scalar_type =
+                ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+            let stacked_carry_sharding =
+                Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
+            let stacked_carry_type =
+                ArrayType::new_static(DataType::F64, [0, 2]).with_sharding(stacked_carry_sharding).unwrap();
+
+            // The body derives its carry metadata from the actual unbatched input, as an input-driven trace would.
+            let parent = TracingContext::<Array, TestOperation>::new();
+            let builder = parent.builder().clone();
+            let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
+            let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
+            let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
+            let carries = ArrayBatch::new(parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
+            let logical_type = carries.unbatched_type();
+            let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
+            let tracer_inputs =
+                [BatchingTracer::new(context.clone(), carries), BatchingTracer::new(context.clone(), stacked_inputs)];
+            let outputs = context
+                .bind(
+                    TestOperation::Scan(TestScanOperation::new(1, 0)),
+                    [zero_length_body(logical_type, scan_slice_type(&stack_type, 0).unwrap().0)],
+                    &tracer_inputs,
+                )
+                .unwrap();
+            let output_axes = outputs.iter().map(|output| output.batch().batch_axis()).collect::<Vec<_>>();
+            let output_atoms =
+                outputs.iter().map(|output| output.batch().value().atom_id().unwrap()).collect::<Vec<_>>();
+            drop(outputs);
+            drop(tracer_inputs);
+            drop(context);
+            drop(parent);
+            let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
+            let program = builder
+                .build::<Vec<Array>, Vec<Array>>(
+                    output_atoms,
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder, Placeholder],
+                )
+                .unwrap();
+            let carry = carry_type.to_string();
+            let stack = stack_type.to_string();
+            let scalar = scalar_type.to_string();
+            let stacked = stacked_carry_type.to_string();
+            let attributes = "carry_count=1, iteration_count=0, reverse=false";
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                        lambda %0:{carry}, %1:{stack} .
+                        let %2:{carry}, %3:{stacked}, %4:{stack} = scan [{attributes}] %0 %1 [
+                            body={{
+                                lambda %0:i64[], %1:{carry}, %2:{scalar} .
+                                let %3:{scalar} = const 7.0
+                                in (%1, %1, %3)
+                            }},
+                        ]
+                        in (%0, %3, %4)"},
+            );
+            assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
+
+            // Eager binding also discovers these output types without executing an iteration.
+            let carries =
+                ArrayBatch::new(Array::from_elements::<f64>(carry_type, &[1.0, 2.0]).unwrap(), BatchAxis::new(0))
+                    .unwrap();
+            let stacked_inputs = ArrayBatch::replicated(Array::from_elements::<f64>(stack_type.clone(), &[]).unwrap());
+            let context =
+                BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
+            assert_eq!(
+                bind_batched_scan(
+                    &context,
+                    TestScanOperation::new(1, 0),
+                    zero_length_body(carries.unbatched_type(), scalar_type),
+                    vec![carries.clone(), stacked_inputs],
+                ),
+                vec![
+                    carries,
+                    ArrayBatch::new(Array::from_elements::<f64>(stacked_carry_type, &[]).unwrap(), BatchAxis::new(1))
+                        .unwrap(),
+                    ArrayBatch::replicated(Array::from_elements::<f64>(stack_type, &[]).unwrap()),
+                ],
+            );
+        }
     }
 
     #[test]
@@ -14905,7 +15286,7 @@ mod tests {
                     &BatchingContext::new(TestEagerContext::new(), 2),
                     TestScanOperation::new(1, 1),
                     body,
-                    vec![carry]
+                    vec![carry],
                 ),
                 vec![
                     ArrayBatch::new(Array::matrix(2, 2, vec![0.0f64, 0.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
@@ -14921,10 +15302,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_widens_replicated_carries_in_manual_regions() {
-        // Inside a manual region, a replicated carry becomes batched because the body adds a mapped stacked slice to
-        // it. Both vary over `devices`, so the fixed point widens the carry with a broadcast that keeps its variation
-        // and needs no `parallel_vary`.
+    fn test_scan_batching_preserves_manual_variation_when_widening_carries() {
+        // A carry replicated over the batch becomes mapped because the body adds a mapped stacked slice to it. Both
+        // types already vary over `devices`, so the fixed point widens the carry with a broadcast that preserves
+        // manual variation without requiring an active manual region or a `parallel_vary`.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["devices"]).unwrap();
         let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(varying(0)).unwrap();
@@ -15107,14 +15488,14 @@ mod tests {
                         let %2:dimension<2> = constant [value=2]
                             %3:dimension<2> = constant [value=2]
                             %4:{invariant_matrix} = broadcast [output_axes=[1], output_sharding={replicated_matrix}] \
-                %0 %2 %3
+                            %0 %2 %3
                             %5:{slices} = transpose [permutation=[1, 0, 2]] %1
-                            %6:dimension<2>, %7:{invariant_matrix}, %8:{slices} = scan [carry_count=2, iteration_count=3, \
-                reverse=false] %2 %4 %5 [
+                            %6:dimension<2>, %7:{invariant_matrix}, %8:{slices} = scan [carry_count=2, \
+                            iteration_count=3, reverse=false] %2 %4 %5 [
                                 body={{
                                     lambda %0:i64[], %1:dimension<2>, %2:{invariant_matrix}, %3:{varying_matrix} .
                                     let %4:{invariant_matrix} = parallel_reduce [kind=sum, axis_name=\"devices\", \
-                mesh=['devices'=2:manual]] %3
+                                    mesh=['devices'=2:manual]] %3
                                         %5:{invariant_matrix} = add %2 %4
                                         %6:{varying_matrix} = parallel_vary [axis_name=\"devices\"] %2
                                         %7:{varying_matrix} = mul %6 %3
@@ -15216,7 +15597,7 @@ mod tests {
                 lambda %0:dimension<2>, %1:f32[], %2:f32[length, 2], %3:dimension<length ∈ [1, 8)> .
                 let %4:f32[2] = broadcast [output_axes=[]] %1 %0
                     %5:dimension<2>, %6:f32[2], %7:f32[length, 2] = scan [carry_count=2, iteration_count=length, \
-                     reverse=true, unroll=2] %0 %4 %2 %3 [
+                    reverse=true, unroll=2] %0 %4 %2 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2] .
                             let %4:f32[2] = add %2 %3
@@ -15238,83 +15619,6 @@ mod tests {
                 TestIrValue::Dimension(axis_extent),
                 TestIrValue::Array(Array::vector(vec![7.0f32, 16.0]).unwrap()),
                 TestIrValue::Array(Array::matrix(3, 2, vec![6.0f32, 12.0, 4.0, 7.0, 1.0, 1.0]).unwrap()),
-            ]),
-        );
-    }
-
-    #[test]
-    fn test_scan_batching_array_ir_keeps_iteration_counts_replicated() {
-        // An iteration count mapped over the batch would give each batch item its own iteration count, which one scan
-        // over the packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch
-        // construction rejects it before any rule runs, as the `ArrayIrBatch` tests pin), so the rule always receives a
-        // replicated iteration count. It threads that iteration count unchanged as the trailing input of the batched
-        // reversed scan, while the carry stays at batch axis 0 and the stacked input keeps its batch axis behind the
-        // leading scan axis.
-        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        body.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = body.add_input(scalar_type.clone());
-        let value = body.add_input(scalar_type.clone());
-        let next = body
-            .add_instruction(
-                TestIrOperation::Array(TestOperation::Add(AddOperation::new())),
-                Vec::new(),
-                vec![carry, value],
-                None,
-            )
-            .unwrap()[0];
-        let body = body
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
-            .unwrap();
-        let program = scan_program(
-            ScanOperation::new(1, Dimension::Dynamic(length.clone())).with_reverse(true),
-            body,
-            vec![
-                scalar_type,
-                ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into()])).into(),
-                DimensionType::from(length.clone()).into(),
-            ],
-        );
-        let extent = DimensionValue::constant(2).unwrap();
-        let batched = program
-            .batched_with_threaded_extent(
-                extent.r#type().into_owned(),
-                ShardingDimension::Replicated,
-                &[BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap();
-        assert_eq!(batched.output_axes(), &[BatchAxis::new(0), BatchAxis::new(1)]);
-        let batched = batched.into_parts().0;
-        assert_eq!(
-            batched.to_string(),
-            indoc! {"
-                lambda %0:dimension<2>, %1:f32[2], %2:f32[length, 2], %3:dimension<length ∈ [1, 8)> .
-                let %4:dimension<2>, %5:f32[2], %6:f32[length, 2] = scan [carry_count=2, iteration_count=length, \
-                 reverse=true] %0 %1 %2 %3 [
-                    body={
-                        lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2] .
-                        let %4:f32[2] = add %2 %3
-                        in (%1, %4, %2)
-                    },
-                ]
-                in (%0, %5, %6)"},
-        );
-
-        // Batch item 0 starts from `1` and batch item 1 from `10`. Each visits its slices from the back and stacks the
-        // carry that each iteration receives in the slot of the slice that it reads.
-        assert_eq!(
-            batched.interpret(vec![
-                TestIrValue::Dimension(extent.clone()),
-                array(Array::vector(vec![1f32, 10.0]).unwrap()),
-                array(Array::matrix(3, 2, vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()),
-                dimension(&DimensionType::from(length), 3),
-            ]),
-            Ok(vec![
-                TestIrValue::Dimension(extent),
-                array(Array::vector(vec![7f32, 25.0]).unwrap()),
-                array(Array::matrix(3, 2, vec![6f32, 21.0, 4.0, 16.0, 1.0, 10.0]).unwrap()),
             ]),
         );
     }
@@ -15369,7 +15673,7 @@ mod tests {
                     BatchAxis::new(1),
                 )
                 .unwrap(),
-            ]
+            ],
         );
         for extent in [2, 4] {
             assert_eq!(
@@ -15396,7 +15700,7 @@ mod tests {
         let four = array(Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap());
         assert_eq!(
             program.interpret(vec![array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()), four.clone()]),
-            Err(input_dimension_mismatch("n", 3, 4))
+            Err(input_dimension_mismatch("n", 3, 4)),
         );
         let extent = DimensionValue::constant(2).unwrap();
         let batched = program
@@ -15413,7 +15717,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2, 3], %2:f32[n] .
-                let %3:dimension<2>, %4:f32[2, 3], %5:f32[3] = scan [carry_count=3, iteration_count=2, reverse=false] %0 %1 %2 [
+                let %3:dimension<2>, %4:f32[2, 3], %5:f32[3] = scan [carry_count=3, iteration_count=2, reverse=false] \
+                %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2, n], %3:f32[n] .
                         in (%1, %2, %3)
@@ -15468,7 +15773,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[3], %3:dimension<length ∈ [1, 8)> .
-                let %4:dimension<2>, %5:f32[2] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 %3 [
+                let %4:dimension<2>, %5:f32[2] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 \
+                %3 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[] .
                         in (%1, %2)
@@ -15518,8 +15824,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f64[2, 3], %2:f64[2, 3] .
-                let %3:dimension<2>, %4:f64[2, 3], %5:f64[2, 3] = scan [carry_count=2, iteration_count=2, reverse=false] %0 \
-                %1 %2 [
+                let %3:dimension<2>, %4:f64[2, 3], %5:f64[2, 3] = scan [carry_count=2, iteration_count=2, \
+                reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f64[2, 3], %3:f64[3] .
                         let %4:dimension<3> = dimension_size [axis=1] %2
@@ -15657,8 +15963,8 @@ mod tests {
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2, 3] .
                 let %3:ref<f32[2]> = reference_new %1
                     %4:f32[3, 2] = transpose [permutation=[1, 0]] %2
-                    %5:dimension<2>, %6:ref<f32[2]>, %7:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
-                %0 %3 %4 [
+                    %5:dimension<2>, %6:ref<f32[2]>, %7:f32[3, 2] = scan [carry_count=2, iteration_count=3, \
+                    reverse=false] %0 %3 %4 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:ref<f32[2]>, %3:f32[2] .
                             let () = reference_add_update %2 %3
@@ -15674,8 +15980,8 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2, 3] .
                 let %3:f32[3, 2] = transpose [permutation=[1, 0]] %2
-                    %4:dimension<2>, %5:f32[2], %6:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 \
-                %3 [
+                    %4:dimension<2>, %5:f32[2], %6:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
+                    %0 %1 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2] .
                             let %4:f32[2] = add %2 %3
@@ -15720,8 +16026,8 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[3, 2], %2:f32[3, 2] .
                 let %3:ref<f32[3, 2]> = reference_new %1
-                    %4:dimension<2>, %5:ref<f32[3, 2]>, %6:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
-                %0 %3 %3 %2 [
+                    %4:dimension<2>, %5:ref<f32[3, 2]>, %6:f32[3, 2] = scan [carry_count=2, iteration_count=3, \
+                    reverse=false] %0 %3 %3 %2 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:ref<f32[3, 2]>, %3:ref<f32[3, 2]>, %4:f32[2] .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %4 %0
@@ -15855,124 +16161,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_zero_iteration_count_through_interpretation_partial_evaluation_and_batching() {
-        // A scan with a dynamic iteration count whose iteration count is zero runs no iteration when interpreted,
-        // partially evaluated, or batched: each staged program keeps one scan over the iteration count, and executing
-        // it with an iteration count of zero returns the initial carry next to empty stacks.
-        // `test_scan_differentiation_zero_iteration_count` covers the differentiation transforms of the same scan.
-        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
-        let length_type = DimensionType::from(length.clone());
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let stacked_type: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![length.clone().into()])).into();
-        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        body.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = body.add_input(scalar_type.clone());
-        let value = body.add_input(scalar_type.clone());
-        let product = body
-            .add_instruction(
-                TestIrOperation::Array(TestOperation::Mul(MulOperation::new())),
-                Vec::new(),
-                vec![carry, value],
-                None,
-            )
-            .unwrap()[0];
-        let body = body
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![product, product],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let program = scan_program(
-            ScanOperation::new(1, Dimension::Dynamic(length)),
-            body,
-            vec![scalar_type, stacked_type.clone(), length_type.clone().into()],
-        );
-        let carry = array(Array::scalar(2.0f64).unwrap());
-        let empty = array(Array::vector(Vec::<f64>::new()).unwrap());
-        let zero = dimension(&length_type, 0);
-
-        // Interpretation.
-        assert_eq!(
-            program.interpret(vec![carry.clone(), empty.clone(), zero.clone()]),
-            Ok(vec![carry.clone(), empty.clone()]),
-        );
-
-        // Partial evaluation with a known carry, whose final value the residual scan still computes.
-        let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Known(carry.clone()),
-                PartialValue::Unknown(stacked_type),
-                PartialValue::Unknown(length_type.into()),
-            ])
-            .unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
-                lambda %0:f64[length], %1:dimension<length ∈ [0, 4)>, %2:f64[] .
-                let %3:f64[], %4:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %0 %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = mul %1 %2
-                        in (%3, %3)
-                    },
-                ]
-                in (%3, %4)"},
-        );
-        assert_eq!(
-            evaluation.inputs,
-            vec![
-                PartialEvaluationInput::Unknown(1),
-                PartialEvaluationInput::Unknown(2),
-                PartialEvaluationInput::Known(carry.clone()),
-            ],
-        );
-        assert_eq!(
-            evaluation.interpret(&TestIrEagerContext::new(), &[empty.clone(), zero.clone()]),
-            Ok(vec![carry.clone(), empty.clone()]),
-        );
-
-        // Batching with a mapped carry and a mapped stack.
-        let extent = DimensionValue::constant(2).unwrap();
-        let batched = program
-            .batched_with_threaded_extent(
-                extent.r#type().into_owned(),
-                ShardingDimension::Replicated,
-                &[BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap();
-        assert_eq!(batched.output_axes(), &[BatchAxis::new(0), BatchAxis::new(1)]);
-        let batched = batched.into_parts().0;
-        assert_eq!(
-            batched.to_string(),
-            indoc! {"
-                lambda %0:dimension<2>, %1:f64[2], %2:f64[length, 2], %3:dimension<length ∈ [0, 4)> .
-                let %4:dimension<2>, %5:f64[2], %6:f64[length, 2] = scan [carry_count=2, iteration_count=length, reverse=false] \
-                %0 %1 %2 %3 [
-                    body={
-                        lambda %0:i64[], %1:dimension<2>, %2:f64[2], %3:f64[2] .
-                        let %4:f64[2] = mul %2 %3
-                        in (%1, %4, %4)
-                    },
-                ]
-                in (%0, %5, %6)"},
-        );
-        let carries = array(Array::vector(vec![2.0f64, 3.0]).unwrap());
-        let empty_batch =
-            array(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 2]), &[]).unwrap());
-        assert_eq!(
-            batched.interpret(vec![
-                TestIrValue::Dimension(extent.clone()),
-                carries.clone(),
-                empty_batch.clone(),
-                zero.clone(),
-            ]),
-            Ok(vec![TestIrValue::Dimension(extent), carries, empty_batch]),
-        );
-    }
-
-    #[test]
     fn test_scan_differentiation() {
         // Forward mode stages one fused scan whose carries and body boundaries pair every primal entry that has a live
         // tangent with that tangent.
@@ -15983,8 +16171,8 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
-                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, \
-                 reverse=false] %0 %2 %1 %3 [
+                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] \
+                %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %1 %3
@@ -16161,9 +16349,10 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[], %2:dimension<length ∈ [1, 8)> .
-                let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", \
-                 declared_types=[f32[length], dimension<length ∈ [1, 8)>]] %0 %2
-                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %3 %1 %4 [
+                let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", declared_types=[f32[length], \
+                dimension<length ∈ [1, 8)>]] %0 %2
+                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %3 \
+                    %1 %4 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[] .
                             let %3:f32[] = mul %2 %2
@@ -16243,8 +16432,8 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<3>, %3:f32[], %4:f32[length] .
-                let %5:f32[3], %6:dimension<3> = guard [boundary=\"scan\", \
-                 declared_types=[f32[length], dimension<length ∈ [1, 8)>]] %1 %2
+                let %5:f32[3], %6:dimension<3> = guard [boundary=\"scan\", declared_types=[f32[length], \
+                dimension<length ∈ [1, 8)>]] %1 %2
                     %7:dimension<length ∈ [1, 8)> = dimension_size [axis=0] %1
                     %8:f32[3] = cast [type=f32[3], inputs=[f32[length], dimension<length ∈ [1, 8)>, f32[3]]] %4 %7 %5
                     %9:f32[], %10:f32[] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %3 %5 %8 %6 [
@@ -16269,8 +16458,8 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<3> .
-                let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", \
-                 declared_types=[f32[length], dimension<length ∈ [1, 8)>]] %1 %2
+                let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", declared_types=[f32[length], \
+                dimension<length ∈ [1, 8)>]] %1 %2
                     %5:f32[], %6:f32[3] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %3 %4 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[] .
@@ -16375,7 +16564,7 @@ mod tests {
                     %8:dimension<length ∈ [1, 8)> = dimension_size [axis=0] %6
                     %9:f32[length] = cast [type=f32[length], inputs=[f32[3], dimension<length ∈ [1, 8)>]] %5 %8
                     %10:f32[], %11:ref<f32[length]>, %12:f32[] = scan [carry_count=3, iteration_count=length, \
-                 reverse=false] %0 %1 %4 %6 %9 %7 [
+                    reverse=false] %0 %1 %4 %6 %9 %7 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[length]>, %3:f32[], %4:f32[], %5:f32[] .
                             let %6:f32[] = mul %1 %4
@@ -16419,7 +16608,7 @@ mod tests {
                     retained_identities=[length],
                 ] %1 %2 %3
                     %6:f32[], %7:ref<f32[length]>, %8:f32[length] = scan [carry_count=2, iteration_count=length, \
-                 reverse=false] %0 %1 %4 %5 [
+                    reverse=false] %0 %1 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[length]>, %3:f32[] .
                             let %4:f32[] = mul %1 %3
@@ -16429,21 +16618,22 @@ mod tests {
                     %9:dimension<length ∈ [1, 8)> = dimension_size [axis=0] %4
                 in (%6, %9, %4, %8, %5)"},
         );
+        let dimension_type = "dimension<length ∈ [1, 8)>";
         assert_eq!(
             linearization.tangent().to_string(),
-            indoc! {r#"
-                lambda %0:f32[], %1:f32[3], %2:dimension<length ∈ [1, 8)>, %3:f32[length], %4:f32[length], %5:dimension<length ∈ [1, 8)> .
-                let %6:f32[length] = cast [type=f32[length], inputs=[f32[3], dimension<length ∈ [1, 8)>]] %1 %2
+            formatdoc! {"
+                lambda %0:f32[], %1:f32[3], %2:{dimension_type}, %3:f32[length], %4:f32[length], %5:{dimension_type} .
+                let %6:f32[length] = cast [type=f32[length], inputs=[f32[3], {dimension_type}]] %1 %2
                     %7:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %6 %3 %4 %5 [
-                        body={
+                        body={{
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
                             let %5:f32[] = mul %3 %1
                                 %6:f32[] = mul %4 %2
                                 %7:f32[] = add %5 %6
                             in (%7)
-                        },
+                        }},
                     ]
-                in (%7)"#},
+                in (%7)"},
         );
         let primal = linearization.primal().interpret(inputs(3)[..4].to_vec()).unwrap();
         let three = dimension(&DimensionType::from(length.clone()), 3);
@@ -16487,9 +16677,10 @@ mod tests {
         assert_eq!(
             program.linearize_with_respect_to(&[1]).map(|linearization| linearization.primal().to_string()),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument {
-                message: "`reference_add_update` writes a live tangent into a reference that carries no tangent; pass \
-                          the reference as a differentiated input instead of capturing it"
-                    .to_string(),
+                message: format!(
+                    "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` writes a live tangent into a reference that carries no \
+                     tangent; pass the reference as a differentiated input instead of capturing it",
+                ),
             })),
         );
     }
@@ -16629,7 +16820,7 @@ mod tests {
                 assert_eq!(direct, Err(input_dimension_mismatch("n", 2, 3)));
                 assert_eq!(
                     single_scan_program(&body, 2, length).interpret(primals.clone()),
-                    Err(input_dimension_mismatch("n", 2, 3))
+                    Err(input_dimension_mismatch("n", 2, 3)),
                 );
                 assert_eq!(
                     linearize_scan_rule(&operation, &body, primals.clone(), &[]).map(|_| ()),
@@ -16641,20 +16832,94 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_linearizes_zero_iteration_count_reference_carries() {
-        // Linearizing a reference carry of a scan with no iterations must not restore an unused residual dimension
-        // whose identity the tangent body's inputs already establish.
+        // Restoring a dimension shared by a numeric carry and a reference carry must keep one nominal identity.
+        // Cover an empty scan and a pass-through scan, with the numeric carry tangent active or structural zero.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()]));
         let body = pass_through_body(&[vector_type.clone().into(), ReferenceType::new(vector_type).into()]);
         for length in [0, 2] {
             let program = single_scan_program(&body, 2, length);
-            for input_indices in [vec![0, 1], vec![1]] {
+            let (primal_rendering, tangent_renderings) = if length == 0 {
+                (
+                    indoc! {"
+                        lambda %0:f32[n], %1:ref<f32[n]> .
+                        let %2:f32[n], %3:ref<f32[n]>, %4:i64[0] = scan [carry_count=2, iteration_count=0, \
+                        reverse=false] %0 %1 [
+                            body={
+                                lambda %0:i64[], %1:f32[n], %2:ref<f32[n]> .
+                                let %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %1
+                                    %4:i64[] = dimension_to_scalar %3
+                                in (%1, %2, %4)
+                            },
+                        ]
+                            %5:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                        in (%0, %1, %4, %5)"},
+                    [
+                        indoc! {"
+                            lambda %0:f32[n], %1:ref<f32[n]>, %2:i64[0], %3:dimension<n ∈ [1, 8)> .
+                            let %4:f32[n], %5:ref<f32[n]> = scan [carry_count=2, iteration_count=0, reverse=false] %0 \
+                            %1 %2 [
+                                body={
+                                    lambda %0:i64[], %1:f32[n], %2:ref<f32[n]>, %3:i64[] .
+                                    in (%1, %2)
+                                },
+                            ]
+                            in (%0, %5)"},
+                        indoc! {"
+                            lambda %0:ref<f32[n]>, %1:i64[0], %2:dimension<n ∈ [1, 8)> .
+                            let %3:f32[n] = zero [type=f32[n]] %2
+                                %4:ref<f32[n]> = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
+                                    body={
+                                        lambda %0:i64[], %1:ref<f32[n]>, %2:i64[] .
+                                        in (%1)
+                                    },
+                                ]
+                            in (%3, %4)"},
+                    ],
+                )
+            } else {
+                (
+                    indoc! {"
+                        lambda %0:f32[n], %1:ref<f32[n]> .
+                        let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                        in (%0, %1, %2)"},
+                    [
+                        indoc! {"
+                            lambda %0:f32[n], %1:ref<f32[n]>, %2:dimension<n ∈ [1, 8)> .
+                            let %3:f32[n], %4:ref<f32[n]> = scan [carry_count=2, iteration_count=2, reverse=false] %0 \
+                            %1 [
+                                body={
+                                    lambda %0:i64[], %1:f32[n], %2:ref<f32[n]> .
+                                    in (%1, %2)
+                                },
+                            ]
+                            in (%0, %4)"},
+                        indoc! {"
+                            lambda %0:ref<f32[n]>, %1:dimension<n ∈ [1, 8)> .
+                            let %2:f32[n] = zero [type=f32[n]] %1
+                                %3:ref<f32[n]> = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
+                                    body={
+                                        lambda %0:i64[], %1:ref<f32[n]> .
+                                        in (%1)
+                                    },
+                                ]
+                            in (%2, %3)"},
+                    ],
+                )
+            };
+            for (input_indices, tangent_rendering) in [vec![0, 1], vec![1]].into_iter().zip(tangent_renderings) {
                 let linearization = program.linearize_with_respect_to(&input_indices).unwrap();
+                assert_eq!(linearization.primal().to_string(), primal_rendering);
+                assert_eq!(linearization.tangent().to_string(), tangent_rendering);
                 let vector = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
                 let reference =
                     TestIrValue::Reference(ArrayReference::new(Array::vector(vec![4f32, 5.0, 6.0]).unwrap()));
-                let primal = linearization.primal().interpret(vec![vector.clone(), reference.clone()]).unwrap();
-                assert_eq!(primal[..2], [vector, reference]);
+                let mut expected = vec![vector.clone(), reference.clone()];
+                if length == 0 {
+                    expected.push(array(Array::vector(Vec::<i64>::new()).unwrap()));
+                }
+                expected.push(dimension(&n_type, 3));
+                assert_eq!(linearization.primal().interpret(vec![vector, reference]), Ok(expected));
             }
         }
     }
@@ -16767,7 +17032,8 @@ mod tests {
             format!(
                 indoc! {"
                     lambda %0:f32[3], %1:ref<f32[3]> .
-                    let %2:f32[3], %3:ref<f32[3]> = scan [carry_count=2, iteration_count={length}, reverse={reverse}] %0 %1 [
+                    let %2:f32[3], %3:ref<f32[3]> = scan [carry_count=2, iteration_count={length}, reverse={reverse}] \
+                    %0 %1 [
                         body={{
                             lambda %0:i64[], %1:f32[3], %2:ref<f32[3]> .
                             let %3:f32[3] = zero [type=f32[3]]
@@ -16905,7 +17171,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
                 let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true, \
-                 unroll=2] %0 %2 %1 %3 [
+                unroll=2] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %1 %3
@@ -16925,7 +17191,8 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 [
+                let %2:f64[], %3:f64[3], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] \
+                %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -16968,24 +17235,66 @@ mod tests {
         let operation =
             TestScanOperation::new(1, 3).with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]);
         let program = scan_program(operation, product_body(), vec![carry_type, stack_type]);
-        let placed = |program: &TestProgram| {
-            program
-                .entry_region_ref()
-                .instructions()
-                .iter()
-                .filter_map(|instruction| match instruction.operation() {
-                    TestOperation::Scan(scan) => Some((scan.carry_count(), scan.stacked_axis_shardings().to_vec())),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        let placement = ShardingDimension::sharded(["x"]);
-        // The fused scan stacks the primal output and then its tangent, both placed like the output.
-        assert_eq!(placed(&program.jvp().unwrap()), vec![(2, vec![placement.clone(), placement.clone()])]);
-        // The primal scan stacks the output and then its residuals, which are replicated.
+        let scalar = "f64[][sharding={mesh<['x'=1:auto]>, []}]";
+        let stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{'x'}]}]";
+        let residual_stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{}]}]";
+
+        // The fused scan stacks the primal output and its tangent at the requested scan-axis sharding.
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            formatdoc! {"
+                lambda %0:{scalar}, %1:{stack}, %2:{scalar}, %3:{stack} .
+                let %4:{scalar}, %5:{scalar}, %6:{stack}, %7:{stack} = scan [
+                    carry_count=2,
+                    iteration_count=3,
+                    reverse=false,
+                    stacked_axis_shardings=[{{'x'}}, {{'x'}}],
+                ] %0 %2 %1 %3 [
+                    body={{
+                        lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar}, %4:{scalar} .
+                        let %5:{scalar} = mul %1 %3
+                            %6:{scalar} = mul %3 %2
+                            %7:{scalar} = mul %1 %4
+                            %8:{scalar} = add %6 %7
+                        in (%5, %8, %5, %8)
+                    }},
+                ]
+                in (%4, %6, %5, %7)"},
+        );
+
+        // The primal scan stores its carry residual with a replicated leading axis; its output and the tangent
+        // scan's output retain the requested sharding.
         let linearization = program.linearize().unwrap();
-        assert_eq!(placed(linearization.primal()), vec![(1, vec![placement.clone()])]);
-        assert_eq!(placed(linearization.tangent()), vec![(1, vec![placement])]);
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {"
+                lambda %0:{scalar}, %1:{stack} .
+                let %2:{scalar}, %3:{stack}, %4:{residual_stack} = scan [carry_count=1, iteration_count=3, \
+                reverse=false, stacked_axis_shardings=[{{'x'}}]] %0 %1 [
+                    body={{
+                        lambda %0:i64[], %1:{scalar}, %2:{scalar} .
+                        let %3:{scalar} = mul %1 %2
+                        in (%3, %3, %1)
+                    }},
+                ]
+                in (%2, %3, %1, %4)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{scalar}, %1:{stack}, %2:{stack}, %3:{residual_stack} .
+                let %4:{scalar}, %5:{stack} = scan [carry_count=1, iteration_count=3, reverse=false, \
+                stacked_axis_shardings=[{{'x'}}]] %0 %1 %2 %3 [
+                    body={{
+                        lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar}, %4:{scalar} .
+                        let %5:{scalar} = mul %3 %1
+                            %6:{scalar} = mul %4 %2
+                            %7:{scalar} = add %5 %6
+                        in (%7, %7)
+                    }},
+                ]
+                in (%4, %5)"},
+        );
     }
 
     #[test]
@@ -17029,8 +17338,8 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[0], %2:f64[], %3:f64[0] .
-                let %4:f64[], %5:f64[], %6:f64[0], %7:f64[0] = scan [carry_count=2, iteration_count=0, \
-                 reverse=false] %0 %2 %1 %3 [
+                let %4:f64[], %5:f64[], %6:f64[0], %7:f64[0] = scan [carry_count=2, iteration_count=0, reverse=false] \
+                %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %1 %3
@@ -17056,7 +17365,7 @@ mod tests {
         assert_eq!(final_carry, Array::scalar(2.0).unwrap());
         assert_eq!(
             pullback.apply(Array::scalar(5.0).unwrap()),
-            Ok((MaybeZero::Value(Array::scalar(5.0).unwrap()), MaybeZero::Value(empty)))
+            Ok((MaybeZero::Value(Array::scalar(5.0).unwrap()), MaybeZero::Value(empty))),
         );
 
         // A residual computed from an invariant carry still belongs to the body when no iteration can run.
@@ -17167,8 +17476,8 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 4)> .
-                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] \
-                %0 %1 %2 [
+                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, iteration_count=length, \
+                reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -17181,7 +17490,8 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [0, 4)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 \
+                %3 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -17197,7 +17507,8 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [0, 4)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 %2 %3 \
+                %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = add %1 %2
@@ -17260,11 +17571,11 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[], %2:dimension<length ∈ [0, 8)>, %3:f32[3], %4:f32[] .
-                let %5:f32[3], %6:dimension<3> = guard [boundary=\"scan\", \
-                 declared_types=[f32[length], dimension<length ∈ [0, 8)>]] %0 %2
+                let %5:f32[3], %6:dimension<3> = guard [boundary=\"scan\", declared_types=[f32[length], \
+                dimension<length ∈ [0, 8)>]] %0 %2
                     %7:f32[3] = cast [type=f32[3], inputs=[f32[3], f32[3]]] %3 %5
-                    %8:f32[3], %9:f32[], %10:f32[3], %11:f32[] = scan [carry_count=4, iteration_count=length, reverse=false] \
-                 %5 %1 %7 %4 %6 [
+                    %8:f32[3], %9:f32[], %10:f32[3], %11:f32[] = scan [carry_count=4, iteration_count=length, \
+                    reverse=false] %5 %1 %7 %4 %6 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[], %3:f32[3], %4:f32[] .
                             let %5:f32[] = mul %2 %2
@@ -17303,9 +17614,10 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[], %2:dimension<length ∈ [0, 8)> .
-                let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", \
-                 declared_types=[f32[length], dimension<length ∈ [0, 8)>]] %0 %2
-                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %3 %1 %4 [
+                let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", declared_types=[f32[length], \
+                dimension<length ∈ [0, 8)>]] %0 %2
+                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %3 \
+                    %1 %4 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[] .
                             let %3:f32[] = mul %2 %2
@@ -17367,7 +17679,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)>, %3:f32[], %4:f32[length] .
                 let %5:f32[], %6:f32[], %7:f32[length], %8:f32[length] = scan [carry_count=2, iteration_count=length, \
-                 reverse=false] %0 %3 %1 %4 %2 [
+                reverse=false] %0 %3 %1 %4 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
                         let %5:f32[] = mul %1 %3
@@ -17441,8 +17753,8 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 4)> .
-                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] \
-                    %0 %1 %2 [
+                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, iteration_count=length, \
+                reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %1
@@ -17513,9 +17825,9 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:dimension<carry_extent ∈ [1, 8)>, %1:f64[], %2:f64[length], %3:dimension<length ∈ [1, 8)>, \
-                 %4:f64[], %5:f64[length] .
+                %4:f64[], %5:f64[length] .
                 let %6:dimension<carry_extent ∈ [1, 8)>, %7:f64[], %8:f64[], %9:f64[length], %10:f64[length] = scan \
-                 [carry_count=3, iteration_count=length, reverse=false] %0 %1 %4 %2 %5 %3 [
+                [carry_count=3, iteration_count=length, reverse=false] %0 %1 %4 %2 %5 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<carry_extent ∈ [1, 8)>, %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
                         let %6:f64[] = mul %2 %4
@@ -17556,8 +17868,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<carry_extent ∈ [1, 8)>, %1:f64[], %2:f64[length], %3:dimension<length ∈ [1, 8)> .
                 let %4:dimension<carry_extent ∈ [1, 8)>, %5:f64[], %6:f64[length], %7:f64[length] = scan \
-                 [carry_count=2, \
-                 iteration_count=length, reverse=false] %0 %1 %2 %3 [
+                [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<carry_extent ∈ [1, 8)>, %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %2 %3
@@ -17572,7 +17883,8 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [1, 8)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 \
+                %3 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -17589,7 +17901,8 @@ mod tests {
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [1, 8)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 %2 %3 \
+                %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = add %1 %2
@@ -17699,7 +18012,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[3] = const [2.0, 3.0, 4.0]
-                    %3:f64[], %4:f64[], %5:f64[3], %6:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
+                    %3:f64[], %4:f64[], %5:f64[3], %6:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] \
+                    %0 %1 %2 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                             let %4:f64[] = mul %1 %3
@@ -17749,8 +18063,8 @@ mod tests {
                 lambda %0:f64[3], %1:f64[3] .
                 let %2:f64[] = const 0.0
                     %3:f64[] = zero [type=f64[]]
-                    %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, \
-                     reverse=false] %2 %3 %0 %1 [
+                    %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] \
+                    %2 %3 %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                             let %5:f64[] = add %1 %3
@@ -17836,15 +18150,15 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[3, extent], %3:f64[extent], %4:f64[3, \
-                 extent] .
+                extent] .
                 let %5:f64[extent] = stop_gradient %1
                     %6:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %5
                     %7:f64[extent] = zero [type=f64[extent]] %6
-                    %8:dimension<extent ∈ [1, 8)>, %9:f64[extent], %10:f64[extent] = scan [carry_count=3, iteration_count=3, \
-                 reverse=false] %0 %5 %7 %2 %4 [
+                    %8:dimension<extent ∈ [1, 8)>, %9:f64[extent], %10:f64[extent] = scan [carry_count=3, \
+                    iteration_count=3, reverse=false] %0 %5 %7 %2 %4 [
                         body={
                             lambda %0:i64[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:f64[extent], \
-                 %4:f64[extent], %5:f64[extent] .
+                            %4:f64[extent], %5:f64[extent] .
                             let %6:f64[extent] = add %2 %4
                                 %7:f64[extent] = add %3 %5
                             in (%1, %6, %7)
@@ -17896,8 +18210,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
                 let %4:f64[] = const 0.0
-                    %5:f64[], %6:f64[], %7:f64[], %8:f64[3] = scan [carry_count=3, iteration_count=3, \
-                     reverse=false] %4 %0 %2 %1 %3 [
+                    %5:f64[], %6:f64[], %7:f64[], %8:f64[3] = scan [carry_count=3, iteration_count=3, reverse=false] \
+                    %4 %0 %2 %1 %3 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
                             let %6:f64[] = const 1.0
@@ -17954,8 +18268,8 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
-                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, iteration_count=3, \
-                 reverse=false] %0 %1 %3 %4 %2 %5 [
+                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, iteration_count=3, reverse=false] \
+                %0 %1 %3 %4 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
                         let %7:f64[] = mul %1 %5
@@ -17989,7 +18303,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
                 let %4:f64[] = const 2.0
-                    %5:f64[], %6:f64[], %7:f64[] = scan [carry_count=3, iteration_count=3, reverse=false] %4 %0 %2 %1 %3 [
+                    %5:f64[], %6:f64[], %7:f64[] = scan [carry_count=3, iteration_count=3, reverse=false] %4 %0 %2 %1 \
+                    %3 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
                             let %6:f64[] = mul %1 %4
@@ -18051,8 +18366,8 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
-                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, iteration_count=3, \
-                 reverse=false] %3 %4 %0 %1 %2 %5 [
+                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, iteration_count=3, reverse=false] \
+                %3 %4 %0 %1 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
                         let %7:f64[] = mul %1 %4
@@ -18166,7 +18481,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
                 let %6:f64[], %7:f64[], %8:f64[], %9:f64[], %10:f64[3] = scan [carry_count=4, iteration_count=3, \
-                 reverse=true] %3 %4 %0 %1 %2 %5 [
+                reverse=true] %3 %4 %0 %1 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
                         let %7:f64[] = mul %1 %4
@@ -18190,7 +18505,7 @@ mod tests {
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
                 let %6:f64[] = zero [type=f64[]]
                     %7:f64[], %8:f64[], %9:f64[], %10:f64[], %11:f64[3] = scan [carry_count=4, iteration_count=3, \
-                 reverse=false] %3 %4 %0 %6 %2 %5 [
+                    reverse=false] %3 %4 %0 %6 %2 %5 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
                             let %7:f64[] = add %5 %3
@@ -18334,8 +18649,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:u64[] .
                 let %2:f64[], %3:u64[], %4:f64[2], %5:i64[2], %6:i64[2] = scan [carry_count=2, iteration_count=2, \
-                 reverse=false] \
-                 %0 %1 [
+                reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:u64[] .
                         let %3:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %2
@@ -18422,7 +18736,7 @@ mod tests {
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().program().interpret(pullback_inputs),
-            Ok(vec![array(Array::scalar(2.0).unwrap())])
+            Ok(vec![array(Array::scalar(2.0).unwrap())]),
         );
     }
 
@@ -18459,14 +18773,14 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
-                    %1:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                %1:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
-                    %3:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
-                    %4:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                    scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
+                %3:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %4:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = scan [carry_count=1, \
+                iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
-                            %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                        %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
                         let %3:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %1 %2
                         in (%3, %3, %1)
                     },
@@ -18541,8 +18855,8 @@ mod tests {
             formatdoc! {"
                 lambda %0:{scalar}, %1:{stack}, %2:{stack} .
                 let %3:{scalar} = zero [type={scalar}]
-                    %4:{scalar}, %5:{scalar}, %6:{stack}, %7:{stack} = scan [carry_count=2, iteration_count=3, reverse=false] \
-                 %0 %3 %1 %2 [
+                    %4:{scalar}, %5:{scalar}, %6:{stack}, %7:{stack} = scan [carry_count=2, iteration_count=3, \
+                    reverse=false] %0 %3 %1 %2 [
                         body={{
                             lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar}, %4:{scalar} .
                             let %5:{scalar} = add %1 %3
@@ -18572,8 +18886,8 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_zero_space_carries() {
-        // A scan whose carries mix a differentiable accumulator with a zero-differential-space element: here a `u64`
-        // key, the shape of every keyed training loop. The body maps `[accumulator, key, x]` to
+        // The carries mix a differentiable accumulator with a `u64` key whose differential space is zero. The body maps
+        // `[accumulator, key, x]` to
         // `[accumulator * x, key, accumulator * x]`. The compact fused-JVP contract omits the key's tangent slot on
         // both the carry and the output boundaries, and reverse mode returns a typed zero-space cotangent for the key
         // input at the public boundary.
@@ -18598,7 +18912,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:u64[], %2:f64[3], %3:f64[], %4:f64[3] .
                 let %5:f64[], %6:u64[], %7:f64[], %8:f64[3], %9:f64[3] = scan [carry_count=3, iteration_count=3, \
-                 reverse=false] %0 %1 %3 %2 %4 [
+                reverse=false] %0 %1 %3 %2 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:u64[], %3:f64[], %4:f64[], %5:f64[] .
                         let %6:f64[] = mul %1 %4
@@ -18654,9 +18968,8 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3], %2:f64[3], %3:f64[2, 3] .
-                let %4:f64[3], %5:f64[3], %6:f64[2, 3], %7:f64[2, 3] = scan [carry_count=2, iteration_count=2, reverse=false] \
-                 %0 \
-                 %2 %1 %3 [
+                let %4:f64[3], %5:f64[3], %6:f64[2, 3], %7:f64[2, 3] = scan [carry_count=2, iteration_count=2, \
+                reverse=false] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[3] .
                         let %5:f64[3] = add %1 %3
@@ -18898,10 +19211,8 @@ mod tests {
                 vec![Array::scalar(24.0).unwrap(), Array::vector(vec![12.0, 8.0, 6.0]).unwrap()],
             );
         }
-        let hessian = TestEagerContext::new()
-            .differentiate_at(primals)
-            .hessian(|(initial, values)| apply_product_scan(initial, values))
-            .unwrap();
+        let hessian =
+            differentiate_at(primals).hessian(|(initial, values)| apply_product_scan(initial, values)).unwrap();
         assert_eq!(
             hessian.iter_blocks().map(|block| block.value().to_f64s()).collect::<Vec<_>>(),
             vec![
@@ -18930,10 +19241,10 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3], %4:f64[], %5:f64[3], %6:f64[], %7:f64[3] .
                 let %8:f64[], %9:f64[], %10:f64[], %11:f64[], %12:f64[3], %13:f64[3], %14:f64[3], %15:f64[3] = scan \
-                 [carry_count=4, iteration_count=3, reverse=false] %0 %2 %4 %6 %1 %3 %5 %7 [
+                [carry_count=4, iteration_count=3, reverse=false] %0 %2 %4 %6 %1 %3 %5 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
-                 %8:f64[] .
+                        %8:f64[] .
                         let %9:f64[] = mul %1 %5
                             %10:f64[] = mul %5 %2
                             %11:f64[] = mul %1 %6
@@ -18998,8 +19309,8 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
-                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3] = scan [carry_count=2, iteration_count=3, \
-                 reverse=false] %0 %2 %1 %3 [
+                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3] = scan [carry_count=2, \
+                iteration_count=3, reverse=false] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %1 %3
@@ -19017,11 +19328,11 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[3], %6:f64[3], %7:f64[3] .
-                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %2 \
-                 %1 %3 %4 %5 %6 %7 [
+                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, \
+                reverse=false] %0 %2 %1 %3 %4 %5 %6 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
-                 %8:f64[] .
+                        %8:f64[] .
                         let %9:f64[] = mul %5 %1
                             %10:f64[] = mul %6 %3
                             %11:f64[] = add %9 %10
@@ -19044,11 +19355,11 @@ mod tests {
             pullback.program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[3], %6:f64[3], %7:f64[3] .
-                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %0 %2 \
-                 %1 %3 %4 %5 %6 %7 [
+                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, \
+                reverse=true] %0 %2 %1 %3 %4 %5 %6 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
-                 %8:f64[] .
+                        %8:f64[] .
                         let %9:f64[] = add %2 %4
                             %10:f64[] = mul %8 %9
                             %11:f64[] = add %1 %3
@@ -19098,11 +19409,11 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[], %5:f64[3], %6:f64[3], %7:f64[3] .
-                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %0 %4 \
-                 %1 %2 %3 %5 %6 %7 [
+                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, \
+                reverse=true] %0 %4 %1 %2 %3 %5 %6 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
-                 %8:f64[] .
+                        %8:f64[] .
                         let %9:f64[] = add %1 %3
                             %10:f64[] = mul %4 %9
                             %11:f64[] = mul %9 %7
@@ -19165,8 +19476,8 @@ mod tests {
                     %4:f64[3, 2] = transpose [permutation=[1, 0]] %1
                     %5:f64[3, 2] = transpose [permutation=[1, 0]] %2
                     %6:f64[2] = zero [type=f64[2]]
-                    %7:f64[2], %8:f64[2], %9:f64[3, 2], %10:f64[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
-                 %3 %6 %4 %5 [
+                    %7:f64[2], %8:f64[2], %9:f64[3, 2], %10:f64[3, 2] = scan [carry_count=2, iteration_count=3, \
+                    reverse=false] %3 %6 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2], %3:f64[2], %4:f64[2] .
                             let %5:f64[2] = mul %1 %3
@@ -19202,8 +19513,8 @@ mod tests {
                     %5:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %4
                     %6:f64[3, 2] = transpose [permutation=[1, 0]] %1
                     %7:f64[3, 2] = transpose [permutation=[1, 0]] %2
-                    %8:f64[2], %9:f64[2], %10:f64[3, 2], %11:f64[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
-                 %3 %5 %6 %7 [
+                    %8:f64[2], %9:f64[2], %10:f64[3, 2], %11:f64[3, 2] = scan [carry_count=2, iteration_count=3, \
+                    reverse=false] %3 %5 %6 %7 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2], %3:f64[2], %4:f64[2] .
                             let %5:f64[2] = mul %1 %3
@@ -19234,7 +19545,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transform_orders_with_an_unknown_iteration_count() {
+    fn test_scan_differentiation_composes_with_batching_with_an_unknown_iteration_count() {
         // A cumulative product with a dynamic iteration count whose stacked input alone is differentiated and mapped.
         // Both orders of batching and forward-mode differentiation stage the same fused scan, which keeps the trailing
         // iteration count and threads the batch extent as a leading carry, and both compute the same values.
@@ -19283,7 +19594,7 @@ mod tests {
                     %7:f32[length, 2] = transpose [permutation=[1, 0]] %4
                     %8:f32[2] = zero [type=f32[2]]
                     %9:dimension<2>, %10:f32[2], %11:f32[2], %12:f32[length, 2], %13:f32[length, 2] = scan \
-                 [carry_count=3, iteration_count=length, reverse=false] %0 %5 %8 %6 %7 %3 [
+                    [carry_count=3, iteration_count=length, reverse=false] %0 %5 %8 %6 %7 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2], %4:f32[2], %5:f32[2] .
                             let %6:f32[2] = mul %2 %4
@@ -19320,7 +19631,7 @@ mod tests {
                     %8:f32[length, 2] = transpose [permutation=[1, 0]] %2
                     %9:f32[length, 2] = transpose [permutation=[1, 0]] %4
                     %10:dimension<2>, %11:f32[2], %12:f32[2], %13:f32[length, 2], %14:f32[length, 2] = scan \
-                 [carry_count=3, iteration_count=length, reverse=false] %0 %5 %7 %8 %9 %3 [
+                    [carry_count=3, iteration_count=length, reverse=false] %0 %5 %7 %8 %9 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2], %4:f32[2], %5:f32[2] .
                             let %6:f32[2] = mul %2 %4
@@ -19369,7 +19680,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[length], %1:dimension<length ∈ [1, 8)>, %2:f32[length], %3:f32[], %4:f32[] .
                 let %5:f32[], %6:f32[], %7:f32[length], %8:f32[length] = scan [carry_count=2, iteration_count=length, \
-                 reverse=false] %3 %4 %0 %2 %1 [
+                reverse=false] %3 %4 %0 %2 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
                         let %5:f32[] = mul %1 %3
@@ -19493,10 +19804,9 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_reuses_the_shared_body_transforms() {
-        // The `scan` differentiation rules reach their body through the per-region transform cache, so several programs
-        // attaching one shared body derive its fused forward-mode program once and its transposition once per linearity
-        // mask, while staging exactly the programs that the uncached path stages from independently built copies of the
-        // same body.
+        // Programs that attach one shared body retain separate linearizations for their different epilogues. The
+        // body's retained transposition is reused, and the staged programs agree with those derived from a fresh
+        // body with no retained transforms.
         /// Builds a program that scans the provided body over three slices and then applies `epilogue` sines to the
         /// final carry, so that programs sharing one body still have distinct derived programs.
         fn scanning_program(body: &Arc<TestProgram>, epilogue: usize) -> TestProgram {
@@ -19613,8 +19923,8 @@ mod tests {
             pushforward.program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[4] .
-                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, iteration_count=4, reverse=false] %0 %1 %2 \
-                 %3 [
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, iteration_count=4, reverse=false] \
+                %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         in (%2, %3, %4, %1)
@@ -19735,8 +20045,6 @@ mod tests {
         assert_eq!(
             linearization
                 .pushforward()
-                .as_ref()
-                .clone()
                 .interpret(vec![Array::matrix(3, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap()]),
             Ok(vec![Array::matrix(3, 1, vec![1.0, 5.0, 9.0]).unwrap()]),
         );
@@ -19770,7 +20078,7 @@ mod tests {
                 let %6:ref<f32[]> = reference_new %1
                     %7:ref<f32[]> = reference_new %4
                     %8:f32[], %9:ref<f32[]>, %10:f32[], %11:ref<f32[]>, %12:f32[3], %13:f32[3] = scan [carry_count=4, \
-                 iteration_count=3, reverse=false] %0 %6 %3 %7 %2 %5 [
+                    iteration_count=3, reverse=false] %0 %6 %3 %7 %2 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[]>, %3:f32[], %4:ref<f32[]>, %5:f32[], %6:f32[] .
                             let () = reference_add_update %2 %5
@@ -19807,8 +20115,8 @@ mod tests {
             discharged_jvp.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[3], %3:f32[], %4:f32[], %5:f32[3] .
-                let %6:f32[], %7:f32[], %8:f32[], %9:f32[], %10:f32[3], %11:f32[3] = scan [carry_count=4, iteration_count=3, \
-                 reverse=false] %0 %1 %3 %4 %2 %5 [
+                let %6:f32[], %7:f32[], %8:f32[], %9:f32[], %10:f32[3], %11:f32[3] = scan [carry_count=4, \
+                iteration_count=3, reverse=false] %0 %1 %3 %4 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[], %5:f32[], %6:f32[] .
                         let %7:f32[] = add %1 %5
@@ -19884,7 +20192,8 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
-                let %3:ref<f32[]>, %4:f32[], %5:f32[] = scan [carry_count=3, iteration_count=3, reverse=false] %0 %1 %2 [
+                let %3:ref<f32[]>, %4:f32[], %5:f32[] = scan [carry_count=3, iteration_count=3, reverse=false] %0 %1 \
+                %2 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[], %3:f32[] .
                         let %4:f32[] = add %2 %2
@@ -19909,7 +20218,7 @@ mod tests {
                 TestIrValue::Array(Array::scalar(5.0f32).unwrap()),
                 TestIrValue::Array(Array::scalar(16.0f32).unwrap()),
                 TestIrValue::Array(Array::scalar(0.0f32).unwrap()),
-            ])
+            ]),
         );
     }
 
@@ -20102,20 +20411,20 @@ mod tests {
             ArrayType::new_static(DataType::F64, [3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
         let initial = Array::from_elements::<f64>(carry_type.clone(), &[1.0]).unwrap();
         let values = Array::from_elements::<f64>(stack_type.clone(), &[2.0, 3.0, 4.0]).unwrap();
-        let (output, pullback) = TestEagerContext::new()
-            .vjp(|(initial, values), ()| apply_product_scan(initial, values), (initial, values), ())
+        let (output, pullback) = differentiate_at((initial, values))
+            .vjp(|(initial, values)| apply_product_scan(initial, values))
             .unwrap();
         assert_eq!(
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:f64[][sharding={mesh<['x'=1:auto]>, []}], %1:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], \
-                 %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
-                let %4:f64[][sharding={mesh<['x'=1:auto]>, []}], %5:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] = scan \
-                 [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 %3 [
+                %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
+                let %4:f64[][sharding={mesh<['x'=1:auto]>, []}], %5:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] = \
+                scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[][sharding={mesh<['x'=1:auto]>, []}], \
-                 %2:f64[][sharding={mesh<['x'=1:auto]>, []}], %3:f64[][sharding={mesh<['x'=1:auto]>, []}], \
-                 %4:f64[][sharding={mesh<['x'=1:auto]>, []}] .
+                        %2:f64[][sharding={mesh<['x'=1:auto]>, []}], %3:f64[][sharding={mesh<['x'=1:auto]>, []}], \
+                        %4:f64[][sharding={mesh<['x'=1:auto]>, []}] .
                         let %5:f64[][sharding={mesh<['x'=1:auto]>, []}] = mul %3 %1
                             %6:f64[][sharding={mesh<['x'=1:auto]>, []}] = mul %4 %2
                             %7:f64[][sharding={mesh<['x'=1:auto]>, []}] = add %5 %6
@@ -20130,12 +20439,12 @@ mod tests {
             pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[][sharding={mesh<['x'=1:auto]>, []}], %1:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], \
-                 %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
-                let %3:f64[][sharding={mesh<['x'=1:auto]>, []}], %4:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] = scan \
-                 [carry_count=1, iteration_count=3, reverse=true] %0 %1 %2 [
+                %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
+                let %3:f64[][sharding={mesh<['x'=1:auto]>, []}], %4:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] = \
+                scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[][sharding={mesh<['x'=1:auto]>, []}], \
-                 %2:f64[][sharding={mesh<['x'=1:auto]>, []}], %3:f64[][sharding={mesh<['x'=1:auto]>, []}] .
+                        %2:f64[][sharding={mesh<['x'=1:auto]>, []}], %3:f64[][sharding={mesh<['x'=1:auto]>, []}] .
                         let %4:f64[][sharding={mesh<['x'=1:auto]>, []}] = mul %2 %1
                             %5:f64[][sharding={mesh<['x'=1:auto]>, []}] = mul %3 %1
                         in (%4, %5)
@@ -20306,7 +20615,7 @@ mod tests {
         assert_eq!(final_carry, TestIrValue::Array(Array::scalar(6.0f32).unwrap()));
         assert_eq!(
             pullback.apply(TestIrValue::Array(Array::scalar(1.0f32).unwrap())),
-            Ok(MaybeZero::Value(TestIrValue::Array(Array::scalar(6.0f32).unwrap())))
+            Ok(MaybeZero::Value(TestIrValue::Array(Array::scalar(6.0f32).unwrap()))),
         );
     }
 
@@ -20327,30 +20636,34 @@ mod tests {
         let operation =
             TestScanOperation::new(1, 3).with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]);
         let initial = Array::from_elements::<f64>(carry_type.clone(), &[1.0]).unwrap();
-        for stack_type in [sharded_stack_type, replicated_stack_type] {
+        let scalar = "f64[][sharding={mesh<['x'=1:auto]>, []}]";
+        let sharded_stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{'x'}]}]";
+        let replicated_stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{}]}]";
+        for (stack_type, stack, sharding_attributes) in [
+            (sharded_stack_type.clone(), sharded_stack, ", stacked_axis_shardings=[{'x'}]"),
+            (replicated_stack_type.clone(), replicated_stack, ""),
+        ] {
             let values = Array::from_elements::<f64>(stack_type.clone(), &[2.0, 3.0, 4.0]).unwrap();
             let operation = operation.clone();
-            let (output, pullback) = TestEagerContext::new()
-                .vjp(
-                    |(initial, values), ()| Ok(bind_scan(operation, product_body(), &[initial, values])?.remove(0)),
-                    (initial.clone(), values),
-                    (),
-                )
+            let (output, pullback) = differentiate_at((initial.clone(), values))
+                .vjp(|(initial, values)| Ok(bind_scan(operation, product_body(), &[initial, values])?.remove(0)))
                 .unwrap();
             assert_eq!(output.to_f64s(), vec![24.0]);
-            let stacked_axis_sharding = stack_type
-                .sharding()
-                .map(|sharding| sharding.dimensions()[0].clone())
-                .unwrap_or(ShardingDimension::Replicated);
             let transposed = pullback.transposed_program(&[]).unwrap();
-            let reversed = transposed.program().entry_region_ref().instructions()[0].operation().clone();
             assert_eq!(
-                reversed,
-                TestOperation::Scan(
-                    TestScanOperation::new(1, 3)
-                        .with_reverse(true)
-                        .with_stacked_axis_shardings(vec![stacked_axis_sharding]),
-                ),
+                transposed.program().to_string(),
+                formatdoc! {"
+                    lambda %0:{scalar}, %1:{stack}, %2:{replicated_stack} .
+                    let %3:{scalar}, %4:{stack} = scan [carry_count=1, iteration_count=3, \
+                    reverse=true{sharding_attributes}] %0 %1 %2 [
+                        body={{
+                            lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar} .
+                            let %4:{scalar} = mul %2 %1
+                                %5:{scalar} = mul %3 %1
+                            in (%4, %5)
+                        }},
+                    ]
+                    in (%3, %4)"},
             );
             let seed = Array::from_elements::<f64>(carry_type.cotangent().unwrap(), &[1.0]).unwrap();
             let (initial_cotangent, values_cotangent) = pullback.apply(seed).unwrap();
@@ -20370,29 +20683,24 @@ mod tests {
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
             builder.build(vec![carry, sum], vec![Placeholder; 4], vec![Placeholder; 2]).unwrap()
         };
-        let sharded_stack_type = ArrayType::new_static(DataType::F64, [3])
-            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        let replicated_stack_type =
-            ArrayType::new_static(DataType::F64, [3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
         let program = scan_program(
             TestScanOperation::new(1, 3),
             body,
-            vec![carry_type, sharded_stack_type.clone(), replicated_stack_type.clone()],
+            vec![carry_type, sharded_stack_type, replicated_stack_type],
         );
         let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
         assert_eq!(
-            transposed.entry_region_ref().instructions()[0].operation(),
-            &TestOperation::Scan(
-                TestScanOperation::new(1, 3).with_reverse(true).with_stacked_axis_shardings(vec![
-                    ShardingDimension::sharded(["x"]),
-                    ShardingDimension::Replicated,
-                ]),
-            ),
-        );
-        assert_eq!(
-            transposed.output_types(),
-            vec![sharded_stack_type.cotangent().unwrap(), replicated_stack_type.cotangent().unwrap()],
+            transposed.to_string(),
+            formatdoc! {"
+                lambda %0:{scalar}, %1:{replicated_stack}, %2:{scalar} .
+                let %3:{scalar}, %4:{sharded_stack}, %5:{replicated_stack} = scan [carry_count=1, iteration_count=3, \
+                reverse=true, stacked_axis_shardings=[{{'x'}}]] %2 %1 [
+                    body={{
+                        lambda %0:i64[], %1:{scalar}, %2:{scalar} .
+                        in (%1, %2, %2)
+                    }},
+                ]
+                in (%4, %5)"},
         );
     }
 
@@ -20584,7 +20892,8 @@ mod tests {
                 let %2:{scalar} = zero [
                     type={scalar},
                 ]
-                    %3:{scalar}, %4:{scalar}, %5:{stack} = scan [carry_count=2, iteration_count=3, reverse=true] %0 %2 %1 [
+                    %3:{scalar}, %4:{scalar}, %5:{stack} = scan [carry_count=2, iteration_count=3, reverse=true] %0 \
+                    %2 %1 [
                         body={{
                             lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar} .
                             let %4:{scalar} = add %3 %2
@@ -20702,7 +21011,7 @@ mod tests {
             ]),
         );
 
-        // Exercise the public pullback boundary inside vmap as well: the disconnected cotangent remains a
+        // Exercise the public pullback boundary inside batching as well: the disconnected cotangent remains a
         // `MaybeZero::Zero` at each logical batch item rather than becoming a batched buffer of zeros.
         let (carry_cotangent, live_cotangent) = batch(
             |(initial, dead, live, seed)| {
@@ -21174,35 +21483,8 @@ mod tests {
 
         // A known reference is a stack whose whole root the body receives. The reversed scan threads
         // that root to the dormant backward rule, whose update must execute once per reversed iteration.
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F64, [3])).into();
-        let mut backward_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let reference = backward_builder.add_input(reference_type.clone());
-        let update = backward_builder.add_constant(array(Array::vector(vec![1.0f64; 3]).unwrap()));
-        backward_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let backward = backward_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
-            .unwrap();
-        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let reference = body_builder.add_input(reference_type.clone());
-        let backward_region = body_builder.import_program(backward);
-        body_builder
-            .add_instruction(
-                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
-                    1,
-                    Vec::new(),
-                    Vec::new(),
-                )),
-                vec![backward_region],
-                vec![reference],
-                None,
-            )
-            .unwrap();
-        let body = body_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
-            .unwrap();
+        let body = deferred_reference_stack_body();
+        let reference_type = body.input_types()[1].clone();
         assert!(body.effects().has_deferred_work());
         let program = scan_program(ScanOperation::new(0, 3), body, vec![reference_type]);
         let transposed = program.transpose_with_respect_to(&[], &[]).unwrap();
@@ -21246,7 +21528,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[3], %4:f64[], %5:f64[], %6:f64[] .
                 let %7:f64[], %8:f64[], %9:f64[], %10:f64[3] = scan [carry_count=3, iteration_count=3, reverse=true] \
-                 %0 %1 %2 %3 [
+                %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         in (%4, %1, %2, %3)
@@ -21407,8 +21689,10 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `mul` does not support transposition for input pattern \
-                               [left = linear, right = linear]",
+                if message == format!(
+                    "operation `{MUL_OPERATION_NAME}` does not support transposition for input pattern \
+                     [left = linear, right = linear]",
+                ),
         ));
 
         // Body `[known, linear] -> [known + 1, linear * known]`. The known carry changes on every iteration, so the
@@ -21428,8 +21712,10 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `mul` does not support transposition for input pattern \
-                               [left = linear, right = linear]",
+                if message == format!(
+                    "operation `{MUL_OPERATION_NAME}` does not support transposition for input pattern \
+                     [left = linear, right = linear]",
+                ),
         ));
 
         // A changing known integer carry has no cotangent, so it cannot be promoted and is rejected directly.
@@ -22008,8 +22294,10 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "partition-aware transpose cannot replay effectful known intermediate producer \
-                               `reference_read`; partial-evaluate it into a residual input first",
+                if message == format!(
+                    "partition-aware transpose cannot replay effectful known intermediate producer \
+                     `{REFERENCE_READ_OPERATION_NAME}`; partial-evaluate it into a residual input first",
+                ),
         ));
     }
 
@@ -22115,7 +22403,7 @@ mod tests {
                 &transposed,
                 vec![],
                 vec![Array::vector(vec![10.0f32, 20.0]).unwrap()],
-                vec![]
+                vec![],
             ),
             vec![Array::vector(vec![20.0f32, 20.0, 20.0]).unwrap(), Array::vector(vec![10.0f32, 20.0]).unwrap()],
         );
@@ -22235,7 +22523,7 @@ mod tests {
                 &transposed,
                 vec![Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()],
                 vec![],
-                vec![]
+                vec![],
             ),
             vec![Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()],
         );
@@ -22465,7 +22753,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
                 let %2:ref<f32[]> = reference_new %0
-                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] %2 %2 %1 [
+                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] \
+                    %2 %2 %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
                             let %4:f32[] = reference_read %2
@@ -22485,7 +22774,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
                 let %2:ref<f32[]> = reference_new %1
-                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] %2 %2 %0 [
+                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] \
+                    %2 %2 %0 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
                             let %4:f32[] = reference_read %2
@@ -22514,8 +22804,8 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2] .
                 let %3:ref<f32[2]> = reference_new %1
-                    %4:dimension<2>, %5:ref<f32[2]>, %6:ref<f32[2]>, %7:f32[2] = scan [carry_count=4, iteration_count=2, \
-                reverse=false] %0 %3 %3 %2 [
+                    %4:dimension<2>, %5:ref<f32[2]>, %6:ref<f32[2]>, %7:f32[2] = scan [carry_count=4, \
+                    iteration_count=2, reverse=false] %0 %3 %3 %2 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:ref<f32[2]>, %3:ref<f32[2]>, %4:f32[2] .
                             let %5:f32[2] = reference_read %3
@@ -22543,10 +22833,10 @@ mod tests {
                 let %4:ref<f32[]> = reference_new %0
                     %5:ref<f32[]> = reference_new %2
                     %6:ref<f32[]>, %7:ref<f32[]>, %8:f32[], %9:ref<f32[]>, %10:ref<f32[]>, %11:f32[] = scan \
-                [carry_count=6, iteration_count=2, reverse=false] %4 %4 %1 %5 %5 %3 [
+                    [carry_count=6, iteration_count=2, reverse=false] %4 %4 %1 %5 %5 %3 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[], %4:ref<f32[]>, %5:ref<f32[]>, \
-                %6:f32[] .
+                            %6:f32[] .
                             let %7:f32[] = reference_read %2
                                 %8:f32[] = reference_read %5
                                 () = reference_add_update %1 %3
@@ -22571,7 +22861,8 @@ mod tests {
                 let %2:f32[] = zero [type=f32[]]
                     %3:ref<f32[]> = reference_new %2
                     () = reference_add_update %3 %0
-                    %4:ref<f32[]>, %5:ref<f32[]>, %6:f32[] = scan [carry_count=3, iteration_count=2, reverse=true] %3 %3 %1 [
+                    %4:ref<f32[]>, %5:ref<f32[]>, %6:f32[] = scan [carry_count=3, iteration_count=2, reverse=true] %3 \
+                    %3 %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
                             let %4:f32[] = reference_read %1
@@ -22586,373 +22877,139 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_iteration_count_type() {
-        // An array IR scan takes a dynamic iteration count from a trailing `dimension<length>` input, which a
-        // homogeneous array scan does not admit.
-        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
-        assert_eq!(
-            <ArrayIrType as ScanType>::iteration_count_type(&length),
-            Ok(ArrayIrType::Dimension(DimensionType::from(length.clone()))),
+    fn test_scan_zero_iteration_count_through_interpretation_partial_evaluation_and_batching() {
+        // A scan with a dynamic iteration count whose iteration count is zero runs no iteration when interpreted,
+        // partially evaluated, or batched: each staged program keeps one scan over the iteration count, and executing
+        // it with an iteration count of zero returns the initial carry next to empty stacks.
+        // `test_scan_differentiation_zero_dynamic_iteration_count` covers differentiation of the same scan.
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
+        let length_type = DimensionType::from(length.clone());
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let stacked_type: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![length.clone().into()])).into();
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body.add_input(scalar_type.clone());
+        let value = body.add_input(scalar_type.clone());
+        let product = body
+            .add_instruction(
+                TestIrOperation::Array(TestOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![carry, value],
+                None,
+            )
+            .unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![product, product],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let program = scan_program(
+            ScanOperation::new(1, Dimension::Dynamic(length)),
+            body,
+            vec![scalar_type, stacked_type.clone(), length_type.clone().into()],
         );
-        assert_eq!(
-            <ArrayType as ScanType>::iteration_count_type(&length),
-            Err(TypeError::invalid(format!(
-                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
-                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
-                 count",
-            ),)),
-        );
-    }
+        let carry = array(Array::scalar(2.0f64).unwrap());
+        let empty = array(Array::vector(Vec::<f64>::new()).unwrap());
+        let zero = dimension(&length_type, 0);
 
-    #[test]
-    fn test_scan_type_validate_scan_body_members() {
-        // Homogeneous array bodies must be fully static, and their errors report body positions (i.e., counting the
-        // index input), while array IR bodies admit dynamic shapes.
-        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let static_type = ArrayType::new_static(DataType::F32, [2]);
-        let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(extent)]));
-        let static_types = [static_type.clone()];
-        assert_eq!(ArrayType::validate_scan_body_members(&static_types, &static_types), Ok(()));
+        // Interpretation.
         assert_eq!(
-            ArrayType::validate_scan_body_members(&[static_type.clone(), dynamic_type.clone()], &[]),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` body input 2 must have a fully static type but axis 1 of `f32[2, extent]` \
-                 has size `extent`",
-            ),)),
-        );
-        assert_eq!(
-            ArrayType::validate_scan_body_members(&[], &[static_type, dynamic_type.clone()]),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` body output 1 must have a fully static type but axis 1 of `f32[2, extent]` \
-                 has size `extent`",
-            ),)),
-        );
-        assert_eq!(
-            ArrayIrType::validate_scan_body_members(&[dynamic_type.clone().into()], &[dynamic_type.into()]),
-            Ok(()),
-        );
-    }
-
-    #[test]
-    fn test_scan_type_validate_scan_body_type_signature() {
-        // A declared body needs a scalar `i64` index and the same carry types on both of its boundaries, independently
-        // of the inputs that bind it, and a dynamic iteration count requires a family that admits an iteration count.
-        let index_type = ArrayType::scalar(DataType::I64);
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
-        let body_input_types = [index_type.clone(), scalar_type.clone(), scalar_type.clone()];
-        assert_eq!(
-            ArrayType::validate_scan_body_type_signature(
-                &body_input_types,
-                &[scalar_type.clone(), scalar_type.clone()],
-                1,
-                &Dimension::Static(3),
-            ),
-            Ok(()),
-        );
-        assert_eq!(
-            ArrayType::validate_scan_body_type_signature(
-                &body_input_types,
-                &[index_type.clone(), scalar_type.clone()],
-                1,
-                &Dimension::Static(3),
-            ),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` body carry type signature mismatch: expected [f32[]] but got [i64[]]",
-            ))),
-        );
-        assert_eq!(
-            ArrayType::validate_scan_body_type_signature(
-                &body_input_types[1..],
-                std::slice::from_ref(&scalar_type),
-                0,
-                &length
-            ),
-            Err(TypeError::invalid(format!(
-                "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `length`; use an \
-                 array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic iteration \
-                 count",
-            ),)),
-        );
-        assert_eq!(
-            ArrayIrType::validate_scan_body_type_signature(
-                &[index_type.into(), scalar_type.clone().into()],
-                &[scalar_type.clone().into()],
-                1,
-                &length,
-            ),
-            Ok(()),
-        );
-        assert_eq!(
-            ArrayIrType::validate_scan_body_type_signature(
-                &[scalar_type.clone().into()],
-                &[scalar_type.into()],
-                0,
-                &length,
-            ),
-            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index"))),
-        );
-    }
-
-    #[test]
-    fn test_scan_type_validate_scan_input_type_signature() {
-        // The inputs must refine the declared carries and supply stacks whose slices refine the declared slices,
-        // followed by an iteration count of the declared identity, or of one exact extent within its bounds, for a
-        // dynamic iteration count. How that iteration count relates to the stacked axes is not validated here.
-        let index_type = ArrayType::scalar(DataType::I64);
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let stacked_type = ArrayType::new_static(DataType::F32, [3]);
-        let body_input_types = [index_type.clone(), scalar_type.clone(), scalar_type.clone()];
-        let length = Dimension::Static(3);
-        assert_eq!(
-            ArrayType::validate_scan_input_type_signature(
-                &body_input_types,
-                1,
-                &length,
-                &[scalar_type.clone(), stacked_type.clone()],
-            ),
-            Ok(()),
-        );
-        assert_eq!(
-            ArrayType::validate_scan_input_type_signature(
-                &body_input_types,
-                1,
-                &length,
-                std::slice::from_ref(&scalar_type)
-            ),
-            Err(TypeError::invalid("expected 2 inputs but got 1")),
-        );
-        assert_eq!(
-            ArrayType::validate_scan_input_type_signature(
-                &body_input_types,
-                1,
-                &length,
-                &[ArrayType::scalar(DataType::F64), stacked_type.clone()],
-            ),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` input 0 has type `f64[]`, which does not refine its expected type `f32[]`",
-            ))),
+            program.interpret(vec![carry.clone(), empty.clone(), zero.clone()]),
+            Ok(vec![carry.clone(), empty.clone()]),
         );
 
-        let variable = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
-        let length = Dimension::Dynamic(variable.clone());
-        let body_input_types = [ArrayIrType::from(index_type), scalar_type.into()];
-        let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
+        // Partial evaluation with a known carry, whose final value the residual scan still computes.
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(carry.clone()),
+                PartialValue::Unknown(stacked_type),
+                PartialValue::Unknown(length_type.into()),
+            ])
+            .unwrap();
         assert_eq!(
-            ArrayIrType::validate_scan_input_type_signature(
-                &body_input_types,
-                0,
-                &length,
-                &[stacked_type.clone().into(), DimensionType::from(variable).into()],
-            ),
-            Ok(()),
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[length], %1:dimension<length ∈ [0, 4)>, %2:f64[] .
+                let %3:f64[], %4:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = mul %1 %2
+                        in (%3, %3)
+                    },
+                ]
+                in (%3, %4)"},
         );
         assert_eq!(
-            ArrayIrType::validate_scan_input_type_signature(
-                &body_input_types,
-                0,
-                &length,
-                &[stacked_type.clone().into(), four.into()],
-            ),
-            Ok(()),
+            evaluation.inputs,
+            vec![
+                PartialEvaluationInput::Unknown(1),
+                PartialEvaluationInput::Unknown(2),
+                PartialEvaluationInput::Known(carry.clone()),
+            ],
         );
         assert_eq!(
-            ArrayIrType::validate_scan_input_type_signature(
-                &body_input_types,
-                0,
-                &length,
-                &[stacked_type.clone().into(), stacked_type.into()],
-            ),
-            Err(TypeError::invalid("expected dimension type but got array type")),
-        );
-    }
-
-    #[test]
-    fn test_scan_type_infer_scan_body_input_types() {
-        // The body inputs are the intrinsic `i64` index, then the carries, then one slice per stacked array. A stacked
-        // reference enters whole instead, as a root whose leading axis is the scan axis.
-        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let stacked_reference =
-            ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
-        let length = Dimension::Static(3);
-        assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(
-                &[scalar_type.clone(), ArrayType::new_static(DataType::F32, [3, 2]).into()],
-                3,
-                1,
-                &length,
-            ),
-            Ok(vec![index_type.clone(), scalar_type, ArrayType::new_static(DataType::F32, [2]).into()]),
-        );
-        assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(std::slice::from_ref(&stacked_reference), 2, 0, &length),
-            Ok(vec![index_type.clone(), stacked_reference.clone()]),
+            evaluation.interpret(&TestIrEagerContext::new(), &[empty.clone(), zero.clone()]),
+            Ok(vec![carry.clone(), empty.clone()]),
         );
 
-        // The stacked referent must be a stack over the iteration count, and a first-class dimension is neither an
-        // array nor a reference.
+        // Batching with a mapped carry and a mapped stack.
+        let extent = DimensionValue::constant(2).unwrap();
+        let batched = program
+            .batched_with_threaded_extent(
+                extent.r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        assert_eq!(batched.output_axes(), &[BatchAxis::new(0), BatchAxis::new(1)]);
+        let batched = batched.into_parts().0;
         assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(
-                &[ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4, 2])))],
-                2,
-                0,
-                &length,
-            ),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` stacked input 0 must have leading dimension `3` but has type `ref<f32[4, 2]>`",
-            ))),
+            batched.to_string(),
+            indoc! {"
+                lambda %0:dimension<2>, %1:f64[2], %2:f64[length, 2], %3:dimension<length ∈ [0, 4)> .
+                let %4:dimension<2>, %5:f64[2], %6:f64[length, 2] = scan [carry_count=2, iteration_count=length, \
+                reverse=false] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:i64[], %1:dimension<2>, %2:f64[2], %3:f64[2] .
+                        let %4:f64[2] = mul %2 %3
+                        in (%1, %4, %4)
+                    },
+                ]
+                in (%0, %5, %6)"},
         );
+        let carries = array(Array::vector(vec![2.0f64, 3.0]).unwrap());
+        let empty_batch =
+            array(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 2]), &[]).unwrap());
         assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(
-                &[ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))],
-                2,
-                0,
-                &length,
-            ),
-            Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` stacked input 0 must have rank at least 1"))),
-        );
-        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(&[DimensionType::from(extent).into()], 2, 0, &length),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` stacked input 0 must be an array or a reference but got `dimension<extent ∈ \
-                 [1, 8)>`",
-            ),)),
-        );
-
-        // An iteration count input that pins one exact extent applies the same refinement rule to stacked references as
-        // to stacked arrays.
-        let dynamic_length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
-        let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
-        assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(
-                &[stacked_reference.clone(), three.into()],
-                2,
-                0,
-                &Dimension::Dynamic(dynamic_length.clone()),
-            ),
-            Ok(vec![index_type, stacked_reference]),
-        );
-        let symbolic_reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(dynamic_length.clone()), Dimension::Static(2)]),
-        )));
-        let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
-        assert_eq!(
-            ArrayIrType::infer_scan_body_input_types(
-                &[symbolic_reference, four.into()],
-                2,
-                0,
-                &Dimension::Dynamic(dynamic_length),
-            ),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` iteration count input has type `dimension<4>` but stacked input 0 has type \
-                 `ref<f32[length, 2]>` whose leading dimension is not refined to extent 4",
-            ),)),
-        );
-    }
-
-    #[test]
-    fn test_scan_type_infer_scan_output_types() {
-        // The outputs are the carries followed by the stacked body outputs along a leading axis of the iteration count,
-        // placed as declared and refined by the facts that the inputs establish, including the iteration count that an
-        // exact iteration count fixes.
-        let index_type = ArrayType::scalar(DataType::I64);
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let slice_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        assert_eq!(
-            ArrayType::infer_scan_output_types(
-                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
-                &[scalar_type.clone(), slice_type],
-                1,
-                &Dimension::Static(3),
-                &[ShardingDimension::sharded(["x"])],
-                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [3])],
-            ),
-            Ok(vec![
-                scalar_type.clone(),
-                ArrayType::new_static(DataType::F64, [3])
-                    .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
-                    .unwrap(),
+            batched.interpret(vec![
+                TestIrValue::Dimension(extent.clone()),
+                carries.clone(),
+                empty_batch.clone(),
+                zero.clone(),
             ]),
-        );
-        assert_eq!(
-            ArrayType::infer_scan_output_types(
-                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
-                &[scalar_type.clone(), scalar_type.clone()],
-                1,
-                &Dimension::Static(3),
-                &[],
-                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [4])],
-            ),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` stacked input 1 must have leading dimension `3` but has type `f64[4]`",
-            ))),
-        );
-        // Excess placements are invalid even when they request implicit replication.
-        assert_eq!(
-            ArrayType::infer_scan_output_types(
-                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
-                &[scalar_type.clone(), scalar_type.clone()],
-                1,
-                &Dimension::Static(3),
-                &[ShardingDimension::Replicated, ShardingDimension::Replicated],
-                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [3])],
-            ),
-            Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` places 2 stacked axes but its body has 1 stacked outputs",
-            ))),
-        );
-
-        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
-        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
-        let vector_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![rows.into()])));
-        let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
-        assert_eq!(
-            ArrayIrType::infer_scan_output_types(
-                &[index_type.into(), vector_type.clone()],
-                &[vector_type.clone(), vector_type],
-                1,
-                &Dimension::Dynamic(length),
-                &[],
-                &[ArrayType::new_static(DataType::F64, [2]).into(), three.into()],
-            ),
-            Ok(vec![
-                ArrayType::new_static(DataType::F64, [2]).into(),
-                ArrayType::new_static(DataType::F64, [3, 2]).into(),
-            ]),
+            Ok(vec![TestIrValue::Dimension(extent), carries, empty_batch]),
         );
     }
 
     #[test]
-    fn test_scan_options() {
+    fn test_scan_options_new() {
         let options = ScanOptions::<Array>::new();
         assert_eq!(options.iteration_count(), &ScanIterationCount::Inferred);
         assert!(!options.reverse());
         assert_eq!(options.unroll(), 1);
         assert_eq!(options.stacked_axis_shardings(), &[]);
-        let options = options
-            .with_iteration_count(3)
-            .with_reverse(true)
-            .with_unroll(2)
-            .unwrap()
-            .with_stacked_axis_shardings(vec![ShardingDimension::Replicated]);
-        assert_eq!(options.iteration_count(), &ScanIterationCount::Static(3));
-        assert!(options.reverse());
-        assert_eq!(options.unroll(), 2);
-        assert_eq!(options.stacked_axis_shardings(), &[ShardingDimension::Replicated]);
-        assert_eq!(
-            ScanOptions::<Array>::new().with_unroll(0).err(),
-            Some(ProgramError::Type(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` unroll factor must be at least 1",
-            )))),
-        );
+    }
+
+    #[test]
+    fn test_scan_options_with_iteration_count() {
         let count = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let options = ScanOptions::new().with_iteration_count(2).with_iteration_count(count.clone());
         assert_eq!(options.iteration_count(), &ScanIterationCount::Value(count));
+        let options = options.with_iteration_count(4);
+        assert_eq!(options.iteration_count(), &ScanIterationCount::Static(4));
         assert_eq!(
             options.with_iteration_count(ScanIterationCount::Inferred).iteration_count(),
             &ScanIterationCount::Inferred,
@@ -22960,7 +23017,35 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend() {
+    fn test_scan_options_with_reverse() {
+        let options = ScanOptions::<Array>::new().with_reverse(true);
+        assert!(options.reverse());
+        assert!(!options.with_reverse(false).reverse());
+    }
+
+    #[test]
+    fn test_scan_options_with_unroll() {
+        let options = ScanOptions::<Array>::new().with_unroll(2).unwrap();
+        assert_eq!(options.unroll(), 2);
+        assert_eq!(options.with_unroll(1).unwrap().unroll(), 1);
+        assert!(matches!(
+            ScanOptions::<Array>::new().with_unroll(0),
+            Err(ProgramError::Type(error))
+                if error == TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` unroll factor must be at least 1")),
+        ));
+    }
+
+    #[test]
+    fn test_scan_options_with_stacked_axis_shardings() {
+        // Options retain parameter order and trailing replication; the operation canonicalizes them later.
+        let shardings = vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated];
+        let options = ScanOptions::<Array>::new().with_stacked_axis_shardings(shardings.clone());
+        assert_eq!(options.stacked_axis_shardings(), shardings);
+        assert_eq!(options.with_stacked_axis_shardings(Vec::new()).stacked_axis_shardings(), &[]);
+    }
+
+    #[test]
+    fn test_scan_scan() {
         // The body sees the physical slice index in either visit order, and structured output leaves stack separately.
         let inputs = Array::vector(vec![1f32, 2.0, 3.0]).unwrap();
         assert_eq!(
@@ -22996,7 +23081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_context_empty_inputs() {
+    fn test_scan_scan_empty_inputs() {
         // The explicit constructor supplies the execution domain when there are no leaves; the global entry errors.
         let context = TestEagerContext::new();
         assert_eq!(
@@ -23029,7 +23114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_staging() {
+    fn test_scan_scan_staging() {
         let (_, program) = TracingContext::<Array, TestOperation>::trace(
             |(carry, inputs)| {
                 scan(
@@ -23056,7 +23141,7 @@ mod tests {
                     in (%3, %3)
                 },
             ]
-            in (%2, %3)"}
+            in (%2, %3)"},
         );
         assert_eq!(
             program.interpret((Array::scalar(0f32).unwrap(), Array::vector(vec![1f32, 2.0, 3.0]).unwrap())),
@@ -23065,7 +23150,55 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_structure() {
+    fn test_scan_scan_with_stacked_axis_shardings() {
+        // Each structured output receives its own requested scan-axis sharding, including an implicit replicated tail.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, TestOperation>::trace(
+            |input| {
+                scan(
+                    |_, (), value| Ok(((), (value.clone(), value))),
+                    (),
+                    input,
+                    ScanOptions::new().with_stacked_axis_shardings(vec![
+                        ShardingDimension::sharded(["x"]),
+                        ShardingDimension::Replicated,
+                    ]),
+                )
+            },
+            input_type.clone(),
+        )
+        .unwrap();
+        let replicated = "f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]";
+        let sharded = "f32[2][sharding={mesh<['x'=1:auto]>, [{'x'}]}]";
+        let slice = "f32[][sharding={mesh<['x'=1:auto]>, []}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{replicated} .
+                let %1:{sharded}, %2:{replicated} = scan [carry_count=0, iteration_count=2, reverse=false, \
+                stacked_axis_shardings=[{{'x'}}]] %0 [
+                    body={{
+                        lambda %0:i64[], %1:{slice} .
+                        in (%1, %1)
+                    }},
+                ]
+                in (%1, %2)"},
+        );
+        let input = Array::from_elements(input_type, &[1f32, 2.0]).unwrap();
+        assert_eq!(
+            program.interpret(input.clone()),
+            Ok(((), (Array::from_elements(output_type, &[1f32, 2.0]).unwrap(), input))),
+        );
+    }
+
+    #[test]
+    fn test_scan_scan_structure() {
         /// A state whose static tag must survive tracing, without requiring Clone on runtime structures.
         #[derive(ryft_macros::Parameterized)]
         struct State<P: Parameter> {
@@ -23111,7 +23244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_validation() {
+    fn test_scan_scan_validation() {
         let called = std::cell::Cell::new(false);
         assert_eq!(
             scan(
@@ -23151,7 +23284,20 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_dynamic_count() {
+    fn test_scan_scan_rejects_non_dimension_iteration_count() {
+        assert_eq!(
+            scan(
+                |index, (), ()| Ok(((), index)),
+                (),
+                (),
+                ScanOptions::new().with_iteration_count(Array::scalar(3i64).unwrap()),
+            ),
+            Err(ProgramError::Type(TypeError::invalid("expected dimension type but got array type"))),
+        );
+    }
+
+    #[test]
+    fn test_scan_scan_dynamic_iteration_count() {
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let count_type = DimensionType::from(length.clone());
         let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
@@ -23184,7 +23330,7 @@ mod tests {
                     in (%3, %3)
                 },
             ]
-            in (%3, %4)"}
+            in (%3, %4)"},
         );
         let inputs = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         assert_eq!(
@@ -23198,7 +23344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_singleton_count_keeps_validation() {
+    fn test_scan_scan_singleton_iteration_count_keeps_validation() {
         // A scalar-to-dimension assertion remains an input dependency, even though its declared extent is fixed at 3.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let count_type = DimensionType::new("count", DimensionBounds::new(3, Some(4)).unwrap());
@@ -23231,7 +23377,7 @@ mod tests {
                         in (%1)
                     },
                 ]
-            in (%3)"}
+            in (%3)"},
         );
         let inputs = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         assert_eq!(program.interpret((inputs.clone(), array(Array::scalar(3i64).unwrap()))), Ok(((), inputs.clone())));
@@ -23246,7 +23392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_references() {
+    fn test_scan_scan_references() {
         let root = ArrayReference::new(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         let root_type = root.r#type().into_owned();
         assert_eq!(
@@ -23278,7 +23424,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_keeps_effects_with_no_outputs() {
+    fn test_scan_scan_keeps_effects_with_no_outputs() {
         let (_, program) = TracingContext::<Array, TestOperation>::trace(
             |anchor| {
                 anchor.context().scan(
@@ -23305,71 +23451,12 @@ mod tests {
                     in ()
                 },
             ]
-            in ()"}
+            in ()"},
         );
     }
 
     #[test]
-    fn test_write_scan_iteration() {
-        // Writing an iteration stores the value as the slice at that index along the leading axis.
-        let accumulator = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
-        assert_eq!(
-            write_scan_iteration(
-                accumulator,
-                2,
-                Array::vector(vec![5.0, 6.0]).unwrap(),
-                &ShardingDimension::Replicated,
-            ),
-            Ok(Array::matrix(3, 2, vec![0.0, 0.0, 0.0, 0.0, 5.0, 6.0]).unwrap()),
-        );
-        let accumulator = Array::vector(vec![0.0, 0.0, 0.0]).unwrap();
-        assert_eq!(
-            write_scan_iteration(accumulator, 0, Array::scalar(4.0).unwrap(), &ShardingDimension::Replicated),
-            Ok(Array::vector(vec![4.0, 0.0, 0.0]).unwrap()),
-        );
-
-        // A stack whose leading axis is placed over a manual mesh axis varies over it, and so does the unit axis of
-        // a written slice that varies over it, so that the in-place update agrees with the stack; the slice keeps its
-        // elements.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let slice_type = ArrayType::scalar(DataType::F64)
-            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
-            .unwrap();
-        let placement = ShardingDimension::sharded(["m"]);
-        let stack_type = slice_type.batched(0, Dimension::Static(3), placement.clone()).unwrap();
-        let accumulator = Array::from_elements::<f64>(stack_type.clone(), &[0.0, 0.0, 0.0]).unwrap();
-        assert_eq!(
-            write_scan_iteration(accumulator, 1, Array::from_elements::<f64>(slice_type, &[4.0]).unwrap(), &placement),
-            Ok(Array::from_elements::<f64>(stack_type, &[0.0, 4.0, 0.0]).unwrap()),
-        );
-    }
-
-    #[test]
-    fn test_scan_jvp_signature_permutation() {
-        // The live tangent entries follow all primal entries in JVP order. Scan order interleaves them so that the
-        // carries, followed by the live carry tangents, lead the scanned entries and their live tangents.
-        assert_eq!(
-            ScanJvp::<TestEagerContext>::signature_permutation(&[true, false, true, true], 2),
-            vec![0, 1, 4, 2, 3, 5, 6],
-        );
-        assert_eq!(ScanJvp::<TestEagerContext>::signature_permutation(&[false, true, false], 1), vec![0, 1, 2, 3]);
-        assert_eq!(ScanJvp::<TestEagerContext>::signature_permutation(&[false, false], 2), vec![0, 1]);
-    }
-
-    // The following tests moved here from the former `tests/test_scan_frontend.rs` integration binary: they cover the
-    // frontend's manual-variation fixed point, its entry alignment, and replay through an explicit context, none of
-    // which needs a separate crate.
-    type IrValue = ArrayIrValue<Array>;
-    type IrOperation = ArrayIrOperation<Array>;
-    type IrContext = EagerContext<IrValue, IrOperation>;
-
-    /// Two devices whose different local values must be tracked by manual variation.
-    fn manual_mesh() -> LogicalMesh {
-        LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap()
-    }
-
-    #[test]
-    fn test_scan_frontend_propagates_manual_variation_across_carries() {
+    fn test_scan_scan_propagates_manual_variation_across_carries() {
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"])]).unwrap();
@@ -23383,7 +23470,7 @@ mod tests {
         // Variation reaches the second carry first, then the first carry on the next trace. Entry transitions belong
         // outside the scan even at count zero, where the original contents still acquire the fixed-point metadata.
         for iteration_count in [0, 2] {
-            let (_, program) = TracingContext::<IrValue, IrOperation>::trace_with_named_axes(
+            let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace_with_named_axes(
                 |inputs: Vec<Tracer<_>>| {
                     let (carries, ()) = scan(
                         |_, (_, second, source), ()| Ok(((second, source.clone(), source), ())),
@@ -23434,26 +23521,26 @@ mod tests {
             let first = if iteration_count == 0 { vec![1.0f32, 1.0] } else { vec![3.0, 4.0] };
             let second = if iteration_count == 0 { vec![2.0f32, 2.0] } else { vec![3.0, 4.0] };
             assert_eq!(
-                IrContext::new().bind(
+                TestIrEagerContext::new().bind(
                     operation,
                     vec![program],
                     &[
-                        IrValue::Array(Array::vector(vec![1.0f32]).unwrap()),
-                        IrValue::Array(Array::vector(vec![2.0f32]).unwrap()),
-                        IrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+                        TestIrValue::Array(Array::vector(vec![1.0f32]).unwrap()),
+                        TestIrValue::Array(Array::vector(vec![2.0f32]).unwrap()),
+                        TestIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
                     ],
                 ),
                 Ok(vec![
-                    IrValue::Array(Array::from_elements(output_type.clone(), &first).unwrap()),
-                    IrValue::Array(Array::from_elements(output_type.clone(), &second).unwrap()),
-                    IrValue::Array(Array::from_elements(output_type, &[3.0f32, 4.0]).unwrap()),
+                    TestIrValue::Array(Array::from_elements(output_type.clone(), &first).unwrap()),
+                    TestIrValue::Array(Array::from_elements(output_type.clone(), &second).unwrap()),
+                    TestIrValue::Array(Array::from_elements(output_type, &[3.0f32, 4.0]).unwrap()),
                 ]),
             );
         }
     }
 
     #[test]
-    fn test_scan_frontend_transposes_entry_variation_outside_the_loop() {
+    fn test_scan_scan_transposes_entry_variation_outside_the_loop() {
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"])]).unwrap();
@@ -23467,7 +23554,7 @@ mod tests {
         let invariant = "f32[1][sharding={mesh<['m'=2:manual]>, [{}]}]";
         let varying = "f32[1][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]";
         let stack = "f32[2, 1][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}]";
-        let (_, program) = TracingContext::<IrValue, IrOperation>::trace_with_named_axes(
+        let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 let (carry, ()) = scan(
                     |_, carry, item| {
@@ -23522,20 +23609,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            IrContext::new().bind(
+            TestIrEagerContext::new().bind(
                 operation,
                 vec![transposed],
-                &[IrValue::Array(Array::vector(vec![1.0f32, 1.0]).unwrap())],
+                &[TestIrValue::Array(Array::vector(vec![1.0f32, 1.0]).unwrap())],
             ),
             Ok(vec![
-                IrValue::Array(
+                TestIrValue::Array(
                     Array::from_elements(
                         ArrayType::new_static(DataType::F32, [1]).with_sharding(replicated).unwrap(),
                         &[2.0f32],
                     )
                     .unwrap(),
                 ),
-                IrValue::Array(
+                TestIrValue::Array(
                     Array::from_elements(
                         ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(stacked_sharding).unwrap(),
                         &[1.0f32, 1.0, 1.0, 1.0],
@@ -23547,7 +23634,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_replays_entry_alignment_in_the_explicit_context() {
+    fn test_scan_scan_replays_entry_alignment_in_the_explicit_context() {
         /// Executes arrays through an explicit domain distinct from `Array::Domain`, recording every parent bind.
         #[derive(Clone)]
         struct RecordingContext {
@@ -23641,5 +23728,52 @@ mod tests {
             Ok((Array::from_elements(varying_type, &[7.0f32]).unwrap(), ())),
         );
         assert_eq!(*context.binds.borrow(), vec!["parallel_vary", "scan"]);
+    }
+
+    #[test]
+    fn test_scan_jvp_signature_permutation() {
+        // The live tangent entries follow all primal entries in JVP order. Scan order interleaves them so that the
+        // carries, followed by the live carry tangents, lead the scanned entries and their live tangents.
+        assert_eq!(
+            ScanJvp::<TestEagerContext>::signature_permutation(&[true, false, true, true], 2),
+            vec![0, 1, 4, 2, 3, 5, 6],
+        );
+        assert_eq!(ScanJvp::<TestEagerContext>::signature_permutation(&[false, true, false], 1), vec![0, 1, 2, 3]);
+        assert_eq!(ScanJvp::<TestEagerContext>::signature_permutation(&[false, false], 2), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_write_scan_iteration() {
+        // Writing an iteration stores the value as the slice at that index along the leading axis.
+        let accumulator = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
+        assert_eq!(
+            write_scan_iteration(
+                accumulator,
+                2,
+                Array::vector(vec![5.0, 6.0]).unwrap(),
+                &ShardingDimension::Replicated,
+            ),
+            Ok(Array::matrix(3, 2, vec![0.0, 0.0, 0.0, 0.0, 5.0, 6.0]).unwrap()),
+        );
+        let accumulator = Array::vector(vec![0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            write_scan_iteration(accumulator, 0, Array::scalar(4.0).unwrap(), &ShardingDimension::Replicated),
+            Ok(Array::vector(vec![4.0, 0.0, 0.0]).unwrap()),
+        );
+
+        // A stack whose leading axis is placed over a manual mesh axis varies over it, and so does the unit axis of
+        // a written slice that varies over it, so that the in-place update agrees with the stack; the slice keeps its
+        // elements.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let slice_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let placement = ShardingDimension::sharded(["m"]);
+        let stack_type = slice_type.batched(0, Dimension::Static(3), placement.clone()).unwrap();
+        let accumulator = Array::from_elements::<f64>(stack_type.clone(), &[0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            write_scan_iteration(accumulator, 1, Array::from_elements::<f64>(slice_type, &[4.0]).unwrap(), &placement),
+            Ok(Array::from_elements::<f64>(stack_type, &[0.0, 4.0, 0.0]).unwrap()),
+        );
     }
 }
