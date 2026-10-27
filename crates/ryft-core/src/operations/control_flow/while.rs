@@ -130,63 +130,61 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// every reference referent) must vary over each manual mesh axis that the predicate varies over (refer to
 /// [`Sharding::varying_manual_axes`]). A first-class dimension carries no manual variation and is not checked.
 pub trait WhileType: Type + ArrayMemberType + From<ArrayType> {
-    // TODO(eaplatanios): Review from here onwards.
-    /// Validates the type family's restrictions on using a value of type `predicate_type` as the predicate of a loop
-    /// over state of types `state_types`. [`WhileOperation`] validates the predicate count and the state signatures
-    /// separately.
-    ///
+    /// Validates the type family's restrictions on using a value of this type as the predicate of a loop over state
+    /// of types `state_types`. [`WhileOperation`] validates the predicate count and the state signatures separately.
     /// For example, [`ArrayType`] requires a Boolean predicate whose shape is a prefix of every state shape, and state
     /// that varies over every manual mesh axis that the predicate varies over.
     ///
     /// # Parameters
     ///
-    ///   - `predicate_type`: Type of the predicate returned by the condition region.
     ///   - `state_types`: Types of the loop-carried state that the condition and the body consume.
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] if `predicate_type` is not a valid predicate type for that state according to the type
-    /// family's rules.
-    fn validate_while_predicate(predicate_type: &Self, state_types: &[Self]) -> Result<(), TypeError>;
+    /// Returns a [`TypeError`] if this type is not a valid predicate type for that state according to the type family's
+    /// rules.
+    fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError>;
 
-    /// Returns whether `predicate_type` describes a batched predicate, which carries one termination decision per item
-    /// of its leading axes rather than one for the whole loop (e.g., a non-scalar Boolean [`ArrayType`] predicate). A
+    /// Returns whether this type describes a batched predicate, which carries one termination decision per item of
+    /// its leading axes rather than one for the whole loop (e.g., a non-scalar Boolean [`ArrayType`] predicate). A
     /// loop with a batched predicate keeps running for active items after others have finished and re-evaluates the
-    /// condition and the body over every item on each iteration, so [`WhileOperation`] requires both regions to be pure
-    /// and masks the state updates per item (refer to [`WhilePredicate`]). Type families without batched predicates can
-    /// return `false`.
-    fn is_batched_while_predicate(predicate_type: &Self) -> bool;
+    /// condition and the body over every item on each iteration, so [`WhileOperation`] requires both regions to be
+    /// pure and masks the state updates per item (refer to [`WhilePredicate`]). Type families without batched
+    /// predicates can return `false`.
+    fn is_batched_while_predicate(&self) -> bool;
 
-    /// Returns whether state of type `state_type` has no per-item value that a batched predicate could mask (e.g., a
+    /// Returns whether state of this type has no per-item value that a batched predicate could mask (e.g.,
     /// first-class dimension). Under a batched predicate, [`WhileOperation`] requires the body to pass such state
     /// through unchanged, which makes masking it the identity. Type families whose state is always maskable (e.g.,
     /// [`ArrayType`]) return `false`.
-    fn is_loop_invariant_state(state_type: &Self) -> bool;
+    fn is_loop_invariant_state(&self) -> bool;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl WhileType for ArrayType {
     #[inline]
-    fn validate_while_predicate(predicate_type: &Self, state_types: &[Self]) -> Result<(), TypeError> {
-        validate_while_array_predicate(predicate_type, state_types)?;
-        validate_while_state_variation(predicate_type, state_types)
+    fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError> {
+        validate_while_array_predicate(self, state_types)?;
+        validate_while_state_variation(self, state_types)
     }
 
     #[inline]
-    fn is_batched_while_predicate(predicate_type: &Self) -> bool {
-        predicate_type.rank() > 0
+    fn is_batched_while_predicate(&self) -> bool {
+        self.rank() > 0
     }
 
     #[inline]
-    fn is_loop_invariant_state(_state_type: &Self) -> bool {
+    fn is_loop_invariant_state(&self) -> bool {
         false
     }
 }
 
 impl WhileType for ArrayIrType {
-    fn validate_while_predicate(predicate_type: &Self, state_types: &[Self]) -> Result<(), TypeError> {
-        let Self::Array(predicate) = predicate_type else {
+    fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError> {
+        let Self::Array(predicate) = self else {
             return Err(TypeError::invalid(format!(
-                "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `{predicate_type}`",
+                "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `{self}`",
             )));
         };
         // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such a
@@ -225,13 +223,13 @@ impl WhileType for ArrayIrType {
     }
 
     #[inline]
-    fn is_batched_while_predicate(predicate_type: &Self) -> bool {
-        matches!(predicate_type, Self::Array(r#type) if r#type.rank() > 0)
+    fn is_batched_while_predicate(&self) -> bool {
+        matches!(self, Self::Array(r#type) if r#type.rank() > 0)
     }
 
     #[inline]
-    fn is_loop_invariant_state(state_type: &Self) -> bool {
-        matches!(state_type, Self::Dimension(_))
+    fn is_loop_invariant_state(&self) -> bool {
+        matches!(self, Self::Dimension(_))
     }
 }
 
@@ -578,10 +576,10 @@ impl<T: WhileType> WhileOperation<T> {
         // inputs alias.
         validate_reference_carry_roots(WHILE_OPERATION_NAME, body, 0..body.input_ids().len())?;
         let state_types = body.input_types();
-        if T::is_batched_while_predicate(&condition.output_types()[0]) {
+        if condition.output_types()[0].is_batched_while_predicate() {
             let passes_through = passed_through_carries(body, 0..state_types.len());
             for (index, state_type) in state_types.iter().enumerate() {
-                if T::is_loop_invariant_state(state_type) && !passes_through[index] {
+                if state_type.is_loop_invariant_state() && !passes_through[index] {
                     return Err(TypeError::invalid(format!(
                         "`{WHILE_OPERATION_NAME}` state {index} of type `{state_type}` must be passed through \
                          unchanged by the body under a batched predicate, because it has no per-item value to mask",
@@ -621,12 +619,12 @@ impl<T: WhileType> WhileOperation<T> {
                 condition_output_types.len(),
             )));
         }
-        T::validate_while_predicate(&condition_output_types[0], state_types)?;
+        condition_output_types[0].validate_while_predicate(state_types)?;
         check_types!(@same, format!("`{WHILE_OPERATION_NAME}` body output"), [
             state_types,
             body_interface.output_types(),
         ]);
-        if T::is_batched_while_predicate(&condition_output_types[0])
+        if condition_output_types[0].is_batched_while_predicate()
             && (!condition_interface.effects().is_empty() || !body_interface.effects().is_empty())
         {
             return Err(TypeError::invalid(format!(
@@ -634,7 +632,7 @@ impl<T: WhileType> WhileOperation<T> {
                  cannot be masked for finished batch items",
             )));
         }
-        if T::is_batched_while_predicate(&condition_output_types[0])
+        if condition_output_types[0].is_batched_while_predicate()
             && (condition_interface.has_deferred_work() || body_interface.has_deferred_work())
         {
             return Err(TypeError::invalid(format!(
@@ -2335,7 +2333,7 @@ where
         // and its outputs are exactly the state. A carried mask would have to be recomputed on the state after every
         // body application, including the last one that the bound admits, where no other path (interpretation, which
         // stops at the bound before evaluating the condition, or the lowering) evaluates the condition.
-        if C::Type::is_batched_while_predicate(&condition.output_types()[0]) {
+        if condition.output_types()[0].is_batched_while_predicate() {
             let (masked_condition, masked_body) = masked_while_programs(condition, body)?;
             // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
             // requested through the instruction-scoped driver over them.
@@ -4303,19 +4301,16 @@ mod tests {
     fn test_while_type_validate_while_predicate() {
         // An array predicate must be Boolean, and a batched one must be a prefix of every state shape.
         let state_types = vec![ArrayType::new_static(DataType::F32, [2])];
-        assert_eq!(ArrayType::validate_while_predicate(&ArrayType::scalar(DataType::Boolean), &state_types), Ok(()),);
+        assert_eq!(ArrayType::scalar(DataType::Boolean).validate_while_predicate(&state_types), Ok(()));
+        assert_eq!(ArrayType::new_static(DataType::Boolean, [2]).validate_while_predicate(&state_types), Ok(()));
         assert_eq!(
-            ArrayType::validate_while_predicate(&ArrayType::new_static(DataType::Boolean, [2]), &state_types),
-            Ok(()),
-        );
-        assert_eq!(
-            ArrayType::validate_while_predicate(&ArrayType::scalar(DataType::F32), &state_types),
+            ArrayType::scalar(DataType::F32).validate_while_predicate(&state_types),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `f32[]`",
             ))),
         );
         assert_eq!(
-            ArrayType::validate_while_predicate(&ArrayType::new_static(DataType::Boolean, [3]), &state_types),
+            ArrayType::new_static(DataType::Boolean, [3]).validate_while_predicate(&state_types),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[3]` is not a prefix of state `f32[2]`",
@@ -4327,18 +4322,18 @@ mod tests {
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3)));
         let state_types = vec![dimension_type.clone(), ArrayType::new_static(DataType::F32, [2]).into()];
         assert_eq!(
-            ArrayIrType::validate_while_predicate(&ArrayType::new_static(DataType::Boolean, [2]).into(), &state_types,),
+            ArrayIrType::Array(ArrayType::new_static(DataType::Boolean, [2])).validate_while_predicate(&state_types),
             Ok(()),
         );
         assert_eq!(
-            ArrayIrType::validate_while_predicate(&dimension_type, &state_types),
+            dimension_type.validate_while_predicate(&state_types),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `dimension<3>`",
             ))),
         );
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Boolean)));
         assert_eq!(
-            ArrayIrType::validate_while_predicate(&reference_type, &state_types),
+            reference_type.validate_while_predicate(&state_types),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `ref<bool[]>`",
             ))),
@@ -4350,14 +4345,12 @@ mod tests {
         // Only a non-scalar Boolean array predicate is batched, so a scalar predicate, a first-class dimension, and a
         // reference to a non-scalar Boolean array are not.
         let batched_type = ArrayType::new_static(DataType::Boolean, [2]);
-        assert!(!ArrayType::is_batched_while_predicate(&ArrayType::scalar(DataType::Boolean)));
-        assert!(ArrayType::is_batched_while_predicate(&batched_type));
-        assert!(!ArrayIrType::is_batched_while_predicate(&ArrayType::scalar(DataType::Boolean).into()));
-        assert!(ArrayIrType::is_batched_while_predicate(&batched_type.clone().into()));
-        assert!(!ArrayIrType::is_batched_while_predicate(&ArrayIrType::Dimension(DimensionType::from(
-            Dimension::Static(2),
-        ))));
-        assert!(!ArrayIrType::is_batched_while_predicate(&ArrayIrType::Reference(ReferenceType::new(batched_type))));
+        assert!(!ArrayType::scalar(DataType::Boolean).is_batched_while_predicate());
+        assert!(batched_type.is_batched_while_predicate());
+        assert!(!ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)).is_batched_while_predicate());
+        assert!(ArrayIrType::Array(batched_type.clone()).is_batched_while_predicate());
+        assert!(!ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2))).is_batched_while_predicate());
+        assert!(!ArrayIrType::Reference(ReferenceType::new(batched_type)).is_batched_while_predicate());
     }
 
     #[test]
@@ -4365,11 +4358,11 @@ mod tests {
         // Only a first-class dimension has no per-item value to mask. Array state is maskable, and reference state is
         // rejected under a batched predicate by its own rule (refer to `test_while_type_inference_array_ir_state`).
         let scalar_type = ArrayType::scalar(DataType::F32);
-        assert!(!ArrayType::is_loop_invariant_state(&scalar_type));
-        assert!(!ArrayIrType::is_loop_invariant_state(&scalar_type.clone().into()));
-        assert!(!ArrayIrType::is_loop_invariant_state(&ArrayIrType::Reference(ReferenceType::new(scalar_type))));
+        assert!(!scalar_type.is_loop_invariant_state());
+        assert!(!ArrayIrType::Array(scalar_type.clone()).is_loop_invariant_state());
+        assert!(!ArrayIrType::Reference(ReferenceType::new(scalar_type)).is_loop_invariant_state());
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
-        assert!(ArrayIrType::is_loop_invariant_state(&dimension_type));
+        assert!(dimension_type.is_loop_invariant_state());
     }
 
     #[test]
