@@ -484,8 +484,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Value-level capability bundle that groups every operation Ryft supports on array IR values, so that generic array
 /// IR code can state one bound instead of listing each capability it uses. It is implemented automatically for every
 /// value that implements all of its members, and so it must never be implemented manually.
@@ -498,29 +496,29 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// its [`ValueProjection<DimensionType>`](ValueProjection) satisfies [`DimensionOperations`], so that generic array IR
 /// code that projects explicitly (e.g., to compute in the array universe over several operations) does not have to
 /// restate `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds. That projected guarantee is not
-/// implied by the member bound: a blanket implementation that derives `V: X` from `V::Projected: X` cannot be
-/// inverted.
+/// implied by the member bound: a blanket implementation that derives `V: X` from `V::Projected: X` cannot be inverted.
 ///
 /// Variants without a value-level capability are necessarily absent. These are the context-side constructors
-/// [`DynamicZero`](crate::operations::constants::DynamicZero),
-/// [`DynamicOne`](crate::operations::constants::DynamicOne), and
-/// [`DynamicIota`](crate::operations::constants::DynamicIota), and the variants that function-level APIs and transforms
-/// stage on behalf of values, namely control flow, rematerialization, linear calls, composites, and shard maps.
+/// [`DynamicZero`](crate::DynamicZero), [`DynamicOne`](crate::DynamicOne), and [`DynamicIota`](crate::DynamicIota),
+/// and the variants that function-level APIs and transforms stage on behalf of values, namely control flow,
+/// rematerialization, linear calls, composites, and shard maps.
 ///
 /// Array capabilities apply directly to array IR values, and checked arithmetic over first-class dimensions uses
 /// their member projection:
 ///
 /// ```rust
-/// use ryft_core::arrays::DimensionValue;
-/// use ryft_core::{Array, ArrayIrValue, DimensionType, Mul, ProgramError, ValueProjection};
-///
+/// # use ryft_core::{Array, ArrayIrValue, DimensionType, DimensionValue, Mul, ProgramError, ValueProjection};
 /// # fn main() -> Result<(), ProgramError> {
-/// let left: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap());
-/// let right: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]).unwrap());
-/// assert_eq!(left.mul(&right)?, ArrayIrValue::Array(Array::vector(vec![8.0_f64, 15.0]).unwrap()));
+/// // Array capabilities apply directly to array IR values containing arrays.
+/// let left = ArrayIrValue::Array(Array::vector(vec![2.0f64, 3.0]).unwrap());
+/// let right = ArrayIrValue::Array(Array::vector(vec![4.0f64, 5.0]).unwrap());
+/// assert_eq!(left.mul(&right)?, ArrayIrValue::Array(Array::vector(vec![8.0f64, 15.0]).unwrap()));
 ///
-/// let rows: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
-/// let columns: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+/// // The same array IR universe also holds first-class dimension values representing extents.
+/// let rows = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
+/// let columns = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+///
+/// // Project those members so that `mul` uses checked dimension arithmetic.
 /// let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
 /// let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
 /// let elements = rows.mul(&columns)?;
@@ -530,13 +528,13 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// ```
 ///
 /// The [`ParameterProjection`](crate::ParameterProjection) extension trait applies the member projection to a whole
-/// [`Parameterized`](crate::parameters::Parameterized) tree at a boundary (i.e.,
-/// `model.project_parameters::<ArrayType>()?` and `projected.lift_parameters::<ArrayIrValue<A>>()?`), which code whose
-/// machinery is defined only on [`ArrayType`] uses instead of projecting leaf by leaf. Dense derivative terminals
-/// ([`Jacobian`](crate::Jacobian) and [`Hessian`](crate::Hessian)) use that route for their coordinate machinery.
+/// [`Parameterized`](crate::Parameterized) tree at a boundary (i.e., `model.project_parameters::<ArrayType>()?` and
+/// `projected.lift_parameters::<ArrayIrValue<A>>()?`), which code whose machinery is defined only on [`ArrayType`]
+/// uses instead of projecting leaf by leaf. Dense derivative terminals (i.e., [`Jacobian`](crate::Jacobian) and
+/// [`Hessian`](crate::Hessian)) use that route for their coordinate machinery.
 ///
-/// As with [`ArrayOperations`], this bundle implies nothing about the tracers derived from an implementing value, and
-/// a tracer requirement stays a separate bound.
+/// As with [`ArrayOperations`], this bundle implies nothing about the tracers derived from an implementing value,
+/// and a tracer requirement stays a separate bound.
 pub trait ArrayIrOperations:
     Value<Type = ArrayIrType>
     + ArrayOperations<ArrayIrType>
@@ -568,6 +566,8 @@ where
     <V as ValueProjection<DimensionType>>::Projected: DimensionOperations<DimensionType>,
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A> {
     #[inline]
