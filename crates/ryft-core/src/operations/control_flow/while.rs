@@ -160,8 +160,6 @@ pub trait WhileType: Type + ArrayMemberType + From<ArrayType> {
     fn is_loop_invariant_state(&self) -> bool;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl WhileType for ArrayType {
     #[inline]
     fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError> {
@@ -187,9 +185,10 @@ impl WhileType for ArrayIrType {
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `{self}`",
             )));
         };
-        // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such a
-        // carry must instead be passed through the body unchanged, which `WhileOperation::validate_application`
-        // enforces structurally (refer to the documentation of `WhileType`).
+
+        // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such
+        // a carry must instead be passed through the body unchanged, which `WhileOperation::validate_application`
+        // enforces structurally.
         validate_while_predicate_type_and_shape(
             predicate,
             state_types.iter().filter_map(|state_type| match state_type {
@@ -197,6 +196,7 @@ impl WhileType for ArrayIrType {
                 Self::Dimension(_) | Self::Reference(_) => None,
             }),
         )?;
+
         // A reference's referent changes with every iteration that writes it, so it follows the same variation rule
         // as array state.
         validate_while_state_manual_variation(
@@ -207,6 +207,7 @@ impl WhileType for ArrayIrType {
                 Self::Dimension(_) => None,
             }),
         )?;
+
         // Reference operations are effectful, and a batched predicate masks carries per batch item after the body ran
         // for the whole batch. Effectful state cannot be masked that way, because the items whose predicate is already
         // false would still observe the body's writes.
@@ -232,6 +233,8 @@ impl WhileType for ArrayIrType {
         matches!(self, Self::Dimension(_))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level predicate contract that backs the masked loop semantics of [`WhileOperation`] during interpretation.
 /// The shared [`InterpretableOperation`] rule of [`WhileOperation`] requires it of the values of the interpreting
