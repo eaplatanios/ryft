@@ -1099,7 +1099,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         Self::Family: ParameterizedFamily<T>,
     {
-        self.try_map_parameters(|parameter| Ok(map_fn(parameter)))
+        map_parameters_erased::<Self, P, T>(self, &mut map_fn)
     }
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided fallible `map_fn`, which receives
@@ -1377,6 +1377,22 @@ pub trait Parameterized<P: Parameter>: Sized {
             Self::from_parameters(structure, replaced_parameters)
         }
     }
+}
+
+/// Internal helper that maps parameters like [`Parameterized::map_parameters`] with the mapping function type erased.
+/// This is the body of that function, which only wraps its mapping function, so that this body is compiled once per
+/// [`Parameterized`] type and pair of parameter types rather than once per mapping function type: every mapping with a
+/// distinct closure would otherwise instantiate this body and the [`Parameterized::try_map_parameters`] traversal that
+/// it performs again. `map_fn` is called once per parameter, in parameter order, through a dynamic call.
+#[inline]
+fn map_parameters_erased<S: Parameterized<P>, P: Parameter, T: Parameter>(
+    parameters: S,
+    map_fn: &mut dyn FnMut(P) -> T,
+) -> Result<S::To<T>, ParameterError>
+where
+    S::Family: ParameterizedFamily<T>,
+{
+    parameters.try_map_parameters(|parameter| Ok(map_fn(parameter)))
 }
 
 /// Iterator adapter that prefixes each yielded [`ParameterPath`] with a stored [`ParameterPathSegment`]. This exists as

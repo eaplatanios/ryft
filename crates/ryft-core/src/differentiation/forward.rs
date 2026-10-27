@@ -829,6 +829,31 @@ impl<
     }
 }
 
+impl<C: Context> Pushforward<C, Vec<C::Value>, Vec<C::Value>> {
+    /// Reinterprets this [`Pushforward`], built over flat input and output boundaries, as a pushforward over the
+    /// structured `Input` and `Output` of the linearized closure, whose tangent outputs [`apply`](Self::apply) reshapes
+    /// against `output_structure`. Every other part of the pushforward describes only the flattened boundaries and is
+    /// retained unchanged, so `Input` must flatten to the complete primal input boundary and `output_structure` must
+    /// contain one leaf per primal output.
+    #[inline]
+    pub(crate) fn restructured<Input, Output: Parameterized<C::Value>>(
+        self,
+        output_structure: Output::ParameterStructure,
+    ) -> Pushforward<C, Input, Output> {
+        Pushforward {
+            context: self.context,
+            program: self.program,
+            residuals: self.residuals,
+            tangent_reconstruction: self.tangent_reconstruction,
+            primal_input_types: self.primal_input_types,
+            primal_output_types: self.primal_output_types,
+            primal_references: self.primal_references,
+            output_structure,
+            marker: PhantomData,
+        }
+    }
+}
+
 /// Specifies how a [`DifferentiationContext`] uses its underlying [`Context`]s to compute primal values and tangents.
 /// The primal computation evaluates the original function. The tangent computation applies its derivative to input
 /// tangents. A policy decides whether these computations share one context or use separate contexts, and how a primal
@@ -3258,7 +3283,9 @@ where
 /// Internal helper that linearizes like [`linearize_for_rule`] with the callback type erased. This is the body of that
 /// function, which only wraps its callback, so that this body is compiled once per context and input, capture, and
 /// output structure rather than once per callback type: every linearization of a distinct closure would otherwise
-/// instantiate this body and every closure and iterator adapter in it again. The callback is invoked exactly once.
+/// instantiate this body again. This body in turn only flattens the input, capture, and output structures around
+/// [`linearize_for_rule_erased_and_flattened`], so that the linearization itself and every closure and iterator
+/// adapter in it are compiled once per context. The callback is invoked exactly once.
 #[allow(clippy::type_complexity)]
 fn linearize_for_rule_erased<
     C: Context<Type: DifferentiableType>,
@@ -3282,20 +3309,64 @@ where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    if primal.parameters().next().is_none() {
+    // The flat callback rebuilds the structured tracers, invokes `function`, and records the output structure for
+    // reshaping the flat primal outputs and pushforward below. Neither structure holds a tracer, so the callback
+    // retains none of the context clones that must be dropped before the pushforward program is finalized.
+    let mut structures = Some((primal.parameter_structure(), capture.parameter_structure()));
+    let mut output_structure = None;
+    let (primal_outputs, pushforward) = linearize_for_rule_erased_and_flattened(
+        context,
+        &mut |input: Vec<LinearizationTracer<C>>, capture: Vec<LinearizationTracer<C>>| {
+            let (input_structure, capture_structure) = structures.take().unwrap();
+            let input = Input::To::<LinearizationTracer<C>>::from_parameters(input_structure, input)?;
+            let capture = Capture::To::<LinearizationTracer<C>>::from_parameters(capture_structure, capture)?;
+            let output = function(input, capture)?;
+            output_structure = Some(output.parameter_structure());
+            Ok(output.into_parameters().collect())
+        },
+        primal.into_parameters().collect(),
+        capture.into_parameters().collect(),
+        rule,
+    )?;
+    let output_structure = output_structure.unwrap();
+    let output = Output::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
+    Ok((output, pushforward.restructured(output_structure)))
+}
+
+/// Internal helper that linearizes like [`linearize_for_rule_erased`] over the flattened leaves of its input,
+/// capture, and output structures, so that it is compiled once per context. `function` receives the flat input and
+/// capture tracers and returns the flat output tracers. The returned primal outputs and pushforward are flat as well,
+/// and [`linearize_for_rule_erased`] reshapes them against the output structure. The callback is invoked exactly once.
+#[allow(clippy::type_complexity)]
+fn linearize_for_rule_erased_and_flattened<C: Context<Type: DifferentiableType>>(
+    context: &C,
+    function: &mut dyn FnMut(
+        Vec<LinearizationTracer<C>>,
+        Vec<LinearizationTracer<C>>,
+    ) -> Result<Vec<LinearizationTracer<C>>, ProgramError>,
+    primal_values: Vec<C::Value>,
+    capture_values: Vec<C::Value>,
+    rule: DifferentiationRule,
+) -> Result<(Vec<C::Value>, Pushforward<C, Vec<C::Value>, Vec<C::Value>>), DifferentiationError>
+where
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    if primal_values.is_empty() {
         return Err(DifferentiationError::EmptyInput);
     }
 
     let primal_references = ReferenceBoundary::new_for_differentiation(
         context,
-        primal.parameters(),
+        primal_values.iter(),
         std::iter::empty(),
-        capture.parameters(),
+        capture_values.iter(),
     )?;
 
-    let input_structure = primal.parameter_structure();
-    let input_values = primal.into_parameters().collect::<Vec<_>>();
-    let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+    let input_types = primal_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
     // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
     // so they can be residualized when needed without increasing the pushforward's tangent arity.
@@ -3306,7 +3377,7 @@ where
     let mut tangent_index = 0usize;
 
     // Retain the primals for the extent capture below; only the values stamped into duals need cloning.
-    let input_duals = input_values
+    let input_duals = primal_values
         .iter()
         .cloned()
         .map(|value| {
@@ -3327,10 +3398,8 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     let tangent_input_count = tangent_index;
-    let input = Input::To::<LinearizationTracer<C>>::from_parameters(input_structure, input_duals)?;
-    let capture_structure = capture.parameter_structure();
-    let capture_duals = capture
-        .into_parameters()
+    let capture_duals = capture_values
+        .into_iter()
         .map(|value| -> Result<_, DifferentiationError> {
             let primal =
                 PartialTracer::new(primal_evaluation_context.clone(), PartialEvaluationValue::known_input(value));
@@ -3340,13 +3409,7 @@ where
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let capture = Capture::To::<LinearizationTracer<C>>::from_parameters(capture_structure, capture_duals)?;
-    let output = function(input, capture)?;
-
-    // Split each output dual into its known primal value and its tangent. Primal work depends only on known primal
-    // inputs, so every primal half must have folded to a known value.
-    let output_structure = output.parameter_structure();
-    let output_duals = output.into_parameters().collect::<Vec<_>>();
+    let output_duals = function(input_duals, capture_duals)?;
 
     // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
     // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a Single
@@ -3419,7 +3482,6 @@ where
         }
         DifferentiationRule::JvpForTranspose => None,
     };
-    let output = Output::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
     // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
     drop(differentiation_context);
@@ -3460,7 +3522,7 @@ where
     let has_references = program.entry_region_ref().contains_references_in_closure();
     let mut zero_residuals = Vec::new();
     if has_references {
-        let differentiable_primal_inputs = input_values
+        let differentiable_primal_inputs = primal_values
             .iter()
             .map(|value| Ok((value.r#type().tangent()?, value)))
             .collect::<Result<Vec<_>, DifferentiationError>>()?
@@ -3504,10 +3566,10 @@ where
         input_types,
         output_types,
         primal_references,
-        output_structure,
+        vec![Placeholder; primal_outputs.len()],
     )?;
 
-    Ok((output, pushforward))
+    Ok((primal_outputs, pushforward))
 }
 
 impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}

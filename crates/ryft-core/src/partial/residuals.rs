@@ -1534,10 +1534,24 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// Returns a [`ProgramError::InvalidArgument`] when this partition has forwarded residual inputs and another
     /// [`ProgramError`] when the operation family cannot hold a rounding operation or when rebuilding the known
     /// program fails.
+    #[inline]
     pub(crate) fn with_rounded_residuals<R: Fn(&V::Type) -> Option<ErasedOperation>, S: Fn(&O) -> bool>(
         self,
         rounding: R,
         is_storage: S,
+    ) -> Result<Self, ProgramError> {
+        self.with_rounded_residuals_erased(&rounding, &is_storage)
+    }
+
+    /// Internal helper that rounds residuals like [`with_rounded_residuals`](Self::with_rounded_residuals) with the
+    /// callback types erased. This is the body of that function, which only wraps its callbacks, so that this body is
+    /// compiled once per value type and operation family rather than once per pair of callback types: every rounding
+    /// with distinct callbacks would otherwise instantiate this body and every closure and iterator adapter in it
+    /// again. `is_storage` is invoked once per traversed chain instruction and `rounding` at most once per edge.
+    fn with_rounded_residuals_erased(
+        self,
+        rounding: &dyn Fn(&V::Type) -> Option<ErasedOperation>,
+        is_storage: &dyn Fn(&O) -> bool,
     ) -> Result<Self, ProgramError> {
         if self.has_forwarded_residual_inputs() {
             return Err(ProgramError::InvalidArgument {

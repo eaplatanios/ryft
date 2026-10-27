@@ -488,6 +488,7 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
     ///     (i.e., `ȳ = Σᵢ ȳᵢ`, because replicating a primal across the batch is a broadcast and the transpose of a
     ///     broadcast is a summation), while a hypothetical consumer of replicated primal values would instead select
     ///     any one item.
+    #[inline]
     pub fn from_widened_boundary<
         CollapseFn: Fn(
             &TracingContext<V, O>,
@@ -500,6 +501,35 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
         required_output_axes: Option<&[BatchAxis]>,
         widening_output_count: usize,
         collapse_fn: CollapseFn,
+    ) -> Result<Self, BatchingError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
+        Self::from_widened_boundary_erased(
+            program,
+            output_axes,
+            required_output_axes,
+            widening_output_count,
+            &collapse_fn,
+        )
+    }
+
+    /// Internal helper that constructs a [`BoundaryPreservingBatchedProgram`] like [`Self::from_widened_boundary`]
+    /// with the collapse callback type erased. This is the body of that function, which only wraps its callback, so
+    /// that this body is compiled once per value type and operation family rather than once per callback type: every
+    /// adaptation with a distinct collapse closure would otherwise instantiate this body and every closure and
+    /// iterator adapter in it again. The callback is invoked once per collapsed output.
+    #[allow(clippy::type_complexity)]
+    fn from_widened_boundary_erased(
+        program: Program<V, O, Vec<V>, Vec<V>>,
+        output_axes: Vec<BatchAxis>,
+        required_output_axes: Option<&[BatchAxis]>,
+        widening_output_count: usize,
+        collapse_fn: &dyn Fn(
+            &TracingContext<V, O>,
+            Tracer<TracingContext<V, O>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<V, O>>, BatchingError>,
     ) -> Result<Self, BatchingError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
