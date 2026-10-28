@@ -795,11 +795,11 @@ impl<O: Operation<Type = ArrayIrType>> WhilePredicate for LockstepValue<O> {
         agreed_predicate(self.0.iter().map(WhilePredicate::any_true), WHILE_OPERATION_NAME)
     }
 
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         self.0
             .iter()
             .zip(on_true.0.iter().zip(&on_false.0))
-            .map(|(predicate, (on_true, on_false))| predicate.mask_select(on_true, on_false))
+            .map(|(predicate, (on_true, on_false))| predicate.select(on_true, on_false))
             .collect::<Result<_, _>>()
             .map(Self::new)
     }

@@ -177,7 +177,7 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for XlaArray<'_> {
 
 // Batched while-predicate semantics for [`XlaArray`], mirroring the reference semantics of
 // [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
-// `or` via device-to-host readback of every shard, and [`WhilePredicate::mask_select`] broadcasts the predicate
+// `or` via device-to-host readback of every shard, and [`WhilePredicate::select`] broadcasts the predicate
 // against the operands along its leading (prefix) axes on device before selecting.
 impl WhilePredicate for XlaArray<'_> {
     fn any_true(&self) -> Result<bool, ProgramError> {
@@ -209,11 +209,11 @@ impl WhilePredicate for XlaArray<'_> {
         Ok(any)
     }
 
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         if !self.data_type().is_boolean() || on_true.r#type() != on_false.r#type() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "mask_select requires a Boolean prefix-shaped predicate and congruent inputs, but got \
+                    "select requires a Boolean prefix-shaped predicate and congruent inputs, but got \
                      predicate {} with inputs {} and {}",
                     self.r#type().as_ref(),
                     on_true.r#type().as_ref(),
@@ -230,7 +230,7 @@ impl WhilePredicate for XlaArray<'_> {
             let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
             self.broadcast(output_type, output_axes.as_slice())?
         };
-        condition.select(on_true, on_false)
+        Select::select(&condition, on_true, on_false)
     }
 }
 
@@ -1502,8 +1502,8 @@ mod tests {
         let condition = boolean_vector(&domain, &mesh, &condition_values);
         let reference_condition = Array::vector(condition_values.to_vec()).unwrap();
         assert_parity(
-            &condition.select(&left, &right).unwrap(),
-            &reference_condition.select(&reference_left, &reference_right).unwrap(),
+            &Select::select(&condition, &left, &right).unwrap(),
+            &Select::select(&reference_condition, &reference_left, &reference_right).unwrap(),
         );
 
         // Reductions agree, including the divide-by-count semantics of `Mean`.
@@ -4091,7 +4091,7 @@ mod tests {
         assert_eq!(less_than.data_type(), DataType::Boolean);
         assert_eq!(read_booleans(&less_than), vec![true, false, false, true]);
 
-        let selected = less_than.select(&a, &b).unwrap();
+        let selected = Select::select(&less_than, &a, &b).unwrap();
         assert_eq!(read_f32s(&selected), vec![1.0, 2.0, 3.0, 8.0]);
     }
 
@@ -4148,16 +4148,22 @@ mod tests {
 
         // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Exercise both
         // branch positions so that recovering the sign cannot accidentally depend on the selected side.
-        let selected_signed = read_i32s(&condition.select(&signed, &wide).unwrap());
+        let selected_signed = read_i32s(&Select::select(&condition, &signed, &wide).unwrap());
         assert_eq!(
             selected_signed,
-            reference_condition.select(&reference_signed, &reference_wide).unwrap().elements::<i32>().unwrap(),
+            Select::select(&reference_condition, &reference_signed, &reference_wide)
+                .unwrap()
+                .elements::<i32>()
+                .unwrap(),
         );
         assert_eq!(selected_signed, vec![-1, 3, 0, 5]);
-        let selected_wide = read_i32s(&condition.select(&wide, &signed).unwrap());
+        let selected_wide = read_i32s(&Select::select(&condition, &wide, &signed).unwrap());
         assert_eq!(
             selected_wide,
-            reference_condition.select(&reference_wide, &reference_signed).unwrap().elements::<i32>().unwrap(),
+            Select::select(&reference_condition, &reference_wide, &reference_signed)
+                .unwrap()
+                .elements::<i32>()
+                .unwrap(),
         );
         assert_eq!(selected_wide, vec![2, -1, 4, 0]);
     }
@@ -4487,7 +4493,7 @@ mod tests {
         // item 1 takes `on_true`'s second row.
         let on_true = f32_matrix(&domain, &mesh, 2, 2, &[1.0, 2.0, 3.0, 4.0]);
         let on_false = f32_matrix(&domain, &mesh, 2, 2, &[5.0, 6.0, 7.0, 8.0]);
-        let masked = mixed.mask_select(&on_true, &on_false).unwrap();
+        let masked = WhilePredicate::select(&mixed, &on_true, &on_false).unwrap();
         assert_eq!(read_f32s(&masked), vec![5.0, 6.0, 3.0, 4.0]);
     }
 

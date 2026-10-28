@@ -306,7 +306,7 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                     .map(|((candidate, carried), state_type)| {
                         // A first-class dimension carry is loop-invariant under a batched predicate (the contract
                         // documented on `WhileType`), so masking it is the identity and the body's candidate result is
-                        // threaded on directly. This matches eager interpretation, whose `mask_select` returns equal
+                        // threaded on directly. This matches eager interpretation, whose `select` returns equal
                         // dimension carries unchanged.
                         if matches!(state_type, ArrayIrType::Dimension(_)) {
                             return Ok(candidate);

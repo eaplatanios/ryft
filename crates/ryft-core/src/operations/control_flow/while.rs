@@ -116,14 +116,14 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// batched, and the consumers of the loop (i.e., interpretation, differentiation, and lowering) implement the masked
 /// semantics. Array state is always maskable.
 ///
-/// [`ArrayIrType`] predicates are Boolean array members, and the state may mix arrays, first-class dimensions, and
-/// references. The prefix requirement applies to the array members only, because a first-class dimension has no
+/// [`ArrayIrType`] predicates are Boolean array members, and the state may mix arrays, first-class dimensions,
+/// and references. The prefix requirement applies to the array members only, because a first-class dimension has no
 /// shape. Under a batched predicate, a dimension carry is loop-invariant state: one dimension value cannot represent
 /// independently masked per-item extents, but masking a carry that the body passes through unchanged is the identity,
-/// and the [`mask_select`](WhilePredicate::mask_select) function of [`ArrayIrValue`] returns such equal dimension
-/// carries unchanged. Structural array IR batching relies on this to thread its loop-invariant mapped extent through
-/// batch-varying loops. Reference state is supported under scalar predicates only: a batched predicate requires
-/// reference discharge first, because reference effects cannot be masked per item.
+/// and the [`select`](WhilePredicate::select) function of [`ArrayIrValue`] returns such equal dimension carries
+/// unchanged. Structural array IR batching relies on this to thread its loop-invariant mapped extent through
+/// batch-varying loops. Reference state is supported under scalar predicates only: a batched predicate
+/// requires reference discharge first, because reference effects cannot be masked per item.
 ///
 /// A manual region is a [`ShardMapOperation`](crate::ShardMapOperation) body. Devices whose predicates differ along
 /// its manual mesh axes run different numbers of iterations, so every array state element (and, for [`ArrayIrType`],
@@ -242,11 +242,11 @@ impl WhileType for ArrayIrType {
 ///
 /// A while condition may produce a batched Boolean predicate (i.e., one termination decision per item of its leading
 /// axes), whose shape is a prefix of every state shape (refer to [`WhileType`]). Interpretation then continues while
-/// [`any_true`](Self::any_true) holds and updates each state element with [`mask_select`](Self::mask_select), so the
-/// items whose predicate is false keep their carried state while the active items take the candidate update of the
-/// body. The predicate is recomputed from the whole state on every iteration, so a finished item whose predicate reads
-/// its own state alone can never rejoin the loop (its state is frozen), whereas an item whose predicate also reads
-/// other items rejoins whenever that predicate turns true again. Every path (i.e., interpretation, the masked form of
+/// [`any_true`](Self::any_true) holds and updates each state element with [`select`](Self::select), so the items whose
+/// predicate is false keep their carried state while the active items take the candidate update of the body. The
+/// predicate is recomputed from the whole state on every iteration, so a finished item whose predicate reads its own
+/// state alone can never rejoin the loop (its state is frozen), whereas an item whose predicate also reads other items
+/// rejoins whenever that predicate turns true again. Every path (i.e., interpretation, the masked form of
 /// differentiation, and the lowering) decides this the same way.
 ///
 /// Per-item masking selects values after evaluating the body for every item; it does not skip the body computations of
@@ -274,19 +274,22 @@ pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// Selects between `on_true` and `on_false` per element under this Boolean predicate, broadcasting the predicate
     /// against their shape along its leading (i.e., prefix) axes.
     ///
+    /// The candidates must have the same type. [`Select::select`](super::select::Select::select) instead uses ordinary
+    /// elementwise broadcasting and promotion. Use trait-qualified calls when both traits are in scope.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when this value is not a Boolean predicate whose shape is a prefix of the shape of
     /// `on_true` and `on_false`, when the two candidates have different types or (under a batched predicate) do not
     /// vary over every manual mesh axis that the predicate varies over, or when this value does not have a concrete
     /// value.
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         Ok(if self.concretize()? { on_true.clone() } else { on_false.clone() })
     }
 }
 
 // Batched while-predicate semantics for `Array`: `any_true` reduces the whole Boolean payload with `or`, and
-// `mask_select` broadcasts the predicate against its other inputs along its leading (prefix) axes, so predicate item
+// `select` broadcasts the predicate against its other inputs along its leading (prefix) axes, so predicate item
 // `i` masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
 impl WhilePredicate for Array {
     fn any_true(&self) -> Result<bool, ProgramError> {
@@ -304,13 +307,13 @@ impl WhilePredicate for Array {
             .any(|index| self.storage_bytes()[addressing.byte_range_for_flat_index(index).start] != 0))
     }
 
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let predicate_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
         if on_true.r#type() != on_false.r#type() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`mask_select` requires congruent inputs, but got `{}` and `{}`",
+                    "`select` requires congruent inputs, but got `{}` and `{}`",
                     on_true.r#type(),
                     on_false.r#type(),
                 ),
@@ -373,7 +376,7 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
         }
     }
 
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let predicate = match self {
             Self::Array(predicate) => predicate,
             Self::Dimension(value) => {
@@ -390,7 +393,7 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
             }
         };
         match (on_true, on_false) {
-            (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.mask_select(on_true, on_false)?)),
+            (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.select(on_true, on_false)?)),
             (Self::Dimension(on_true), Self::Dimension(on_false)) => {
                 // Selecting between equal dimension carries (e.g., the loop-invariant mapped extent that structural
                 // batching threads through a while loop's state) is the identity for every item, so it needs no
@@ -1268,7 +1271,7 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
             state = candidates
                 .iter()
                 .zip(state.iter())
-                .map(|(candidate, carried)| predicate.mask_select(candidate, carried))
+                .map(|(candidate, carried)| predicate.select(candidate, carried))
                 .collect::<Result<Vec<_>, _>>()?;
             completed_iterations += 1;
         }
@@ -3070,7 +3073,7 @@ where
             for ((candidate, carried), state_type) in candidates.iter().zip(&state).zip(state_types.iter()) {
                 // A first-class dimension carry is loop-invariant under a batched predicate (the contract documented on
                 // `WhileType`), so masking it is the identity and the body's candidate result is threaded on directly.
-                // This matches eager interpretation, whose `mask_select` returns equal dimension carries unchanged, and
+                // This matches eager interpretation, whose `select` returns equal dimension carries unchanged, and
                 // the XLA lowering's batched-predicate masking.
                 let Some(state_array_type) = state_type.as_array_type().ok() else {
                     next_state.push(candidate.clone());
@@ -4412,12 +4415,12 @@ mod tests {
     }
 
     #[test]
-    fn test_while_predicate_mask_select() {
+    fn test_while_predicate_select() {
         // A scalar array predicate selects one candidate wholesale.
         let on_true = Array::vector(vec![1.0f64, 2.0]).unwrap();
         let on_false = Array::vector(vec![-1.0f64, -2.0]).unwrap();
-        assert_eq!(Array::scalar(true).unwrap().mask_select(&on_true, &on_false), Ok(on_true.clone()));
-        assert_eq!(Array::scalar(false).unwrap().mask_select(&on_true, &on_false), Ok(on_false.clone()));
+        assert_eq!(Array::scalar(true).unwrap().select(&on_true, &on_false), Ok(on_true.clone()));
+        assert_eq!(Array::scalar(false).unwrap().select(&on_true, &on_false), Ok(on_false.clone()));
 
         // Predicate item `i` masks the contiguous per-item block of `on_true` and `on_false` elements it governs.
         let predicate = Array::vector(vec![false, true]).unwrap();
@@ -4427,7 +4430,7 @@ mod tests {
             Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, -3.0, -4.0])
                 .unwrap();
         assert_eq!(
-            predicate.mask_select(&on_true, &on_false),
+            predicate.select(&on_true, &on_false),
             Ok(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, 3.0, 4.0])
                 .unwrap()),
         );
@@ -4435,7 +4438,7 @@ mod tests {
         // Matching or divisible element counts do not make incompatible shapes broadcastable along prefix axes.
         let flattened = Array::vector(vec![1.0f64, 2.0, 3.0, 4.0]).unwrap();
         assert_eq!(
-            predicate.mask_select(&flattened, &flattened),
+            predicate.select(&flattened, &flattened),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[2]` is not a prefix of state `f64[4]`",
@@ -4445,7 +4448,7 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::Boolean, [2, 2]), &[false, true, true, false])
                 .unwrap();
         assert_eq!(
-            matrix_predicate.mask_select(&flattened, &flattened),
+            matrix_predicate.select(&flattened, &flattened),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[2, 2]` is not a prefix of state `f64[4]`",
@@ -4453,16 +4456,16 @@ mod tests {
         );
         let mismatched = Array::vector(vec![1.0f64, 2.0]).unwrap();
         assert_eq!(
-            predicate.mask_select(&on_true, &mismatched),
+            predicate.select(&on_true, &mismatched),
             Err(ProgramError::UnsupportedOperation {
-                message: "`mask_select` requires congruent inputs, but got `f64[2, 2]` and `f64[2]`".to_string(),
+                message: "`select` requires congruent inputs, but got `f64[2, 2]` and `f64[2]`".to_string(),
             }),
         );
 
         // An empty predicate has a valid empty prefix and selects an empty state without dividing by zero.
         let empty_predicate = Array::vector(Vec::<bool>::new()).unwrap();
         let empty_state = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 2]), &[]).unwrap();
-        assert_eq!(empty_predicate.mask_select(&empty_state, &empty_state), Ok(empty_state));
+        assert_eq!(empty_predicate.select(&empty_state, &empty_state), Ok(empty_state));
 
         // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch
         // layout, including its hole, while selecting exact element bytes in logical order.
@@ -4473,7 +4476,7 @@ mod tests {
             ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
         let on_true = Array::from_elements(branch_type.clone(), &[0x1111u16, 0x2222, 0x3333, 0x4444]).unwrap();
         let on_false = Array::from_elements(branch_type.clone(), &[0xaaaau16, 0xbbbb, 0xcccc, 0xdddd]).unwrap();
-        let selected = predicate.mask_select(&on_true, &on_false).unwrap();
+        let selected = predicate.select(&on_true, &on_false).unwrap();
         assert_eq!(selected.r#type().as_ref(), &branch_type);
         assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
         assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
@@ -4483,7 +4486,7 @@ mod tests {
         let scalar_false = array(Array::scalar(false).unwrap());
         let batched = array(Array::vector(vec![false, true]).unwrap());
         assert_eq!(
-            batched.mask_select(
+            batched.select(
                 &array(Array::vector(vec![1.0f64, 2.0]).unwrap()),
                 &array(Array::vector(vec![-1.0f64, -2.0]).unwrap()),
             ),
@@ -4495,11 +4498,11 @@ mod tests {
         // item, so it accepts only identical carries.
         let on_true = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
         let on_false = TestIrValue::Reference(ArrayReference::new(Array::scalar(2.0f32).unwrap()));
-        assert_eq!(scalar_true.mask_select(&on_true, &on_false), Ok(on_true.clone()));
-        assert_eq!(scalar_false.mask_select(&on_true, &on_false), Ok(on_false.clone()));
-        assert_eq!(batched.mask_select(&on_true, &on_true), Ok(on_true.clone()));
+        assert_eq!(scalar_true.select(&on_true, &on_false), Ok(on_true.clone()));
+        assert_eq!(scalar_false.select(&on_true, &on_false), Ok(on_false.clone()));
+        assert_eq!(batched.select(&on_true, &on_true), Ok(on_true.clone()));
         assert_eq!(
-            batched.mask_select(&on_true, &on_false),
+            batched.select(&on_true, &on_false),
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "a batched `{WHILE_OPERATION_NAME}` predicate cannot select between distinct reference carries per \
@@ -4513,11 +4516,11 @@ mod tests {
         // represent independently masked per-item extents, so distinct dimension carries need a scalar predicate.
         let three = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let four = TestIrValue::Dimension(DimensionValue::constant(4).unwrap());
-        assert_eq!(scalar_true.mask_select(&three, &four), Ok(three.clone()));
-        assert_eq!(scalar_false.mask_select(&three, &four), Ok(four.clone()));
-        assert_eq!(batched.mask_select(&three, &three), Ok(three.clone()));
+        assert_eq!(scalar_true.select(&three, &four), Ok(three.clone()));
+        assert_eq!(scalar_false.select(&three, &four), Ok(four.clone()));
+        assert_eq!(batched.select(&three, &three), Ok(three.clone()));
         assert_eq!(
-            batched.mask_select(&three, &four),
+            batched.select(&three, &four),
             Err(ProgramError::Concretization {
                 message: "cannot extract a concrete boolean from a value of type `bool[2]`; expected `bool[]`"
                     .to_string(),
@@ -4527,20 +4530,20 @@ mod tests {
         // A state element can only be selected against an element of the same kind, and only an array predicate can
         // select at all.
         assert_eq!(
-            scalar_true.mask_select(&three, &on_true),
+            scalar_true.select(&three, &on_true),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` predicate cannot select between mismatched state types `dimension<3>` and \
                  `ref<f32[]>`",
             )))),
         );
         assert_eq!(
-            three.mask_select(&on_true, &on_false),
+            three.select(&on_true, &on_false),
             Err(ProgramError::Concretization {
                 message: format!("cannot use first-class dimension `3` as a `{WHILE_OPERATION_NAME}` predicate"),
             }),
         );
         assert_eq!(
-            on_true.mask_select(&three, &four),
+            on_true.select(&three, &four),
             Err(ProgramError::Concretization {
                 message: format!("cannot use reference `ref<f32[]>` as a `{WHILE_OPERATION_NAME}` predicate"),
             }),
@@ -4551,7 +4554,7 @@ mod tests {
         let predicate = trace.input(ArrayType::scalar(DataType::Boolean));
         let state = trace.input(ArrayType::scalar(DataType::F64));
         assert_eq!(
-            predicate.mask_select(&state, &state).map(|_| ()),
+            predicate.select(&state, &state).map(|_| ()),
             Err(ProgramError::Concretization {
                 message: "cannot extract a concrete boolean from a tracer".to_string(),
             }),
@@ -4559,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_predicate_mask_select_manual_variation() {
+    fn test_while_predicate_select_manual_variation() {
         // Masked selection checks the manual variation of a batched predicate against the state: a scalar predicate
         // selects a whole candidate, so its variation does not constrain the state.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -4570,23 +4573,23 @@ mod tests {
         let invariant = Array::vector(vec![false, true]).unwrap();
         let varying = Array::from_elements(varying_vector_type.clone(), &[true, false]).unwrap();
         let predicate = Array::from_elements(varying_scalar_type, &[true]).unwrap();
-        assert_eq!(predicate.mask_select(&invariant, &invariant), Ok(invariant.clone()));
-        assert_eq!(predicate.mask_select(&varying, &varying), Ok(varying.clone()));
+        assert_eq!(predicate.select(&invariant, &invariant), Ok(invariant.clone()));
+        assert_eq!(predicate.select(&varying, &varying), Ok(varying.clone()));
 
         // A batched predicate may be invariant over axes that the state varies over, but not the other way around.
         let predicate = Array::vector(vec![true, false]).unwrap();
         let other = Array::from_elements(varying_vector_type.clone(), &[false, true]).unwrap();
         assert_eq!(
-            predicate.mask_select(&varying, &other),
+            predicate.select(&varying, &other),
             Ok(Array::from_elements(varying_vector_type.clone(), &[true, true]).unwrap()),
         );
         let predicate = Array::from_elements(varying_vector_type.clone(), &[false, true]).unwrap();
         assert_eq!(
-            predicate.mask_select(&varying, &other),
+            predicate.select(&varying, &other),
             Ok(Array::from_elements(varying_vector_type, &[false, false]).unwrap()),
         );
         assert_eq!(
-            predicate.mask_select(&invariant, &invariant),
+            predicate.select(&invariant, &invariant),
             Err(TypeError::invalid(format!(
                 "batched `{WHILE_OPERATION_NAME}` predicate `bool[2][sharding={{mesh<['m'=2:manual]>, [{{}}], \
                  varying_manual={{'m'}}}}]` varies over manual axes that state `bool[2]` does not vary over",

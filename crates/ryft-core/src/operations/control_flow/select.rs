@@ -11,10 +11,11 @@
 //! [`jax.numpy.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html), which is more permissive
 //! than [`jax.lax.select`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.select.html), whose branches must share
 //! a shape and data type and whose condition must be a scalar or have that shape. The output keeps the broadcast
-//! placement of its inputs and uses the dense row-major layout. Branches that carry pending reductions must carry
-//! identical reduction state, which the output inherits, while the condition must neither be unreduced nor vary over
-//! any of those reduction axes, because selection commutes with a pending sum only when every shard selects the same
-//! way.
+//! placement of its inputs and preserves an explicit layout when all three inputs agree on it; otherwise, its layout
+//! is unspecified, and eager [`Array`] execution uses dense row-major storage. Branches that carry pending reductions
+//! must carry identical reduction state, which the output inherits, while the condition must neither be unreduced nor
+//! vary over any of those reduction axes, because selection commutes with a pending sum only when every shard selects
+//! the same way.
 //!
 //! For a fixed condition, `select` is linear in its two branches. Forward mode differentiation therefore selects the
 //! branch tangents under the primal condition and keeps a structural-zero output tangent when both branch tangents are
@@ -422,10 +423,11 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// For arrays, the three input shapes broadcast together and the two branch element data types promote to the output
 /// data type, so the inputs need not share a shape and the branches need not share a data type. After any required
 /// element type conversion, selection copies the chosen element encodings exactly, including NaN payloads and signed
-/// zeros. Equal-typed branches retain their original encodings, and the output uses the dense row-major layout. A
-/// staged call retains all three inputs, so dynamic extents are read at execution time. Selection is linear in its
-/// branches for a fixed condition. Refer to the [module documentation](self) for its sharding, differentiation, and
-/// batching semantics.
+/// zeros. Equal-typed branches retain their original encodings. The output preserves an explicit layout when all
+/// three inputs agree on it; otherwise, its layout is unspecified, and eager [`Array`] execution uses dense row-major
+/// storage. A staged call retains all three inputs, so dynamic extents are read at execution time. Selection is linear
+/// in its branches for a fixed condition. Refer to the [module documentation](self) for its sharding, differentiation,
+/// and batching semantics.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
@@ -463,7 +465,7 @@ impl Select for Array {
 
         // Only a branch whose element data type differs from the output data type is converted, so an equal-typed
         // branch is read from its original storage and layout. Every input is addressed through its own physical
-        // layout under broadcasting, and the selected element bytes are copied into a dense output.
+        // layout under broadcasting, and the selected element bytes are copied into the inferred output layout.
         let output_data_type = output_type.data_type();
         let on_true = on_true.promoted_to(output_data_type)?;
         let on_false = on_false.promoted_to(output_data_type)?;
@@ -852,6 +854,28 @@ mod tests {
             ),
             Ok(Array::from_elements(branch_type, &[1f32, 4.0]).unwrap()),
         );
+    }
+
+    #[test]
+    fn test_select_interpretation_preserves_shared_layout() {
+        let layout = Layout::Strided(StridedLayout::new(vec![1, 2]));
+        let condition_type = ArrayType::new_static(DataType::Boolean, [2, 2]).with_layout(layout.clone());
+        let branch_type = ArrayType::new_static(DataType::U8, [2, 2]).with_layout(layout);
+        let condition = Array::from_elements(condition_type.clone(), &[true, true, false, false]).unwrap();
+        let on_true = Array::from_elements(branch_type.clone(), &[1u8, 2, 3, 4]).unwrap();
+        let on_false = Array::from_elements(branch_type.clone(), &[11u8, 12, 13, 14]).unwrap();
+        assert_eq!(
+            Operation::infer_output_types(
+                &SelectOperation::<ArrayType>::new(),
+                &[condition_type, branch_type.clone(), branch_type.clone()],
+                &[],
+            ),
+            Ok(vec![branch_type.clone()]),
+        );
+        let output = condition.select(&on_true, &on_false).unwrap();
+        assert_eq!(output.r#type().as_ref(), &branch_type);
+        assert_eq!(output.elements::<u8>(), Ok(vec![1, 2, 13, 14]));
+        assert_eq!(output.storage_bytes(), [1, 13, 2, 14]);
     }
 
     #[test]

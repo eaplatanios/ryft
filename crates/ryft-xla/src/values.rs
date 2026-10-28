@@ -478,11 +478,11 @@ impl WhilePredicate for XlaValue<'_> {
         self.clone().into_array_ir_value().any_true()
     }
 
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let output = self
             .clone()
             .into_array_ir_value()
-            .mask_select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
+            .select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
         Ok(Self::from_array_ir_value(output, on_true.xla_domain())?)
     }
 }
@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_mask_select() {
+    fn test_xla_value_select() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);
@@ -1019,22 +1019,22 @@ mod tests {
         let falsity = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8], &[]));
         let one = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32], &[]));
         let two = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[2.0f32], &[]));
-        assert_eq!(read::<f32>(&falsity.mask_select(&one, &two).unwrap()), vec![2.0]);
+        assert_eq!(read::<f32>(&falsity.select(&one, &two).unwrap()), vec![2.0]);
 
         // A batched (prefix-shaped) predicate selects per item: item 0 keeps the first row of `on_false` and item 1
         // takes the second row of `on_true`.
         let mixed = XlaValue::Array(array(&domain, &mesh, DataType::Boolean, &[0u8, 1], &[2]));
         let on_true = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]));
         let on_false = XlaValue::Array(array(&domain, &mesh, DataType::F32, &[5.0f32, 6.0, 7.0, 8.0], &[2, 2]));
-        assert_eq!(read::<f32>(&mixed.mask_select(&on_true, &on_false).unwrap()), vec![5.0, 6.0, 3.0, 4.0]);
+        assert_eq!(read::<f32>(&mixed.select(&on_true, &on_false).unwrap()), vec![5.0, 6.0, 3.0, 4.0]);
 
         // Equal dimension carries pass through with their session, while dimensions are never predicates.
         let three = dimension(&domain, 3);
-        let selected = mixed.mask_select(&three, &three).unwrap();
+        let selected = mixed.select(&three, &three).unwrap();
         assert_eq!(selected, three);
         assert!(same_session(selected.xla_domain(), &domain));
         assert!(matches!(
-            three.mask_select(&one, &two),
+            three.select(&one, &two),
             Err(ProgramError::Concretization { message })
                 if message == "cannot use first-class dimension `3` as a `while` predicate",
         ));
