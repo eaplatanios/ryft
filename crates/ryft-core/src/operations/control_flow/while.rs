@@ -83,11 +83,11 @@ use crate::partial::{
 use crate::programs::{
     AtomId, AttachedRegions, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
     OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
-    ReferenceAccessMode, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary,
-    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef,
-    RegionSlot, Type, TypeError, Typed, Value,
+    ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule,
+    RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
+    TypeError, Typed, Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -1152,12 +1152,60 @@ impl<
                 discharged_inputs.push(predicate);
                 let state_allocations =
                     carries.iter().copied().chain(entering.iter().copied().map(Some)).collect::<Vec<_>>();
-                let (rotated_condition, rotated_body) = rotated_discharge_regions(
-                    &condition_program,
-                    &body_program,
-                    state_allocations.as_slice(),
-                    condition_published.as_slice(),
-                )?;
+                let (rotated_condition, rotated_body) = {
+                    let condition = &condition_program;
+                    let body = &body_program;
+                    // Rotate the discharged regions of a `while` loop whose condition mutates a discharged allocation
+                    // into do-while form and returns the rotated `(condition, body)` programs. Both take the rebuilt
+                    // body's state boundary followed by one predicate input. The rotated body splices the rebuilt body
+                    // over the state, then splices the rebuilt condition over the states the body returned, and returns
+                    // those states, with the final states the condition published replacing the body's at every
+                    // position carrying the same allocation, followed by the fresh predicate. The rotated condition
+                    // merely returns its predicate input. The caller supplies the initial predicate by discharging the
+                    // original condition once before the loop, so the loop evaluates the condition exactly as often and
+                    // in the same order as the source did.
+                    let state_types = body.input_types();
+                    check_count!("input", state_allocations, state_types.len(), ProgramError);
+                    let condition_output_types = condition.output_types();
+                    check_count!("output", condition_output_types, 1 + condition_published.len(), ProgramError);
+                    let predicate_type = condition_output_types[0].clone();
+
+                    let mut body_builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+                    let state =
+                        state_types.iter().cloned().map(|r#type| body_builder.add_input(r#type)).collect::<Vec<_>>();
+                    body_builder.add_input(predicate_type.clone());
+                    let state = body_builder.splice_program(body, state.as_slice())?;
+                    check_count!("output", state, state_types.len(), ProgramError);
+                    let condition_outputs = body_builder.splice_program(condition, state.as_slice())?;
+                    let mut outputs = Vec::with_capacity(state.len() + 1);
+                    for (position, current) in state.iter().enumerate() {
+                        let published = state_allocations[position].and_then(|allocation| {
+                            condition_published.iter().position(|published| *published == allocation)
+                        });
+                        outputs.push(match published {
+                            Some(index) => condition_outputs[1 + index],
+                            None => *current,
+                        });
+                    }
+                    outputs.push(condition_outputs[0]);
+                    let rotated_body = body_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                        outputs,
+                        vec![Placeholder; state_types.len() + 1],
+                        vec![Placeholder; state_types.len() + 1],
+                    )?;
+
+                    let mut condition_builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+                    for r#type in state_types.iter().cloned() {
+                        condition_builder.add_input(r#type);
+                    }
+                    let predicate = condition_builder.add_input(predicate_type);
+                    let rotated_condition = condition_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                        vec![predicate],
+                        vec![Placeholder; state_types.len() + 1],
+                        vec![Placeholder],
+                    )?;
+                    (rotated_condition, rotated_body)
+                };
                 // The bound truncates the source loop after its last body application, before the condition's next
                 // evaluation, whereas every rotated iteration evaluates the condition after the body. The rotated loop
                 // therefore runs one body application fewer (none at all for a bound of one), and the last one runs
@@ -1462,7 +1510,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
             .map(|state_type| condition_builder.add_input(state_type.clone()))
             .collect::<Vec<_>>();
         let condition_outputs =
-            rebuild_while_program(context, &mut condition_builder, &condition_state_atoms, &condition_evaluation)?;
+            context.rebuild_while_region(&mut condition_builder, &condition_state_atoms, &condition_evaluation)?;
         let residual_condition = condition_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             condition_outputs,
             vec![Placeholder; state_count],
@@ -1472,7 +1520,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         let mut body_builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let body_state_atoms =
             state_types.iter().map(|state_type| body_builder.add_input(state_type.clone())).collect::<Vec<_>>();
-        let body_outputs = rebuild_while_program(context, &mut body_builder, &body_state_atoms, &body_evaluation)?;
+        let body_outputs = context.rebuild_while_region(&mut body_builder, &body_state_atoms, &body_evaluation)?;
         let residual_body = body_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             body_outputs,
             vec![Placeholder; state_count],
@@ -1548,7 +1596,7 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // An eager context runs the loop directly at the concrete duals (refer to `jvp_while_eagerly`), so eager
+        // An eager context runs the loop directly at the concrete duals, so eager
         // forward mode is total over data-dependent `while` loops with no iteration bound. Staging contexts stage the
         // shared array-backed rule (refer to `WhileJvp::bind`), and the eager rule resumes with it from the current
         // duals once the predicate stops concretizing to one scalar Boolean (e.g., a batched predicate, which has no
@@ -1564,7 +1612,121 @@ where
         let condition = driver.region(0)?.to_program();
         let body = driver.region(1)?.to_program();
         if context.primal().is_eager() {
-            return jvp_while_eagerly(self, &condition, &body, context, driver, inputs);
+            // Run a `while` loop's forward-mode rule directly at concrete duals for an [eager](Context::is_eager)
+            // context and returns the output duals, resuming with the staged rule (refer to [`WhileJvp::bind`]) from
+            // the current duals when the loop's predicate stops concretizing to one scalar Boolean.
+            //
+            // Each iteration evaluates the condition on the concrete primal carries and interprets the body once over
+            // the current dual carries. Body instructions re-enter their JVP rules through the differentiation driver,
+            // so nested data-dependent `while` operations recurse through this same eager path without a program-level
+            // unroll pre-pass. Data-dependent iteration counts therefore need no iteration bound, as for [JAX's `jvp`
+            // through an eagerly executed loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html), while a
+            // semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached,
+            // matching the bounded-`while` truncation semantics. Each body effect executes exactly once per loop
+            // iteration.
+            //
+            // A predicate may fail to concretize on any iteration, not only the first: a batched per-item predicate has
+            // no single continuation decision, and an eager transform context (e.g., batching over an eager parent) can
+            // turn a replicated predicate into a mapped one once a replicated state element mixes with a mapped one in
+            // the body. A while loop is a fixed point of its state, so continuing from the current state with the bound
+            // lowered by the number of completed iterations is exact. The staged rule then evaluates the condition on
+            // that state again, which is sound only for a pure condition without deferred work; for any other condition
+            // the concretization error is returned instead, because re-running the condition would repeat its effects.
+            //
+            // This rule derives no program from the body region and therefore consults no per-region transform cache:
+            // it interprets the body once per iteration at the concrete duals reached by the loop, so its work is a
+            // function of the runtime values rather than of the region's contents alone.
+            let condition = &condition;
+            let body = &body;
+            let state_count = inputs.len();
+            let mut primal_carries = Vec::with_capacity(state_count);
+            let mut tangent_carries = Vec::with_capacity(state_count);
+            for input in inputs {
+                primal_carries.push(input.primal().clone());
+                tangent_carries.push(input.tangent().clone());
+            }
+
+            let mut completed_iterations = 0;
+            loop {
+                if self.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                    break;
+                }
+
+                // Concretize the condition on the current concrete primal carries to decide whether another iteration
+                // runs.
+                let mut condition_outputs = condition.interpret_in_context(context.primal(), primal_carries.clone())?;
+                check_count!("output", condition_outputs, 1, ProgramError);
+                let predicate = match condition_outputs.remove(0).concretize() {
+                    Ok(predicate) => predicate,
+                    // The predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate,
+                    // whose items stop on different iterations, has no single continuation decision, or a predicate
+                    // that an eager batching context maps once the body mixes a replicated state element with a mapped
+                    // one). The loop resumes from the current duals under the staged rule with the remaining bound,
+                    // which is at least one because the loop exits above, before evaluating the condition, once the
+                    // bound is reached. The staged rule evaluates the condition on the current state once more, so only
+                    // a pure condition without deferred work resumes.
+                    Err(error) => {
+                        let condition_effects = condition.effects();
+                        if !condition_effects.classes().is_empty() || condition_effects.has_deferred_work() {
+                            return Err(error.into());
+                        }
+                        let remaining = WhileOperation::new()
+                            .with_iteration_bound(self.iteration_bound().map(|bound| bound - completed_iterations))?;
+                        let duals = primal_carries
+                            .into_iter()
+                            .zip(tangent_carries)
+                            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return WhileJvp::new(driver, &remaining, &duals)?
+                            .bind(condition, body, context, driver, &duals);
+                    }
+                };
+                if !predicate {
+                    break;
+                }
+
+                // Advance one iteration by replaying the body directly over dual values. This is deliberately not
+                // routed through a program-level unroll pre-pass: such a rewrite interprets the body to discover
+                // concrete nested-loop iteration counts, after which replaying its fused JVP would execute primal
+                // effects a second time. Direct dual interpretation lets a nested while recurse through this eager rule
+                // and executes every primal operation once.
+                let input_duals = primal_carries
+                    .drain(..)
+                    .zip(tangent_carries.drain(..))
+                    .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let body_region = body.entry_region_ref();
+                let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
+                    input_duals,
+                    |_, constant| {
+                        Ok(DifferentiationDual::new_with_zero_tangent(context.primal().lift(constant.clone())?)?)
+                    },
+                    |instruction, input_duals| {
+                        let programs = instruction
+                            .regions()
+                            .iter()
+                            .map(|region| body_region.with_id(*region).map(RegionRef::to_program))
+                            .collect::<Result<Vec<_>, ProgramError>>()?;
+                        let output_duals =
+                            driver.bind_jvp_operation(context, instruction.operation(), programs, input_duals)?;
+                        check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
+                        Ok(output_duals)
+                    },
+                )?;
+                check_count!("output", output_duals, state_count, ProgramError);
+                for dual in output_duals {
+                    let (primal, tangent) = dual.into_parts();
+                    primal_carries.push(primal);
+                    tangent_carries.push(tangent);
+                }
+                completed_iterations += 1;
+            }
+
+            return Ok(primal_carries
+                .into_iter()
+                .zip(tangent_carries)
+                .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+                .collect::<Result<Vec<_>, _>>()?);
         }
         WhileJvp::new(driver, self, inputs)?.bind(&condition, &body, context, driver, inputs)
     }
@@ -2303,7 +2465,7 @@ where
     ///     transposable: reverse mode through a staged unbounded loop reports the transposition error, as JAX's
     ///     `lax.while_loop` does.
     ///   - A bounded loop with a batched (per-item) predicate is first rewritten into its scalar-predicate masked form
-    ///     over the same state (refer to [`masked_while_programs`]), whose forward mode is this same rule.
+    ///     over the same state, whose forward mode is this same rule.
     ///   - A bounded loop with a scalar predicate stages the reverse-capable hybrid of an augmented primal `while` that
     ///     stores every per-iteration residual and a validity mask in `[bound, …]` stacks, and one masked tangent
     ///     `scan` of length `bound` (refer to [`Self::bind_bounded`]). The residuals and the mask are plain primal
@@ -2344,14 +2506,115 @@ where
         // A batched (per-item) predicate cannot thread the bounded rule's augmented differentiation state through the
         // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
         // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked form over the same state
-        // (see `masked_while_programs`) and differentiated recursively, since the masked loop's forward mode is this
-        // same rule. The masked condition reduces the predicate of the state it receives and the masked body recomputes
-        // that predicate to select its updates, so the masked loop carries no mask: no initial mask is evaluated here
-        // and its outputs are exactly the state. A carried mask would have to be recomputed on the state after every
-        // body application, including the last one that the bound admits, where no other path (interpretation, which
-        // stops at the bound before evaluating the condition, or the lowering) evaluates the condition.
+        // and differentiated recursively, since the masked loop's forward mode is this same rule. The masked condition
+        // reduces the predicate of the state it receives and the masked body recomputes that predicate to select its
+        // updates, so the masked loop carries no mask: no initial mask is evaluated here and its outputs are exactly
+        // the state. A carried mask would have to be recomputed on the state after every body application, including
+        // the last one that the bound admits, where no other path (interpretation, which stops at the bound before
+        // evaluating the condition, or the lowering) evaluates the condition.
         if condition.output_types()[0].is_batched_while_predicate() {
-            let (masked_condition, masked_body) = masked_while_programs(condition, body)?;
+            // Rewrite the condition and body of a while loop with a batched (per-item) predicate into its
+            // scalar-predicate *masked form* over the same state, as JAX's `_while_loop_batching_rule` does: the masked
+            // condition evaluates the original condition on the state and reduces the per-item predicate with a Boolean
+            // `any` over every predicate axis, and the masked body evaluates the original condition on the same state
+            // again, replays the original body for candidate updates, and selects per array state element between the
+            // candidate and the carried state under the (broadcast) predicate. A first-class dimension carry is
+            // loop-invariant under a batched predicate, so it carries no selection and its candidate is forwarded
+            // directly (refer to the documentation of [`WhileType`]).
+            //
+            // The masked form evaluates the condition on exactly the states that the source loop evaluates it on: the
+            // masked condition runs on the entry state and on the state after every body application that the iteration
+            // bound admits, and the masked body re-evaluates it only on the state that the masked condition has just
+            // accepted. Interpretation likewise stops at the bound before evaluating the condition, and the XLA
+            // lowering threads the predicate so that reaching the bound skips the condition, so a condition that
+            // errors, diverges, or differs on the state after the last admitted body application behaves alike on every
+            // path. Both regions are pure under a batched predicate (refer to [`WhileOperation::validate_interfaces`]),
+            // so the repeated evaluation is unobservable. The bounded while forward-mode rule uses this form for
+            // batched-predicate loops, whose counter- and stack-augmented differentiation state is not
+            // predicate-prefixed and therefore needs the loop's masking made explicit as program data hanging off a
+            // scalar predicate.
+            let state_types = body.input_types();
+            let state_count = state_types.len();
+            let mask_axes = (0..condition.output_types()[0].as_array_type()?.rank()).collect::<Vec<_>>();
+
+            // Masked condition: `any(condition(state))` over every predicate axis.
+            let (_, masked_condition) = TracingContext::<C::Constant, C::Operation>::trace_with_context_and_named_axes(
+                |trace_context, state: Vec<Tracer<TracingContext<C::Constant, C::Operation>>>| {
+                    let predicate = condition.interpret_in_context(trace_context, state)?;
+                    check_count!("output", predicate, 1, ProgramError);
+                    trace_context.bind(
+                        C::Operation::mask_reduce_any(mask_axes.clone()),
+                        Vec::new(),
+                        predicate.as_slice(),
+                    )
+                },
+                state_types.clone(),
+                Vec::new(),
+            )?;
+
+            // Masked body: the per-item predicate of the state, candidate updates from the replayed body, and
+            // per-element masked selection between the candidate update and the carried state.
+            let (_, masked_body) = TracingContext::<C::Constant, C::Operation>::trace_with_context_and_named_axes(
+                |trace_context, state: Vec<Tracer<TracingContext<C::Constant, C::Operation>>>| {
+                    let mut predicate = condition.interpret_in_context(trace_context, state.clone())?;
+                    check_count!("output", predicate, 1, ProgramError);
+                    let mask = predicate.remove(0);
+                    let candidates = body.interpret_in_context(trace_context, state.clone())?;
+                    check_count!("output", candidates, state_count, ProgramError);
+                    let mut next_state = Vec::with_capacity(state_count);
+                    for ((candidate, carried), state_type) in candidates.iter().zip(&state).zip(state_types.iter()) {
+                        // A first-class dimension carry is loop-invariant under a batched predicate (the contract
+                        // documented on `WhileType`), so masking it is the identity and the body's candidate result is
+                        // threaded on directly. This matches eager interpretation, whose `select` returns equal
+                        // dimension carries unchanged, and the XLA lowering's batched-predicate masking.
+                        let Some(state_array_type) = state_type.as_array_type().ok() else {
+                            next_state.push(candidate.clone());
+                            continue;
+                        };
+                        // The Boolean mask carries no tangent, so it first takes the manual variation of the state
+                        // element that it selects through staged transitions. It then broadcasts to the state element's
+                        // shape with its own sharding extended over the trailing axes, so that the selection is per
+                        // predicate item. A state element already shaped like the mask reuses it directly.
+                        let varied_mask = vary_while_index_or_mask(trace_context, mask.clone(), state_array_type)?;
+                        let varied_mask_type = varied_mask.r#type().as_array_type()?.clone();
+                        let element_mask_sharding = varied_mask_type
+                            .sharding()
+                            .map(|sharding| sharding.with_broadcasted_dimensions(state_array_type.rank(), &mask_axes))
+                            .transpose()
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        let element_mask_type = ArrayType::new(DataType::Boolean, state_array_type.shape().clone())
+                            .with_sharding(element_mask_sharding)
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        let element_mask = if element_mask_type == varied_mask_type {
+                            varied_mask
+                        } else {
+                            trace_context
+                                .bind(
+                                    C::Operation::residual_stack_broadcast(element_mask_type, mask_axes.clone()),
+                                    Vec::new(),
+                                    std::slice::from_ref(&varied_mask),
+                                )?
+                                .remove(0)
+                        };
+                        next_state.push(
+                            trace_context
+                                .bind(
+                                    C::Operation::residual_stack_select(),
+                                    Vec::new(),
+                                    &[element_mask, candidate.clone(), carried.clone()],
+                                )?
+                                .remove(0),
+                        );
+                    }
+                    // The predicate is recomputed from the whole state on every iteration, exactly as interpretation,
+                    // the lowering, and the fused forward-mode rule recompute it: an item whose predicate reads its own
+                    // state alone stays finished, because its state is frozen, while an item whose predicate reads
+                    // other items may rejoin on every path alike.
+                    Ok(next_state)
+                },
+                state_types.clone(),
+                Vec::new(),
+            )?;
             // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
             // requested through the instruction-scoped driver over them.
             let masked_while = C::Operation::from(self.operation);
@@ -2375,7 +2638,7 @@ where
     ///
     ///   1. Builds the augmented primal `while` over the state `[original_state..., counter (i64 scalar),
     ///      residual_stacks (one zero-initialized [B, ...] stack per residual), mask_stack (a false-initialized Boolean
-    ///      [B] stack)]` with [`build_bounded_while_programs`] from the residual-extended primal body, keeping
+    ///      [B] stack)]` from the residual-extended primal body, keeping
     ///      `iteration_bound = B` so the per-iteration writes can never clamp, and stages it over the input primals
     ///      followed by the staged counter and stack zeros. Its outputs split into the original state outputs (the
     ///      primal outputs), the dropped counter, the stacked residual outputs, and the mask stack.
@@ -2467,8 +2730,233 @@ where
         let boolean_scalar_type: C::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
         let mask_stack_type: C::Type =
             boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into())?.into();
-        let (extended_condition, augmented_body, stack_types) =
-            build_bounded_while_programs(condition, &stacked_primal_program, stacked_residual_types.as_slice(), bound)?;
+        let (extended_condition, augmented_body, stack_types) = {
+            let primal_body = stacked_primal_program.as_ref();
+            let residual_types = stacked_residual_types.as_slice();
+            // Build the augmented condition and body programs of the bounded staged while loop. The body replays the
+            // original body through its tracing context before adding the augmented-state operations, while the
+            // condition structurally relocates the original condition into a builder with the extended input boundary.
+            //
+            // The augmented loop state is `[original_state..., counter (i64 scalar), residual_stacks..., mask_stack]`:
+            //
+            //   - The body runs the residual-extended primal body (which outputs `[next_state..., residuals...]`) on
+            //     the original state slots, then *stores* instead of returning each per-iteration residual: residual
+            //     `k` is broadcast to `[1, …]` and written into stack `k` at stack slot `counter` via
+            //     `dynamic_update_slice`, a scalar Boolean `one` (true) is written into the Boolean `[bound]` mask
+            //     stack at stack slot `counter`, and the counter advances by an i64 `one`. Because the enclosing while
+            //     keeps `iteration_bound = bound`, the counter is always strictly below `bound` whenever the body runs,
+            //     so the writes can never clamp.
+            //   - The condition is the original loop condition extended with ignored extra-state inputs.
+            //
+            // Returns the extended condition, the augmented body, and the `[bound, …]` residual stack types.
+            let storage_types =
+                residual_types.iter().map(C::Operation::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
+            let predicate_axes =
+                predicate_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+            for storage_type in &storage_types {
+                let storage_type = storage_type.as_array_type()?;
+                if storage_type.static_shape().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "`jvp` of a bounded `{WHILE_OPERATION_NAME}` loop requires statically shaped residual storage \
+                         but got `{storage_type}`",
+                    ))
+                    .into());
+                }
+
+                // Devices whose predicates differ fill different numbers of stack slots, so every stack must vary over
+                // the predicate's manual axes. A residual that depends on loop state already does, because all array
+                // state varies over those axes. A residual that does not cannot be retyped without changing the tangent
+                // program that consumes it, so it is rejected instead of being mistyped.
+                if !predicate_axes.iter().all(|axis| {
+                    storage_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis))
+                }) {
+                    return Err(TypeError::invalid(format!(
+                        "`jvp` of a bounded `{WHILE_OPERATION_NAME}` loop requires every residual to vary over the \
+                         manual axes that the predicate `{predicate_type}` varies over, but got residual storage \
+                         `{storage_type}`",
+                    ))
+                    .into());
+                }
+            }
+            let stack_types = storage_types
+                .iter()
+                .map(|storage_type| {
+                    storage_type
+                        .as_array_type()
+                        .map(|storage_type| storage_type.with_inserted_dimension(0, bound.into()).unwrap().into())
+                })
+                .collect::<Result<Vec<C::Type>, _>>()?;
+
+            let body_input_types = primal_body
+                .input_types()
+                .into_iter()
+                .chain(std::iter::once(counter_type.clone()))
+                .chain(stack_types.iter().cloned())
+                .chain(std::iter::once(mask_stack_type.clone()))
+                .collect::<Vec<_>>();
+            let body = TracingContext::<C::Constant, C::Operation>::trace(
+                |inputs| {
+                    let context = inputs[0].context().clone();
+                    let original_input_count = primal_body.input_ids().len();
+                    let mut extra_inputs = inputs[original_input_count..].iter();
+                    let counter_input = extra_inputs.next().cloned().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the counter input",
+                        ))
+                    })?;
+                    let stack_inputs = extra_inputs.by_ref().take(stack_types.len()).cloned().collect::<Vec<_>>();
+                    check_count!("input", stack_inputs, stack_types.len(), ProgramError);
+                    let mask_input = extra_inputs.next().cloned().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the mask input",
+                        ))
+                    })?;
+                    let mut body_outputs =
+                        primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
+                    let residual_outputs = body_outputs.split_off(state_count);
+                    check_count!("output", residual_outputs, residual_types.len(), ProgramError);
+                    // Integer indices carry no tangent, but `dynamic_update_slice` requires them to vary over the same
+                    // manual mesh axes as the stack that they index. Invariant stacks use the counter and one shared
+                    // zero index. For each distinct stack variation, the counter, which is loop state, takes that
+                    // variation through staged transitions, while the zero index is a non-differentiable constant and
+                    // is therefore created directly with the variation of that varied counter.
+                    let manual_variation = |storage_type: &ArrayType| {
+                        storage_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default()
+                    };
+                    let zero_index = if storage_types.iter().any(|storage_type| {
+                        storage_type.as_array_type().is_ok_and(|storage_type| {
+                            storage_type.rank() > 0 && manual_variation(storage_type).is_empty()
+                        })
+                    }) {
+                        let mut outputs =
+                            context.bind(C::Operation::residual_stack_zero(counter_type.clone()), Vec::new(), &[])?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Some(outputs.remove(0))
+                    } else {
+                        None
+                    };
+                    let mut varying_indices =
+                        Vec::<(BTreeSet<String>, Tracer<TracingContext<C::Constant, C::Operation>>, Option<_>)>::new();
+                    let mut next_stacks = Vec::with_capacity(stack_types.len());
+                    for (((residual_output, residual_type), storage_type), stack_input) in
+                        residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
+                    {
+                        let storage_output = if let Some(operation) = C::Operation::residual_to_storage(residual_type)?
+                        {
+                            let mut outputs =
+                                context.bind(operation, Vec::new(), std::slice::from_ref(residual_output))?;
+                            check_count!("output", outputs, 1, ProgramError);
+                            outputs.remove(0)
+                        } else {
+                            residual_output.clone()
+                        };
+                        let storage_array_type = storage_type.as_array_type()?;
+                        let batch_item_type = storage_array_type.with_inserted_dimension(0, 1.into()).unwrap();
+                        let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
+                        let mut expanded = context.bind(
+                            C::Operation::residual_stack_broadcast(batch_item_type, output_axes),
+                            Vec::new(),
+                            std::slice::from_ref(&storage_output),
+                        )?;
+                        check_count!("output", expanded, 1, ProgramError);
+                        let variation = manual_variation(storage_array_type);
+                        let (counter_index, zero_index) = if variation.is_empty() {
+                            (counter_input.clone(), zero_index.clone())
+                        } else {
+                            let position = match varying_indices.iter().position(|(axes, ..)| *axes == variation) {
+                                Some(position) => position,
+                                None => {
+                                    let counter =
+                                        vary_while_index_or_mask(&context, counter_input.clone(), storage_array_type)?;
+                                    varying_indices.push((variation, counter, None));
+                                    varying_indices.len() - 1
+                                }
+                            };
+                            let (_, counter, zero) = &mut varying_indices[position];
+                            if zero.is_none() && storage_array_type.rank() > 0 {
+                                let mut outputs = context.bind(
+                                    C::Operation::residual_stack_zero(counter.r#type().into_owned()),
+                                    Vec::new(),
+                                    &[],
+                                )?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                *zero = Some(outputs.remove(0));
+                            }
+                            (counter.clone(), zero.clone())
+                        };
+                        let mut start_indices = vec![counter_index];
+                        if let Some(zero_index) = zero_index {
+                            start_indices.extend((0..storage_array_type.rank()).map(|_| zero_index.clone()));
+                        }
+                        let mut next_stack = context.bind(
+                            C::Operation::residual_stack_update(),
+                            Vec::new(),
+                            &std::iter::once(stack_input.clone())
+                                .chain(expanded.drain(..))
+                                .chain(start_indices)
+                                .collect::<Vec<_>>(),
+                        )?;
+                        check_count!("output", next_stack, 1, ProgramError);
+                        next_stacks.push(next_stack.remove(0));
+                    }
+                    let true_scalar =
+                        context.bind(C::Operation::residual_stack_one(boolean_scalar_type.clone()), Vec::new(), &[])?;
+                    check_count!("output", true_scalar, 1, ProgramError);
+                    let true_item_type =
+                        boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, 1.into()).unwrap();
+                    let mut true_item = context.bind(
+                        C::Operation::residual_stack_broadcast(true_item_type, Vec::new()),
+                        Vec::new(),
+                        std::slice::from_ref(&true_scalar[0]),
+                    )?;
+                    check_count!("output", true_item, 1, ProgramError);
+                    let mut next_mask = context.bind(
+                        C::Operation::residual_stack_update(),
+                        Vec::new(),
+                        &[mask_input.clone(), true_item.remove(0), counter_input.clone()],
+                    )?;
+                    check_count!("output", next_mask, 1, ProgramError);
+                    let mut one_i64 =
+                        context.bind(C::Operation::residual_stack_one(counter_type.clone()), Vec::new(), &[])?;
+                    check_count!("output", one_i64, 1, ProgramError);
+                    let mut next_counter = context.bind(
+                        C::Operation::residual_stack_add(),
+                        Vec::new(),
+                        &[counter_input, one_i64.remove(0)],
+                    )?;
+                    check_count!("output", next_counter, 1, ProgramError);
+                    body_outputs.push(next_counter.remove(0));
+                    body_outputs.extend(next_stacks);
+                    body_outputs.push(next_mask.remove(0));
+                    Ok(body_outputs)
+                },
+                body_input_types,
+            )?
+            .1;
+
+            // Condition: the original loop condition extended with ignored extra-state inputs.
+            let condition_input_types = condition
+                .input_types()
+                .into_iter()
+                .chain(std::iter::once(counter_type.clone()))
+                .chain(stack_types.iter().cloned())
+                .chain(std::iter::once(mask_stack_type.clone()))
+                .collect::<Vec<_>>();
+            let condition_input_count = condition_input_types.len();
+            let mut condition_builder = ProgramBuilder::new();
+            let condition_inputs = condition_input_types
+                .into_iter()
+                .map(|r#type| condition_builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let condition_outputs = condition_builder.splice_program(condition, &condition_inputs[..state_count])?;
+            let condition_output_count = condition_outputs.len();
+            let extended_condition = condition_builder.build(
+                condition_outputs,
+                vec![Placeholder; condition_input_count],
+                vec![Placeholder; condition_output_count],
+            )?;
+            (extended_condition, body, stack_types)
+        };
         let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         for zero_state_type in
             std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
@@ -2740,6 +3228,53 @@ where
     }
 }
 
+impl<C: Context> PartialEvaluationContext<C> {
+    /// Rebuilds one partially evaluated region of a `while` loop (i.e., the condition or the body) over the full state
+    /// signature of the loop, for the loop-invariant fold of the [`PartiallyEvaluatableOperation`] implementation for
+    /// [`WhileOperation`].
+    ///
+    /// The condition and the body both run on the *same* loop-carried state every iteration, so each is rebuilt over
+    /// the identical `state_atoms` input signature rather than over its own residual-input signature. Each residual
+    /// input of `evaluation` is fed either by the matching state atom (for an unknown state element that the region
+    /// still reads) or by an inline constant (for a known residual that the region closed over, such as a folded
+    /// loop-invariant state value). The residual program of the region is then spliced over those inputs and its
+    /// outputs are reassembled: a folded [`Known`](PartialEvaluationOutput::Known) output becomes an inline constant
+    /// and an [`Unknown`](PartialEvaluationOutput::Unknown) output reads the corresponding output of the spliced
+    /// residual program.
+    ///
+    /// # Parameters
+    ///
+    ///   - `builder`: Builder accumulating the rebuilt program.
+    ///   - `state_atoms`: Input atoms holding the loop state, in state order, to which the residual inputs of the
+    ///     region map back.
+    ///   - `evaluation`: Partial evaluation of the region against the loop-invariant-known state knowledge.
+    fn rebuild_while_region(
+        &self,
+        builder: &mut ProgramBuilder<C::Constant, C::Operation>,
+        state_atoms: &[AtomId],
+        evaluation: &PartialEvaluation<C>,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        let mut residual_inputs = Vec::with_capacity(evaluation.inputs.len());
+        for residual_input in evaluation.inputs.iter() {
+            match residual_input {
+                PartialEvaluationInput::Unknown(state_index) => residual_inputs.push(state_atoms[*state_index]),
+                PartialEvaluationInput::Known(value) => {
+                    residual_inputs.push(builder.add_constant(self.known_constant(value)?))
+                }
+            }
+        }
+        let spliced_outputs = builder.splice_program(&evaluation.program, &residual_inputs)?;
+        evaluation
+            .outputs
+            .iter()
+            .map(|output| match output {
+                PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(self.known_constant(value)?)),
+                PartialEvaluationOutput::Unknown(index) => Ok(spliced_outputs[*index]),
+            })
+            .collect()
+    }
+}
+
 /// Validates that `predicate` is a Boolean [`while`](WhileOperation) predicate for array state of types
 /// `state_types`: a scalar predicate is always valid, and a batched predicate's shape must be a prefix of every array
 /// state shape, so that it broadcasts against each state element along its leading axes.
@@ -2792,349 +3327,6 @@ fn validate_while_state_manual_variation<'t>(
         }
     }
     Ok(())
-}
-
-/// Rotates the discharged regions of a `while` loop whose condition mutates a discharged allocation into do-while form
-/// and returns the rotated `(condition, body)` programs. Both take the rebuilt body's state boundary followed by one
-/// predicate input. The rotated body splices the rebuilt body over the state, then splices the rebuilt condition over
-/// the states the body returned, and returns those states, with the final states the condition published replacing the
-/// body's at every position carrying the same allocation, followed by the fresh predicate. The rotated condition merely
-/// returns its predicate input. The caller supplies the initial predicate by discharging the original condition once
-/// before the loop, so the loop evaluates the condition exactly as often and in the same order as the source did.
-///
-/// # Parameters
-///
-///   - `condition`: Rebuilt condition program returning its predicate followed by the final state of every allocation
-///     in `condition_published`.
-///   - `body`: Rebuilt body program with a symmetric state boundary.
-///   - `state_allocations`: Allocation carried at each position of the body's boundary, or [`None`] for a value.
-///   - `condition_published`: Allocations whose final states the rebuilt condition publishes after its predicate.
-fn rotated_discharge_regions<V: Value, O: Operation<Type = V::Type>>(
-    condition: &Program<V, O, Vec<V>, Vec<V>>,
-    body: &Program<V, O, Vec<V>, Vec<V>>,
-    state_allocations: &[Option<ReferenceDischargeAllocationId>],
-    condition_published: &[ReferenceDischargeAllocationId],
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>), ProgramError> {
-    let state_types = body.input_types();
-    check_count!("input", state_allocations, state_types.len(), ProgramError);
-    let condition_output_types = condition.output_types();
-    check_count!("output", condition_output_types, 1 + condition_published.len(), ProgramError);
-    let predicate_type = condition_output_types[0].clone();
-
-    let mut body_builder = ProgramBuilder::<V, O>::new();
-    let state = state_types.iter().cloned().map(|r#type| body_builder.add_input(r#type)).collect::<Vec<_>>();
-    body_builder.add_input(predicate_type.clone());
-    let state = body_builder.splice_program(body, state.as_slice())?;
-    check_count!("output", state, state_types.len(), ProgramError);
-    let condition_outputs = body_builder.splice_program(condition, state.as_slice())?;
-    let mut outputs = Vec::with_capacity(state.len() + 1);
-    for (position, current) in state.iter().enumerate() {
-        let published = state_allocations[position]
-            .and_then(|allocation| condition_published.iter().position(|published| *published == allocation));
-        outputs.push(match published {
-            Some(index) => condition_outputs[1 + index],
-            None => *current,
-        });
-    }
-    outputs.push(condition_outputs[0]);
-    let rotated_body = body_builder.build::<Vec<V>, Vec<V>>(
-        outputs,
-        vec![Placeholder; state_types.len() + 1],
-        vec![Placeholder; state_types.len() + 1],
-    )?;
-
-    let mut condition_builder = ProgramBuilder::<V, O>::new();
-    for r#type in state_types.iter().cloned() {
-        condition_builder.add_input(r#type);
-    }
-    let predicate = condition_builder.add_input(predicate_type);
-    let rotated_condition = condition_builder.build::<Vec<V>, Vec<V>>(
-        vec![predicate],
-        vec![Placeholder; state_types.len() + 1],
-        vec![Placeholder],
-    )?;
-    Ok((rotated_condition, rotated_body))
-}
-
-/// Rebuilds one partially evaluated region of a `while` loop (i.e., the condition or the body) over the full state
-/// signature of the loop, for the loop-invariant fold of the [`PartiallyEvaluatableOperation`] implementation for
-/// [`WhileOperation`].
-///
-/// The condition and the body both run on the *same* loop-carried state every iteration, so each is rebuilt over the
-/// identical `state_atoms` input signature rather than over its own residual-input signature. Each residual input of
-/// `evaluation` is fed either by the matching state atom (for an unknown state element that the region still reads) or
-/// by an inline constant (for a known residual that the region closed over, such as a folded loop-invariant state
-/// value). The residual program of the region is then spliced over those inputs and its outputs are reassembled: a
-/// folded [`Known`](PartialEvaluationOutput::Known) output becomes an inline constant and an
-/// [`Unknown`](PartialEvaluationOutput::Unknown) output reads the corresponding output of the spliced residual program.
-///
-/// # Parameters
-///
-///   - `context`: Partial evaluation context that converts known values into program constants.
-///   - `builder`: Builder accumulating the rebuilt program.
-///   - `state_atoms`: Input atoms holding the loop state, in state order, to which the residual inputs of the region
-///     map back.
-///   - `evaluation`: Partial evaluation of the region against the loop-invariant-known state knowledge.
-fn rebuild_while_program<C: Context>(
-    context: &PartialEvaluationContext<C>,
-    builder: &mut ProgramBuilder<C::Constant, C::Operation>,
-    state_atoms: &[AtomId],
-    evaluation: &PartialEvaluation<C>,
-) -> Result<Vec<AtomId>, ProgramError> {
-    let mut residual_inputs = Vec::with_capacity(evaluation.inputs.len());
-    for residual_input in evaluation.inputs.iter() {
-        match residual_input {
-            PartialEvaluationInput::Unknown(state_index) => residual_inputs.push(state_atoms[*state_index]),
-            PartialEvaluationInput::Known(value) => {
-                residual_inputs.push(builder.add_constant(context.known_constant(value)?))
-            }
-        }
-    }
-    let spliced_outputs = builder.splice_program(&evaluation.program, &residual_inputs)?;
-    evaluation
-        .outputs
-        .iter()
-        .map(|output| match output {
-            PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(context.known_constant(value)?)),
-            PartialEvaluationOutput::Unknown(index) => Ok(spliced_outputs[*index]),
-        })
-        .collect()
-}
-
-/// Runs a `while` loop's forward-mode rule directly at concrete duals for an [eager](Context::is_eager) context and
-/// returns the output duals, resuming with the staged rule (refer to [`WhileJvp::bind`]) from the current duals when
-/// the loop's predicate stops concretizing to one scalar Boolean.
-///
-/// Each iteration evaluates the condition on the concrete primal carries and interprets the body once over the current
-/// dual carries. Body instructions re-enter their JVP rules through the differentiation driver, so nested
-/// data-dependent `while` operations recurse through this same eager path without a program-level unroll pre-pass.
-/// Data-dependent iteration counts therefore need no iteration bound, as for [JAX's `jvp` through an eagerly executed
-/// loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html), while a semantic
-/// [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached, matching the
-/// bounded-`while` truncation semantics. Each body effect executes exactly once per loop iteration.
-///
-/// A predicate may fail to concretize on any iteration, not only the first: a batched per-item predicate has no single
-/// continuation decision, and an eager transform context (e.g., batching over an eager parent) can turn a replicated
-/// predicate into a mapped one once a replicated state element mixes with a mapped one in the body. A while loop is a
-/// fixed point of its state, so continuing from the current state with the bound lowered by the number of completed
-/// iterations is exact. The staged rule then evaluates the condition on that state again, which is sound only for a
-/// pure condition without deferred work; for any other condition the concretization error is returned instead, because
-/// re-running the condition would repeat its effects.
-///
-/// This rule derives no program from the body region and therefore consults no per-region transform cache: it
-/// interprets the body once per iteration at the concrete duals reached by the loop, so its work is a function of the
-/// runtime values rather than of the region's contents alone.
-fn jvp_while_eagerly<
-    C: Context<Type: DifferentiableType + WhileType> + Zero<C::Value>,
-    D: DifferentiationDriver<C>,
-    P: DifferentiationPolicy<C>,
->(
-    operation: &WhileOperation<C::Type>,
-    condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-    body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-    context: &DifferentiationContext<C, P>,
-    driver: &D,
-    inputs: &[DifferentiationDual<C::Value>],
-) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    C::Value: Concretizable<bool>,
-    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + From<ConditionOperation<C::Type>>
-        + From<WhileOperation<C::Type>>
-        + From<ScanOperation<C::Type>>
-        + WhileResidualStackOperation<C::Type>,
-{
-    let state_count = inputs.len();
-    let mut primal_carries = Vec::with_capacity(state_count);
-    let mut tangent_carries = Vec::with_capacity(state_count);
-    for input in inputs {
-        primal_carries.push(input.primal().clone());
-        tangent_carries.push(input.tangent().clone());
-    }
-
-    let mut completed_iterations = 0;
-    loop {
-        if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-            break;
-        }
-
-        // Concretize the condition on the current concrete primal carries to decide whether another iteration runs.
-        let mut condition_outputs = condition.interpret_in_context(context.primal(), primal_carries.clone())?;
-        check_count!("output", condition_outputs, 1, ProgramError);
-        let predicate = match condition_outputs.remove(0).concretize() {
-            Ok(predicate) => predicate,
-            // The predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate, whose items
-            // stop on different iterations, has no single continuation decision, or a predicate that an eager batching
-            // context maps once the body mixes a replicated state element with a mapped one). The loop resumes from
-            // the current duals under the staged rule with the remaining bound, which is at least one because the
-            // loop exits above, before evaluating the condition, once the bound is reached. The staged rule evaluates
-            // the condition on the current state once more, so only a pure condition without deferred work resumes.
-            Err(error) => {
-                let condition_effects = condition.effects();
-                if !condition_effects.classes().is_empty() || condition_effects.has_deferred_work() {
-                    return Err(error.into());
-                }
-                let remaining = WhileOperation::new()
-                    .with_iteration_bound(operation.iteration_bound().map(|bound| bound - completed_iterations))?;
-                let duals = primal_carries
-                    .into_iter()
-                    .zip(tangent_carries)
-                    .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-                    .collect::<Result<Vec<_>, _>>()?;
-                return WhileJvp::new(driver, &remaining, &duals)?.bind(condition, body, context, driver, &duals);
-            }
-        };
-        if !predicate {
-            break;
-        }
-
-        // Advance one iteration by replaying the body directly over dual values. This is deliberately not routed
-        // through a program-level unroll pre-pass: such a rewrite interprets the body to discover concrete nested-loop
-        // iteration counts, after which replaying its fused JVP would execute primal effects a second time. Direct dual
-        // interpretation lets a nested while recurse through this eager rule and executes every primal operation once.
-        let input_duals = primal_carries
-            .drain(..)
-            .zip(tangent_carries.drain(..))
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect::<Result<Vec<_>, _>>()?;
-        let body_region = body.entry_region_ref();
-        let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
-            input_duals,
-            |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.primal().lift(constant.clone())?)?),
-            |instruction, input_duals| {
-                let programs = instruction
-                    .regions()
-                    .iter()
-                    .map(|region| body_region.with_id(*region).map(RegionRef::to_program))
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-                let output_duals =
-                    driver.bind_jvp_operation(context, instruction.operation(), programs, input_duals)?;
-                check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
-                Ok(output_duals)
-            },
-        )?;
-        check_count!("output", output_duals, state_count, ProgramError);
-        for dual in output_duals {
-            let (primal, tangent) = dual.into_parts();
-            primal_carries.push(primal);
-            tangent_carries.push(tangent);
-        }
-        completed_iterations += 1;
-    }
-
-    Ok(primal_carries
-        .into_iter()
-        .zip(tangent_carries)
-        .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-        .collect::<Result<Vec<_>, _>>()?)
-}
-
-/// Rewrites the condition and body of a while loop with a batched (per-item) predicate into its scalar-predicate
-/// *masked form* over the same state, as JAX's `_while_loop_batching_rule` does: the masked condition evaluates the
-/// original condition on the state and reduces the per-item predicate with a Boolean `any` over every predicate axis,
-/// and the masked body evaluates the original condition on the same state again, replays the original body for
-/// candidate updates, and selects per array state element between the candidate and the carried state under the
-/// (broadcast) predicate. A first-class dimension carry is loop-invariant under a batched predicate, so it carries no
-/// selection and its candidate is forwarded directly (refer to the documentation of [`WhileType`]).
-///
-/// The masked form evaluates the condition on exactly the states that the source loop evaluates it on: the masked
-/// condition runs on the entry state and on the state after every body application that the iteration bound admits,
-/// and the masked body re-evaluates it only on the state that the masked condition has just accepted. Interpretation
-/// likewise stops at the bound before evaluating the condition, and the XLA lowering threads the predicate so that
-/// reaching the bound skips the condition, so a condition that errors, diverges, or differs on the state after the last
-/// admitted body application behaves alike on every path. Both regions are pure under a batched predicate (refer to
-/// [`WhileOperation::validate_interfaces`]), so the repeated evaluation is unobservable. The bounded while forward-mode
-/// rule uses this form for batched-predicate loops, whose counter- and stack-augmented differentiation state is not
-/// predicate-prefixed and therefore needs the loop's masking made explicit as program data hanging off a scalar
-/// predicate.
-fn masked_while_programs<V: Value<Type: WhileType>, O: WhileResidualStackOperation<V::Type>>(
-    condition: &Program<V, O, Vec<V>, Vec<V>>,
-    body: &Program<V, O, Vec<V>, Vec<V>>,
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    let state_types = body.input_types();
-    let state_count = state_types.len();
-    let mask_axes = (0..condition.output_types()[0].as_array_type()?.rank()).collect::<Vec<_>>();
-
-    // Masked condition: `any(condition(state))` over every predicate axis.
-    let (_, masked_condition) = TracingContext::<V, O>::trace_with_context_and_named_axes(
-        |trace_context, state: Vec<Tracer<TracingContext<V, O>>>| {
-            let predicate = condition.interpret_in_context(trace_context, state)?;
-            check_count!("output", predicate, 1, ProgramError);
-            trace_context.bind(O::mask_reduce_any(mask_axes.clone()), Vec::new(), predicate.as_slice())
-        },
-        state_types.clone(),
-        Vec::new(),
-    )?;
-
-    // Masked body: the per-item predicate of the state, candidate updates from the replayed body, and per-element
-    // masked selection between the candidate update and the carried state.
-    let (_, masked_body) = TracingContext::<V, O>::trace_with_context_and_named_axes(
-        |trace_context, state: Vec<Tracer<TracingContext<V, O>>>| {
-            let mut predicate = condition.interpret_in_context(trace_context, state.clone())?;
-            check_count!("output", predicate, 1, ProgramError);
-            let mask = predicate.remove(0);
-            let candidates = body.interpret_in_context(trace_context, state.clone())?;
-            check_count!("output", candidates, state_count, ProgramError);
-            let mut next_state = Vec::with_capacity(state_count);
-            for ((candidate, carried), state_type) in candidates.iter().zip(&state).zip(state_types.iter()) {
-                // A first-class dimension carry is loop-invariant under a batched predicate (the contract documented on
-                // `WhileType`), so masking it is the identity and the body's candidate result is threaded on directly.
-                // This matches eager interpretation, whose `select` returns equal dimension carries unchanged, and
-                // the XLA lowering's batched-predicate masking.
-                let Some(state_array_type) = state_type.as_array_type().ok() else {
-                    next_state.push(candidate.clone());
-                    continue;
-                };
-                // The Boolean mask carries no tangent, so it first takes the manual variation of the state element
-                // that it selects through staged transitions. It then broadcasts to the state element's shape with its
-                // own sharding extended over the trailing axes, so that the selection is per predicate item. A state
-                // element already shaped like the mask reuses it directly.
-                let varied_mask = vary_while_index_or_mask(trace_context, mask.clone(), state_array_type)?;
-                let varied_mask_type = varied_mask.r#type().as_array_type()?.clone();
-                let element_mask_sharding = varied_mask_type
-                    .sharding()
-                    .map(|sharding| sharding.with_broadcasted_dimensions(state_array_type.rank(), &mask_axes))
-                    .transpose()
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                let element_mask_type = ArrayType::new(DataType::Boolean, state_array_type.shape().clone())
-                    .with_sharding(element_mask_sharding)
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                let element_mask = if element_mask_type == varied_mask_type {
-                    varied_mask
-                } else {
-                    trace_context
-                        .bind(
-                            O::residual_stack_broadcast(element_mask_type, mask_axes.clone()),
-                            Vec::new(),
-                            std::slice::from_ref(&varied_mask),
-                        )?
-                        .remove(0)
-                };
-                next_state.push(
-                    trace_context
-                        .bind(
-                            O::residual_stack_select(),
-                            Vec::new(),
-                            &[element_mask, candidate.clone(), carried.clone()],
-                        )?
-                        .remove(0),
-                );
-            }
-            // The predicate is recomputed from the whole state on every iteration, exactly as interpretation, the
-            // lowering, and the fused forward-mode rule recompute it: an item whose predicate reads its own state alone
-            // stays finished, because its state is frozen, while an item whose predicate reads other items may rejoin
-            // on every path alike.
-            Ok(next_state)
-        },
-        state_types.clone(),
-        Vec::new(),
-    )?;
-    Ok((masked_condition, masked_body))
 }
 
 /// Stages the transitions that make `value`, a loop index or Boolean mask inside a bounded or masked `while` program
@@ -3201,230 +3393,6 @@ fn bounded_while_scalar_type(data_type: DataType, predicate_type: &ArrayType) ->
         .with_varying_manual_axes(sharding.varying_manual_axes().iter().cloned())
         .map_err(|error| TypeError::invalid(error.to_string()))?;
     scalar_type.with_sharding(scalar_sharding).map_err(|error| TypeError::invalid(error.to_string()))
-}
-
-/// Builds the augmented condition and body programs of the bounded staged while loop (see [`WhileJvp::bind_bounded`]).
-/// The body replays the original body through its tracing context before adding the augmented-state operations, while
-/// the condition structurally relocates the original condition into a builder with the extended input boundary.
-///
-/// The augmented loop state is `[original_state..., counter (i64 scalar), residual_stacks..., mask_stack]`:
-///
-///   - The body runs the residual-extended primal body (which outputs `[next_state..., residuals...]`) on the
-///     original state slots, then *stores* instead of returning each per-iteration residual: residual `k` is
-///     broadcast to `[1, …]` and written into stack `k` at stack slot `counter` via `dynamic_update_slice`, a scalar
-///     Boolean `one` (true) is written into the Boolean `[bound]` mask stack at stack slot `counter`, and the counter
-///     advances by an i64 `one`. Because the enclosing while keeps `iteration_bound = bound`, the counter is always
-///     strictly below `bound` whenever the body runs, so the writes can never clamp.
-///   - The condition is the original loop condition extended with ignored extra-state inputs.
-///
-/// Returns the extended condition, the augmented body, and the `[bound, …]` residual stack types.
-fn build_bounded_while_programs<V: Value<Type: WhileType>, O: WhileResidualStackOperation<V::Type>>(
-    condition: &Program<V, O, Vec<V>, Vec<V>>,
-    primal_body: &Program<V, O, Vec<V>, Vec<V>>,
-    residual_types: &[V::Type],
-    bound: usize,
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, Vec<V::Type>), ProgramError>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    let state_count = condition.input_types().len();
-    let predicate_type = condition.output_types()[0].as_array_type()?.clone();
-    let counter_type: V::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
-    let boolean_scalar_type: V::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
-    let mask_stack_type: V::Type =
-        boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into())?.into();
-    let storage_types = residual_types.iter().map(O::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
-    let predicate_axes = predicate_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
-    for storage_type in &storage_types {
-        let storage_type = storage_type.as_array_type()?;
-        if storage_type.static_shape().is_none() {
-            return Err(TypeError::invalid(format!(
-                "`jvp` of a bounded `{WHILE_OPERATION_NAME}` loop requires statically shaped residual storage but got \
-                 `{storage_type}`",
-            ))
-            .into());
-        }
-
-        // Devices whose predicates differ fill different numbers of stack slots, so every stack must vary over the
-        // predicate's manual axes. A residual that depends on loop state already does, because all array state varies
-        // over those axes. A residual that does not cannot be retyped without changing the tangent program that
-        // consumes it, so it is rejected instead of being mistyped.
-        if !predicate_axes
-            .iter()
-            .all(|axis| storage_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis)))
-        {
-            return Err(TypeError::invalid(format!(
-                "`jvp` of a bounded `{WHILE_OPERATION_NAME}` loop requires every residual to vary over the manual axes \
-                 that the predicate `{predicate_type}` varies over, but got residual storage `{storage_type}`",
-            ))
-            .into());
-        }
-    }
-    let stack_types = storage_types
-        .iter()
-        .map(|storage_type| {
-            storage_type
-                .as_array_type()
-                .map(|storage_type| storage_type.with_inserted_dimension(0, bound.into()).unwrap().into())
-        })
-        .collect::<Result<Vec<V::Type>, _>>()?;
-
-    let body_input_types = primal_body
-        .input_types()
-        .into_iter()
-        .chain(std::iter::once(counter_type.clone()))
-        .chain(stack_types.iter().cloned())
-        .chain(std::iter::once(mask_stack_type.clone()))
-        .collect::<Vec<_>>();
-    let body = TracingContext::<V, O>::trace(
-        |inputs| {
-            let context = inputs[0].context().clone();
-            let original_input_count = primal_body.input_ids().len();
-            let mut extra_inputs = inputs[original_input_count..].iter();
-            let counter_input = extra_inputs.next().cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the counter input",
-                ))
-            })?;
-            let stack_inputs = extra_inputs.by_ref().take(stack_types.len()).cloned().collect::<Vec<_>>();
-            check_count!("input", stack_inputs, stack_types.len(), ProgramError);
-            let mask_input = extra_inputs.next().cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the mask input",
-                ))
-            })?;
-            let mut body_outputs =
-                primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
-            let residual_outputs = body_outputs.split_off(state_count);
-            check_count!("output", residual_outputs, residual_types.len(), ProgramError);
-            // Integer indices carry no tangent, but `dynamic_update_slice` requires them to vary over the same manual
-            // mesh axes as the stack that they index. Invariant stacks use the counter and one shared zero index. For
-            // each distinct stack variation, the counter, which is loop state, takes that variation through staged
-            // transitions, while the zero index is a non-differentiable constant and is therefore created directly
-            // with the variation of that varied counter.
-            let manual_variation = |storage_type: &ArrayType| {
-                storage_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default()
-            };
-            let zero_index = if storage_types.iter().any(|storage_type| {
-                storage_type
-                    .as_array_type()
-                    .is_ok_and(|storage_type| storage_type.rank() > 0 && manual_variation(storage_type).is_empty())
-            }) {
-                let mut outputs = context.bind(O::residual_stack_zero(counter_type.clone()), Vec::new(), &[])?;
-                check_count!("output", outputs, 1, ProgramError);
-                Some(outputs.remove(0))
-            } else {
-                None
-            };
-            let mut varying_indices = Vec::<(BTreeSet<String>, Tracer<TracingContext<V, O>>, Option<_>)>::new();
-            let mut next_stacks = Vec::with_capacity(stack_types.len());
-            for (((residual_output, residual_type), storage_type), stack_input) in
-                residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
-            {
-                let storage_output = if let Some(operation) = O::residual_to_storage(residual_type)? {
-                    let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(residual_output))?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    outputs.remove(0)
-                } else {
-                    residual_output.clone()
-                };
-                let storage_array_type = storage_type.as_array_type()?;
-                let batch_item_type = storage_array_type.with_inserted_dimension(0, 1.into()).unwrap();
-                let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
-                let mut expanded = context.bind(
-                    O::residual_stack_broadcast(batch_item_type, output_axes),
-                    Vec::new(),
-                    std::slice::from_ref(&storage_output),
-                )?;
-                check_count!("output", expanded, 1, ProgramError);
-                let variation = manual_variation(storage_array_type);
-                let (counter_index, zero_index) = if variation.is_empty() {
-                    (counter_input.clone(), zero_index.clone())
-                } else {
-                    let position = match varying_indices.iter().position(|(axes, ..)| *axes == variation) {
-                        Some(position) => position,
-                        None => {
-                            let counter =
-                                vary_while_index_or_mask(&context, counter_input.clone(), storage_array_type)?;
-                            varying_indices.push((variation, counter, None));
-                            varying_indices.len() - 1
-                        }
-                    };
-                    let (_, counter, zero) = &mut varying_indices[position];
-                    if zero.is_none() && storage_array_type.rank() > 0 {
-                        let mut outputs =
-                            context.bind(O::residual_stack_zero(counter.r#type().into_owned()), Vec::new(), &[])?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        *zero = Some(outputs.remove(0));
-                    }
-                    (counter.clone(), zero.clone())
-                };
-                let mut start_indices = vec![counter_index];
-                if let Some(zero_index) = zero_index {
-                    start_indices.extend((0..storage_array_type.rank()).map(|_| zero_index.clone()));
-                }
-                let mut next_stack = context.bind(
-                    O::residual_stack_update(),
-                    Vec::new(),
-                    &std::iter::once(stack_input.clone())
-                        .chain(expanded.drain(..))
-                        .chain(start_indices)
-                        .collect::<Vec<_>>(),
-                )?;
-                check_count!("output", next_stack, 1, ProgramError);
-                next_stacks.push(next_stack.remove(0));
-            }
-            let true_scalar = context.bind(O::residual_stack_one(boolean_scalar_type.clone()), Vec::new(), &[])?;
-            check_count!("output", true_scalar, 1, ProgramError);
-            let true_item_type = boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, 1.into()).unwrap();
-            let mut true_item = context.bind(
-                O::residual_stack_broadcast(true_item_type, Vec::new()),
-                Vec::new(),
-                std::slice::from_ref(&true_scalar[0]),
-            )?;
-            check_count!("output", true_item, 1, ProgramError);
-            let mut next_mask = context.bind(
-                O::residual_stack_update(),
-                Vec::new(),
-                &[mask_input.clone(), true_item.remove(0), counter_input.clone()],
-            )?;
-            check_count!("output", next_mask, 1, ProgramError);
-            let mut one_i64 = context.bind(O::residual_stack_one(counter_type.clone()), Vec::new(), &[])?;
-            check_count!("output", one_i64, 1, ProgramError);
-            let mut next_counter =
-                context.bind(O::residual_stack_add(), Vec::new(), &[counter_input, one_i64.remove(0)])?;
-            check_count!("output", next_counter, 1, ProgramError);
-            body_outputs.push(next_counter.remove(0));
-            body_outputs.extend(next_stacks);
-            body_outputs.push(next_mask.remove(0));
-            Ok(body_outputs)
-        },
-        body_input_types,
-    )?
-    .1;
-
-    // Condition: the original loop condition extended with ignored extra-state inputs.
-    let condition_input_types = condition
-        .input_types()
-        .into_iter()
-        .chain(std::iter::once(counter_type))
-        .chain(stack_types.iter().cloned())
-        .chain(std::iter::once(mask_stack_type))
-        .collect::<Vec<_>>();
-    let condition_input_count = condition_input_types.len();
-    let mut condition_builder = ProgramBuilder::new();
-    let condition_inputs = condition_input_types
-        .into_iter()
-        .map(|r#type| condition_builder.add_input(r#type))
-        .collect::<Vec<_>>();
-    let condition_outputs = condition_builder.splice_program(condition, &condition_inputs[..state_count])?;
-    let condition_output_count = condition_outputs.len();
-    let extended_condition = condition_builder.build(
-        condition_outputs,
-        vec![Placeholder; condition_input_count],
-        vec![Placeholder; condition_output_count],
-    )?;
-    Ok((extended_condition, body, stack_types))
 }
 
 #[cfg(test)]
@@ -11208,8 +11176,8 @@ mod tests {
         let expected = Array::vector(vec![2.5, 4.75]).unwrap();
         assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![expected.clone()]));
 
-        // The staged bounded forward mode differentiates the masked form (refer to `test_masked_while_programs`),
-        // which lets item 0 rejoin as well.
+        // The staged bounded forward mode differentiates the scalar-predicate masked form, which lets item 0 rejoin
+        // as well.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.interpret(vec![input.clone(), Array::vector(vec![1.0, 1.0]).unwrap()]),
@@ -11218,6 +11186,57 @@ mod tests {
 
         // Reverse mode transposes the masked tangent scan of the same masked form.
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:bool[5, 2] = zero [type=bool[5, 2]]
+                    %3:bool[5] = zero [type=bool[5]]
+                    %4:f64[2], %5:i64[], %6:bool[5, 2], %7:bool[5] = while [iteration_bound=5] %0 %1 %2 %3 [
+                        condition={
+                            lambda %0:f64[2], %1:i64[], %2:bool[5, 2], %3:bool[5] .
+                            let %4:f64[2] = const [1.0, 3.0]
+                                %5:bool[2] = compare [direction=LessThan] %0 %4
+                                %6:f64[2] = reverse [axes=[0]] %0
+                                %7:f64[2] = const [2.0, 10.0]
+                                %8:bool[2] = compare [direction=GreaterThanOrEqual] %6 %7
+                                %9:f64[2] = const [3.0, 3.0]
+                                %10:bool[2] = compare [direction=LessThan] %6 %9
+                                %11:bool[2] = and %8 %10
+                                %12:bool[2] = or %5 %11
+                                %13:bool[] = reduce [kind=any, axes=[0]] %12
+                            in (%13)
+                        },
+                        body={
+                            lambda %0:f64[2], %1:i64[], %2:bool[5, 2], %3:bool[5] .
+                            let %4:f64[2] = const [1.0, 3.0]
+                                %5:bool[2] = compare [direction=LessThan] %0 %4
+                                %6:f64[2] = reverse [axes=[0]] %0
+                                %7:f64[2] = const [2.0, 10.0]
+                                %8:bool[2] = compare [direction=GreaterThanOrEqual] %6 %7
+                                %9:f64[2] = const [3.0, 3.0]
+                                %10:bool[2] = compare [direction=LessThan] %6 %9
+                                %11:bool[2] = and %8 %10
+                                %12:bool[2] = or %5 %11
+                                %13:f64[2] = const [1.5, 1.5]
+                                %14:f64[2] = mul %0 %13
+                                %15:f64[2] = const [1.0, 1.0]
+                                %16:f64[2] = add %14 %15
+                                %17:f64[2] = select %12 %16 %0
+                                %18:i64[] = one [type=i64[]]
+                                %19:i64[] = add %1 %18
+                                %20:bool[1, 2] = broadcast [output_type=bool[1, 2], output_axes=[1]] %12
+                                %21:i64[] = zero [type=i64[]]
+                                %22:bool[5, 2] = dynamic_update_slice %2 %20 %1 %21
+                                %23:bool[] = one [type=bool[]]
+                                %24:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %23
+                                %25:bool[5] = dynamic_update_slice %3 %24 %1
+                            in (%17, %19, %22, %25)
+                        },
+                    ]
+                in (%4, %7, %6)"},
+        );
         let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
         let residuals = primal_outputs.split_off(1);
         assert_eq!(primal_outputs, vec![expected]);
@@ -14934,52 +14953,6 @@ mod tests {
                 None,
             ),
             expected,
-        );
-    }
-
-    #[test]
-    fn test_masked_while_programs() {
-        // The masked normal form carries no mask: its condition reduces the predicate of the current state and its body
-        // recomputes that predicate to select the updates, instead of narrowing a carried mask, so a finished item
-        // rejoins whenever its predicate turns true again, and the condition is never evaluated on the state after
-        // the last body application that the bound admits.
-        let regions = rejoining_while_regions();
-        let (masked_condition, masked_body) = masked_while_programs(&regions[0], &regions[1]).unwrap();
-        assert_eq!(
-            masked_condition.to_string(),
-            indoc! {"
-                lambda %0:f64[2] .
-                let %1:f64[2] = const [1.0, 3.0]
-                    %2:f64[2] = const [2.0, 10.0]
-                    %3:f64[2] = const [3.0, 3.0]
-                    %4:f64[2] = reverse [axes=[0]] %0
-                    %5:bool[2] = compare [direction=LessThan] %0 %1
-                    %6:bool[2] = compare [direction=GreaterThanOrEqual] %4 %2
-                    %7:bool[2] = compare [direction=LessThan] %4 %3
-                    %8:bool[2] = and %6 %7
-                    %9:bool[2] = or %5 %8
-                    %10:bool[] = reduce [kind=any, axes=[0]] %9
-                in (%10)"},
-        );
-        assert_eq!(
-            masked_body.to_string(),
-            indoc! {"
-                lambda %0:f64[2] .
-                let %1:f64[2] = const [1.0, 3.0]
-                    %2:f64[2] = const [2.0, 10.0]
-                    %3:f64[2] = const [3.0, 3.0]
-                    %4:f64[2] = reverse [axes=[0]] %0
-                    %5:bool[2] = compare [direction=LessThan] %0 %1
-                    %6:bool[2] = compare [direction=GreaterThanOrEqual] %4 %2
-                    %7:bool[2] = compare [direction=LessThan] %4 %3
-                    %8:bool[2] = and %6 %7
-                    %9:bool[2] = or %5 %8
-                    %10:f64[2] = const [1.5, 1.5]
-                    %11:f64[2] = const [1.0, 1.0]
-                    %12:f64[2] = mul %0 %10
-                    %13:f64[2] = add %12 %11
-                    %14:f64[2] = select %9 %13 %0
-                in (%14)"},
         );
     }
 }
