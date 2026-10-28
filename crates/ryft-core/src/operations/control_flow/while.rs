@@ -69,8 +69,8 @@ use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{
-    ResidualStackOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types, stabilize_carry_axes,
-    validate_output_identities, validate_reference_carry_roots, validate_region_input,
+    ResidualStorageOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types,
+    stabilize_carry_axes, validate_output_identities, validate_reference_carry_roots, validate_region_input,
 };
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
@@ -1595,7 +1595,7 @@ where
         + From<ConditionOperation<T>>
         + From<WhileOperation<T>>
         + From<ScanOperation<T>>
-        + WhileResidualStackOperation<T>,
+        + WhileDifferentiationOperation<T>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
 {
@@ -1612,7 +1612,7 @@ where
         // decision). Bounded loops stage the reverse-capable hybrid of an augmented primal `while` and a masked
         // tangent `scan`, after rewriting a batched predicate into its masked form, while unbounded loops stage
         // the forward-only fused doubled-state loop. Both type families share that rule. They differ only in
-        // their array-backed storage, which `WhileResidualStackOperation` describes.
+        // their array-backed storage, which `WhileDifferentiationOperation` describes.
 
         // The rule requests all nested-computation work through its driver (region `0` is the condition and region `1`
         // the body), which keeps its bounds free of the operation family's own semantic traits.
@@ -1788,30 +1788,29 @@ impl From<WhileOperation<ArrayType>> for WhileOperation<ArrayIrType> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Operation-family constructors that the staged forward-mode rule of [`WhileOperation`] uses to store the
+/// Operation family constructors that the staged forward mode rule of [`WhileOperation`] uses to store the
 /// per-iteration residuals of a bounded loop in stacks and to make the per-item masking of a loop with a batched
 /// predicate explicit.
 ///
 /// The functions return operations rather than binding values, so the same contract works in the parent differentiation
 /// context and in the nested tracing contexts used to build the augmented primal body and the masked tangent scan body.
-/// The scalar and dimension gateway operations come from the [`ResidualStackOperation`] supertrait.
+/// The scalar and dimension gateway operations come from the [`ResidualStorageOperation`] supertrait.
 ///
 /// Custom backends implement this trait on their operation family to reuse the shared [`DifferentiableOperation`] rule
 /// for [`WhileOperation`], whose bounds require it even though eager differentiation runs the loop directly and never
 /// uses these constructors. Each constructor returns a region-free operation of the family with the semantics of the
-/// named array operation over the family's array members, except that
-/// [`residual_stack_vary`](Self::residual_stack_vary) may return an error for a family that cannot stage
-/// manual-variation transitions.
+/// named array operation over the family's members, except that [`residual_stack_vary`](Self::residual_stack_vary)
+/// may return an error for a family that cannot stage manual-variation transitions.
 ///
 /// Operation families over [`ArrayType`] that convert from the zero, one, addition, broadcast, dynamic-update-slice,
 /// select, and reduction operations and provide [`ParallelVaryOperation`], and array IR families over [`ArrayIrType`]
 /// whose array projection provides the same operations, already receive blanket implementations. An operation family
 /// covered by a blanket implementation cannot also provide an overlapping implementation of its own.
-pub trait WhileResidualStackOperation<T: Type>: ResidualStackOperation<T> {
-    /// Constructs a zero for a statically shaped array-backed state type.
+pub trait WhileDifferentiationOperation<T: Type>: ResidualStorageOperation<T> {
+    /// Constructs a zero value for a statically shaped array-backed state type.
     fn residual_stack_zero(r#type: T) -> Self;
 
-    /// Constructs a one for a scalar array-backed state type.
+    /// Constructs a one value for a scalar array-backed state type.
     fn residual_stack_one(r#type: T) -> Self;
 
     /// Constructs an array broadcast used to insert a leading stack axis or expand a mask.
@@ -1839,7 +1838,7 @@ pub trait WhileResidualStackOperation<T: Type>: ResidualStackOperation<T> {
     fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError>;
 }
 
-impl<O: Operation<Type = ArrayType>> WhileResidualStackOperation<ArrayType> for O
+impl<O: Operation<Type = ArrayType>> WhileDifferentiationOperation<ArrayType> for O
 where
     O: From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
@@ -1891,7 +1890,7 @@ where
     }
 }
 
-impl<O: ResidualStackOperation<ArrayIrType>> WhileResidualStackOperation<ArrayIrType> for O
+impl<O: ResidualStorageOperation<ArrayIrType>> WhileDifferentiationOperation<ArrayIrType> for O
 where
     O: From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
@@ -2442,7 +2441,7 @@ where
         + From<ConditionOperation<C::Type>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Type>>
-        + WhileResidualStackOperation<C::Type>,
+        + WhileDifferentiationOperation<C::Type>,
 {
     /// Creates a new [`WhileJvp`] by analyzing the forward-mode activity of an application of `operation` to the input
     /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body.
@@ -3348,7 +3347,7 @@ fn validate_while_state_manual_variation<'t>(
 /// The value is returned unchanged when it already varies over those axes, which keeps programs outside manual regions
 /// unchanged. The transitions are bound as raw operations because the tracing contexts that build these programs bind
 /// no named axes, and they are never transposed because their inputs are integer or Boolean values.
-fn vary_while_index_or_mask<V: Value<Type: WhileType>, O: WhileResidualStackOperation<V::Type>>(
+fn vary_while_index_or_mask<V: Value<Type: WhileType>, O: WhileDifferentiationOperation<V::Type>>(
     context: &TracingContext<V, O>,
     value: Tracer<TracingContext<V, O>>,
     target: &ArrayType,
@@ -14220,7 +14219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_residual_stack_operation() {
+    fn test_while_differentiation_operation() {
         // The array family constructs each operation directly.
         let state_type = ArrayType::new_static(DataType::F32, [2]);
         let mask_type = ArrayType::new_static(DataType::Boolean, [2, 3]);
