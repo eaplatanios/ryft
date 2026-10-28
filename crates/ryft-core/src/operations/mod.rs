@@ -86,10 +86,10 @@ pub use constants::{
 pub use control_flow::scan::scan;
 pub use control_flow::r#while::r#while;
 pub use control_flow::{
-    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, ResidualStackOperation,
+    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, ResidualStorageOperation,
     SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation,
-    ScanOptions, ScanType, Select, SelectOperation, WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions,
-    WhilePredicate, WhileResidualStackOperation, WhileType,
+    ScanOptions, ScanType, Select, SelectOperation, WHILE_OPERATION_NAME, While, WhileDifferentiationOperation,
+    WhileOperation, WhileOptions, WhilePredicate, WhileType,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_call::{

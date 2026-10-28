@@ -72,7 +72,7 @@ Group each operation in this order, omitting only implementations that do not ap
    free helper functions in call order.
 
 Downstream customization points that bound public rule implementations (e.g., `ScanInterpretationDomain`,
-`ResidualStackOperation`, and `WhileResidualStackOperation`) must be public, documented with what their blanket
+`ResidualStorageOperation`, and `WhileDifferentiationOperation`) must be public, documented with what their blanket
 implementations cover and the coherence limit that those impose, and re-exported through the module facades.
 
 Keep shared blanket implementations and substantial helper submodules shared; do not duplicate them to reproduce

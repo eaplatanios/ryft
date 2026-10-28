@@ -2,10 +2,10 @@ use std::fmt::{Display, Formatter};
 
 use pretty_assertions::assert_eq;
 
-use ryft_core::{NoIdentity, Operation, Parameter, RegionInterface, ResidualStackOperation, Type, TypeError};
+use ryft_core::{NoIdentity, Operation, Parameter, RegionInterface, ResidualStorageOperation, Type, TypeError};
 
 #[test]
-fn test_external_residual_stack_operation() {
+fn test_external_residual_storage_operation() {
     // An independent type universe selects its own array encoding without implementing a runtime value family.
     #[derive(Clone, Debug, PartialEq)]
     enum ExternalType {
@@ -74,7 +74,7 @@ fn test_external_residual_stack_operation() {
         }
     }
 
-    impl ResidualStackOperation<ExternalType> for ExternalOperation {
+    impl ResidualStorageOperation<ExternalType> for ExternalOperation {
         fn residual_to_storage(residual_type: &ExternalType) -> Result<Option<Self>, TypeError> {
             Ok(matches!(residual_type, ExternalType::Metadata).then_some(Self::Save))
         }

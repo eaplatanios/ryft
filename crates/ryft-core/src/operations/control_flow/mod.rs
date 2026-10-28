@@ -100,15 +100,15 @@ pub use scan::{
 };
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{
-    WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions, WhilePredicate, WhileResidualStackOperation, WhileType,
-    r#while,
+    WHILE_OPERATION_NAME, While, WhileDifferentiationOperation, WhileOperation, WhileOptions, WhilePredicate,
+    WhileType, r#while,
 };
 
-/// Operations for storing a loop's intermediate values in stacks and recovering them when needed. When partial
-/// evaluation or differentiation splits a loop body, the later computation may need values produced by the earlier
-/// computation. Those saved values are _residuals_. [`ScanOperation`] partial evaluation and bounded [`WhileOperation`]
-/// differentiation store per-iteration residuals in array stacks. Arrays already have a stackable representation;
-/// first-class dimensions are converted to scalar arrays first:
+/// Operations that convert loop residuals to and from their array storage representation. When partial evaluation
+/// or differentiation splits a loop body, the later computation may need values produced by the earlier computation.
+/// Those saved values are _residuals_. [`ScanOperation`] partial evaluation and bounded [`WhileOperation`]
+/// differentiation store per-iteration residuals in array stacks. Arrays already have a stackable
+/// representation; first-class dimensions are converted to scalar arrays first:
 ///
 /// ```text
 ///   dimension<n> --save--> i64[] --stack--> i64[iterations] --slice--> i64[] --restore--> dimension<n>
@@ -138,7 +138,7 @@ pub use r#while::{
 /// optional; it must preserve the identity already carried by its input rather than introduce an independent identity.
 /// This protocol supplies conversions only, and does not imply that the family supports every loop or differentiation
 /// rule that consumes them.
-pub trait ResidualStackOperation<T: Type>: Operation<Type = T> {
+pub trait ResidualStorageOperation<T: Type>: Operation<Type = T> {
     /// Returns the type of one stored residual slice, inferred from [`Self::residual_to_storage`] when conversion is
     /// needed; otherwise returns `residual_type` unchanged. This is the type before the caller prepends the loop axis,
     /// not the type of the complete residual stack.
@@ -190,7 +190,7 @@ pub trait ResidualStackOperation<T: Type>: Operation<Type = T> {
     fn residual_from_carrier(residual_type: &T, carrier_type: &T) -> Result<Option<Self>, TypeError>;
 }
 
-impl<O: Operation<Type = ArrayType>> ResidualStackOperation<ArrayType> for O {
+impl<O: Operation<Type = ArrayType>> ResidualStorageOperation<ArrayType> for O {
     #[inline]
     fn residual_to_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
         Ok(None)
@@ -212,7 +212,7 @@ impl<
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>,
-> ResidualStackOperation<ArrayIrType> for O
+> ResidualStorageOperation<ArrayIrType> for O
 {
     // Array IR residuals store arrays directly and first-class dimensions as scalar arrays.
     // References are threaded through loop carries instead of stored in residual stacks.
@@ -640,7 +640,7 @@ mod tests {
         RegionRef, TypeError, Value,
     };
 
-    use super::{ResidualStackOperation, SCAN_OPERATION_NAME, validate_reference_carry_axis};
+    use super::{ResidualStorageOperation, SCAN_OPERATION_NAME, validate_reference_carry_axis};
 
     /// Array IR value, which admits references and first-class dimensions.
     pub(super) type TestIrValue = ArrayIrValue<Array>;
@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn test_residual_stack_operation_residual_storage_type() {
+    fn test_residual_storage_operation_residual_storage_type() {
         // Arrays keep their metadata in both families; dimensions use scalar array storage, and references are rejected.
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true });
         assert_eq!(ArrayOperation::<Array>::residual_storage_type(&array_type), Ok(array_type.clone()));

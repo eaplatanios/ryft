@@ -70,8 +70,8 @@ use crate::operations::collectives::parallel_vary::{
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero};
 use crate::operations::control_flow::{
-    ResidualStackOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types, stabilize_carry_axes,
-    validate_output_identities, validate_reference_carry_roots, validate_region_input,
+    ResidualStorageOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types,
+    stabilize_carry_axes, validate_output_identities, validate_reference_carry_roots, validate_region_input,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::conversions::{CastOperation, CastType};
@@ -1921,7 +1921,7 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
 impl<
     T: ScanType,
     V: Value<Type = T>,
-    O: ResidualStackOperation<T> + From<ScanOperation<T>>,
+    O: ResidualStorageOperation<T> + From<ScanOperation<T>>,
     C: Context<Type = T, Constant = V, Operation = O>,
 > PartiallyEvaluatableOperation<C> for ScanOperation<T>
 {
@@ -2056,7 +2056,7 @@ impl<
     C: Context<
             Type = T,
             Operation: ResidualZeroProvider<T, Operation = C::Operation>
-                           + ResidualStackOperation<T>
+                           + ResidualStorageOperation<T>
                            + From<ScanOperation<T>>
                            + From<GuardOperation<T>>
                            + From<CastOperation<T>>
@@ -3290,7 +3290,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         scan_inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, DifferentiationError>
     where
-        C::Operation: From<ScanOperation<C::Type>> + ResidualStackOperation<C::Type>,
+        C::Operation: From<ScanOperation<C::Type>> + ResidualStorageOperation<C::Type>,
     {
         let body_input_count = self.input_order.len() - self.activity.input_indices().len();
         let body_output_count = self.activity.output_tangent_liveness().len();
@@ -3653,7 +3653,7 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
 #[inline]
 fn reconstruct_partitioned_scan<
     V: Value<Type: ScanType>,
-    O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
+    O: ResidualStorageOperation<V::Type> + From<ScanOperation<V::Type>>,
     Input: Clone,
     LiftKnownFn: FnMut(V) -> Result<Input, ProgramError>,
     ResolveConstantFn: FnMut(&Input) -> Option<V>,
@@ -3680,7 +3680,7 @@ fn reconstruct_partitioned_scan<
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn inner<
         V: Value<Type: ScanType>,
-        O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
+        O: ResidualStorageOperation<V::Type> + From<ScanOperation<V::Type>>,
         Input: Clone,
     >(
         scan: &ScanOperation<V::Type>,
