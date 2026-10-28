@@ -1302,8 +1302,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C> for WhileOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -1323,8 +1321,8 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
         let mut state = inputs.to_vec();
         let mut completed_iterations = 0;
         loop {
-            // The semantic iteration bound means a bounded loop runs at most `bound` iterations by definition, so the
-            // loop exits here even while the condition still produces true.
+            // The semantic iteration bound means a bounded loop runs at most `bound` iterations by definition,
+            // so the loop exits here even while the condition still produces `true`.
             if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
                 return Ok(state);
             }
@@ -1334,6 +1332,7 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
             if !predicate.any_true()? {
                 return Ok(state);
             }
+
             // Update the state under the mask so items whose predicate is true take the body's candidate update and the
             // rest keep their carried state. For a scalar predicate this reduces to taking the candidates wholesale,
             // since a false scalar predicate exits above.
@@ -1348,6 +1347,8 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
     for WhileOperation<C::Type>
