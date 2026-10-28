@@ -458,36 +458,34 @@ impl<C: Context<Type: DifferentiableType, Value: Concretizable<bool>>, P: Differ
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`WhileOperation`].
 pub const WHILE_OPERATION_NAME: &str = "while";
 
 /// [`Operation`] that repeatedly applies a body [`Region`](crate::Region) to loop-carried state while a condition
 /// [`Region`](crate::Region) over the same state produces a true Boolean predicate. The condition and the body consume
 /// identical state type signatures, the body produces the next state with that same signature, and the operation
-/// outputs the final state once the condition produces false or the optional semantic iteration bound truncates the
-/// loop (refer to [`Self::with_iteration_bound`]).
+/// outputs the final state once the condition produces `false` or the optional semantic iteration bound truncates
+/// the loop.
 ///
-/// The condition and the body are not part of this payload: they are [`Region`](crate::Region)s attached to the
-/// [`Instruction`](crate::Instruction) that applies the operation, in the [`region_slots`](Operation::region_slots)
-/// order `["condition", "body"]`, and semantic rules reach them through their driver-granted region access. Owned
-/// loops supply the two [`Program`]s through the `driver` argument of [`Context::bind`].
-/// [`Operation::infer_output_types`] validates the loop contract over the attached [`RegionInterface`]s: the condition
-/// and the body share the loop-carried state input signature, the condition returns exactly one Boolean predicate that
-/// [`WhileType`] admits for that state, and the body returns the state signature. A batched (i.e., per-item) predicate
-/// requires both regions to be pure and free of deferred work, because neither observable effects nor transformation
-/// obligations can be masked for the items that have finished.
+/// The condition and the body are not part of this payload. Instead, they are [`Region`](crate::Region)s attached to
+/// the [`Instruction`](crate::Instruction) that applies the operation, in the [`region_slots`](Operation::region_slots)
+/// order `["condition", "body"]`, and semantic rules reach them through their driver-granted region access. Owned loops
+/// supply the two [`Program`]s through the `driver` argument of [`Context::bind`]. [`Operation::infer_output_types`]
+/// validates the loop contract over the attached [`RegionInterface`]s: the condition and the body share the
+/// loop-carried state input signature, the condition returns exactly one Boolean predicate that [`WhileType`] admits
+/// for that state, and the body returns the state signature. A batched (i.e., per-item) predicate requires both regions
+/// to be pure and free of deferred work, because neither observable effects nor transformation obligations can be
+/// masked for the items that have finished.
 ///
 /// Differentiation through a while loop follows one of three regimes:
 ///
-///   - **Eager:** When the primal values of the differentiation context are concrete, the forward-mode rule evaluates
+///   - **Eager:** When the primal values of the differentiation context are concrete, the forward mode rule evaluates
 ///     the condition on the primal state and applies the body once over the current dual state on each iteration,
-///     respecting any iteration bound. During linearization, partial evaluation records the executed tangent
-///     operations as a straight-line (and therefore transposable) pushforward, so eager reverse mode works without
-///     replaying primal body effects. Once the predicate stops concretizing to one scalar Boolean (e.g., because it
-///     becomes batched), a loop whose condition is pure and free of deferred work resumes from the current duals with
-///     the staged regimes below and the remaining iteration bound.
+///     respecting any iteration bound. During linearization, partial evaluation records the executed tangent operations
+///     as a straight-line (and therefore transposable) pushforward, so eager reverse mode works without replaying
+///     primal body effects. Once the predicate stops concretizing to one scalar Boolean (e.g., because it becomes
+///     batched), a loop whose condition is pure and free of deferred work resumes from the current duals with the
+///     staged regimes below and the remaining iteration bound.
 ///   - **Bounded Staged:** When the primal values are tracers and the loop has an iteration bound `B`, the rule stages
 ///     an augmented primal loop that stores every per-iteration residual in a preallocated `[B, …]` stack, together
 ///     with a Boolean validity mask, and the tangent side becomes one masked linear [`ScanOperation`] of length `B`,
@@ -503,11 +501,11 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///     transposition.
 ///
 /// The `T` parameter fixes the type universe of the loop in the payload itself. Consequently, one concrete
-/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the
-/// shared implementation supports homogeneous array and array IR loops.
+/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even
+/// though the shared implementation supports homogeneous array and array IR loops.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WhileOperation<T: Type> {
-    /// Optional semantic iteration bound of the loop (refer to [`Self::with_iteration_bound`]).
+    /// Optional bound for the number of iterations of the loop.
     iteration_bound: Option<usize>,
 
     /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
@@ -515,8 +513,8 @@ pub struct WhileOperation<T: Type> {
 }
 
 impl<T: Type> WhileOperation<T> {
-    /// Creates a new [`WhileOperation`] with no semantic iteration bound. The condition and body [`Program`]s are
-    /// supplied separately as the attached regions of the operation, through the region driver passed to
+    /// Creates a new [`WhileOperation`] with no semantic iteration bound. The condition and body [`Program`]s
+    /// are supplied separately as the attached regions of the operation, through the region driver passed to
     /// [`Context::bind`], and [`Operation::infer_output_types`] validates the loop contract over their interfaces.
     pub const fn new() -> Self {
         Self { iteration_bound: None, marker: PhantomData }
@@ -525,13 +523,14 @@ impl<T: Type> WhileOperation<T> {
     /// Returns this [`WhileOperation`] with its semantic iteration bound set to `bound`. Passing [`None`] restores the
     /// default unbounded loop.
     ///
-    /// The bound is semantic rather than a hint or an unchecked promise: a bounded loop runs at most `bound` iterations
-    /// by definition, so a loop whose condition would keep it running longer is truncated after `bound` body
+    /// The bound is semantic rather than a hint or an unchecked promise: a bounded loop runs at most `bound`
+    /// iterations by definition, so a loop whose condition would keep it running longer is truncated after `bound` body
     /// applications. Every rule honors this truncation. For example, interpretation exits the loop once the bound is
-    /// reached even while the condition still produces true, and the XLA lowering threads an iteration counter through
-    /// the `stablehlo.while` state and conjoins `counter < bound` into the loop condition. The bound also makes staged
-    /// reverse-mode differentiation possible, because it gives the linearization of the loop a static residual-stack
-    /// length (refer to the bounded staged regime described on [`WhileOperation`]).
+    /// reached even while the condition still produces `true`, and the XLA backend lowering, for example, threads an
+    /// iteration counter through the `stablehlo.while` state and conjoins `counter < bound` into the loop condition.
+    /// The bound also makes staged reverse mode differentiation possible, because it gives the linearization of the
+    /// loop a static residual stack length (refer to the bounded staged regime described on the documentation of
+    /// [`WhileOperation`]).
     ///
     /// # Errors
     ///
@@ -557,8 +556,8 @@ impl<T: Type> WhileOperation<T> {
         Ok(self)
     }
 
-    /// Returns the semantic iteration bound of this [`WhileOperation`], if any. Refer to the documentation of
-    /// [`Self::with_iteration_bound`] for the truncation semantics a bound carries.
+    /// Returns the semantic iteration bound of this [`WhileOperation`], if any. Refer to the documentation
+    /// of [`Self::with_iteration_bound`] for the truncation semantics a bound carries.
     #[inline]
     pub fn iteration_bound(&self) -> Option<usize> {
         self.iteration_bound
@@ -573,7 +572,7 @@ impl<T: WhileType> WhileOperation<T> {
     /// reference contract that only the body reveals (refer to [`validate_reference_carry_roots`]), and of the loop
     /// invariance of the state that [`WhileType::is_loop_invariant_state`] requires under a batched predicate: such
     /// state has no per-item value that masking could select, so the body must pass it through unchanged, which makes
-    /// masking it the identity on every path (eager interpretation, the masked form of differentiation, and the
+    /// masking it the identity on every path (i.e., eager interpretation, the masked form of differentiation, and the
     /// lowering all forward it unmasked).
     ///
     /// # Parameters
@@ -588,10 +587,12 @@ impl<T: WhileType> WhileOperation<T> {
         body: RegionRef<'_, V, O>,
     ) -> Result<Vec<T>, ProgramError> {
         let output_types = self.infer_output_types(input_types, &[condition.interface(), body.interface()])?;
+
         // The body must return every reference carry as its own body input. This is checked even when no iteration
         // runs, so that whether a loop is accepted does not depend on the transform that reaches it or on how its
         // inputs alias.
         validate_reference_carry_roots(WHILE_OPERATION_NAME, body, 0..body.input_ids().len())?;
+
         let state_types = body.input_types();
         if condition.output_types()[0].is_batched_while_predicate() {
             let passes_through = passed_through_carries(body, 0..state_types.len());
@@ -605,18 +606,19 @@ impl<T: WhileType> WhileOperation<T> {
                 }
             }
         }
+
         Ok(output_types)
     }
 
-    /// Validates the loop contract over the two attached region interfaces (`["condition", "body"]` region order) and
-    /// returns them. The loop-carried state signature is the body's input signature: the condition must consume the
+    /// Validates the loop contract over the two attached region interfaces (i.e., `["condition", "body"]` region order)
+    /// and returns them. The loop-carried state signature is the body's input signature: the condition must consume the
     /// same state and return exactly one Boolean predicate valid for that state under [`WhileType`], and the body must
     /// return the state signature. A batched (per-item) predicate additionally requires both regions to be pure and
     /// free of deferred work: the loop keeps running for still-active items after others finish, so the condition and
     /// body re-execute over every item each iteration, and neither observable effects nor transformation obligations
     /// (refer to the [Deferred Work](crate::Effects#deferred-work) section of [`Effects`](crate::Effects)) can be
-    /// masked back out for the finished items the way values can. This mirrors JAX's `_while_loop_batching_rule`, which
-    /// rejects IO effects once the predicate is batched.
+    /// masked back out for the finished items the way values can. This mirrors JAX's `_while_loop_batching_rule`,
+    /// which rejects IO effects once the predicate is batched.
     fn validate_interfaces(
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<(&RegionInterface<T>, &RegionInterface<T>), TypeError> {
@@ -676,31 +678,31 @@ impl<T: WhileType> WhileOperation<T> {
         Ok(())
     }
 
-    /// Splits a pure `while` loop whose known state subset is *closed* (i.e., every known state element's next-state
-    /// value and the predicate fold from the known state alone) into a *known* loop bound in the enclosing known-side
-    /// context and the *residual* loop kept whole, returning [`None`] when the split does not apply.
+    /// Splits a pure `while` loop whose known state subset is _closed_ (i.e., every known state element's next-state
+    /// value and the predicate fold from the known state alone) into a _known_ loop bound in the enclosing known-side
+    /// context and the _residual_ loop kept whole, returning [`None`] when the split does not apply.
     ///
     /// The known state subset is found by a monotonic fixed point like the known-ness split of [`ScanOperation`]: a
-    /// state element stays known iff its init is known and the body computes its next value from known state alone,
-    /// with each round partitioning the body through a **fresh** staging context (via
+    /// state element stays known if and only if its initial value is known and the body computes its next value from
+    /// known state alone, with each round partitioning the body through a _fresh_ staging context (via
     /// [`PartialEvaluationDriver::partition_program`]) so no probe work leaks into the caller's context. Unlike the
-    /// loop-*invariance* rewrite, known-ness needs neither constant resolution nor value equality, so symbolic known
-    /// inits (tracers into a live outer trace) participate fully, which is what makes the split fire under
-    /// [`Program::linearize`]. After convergence the split additionally requires the *predicate* to fold from the known
+    /// _loop-invariance_ rewrite, known-ness needs neither constant resolution nor value equality, so symbolic known
+    /// initial values (tracers into a live outer trace) participate fully, which is what makes the split fire under
+    /// [`Program::linearize`]. After convergence the split additionally requires the _predicate_ to fold from the known
     /// state alone; only then does the known loop run the original iteration count, since its continuation decision is
     /// byte-for-byte the original one over state it computes itself.
     ///
     /// The known loop is the projection of the original loop onto the known subset: its body maps the known state
     /// elements to their known next values and its condition is the known projection of the original condition. It is
-    /// bound whole into the enclosing known-side context over the original known inits (executing under an eager
-    /// context and staging into the outer program under a staging one), and its outputs are the known state elements'
-    /// final values. The residual loop is the **original loop unchanged**: its unknown outputs are the unknown state
-    /// elements' finals, and any known per-iteration values the unknown side reads are *recomputed inside the loop*
-    /// rather than streamed as residual edges, because a loop with a data-dependent iteration count has no statically
-    /// shaped residual stream. For an eligible fused forward-mode loop, this duplication lets the known side recover
-    /// the primal outputs while the tangent program keeps the complete loop. The residual loop's known-state outputs
-    /// are left dead. This does not support arbitrary unbounded-loop linearization: the split requires pure regions and
-    /// a predicate that depends only on the closed known state.
+    /// bound whole into the enclosing known-side context over the original known initial values (executing under an
+    /// eager context and staging into the outer program under a staging one), and its outputs are the known state
+    /// elements' final values. The residual loop is the _original loop unchanged_: its unknown outputs are the unknown
+    /// state elements' finals, and any known per-iteration values the unknown side reads are _recomputed inside the
+    /// loop_ rather than streamed as residual edges, because a loop with a data-dependent iteration count has no
+    /// statically shaped residual stream. For an eligible fused forward-mode loop, this duplication lets the known side
+    /// recover the primal outputs while the tangent program keeps the complete loop. The residual loop's known-state
+    /// outputs are left dead. This does not support arbitrary unbounded-loop linearization; the split requires pure
+    /// regions and a predicate that depends only on the closed known state.
     ///
     /// The split does not apply (and the caller residualizes unchanged) when the converged known subset is empty or
     /// complete (an all-known loop folds whole through the default rule), or when the predicate reads unknown state.
@@ -820,8 +822,8 @@ impl<T: WhileType> WhileOperation<T> {
             vec![Placeholder; 1],
         )?;
 
-        // Bind the known loop into the enclosing known-side context over the original known inits, and emit the
-        // original loop unchanged into the residual program for the unknown state elements' finals.
+        // Bind the known loop into the enclosing known-side context over the original known initial values, and emit
+        // the original loop unchanged into the residual program for the unknown state elements' finals.
         let known_while = WhileOperation::new().with_iteration_bound(self.iteration_bound())?;
         let known_inputs = known_state_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
         let known_outputs = context.fold_or_residualize(
@@ -853,8 +855,6 @@ impl<T: WhileType> WhileOperation<T> {
     }
 }
 
-impl<T: Type> Copy for WhileOperation<T> {}
-
 impl<T: Type> Default for WhileOperation<T> {
     #[inline]
     fn default() -> Self {
@@ -862,7 +862,10 @@ impl<T: Type> Default for WhileOperation<T> {
     }
 }
 
+impl<T: Type> Copy for WhileOperation<T> {}
+
 impl<T: WhileType> Display for WhileOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -881,6 +884,7 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         const { &[RegionSlot::computation("condition"), RegionSlot::computation("body")] }
     }
 
+    #[inline]
     fn validate_region_interfaces(&self, region_interfaces: &[RegionInterface<T>]) -> Result<(), ProgramError> {
         // The condition and the body both receive the loop state, and the body must map it to itself. Validating these
         // declared signatures here means that specialization cannot make a mismatched body agree with its state types,
@@ -907,18 +911,17 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        // Value inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation rather than
-        // strict type equality, so actual inputs that carry metadata the state types leave unspecified (e.g., the
-        // normalized shardings of concrete backend array types) or static extents within the bounds of dynamic state
-        // dimensions are accepted. Reference inputs refine their state types by their referents (refer to
-        // `validate_region_input`).
-        // The outputs are the state types refined by the facts that the inputs establish (refer to
-        // `refine_output_types`): an identity that the inputs fix to a static extent and that no state element defines
-        // is loop-invariant, so every iteration carries values of that extent. An identity that a first-class dimension
-        // carry defines is defined by that carry's body input, and the body must return the state signature, so
-        // identity validation rejects a body that returns a different dimension for the carry. The identity
-        // nevertheless stays symbolic in the outputs, because the refinement only fixes identities that no state
-        // element defines. Metadata such as shardings is not propagated, because the body may change it.
+        // Value inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation rather
+        // than strict type equality, so actual inputs that carry metadata the state types leave unspecified (e.g.,
+        // the normalized shardings of concrete backend array types) or static extents within the bounds of dynamic
+        // state dimensions are accepted. Reference inputs refine their state types by their referents. The outputs are
+        // the state types refined by the facts that the inputs establish: an identity that the inputs fix to a static
+        // extent and that no state element defines is loop-invariant, so every iteration carries values of that extent.
+        // An identity that a first-class dimension carry defines is defined by that carry's body input, and the body
+        // must return the state signature, so identity validation rejects a body that returns a different dimension
+        // for the carry. The identity nevertheless stays symbolic in the outputs, because the refinement only fixes
+        // identities that no state element defines. Metadata such as shardings is not propagated, because the body
+        // may change it.
         let (_, body_interface) = Self::validate_interfaces(region_interfaces)?;
         let state_types = body_interface.input_types();
         check_count!("input", input_types, state_types.len(), TypeError);
@@ -975,6 +978,8 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: WhileType> RegionDataFlowRule for WhileOperation<T> {
     fn input_sources(
@@ -1349,18 +1354,19 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         // A while's inputs are the initial loop state and its outputs are the final loop state (the same arity).
         // Partial evaluation folds the known value of every *loop-invariant-known* state element into both nested
         // programs: a state element is loop-invariant-known iff the body passes it through unchanged (its next-state
-        // output is its own state input), its init input is `PartialValue::Known`, and its type is not a reference and
-        // mentions no type identity. Such an element holds its init value on every iteration, so binding it to that
-        // constant inside the condition and body is sound and collapses every subcomputation that depended only on it.
-        // Invariance is structural rather than decided by comparing the body's next-state values with the init values,
-        // because value equality cannot distinguish values that the body changes without changing their equality class
-        // (e.g., a body that negates a state element of `0.0` returns `-0.0`, which compares equal to `0.0`). A folded
-        // element is rebuilt as a program constant, which excludes two kinds of state even when the body only passes
-        // them through: a reference carry must keep its allocation flowing through the loop boundary, and a type that
-        // mentions an identity cannot be rebuilt as a constant. A type that defines an identity (e.g., a first-class
-        // dimension) is already defined by the state input that the rebuilt condition and body keep, so a constant of
-        // that type would define the identity twice, and a type that refers to an identity (e.g., `f32[extent]`) would
-        // be replaced by the concrete static type of the constant, which no longer matches the loop's state signature.
+        // output is its own state input), its initial input is `PartialValue::Known`, and its type is not a reference
+        // and mentions no type identity. Such an element holds its initial value on every iteration, so binding it to
+        // that constant inside the condition and body is sound and collapses every subcomputation that depended only on
+        // it. Invariance is structural rather than decided by comparing the body's next-state values with the initial
+        // values, because value equality cannot distinguish values that the body changes without changing their
+        // equality class (e.g., a body that negates a state element of `0.0` returns `-0.0`, which compares equal to
+        // `0.0`). A folded element is rebuilt as a program constant, which excludes two kinds of state even when the
+        // body only passes them through: a reference carry must keep its allocation flowing through the loop boundary,
+        // and a type that mentions an identity cannot be rebuilt as a constant. A type that defines an identity (e.g.,
+        // a first-class dimension) is already defined by the state input that the rebuilt condition and body keep, so a
+        // constant of that type would define the identity twice, and a type that refers to an identity (e.g.,
+        // `f32[extent]`) would be replaced by the concrete static type of the constant, which no longer matches the
+        // loop's state signature.
         //
         // Both the body and the condition are then partially evaluated with the invariant-known state knowledge through
         // the partial-evaluation driver's split requests. The condition reads the state too, so folding an invariant
@@ -1368,7 +1374,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         //
         // The residual while keeps the *same* state set and therefore the same output arity as the original operation.
         // A loop-invariant-known element is not dropped; instead its body next-state output is rebuilt as the constant
-        // init value and its uses fold away inside both programs. Because the condition and body run on the same
+        // initial value and its uses fold away inside both programs. Because the condition and body run on the same
         // loop-carried state each iteration, both residual programs are rebuilt over the loop's full state signature
         // (in state order): each surviving unknown state element feeds the matching state input, and every known
         // residual a program closed over is rebuilt as an inline residual-program constant (so the residual while needs
@@ -1440,11 +1446,11 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         };
 
         // A state element can only fold if its type is not a reference and mentions no type identity (see the overview
-        // above), the body passes it through unchanged, and its init input is known *and* resolves to a constant in the
-        // known-side context: the folded value must be embeddable as a rebuilt-program constant, and skipping symbolic
-        // knowns also keeps the probes from folding symbolic known work into a live staging context.
+        // above), the body passes it through unchanged, and its initial input is known *and* resolves to a constant in
+        // the known-side context: the folded value must be embeddable as a rebuilt-program constant, and skipping
+        // symbolic knowns also keeps the probes from folding symbolic known work into a live staging context.
         let passes_through = passed_through_carries(body, 0..state_count);
-        let state_inits = (0..state_count)
+        let initial_state_values = (0..state_count)
             .map(|index| {
                 inputs[index]
                     .as_known()
@@ -1459,15 +1465,15 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
             .collect::<Vec<Option<C::Value>>>();
 
         // With no invariant elements there is nothing the rebuild below could embed, so skip the live-context probes
-        // entirely. In particular, under a staging known-side context every symbolic known init lands here, which is
-        // where the closed-knownness split serves `Program::linearize`.
-        let invariant = state_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
+        // entirely. In particular, under a staging known-side context every symbolic known initial value lands here,
+        // which is where the closed-knownness split serves `Program::linearize`.
+        let invariant = initial_state_values.iter().map(Option::is_some).collect::<Vec<bool>>();
         if invariant.iter().all(|folded| !folded) {
             return split_or_residualize(context);
         }
         let state_knowledge = |invariant: &[bool]| -> Vec<PartialValue<C::Value>> {
             (0..state_count)
-                .map(|index| match (invariant[index], &state_inits[index]) {
+                .map(|index| match (invariant[index], &initial_state_values[index]) {
                     (true, Some(value)) => PartialValue::Known(value.clone()),
                     _ => PartialValue::Unknown(state_types[index].clone()),
                 })
@@ -1532,7 +1538,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         // The folded loop may still have a closed known state subset (e.g., a counter that the folded limit bounds),
         // which the split recovers on the known side; the two rewrites compose, so the split runs over the rebuilt
         // regions. Otherwise the residual while's inputs are exactly the guarded while inputs: each state element's
-        // init value (now a known residual for the folded elements) in state order.
+        // initial value (now a known residual for the folded elements) in state order.
         if let Some(outputs) = while_operation.split_by_closed_knownness(
             context,
             residual_condition.entry_region_ref(),
