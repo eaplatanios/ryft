@@ -1587,23 +1587,17 @@ impl<C: Context<Type = ArrayIrType, Operation: From<WhileOperation<ArrayIrType>>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<
-    T: DifferentiableType + WhileType,
-    C: Context<
-            Type = T,
-            Operation: ResidualZeroProvider<T, Operation = C::Operation>
-                           + From<ConditionOperation<T>>
-                           + From<WhileOperation<T>>
-                           + From<ScanOperation<T>>
-                           + WhileResidualStackOperation<T>,
-        > + Zero<C::Value>,
-> DifferentiableOperation<C> for WhileOperation<T>
+impl<T: DifferentiableType + WhileType, C: Context<Type = T> + Zero<C::Value>> DifferentiableOperation<C>
+    for WhileOperation<T>
 where
+    C::Value: Concretizable<bool>,
+    C::Operation: ResidualZeroProvider<T, Operation = C::Operation>
+        + From<ConditionOperation<T>>
+        + From<WhileOperation<T>>
+        + From<ScanOperation<T>>
+        + WhileResidualStackOperation<T>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
-    C::Value: Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1615,30 +1609,29 @@ where
         // data-dependent `while` loops with no iteration bound. Staging contexts stage the shared array-backed rule
         // (refer to `WhileJvp::bind`), and the eager rule resumes with it from the current duals once the predicate
         // stops concretizing to one scalar Boolean (e.g., a batched predicate, which has no single continuation
-        // decision). Bounded loops stage the reverse-capable hybrid of an augmented primal `while` and a masked tangent
-        // `scan`, after rewriting a batched predicate into its masked form, while unbounded loops stage the
-        // forward-only fused doubled-state loop. Both type families share that rule. They differ only in their
-        // array-backed storage, which `WhileResidualStackOperation` describes.
+        // decision). Bounded loops stage the reverse-capable hybrid of an augmented primal `while` and a masked
+        // tangent `scan`, after rewriting a batched predicate into its masked form, while unbounded loops stage
+        // the forward-only fused doubled-state loop. Both type families share that rule. They differ only in
+        // their array-backed storage, which `WhileResidualStackOperation` describes.
 
-        // The rule requests all nested-computation work through its driver (region 0 is the condition and region 1 the
-        // body), which keeps its bounds free of the operation family's own semantic traits.
+        // The rule requests all nested-computation work through its driver (region `0` is the condition and region `1`
+        // the body), which keeps its bounds free of the operation family's own semantic traits.
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, driver.region(0)?, driver.region(1)?)?;
         let condition = driver.region(0)?.to_program();
         let body = driver.region(1)?.to_program();
         if context.primal().is_eager() {
-            // Run a `while` loop's forward-mode rule directly at concrete duals for an [eager](Context::is_eager)
-            // context and returns the output duals, resuming with the staged rule (refer to [`WhileJvp::bind`]) from
-            // the current duals when the loop's predicate stops concretizing to one scalar Boolean.
+            // Run a `while` loop's forward-mode rule directly at concrete duals for an eager context and returns the
+            // output duals, resuming with the staged rule (refer to `WhileJvp::bind`) from the current duals when the
+            // loop's predicate stops concretizing to one scalar Boolean.
             //
             // Each iteration evaluates the condition on the concrete primal carries and interprets the body once over
             // the current dual carries. Body instructions re-enter their JVP rules through the differentiation driver,
             // so nested data-dependent `while` operations recurse through this same eager path without a program-level
-            // unroll pre-pass. Data-dependent iteration counts therefore need no iteration bound, as for [JAX's `jvp`
-            // through an eagerly executed loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html), while a
-            // semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached,
-            // matching the bounded-`while` truncation semantics. Each body effect executes exactly once per loop
-            // iteration.
+            // unroll pre-pass. Data-dependent iteration counts therefore need no iteration bound, as for JAX's `jvp`
+            // through an eagerly executed loop (i.e., https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html), while
+            // a semantic iteration bound truncates the loop once it is reached, matching the bounded-`while` truncation
+            // semantics. Each body effect executes exactly once per loop iteration.
             //
             // A predicate may fail to concretize on any iteration, not only the first. A batched per-item predicate has
             // no single continuation decision, and an eager transform context (e.g., batching over an eager parent) can
@@ -1667,20 +1660,20 @@ where
                     break;
                 }
 
-                // Concretize the condition on the current concrete primal carries to decide whether another iteration
-                // runs.
+                // Concretize the condition on the current concrete primal carries to decide whether
+                // another iteration runs.
                 let mut condition_outputs = condition.interpret_in_context(context.primal(), primal_carries.clone())?;
                 check_count!("output", condition_outputs, 1, ProgramError);
                 let predicate = match condition_outputs.remove(0).concretize() {
                     Ok(predicate) => predicate,
-                    // The predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate,
-                    // whose items stop on different iterations, has no single continuation decision, or a predicate
-                    // that an eager batching context maps once the body mixes a replicated state element with a mapped
-                    // one). The loop resumes from the current duals under the staged rule with the remaining bound,
-                    // which is at least one because the loop exits above, before evaluating the condition, once the
-                    // bound is reached. The staged rule evaluates the condition on the current state once more, so only
-                    // a pure condition without deferred work resumes.
                     Err(error) => {
+                        // The predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate,
+                        // whose items stop on different iterations, has no single continuation decision, or a predicate
+                        // that an eager batching context maps once the body mixes a replicated state element with a
+                        // mapped one). The loop resumes from the current duals under the staged rule with the remaining
+                        // bound, which is at least one because the loop exits above, before evaluating the condition,
+                        // once the bound is reached. The staged rule evaluates the condition on the current state once
+                        // more, so only a pure condition without deferred work resumes.
                         let condition_effects = condition.effects();
                         if !condition_effects.classes().is_empty() || condition_effects.has_deferred_work() {
                             return Err(error.into());
@@ -1696,6 +1689,7 @@ where
                             .bind(condition, body, context, driver, &duals);
                     }
                 };
+
                 if !predicate {
                     break;
                 }
@@ -1703,8 +1697,8 @@ where
                 // Advance one iteration by replaying the body directly over dual values. This is deliberately not
                 // routed through a program-level unroll pre-pass. Such a rewrite interprets the body to discover
                 // concrete nested-loop iteration counts, after which replaying its fused JVP would execute primal
-                // effects a second time. Direct dual interpretation lets a nested while recurse through this eager rule
-                // and executes every primal operation once.
+                // effects a second time. Direct dual interpretation lets a nested while recurse through this eager
+                // rule and executes every primal operation once.
                 let input_duals = primal_carries
                     .drain(..)
                     .zip(tangent_carries.drain(..))
@@ -1737,12 +1731,13 @@ where
                 completed_iterations += 1;
             }
 
-            return Ok(primal_carries
+            return primal_carries
                 .into_iter()
                 .zip(tangent_carries)
                 .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-                .collect::<Result<Vec<_>, _>>()?);
+                .collect::<Result<Vec<_>, _>>();
         }
+
         WhileJvp::new(driver, self, inputs)?.bind(&condition, &body, context, driver, inputs)
     }
 }
@@ -1759,23 +1754,24 @@ where
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         _accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // This rule rejects the transposition of a staged linear `while` loop. The forward-mode rule stages one for an
-        // unbounded loop (the doubled-state linear loop, which recomputes primal state _forward_ through the
+        // TODO(eaplatanios): Support transposition of unbounded while loops.
+
+        // This rule rejects the transposition of a staged linear `while` loop. The forward mode rule stages one
+        // for an unbounded loop (the doubled-state linear loop, which recomputes primal state _forward_ through the
         // iterations, so transposing it would have to run that recomputation backwards, which a while loop cannot
         // express), and a linear program handed to `Program::transpose` can contain one directly, whether or not it is
         // bounded. Two paths avoid this rule. Eager domains execute the loop directly over concrete duals and record a
-        // straight-line pushforward during linearization. The forward-mode rule never stages a linear `while` for a
-        // bounded loop (`WhileOperation::with_iteration_bound`), because its tangent side is a masked linear scan whose
-        // transpose is total.
+        // straight-line pushforward during linearization. The forward mode rule never stages a linear `while` for a
+        // bounded loop, because its tangent side is a masked linear scan whose transpose is total.
 
         // The loop is validated as every rule validates it before the unsupported transposition is reported.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, driver.region(0)?, driver.region(1)?)?;
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{WHILE_OPERATION_NAME}` does not support transposition (reverse-mode differentiation through staged \
+                "`{WHILE_OPERATION_NAME}` does not support transposition (reverse mode differentiation through staged \
                  linear `{WHILE_OPERATION_NAME}` loops is not supported; eager differentiation executes concrete \
-                 duals, and the forward-mode rule of loops built with `with_iteration_bound` stages a transposable \
+                 duals, and the forward mode rule of loops built with `with_iteration_bound` stages a transposable \
                  masked scan)",
             ),
         }
@@ -1789,6 +1785,8 @@ impl From<WhileOperation<ArrayType>> for WhileOperation<ArrayIrType> {
         Self { iteration_bound: operation.iteration_bound, marker: PhantomData }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Operation-family constructors that the staged forward-mode rule of [`WhileOperation`] uses to store the
 /// per-iteration residuals of a bounded loop in stacks and to make the per-item masking of a loop with a batched
