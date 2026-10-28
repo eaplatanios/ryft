@@ -234,8 +234,6 @@ impl WhileType for ArrayIrType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Value-level predicate contract that backs the masked loop semantics of [`WhileOperation`] during interpretation.
 /// The shared [`InterpretableOperation`] rule of [`WhileOperation`] requires it of the values of the interpreting
 /// domain, so custom value representations implement it to reuse that rule.
@@ -250,23 +248,23 @@ impl WhileType for ArrayIrType {
 /// differentiation, and the lowering) decides this the same way.
 ///
 /// Per-item masking selects values after evaluating the body for every item; it does not skip the body computations of
-/// inactive items. The body must therefore remain defined for their frozen state too. During differentiation,
-/// undefined derivatives in those computations can produce non-finite cotangents even when their selected output is
-/// inactive.
+/// inactive items. The body must therefore remain defined for their frozen state too. During differentiation, undefined
+/// derivatives in those computations can produce non-finite cotangents even when their selected output is inactive.
 ///
 /// The default implementations are the scalar-predicate semantics, expressed through [`Concretizable<bool>`]: the
 /// truth of the predicate decides continuation, and a true predicate takes the candidate wholesale. Value types with
 /// genuinely batched payloads (e.g., [`Array`]) override both functions with per-item semantics, and symbolic values
 /// (e.g., tracers and capture references) inherit the defaults, which surface the errors of
-/// [`Concretizable::concretize`], because a staged loop is consumed by staging and lowering rather than by eager
-/// interpretation.
+/// [`Concretizable::concretize`], because a staged loop is consumed by staging and lowering
+/// rather than by eager interpretation.
 pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
-    /// Returns `true` when any element of this Boolean predicate is true, which is the loop-continuation decision.
+    /// Returns `true` when any element of this Boolean predicate is `true`, which is the loop-continuation decision.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when this value is not a Boolean predicate or does not have a concrete value (e.g.,
-    /// the concretization error of a symbolic value).
+    /// Returns a [`ProgramError`] when this value is not a Boolean predicate or does not have a concrete value
+    /// (e.g., the concretization error of a symbolic value).
+    #[inline]
     fn any_true(&self) -> Result<bool, ProgramError> {
         self.concretize()
     }
@@ -274,8 +272,8 @@ pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// Selects between `on_true` and `on_false` per element under this Boolean predicate, broadcasting the predicate
     /// against their shape along its leading (i.e., prefix) axes.
     ///
-    /// The candidates must have the same type. [`Select::select`](super::select::Select::select) instead uses ordinary
-    /// elementwise broadcasting and promotion. Use trait-qualified calls when both traits are in scope.
+    /// The candidates must have the same type. [`Select::select`](crate::Select::select) instead uses ordinary
+    /// elementwise broadcasting and promotion.
     ///
     /// # Errors
     ///
@@ -283,15 +281,18 @@ pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// `on_true` and `on_false`, when the two candidates have different types or (under a batched predicate) do not
     /// vary over every manual mesh axis that the predicate varies over, or when this value does not have a concrete
     /// value.
+    #[inline]
     fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         Ok(if self.concretize()? { on_true.clone() } else { on_false.clone() })
     }
 }
 
-// Batched while-predicate semantics for `Array`: `any_true` reduces the whole Boolean payload with `or`, and
-// `select` broadcasts the predicate against its other inputs along its leading (prefix) axes, so predicate item
-// `i` masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
 impl WhilePredicate for Array {
+    // The batched while-predicate semantics for `Array` are as follows:
+    //   - `any_true` reduces the whole Boolean payload with `or`, and
+    //   - `select` broadcasts the predicate against its other inputs along its leading (i.e., prefix) axes,
+    //     so predicate item `i` masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
+
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.r#type().data_type().is_boolean() {
             return Err(ProgramError::Concretization {
@@ -319,7 +320,9 @@ impl WhilePredicate for Array {
                 ),
             });
         }
+
         validate_while_predicate_type_and_shape(self.r#type().as_ref(), [on_true.r#type().as_ref()])?;
+
         // Both candidates share the state type, which the selection keeps. A scalar predicate selects one candidate
         // wholesale, and the `while` interpreter only calls this function once that predicate is true, so its manual
         // variation never mixes candidate items and does not constrain the state type. A batched predicate selects per
@@ -341,9 +344,11 @@ impl WhilePredicate for Array {
                 .into());
             }
         }
+
         if predicate_addressing.element_count() == 0 {
             return Ok(on_false.clone());
         }
+
         let block = true_addressing.element_count() / predicate_addressing.element_count();
         let mut output_bytes = vec![0; true_addressing.storage_byte_len()];
         for index in 0..true_addressing.element_count() {
@@ -356,14 +361,17 @@ impl WhilePredicate for Array {
             let source_range = true_addressing.byte_range_for_flat_index(index);
             output_bytes[source_range.clone()].copy_from_slice(&source[source_range]);
         }
+
         Ok(Self::new_unchecked(on_true.r#type().into_owned(), Arc::new(output_bytes)))
     }
 }
 
-// Array IR predicates delegate to their array payload. Under a batched predicate, equal dimension and reference carries
-// pass through unchanged; the eager `while` interpreter selects distinct reference carries wholesale under a scalar
-// predicate and rejects a batched predicate over them, since effectful state has no per-item value to mask.
 impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValue<A> {
+    // Array IR predicates delegate to their array payload. Under a batched predicate, equal dimension and reference
+    // carries pass through unchanged; the eager `while` interpreter selects distinct reference carries wholesale
+    // under a scalar predicate and rejects a batched predicate over them, since effectful state has no per-item
+    // value to mask.
+
     fn any_true(&self) -> Result<bool, ProgramError> {
         match self {
             Self::Array(predicate) => predicate.any_true(),
@@ -392,22 +400,23 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
                 });
             }
         };
+
         match (on_true, on_false) {
             (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.select(on_true, on_false)?)),
             (Self::Dimension(on_true), Self::Dimension(on_false)) => {
                 // Selecting between equal dimension carries (e.g., the loop-invariant mapped extent that structural
-                // batching threads through a while loop's state) is the identity for every item, so it needs no
-                // scalar predicate. Distinct dimension carries fall back to the scalar-predicate semantics because
-                // one dimension value cannot represent independently masked per-item extents.
+                // batching threads through a while loop's state) is the identity for every item, so it needs no scalar
+                // predicate. Distinct dimension carries fall back to the scalar-predicate semantics because one
+                // dimension value cannot represent independently masked per-item extents.
                 if on_true == on_false {
                     return Ok(Self::Dimension(on_true.clone()));
                 }
                 Ok(Self::Dimension(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
             }
             (Self::Reference(on_true), Self::Reference(on_false)) => {
-                // A reference carry has one state per allocation rather than one per batch item, so it is never
-                // masked: identical carries (the common loop-invariant case) need no selection, a scalar predicate
-                // selects one carry wholesale, and a batched predicate over distinct carries has no per-item meaning.
+                // A reference carry has one state per allocation rather than one per batch item, so it is never masked:
+                // identical carries (the common loop-invariant case) need no selection, a scalar predicate selects one
+                // carry wholesale, and a batched predicate over distinct carries has no per-item meaning.
                 if on_true == on_false {
                     return Ok(Self::Reference(on_true.clone()));
                 }
@@ -433,8 +442,8 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
 }
 
 // Symbolic values inherit the scalar `WhilePredicate` defaults, which surface `Concretizable::concretize`'s
-// concretization errors: none of these carry a concrete predicate payload, and staged whiles are consumed by staging
-// and lowering rather than by the eager masked loop.
+// concretization errors: none of these carry a concrete predicate payload, and staged whiles are consumed by
+// staging and lowering rather than by the eager masked loop.
 impl<C: Context> WhilePredicate for Tracer<C> {}
 
 impl WhilePredicate for CaptureReference<ArrayType> {}
@@ -448,6 +457,8 @@ impl<C: Context<Type: DifferentiableType, Value: Concretizable<bool>>, P: Differ
     for DifferentiationTracer<C, P>
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`WhileOperation`].
 pub const WHILE_OPERATION_NAME: &str = "while";
