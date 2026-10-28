@@ -1348,8 +1348,6 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
     for WhileOperation<C::Type>
 {
@@ -1360,27 +1358,27 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // A while's inputs are the initial loop state and its outputs are the final loop state (the same arity).
-        // Partial evaluation folds the known value of every *loop-invariant-known* state element into both nested
-        // programs. A state element is loop-invariant-known iff the body passes it through unchanged (its next-state
-        // output is its own state input), its initial input is `PartialValue::Known`, and its type is not a reference
-        // and mentions no type identity. Such an element holds its initial value on every iteration, so binding it to
-        // that constant inside the condition and body is sound and collapses every subcomputation that depended only on
-        // it. Invariance is structural rather than decided by comparing the body's next-state values with the initial
-        // values, because value equality cannot distinguish values that the body changes without changing their
-        // equality class (e.g., a body that negates a state element of `0.0` returns `-0.0`, which compares equal to
-        // `0.0`). A folded element is rebuilt as a program constant, which excludes two kinds of state even when the
-        // body only passes them through. A reference carry must keep its allocation flowing through the loop boundary,
-        // and a type that mentions an identity cannot be rebuilt as a constant. A type that defines an identity (e.g.,
-        // a first-class dimension) is already defined by the state input that the rebuilt condition and body keep, so a
-        // constant of that type would define the identity twice, and a type that refers to an identity (e.g.,
-        // `f32[extent]`) would be replaced by the concrete static type of the constant, which no longer matches the
-        // loop's state signature.
+        // Partial evaluation folds the known value of every _loop-invariant-known_ state element into both nested
+        // programs. A state element is loop-invariant-known if and only if the body passes it through unchanged (its
+        // next-state output is its own state input), its initial input is `PartialValue::Known`, and its type is not
+        // a reference and mentions no type identity. Such an element holds its initial value on every iteration, so
+        // binding it to that constant inside the condition and body is sound and collapses every subcomputation that
+        // depended only on it. Invariance is structural rather than decided by comparing the body's next-state values
+        // with the initial values, because value equality cannot distinguish values that the body changes without
+        // changing their equality class (e.g., a body that negates a state element of `0.0` returns `-0.0`, which
+        // compares equal to `0.0`). A folded element is rebuilt as a program constant, which excludes two kinds of
+        // state even when the body only passes them through. A reference carry must keep its allocation flowing through
+        // the loop boundary, and a type that mentions an identity cannot be rebuilt as a constant. A type that defines
+        // an identity (e.g., a first-class dimension) is already defined by the state input that the rebuilt condition
+        // and body keep, so a constant of that type would define the identity twice, and a type that refers to an
+        // identity (e.g., `f32[extent]`) would be replaced by the concrete static type of the constant, which no longer
+        // matches the loop's state signature.
         //
         // Both the body and the condition are then partially evaluated with the invariant-known state knowledge through
-        // the partial-evaluation driver's split requests. The condition reads the state too, so folding an invariant
+        // the partial evaluation driver's split requests. The condition reads the state too, so folding an invariant
         // element can shrink it as well.
         //
-        // The residual while keeps the *same* state set and therefore the same output arity as the original operation.
+        // The residual while keeps the _same_ state set and therefore the same output arity as the original operation.
         // A loop-invariant-known element is retained, and its body next-state output is rebuilt as the constant initial
         // value and its uses fold away inside both programs. Because the condition and body run on the same
         // loop-carried state each iteration, both residual programs are rebuilt over the loop's full state signature
@@ -1389,15 +1387,15 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         // no captures). The `iteration_bound` is preserved. The rewrite is emitted over the guarded while inputs, which
         // an entry guard derives from the original inputs first (see below).
         //
-        // If no state element is loop-invariant-known, or a probe fails or folds to a value that is not a constant, the
-        // rule attempts the *closed-knownness split* before residualizing unchanged (provided that some input is
-        // known). When a known state subset's next values and the predicate fold from known state alone, the loop
-        // separates into a known loop bound on the known side and the residual loop kept whole (refer to
-        // `WhileOperation::split_by_closed_knownness`). This is the split that makes `Program::linearize` total over
-        // the fused doubled-state loops staged by the unbounded `while` forward-mode rule.
+        // If no state element is loop-invariant-known, or a probe fails or folds to a value that is not a constant,
+        // the rule attempts the _closed-knownness split_ before residualizing unchanged (provided that some input
+        // is known). When a known state subset's next values and the predicate fold from known state alone, the
+        // loop separates into a known loop bound on the known side and the residual loop kept whole (refer to
+        // `WhileOperation::split_by_closed_knownness`). This is the split that makes `Program::linearize`
+        // total over the fused doubled-state loops staged by the unbounded `while` forward mode rule.
 
-        // The rule requests all nested-computation work through its region access (region 0 is the condition and
-        // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
+        // The rule requests all nested-computation work through its region access (region `0` is the condition and
+        // region `1` the body), which keeps its bounds free of the operation family's own semantic traits.
         //
         // When every input is known the whole loop folds by binding it in the known-side context. Defer to that default
         // behavior, after the validation that every rule performs, which a staging known-side context would otherwise
@@ -1413,7 +1411,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         let state_types = body.input_types();
         let state_count = state_types.len();
 
-        // The invariance probes below fold the condition and body through the *live* known-side context, and the
+        // The invariance probes below fold the condition and body through the _live_ known-side context, and the
         // closed-knownness split's known loop re-runs the known part of every iteration. For an effectful loop the
         // probes would execute (eager) or stage (staging) the loop's effects once more and the split would run them
         // twice, so effectful loops skip both and residualize unchanged (see the effect placement contract on
@@ -1454,7 +1452,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         };
 
         // A state element can only fold if its type is not a reference and mentions no type identity (see the overview
-        // above), the body passes it through unchanged, and its initial input is known *and* resolves to a constant in
+        // above), the body passes it through unchanged, and its initial input is known _and_ resolves to a constant in
         // the known-side context. The folded value must be embeddable as a rebuilt-program constant, and skipping
         // symbolic knowns also keeps the probes from folding symbolic known work into a live staging context.
         let passes_through = passed_through_carries(body, 0..state_count);
@@ -1556,6 +1554,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         )? {
             return Ok(outputs);
         }
+
         context.fold_or_residualize(while_operation, vec![residual_condition, residual_body], inputs)
     }
 }
@@ -1587,6 +1586,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<WhileOperation<ArrayIrType>>
         context.batch_while(self, driver, inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     T: DifferentiableType + WhileType,
@@ -1759,7 +1760,7 @@ where
         _accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         // This rule rejects the transposition of a staged linear `while` loop. The forward-mode rule stages one for an
-        // unbounded loop (the doubled-state linear loop, which recomputes primal state *forward* through the
+        // unbounded loop (the doubled-state linear loop, which recomputes primal state _forward_ through the
         // iterations, so transposing it would have to run that recomputation backwards, which a while loop cannot
         // express), and a linear program handed to `Program::transpose` can contain one directly, whether or not it is
         // bounded. Two paths avoid this rule. Eager domains execute the loop directly over concrete duals and record a
@@ -2265,23 +2266,23 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
-        // The rule builds batched loop *structure* and binds it into the parent context, whose relaxed-predicate
+        // The rule builds batched loop _structure_ and binds it into the parent context, whose relaxed-predicate
         // interpretation owns the per-item masked semantics under an eager parent:
         //
         //   1. Every batched array state input is realigned to batch axis `0` in the parent context, and the body is
         //      batched at the state batch axes, iterating the axes to a fixed point (refer to `stabilize_carry_axes`).
         //      A while loop's state types are loop-invariant, so a replicated state element whose update depends on a
-        //      batched element *becomes* batched. Each pass instantiates the body outputs at the current state axes
+        //      batched element _becomes_ batched. Each pass instantiates the body outputs at the current state axes
         //      (mirroring JAX's `instantiate=carry_bat`), so the converged body is already aligned to the
         //      loop-invariant state layout, and widened parent inputs gain their batch axis through the driver.
         //      First-class dimension state stays replicated, because array IR batching admits no mapped dimension
         //      values, and reference state keeps the batch axis that its referent fixes.
-        //   2. The condition is batched at the stabilized axes. When its predicate output stays *replicated*, one
+        //   2. The condition is batched at the stabilized axes. When its predicate output stays _replicated_, one
         //      `WhileOperation` over the batched condition and body is bound into the parent directly, preserving any
         //      semantic `iteration_bound` (so bounded loops stay reverse-capable under `batch`). A replicated predicate
         //      that already masks a prefix of the array state keeps that prefix ahead of the new mapped carry axis, so
         //      its per-item selection remains valid.
-        //   3. When the predicate output is *batched* (per-item termination), every array state element is widened to a
+        //   3. When the predicate output is _batched_ (per-item termination), every array state element is widened to a
         //      batched element, the condition's predicate output is instantiated at axis `0` (re-batching the condition
         //      only when its natural predicate axis is not already `0`), and one `WhileOperation` is bound directly
         //      with that batched predicate (mirroring JAX's `_while_loop_batching_rule`). The predicate's `[axis_size]`
@@ -2528,7 +2529,7 @@ where
         // evaluating the condition, or the lowering) evaluates the condition.
         if condition.output_types()[0].is_batched_while_predicate() {
             // Rewrite the condition and body of a while loop with a batched (per-item) predicate into its
-            // scalar-predicate *masked form* over the same state, as JAX's `_while_loop_batching_rule` does. The masked
+            // scalar-predicate _masked form_ over the same state, as JAX's `_while_loop_batching_rule` does. The masked
             // condition evaluates the original condition on the state and reduces the per-item predicate with a Boolean
             // `any` over every predicate axis, and the masked body evaluates the original condition on the same state
             // again, replays the original body for candidate updates, and selects per array state element between the
@@ -2754,7 +2755,7 @@ where
             // The augmented loop state is `[original_state..., counter (i64 scalar), residual_stacks..., mask_stack]`:
             //
             //   - The body runs the residual-extended primal body (which outputs `[next_state..., residuals...]`) on
-            //     the original state slots, then *stores* instead of returning each per-iteration residual. Residual
+            //     the original state slots, then _stores_ instead of returning each per-iteration residual. Residual
             //     `k` is broadcast to `[1, …]` and written into stack `k` at stack slot `counter` via
             //     `dynamic_update_slice`. The body also writes a scalar Boolean `one` (true) into the Boolean `[bound]`
             //     mask stack at stack slot `counter` and advances the counter by an i64 `one`. Because the enclosing
@@ -3141,7 +3142,7 @@ where
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 
-    /// Stages **one fused** doubled-state forward-mode `while` for the condition program `condition` and the input
+    /// Stages __one fused__ doubled-state forward-mode `while` for the condition program `condition` and the input
     /// duals `inputs`, and returns the output duals. Like [JAX's `jvp` of
     /// `lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), the fused loop runs the
     /// pushforward alongside the primal loop instead of storing per-iteration residuals. The fused state is
@@ -3150,7 +3151,7 @@ where
     /// inputs, so the continuation decision reads the primal state alone and the fused loop runs exactly as long as the
     /// primal loop. The fused state is compact because state elements whose tangent type is a zero differential space
     /// carry no tangent boundary input or output, and their output duals are restored as structural zeros. Because no
-    /// residuals are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`].
+    /// residuals are stored, the rule applies to loops with _no_ [`WhileOperation::iteration_bound`].
     ///
     /// Shared construction binds the fused loop directly. Separate construction partitions the generated loop while
     /// requiring every primal state output to remain known. Loops that require an unbounded history are rejected.
@@ -3247,7 +3248,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// signature of the loop, for the loop-invariant fold of the [`PartiallyEvaluatableOperation`] implementation for
     /// [`WhileOperation`].
     ///
-    /// The condition and the body both run on the *same* loop-carried state every iteration, so each is rebuilt over
+    /// The condition and the body both run on the _same_ loop-carried state every iteration, so each is rebuilt over
     /// the identical `state_atoms` input signature rather than over its own residual-input signature. Each residual
     /// input of `evaluation` is fed either by the matching state atom (for an unknown state element that the region
     /// still reads) or by an inline constant (for a known residual that the region closed over, such as a folded
@@ -5667,7 +5668,7 @@ mod tests {
                 in (%2)"},
         );
 
-        // The carry survives inside the loop, but the *entry* boundary is a different question. Nothing writes the
+        // The carry survives inside the loop, but the _entry_ boundary is a different question. Nothing writes the
         // allocation, so it publishes no hidden final-state output and its caller's holder is left alone. Symmetry is a
         // property of the loop's own boundaries, not a claim that the loop wrote what it carried.
         assert_eq!(discharged.output_count(), 1);
@@ -8876,8 +8877,8 @@ mod tests {
     #[test]
     fn test_while_partial_evaluation_splits_closed_known_state() {
         // The loop carries `[counter, accumulator]` and runs while `counter > 0`. Its body computes `next_counter =
-        // counter - 1` and `next_accumulator = accumulator + counter`. The `counter` element is *time-varying* known
-        // (its value changes every iteration, so the loop-invariant rewrite cannot fold it) but *closed* because its
+        // counter - 1` and `next_accumulator = accumulator + counter`. The `counter` element is _time-varying_ known
+        // (its value changes every iteration, so the loop-invariant rewrite cannot fold it) but _closed_ because its
         // next value and the predicate fold from it alone. With `counter` known (`3`) and `accumulator` unknown, the
         // closed-knownness split runs the known counter loop on the known side, folding the final counter to the known
         // value `0` (3 -> 2 -> 1 -> 0), and keeps the whole loop residual for `accumulator`, recomputing the counter
