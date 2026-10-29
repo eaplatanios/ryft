@@ -516,7 +516,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         // the tangent program consumes at least `residual_count` inputs. The default cotangent destination kinds apply,
         // and so a reference-typed tangent input exposes a cotangent reference input in the pullback (refer to the
         // documentation of `Program::transpose_with_respect_to` for more information).
-        self.tangent.transpose_with_trailing_residuals_shared(self.residual_count, &[])
+        self.tangent.transpose_with_trailing_residuals_shared(self.residual_count, &[], &[])
     }
 }
 

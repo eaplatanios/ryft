@@ -35,13 +35,21 @@ use crate::tracing::{Tracer, TracingContext};
 
 /// Cotangent seed for one flattened primal output leaf of a [`Pullback`] application, aligned leaf-for-leaf with
 /// the differentiated closure's output structure. Non-reference output leaves are seeded with a [`Value`](Self::Value)
-/// of their cotangent type, while reference-typed output leaves carry [`NoCotangent`](Self::NoCotangent) since a
-/// reference output forwards an input root, and the cotangent of that root's state lives in the input's
-/// [`CotangentDestination`] rather than in a seed. [`Pullback::apply_with_destinations`] rejects every other pairing.
+/// of their cotangent type or with a structural [`Zero`](Self::Zero), while reference-typed output leaves carry
+/// [`NoCotangent`](Self::NoCotangent) since a reference output forwards an input root, and the cotangent of that root's
+/// state lives in the input's [`CotangentDestination`] rather than in a seed. [`Pullback::apply_with_destinations`]
+/// rejects every other pairing.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum CotangentSeed<V> {
     /// Cotangent value of a non-reference primal output leaf, typed with that leaf's cotangent type.
     Value(V),
+
+    /// Structural zero cotangent of a non-reference primal output leaf. Its type is that leaf's cotangent type, which
+    /// the pullback already knows. A structural zero seeds nothing, so the application transposes the linear program
+    /// without an input for it and never constructs its value or reads its runtime extents. For a leaf whose
+    /// cotangent space is not only zero, it selects a different retained transposition than a zero-valued
+    /// [`Value`](Self::Value), so applications that leave different outputs unseeded may each derive one.
+    Zero,
 
     /// No cotangent, for a reference-typed primal output leaf whose state cotangent is owned by an input destination.
     NoCotangent,
@@ -1428,7 +1436,9 @@ impl<
     /// Returns the transposition of [`linear_program`](Self::linear_program) under the destination kinds of its tangent
     /// inputs, served from the linear program's retained transform cache. An empty `destination_kinds` selects the
     /// default kinds (i.e., [`Return`](CotangentDestinationKind::Return) for non-reference inputs and
-    /// [`Reference`](CotangentDestinationKind::Reference) for reference inputs).
+    /// [`Reference`](CotangentDestinationKind::Reference) for reference inputs). It flags no structural-zero seed,
+    /// so the returned program has one seed input per non-reference linear output (i.e., the program that
+    /// [`CotangentSeed::Value`] seeds select).
     #[allow(clippy::type_complexity)]
     #[inline]
     pub fn transposed_program(
@@ -1457,7 +1467,7 @@ impl<
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.linear_program
-            .transpose_with_trailing_residuals_shared(self.residuals.len(), destination_kinds)
+            .transpose_with_trailing_residuals_shared(self.residuals.len(), &[], destination_kinds)
     }
 
     /// Returns the linearization-point residuals `r` that this callable closes over, aligned with the trailing inputs
@@ -1678,7 +1688,7 @@ impl<
     ///
     /// | Primal Boundary Leaf | Legal Seed or Destination                                                    |
     /// |----------------------|------------------------------------------------------------------------------|
-    /// | Non-Reference Output | [`CotangentSeed::Value`]                                                     |
+    /// | Non-Reference Output | [`CotangentSeed::Value`] or [`CotangentSeed::Zero`]                          |
     /// | Reference Output     | [`CotangentSeed::NoCotangent`]                                               |
     /// | Non-Reference Input  | `Return`, `Ignore`, or `Reference` storing the input's cotangent type        |
     /// | Reference Input      | [`CotangentDestination::Reference`] with `r: ref<cotangent(T)>`, or `Ignore` |
@@ -1698,6 +1708,14 @@ impl<
     /// internal cotangent reference whose final contents are discarded. A reference-primal destination is threaded
     /// through the raw transposed program by identity. Reference destinations for non-reference inputs and all ignored
     /// inputs have no program output. The returned structure carries [`None`] at every non-`Return` position.
+    ///
+    /// A [`Zero`](CotangentSeed::Zero) seed seeds nothing: the linear program is transposed with that output's
+    /// cotangent flagged as a structural zero, so the transposed program has no input for it and no zero is constructed
+    /// or shaped for it. The seed pattern is part of the structural mask, so each distinct pattern selects its own
+    /// program in the bounded transform cache (patterns beyond its capacity are transposed again), while a zero-valued
+    /// [`Value`](CotangentSeed::Value) shares the all-value program. The linear program is transposed and replayed even
+    /// when every seed is a structural zero, so the operations whose transposition runs without cotangents (e.g.,
+    /// deferred work or ordered assertions) still run.
     ///
     /// # Parameters
     ///
@@ -1849,9 +1867,13 @@ impl<
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         // Validate the seeds against the complete primal output boundary, including the leaves whose differential
-        // spaces contain only zero. Only information-carrying values become program inputs because the compact program
-        // has no Single Static Assignment (SSA) input for a zero differential space, and none for a reference output,
-        // whose state cotangent is owned by the destination of the input root it forwards.
+        // spaces contain only zero. Three index spaces meet here: the public output leaves (one seed each), the linear
+        // program's outputs (the public leaves whose differential spaces are not only zero, including reference
+        // outputs), and the transposed program's seed inputs (the linear outputs that are neither references nor
+        // structural zeros). The structural zero mask follows the linear program's outputs. Only information-carrying
+        // values become program inputs because the compact program has no Single Static Assignment (SSA) input for a
+        // zero differential space, none for a structural zero seed, and none for a reference output, whose state
+        // cotangent is owned by the destination of the input root it forwards.
         if seeds.len() != self.primal_output_types.len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: self.primal_output_types.len(),
@@ -1859,8 +1881,10 @@ impl<
             });
         }
         let mut program_inputs = Vec::new();
+        let mut zero_output_cotangents = Vec::with_capacity(seeds.len());
         for (index, (seed, primal_type)) in seeds.into_iter().zip(&self.primal_output_types).enumerate() {
             let cotangent_type = primal_type.cotangent()?;
+            let is_zero = matches!(seed, CotangentSeed::Zero);
             match seed {
                 CotangentSeed::Value(value) => {
                     if primal_type.is_reference() {
@@ -1883,16 +1907,30 @@ impl<
                         program_inputs.push(value);
                     }
                 }
+                CotangentSeed::Zero => {
+                    if primal_type.is_reference() {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "pullback cotangent seed {index} is a structural zero for a primal output of reference \
+                                 type {primal_type}; use `CotangentSeed::NoCotangent` for reference outputs"
+                            ),
+                        });
+                    }
+                }
                 CotangentSeed::NoCotangent => {
                     if !primal_type.is_reference() {
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
                                 "pullback cotangent seed {index} omits the cotangent of a primal output of type \
-                                 {primal_type}; use `CotangentSeed::Value` for non-reference outputs"
+                                 {primal_type}; use `CotangentSeed::Value` or `CotangentSeed::Zero` for non-reference \
+                                 outputs"
                             ),
                         });
                     }
                 }
+            }
+            if !cotangent_type.is_zero_space() {
+                zero_output_cotangents.push(is_zero);
             }
         }
 
@@ -1961,17 +1999,22 @@ impl<
                 .map(|&(index, reference)| (DifferentiationBoundaryPosition::Cotangent(index), reference)),
         )?;
 
-        // Transpose under the derived mask (served from the retained transform cache after the first application),
-        // close the compact cotangent boundary over the destination references and the primal residuals, and replay it
-        // in the originating context. The mask handed to the transposition covers the linear program's tangent inputs
-        // only, so the leaves whose tangent spaces contain only zero (and which the compact program omits) drop out.
+        // Transpose under the derived destination and seed masks (served from the retained transform cache after the
+        // first application), close the compact cotangent boundary over the live seeds, the destination references and
+        // the primal residuals, and replay it in the originating context. The destination mask covers the linear
+        // program's tangent inputs and the seed mask its outputs, so the leaves whose tangent spaces contain only zero
+        // (and which the compact program omits) drop out of both.
         let mut transposition_kinds = Vec::with_capacity(destinations.len());
         for (destination, primal_type) in destinations.iter().zip(&self.primal_input_types) {
             if !primal_type.cotangent()?.is_zero_space() {
                 transposition_kinds.push(destination.kind());
             }
         }
-        let program = self.transposed_program(&transposition_kinds)?;
+        let program = self.linear_program.transpose_with_trailing_residuals_shared(
+            self.residuals.len(),
+            &zero_output_cotangents,
+            &transposition_kinds,
+        )?;
         for (index, reference) in destination_references {
             if !self.primal_input_types[index].cotangent()?.is_zero_space() {
                 program_inputs.push(reference.clone());
@@ -3813,14 +3856,19 @@ where
 
     /// Transposes this compact linearization [`Program`] using the entry region's retained transform cache. Its
     /// trailing `residual_count` inputs are known primal residuals; its leading inputs are tangents whose cotangent
-    /// destinations are selected by `destination_kinds` as in [`Self::transpose_with_respect_to`]. Repeated calls
-    /// with the same arguments share the resulting program.
+    /// destinations are selected by `destination_kinds` as in [`Self::transpose_with_respect_to`]. Each output that
+    /// `zero_output_cotangents` flags has a structural zero cotangent and no input in the transposed program (refer to
+    /// [`TranspositionDriver::transpose_program_with_zero_seeds`]). A nonempty slice has one flag per program output,
+    /// otherwise this returns [`ProgramError::InvalidArgument`]; an empty slice flags none, and flags of reference
+    /// outputs are ignored because those outputs own no seed input. Repeated calls with the same arguments share the
+    /// resulting program.
     ///
     /// Disconnected selected cotangents remain structural zeros in the returned metadata. Their runtime extents
     /// are supplied by the consumer when it materializes them, rather than retained as linearization residuals.
     pub(crate) fn transpose_with_trailing_residuals_shared(
         &self,
         residual_count: usize,
+        zero_output_cotangents: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         let tangent_input_count = self.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
@@ -3830,9 +3878,14 @@ where
                 residual_count,
             ))
         })?;
-
-        self.entry_region_ref()
-            .transpose_shared(&(0..tangent_input_count).collect::<Vec<_>>(), &[], destination_kinds)
+        let region = self.entry_region_ref();
+        region.transpose_shared_with_arguments(TranspositionTransformArguments::new(
+            region,
+            &(0..tangent_input_count).collect::<Vec<_>>(),
+            &[],
+            zero_output_cotangents,
+            destination_kinds,
+        )?)
     }
 }
 
@@ -4060,7 +4113,7 @@ where
 
 /// Computes a value, auxiliary outputs, and a gradient in `context` capturing `capture` as a non-differentiated
 /// `function` input and selecting real or holomorphic complex output validation. Only the scalar value is
-/// differentiated. Auxiliary leaves receive zero cotangent seeds.
+/// differentiated. Auxiliary leaves receive structural zero cotangent seeds.
 pub(crate) fn value_and_gradient_auxiliary_in_context<
     C: ReverseModeDifferentiate + Zero<C::Value>,
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
@@ -4102,29 +4155,19 @@ where
     let ((output, auxiliary), pullback): ((C::Value, AuxiliaryOutput), _) =
         context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
 
-    // Each non-reference auxiliary leaf supplies the runtime shape of its zero cotangent. Cotangent types preserve
-    // shapes even when their element representation differs, so the leaf supplies every required dynamic extent.
-    // Reference auxiliary outputs remain outside the scalar gradient convenience contract.
-    let auxiliary_cotangents = auxiliary
-        .parameters()
-        .map(|value| {
-            if value.r#type().is_reference() {
-                return Err(ProgramError::InvalidArgument {
-                    message: "gradient auxiliary outputs must be non-reference values; \
-                              use `Pullback::apply_with_destinations` for reference outputs"
-                        .to_string(),
-                });
-            }
-            C::Operation::materialize_zero_from_residual_sources(
-                context,
-                MaybeZero::Zero(value.r#type().cotangent()?),
-                std::iter::once(value),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let seeds = std::iter::once(context.gradient_seed(&output, holomorphic)?)
-        .chain(auxiliary_cotangents)
-        .map(CotangentSeed::Value)
+    // Auxiliary leaves are not differentiated, so their seeds are structural zeros that seed nothing: the pullback
+    // neither constructs their zeros nor reads their runtime extents. Reference auxiliary outputs remain outside the
+    // scalar gradient convenience contract.
+    if auxiliary.parameters().any(|value| value.r#type().is_reference()) {
+        return Err(ProgramError::InvalidArgument {
+            message: "gradient auxiliary outputs must be non-reference values; \
+                      use `Pullback::apply_with_destinations` for reference outputs"
+                .to_string(),
+        }
+        .into());
+    }
+    let seeds = std::iter::once(CotangentSeed::Value(context.gradient_seed(&output, holomorphic)?))
+        .chain(auxiliary.parameters().map(|_| CotangentSeed::Zero))
         .collect();
     let gradient = pullback.apply_gradient(seeds, destinations)?;
     Ok(((output, auxiliary), gradient))
@@ -4950,6 +4993,20 @@ pub(crate) mod tests {
             .domain()
             .bind(ArrayOperation::from(MulOperation::<ArrayType>::new()), Vec::new(), &[value.clone(), value.clone()])?
             .remove(0))
+    }
+
+    /// Returns `(x², x³)` for a value `x` in the array IR reference test family, preserving the active transform
+    /// context. Seeding only `x³` pulls back to `3x²`.
+    fn reference_test_square_and_cube<V: Value<Type = ArrayIrType>>(value: V) -> Result<(V, V), ProgramError>
+    where
+        V::Domain: Context<Value = V, Operation: From<ArrayOperation<Array>>>,
+    {
+        let square = reference_test_square(value.clone())?;
+        let cube = value
+            .domain()
+            .bind(ArrayOperation::from(MulOperation::<ArrayType>::new()), Vec::new(), &[square.clone(), value])?
+            .remove(0);
+        Ok((square, cube))
     }
 
     /// Runs a transposed program whose boundary is `[cotangents..., cotangent references..., known...]` by allocating
@@ -6161,7 +6218,7 @@ pub(crate) mod tests {
             ),
             Err(ProgramError::InvalidArgument { message })
                 if message == "pullback cotangent seed 0 omits the cotangent of a primal output of type f32[]; use \
-                    `CotangentSeed::Value` for non-reference outputs",
+                    `CotangentSeed::Value` or `CotangentSeed::Zero` for non-reference outputs",
         ));
         assert!(matches!(
             pullback.apply_with_destinations(
@@ -6248,6 +6305,211 @@ pub(crate) mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == "cotangent 1 and cotangent 0 bind the same reference allocation",
         ));
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_structural_zero_seeds() {
+        // `f(x, n, y) = (x · y, n, y²)` has an integer output, whose cotangent is a zero space, between two live
+        // outputs. A `Zero` seed omits its output's cotangent from the transposed program, so the integer leaf needs
+        // no zero-space value and a dead live-space output needs no zero. Each seed pattern selects its own retained
+        // program whatever the seed values: four patterns produce four programs, and repeating one with another value
+        // reuses its program.
+        let scalar = |value: f32| Array::scalar(value).unwrap();
+        let (value, pullback) = differentiate_at((scalar(3.0), Array::scalar(7_i32).unwrap(), scalar(5.0)))
+            .vjp(|(x, n, y)| Ok::<_, ProgramError>((x * y.clone(), n, y.clone() * y)))
+            .unwrap();
+        assert_eq!(value, (scalar(15.0), Array::scalar(7_i32).unwrap(), scalar(25.0)));
+        let float_zero = MaybeZero::Zero(ArrayType::scalar(DataType::F32));
+        let integer_zero = MaybeZero::Zero(ArrayType::scalar(DataType::I32).cotangent().unwrap());
+        let returned = (CotangentDestination::Return, CotangentDestination::Return, CotangentDestination::Return);
+        let apply = |seeds| pullback.apply_with_destinations(seeds, returned.clone());
+        assert_eq!(
+            apply((CotangentSeed::Value(scalar(2.0)), CotangentSeed::Zero, CotangentSeed::Zero)),
+            Ok((Some(MaybeZero::Value(scalar(10.0))), Some(integer_zero.clone()), Some(MaybeZero::Value(scalar(6.0))))),
+        );
+        assert_eq!(
+            apply((CotangentSeed::Zero, CotangentSeed::Zero, CotangentSeed::Value(scalar(1.0)))),
+            Ok((Some(float_zero.clone()), Some(integer_zero.clone()), Some(MaybeZero::Value(scalar(10.0))))),
+        );
+        assert_eq!(
+            apply((CotangentSeed::Value(scalar(2.0)), CotangentSeed::Zero, CotangentSeed::Value(scalar(1.0)))),
+            Ok((
+                Some(MaybeZero::Value(scalar(10.0))),
+                Some(integer_zero.clone()),
+                Some(MaybeZero::Value(scalar(16.0))),
+            )),
+        );
+        assert_eq!(
+            apply((CotangentSeed::Zero, CotangentSeed::Zero, CotangentSeed::Zero)),
+            Ok((Some(float_zero.clone()), Some(integer_zero.clone()), Some(float_zero))),
+        );
+        assert_eq!(
+            apply((CotangentSeed::Value(scalar(4.0)), CotangentSeed::Zero, CotangentSeed::Zero)),
+            Ok((Some(MaybeZero::Value(scalar(20.0))), Some(integer_zero), Some(MaybeZero::Value(scalar(12.0))))),
+        );
+        let statistics = transposition_statistics(pullback.linear_program().entry_region_ref()).unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (4, 1));
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_structural_zero_seeds_beside_reference_outputs() {
+        // `f(r, x) = { add_update(r, x); (r, read(r)) }` forwards its reference input and reads it. A reference output
+        // carries `NoCotangent`, so a `Zero` seed for it is rejected before replay, leaving the destination unchanged.
+        // With the read's seed a structural zero, the live reference destination still carries its post-state
+        // cotangent `5` back to `x̄` and holds the same pre-state cotangent afterwards.
+        fn function<V: Clone + ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceRead<ArrayReferenceTransform>>(
+            (reference, x): (V, V),
+        ) -> Result<(V, V), ProgramError> {
+            reference.add_update(&x)?;
+            let value = reference.read()?;
+            Ok((reference, value))
+        }
+        let reference = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        let (_, pullback) = differentiate_at((
+            ArrayIrValue::Reference(reference.clone()),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+        ))
+        .vjp(function)
+        .unwrap();
+        let destination = ArrayReference::new(Array::scalar(5.0_f32).unwrap());
+        let destinations = (
+            CotangentDestination::Reference(ArrayIrValue::Reference(destination.clone())),
+            CotangentDestination::Return,
+        );
+        assert!(matches!(
+            pullback.apply_with_destinations(
+                (CotangentSeed::Zero, CotangentSeed::Value(reference_test_scalar(1.0))),
+                destinations.clone(),
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "pullback cotangent seed 0 is a structural zero for a primal output of reference type \
+                    ref<f32[]>; use `CotangentSeed::NoCotangent` for reference outputs",
+        ));
+        assert_eq!(destination.read(), Ok(Array::scalar(5.0_f32).unwrap()));
+        assert_eq!(
+            pullback.apply_with_destinations((CotangentSeed::NoCotangent, CotangentSeed::Zero), destinations),
+            Ok((None, Some(MaybeZero::Value(reference_test_scalar(5.0))))),
+        );
+        assert_eq!(destination.read(), Ok(Array::scalar(5.0_f32).unwrap()));
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_staged_structural_zero_seeds() {
+        // Staged over a symbolic `x: f32[n]`, the dead output `x²` is seeded with a structural zero: no zero of type
+        // `f32[n]` is constructed and no extent of `n` is read, so the staged program only squares its inputs and
+        // pulls the live seed back through `y²`.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let (_, program) = ReferenceTestContext::trace(
+            |inputs: Vec<DomainTracer<ReferenceTestContext>>| {
+                let (_, pullback) = differentiate_at((inputs[0].clone(), inputs[1].clone()))
+                    .vjp(|(x, y)| Ok::<_, ProgramError>((reference_test_square(x)?, reference_test_square(y)?)))?;
+                let (x_cotangent, y_cotangent) = pullback.apply_with_destinations(
+                    (CotangentSeed::Zero, CotangentSeed::Value(inputs[2].clone())),
+                    (CotangentDestination::Return, CotangentDestination::Return),
+                )?;
+                assert_eq!(x_cotangent, Some(MaybeZero::Zero(vector_type.clone().into())));
+                Ok(vec![y_cotangent.unwrap().as_value().unwrap().clone()])
+            },
+            vec![ArrayIrType::from(vector_type.clone()), scalar_type.clone().into(), scalar_type.clone().into()],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[], %2:f32[] .
+                let %3:f32[n] = mul %0 %0
+                    %4:f32[] = mul %1 %1
+                    %5:f32[] = mul %1 %2
+                    %6:f32[] = mul %1 %2
+                    %7:f32[] = add %5 %6
+                in (%7)"},
+        );
+
+        // The scalar gradient of `y²` with the auxiliary output `x²` seeds the auxiliary output with a structural
+        // zero too: only `x̄`, which the gradient returns as a value, is materialized from `x`'s runtime extent.
+        let (_, program) = ReferenceTestContext::trace(
+            |inputs: Vec<DomainTracer<ReferenceTestContext>>| {
+                let ((value, auxiliary), (x_gradient, y_gradient)) =
+                    differentiate_at((inputs[0].clone(), inputs[1].clone()))
+                        .with_auxiliary_output()
+                        .value_and_gradient(|(x, y)| {
+                            Ok::<_, ProgramError>((reference_test_square(y)?, reference_test_square(x)?))
+                        })?;
+                Ok(vec![value, auxiliary, x_gradient, y_gradient])
+            },
+            vec![ArrayIrType::from(vector_type), scalar_type.into()],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[] .
+                let %2:f32[] = mul %1 %1
+                    %3:f32[n] = mul %0 %0
+                    %4:f32[] = one [type=f32[]]
+                    %5:f32[] = mul %1 %4
+                    %6:f32[] = mul %1 %4
+                    %7:f32[] = add %5 %6
+                    %8:dimension<n \u{2208} [1, 5)> = dimension_size [axis=0] %0
+                    %9:f32[n] = zero [type=f32[n]] %8
+                in (%2, %3, %9, %7)"},
+        );
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_structural_zero_seeds_under_transforms() {
+        // `g(x) = (x², x³)` with only `x³` seeded pulls back to `3x²`. Differentiating that application again in
+        // reverse mode and in forward mode gives `6x`, and batching it applies the compact transposition per item.
+        fn square_and_cube<V: Value<Type = ArrayIrType>>(value: V) -> Result<(V, V), ProgramError>
+        where
+            V::Domain: Context<Value = V, Operation: From<ArrayOperation<Array>>>,
+        {
+            let square = reference_test_square(value.clone())?;
+            let cube = value
+                .domain()
+                .bind(ArrayOperation::from(MulOperation::<ArrayType>::new()), Vec::new(), &[square.clone(), value])?
+                .remove(0);
+            Ok((square, cube))
+        }
+        let three = reference_test_scalar(3.0);
+        let result = differentiate_at(three.clone()).value_and_gradient(|value: ReferenceTestTracer| {
+            let seed = value.context().constant(reference_test_scalar(1.0))?;
+            let (_, pullback) = differentiate_at(value).vjp(square_and_cube)?;
+            let cotangent = pullback.apply_with_destinations(
+                (CotangentSeed::Zero, CotangentSeed::Value(seed)),
+                CotangentDestination::Return,
+            )?;
+            Ok::<_, ProgramError>(cotangent.unwrap().as_value().unwrap().clone())
+        });
+        assert_eq!(result, Ok((reference_test_scalar(27.0), reference_test_scalar(18.0))));
+        let result = differentiate_at(three).jvp(reference_test_scalar(1.0), |value| {
+            let seed = value.context().constant(reference_test_scalar(1.0))?;
+            let (_, pullback) = differentiate_at(value).vjp(square_and_cube)?;
+            let cotangent = pullback.apply_with_destinations(
+                (CotangentSeed::Zero, CotangentSeed::Value(seed)),
+                CotangentDestination::Return,
+            )?;
+            Ok::<_, ProgramError>(cotangent.unwrap().as_value().unwrap().clone())
+        });
+        assert_eq!(result, Ok((reference_test_scalar(27.0), reference_test_scalar(18.0))));
+        let result = batch(
+            |value| {
+                let seed = value.context().lift(reference_test_scalar(1.0))?;
+                let (_, pullback) = differentiate_at(value).vjp(square_and_cube)?;
+                let cotangent = pullback.apply_with_destinations(
+                    (CotangentSeed::Zero, CotangentSeed::Value(seed)),
+                    CotangentDestination::Return,
+                )?;
+                Ok::<_, ProgramError>(cotangent.unwrap().as_value().unwrap().clone())
+            },
+            ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0]).unwrap()),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(result, Ok(ArrayIrValue::Array(Array::vector(vec![12.0_f32, 27.0]).unwrap())));
     }
 
     #[test]

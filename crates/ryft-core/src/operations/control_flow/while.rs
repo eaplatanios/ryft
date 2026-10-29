@@ -15047,7 +15047,7 @@ mod tests {
                 transposed = Some(
                     pullback
                         .linear_program()
-                        .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])?
+                        .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[], &[])?
                         .program()
                         .to_string(),
                 );
