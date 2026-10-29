@@ -6349,6 +6349,11 @@ pub(crate) mod tests {
         );
         let statistics = transposition_statistics(pullback.linear_program().entry_region_ref()).unwrap();
         assert_eq!((statistics.productions, statistics.hits), (4, 1));
+
+        // The dense inspection entry point flags no structural-zero seed, so it shares the all-value program.
+        pullback.transposed_program(&[]).unwrap();
+        let statistics = transposition_statistics(pullback.linear_program().entry_region_ref()).unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (4, 2));
     }
 
     #[test]
@@ -6459,24 +6464,87 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_apply_with_destinations_structural_zero_seeds_under_transforms() {
-        // `g(x) = (x², x³)` with only `x³` seeded pulls back to `3x²`. Differentiating that application again in
-        // reverse mode and in forward mode gives `6x`, and batching it applies the compact transposition per item.
-        fn square_and_cube<V: Value<Type = ArrayIrType>>(value: V) -> Result<(V, V), ProgramError>
+    fn test_pullback_apply_with_destinations_structural_zero_seeds_of_repeated_outputs() {
+        // `f(x) = (x², x²)` returns the same value twice. Each output position has its own seed, so seeding either
+        // position with a structural zero pulls back through the other alone, and seeding both adds their pullbacks.
+        let scalar = |value: f32| Array::scalar(value).unwrap();
+        let (_, pullback) = differentiate_at(scalar(3.0))
+            .vjp(|x| {
+                let square = x.clone() * x;
+                Ok::<_, ProgramError>((square.clone(), square))
+            })
+            .unwrap();
+        let apply = |seeds| pullback.apply_with_destinations(seeds, CotangentDestination::Return);
+        assert_eq!(
+            apply((CotangentSeed::Zero, CotangentSeed::Value(scalar(1.0)))),
+            Ok(Some(MaybeZero::Value(scalar(6.0)))),
+        );
+        assert_eq!(
+            apply((CotangentSeed::Value(scalar(1.0)), CotangentSeed::Zero)),
+            Ok(Some(MaybeZero::Value(scalar(6.0)))),
+        );
+        assert_eq!(
+            apply((CotangentSeed::Value(scalar(1.0)), CotangentSeed::Value(scalar(1.0)))),
+            Ok(Some(MaybeZero::Value(scalar(12.0)))),
+        );
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_structural_zero_seeds_with_buffered_destinations() {
+        // `f(x, y) = (x · y, y²)` sends `x̄` to a caller-owned buffer and ignores `ȳ`. With the product's seed a
+        // structural zero, `x̄` is a structural zero and the buffer keeps its contents. Seeding the product instead
+        // adds `x̄ = y`, and repeating that pattern with another buffer reuses the same retained program.
+        fn product_and_square<V: Value<Type = ArrayIrType>>((x, y): (V, V)) -> Result<(V, V), ProgramError>
         where
             V::Domain: Context<Value = V, Operation: From<ArrayOperation<Array>>>,
         {
-            let square = reference_test_square(value.clone())?;
-            let cube = value
+            let product = x
                 .domain()
-                .bind(ArrayOperation::from(MulOperation::<ArrayType>::new()), Vec::new(), &[square.clone(), value])?
+                .bind(ArrayOperation::from(MulOperation::<ArrayType>::new()), Vec::new(), &[x.clone(), y.clone()])?
                 .remove(0);
-            Ok((square, cube))
+            Ok((product, reference_test_square(y)?))
         }
+        let (_, pullback) = differentiate_at((reference_test_scalar(3.0), reference_test_scalar(5.0)))
+            .vjp(product_and_square)
+            .unwrap();
+        let apply = |seeds, buffer: &ArrayReference<Array>| {
+            pullback.apply_with_destinations(
+                seeds,
+                (
+                    CotangentDestination::Reference(ArrayIrValue::Reference(buffer.clone())),
+                    CotangentDestination::Ignore,
+                ),
+            )
+        };
+        let first = ArrayReference::new(Array::scalar(10.0_f32).unwrap());
+        assert_eq!(
+            apply((CotangentSeed::Zero, CotangentSeed::Value(reference_test_scalar(1.0))), &first),
+            Ok((None, None)),
+        );
+        assert_eq!(first.read(), Ok(Array::scalar(10.0_f32).unwrap()));
+        assert_eq!(
+            apply((CotangentSeed::Value(reference_test_scalar(1.0)), CotangentSeed::Zero), &first),
+            Ok((None, None)),
+        );
+        assert_eq!(first.read(), Ok(Array::scalar(15.0_f32).unwrap()));
+        let second = ArrayReference::new(Array::scalar(20.0_f32).unwrap());
+        assert_eq!(
+            apply((CotangentSeed::Value(reference_test_scalar(1.0)), CotangentSeed::Zero), &second),
+            Ok((None, None)),
+        );
+        assert_eq!(second.read(), Ok(Array::scalar(25.0_f32).unwrap()));
+        let statistics = transposition_statistics(pullback.linear_program().entry_region_ref()).unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (2, 1));
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_structural_zero_seeds_higher_order() {
+        // `g(x) = (x², x³)` with only `x³` seeded pulls back to `3x²`. Differentiating that application again
+        // in reverse mode and in forward mode gives `6x`.
         let three = reference_test_scalar(3.0);
         let result = differentiate_at(three.clone()).value_and_gradient(|value: ReferenceTestTracer| {
             let seed = value.context().constant(reference_test_scalar(1.0))?;
-            let (_, pullback) = differentiate_at(value).vjp(square_and_cube)?;
+            let (_, pullback) = differentiate_at(value).vjp(reference_test_square_and_cube)?;
             let cotangent = pullback.apply_with_destinations(
                 (CotangentSeed::Zero, CotangentSeed::Value(seed)),
                 CotangentDestination::Return,
@@ -6486,7 +6554,7 @@ pub(crate) mod tests {
         assert_eq!(result, Ok((reference_test_scalar(27.0), reference_test_scalar(18.0))));
         let result = differentiate_at(three).jvp(reference_test_scalar(1.0), |value| {
             let seed = value.context().constant(reference_test_scalar(1.0))?;
-            let (_, pullback) = differentiate_at(value).vjp(square_and_cube)?;
+            let (_, pullback) = differentiate_at(value).vjp(reference_test_square_and_cube)?;
             let cotangent = pullback.apply_with_destinations(
                 (CotangentSeed::Zero, CotangentSeed::Value(seed)),
                 CotangentDestination::Return,
@@ -6494,10 +6562,15 @@ pub(crate) mod tests {
             Ok::<_, ProgramError>(cotangent.unwrap().as_value().unwrap().clone())
         });
         assert_eq!(result, Ok((reference_test_scalar(27.0), reference_test_scalar(18.0))));
+    }
+
+    #[test]
+    fn test_pullback_apply_with_destinations_structural_zero_seeds_batching() {
+        // Batching the application of `g(x) = (x², x³)` with only `x³` seeded pulls each item back to `3x²`.
         let result = batch(
             |value| {
                 let seed = value.context().lift(reference_test_scalar(1.0))?;
-                let (_, pullback) = differentiate_at(value).vjp(square_and_cube)?;
+                let (_, pullback) = differentiate_at(value).vjp(reference_test_square_and_cube)?;
                 let cotangent = pullback.apply_with_destinations(
                     (CotangentSeed::Zero, CotangentSeed::Value(seed)),
                     CotangentDestination::Return,
