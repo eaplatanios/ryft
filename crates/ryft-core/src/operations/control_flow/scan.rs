@@ -2211,14 +2211,8 @@ where
                 }
                 .into());
             }
-            let zero_output_cotangents = outputs
-                .iter()
-                .enumerate()
-                .map(|(index, cotangent)| index >= carry_count && cotangent.is_zero())
-                .collect::<Vec<_>>();
-
             // The body's index is known, so linear input positions are offset by one. Keep each selected input's
-            // destination kind: live references accumulate in place, while ignored references have no boundary slot.
+            // destination kind. Live references accumulate in place, while ignored references have no boundary slot.
             let destination_kinds = cotangents.kinds();
             let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = input_linear
                 .iter()
@@ -2227,19 +2221,81 @@ where
                 .filter_map(|(index, (&linear, &kind))| linear.then_some((index + 1, kind)))
                 .unzip();
 
-            // Carry cotangents recur between iterations and need concrete values. Disconnected scanned input cotangents
-            // remain structural zeros, so the reversed scan need not allocate or return their stacks.
-            let materialize_zeros = input_indices.iter().map(|&index| index <= carry_count).collect::<Vec<_>>();
+            // An ordinary linear carry whose final cotangent seed is a structural zero is a candidate for omission. Its
+            // cotangent stays a structural zero in every reversed iteration when transposing the body with the seeds of
+            // all remaining candidates flagged as structural zeros returns no cotangent for its carry input, because the
+            // reversed iterations then never produce one from the stacked output seeds, the active carries, or the
+            // reference destinations. Candidates start inactive, and every candidate that the probe below gives a
+            // cotangent output becomes active, after which the body is transposed again. The active set only grows, so
+            // the loop ends after at most one pass per candidate plus a final pass that changes nothing, and that final
+            // transposition is the artifact used below. Without candidates, the loop makes exactly one request.
+            // Reference carries keep their destinations, and known carries and promoted known initializers
+            // keep their existing roles.
+            let mut dropped_carries = (0..carry_count)
+                .map(|index| {
+                    input_linear[index]
+                        && destination_kinds[index] == CotangentDestinationKind::Return
+                        && outputs[index].is_zero()
+                })
+                .collect::<Vec<_>>();
+            let candidate_count = dropped_carries.iter().filter(|&&dropped| dropped).count();
+            let mut converged = None;
+            for _ in 0..=candidate_count {
+                let zero_output_cotangents = outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, cotangent)| match dropped_carries.get(index) {
+                        Some(&dropped) => dropped,
+                        None => cotangent.is_zero(),
+                    })
+                    .collect::<Vec<_>>();
 
-            // Request the retained body transposition through the instruction-scoped driver, preserving its cache and
-            // avoiding a recursive TransposableOperation bound on the operation family.
-            let transposed = driver.transpose_program_with_zero_seeds(
-                body,
-                &input_indices,
-                &materialize_zeros,
-                &zero_output_cotangents,
-                &selected_destination_kinds,
-            )?;
+                // Active carry cotangents recur between iterations and need concrete values, while candidate carry
+                // cotangents stay structural so that the probe can observe them. Disconnected scanned input cotangents
+                // remain structural zeros, so the reversed scan need not allocate or return their stacks.
+                let materialize_zeros = input_indices
+                    .iter()
+                    .map(|&index| index <= carry_count && !dropped_carries[index - 1])
+                    .collect::<Vec<_>>();
+
+                // Request the retained body transposition through the instruction-scoped driver, preserving its cache
+                // and avoiding a recursive TransposableOperation bound on the operation family.
+                let transposed = driver.transpose_program_with_zero_seeds(
+                    body,
+                    &input_indices,
+                    &materialize_zeros,
+                    &zero_output_cotangents,
+                    &selected_destination_kinds,
+                )?;
+                let mut activated = false;
+                for (&index, &slot) in input_indices.iter().zip(transposed.cotangents()) {
+                    if index <= carry_count && dropped_carries[index - 1] && slot == TransposedProgramCotangent::Output
+                    {
+                        dropped_carries[index - 1] = false;
+                        activated = true;
+                    }
+                }
+                if !activated {
+                    converged = Some((transposed, zero_output_cotangents));
+                    break;
+                }
+            }
+            let (transposed, zero_output_cotangents) = converged.ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "`{SCAN_OPERATION_NAME}` transposition carry activity did not converge",
+                ))
+            })?;
+
+            // One mapping from reversed carry positions to the original carries drives the reversed body, its inputs,
+            // its carry count, and the outer cotangents. Ignored reference carries and dropped carries have no reversed
+            // carry. Dropped carries return structural zeros. Dropping a reversed carry whose type relates to the
+            // iteration count or to other inputs loses no check, because the primal scan already validated those
+            // relationships and the reversed scan stages no entry guard.
+            let retained_carries = (0..carry_count)
+                .filter(|&index| {
+                    destination_kinds[index] != CotangentDestinationKind::Ignore && !dropped_carries[index]
+                })
+                .collect::<Vec<_>>();
 
             // Restore one slot per original scan input, then adapt the transposed body to scan order. The intrinsic
             // index is regenerated by the reversed scan; reference carries retain one shared cotangent reference across
@@ -2256,9 +2312,6 @@ where
                 let program = Arc::unwrap_or_clone(transposed.into_program());
                 let body_output_types = body.output_types();
                 let destination_kinds = &destination_kinds[..input_linear.len()];
-                let retained_carries = (0..carry_count)
-                    .filter(|&index| destination_kinds[index] != CotangentDestinationKind::Ignore)
-                    .collect::<Vec<_>>();
                 for &index in &retained_carries {
                     if input_linear[index] && input_cotangent_slots[index] != TransposedProgramCotangent::Output {
                         return Err(ProgramError::MalformedProgram(format!(
@@ -2388,19 +2441,22 @@ where
             let (scan_inputs, iteration_count_inputs) = inputs.split_at(input_linear.len());
 
             // Every non-linear input is known by the classification above. Consume cotangent references in input order,
-            // carrying live reference state unchanged through the reversed iterations and omitting ignored references.
+            // carrying live reference state unchanged through the reversed iterations. Ignored references and dropped
+            // carries have no reversed carry, and only retained carries consume a reference.
             let mut cotangent_references = cotangents.references().iter();
             let mut reversed_inputs = Vec::with_capacity(outputs.len() + inputs.len());
-            for (index, input) in scan_inputs[..carry_count].iter().enumerate() {
+            for &index in &retained_carries {
+                let input = &scan_inputs[index];
                 match cotangents.kind(index) {
                     CotangentDestinationKind::Reference => {
                         reversed_inputs.push(cotangent_references.next().unwrap().clone())
                     }
                     CotangentDestinationKind::Ignore => {}
                     CotangentDestinationKind::Return if input_linear[index] => {
-                        // A dead carry still needs an initial cotangent value for the recurrence. Gather live output
-                        // cotangents, known inputs, and cotangent references as sources of the runtime identities
-                        // needed to materialize that zero.
+                        // A retained carry whose final seed is a structural zero (i.e., a candidate that the probe
+                        // above activated) still needs an initial cotangent value for the recurrence. Gather live
+                        // output cotangents, known inputs, and cotangent references as sources of the runtime
+                        // identities needed to materialize that zero.
                         reversed_inputs.push(O::materialize_zero_from_residual_sources(
                             &**context,
                             outputs[index].clone(),
@@ -2451,8 +2507,7 @@ where
                     ),
                 })?);
             }
-            let retained_carry_count =
-                (0..carry_count).filter(|&index| cotangents.kind(index) != CotangentDestinationKind::Ignore).count();
+            let retained_carry_count = retained_carries.len();
 
             // The reversed scan stacks the cotangents of the stacked inputs, so each of its stacked axes takes the
             // placement of that input's scan axis (replicated for an unsharded stack), not the placement that this
@@ -2501,14 +2556,16 @@ where
 
             // Drain reversed outputs in the original input order. Promoted known initializers discard their carry
             // cotangents, and live reference carries discard their identity outputs because their buffers accumulated
-            // in place. Disconnected stacks, known inputs, ignored references, and the iteration count receive
-            // structural zeros.
+            // in place. Dropped carries, disconnected stacks, known inputs, ignored references, and the iteration count
+            // receive structural zeros.
             let mut scan_cotangents = scan_cotangents.into_iter();
             inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| {
-                    let returned = if index < carry_count {
+                    let returned = if index < carry_count && dropped_carries[index] {
+                        None
+                    } else if index < carry_count {
                         match cotangents.kind(index) {
                             CotangentDestinationKind::Return => scan_cotangents.next().filter(|_| input.is_unknown()),
                             CotangentDestinationKind::Reference => scan_cotangents.next().and(None),
@@ -20987,10 +21044,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transposition_materializes_dead_carry_cotangents_with_peer_variation() {
+    fn test_scan_transposition_omits_dead_carry_cotangents_with_peer_variation() {
         // The body maps `[c0, c1, x]` to `[c0 + x, c1 + c0, c0]` over values whose types vary over the manual mesh axis
-        // `devices`, and the final `c1` is unused. Its structural-zero cotangent still initializes its reversed carry,
-        // so the zero takes the manual variation of the carry's type, as its live peers do.
+        // `devices`, and the final `c1` is unused. Nothing feeds the cotangent of `c1` in any reversed iteration, so the
+        // reversed scan drops that carry, and only the public result materializes its zero, which takes the manual
+        // variation of the carry's type.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["devices"]).unwrap();
         let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(varying(0)).unwrap();
@@ -21020,19 +21078,17 @@ mod tests {
             pullback.to_string(),
             formatdoc! {"
                 lambda %0:{scalar}, %1:{stack} .
-                let %2:{scalar} = zero [
-                    type={scalar},
+                let %2:{scalar}, %3:{stack} = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
+                    body={{
+                        lambda %0:i64[], %1:{scalar}, %2:{scalar} .
+                        let %3:{scalar} = add %2 %1
+                        in (%3, %1)
+                    }},
                 ]
-                    %3:{scalar}, %4:{scalar}, %5:{stack} = scan [carry_count=2, iteration_count=3, reverse=true] %0 \
-                    %2 %1 [
-                        body={{
-                            lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar} .
-                            let %4:{scalar} = add %3 %2
-                                %5:{scalar} = add %4 %1
-                            in (%5, %2, %1)
-                        }},
+                    %4:{scalar} = zero [
+                        type={scalar},
                     ]
-                in (%3, %4, %5)"},
+                in (%2, %4, %3)"},
         );
 
         // With unit cotangents, `c0` receives `1` from the final carry and from every stacked output, `c1` receives
@@ -21685,10 +21741,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transposition_rejects_linear_zero_space_carries() {
+    fn test_scan_transposition_omits_linear_zero_space_carries() {
         // The body passes an `i32[]` counter through next to a summed `f64[]` carry. Transposing with respect to the
-        // counter makes it a linear carry whose cotangent is a zero space, which the reversed scan has no cotangent
-        // input to carry, while transposing with respect to the other inputs keeps the counter a known carry.
+        // counter makes it a linear carry whose cotangent is a zero space. The reversed scan has no cotangent input to
+        // carry for it, but its final seed is a structural zero and nothing else feeds its cotangent, so the reversed
+        // scan drops that carry and the counter receives a structural zero. Transposing with respect to the other
+        // inputs keeps the counter a known carry.
         let mut builder = ProgramBuilder::<Array, TestOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64));
         let count = builder.add_input(ArrayType::scalar(DataType::I32));
@@ -21707,12 +21765,17 @@ mod tests {
         );
         assert_eq!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]).map(|pullback| pullback.to_string()),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{SCAN_OPERATION_NAME}` transposition does not support linear carry 0 of type `i32[]`, whose \
-                     cotangent is a zero space",
-                ),
-            })),
+            Ok(indoc! {"
+                lambda %0:zero[], %1:f64[] .
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[] .
+                        in (%1, %1)
+                    },
+                ]
+                    %4:zero[] = zero [type=zero[]]
+                in (%4, %2, %3)"}
+            .to_owned()),
         );
         assert_eq!(
             program.transpose_with_respect_to(&[1, 2], &[]).map(|pullback| pullback.to_string()),
@@ -21978,6 +22041,227 @@ mod tests {
         assert_eq!(
             run_transposed_with_destinations(&transposed, vec![], vec![destination.clone()], vec![]),
             vec![Array::vector(vec![3.0f64, 6.0]).unwrap(), destination],
+        );
+    }
+
+    #[test]
+    fn test_scan_transposition_omits_permanently_dead_dynamic_carries() {
+        // The body maps `[c0, c1, x]` to `[c0 + x, c1 + c1, c0]` over `f64[extent]` values, and only the final `c0`
+        // and the stacked output are used. Nothing feeds the cotangent of `c1` in any reversed iteration, so the
+        // reversed scan drops that carry instead of reading an extent to construct a zero for it, and `c1` receives a
+        // structural zero cotangent, with and without iterations.
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let first = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let second = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let value = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let add = || TestIrOperation::Array(ArrayOperation::from(AddOperation::new()));
+        let next_first = body_builder.add_instruction(add(), Vec::new(), vec![first, value], None).unwrap()[0];
+        let next_second = body_builder.add_instruction(add(), Vec::new(), vec![second, second], None).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next_first, next_second, first],
+                vec![Placeholder; 4],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        for length in [0, 3] {
+            let stacked_type = ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(length), extent_type.dimension().clone()]),
+            );
+            let program = scan_program(
+                ScanOperation::new(2, length),
+                body.clone(),
+                vec![array_type.clone().into(), array_type.clone().into(), stacked_type.into()],
+            )
+            .with_outputs(&[0, 2])
+            .unwrap();
+            let linearization = program.linearize().unwrap();
+            let pullback = linearization.pullback().unwrap();
+            assert_eq!(
+                pullback.cotangents(),
+                &[
+                    TransposedProgramCotangent::Output,
+                    TransposedProgramCotangent::Zero,
+                    TransposedProgramCotangent::Output
+                ],
+            );
+            assert_eq!(
+                pullback.program().to_string(),
+                formatdoc! {"
+                    lambda %0:f64[extent], %1:f64[{length}, extent] .
+                    let %2:f64[extent], %3:f64[{length}, extent] = scan [carry_count=1, iteration_count={length}, \
+                    reverse=true] %0 %1 [
+                        body={{
+                            lambda %0:i64[], %1:f64[extent], %2:f64[extent] .
+                            let %3:f64[extent] = add %2 %1
+                            in (%3, %1)
+                        }},
+                    ]
+                    in (%2, %3)"},
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_transposition_omits_dead_carries_of_nested_scans() {
+        // An outer scan carries `[a, b]` through an inner scan whose body maps `[c0, c1]` to `[c0 + c0, c1 + c1]`, and
+        // only the final `a` is used. The inner transposition drops its dead `c1` carry and returns a structural zero
+        // for `b`, so the outer probe keeps `b` inactive as well, and neither scan reads an extent or builds a zero.
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()])));
+        let add = || TestIrOperation::Array(ArrayOperation::from(AddOperation::new()));
+        let inner_body = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let first = builder.add_input(array_type.clone());
+            let second = builder.add_input(array_type.clone());
+            let next_first = builder.add_instruction(add(), Vec::new(), vec![first, first], None).unwrap()[0];
+            let next_second = builder.add_instruction(add(), Vec::new(), vec![second, second], None).unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                    vec![next_first, next_second],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let outer_body = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let first = builder.add_input(array_type.clone());
+            let second = builder.add_input(array_type.clone());
+            let inner = builder.import_program(inner_body);
+            let outputs = builder
+                .add_instruction(ScanOperation::new(2, 2), vec![inner], vec![first, second], None)
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let program = scan_program(ScanOperation::new(2, 3), outer_body, vec![array_type.clone(), array_type])
+            .with_outputs(&[0])
+            .unwrap();
+        let pullback = program.linearize().unwrap().pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f64[extent] .
+                let %1:f64[extent] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
+                    body={
+                        lambda %0:i64[], %1:f64[extent] .
+                        let %2:f64[extent] = scan [carry_count=1, iteration_count=2, reverse=true] %1 [
+                            body={
+                                lambda %0:i64[], %1:f64[extent] .
+                                let %2:f64[extent] = add %1 %1
+                                in (%2)
+                            },
+                        ]
+                        in (%2)
+                    },
+                ]
+                in (%1)"},
+        );
+
+        // The final `a` doubles `a` six times, so its cotangent scales the seed by `64`.
+        assert_eq!(
+            pullback.program().interpret(vec![array(Array::vector(vec![1.0, 2.0]).unwrap())]),
+            Ok(vec![array(Array::vector(vec![64.0, 128.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_scan_transposition_keeps_carries_activated_by_stacked_seeds() {
+        // The body maps `[c, x]` to `[c + x, c]`, and only the stacked output is used. The final cotangent of `c` is a
+        // structural zero, but every stacked cotangent feeds it, so the reversed scan keeps the carry and starts it
+        // from a materialized zero.
+        let body = scalar_body(2, |builder, inputs| {
+            let next =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None).unwrap()[0];
+            vec![next, inputs[1]]
+        });
+        let program = scan_program(
+            TestScanOperation::new(1, 3),
+            body,
+            vec![ArrayType::scalar(DataType::F64), ArrayType::new_static(DataType::F64, [3])],
+        )
+        .with_outputs(&[1])
+        .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[] = zero [type=f64[]]
+                    %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %1 %0 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[] .
+                            let %3:f64[] = add %2 %1
+                            in (%3, %1)
+                        },
+                    ]
+                in (%2, %3)"},
+        );
+        // The stacked output `c_j` is `c + x_0 + ... + x_(j-1)`, so with unit cotangents `c` receives `3` and `x_j`
+        // receives one unit from every later stacked output.
+        assert_eq!(
+            pullback.interpret(vec![Array::vector(vec![1.0, 1.0, 1.0]).unwrap()]),
+            Ok(vec![Array::scalar(3.0).unwrap(), Array::vector(vec![2.0, 1.0, 0.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_scan_transposition_activates_carry_chains_over_several_probes() {
+        // The body maps `[c0, c1, c2, x]` to `[c0, c1 + c0, c2 + c1]`, and only the final `c2` is used. The first probe
+        // finds that `c2` feeds `c1`, and the second probe finds that the now active `c1` feeds `c0`, so the reversed
+        // scan keeps all three carries.
+        let body = scalar_body(4, |builder, inputs| {
+            let second =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[2], inputs[1]], None).unwrap()[0];
+            let third =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[3], inputs[2]], None).unwrap()[0];
+            vec![inputs[1], second, third]
+        });
+        let program = scan_program(
+            TestScanOperation::new(3, 3),
+            body,
+            vec![
+                ArrayType::scalar(DataType::F64),
+                ArrayType::scalar(DataType::F64),
+                ArrayType::scalar(DataType::F64),
+                ArrayType::new_static(DataType::F64, [3]),
+            ],
+        )
+        .with_outputs(&[2])
+        .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1, 2], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[3] .
+                let %2:f64[] = zero [type=f64[]]
+                    %3:f64[] = zero [type=f64[]]
+                    %4:f64[], %5:f64[], %6:f64[] = scan [carry_count=3, iteration_count=3, reverse=true] %2 %3 %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                            let %5:f64[] = add %1 %2
+                                %6:f64[] = add %3 %2
+                            in (%5, %6, %3)
+                        },
+                    ]
+                in (%4, %5, %6)"},
+        );
+
+        // After three iterations, `c2` is `c2 + 3 * c1 + (0 + 1 + 2) * c0`. The known stacked input is unused.
+        assert_eq!(
+            pullback.interpret(vec![Array::scalar(1.0).unwrap(), Array::vector(vec![0.0, 0.0, 0.0]).unwrap()]),
+            Ok(vec![Array::scalar(3.0).unwrap(), Array::scalar(3.0).unwrap(), Array::scalar(1.0).unwrap()]),
         );
     }
 

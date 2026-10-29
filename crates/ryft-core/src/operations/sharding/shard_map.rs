@@ -4715,14 +4715,14 @@ struct TransposedShardMap<V: Value, O> {
 /// global inputs under the cotangent duals of their input shardings, except for the `Return`-kind input cotangents that
 /// the transposed program produces as structural zeros, which the returned [`TransposedShardMap`] records instead.
 ///
-/// When some value output cotangents are structural zeros, the body is first projected onto its other outputs and its
-/// reference outputs with [`Program::with_outputs`], which keeps the whole input boundary and every instruction with
-/// observable effects or deferred work. Zero output cotangents therefore never enter the transposed body, and the
-/// transposition engine propagates their absence symbolically: an input that only those outputs depend on (e.g.,
-/// through `neg` or `add`) is disconnected from the projected body, so transposition records its cotangent as a
-/// structural zero in the result metadata and omits its output without constructing a zero. This is the analogue of
-/// JAX's `_shard_map_transpose`, which runs the body's backward pass on symbolic zero output cotangents. A projected
-/// body is a fresh program, so its transposition does not share the body region's retained transform cache.
+/// When some value output cotangents are structural zeros, the body is transposed with those outputs flagged (refer to
+/// [`TranspositionDriver::transpose_program_with_zero_seeds`]). Zero output cotangents therefore never enter the
+/// transposed body, and the transposition engine propagates their absence symbolically. An input that only those
+/// outputs depend on (e.g., through `neg` or `add`) receives no cotangent, so transposition records its cotangent as a
+/// structural zero in the result metadata and omits its output without constructing a zero. Effects and deferred work
+/// of the body are kept. This is the analogue of JAX's `_shard_map_transpose`, which runs the body's backward pass on
+/// symbolic zero output cotangents. The built-in recursive driver serves every mask from the body region's retained
+/// transform cache.
 ///
 /// # Parameters
 ///
@@ -4732,8 +4732,7 @@ struct TransposedShardMap<V: Value, O> {
 ///   - `input_linearity`: Per-input linearity flags over the tangent boundary's global inputs.
 ///   - `destination_kinds`: Per-input cotangent destination kinds over the tangent boundary's global inputs.
 ///   - `zero_output_cotangents`: Per-output flags over the tangent boundary's non-reference outputs recording whether
-///     the output cotangent is a structural zero, which then does not cross the transposed boundary, and whose output
-///     is projected out of the body before it is transposed.
+///     the output cotangent is a structural zero, which then does not cross the transposed boundary.
 fn transpose_shard_map_body<V: Value<Type = ArrayIrType>, O, D: TranspositionDriver<V, O>>(
     operation: &ShardMapOperation,
     driver: &D,
@@ -4762,27 +4761,23 @@ where
     let seed_count = operation.output_types.iter().filter(|r#type| !r#type.is_reference()).count();
     check_count!("output", zero_output_cotangents, seed_count, ProgramError);
 
-    // Structurally zero output cotangents do not cross the transposed boundary, so the body is transposed projected
-    // onto the other outputs. Reference outputs own no cotangent slot and are always kept, so that the projected body
-    // forwards the same reference roots. Without zero output cotangents, the body region is transposed directly through
-    // its retained transform cache, so that a body shared by several programs is transposed once per mask.
-    let body = driver.region(0)?;
-    let projected_body;
-    let body = if zero_output_cotangents.contains(&true) {
-        let mut zero_output_cotangents = zero_output_cotangents.iter();
-        let kept_outputs = operation
-            .output_types
-            .iter()
-            .enumerate()
-            .filter(|(_, output_type)| output_type.is_reference() || !*zero_output_cotangents.next().unwrap())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        projected_body = body.to_program().with_outputs(&kept_outputs)?;
-        projected_body.entry_region_ref()
-    } else {
-        body
-    };
-    let transposed = driver.transpose_program(body, &input_indices, &[], &selected_destination_kinds)?;
+    // Structural zero output cotangents do not cross the transposed boundary. The driver transposes the body region
+    // itself with those outputs flagged, so the built-in recursive driver serves the request from the region's retained
+    // transform cache and a body shared by several programs is transposed once per mask. The flags follow the complete
+    // body output order, and reference outputs, which own no cotangent slot, are never flagged.
+    let mut seed_flags = zero_output_cotangents.iter();
+    let body_zero_output_cotangents = operation
+        .output_types
+        .iter()
+        .map(|output_type| !output_type.is_reference() && *seed_flags.next().unwrap())
+        .collect::<Vec<_>>();
+    let transposed = driver.transpose_program_with_zero_seeds(
+        driver.region(0)?,
+        &input_indices,
+        &[],
+        &body_zero_output_cotangents,
+        &selected_destination_kinds,
+    )?;
     let mut zero_input_cotangents = vec![false; input_linearity.len()];
     for (&index, slot) in input_indices.iter().zip(transposed.cotangents()) {
         zero_input_cotangents[index] = *slot == TransposedProgramCotangent::Zero;
@@ -16209,6 +16204,96 @@ mod tests {
                     }},
                 ]
                 in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_shard_map_transposition_reuses_the_body_transposition_of_zero_output_cotangents() {
+        // Three maps `a`, `b`, and `c` over the body `x -> (x, x)` feed the outputs `(a0, b0, c1)`. Maps `a` and `b`
+        // receive a structural zero cotangent for their second output and map `c` for its first one. The body region is
+        // transposed with those outputs flagged through its retained transform cache, so `a` and `b` share one
+        // transposed body, which interns as one region. The distinct mask of `c` is a separate cache entry whose body
+        // has the same content but is a different program, so it interns as its own region. Transposition visits the
+        // instructions in reverse order, so the transposed maps appear in the order `c`, `b`, `a`.
+        let replicated = Sharding::replicated(manual_mesh(), 1);
+        let input_type = f32_vector_type(2);
+        let body = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(input_type.clone().into());
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let shard_map =
+            ShardMap::new(manual_mesh(), vec![replicated.clone()], vec![replicated.clone(); 2], Vec::new()).unwrap();
+        let operation = ShardMapOperation::from_program(&body, vec![input_type.into()], shard_map).unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(operation.global_input_types()[0].clone());
+        let mut outputs = Vec::new();
+        for kept_output in [0, 0, 1] {
+            let body_region = builder.import_program(body.clone());
+            let map_outputs = builder
+                .add_instruction(TestOperation::ShardMap(operation.clone()), vec![body_region], vec![input], None)
+                .unwrap();
+            outputs.push(map_outputs[kept_output]);
+        }
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder; 3])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let body_regions = transposed
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == SHARD_MAP_OPERATION_NAME)
+            .map(|instruction| instruction.regions().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(body_regions.len(), 3);
+        assert_eq!(body_regions[1], body_regions[2]);
+        assert_ne!(body_regions[0], body_regions[1]);
+        let global_type = operation.global_input_types()[0].clone();
+        assert_eq!(
+            transposed.to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:{global_type}, %2:{global_type} .
+                let %3:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}],
+                    out_shardings=[{replicated}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}],
+                    global_output_types=[{global_type}],
+                ] %2 [
+                    body={{
+                        lambda %0:f32[2] .
+                        in (%0)
+                    }},
+                ]
+                    %4:{global_type} = shard_map [
+                        mesh=['x'=2:manual],
+                        in_shardings=[{replicated}],
+                        out_shardings=[{replicated}],
+                        manual_axes=['x'],
+                        global_input_types=[{global_type}],
+                        global_output_types=[{global_type}],
+                    ] %1 [
+                        body=^1={{
+                            lambda %0:f32[2] .
+                            in (%0)
+                        }},
+                    ]
+                    %5:{global_type} = add %3 %4
+                    %6:{global_type} = shard_map [
+                        mesh=['x'=2:manual],
+                        in_shardings=[{replicated}],
+                        out_shardings=[{replicated}],
+                        manual_axes=['x'],
+                        global_input_types=[{global_type}],
+                        global_output_types=[{global_type}],
+                    ] %0 [
+                        body=^1,
+                    ]
+                    %7:{global_type} = add %5 %6
+                in (%7)"},
         );
     }
 
