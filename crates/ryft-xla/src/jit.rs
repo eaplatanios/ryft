@@ -5869,6 +5869,108 @@ mod tests {
     }
 
     #[test]
+    fn test_gradient_method_omits_dead_seeds_of_staged_compiled_functions() {
+        // `inner(x, s) = (x · x, s · s)` has a dynamically shaped output that `outer(x, s) = inner(x, s).1` discards. The
+        // pullback of the staged `inner` call receives a structural-zero seed for `x · x`, so the transposed call has no
+        // input for it and the pullback reads no `extent` for it; the only `f32[extent]` zero is the gradient for `x`,
+        // which the outer boundary builds. Forward mode over the gradient and the gradient of `∂outer/∂s` both
+        // differentiate through that transposed call again.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaSession::new(&client).domain();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let input_types = (dynamic_type, scalar_type.clone());
+        let inner: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compile(|(x, s)| (x.clone() * x, s.clone() * s), input_types.clone(), &engine, mesh.clone()).unwrap();
+        let outer: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+            compile(move |inputs| inner.call(inputs).unwrap().1, input_types.clone(), &engine, mesh.clone()).unwrap();
+        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            outer.gradient(&engine).unwrap();
+        assert_eq!(
+            gradient.source_program().program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
+                    %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                        callee={
+                            lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                            let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}], %4:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                                callee={
+                                    lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = mul %0 %0
+                                        %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %1 %1
+                                    in (%2, %3, %0, %1)
+                                },
+                            ]
+                            in (%3, %4, %5)
+                        },
+                    ]
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 %7 [
+                        callee={
+                            lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                            let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 %2 [
+                                callee={
+                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %2 %0
+                                        %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %2 %0
+                                        %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = add %3 %4
+                                    in (%5)
+                                },
+                            ]
+                            in (%3)
+                        },
+                    ]
+                in (%3, %8)"#},
+        );
+
+        let concrete_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let array = |r#type: &ArrayType, values: &[f32]| {
+            XlaArray::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
+                .unwrap()
+        };
+        let x = array(&concrete_type, &[2.0, 3.0, 4.0]);
+        let s = array(&scalar_type, &[3.0]);
+        let (x_gradient, s_gradient) =
+            engine.interpret(&gradient.executable_function(), (x.clone(), s.clone())).unwrap();
+        assert_eq!(read_f32_array(&client, &x_gradient), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &s_gradient), vec![6.0]);
+
+        // Forward over reverse: the tangent of the gradient `(0, 2s)` along `(ẋ, ṡ)` is `(0, 2ṡ)`.
+        let forward_over_reverse = gradient.jvp(&engine).unwrap();
+        let ((x_gradient, s_gradient), (x_gradient_tangent, s_gradient_tangent)) = engine
+            .interpret(
+                &forward_over_reverse.executable_function(),
+                ((x.clone(), s.clone()), (array(&concrete_type, &[1.0, 1.0, 1.0]), array(&scalar_type, &[1.0]))),
+            )
+            .unwrap();
+        assert_eq!(read_f32_array(&client, &x_gradient), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &s_gradient), vec![6.0]);
+        assert_eq!(read_f32_array(&client, &x_gradient_tangent), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &s_gradient_tangent), vec![2.0]);
+
+        // Reverse over reverse: the gradient of `∂outer/∂s = 2s` is `(0, 2)`.
+        let s_derivative: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+            compile(move |inputs| gradient.call(inputs).unwrap().1, input_types, &engine, mesh.clone()).unwrap();
+        let reverse_over_reverse = s_derivative.gradient(&engine).unwrap();
+        let (x_second, s_second) = engine.interpret(&reverse_over_reverse.executable_function(), (x, s)).unwrap();
+        assert_eq!(read_f32_array(&client, &x_second), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &s_second), vec![2.0]);
+    }
+
+    #[test]
     fn test_gradient_method_preserves_compiled_function_captures() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

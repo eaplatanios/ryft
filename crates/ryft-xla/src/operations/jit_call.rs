@@ -11,15 +11,14 @@ use ryft_core::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
     CompiledCallOperation, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Dimension, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
-    OperationBoundaryPruning, OperationFormatter, OperationProvider, OutputRegionProvenance, Parameterized,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
-    RematerializationOptimizationBarrier, ShardMapOperation, StagingContext, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero, ZeroOperation,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
+    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
+    ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow, RegionId,
+    RegionInterface, RegionLiveness, RegionRef, RegionSlot, RematerializationOptimizationBarrier, ShardMapOperation,
+    Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero,
     discharge_positional_region_operation,
 };
 use ryft_mlir::dialects::func;
@@ -1391,66 +1390,15 @@ where
     }
 }
 
-/// Returns a tracer for `cotangent`, materializing a structural zero through the canonical XLA representation when a
-/// higher-order transpose call requires an ordinary SSA operand. Dynamic array zeros read their extent operands from
-/// the known dimension inputs of the differentiated call; they are never reconstructed from type metadata.
-pub(crate) fn materialize_transpose_cotangent<
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
->(
-    context: &TracingContext<V, XlaOperation<V>>,
-    cotangent: &MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>,
-    output_type: &ArrayIrType,
-    inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
-) -> Result<Tracer<TracingContext<V, XlaOperation<V>>>, ProgramError> {
-    if let MaybeZero::Value(cotangent) = cotangent {
-        return Ok(cotangent.clone());
-    }
-
-    let (operation, operands) = match output_type {
-        ArrayIrType::Array(array_type)
-            if array_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) =>
-        {
-            // The generic input-free provider cannot construct a dynamically shaped array zero. Resolve each dynamic
-            // axis from the known dimension inputs and pass those extents through the mixed zero operation instead.
-            let operands = array_type
-                .shape()
-                .dimensions()
-                .iter()
-                .filter_map(Dimension::variable)
-                .map(|variable| {
-                    inputs
-                        .iter()
-                        .filter_map(PartialValue::as_known)
-                        .find(|input| {
-                            matches!(
-                                input.r#type().as_ref(),
-                                ArrayIrType::Dimension(r#type) if r#type.variable() == Some(variable)
-                            )
-                        })
-                        .cloned()
-                        .ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "cannot materialize dynamic transpose cotangent of type {output_type} because no known \
-                                 dimension input defines `{variable}`",
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            (XlaOperation::from(ZeroOperation::new(array_type.clone())), operands)
-        }
-        _ => (XlaOperation::provide(ZeroOperation::new(output_type.clone()), &[])?, Vec::new()),
-    };
-    let mut outputs = context.stage_operation(operation, Vec::new(), operands.as_slice())?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
 /// Transposes a tangent [`JitCallOperation`] while retaining its compilation boundary.
 ///
 /// The [`TranspositionDriver`] transposes the attached callee under the operands' linearity and cotangent-destination
-/// masks. Known operands supply residual or captured values and may appear anywhere in the input boundary. The
-/// transposed call consumes ordinary output cotangents, live cotangent references, and known operands, in that order.
-/// Reference outputs forward input roots and therefore have no separate output-cotangent slot.
+/// masks and the structural zeros of its output cotangents. Known operands supply residual or captured values and may
+/// appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that are not
+/// structural zeros, live cotangent references, and known operands, in that order. A structural-zero output cotangent
+/// seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary (a dense
+/// backward rule inside the callee may still materialize the zero that it consumes). Reference outputs forward input
+/// roots and therefore have no separate output-cotangent slot.
 ///
 /// Returned cotangents follow the original input order: linear value inputs receive call results, reference inputs
 /// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
@@ -1463,7 +1411,8 @@ pub(crate) fn materialize_transpose_cotangent<
 ///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the callee's inputs one-to-one. The
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
-///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
+///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
+///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
 ///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a
 ///     live (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
@@ -1503,39 +1452,47 @@ pub fn transpose_primal_jit_call<
     let callee = driver.region(0)?;
     check_count!("input", operand_linear, callee.input_types().len(), ProgramError);
 
-    // Transpose the callee with respect to its linear inputs, through the region's retained transform cache so that a
-    // callee shared by several outer programs is transposed once per linearity mask. A live reference-typed linear
-    // input is transposed with a `Reference` destination and a dead one with an `Ignore` destination, so the transposed
-    // callee maps `[non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
+    // Transpose the callee with respect to its linear inputs and with its structural-zero output cotangents flagged,
+    // through the region's retained transform cache so that a callee shared by several outer programs is transposed
+    // once per linearity and seed mask. A live reference-typed linear input is transposed with a `Reference`
+    // destination and a dead one with an `Ignore` destination, so the transposed callee maps
+    // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
     // `[linear_input_cotangents...]`, in callee-input order, where a live reference input's cotangent is its cotangent
-    // reference itself and a dead reference input has no cotangent slot.
+    // reference itself and a dead reference input has no cotangent slot. The flags follow the callee's complete output
+    // order; flags of reference outputs are normalized away because those outputs never own a cotangent slot.
     let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = operand_linear
         .iter()
         .zip(cotangents.kinds())
         .enumerate()
         .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
         .unzip();
-    let transposed_callee = driver.transpose_program(callee, &input_indices, &[], &destination_kinds)?;
-
-    // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
-    // `jit_call` over the transposed callee on `[outputs..., cotangent_references..., known_input_values...]`. Its
-    // outputs are the linear-input cotangents.
     let output_types = callee.output_types();
     check_count!("output", outputs, output_types.len(), ProgramError);
+    let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+    let transposed_callee = driver.transpose_program_with_zero_seeds(
+        callee,
+        &input_indices,
+        &[],
+        &zero_output_cotangents,
+        &destination_kinds,
+    )?;
+
+    // Stage a fresh `jit_call` over the transposed callee on `[live_outputs..., cotangent_references...,
+    // known_input_values...]`. Its outputs are the linear-input cotangents. A reference output forwards a callee input
+    // root whose state cotangent lives in that operand's cotangent reference, so it owns no cotangent slot.
     let mut operands = Vec::with_capacity(output_types.len() + inputs.len());
-    for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
-        // A reference output forwards a callee input root whose state cotangent lives in that operand's cotangent
-        // reference, so it owns no cotangent slot.
-        if output_type.is_reference() {
-            continue;
-        }
-        let output_cotangent_type = output_type.cotangent()?;
-        operands.push(materialize_transpose_cotangent(context, cotangent, &output_cotangent_type, inputs)?);
-    }
+    operands.extend(
+        outputs
+            .iter()
+            .zip(output_types.iter())
+            .filter(|(_, output_type)| !output_type.is_reference())
+            .filter_map(|(cotangent, _)| cotangent.as_value())
+            .cloned(),
+    );
     operands.extend(cotangents.references().iter().cloned());
     operands.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
-    // The transposed callee's inputs are output cotangents, cotangent references, and known input values — never a
-    // lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
+    // The transposed callee's inputs are live output cotangents, cotangent references, and known input values — never
+    // a lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
     // through fresh-root contexts.
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0).with_callee_type_signature(
         &transposed_callee.program().input_types(),
@@ -1662,29 +1619,32 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, Array, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId, AxisIndexOperation,
-        BroadcastOperation, CaptureReference, ConditionOperation, Context, CosOperation, CotangentDestinationKind,
-        CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DotDimensionNumbers,
-        DotOperation, DynamicBroadcastOperation, EffectClasses, InputRegionProvenance, IotaOperation, LogicalMesh,
-        MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage, Operation, OutputRegionProvenance, PartialValue,
-        Placeholder, ProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
+        BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection, CompositeTransposeOperation,
+        ConditionOperation, Context, CosOperation, CotangentDestinationKind, CotangentDestinations, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
+        EffectClasses, InputRegionProvenance, IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, NoStorage, NothingSavable, Operation, OutputRegionProvenance, PartialValue, Placeholder,
+        PrintOperation, ProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
         ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
         RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
-        ResidualRejection, Shape, Sharding, ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer,
-        TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver,
-        TypeError, TypeIdentity, Typed, Value, ZeroOperation,
+        ResidualRejection, ScanOperation, Shape, Sharding, ShardingDimension, SinOperation, StagingContext,
+        TagOperation, Tracer, TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent,
+        TranspositionDriver, TypeError, TypeIdentity, Typed, Value, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
 
     use crate::experimental::lowering::tests::{
-        XlaProgramBuilder, add_xla_jit_call, lower_replicated_shard_map_body, test_vector_type,
-        unproject_plain_program, xla_identity_branch, xla_neg_branch,
+        MixedValue, XlaProgramBuilder, add_xla_jit_call, execute_mixed_program, lower_replicated_shard_map_body,
+        test_vector_type, unproject_plain_program, xla_identity_branch, xla_neg_branch,
     };
     use crate::experimental::ops::tests::vector_type;
     use crate::experimental::ops::{
         XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
+    use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+    use crate::tests::execution_client;
     use crate::{XlaArray, to_mlir_module_for_program};
 
     use super::*;
@@ -1716,7 +1676,18 @@ mod tests {
             _materialize_zeros: &[bool],
             destination_kinds: &[CotangentDestinationKind],
         ) -> Result<TransposedProgram<XlaConstant, XlaOperation>, DifferentiationError> {
+            // The predetermined program must have the boundary of the requested region's transposition: one input per
+            // non-reference output, per `Reference` destination, and per known input. The default zero-seed request
+            // projects the region onto its unflagged outputs before calling this function, so this also pins the
+            // structural-zero seed mask that the rule requests.
             let input_types = region.input_types();
+            let output_count = region.output_types().iter().filter(|r#type| !r#type.is_reference()).count();
+            let reference_count =
+                destination_kinds.iter().filter(|&&kind| kind == CotangentDestinationKind::Reference).count();
+            assert_eq!(
+                self.transposed.input_types().len(),
+                output_count + reference_count + input_types.len() - input_indices.len(),
+            );
             let cotangents = input_indices
                 .iter()
                 .enumerate()
@@ -2104,8 +2075,6 @@ mod tests {
 
     #[test]
     fn test_repeated_effectful_jit_call_callees_inline_and_chain_prints() {
-        use ryft_core::PrintOperation;
-
         // A repeated `jit_call` callee that prints is excluded from function deduplication and inlines at every
         // call site, so both inlined prints chain onto the caller's ordered-I/O token in program order (a shared
         // token-free `func.func` could not preserve that ordering).
@@ -2143,8 +2112,6 @@ mod tests {
 
     #[test]
     fn test_repeated_jit_call_callees_with_synthesized_guards_inline_and_order_later_io() {
-        use ryft_core::PrintOperation;
-
         // The repeated callee is pure in the source program, but its inner conditional's mixed entry (a symbolic
         // `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry guard during lowering.
         // A shared token-free function could not order that guard, so the callee inlines at both call sites, and the
@@ -3305,28 +3272,595 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_dynamic_zero_transpose_uses_known_extent_operand() {
-        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let output_type =
-            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![extent_type.dimension().clone()])));
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let extent = context.input(extent_type.into());
-
-        let zero = materialize_transpose_cotangent(
-            &context,
-            &MaybeZero::Zero(output_type.clone()),
-            &output_type,
-            &[PartialValue::Known(extent)],
-        )
-        .unwrap();
-
-        let builder = context.builder().borrow();
-        let [instruction] = builder.instructions() else {
-            panic!("expected one dynamic zero instruction");
+    fn test_jit_call_transposition_omits_dead_dynamic_seeds() {
+        // The callee `(x, z) ↦ (x, z)` returns both of its dynamically shaped inputs, and only `z` is live. The dead
+        // output's seed is a structural zero of type `f64[dead]`, whose extent no operand of the call defines. The
+        // transposed call has no input for that seed, so it needs no extent for it: it consumes the live seed alone,
+        // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
+        let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
+        let live = DimensionVariable::new("live", DimensionBounds::new(1, Some(5)).unwrap());
+        let dead_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dead)])));
+        let live_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(live)])));
+        let callee = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let dead = builder.add_input(dead_type.clone());
+            let live = builder.add_input(live_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![dead, live],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
         };
-        assert!(matches!(instruction.operation(), XlaOperation::Zero(_)));
-        assert_eq!(instruction.inputs(), &[ryft_core::AtomId::new(0)]);
-        assert_eq!(zero.atom_id().unwrap(), instruction.outputs()[0]);
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let dead = builder.add_input(dead_type);
+        let live = builder.add_input(live_type.clone());
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dead, live], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[1]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[0, 1], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        let pullback = transposed.into_program();
+        assert_eq!(pullback.output_types(), vec![live_type]);
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[live] .
+                let %1:f64[live] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[live] .
+                        in (%0)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &execution_client(),
+                &pullback,
+                &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
+                &[3],
+            ),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_dead_seeds_of_repeated_outputs() {
+        // The callee `x ↦ (x, x)` returns its input twice. With only the second output live, the first output's seed
+        // is a structural zero, so the transposed call consumes the second seed alone, which is `x̄`. With both outputs
+        // live, the transposed callee receives both seeds and adds them.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let callee = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![input, input],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(scalar_type);
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let client = execution_client();
+
+        // Projecting onto the second output keeps the two-output call, so its first seed reaches the call's transpose
+        // rule as a structural zero rather than being pruned away beforehand.
+        let projected = program.with_outputs(&[1]).unwrap();
+        assert_eq!(
+            projected.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[], %2:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        in (%0, %0)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let transposed = projected.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
+            Ok(vec![MixedValue::Array(vec![2.0], vec![])]),
+        );
+
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = add %0 %1
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &transposed,
+                &[MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![5.0], vec![])],
+                &[],
+            ),
+            Ok(vec![MixedValue::Array(vec![7.0], vec![])]),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_runs_backward_effects_without_live_seeds() {
+        // The callee maps its input through a reverse-mode carrier whose backward rule prints its seed and returns a
+        // zero. With the call's output dead, its only seed is a structural zero, yet the backward effect must still
+        // run: the transposed call has no inputs, and its callee prints a materialized zero seed.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let backward = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let seed = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
+                .unwrap();
+            let zero = builder
+                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let backward = builder.import_region(backward.entry_region_ref());
+            let input = builder.add_input(scalar_type.clone());
+            let output = builder
+                .add_instruction(
+                    CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                        0,
+                        vec![scalar_type.clone()],
+                        vec![scalar_type.clone()],
+                    ),
+                    vec![backward],
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(scalar_type);
+        builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[0], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        let pullback = transposed.into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda  .
+                let () = jit_call [
+                    callee={
+                        lambda  .
+                        let %0:f64[] = zero [type=f64[]]
+                            %1:f64[] = print [label=backward] %0
+                            %2:f64[] = zero [type=f64[]]
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let client = execution_client();
+        ensure_print_handler_registered(&client).unwrap();
+        let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
+        assert_eq!(outputs, Ok(Vec::new()));
+        assert_eq!(lines, vec!["backward: 0.0"]);
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_dead_seeds_beside_cotangent_references() {
+        // The callee accumulates into its reference operand, reads it back, and forwards `x`: `ẏ = { ṫr += ẋ; (read(ṫr),
+        // ẋ) }`. Only the read is live, so the forwarded output's seed is a structural zero. Under a `Reference`
+        // destination the transposed call consumes `[ȳ₀, r̄]` with no input for the dead seed, accumulates into `r̄` in
+        // place, and returns `x̄` read back from it.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
+        let callee = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let read = builder
+                .add_instruction(
+                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![read, update],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![reference, update],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
+        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), reference_type.clone()]);
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:ref<f64[]>, %3:f64[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[], %1:ref<f64[]> .
+                        let () = reference_add_update %1 %0
+                            %2:f64[] = reference_read %1
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %3)
+            "}
+            .trim_end(),
+        );
+
+        // With both outputs dead, every seed is a structural zero, but the live reference destination keeps the call
+        // live: the transposed call consumes `r̄` alone and returns `x̄` read back from it.
+        let transposed =
+            program.with_outputs(&[]).unwrap().transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]> .
+                let %1:ref<f64[]>, %2:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:ref<f64[]> .
+                        let %1:f64[] = reference_read %0
+                        in (%0, %1)
+                    },
+                ]
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_keeps_dead_seeds_structural_in_nested_scans() {
+        // The callee runs the scan `(c, x) ↦ (c + x, c)` over three items and returns its final carry and its stacked
+        // outputs, of which only the final carry is live. The dead stack's seed reaches the scan inside the callee as a
+        // structural zero, so neither the transposed call nor its reversed scan receives a zero stack.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let body = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carry = builder.add_input(scalar_type.clone());
+            let item = builder.add_input(scalar_type.clone());
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![next, carry],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let body = builder.import_region(body.entry_region_ref());
+            let carry = builder.add_input(scalar_type.clone());
+            let items = builder.add_input(stack_type.clone());
+            let outputs = builder
+                .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 3)), vec![body], vec![carry, items], None)
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let carry = builder.add_input(scalar_type);
+        let items = builder.add_input(stack_type);
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![carry, items], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[], %2:f64[3] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
+                            body={
+                                lambda %0:i64[], %1:f64[] .
+                                in (%1, %1)
+                            },
+                        ]
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
+            Ok(vec![MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![2.0, 2.0, 2.0], vec![3])]),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_keeps_dead_seeds_structural_in_nested_conditions() {
+        // The callee selects on `c > 0` between the branches `x ↦ (x, x + x)` and `x ↦ (x + x, x)` and only the first
+        // output is live. The dead output's seed reaches the condition inside the callee as a structural zero, so each
+        // transposed branch consumes the live seed alone: `x̄ = ȳ₀` when `c > 0` and `x̄ = 2ȳ₀` otherwise.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let branch = |doubled_output: usize| {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            let outputs = if doubled_output == 0 { vec![doubled, input] } else { vec![input, doubled] };
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let true_branch = builder.import_region(branch(1).entry_region_ref());
+            let false_branch = builder.import_region(branch(0).entry_region_ref());
+            let selector = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone());
+            let zero = builder
+                .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![selector], None)
+                .unwrap()[0];
+            let predicate = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
+                        ComparisonDirection::GreaterThan,
+                    ))),
+                    Vec::new(),
+                    vec![selector, zero],
+                    None,
+                )
+                .unwrap()[0];
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::Condition(ConditionOperation::new()),
+                    vec![true_branch, false_branch],
+                    vec![predicate, input],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let selector = builder.add_input(scalar_type.clone());
+        let input = builder.add_input(scalar_type);
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![selector, input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = zero_like %1
+                            %3:bool[] = compare [direction=GreaterThan] %1 %2
+                            %4:f64[] = condition %3 %0 [
+                                true={
+                                    lambda %0:f64[] .
+                                    in (%0)
+                                },
+                                false={
+                                    lambda %0:f64[] .
+                                    let %1:f64[] = add %0 %0
+                                    in (%1)
+                                },
+                            ]
+                        in (%4)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let client = execution_client();
+        for (selector, expected) in [(1.0, 3.0), (-1.0, 6.0)] {
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &transposed,
+                    &[MixedValue::Array(vec![3.0], vec![]), MixedValue::Array(vec![selector], vec![])],
+                    &[],
+                ),
+                Ok(vec![MixedValue::Array(vec![expected], vec![])]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_jit_call_transposition_keeps_dead_seeds_structural_across_rematerializations() {
+        // A rematerialization inside a jitted callee and a jitted call inside a rematerialization both map `x` to
+        // `(x, x + x)`, and only `x + x` is live. In both nestings the dead output's seed stays a structural zero across
+        // both boundaries: the outer transposed region consumes the live seed alone, the inner one receives it alone,
+        // and `x̄ = ȳ₁ + ȳ₁`.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let doubling = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![input, doubled],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let rematerialize = || RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
+        let nest = |outer: XlaOperation, inner: XlaOperation| {
+            let inner_program = {
+                let mut builder = ArrayIrXlaProgramBuilder::new();
+                let region = builder.import_region(doubling.entry_region_ref());
+                let input = builder.add_input(scalar_type.clone());
+                let outputs = builder.add_instruction(inner, vec![region], vec![input], None).unwrap().to_vec();
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+                    .unwrap()
+            };
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let region = builder.import_region(inner_program.entry_region_ref());
+            let input = builder.add_input(scalar_type.clone());
+            let outputs = builder.add_instruction(outer, vec![region], vec![input], None).unwrap().to_vec();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[1]], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let client = execution_client();
+
+        let program = nest(XlaOperation::JitCall(JitCallOperation::new(0)), rematerialize().into());
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[] = rematerialize %0 [
+                            body={
+                                lambda %0:f64[] .
+                                let %1:f64[] = add %0 %0
+                                in (%1)
+                            },
+                        ]
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
+            Ok(vec![MixedValue::Array(vec![4.0], vec![])]),
+        );
+
+        let program = nest(rematerialize().into(), XlaOperation::JitCall(JitCallOperation::new(0)));
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = jit_call %0 [
+                            callee={
+                                lambda %0:f64[] .
+                                let %1:f64[] = add %0 %0
+                                in (%1)
+                            },
+                        ]
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]),
+            Ok(vec![MixedValue::Array(vec![4.0], vec![])]),
+        );
     }
 
     #[test]
@@ -3377,7 +3911,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_mixed_output_transpose_materializes_zero_space_values() {
+    fn test_jit_call_mixed_output_transpose_omits_zero_space_seeds() {
+        // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
+        // has no input for it and the transposed call consumes the value output's seed alone.
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
         let value_program_type = ArrayIrType::Array(value_type.clone());
@@ -3398,11 +3934,10 @@ mod tests {
         let transposed = {
             let mut builder = ArrayIrXlaProgramBuilder::new();
             let value_cotangent = builder.add_input(value_program_type.clone());
-            let _predicate_cotangent = builder.add_input(ArrayIrType::Array(predicate_type.cotangent().unwrap()));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value_cotangent],
-                    vec![Placeholder; 2],
+                    vec![Placeholder],
                     vec![Placeholder],
                 )
                 .unwrap()
@@ -3417,7 +3952,7 @@ mod tests {
             &driver,
             &[PartialValue::Unknown(value_program_type.clone())],
             &[
-                MaybeZero::Value(value_cotangent),
+                MaybeZero::Value(value_cotangent.clone()),
                 MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
             ],
             &CotangentDestinations::without_references([true]),
@@ -3427,6 +3962,12 @@ mod tests {
         assert!(
             matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_program_type)
         );
+        let builder = context.builder().borrow();
+        let [call] = builder.instructions() else {
+            panic!("expected the transposed call to be the only staged instruction");
+        };
+        assert!(matches!(call.operation(), XlaOperation::JitCall(_)));
+        assert_eq!(call.inputs(), &[value_cotangent.atom_id().unwrap()]);
     }
 
     /// Online partial evaluation of a mixed `jit_call` against a live outer trace — the second recorded consumer of

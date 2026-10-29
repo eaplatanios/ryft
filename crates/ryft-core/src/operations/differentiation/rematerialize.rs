@@ -667,9 +667,10 @@ where
         // so that the backward computation keeps its rematerialization boundary and higher-order derivatives keep
         // rematerializing. Any work over the known inputs of the body (e.g., values that the residual program
         // recomputes from the saved ones) is replayed inside the transposed body. The transposed call consumes the
-        // cotangents of the non-reference outputs, the cotangent references of the reference inputs whose state
-        // cotangents are live, and the known inputs, in that order, and it produces the cotangents of the linear
-        // inputs that return one.
+        // cotangents of the non-reference outputs that are not structural zeros (as JAX's `remat_transpose` drops its
+        // zero output cotangents), the cotangent references of the inputs whose cotangents accumulate in place (i.e.,
+        // live reference state and caller-owned buffers), and the known inputs, in that order, and it produces the
+        // cotangents of the linear inputs that return one.
         let body = driver.region(0)?;
         check_count!("input", inputs, body.input_types().len(), ProgramError);
         check_count!("output", outputs, body.output_types().len(), ProgramError);
@@ -691,28 +692,38 @@ where
             .enumerate()
             .filter_map(|(index, (input, kind))| input.is_unknown().then_some((index, *kind)))
             .unzip();
-        let transposed_body = driver.transpose_program(body, &linear_input_indices, &[], &destination_kinds)?;
+
+        // A structural zero output cotangent seeds nothing, so the body is transposed with it flagged and the
+        // transposed call has no input for it, rather than materializing a zero whose runtime extents only peer
+        // cotangents or known inputs could supply. The flags follow the body's complete output order; flags of
+        // reference outputs are normalized away because those outputs never own a cotangent input.
+        let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+        let transposed_body = driver.transpose_program_with_zero_seeds(
+            body,
+            &linear_input_indices,
+            &[],
+            &zero_output_cotangents,
+            &destination_kinds,
+        )?;
 
         // A reference output forwards an input root whose state cotangent lives in the cotangent reference of that
-        // input, so it has no cotangent input. A structurally zero output cotangent is materialized from the live
-        // cotangents and the known inputs, which carry any runtime dimensions that its type refers to.
+        // input, so it has no cotangent input either.
         let known_inputs = inputs.iter().filter_map(PartialValue::as_known).cloned().collect::<Vec<_>>();
         let mut call_inputs = Vec::with_capacity(outputs.len() + cotangents.references().len() + known_inputs.len());
-        for (cotangent, output_type) in outputs.iter().zip(body.output_types().iter()) {
-            if !output_type.is_reference() {
-                call_inputs.push(O::materialize_zero_from_residual_sources(
-                    &**context,
-                    cotangent.clone(),
-                    outputs.iter().filter_map(MaybeZero::as_value).chain(&known_inputs),
-                )?);
-            }
-        }
+        call_inputs.extend(
+            outputs
+                .iter()
+                .zip(body.output_types().iter())
+                .filter(|(_, output_type)| !output_type.is_reference())
+                .filter_map(|(cotangent, _)| cotangent.as_value())
+                .cloned(),
+        );
         call_inputs.extend(cotangents.references().iter().cloned());
         let cotangent_input_count = call_inputs.len();
         call_inputs.extend(known_inputs);
 
-        // The optimization barrier of the transposed call selects every cotangent input, followed by the selection
-        // of the known inputs.
+        // The optimization barrier of the transposed call selects every live cotangent input and cotangent reference,
+        // followed by the original selection of each known input.
         let operation = self.with_remapped_optimization_barrier(|selected| {
             std::iter::repeat_n(true, cotangent_input_count)
                 .chain(
@@ -780,7 +791,7 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::composite;
+    use crate::operations::composites::{CompositeTransposeOperation, composite};
     use crate::operations::constants::one_like::OneLike;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
@@ -3453,6 +3464,228 @@ mod tests {
         assert_eq!(
             pullback.assemble_cotangents(&[input_type, scalar_type], outputs),
             Ok(vec![Some(MaybeZero::Zero(program.input_types()[0].clone())), Some(MaybeZero::Value(seed))]),
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_transposition_omits_dead_seeds() {
+        // The body `(s, x, y) ↦ (x, s · y)` returns its symbolically shaped input `x` next to a scaled `y`, and only
+        // the scaled `y` is live. The dead output's seed is a structural zero of type `f64[extent]`, which neither the
+        // live seed nor the known `s` could shape. The transposed call has no input for it: it consumes the live seed
+        // and `s`, and its optimization barrier selects the seed followed by the original selection of `s`.
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.simplified_dimension()]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let scale = body.add_input(scalar_type.clone());
+        let x = body.add_input(vector_type.clone());
+        let y = body.add_input(scalar_type.clone());
+        let scaled = body.add_instruction(MulOperation::new(), Vec::new(), vec![scale, y], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![x, scaled], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let scale = builder.add_input(scalar_type.clone());
+        let x = builder.add_input(vector_type);
+        let y = builder.add_input(scalar_type);
+        let operation = rematerialize_operation()
+            .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false, true, true]));
+        let outputs = builder.add_instruction(operation, vec![body], vec![scale, x, y], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[1]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1, 2], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize [optimization_barrier=[true, false]] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(
+            transposed.program().interpret(vec![Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()]),
+            Ok(vec![Array::scalar(6.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_transposition_runs_deferred_work_without_live_seeds() {
+        // The body forwards `x` and holds a dormant backward rule that adds one to its known reference `r` when the
+        // body is transposed. With the forwarded output dead, its seed is a structural zero, so the transposed call has
+        // no input for it, but the backward update still runs on every application of the pullback.
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F64)).into();
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let mut backward = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = backward.add_input(reference_type.clone());
+        let update = backward.add_constant(ArrayIrValue::Array(Array::scalar(1.0f64).unwrap()));
+        backward
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let backward = backward
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body.add_input(reference_type.clone());
+        let x = body.add_input(scalar_type.clone());
+        let backward = body.import_program(backward);
+        body.add_instruction(
+            TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
+                1,
+                Vec::new(),
+                Vec::new(),
+            )),
+            vec![backward],
+            vec![reference],
+            None,
+        )
+        .unwrap();
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![x], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert!(body.effects().has_deferred_work());
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_program(body);
+        let reference = builder.add_input(reference_type);
+        let x = builder.add_input(scalar_type);
+        builder
+            .add_instruction(rematerialize_operation().lift::<ArrayIrType>(), vec![body], vec![reference, x], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]> .
+                let () = rematerialize %0 [
+                    body={
+                        lambda %0:ref<f64[]> .
+                        let %1:f64[] = const 1.0
+                            () = reference_add_update %0 %1
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let reference = ArrayReference::new(Array::scalar(4.0f64).unwrap());
+        assert_eq!(transposed.program().interpret(vec![TestIrValue::Reference(reference.clone())]), Ok(Vec::new()));
+        assert_eq!(reference.read(), Ok(Array::scalar(5.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_rematerialize_transposition_omits_dead_seeds_with_buffered_destinations() {
+        // The body `(x, y) ↦ (x, y²)` is used only through `y²`, and both inputs' cotangents go to caller-owned
+        // buffers. The transposed call consumes the live seed followed by both buffers and no input for the dead seed.
+        // The buffer of `x` is left unchanged, and the buffer of `y` accumulates `2y`.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let x = body.add_input(scalar_type.clone());
+        let y = body.add_input(scalar_type.clone());
+        let square = ArrayOperation::<Array>::from(MulOperation::<ArrayType>::new());
+        let square = body.add_instruction(square, Vec::new(), vec![y, y], None).unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![x, square], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_program(body);
+        let x = builder.add_input(scalar_type.clone());
+        let y = builder.add_input(scalar_type);
+        let outputs = builder
+            .add_instruction(rematerialize_operation().lift::<ArrayIrType>(), vec![body], vec![x, y], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let scalar = |value: f32| TestIrValue::Array(Array::scalar(value).unwrap());
+        let (value, pullback) = differentiate_at((scalar(2.0), scalar(3.0)))
+            .vjp(|(x, y)| Ok(program.interpret_in_context(&x.domain(), vec![x, y])?.remove(1)))
+            .unwrap();
+        assert_eq!(value, scalar(9.0));
+        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Reference];
+        assert_eq!(
+            pullback.transposed_program(&destination_kinds).unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
+                let () = rematerialize [differentiated=true] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:f32[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
+                        let %4:f32[] = mul %3 %0
+                            () = reference_add_update %2 %4
+                            %5:f32[] = mul %3 %0
+                            () = reference_add_update %2 %5
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let x_buffer = ArrayReference::new(Array::scalar(10.0f32).unwrap());
+        let y_buffer = ArrayReference::new(Array::scalar(20.0f32).unwrap());
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(scalar(1.0)),
+                (
+                    CotangentDestination::Reference(TestIrValue::Reference(x_buffer.clone())),
+                    CotangentDestination::Reference(TestIrValue::Reference(y_buffer.clone())),
+                ),
+            ),
+            Ok((None, None)),
+        );
+        assert_eq!(x_buffer.read(), Ok(Array::scalar(10.0f32).unwrap()));
+        assert_eq!(y_buffer.read(), Ok(Array::scalar(26.0f32).unwrap()));
+    }
+
+    #[test]
+    fn test_rematerialize_transposition_omits_dead_seeds_under_higher_order_differentiation() {
+        // The rematerialized function `y ↦ (y + y, y²)` is used only through its square, so the staged gradient's
+        // differentiated call receives the seed of `y²` alone. Differentiating the staged gradient in forward mode,
+        // and the eager gradient in reverse mode, both compose through that compact call: the gradient is `2y` and
+        // its derivative is `2`.
+        let function = rematerialize(|y: TestTracer| Ok((y.clone() + y.clone(), y.clone() * y)));
+        let (_, gradient) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |y: TestTracer| Ok(differentiate_at(y).gradient(|y| Ok(function.call(y)?.1))?),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let gradient = gradient.into_flat_program();
+        assert_eq!(
+            gradient.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = add %0 %0
+                    %2:f64[] = mul %0 %0
+                    %3:f64[] = one [type=f64[]]
+                    %4:f64[] = rematerialize [differentiated=true] %3 %0 [
+                        body={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %1 %0
+                                %3:f64[] = mul %1 %0
+                                %4:f64[] = add %2 %3
+                            in (%4)
+                        },
+                    ]
+                in (%4)"},
+        );
+        let scalar = |value: f64| Array::scalar(value).unwrap();
+        assert_eq!(gradient.interpret(vec![scalar(3.0)]), Ok(vec![scalar(6.0)]));
+        assert_eq!(
+            gradient.jvp().unwrap().interpret(vec![scalar(3.0), scalar(1.0)]),
+            Ok(vec![scalar(6.0), scalar(2.0)])
+        );
+        assert_eq!(
+            differentiate_at(scalar(3.0))
+                .gradient(|y| Ok::<_, ProgramError>(differentiate_at(y).gradient(|y| Ok(function.call(y)?.1))?)),
+            Ok(scalar(2.0)),
         );
     }
 
