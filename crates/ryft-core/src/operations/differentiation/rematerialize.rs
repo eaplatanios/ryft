@@ -3245,9 +3245,9 @@ mod tests {
             program.linearize().unwrap().pullback(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message
                 == format!(
-                    "`{WHILE_OPERATION_NAME}` does not support transposition (reverse-mode differentiation through \
+                    "`{WHILE_OPERATION_NAME}` does not support transposition (reverse mode differentiation through \
                      staged linear `{WHILE_OPERATION_NAME}` loops is not supported; eager differentiation executes \
-                     concrete duals, and the forward-mode rule of loops built with `with_iteration_bound` stages a \
+                     concrete duals, and the forward mode rule of loops built with `with_iteration_bound` stages a \
                      transposable masked scan)",
                 ),
         ));

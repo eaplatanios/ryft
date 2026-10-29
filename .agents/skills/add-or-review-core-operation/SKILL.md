@@ -71,9 +71,9 @@ Group each operation in this order, omitting only implementations that do not ap
 6. The private machinery of its rules: `BatchingContext` implementations, private rule structs (e.g., `ScanJvp`), and
    free helper functions in call order.
 
-Downstream customization points that bound public rule implementations (e.g., `ScanInterpretationDomain`,
-`ResidualStorageOperation`, and `WhileDifferentiationOperation`) must be public, documented with what their blanket
-implementations cover and the coherence limit that those impose, and re-exported through the module facades.
+Downstream customization points that bound public rule implementations (e.g., `ScanInterpretationDomain` and
+`ResidualStorageOperation`) must be public, documented with what their blanket implementations cover and the coherence
+limit that those impose, and re-exported through the module facades.
 
 Keep shared blanket implementations and substantial helper submodules shared; do not duplicate them to reproduce
 this ordering. Keep additional universe-specific implementations of a shared operation type and their tests in its

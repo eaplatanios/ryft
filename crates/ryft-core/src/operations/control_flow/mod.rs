@@ -99,10 +99,7 @@ pub use scan::{
     SCAN_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation, ScanOptions, ScanType, scan,
 };
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
-pub use r#while::{
-    WHILE_OPERATION_NAME, While, WhileDifferentiationOperation, WhileOperation, WhileOptions, WhilePredicate,
-    WhileType, r#while,
-};
+pub use r#while::{WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions, WhilePredicate, WhileType, r#while};
 
 /// Operations that convert loop residuals to and from their array storage representation. When partial evaluation
 /// or differentiation splits a loop body, the later computation may need values produced by the earlier computation.

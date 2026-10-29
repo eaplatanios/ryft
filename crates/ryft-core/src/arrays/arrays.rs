@@ -24,7 +24,9 @@ use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
 use crate::operations::ElementType;
 use crate::parameters::Parameter;
-use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, Typed, Value, ValueDirectDispatch};
+use crate::programs::{
+    Concretizable, LiteralIdentity, ProgramError, TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
+};
 
 /// Dense multidimensional [`Value`] whose [`Type`](crate::Type) is an [`ArrayType`]. It is the reference array value
 /// of Ryft, and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
@@ -37,7 +39,8 @@ use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, T
 /// layouts determine the physical ordering, as well as any potential "holes" and padding. [`Array::new`] validates the
 /// complete physical representation, while [`Array::from_elements`] and [`Array::from_logical_bytes`] construct it from
 /// logical row-major values through checked typed codecs that preserve exact element encodings. Cloning an array shares
-/// its payload without copying it.
+/// its payload without copying it. Projecting through [`ValueProjection<ArrayType>`] returns the array itself,
+/// preserving its storage and metadata.
 ///
 /// A production [`Array`] always carries a fully static [`ArrayType`]. Every constructor that sizes or addresses a
 /// payload funnels through [`ArrayAddressing::new`], which rejects any type with a [`Dimension::Dynamic`] axis, so a
@@ -808,6 +811,29 @@ impl Value for Array {
                 })
             }),
         }
+    }
+}
+
+impl ValueProjection<ArrayType> for Array {
+    type Projected = Self;
+    type ProjectedRef<'v> = &'v Self;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        Ok(self)
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        Ok(self)
     }
 }
 
@@ -2177,6 +2203,23 @@ mod tests {
         // The zero differential space has a unique zero value, while an effect token is not a numerical zero.
         assert!(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap().is_zero());
         assert!(!Array::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap().is_zero());
+    }
+
+    #[test]
+    fn test_array_value_projection() {
+        let array = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-8]))),
+            &[1i32, 2],
+        )
+        .unwrap();
+        let storage = array.shared_storage_bytes().clone();
+        assert!(std::ptr::eq(array.projected().unwrap(), &array));
+        let projected = array.clone().into_projected().unwrap();
+        assert_eq!(projected.r#type(), array.r#type());
+        assert!(Arc::ptr_eq(projected.shared_storage_bytes(), &storage));
+        let restored = Array::from_projected(projected);
+        assert_eq!(restored, array);
+        assert!(Arc::ptr_eq(restored.shared_storage_bytes(), &storage));
     }
 
     #[test]

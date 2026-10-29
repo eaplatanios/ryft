@@ -51,7 +51,7 @@ use crate::batching::{
     BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
 use crate::captures::CaptureReference;
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer, ResidualZeroProvider,
@@ -59,22 +59,23 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
+use crate::operations::arithmetic::Add;
+use crate::operations::assertions::GuardOperation;
 use crate::operations::collectives::parallel_vary::{
-    ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVaryOperation,
+    ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary,
 };
-use crate::operations::constants::one::OneOperation;
-use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::constants::one::One;
+use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::ScanOperation;
-use crate::operations::control_flow::select::SelectOperation;
+use crate::operations::control_flow::select::Select;
 use crate::operations::control_flow::{
     ResidualStorageOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types,
     stabilize_carry_axes, validate_output_identities, validate_reference_carry_roots, validate_region_input,
 };
-use crate::operations::manipulation::broadcasting::BroadcastOperation;
-use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
-use crate::operations::reductions::{ReduceOperation, ReductionKind};
+use crate::operations::manipulation::broadcasting::Broadcast;
+use crate::operations::manipulation::slicing::DynamicUpdateSlice;
+use crate::operations::reductions::Reduce;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -83,11 +84,11 @@ use crate::partial::{
 use crate::programs::{
     AtomId, AttachedRegions, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
     OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
-    ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ProjectedValue, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule,
     RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, Typed, Value,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -272,8 +273,8 @@ pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// Selects between `on_true` and `on_false` per element under this Boolean predicate, broadcasting the predicate
     /// against their shape along its leading (i.e., prefix) axes.
     ///
-    /// The candidates must have the same type. [`Select::select`](crate::Select::select) instead uses ordinary
-    /// elementwise broadcasting and promotion.
+    /// The candidates must have the same type. [`Select::select`] instead uses ordinary elementwise broadcasting
+    /// and promotion.
     ///
     /// # Errors
     ///
@@ -1587,17 +1588,31 @@ impl<C: Context<Type = ArrayIrType, Operation: From<WhileOperation<ArrayIrType>>
     }
 }
 
+// Keep the projection requirements on the constant and operation families. Assuming `ContextProjection` on the
+// helper tracing context hides `Tracer`'s concrete projected representation from the trait solver.
 impl<T: DifferentiableType + WhileType, C: Context<Type = T> + Zero<C::Value>> DifferentiableOperation<C>
     for WhileOperation<T>
 where
     C::Value: Concretizable<bool>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: ResidualZeroProvider<T, Operation = C::Operation>
         + From<ConditionOperation<T>>
         + From<WhileOperation<T>>
         + From<ScanOperation<T>>
-        + WhileDifferentiationOperation<T>,
+        + ResidualStorageOperation<T>
+        + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: OperationProvider<
+            ArrayType,
+            GuardOperation<ArrayType>,
+            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
+        >,
+    for<'t> &'t ArrayType: TryFrom<&'t T>,
+    for<'t> <&'t ArrayType as TryFrom<&'t T>>::Error: Into<TypeError>,
+    WhileArrayValue<C>: Value<Type = ArrayType> + Add + Broadcast + DynamicUpdateSlice + Select + Reduce + ParallelVary,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
+    ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
+        Zero<WhileArrayValue<C>> + One<WhileArrayValue<C>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1612,7 +1627,8 @@ where
         // decision). Bounded loops stage the reverse-capable hybrid of an augmented primal `while` and a masked
         // tangent `scan`, after rewriting a batched predicate into its masked form, while unbounded loops stage
         // the forward-only fused doubled-state loop. Both type families share that rule. They differ only in
-        // their array-backed storage, which `WhileDifferentiationOperation` describes.
+        // their residual encoding, which `ResidualStorageOperation` describes. Existing context and value
+        // capabilities construct the array-backed bookkeeping in the parent and helper tracing contexts.
 
         // The rule requests all nested-computation work through its driver (region `0` is the condition and region `1`
         // the body), which keeps its bounds free of the operation family's own semantic traits.
@@ -1787,168 +1803,6 @@ impl From<WhileOperation<ArrayType>> for WhileOperation<ArrayIrType> {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Operation family constructors that the staged forward mode rule of [`WhileOperation`] uses to store the
-/// per-iteration residuals of a bounded loop in stacks and to make the per-item masking of a loop with a batched
-/// predicate explicit.
-///
-/// The functions return operations rather than binding values, so the same contract works in the parent differentiation
-/// context and in the nested tracing contexts used to build the augmented primal body and the masked tangent scan body.
-/// The scalar and dimension gateway operations come from the [`ResidualStorageOperation`] supertrait.
-///
-/// Custom backends implement this trait on their operation family to reuse the shared [`DifferentiableOperation`] rule
-/// for [`WhileOperation`], whose bounds require it even though eager differentiation runs the loop directly and never
-/// uses these constructors. Each constructor returns a region-free operation of the family with the semantics of the
-/// named array operation over the family's members, except that [`residual_stack_vary`](Self::residual_stack_vary)
-/// may return an error for a family that cannot stage manual-variation transitions.
-///
-/// Operation families over [`ArrayType`] that convert from the zero, one, addition, broadcast, dynamic-update-slice,
-/// select, and reduction operations and provide [`ParallelVaryOperation`], and array IR families over [`ArrayIrType`]
-/// whose array projection provides the same operations, already receive blanket implementations. An operation family
-/// covered by a blanket implementation cannot also provide an overlapping implementation of its own.
-pub trait WhileDifferentiationOperation<T: Type>: ResidualStorageOperation<T> {
-    /// Constructs a zero value for a statically shaped array-backed state type.
-    fn residual_stack_zero(r#type: T) -> Self;
-
-    /// Constructs a one value for a scalar array-backed state type.
-    fn residual_stack_one(r#type: T) -> Self;
-
-    /// Constructs an array broadcast used to insert a leading stack axis or expand a mask.
-    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self;
-
-    /// Constructs an array dynamic-update-slice operation.
-    fn residual_stack_update() -> Self;
-
-    /// Constructs an array addition operation.
-    fn residual_stack_add() -> Self;
-
-    /// Constructs an array selection operation.
-    fn residual_stack_select() -> Self;
-
-    /// Constructs a Boolean `any` reduction used to scalarize a batched loop predicate.
-    fn mask_reduce_any(axes: Vec<usize>) -> Self;
-
-    /// Constructs the transition that adds variation over the manual mesh axis `axis_name` to a loop index or mask of
-    /// type `input_type`, so that it can be combined with stacks or state that vary over that axis.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] when the operation family cannot stage manual-variation transitions or cannot
-    /// provide the transition for `input_type`.
-    fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError>;
-}
-
-impl<O: Operation<Type = ArrayType>> WhileDifferentiationOperation<ArrayType> for O
-where
-    O: From<ZeroOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<AddOperation<ArrayType>>
-        + From<BroadcastOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<SelectOperation<ArrayType>>
-        + From<ReduceOperation>
-        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>,
-{
-    #[inline]
-    fn residual_stack_zero(r#type: ArrayType) -> Self {
-        Self::from(ZeroOperation::new(r#type))
-    }
-
-    #[inline]
-    fn residual_stack_one(r#type: ArrayType) -> Self {
-        Self::from(OneOperation::new(r#type))
-    }
-
-    #[inline]
-    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        Self::from(BroadcastOperation::new(output_type, output_axes))
-    }
-
-    #[inline]
-    fn residual_stack_update() -> Self {
-        Self::from(DynamicUpdateSliceOperation::new())
-    }
-
-    #[inline]
-    fn residual_stack_add() -> Self {
-        Self::from(AddOperation::new())
-    }
-
-    #[inline]
-    fn residual_stack_select() -> Self {
-        Self::from(SelectOperation::<ArrayType>::new())
-    }
-
-    #[inline]
-    fn mask_reduce_any(axes: Vec<usize>) -> Self {
-        Self::from(ReduceOperation::new(axes, ReductionKind::Any))
-    }
-
-    #[inline]
-    fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError> {
-        O::provide(ParallelVaryOperation::new(axis_name.to_string()), &[input_type])
-    }
-}
-
-impl<O: ResidualStorageOperation<ArrayIrType>> WhileDifferentiationOperation<ArrayIrType> for O
-where
-    O: From<ZeroOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + OperationProjection<
-            ArrayType,
-            Projected: From<AddOperation<ArrayType>>
-                           + From<BroadcastOperation>
-                           + From<DynamicUpdateSliceOperation>
-                           + From<SelectOperation<ArrayType>>
-                           + From<ReduceOperation>,
-        >,
-    O::Projected: OperationProvider<ArrayType, ParallelVaryOperation, Operation = O::Projected>,
-{
-    fn residual_stack_zero(r#type: ArrayIrType) -> Self {
-        let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack zeros are always arrays") };
-        Self::from(ZeroOperation::new(r#type))
-    }
-
-    fn residual_stack_one(r#type: ArrayIrType) -> Self {
-        let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack ones are always arrays") };
-        Self::from(OneOperation::new(r#type))
-    }
-
-    #[inline]
-    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        let operation: O::Projected = BroadcastOperation::new(output_type, output_axes).into();
-        Self::from(operation)
-    }
-
-    #[inline]
-    fn residual_stack_update() -> Self {
-        let operation: O::Projected = DynamicUpdateSliceOperation::new().into();
-        Self::from(operation)
-    }
-
-    #[inline]
-    fn residual_stack_add() -> Self {
-        let operation: O::Projected = AddOperation::<ArrayType>::new().into();
-        Self::from(operation)
-    }
-
-    #[inline]
-    fn residual_stack_select() -> Self {
-        let operation: O::Projected = SelectOperation::<ArrayType>::new().into();
-        Self::from(operation)
-    }
-
-    #[inline]
-    fn mask_reduce_any(axes: Vec<usize>) -> Self {
-        let operation: O::Projected = ReduceOperation::new(axes, ReductionKind::Any).into();
-        Self::from(operation)
-    }
-
-    #[inline]
-    fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError> {
-        Ok(Self::from(O::Projected::provide(ParallelVaryOperation::new(axis_name.to_string()), &[input_type])?))
-    }
-}
 
 /// Configuration of the `r#while` function of [`While`] and of [`r#while()`](fn@while). By default, the loop has no
 /// iteration bound and runs for as long as its condition holds. No option carries a value, so, unlike
@@ -2406,13 +2260,17 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
             self.parent().bind(*operation, vec![batched_condition, batched_body], packed_inputs.as_slice())?;
         check_count!("output", outputs, bookkeeping_count + state_count, ProgramError);
         outputs.drain(..bookkeeping_count);
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(state_axes)
             .map(|(output, axis)| P::batch(output, axis))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
+
+/// Array member of a helper tracer used to stage `while` bookkeeping in the original operation universe.
+type WhileArrayValue<C> =
+    ProjectedValue<ArrayType, Tracer<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>>;
 
 /// Represents a staged forward-mode application of a [`WhileOperation`] whose state enters as the instruction input
 /// duals. The state elements keep their positions across the body boundary, so every state element is a loop carry and
@@ -2436,12 +2294,24 @@ impl<C: Context<Type: DifferentiableType + WhileType> + Zero<C::Value>> WhileJvp
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: OperationProvider<
+            ArrayType,
+            GuardOperation<ArrayType>,
+            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
+        >,
+    ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
+        Zero<WhileArrayValue<C>> + One<WhileArrayValue<C>>,
+    WhileArrayValue<C>: Value<Type = ArrayType> + Add + Broadcast + DynamicUpdateSlice + Select + Reduce + ParallelVary,
     C::Value: Concretizable<bool>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + From<ConditionOperation<C::Type>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Type>>
-        + WhileDifferentiationOperation<C::Type>,
+        + ResidualStorageOperation<C::Type>
+        + OperationProjection<ArrayType>,
+    for<'t> &'t ArrayType: TryFrom<&'t C::Type>,
+    for<'t> <&'t ArrayType as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
 {
     /// Creates a new [`WhileJvp`] by analyzing the forward-mode activity of an application of `operation` to the input
     /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body.
@@ -2554,11 +2424,10 @@ where
                 |trace_context, state: Vec<Tracer<TracingContext<C::Constant, C::Operation>>>| {
                     let predicate = condition.interpret_in_context(trace_context, state)?;
                     check_count!("output", predicate, 1, ProgramError);
-                    trace_context.bind(
-                        C::Operation::mask_reduce_any(mask_axes.clone()),
-                        Vec::new(),
-                        predicate.as_slice(),
-                    )
+                    let predicate: WhileArrayValue<C> =
+                        ValueProjection::<ArrayType>::into_projected(predicate[0].clone())?;
+                    let predicate = predicate.reduce_any(&mask_axes)?;
+                    Ok(vec![<Tracer<_> as ValueProjection<ArrayType>>::from_projected(predicate)])
                 },
                 state_types.clone(),
                 Vec::new(),
@@ -2587,7 +2456,9 @@ where
                         // element that it selects through staged transitions. It then broadcasts to the state element's
                         // shape with its own sharding extended over the trailing axes, so that the selection is per
                         // predicate item. A state element already shaped like the mask reuses it directly.
-                        let varied_mask = vary_while_index_or_mask(trace_context, mask.clone(), state_array_type)?;
+                        let array_mask: WhileArrayValue<C> =
+                            ValueProjection::<ArrayType>::into_projected(mask.clone())?;
+                        let varied_mask = vary_while_index_or_mask(array_mask, state_array_type)?;
                         let varied_mask_type = varied_mask.r#type().as_array_type()?.clone();
                         let element_mask_sharding = varied_mask_type
                             .sharding()
@@ -2600,23 +2471,14 @@ where
                         let element_mask = if element_mask_type == varied_mask_type {
                             varied_mask
                         } else {
-                            trace_context
-                                .bind(
-                                    C::Operation::residual_stack_broadcast(element_mask_type, mask_axes.clone()),
-                                    Vec::new(),
-                                    std::slice::from_ref(&varied_mask),
-                                )?
-                                .remove(0)
+                            varied_mask.broadcast(element_mask_type, &mask_axes)?
                         };
-                        next_state.push(
-                            trace_context
-                                .bind(
-                                    C::Operation::residual_stack_select(),
-                                    Vec::new(),
-                                    &[element_mask, candidate.clone(), carried.clone()],
-                                )?
-                                .remove(0),
-                        );
+                        let candidate: WhileArrayValue<C> =
+                            ValueProjection::<ArrayType>::into_projected(candidate.clone())?;
+                        let carried: WhileArrayValue<C> =
+                            ValueProjection::<ArrayType>::into_projected(carried.clone())?;
+                        let selected = Select::select(&element_mask, &candidate, &carried)?;
+                        next_state.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(selected));
                     }
                     // The predicate is recomputed from the whole state on every iteration, exactly as interpretation,
                     // the lowering, and the fused forward-mode rule recompute it. An item whose predicate reads its own
@@ -2809,6 +2671,7 @@ where
             let body = TracingContext::<C::Constant, C::Operation>::trace(
                 |inputs| {
                     let context = inputs[0].context().clone();
+                    let array_context = ProjectedContext::<_, ArrayType>::new(context.clone());
                     let original_input_count = primal_body.input_ids().len();
                     let mut extra_inputs = inputs[original_input_count..].iter();
                     let counter_input = extra_inputs.next().cloned().ok_or_else(|| {
@@ -2823,6 +2686,9 @@ where
                             "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the mask input",
                         ))
                     })?;
+                    let counter_input: WhileArrayValue<C> =
+                        ValueProjection::<ArrayType>::into_projected(counter_input)?;
+                    let mask_input: WhileArrayValue<C> = ValueProjection::<ArrayType>::into_projected(mask_input)?;
                     let mut body_outputs =
                         primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
                     let residual_outputs = body_outputs.split_off(state_count);
@@ -2840,15 +2706,11 @@ where
                             storage_type.rank() > 0 && manual_variation(storage_type).is_empty()
                         })
                     }) {
-                        let mut outputs =
-                            context.bind(C::Operation::residual_stack_zero(counter_type.clone()), Vec::new(), &[])?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Some(outputs.remove(0))
+                        Some(array_context.zero(counter_type.as_array_type()?)?)
                     } else {
                         None
                     };
-                    let mut varying_indices =
-                        Vec::<(BTreeSet<String>, Tracer<TracingContext<C::Constant, C::Operation>>, Option<_>)>::new();
+                    let mut varying_indices = Vec::<(BTreeSet<String>, WhileArrayValue<C>, Option<_>)>::new();
                     let mut next_stacks = Vec::with_capacity(stack_types.len());
                     for (((residual_output, residual_type), storage_type), stack_input) in
                         residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
@@ -2865,12 +2727,9 @@ where
                         let storage_array_type = storage_type.as_array_type()?;
                         let batch_item_type = storage_array_type.with_inserted_dimension(0, 1.into()).unwrap();
                         let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
-                        let mut expanded = context.bind(
-                            C::Operation::residual_stack_broadcast(batch_item_type, output_axes),
-                            Vec::new(),
-                            std::slice::from_ref(&storage_output),
-                        )?;
-                        check_count!("output", expanded, 1, ProgramError);
+                        let storage_output: WhileArrayValue<C> =
+                            ValueProjection::<ArrayType>::into_projected(storage_output)?;
+                        let expanded = storage_output.broadcast(batch_item_type, &output_axes)?;
                         let variation = manual_variation(storage_array_type);
                         let (counter_index, zero_index) = if variation.is_empty() {
                             (counter_input.clone(), zero_index.clone())
@@ -2878,21 +2737,14 @@ where
                             let position = match varying_indices.iter().position(|(axes, ..)| *axes == variation) {
                                 Some(position) => position,
                                 None => {
-                                    let counter =
-                                        vary_while_index_or_mask(&context, counter_input.clone(), storage_array_type)?;
+                                    let counter = vary_while_index_or_mask(counter_input.clone(), storage_array_type)?;
                                     varying_indices.push((variation, counter, None));
                                     varying_indices.len() - 1
                                 }
                             };
                             let (_, counter, zero) = &mut varying_indices[position];
                             if zero.is_none() && storage_array_type.rank() > 0 {
-                                let mut outputs = context.bind(
-                                    C::Operation::residual_stack_zero(counter.r#type().into_owned()),
-                                    Vec::new(),
-                                    &[],
-                                )?;
-                                check_count!("output", outputs, 1, ProgramError);
-                                *zero = Some(outputs.remove(0));
+                                *zero = Some(array_context.zero(counter.r#type().as_ref())?);
                             }
                             (counter.clone(), zero.clone())
                         };
@@ -2900,46 +2752,22 @@ where
                         if let Some(zero_index) = zero_index {
                             start_indices.extend((0..storage_array_type.rank()).map(|_| zero_index.clone()));
                         }
-                        let mut next_stack = context.bind(
-                            C::Operation::residual_stack_update(),
-                            Vec::new(),
-                            &std::iter::once(stack_input.clone())
-                                .chain(expanded.drain(..))
-                                .chain(start_indices)
-                                .collect::<Vec<_>>(),
-                        )?;
-                        check_count!("output", next_stack, 1, ProgramError);
-                        next_stacks.push(next_stack.remove(0));
+                        let stack_input: WhileArrayValue<C> =
+                            ValueProjection::<ArrayType>::into_projected(stack_input.clone())?;
+                        let next_stack = stack_input.dynamic_update_slice(&expanded, &start_indices)?;
+                        next_stacks.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(next_stack));
                     }
-                    let true_scalar =
-                        context.bind(C::Operation::residual_stack_one(boolean_scalar_type.clone()), Vec::new(), &[])?;
-                    check_count!("output", true_scalar, 1, ProgramError);
+                    let true_scalar = array_context.one(boolean_scalar_type.as_array_type()?)?;
                     let true_item_type =
                         boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, 1.into()).unwrap();
-                    let mut true_item = context.bind(
-                        C::Operation::residual_stack_broadcast(true_item_type, Vec::new()),
-                        Vec::new(),
-                        std::slice::from_ref(&true_scalar[0]),
-                    )?;
-                    check_count!("output", true_item, 1, ProgramError);
-                    let mut next_mask = context.bind(
-                        C::Operation::residual_stack_update(),
-                        Vec::new(),
-                        &[mask_input.clone(), true_item.remove(0), counter_input.clone()],
-                    )?;
-                    check_count!("output", next_mask, 1, ProgramError);
-                    let mut one_i64 =
-                        context.bind(C::Operation::residual_stack_one(counter_type.clone()), Vec::new(), &[])?;
-                    check_count!("output", one_i64, 1, ProgramError);
-                    let mut next_counter = context.bind(
-                        C::Operation::residual_stack_add(),
-                        Vec::new(),
-                        &[counter_input, one_i64.remove(0)],
-                    )?;
-                    check_count!("output", next_counter, 1, ProgramError);
-                    body_outputs.push(next_counter.remove(0));
+                    let true_item = true_scalar.broadcast(true_item_type, &[])?;
+                    let next_mask =
+                        mask_input.dynamic_update_slice(&true_item, std::slice::from_ref(&counter_input))?;
+                    let one_i64 = array_context.one(counter_type.as_array_type()?)?;
+                    let next_counter = counter_input.add(&one_i64)?;
+                    body_outputs.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(next_counter));
                     body_outputs.extend(next_stacks);
-                    body_outputs.push(next_mask.remove(0));
+                    body_outputs.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(next_mask));
                     Ok(body_outputs)
                 },
                 body_input_types,
@@ -2973,10 +2801,7 @@ where
         for zero_state_type in
             std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
         {
-            let mut zeros =
-                context.primal().bind(C::Operation::residual_stack_zero(zero_state_type.clone()), Vec::new(), &[])?;
-            check_count!("output", zeros, 1, ProgramError);
-            primal_inputs.push(zeros.remove(0));
+            primal_inputs.push(context.primal().zero(zero_state_type)?);
         }
         let mut while_outputs = context.primal().bind(
             WhileOperation::new().with_iteration_bound(bound)?,
@@ -3345,16 +3170,12 @@ fn validate_while_state_manual_variation<'t>(
 /// that carries no tangent, vary over every manual mesh axis that `target` varies over, so that it can be combined with
 /// stacks or state of type `target`. A value without a sharding is first placed, replicated, on the mesh of `target`.
 /// The value is returned unchanged when it already varies over those axes, which keeps programs outside manual regions
-/// unchanged. The transitions are bound as raw operations because the tracing contexts that build these programs bind
-/// no named axes, and they are never transposed because their inputs are integer or Boolean values.
-fn vary_while_index_or_mask<V: Value<Type: WhileType>, O: WhileDifferentiationOperation<V::Type>>(
-    context: &TracingContext<V, O>,
-    value: Tracer<TracingContext<V, O>>,
+/// unchanged. The explicit mesh comes from `target` because helper traces bind no named axes. These integer or Boolean
+/// bookkeeping values carry no tangent, so their variation transitions are never transposed.
+fn vary_while_index_or_mask<V: Value<Type: ArrayMemberType> + ParallelVary>(
+    mut value: V,
     target: &ArrayType,
-) -> Result<Tracer<TracingContext<V, O>>, ProgramError>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
+) -> Result<V, ProgramError> {
     let Some(target_sharding) = target.sharding() else {
         return Ok(value);
     };
@@ -3364,28 +3185,8 @@ where
         .iter()
         .filter(|axis| !value_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis)))
         .collect::<Vec<_>>();
-    if missing_axes.is_empty() {
-        return Ok(value);
-    }
-    let mut value = value;
-    if value_type.sharding().is_none() {
-        let rank = value_type.rank();
-        let placed_type = value_type
-            .with_sharding(Sharding::replicated(target_sharding.mesh().clone(), rank))
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let mut outputs = context.bind(
-            O::residual_stack_broadcast(placed_type, (0..rank).collect()),
-            Vec::new(),
-            std::slice::from_ref(&value),
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        value = outputs.remove(0);
-    }
     for axis in missing_axes {
-        let operation = O::residual_stack_vary(axis, value.r#type().as_array_type()?)?;
-        let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(&value))?;
-        check_count!("output", outputs, 1, ProgramError);
-        value = outputs.remove(0);
+        value = value.parallel_vary_on_mesh(axis, target_sharding.mesh())?;
     }
     Ok(value)
 }
@@ -3431,6 +3232,7 @@ mod tests {
     use crate::macros::{check_gradient, check_operation_batching};
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
+    use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection};
     use crate::operations::composites::CompositeTransposeOperation;
     use crate::operations::constants::constant::Constant;
@@ -3438,7 +3240,7 @@ mod tests {
     use crate::operations::constants::iota::Iota;
     use crate::operations::constants::one::One;
     use crate::operations::constants::one_like::OneLikeOperation;
-    use crate::operations::constants::zero::Zero;
+    use crate::operations::constants::zero::{Zero, ZeroOperation};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::tests::{
         CountingBatchingDriver, DischargeCapture, DischargeCaptureOperation, TestIrOperation, TestIrValue,
@@ -3447,10 +3249,11 @@ mod tests {
     use crate::operations::debugging::{PRINT_OPERATION_NAME, PrintOperation};
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::logical::{AndOperation, OrOperation};
-    use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
+    use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
     use crate::operations::manipulation::reshaping::DynamicReshapeOperation;
     use crate::operations::manipulation::reversing::ReverseOperation;
     use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+    use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
         REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
@@ -4252,9 +4055,9 @@ mod tests {
     fn while_transposition_error() -> ProgramError {
         ProgramError::UnsupportedOperation {
             message: format!(
-                "`{WHILE_OPERATION_NAME}` does not support transposition (reverse-mode differentiation through staged \
+                "`{WHILE_OPERATION_NAME}` does not support transposition (reverse mode differentiation through staged \
                  linear `{WHILE_OPERATION_NAME}` loops is not supported; eager differentiation executes concrete \
-                 duals, and the forward-mode rule of loops built with `with_iteration_bound` stages a transposable \
+                 duals, and the forward mode rule of loops built with `with_iteration_bound` stages a transposable \
                  masked scan)",
             ),
         }
@@ -4410,8 +4213,8 @@ mod tests {
         // A scalar array predicate selects one candidate wholesale.
         let on_true = Array::vector(vec![1.0f64, 2.0]).unwrap();
         let on_false = Array::vector(vec![-1.0f64, -2.0]).unwrap();
-        assert_eq!(Array::scalar(true).unwrap().select(&on_true, &on_false), Ok(on_true.clone()));
-        assert_eq!(Array::scalar(false).unwrap().select(&on_true, &on_false), Ok(on_false.clone()));
+        assert_eq!(WhilePredicate::select(&Array::scalar(true).unwrap(), &on_true, &on_false), Ok(on_true.clone()));
+        assert_eq!(WhilePredicate::select(&Array::scalar(false).unwrap(), &on_true, &on_false), Ok(on_false.clone()));
 
         // Predicate item `i` masks the contiguous per-item block of `on_true` and `on_false` elements it governs.
         let predicate = Array::vector(vec![false, true]).unwrap();
@@ -4421,7 +4224,7 @@ mod tests {
             Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, -3.0, -4.0])
                 .unwrap();
         assert_eq!(
-            predicate.select(&on_true, &on_false),
+            WhilePredicate::select(&predicate, &on_true, &on_false),
             Ok(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, 3.0, 4.0])
                 .unwrap()),
         );
@@ -4429,7 +4232,7 @@ mod tests {
         // Matching or divisible element counts do not make incompatible shapes broadcastable along prefix axes.
         let flattened = Array::vector(vec![1.0f64, 2.0, 3.0, 4.0]).unwrap();
         assert_eq!(
-            predicate.select(&flattened, &flattened),
+            WhilePredicate::select(&predicate, &flattened, &flattened),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[2]` is not a prefix of state `f64[4]`",
@@ -4439,7 +4242,7 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::Boolean, [2, 2]), &[false, true, true, false])
                 .unwrap();
         assert_eq!(
-            matrix_predicate.select(&flattened, &flattened),
+            WhilePredicate::select(&matrix_predicate, &flattened, &flattened),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[2, 2]` is not a prefix of state `f64[4]`",
@@ -4447,7 +4250,7 @@ mod tests {
         );
         let mismatched = Array::vector(vec![1.0f64, 2.0]).unwrap();
         assert_eq!(
-            predicate.select(&on_true, &mismatched),
+            WhilePredicate::select(&predicate, &on_true, &mismatched),
             Err(ProgramError::UnsupportedOperation {
                 message: "`select` requires congruent inputs, but got `f64[2, 2]` and `f64[2]`".to_string(),
             }),
@@ -4456,7 +4259,7 @@ mod tests {
         // An empty predicate has a valid empty prefix and selects an empty state without dividing by zero.
         let empty_predicate = Array::vector(Vec::<bool>::new()).unwrap();
         let empty_state = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 2]), &[]).unwrap();
-        assert_eq!(empty_predicate.select(&empty_state, &empty_state), Ok(empty_state));
+        assert_eq!(WhilePredicate::select(&empty_predicate, &empty_state, &empty_state), Ok(empty_state));
 
         // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch
         // layout, including its hole, while selecting exact element bytes in logical order.
@@ -4467,7 +4270,7 @@ mod tests {
             ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
         let on_true = Array::from_elements(branch_type.clone(), &[0x1111u16, 0x2222, 0x3333, 0x4444]).unwrap();
         let on_false = Array::from_elements(branch_type.clone(), &[0xaaaau16, 0xbbbb, 0xcccc, 0xdddd]).unwrap();
-        let selected = predicate.select(&on_true, &on_false).unwrap();
+        let selected = WhilePredicate::select(&predicate, &on_true, &on_false).unwrap();
         assert_eq!(selected.r#type().as_ref(), &branch_type);
         assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
         assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
@@ -4477,7 +4280,8 @@ mod tests {
         let scalar_false = array(Array::scalar(false).unwrap());
         let batched = array(Array::vector(vec![false, true]).unwrap());
         assert_eq!(
-            batched.select(
+            WhilePredicate::select(
+                &batched,
                 &array(Array::vector(vec![1.0f64, 2.0]).unwrap()),
                 &array(Array::vector(vec![-1.0f64, -2.0]).unwrap()),
             ),
@@ -4489,11 +4293,11 @@ mod tests {
         // item, so it accepts only identical carries.
         let on_true = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
         let on_false = TestIrValue::Reference(ArrayReference::new(Array::scalar(2.0f32).unwrap()));
-        assert_eq!(scalar_true.select(&on_true, &on_false), Ok(on_true.clone()));
-        assert_eq!(scalar_false.select(&on_true, &on_false), Ok(on_false.clone()));
-        assert_eq!(batched.select(&on_true, &on_true), Ok(on_true.clone()));
+        assert_eq!(WhilePredicate::select(&scalar_true, &on_true, &on_false), Ok(on_true.clone()));
+        assert_eq!(WhilePredicate::select(&scalar_false, &on_true, &on_false), Ok(on_false.clone()));
+        assert_eq!(WhilePredicate::select(&batched, &on_true, &on_true), Ok(on_true.clone()));
         assert_eq!(
-            batched.select(&on_true, &on_false),
+            WhilePredicate::select(&batched, &on_true, &on_false),
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "a batched `{WHILE_OPERATION_NAME}` predicate cannot select between distinct reference carries per \
@@ -4507,11 +4311,11 @@ mod tests {
         // represent independently masked per-item extents, so distinct dimension carries need a scalar predicate.
         let three = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let four = TestIrValue::Dimension(DimensionValue::constant(4).unwrap());
-        assert_eq!(scalar_true.select(&three, &four), Ok(three.clone()));
-        assert_eq!(scalar_false.select(&three, &four), Ok(four.clone()));
-        assert_eq!(batched.select(&three, &three), Ok(three.clone()));
+        assert_eq!(WhilePredicate::select(&scalar_true, &three, &four), Ok(three.clone()));
+        assert_eq!(WhilePredicate::select(&scalar_false, &three, &four), Ok(four.clone()));
+        assert_eq!(WhilePredicate::select(&batched, &three, &three), Ok(three.clone()));
         assert_eq!(
-            batched.select(&three, &four),
+            WhilePredicate::select(&batched, &three, &four),
             Err(ProgramError::Concretization {
                 message: "cannot extract a concrete boolean from a value of type `bool[2]`; expected `bool[]`"
                     .to_string(),
@@ -4521,20 +4325,20 @@ mod tests {
         // A state element can only be selected against an element of the same kind, and only an array predicate can
         // select at all.
         assert_eq!(
-            scalar_true.select(&three, &on_true),
+            WhilePredicate::select(&scalar_true, &three, &on_true),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` predicate cannot select between mismatched state types `dimension<3>` and \
                  `ref<f32[]>`",
             )))),
         );
         assert_eq!(
-            three.select(&on_true, &on_false),
+            WhilePredicate::select(&three, &on_true, &on_false),
             Err(ProgramError::Concretization {
                 message: format!("cannot use first-class dimension `3` as a `{WHILE_OPERATION_NAME}` predicate"),
             }),
         );
         assert_eq!(
-            on_true.select(&three, &four),
+            WhilePredicate::select(&on_true, &three, &four),
             Err(ProgramError::Concretization {
                 message: format!("cannot use reference `ref<f32[]>` as a `{WHILE_OPERATION_NAME}` predicate"),
             }),
@@ -4545,7 +4349,7 @@ mod tests {
         let predicate = trace.input(ArrayType::scalar(DataType::Boolean));
         let state = trace.input(ArrayType::scalar(DataType::F64));
         assert_eq!(
-            predicate.select(&state, &state).map(|_| ()),
+            WhilePredicate::select(&predicate, &state, &state).map(|_| ()),
             Err(ProgramError::Concretization {
                 message: "cannot extract a concrete boolean from a tracer".to_string(),
             }),
@@ -4564,23 +4368,23 @@ mod tests {
         let invariant = Array::vector(vec![false, true]).unwrap();
         let varying = Array::from_elements(varying_vector_type.clone(), &[true, false]).unwrap();
         let predicate = Array::from_elements(varying_scalar_type, &[true]).unwrap();
-        assert_eq!(predicate.select(&invariant, &invariant), Ok(invariant.clone()));
-        assert_eq!(predicate.select(&varying, &varying), Ok(varying.clone()));
+        assert_eq!(WhilePredicate::select(&predicate, &invariant, &invariant), Ok(invariant.clone()));
+        assert_eq!(WhilePredicate::select(&predicate, &varying, &varying), Ok(varying.clone()));
 
         // A batched predicate may be invariant over axes that the state varies over, but not the other way around.
         let predicate = Array::vector(vec![true, false]).unwrap();
         let other = Array::from_elements(varying_vector_type.clone(), &[false, true]).unwrap();
         assert_eq!(
-            predicate.select(&varying, &other),
+            WhilePredicate::select(&predicate, &varying, &other),
             Ok(Array::from_elements(varying_vector_type.clone(), &[true, true]).unwrap()),
         );
         let predicate = Array::from_elements(varying_vector_type.clone(), &[false, true]).unwrap();
         assert_eq!(
-            predicate.select(&varying, &other),
+            WhilePredicate::select(&predicate, &varying, &other),
             Ok(Array::from_elements(varying_vector_type, &[false, false]).unwrap()),
         );
         assert_eq!(
-            predicate.select(&invariant, &invariant),
+            WhilePredicate::select(&predicate, &invariant, &invariant),
             Err(TypeError::invalid(format!(
                 "batched `{WHILE_OPERATION_NAME}` predicate `bool[2][sharding={{mesh<['m'=2:manual]>, [{{}}], \
                  varying_manual={{'m'}}}}]` varies over manual axes that state `bool[2]` does not vary over",
@@ -14219,75 +14023,6 @@ mod tests {
     }
 
     #[test]
-    fn test_while_differentiation_operation() {
-        // The array family constructs each operation directly.
-        let state_type = ArrayType::new_static(DataType::F32, [2]);
-        let mask_type = ArrayType::new_static(DataType::Boolean, [2, 3]);
-        let scalar_type = ArrayType::scalar(DataType::I64);
-        assert_eq!(
-            TestOperation::residual_stack_zero(state_type.clone()),
-            TestOperation::Zero(ZeroOperation::new(state_type.clone())),
-        );
-        assert_eq!(
-            TestOperation::residual_stack_one(scalar_type.clone()),
-            TestOperation::One(OneOperation::new(scalar_type.clone())),
-        );
-        assert_eq!(
-            TestOperation::residual_stack_broadcast(mask_type.clone(), vec![0]),
-            TestOperation::Broadcast(BroadcastOperation::new(mask_type.clone(), vec![0])),
-        );
-        assert_eq!(
-            TestOperation::residual_stack_update(),
-            TestOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new()),
-        );
-        assert_eq!(TestOperation::residual_stack_add(), TestOperation::Add(AddOperation::new()));
-        assert_eq!(TestOperation::residual_stack_select(), TestOperation::Select(SelectOperation::new()));
-        assert_eq!(
-            TestOperation::mask_reduce_any(vec![0, 1]),
-            TestOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Any)),
-        );
-        assert_eq!(
-            TestOperation::residual_stack_vary("x", &scalar_type),
-            Ok(TestOperation::ParallelVary(ParallelVaryOperation::new("x".to_string()))),
-        );
-
-        // The array IR family wraps each operation of its array projection, including the statically shaped zeros and
-        // ones that it lifts from array-typed state.
-        assert_eq!(
-            TestIrOperation::residual_stack_zero(state_type.clone().into()),
-            TestIrOperation::Array(TestOperation::Zero(ZeroOperation::new(state_type))),
-        );
-        assert_eq!(
-            TestIrOperation::residual_stack_one(scalar_type.clone().into()),
-            TestIrOperation::Array(TestOperation::One(OneOperation::new(scalar_type.clone()))),
-        );
-        assert_eq!(
-            TestIrOperation::residual_stack_broadcast(mask_type.clone(), vec![0]),
-            TestIrOperation::Array(TestOperation::Broadcast(BroadcastOperation::new(mask_type, vec![0]))),
-        );
-        assert_eq!(
-            TestIrOperation::residual_stack_update(),
-            TestIrOperation::Array(TestOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
-        );
-        assert_eq!(
-            TestIrOperation::residual_stack_add(),
-            TestIrOperation::Array(TestOperation::Add(AddOperation::new())),
-        );
-        assert_eq!(
-            TestIrOperation::residual_stack_select(),
-            TestIrOperation::Array(TestOperation::Select(SelectOperation::new())),
-        );
-        assert_eq!(
-            TestIrOperation::mask_reduce_any(vec![0, 1]),
-            TestIrOperation::Array(TestOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Any))),
-        );
-        assert_eq!(
-            TestIrOperation::residual_stack_vary("x", &scalar_type),
-            Ok(TestIrOperation::Array(TestOperation::ParallelVary(ParallelVaryOperation::new("x".to_string())))),
-        );
-    }
-
-    #[test]
     fn test_while_options_new() {
         // New options describe the default unbounded loop.
         let options = WhileOptions::new();
@@ -14968,5 +14703,54 @@ mod tests {
             ),
             expected,
         );
+    }
+
+    #[test]
+    fn test_vary_while_index_or_mask() {
+        // Helper traces bind no named axes. The target supplies the mesh for scalar bookkeeping in both families.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap();
+        let target = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
+        let index_type = ArrayType::scalar(DataType::I64);
+        let varying_index_type = index_type.clone().with_sharding(sharding).unwrap();
+        let expected = indoc! {"
+            lambda %0:i64[] .
+            let %1:i64[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                [output_type=i64[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
+                %2:i64[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                    parallel_vary [axis_name=\"m\"] %1
+            in (%2)"};
+        let (output_type, program) =
+            TestTracingContext::trace(|index| vary_while_index_or_mask(index, &target), index_type.clone()).unwrap();
+        assert_eq!(output_type, varying_index_type);
+        assert_eq!(program.to_string(), expected);
+        let (output_type, program) = TestIrTracingContext::trace(
+            |index| vary_while_index_or_mask(index, &target),
+            ArrayIrType::from(index_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(output_type, varying_index_type.clone().into());
+        assert_eq!(program.to_string(), expected);
+
+        // Already varying values and targets without manual variation need no transitions.
+        let (output_type, program) = TestIrTracingContext::trace(
+            |index| vary_while_index_or_mask(index, &target),
+            ArrayIrType::from(varying_index_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(output_type, varying_index_type.into());
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i64[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                in (%0)"},
+        );
+        let (output_type, program) = TestTracingContext::trace(
+            |index| vary_while_index_or_mask(index, &ArrayType::scalar(DataType::F32)),
+            index_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, index_type);
+        assert_eq!(program.to_string(), "lambda %0:i64[] .\nin (%0)");
     }
 }

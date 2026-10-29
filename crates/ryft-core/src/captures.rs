@@ -77,6 +77,9 @@ use crate::tracing::{NestedTracingContext, TracingContext};
 /// [`ClosedProgram`]'s capture table. This keeps concrete runtime values in the closed program's side environment
 /// instead of embedding them in reusable staged IR.
 ///
+/// [`ValueProjection`] preserves the capture index while narrowing its type. The borrowed type conversion may return
+/// any error convertible into [`TypeError`], including [`std::convert::Infallible`] for a same-type projection.
+///
 /// # Why capture by reference instead of baking in a literal?
 ///
 /// Closed-over runtime values (e.g., the arrays a just-in-time-compiled function closes over) are recorded as captures
@@ -151,7 +154,8 @@ impl<T: Type> Value for CaptureReference<T> {
 
 impl<T: Type + From<P>, P: Type> ValueProjection<P> for CaptureReference<T>
 where
-    for<'a> &'a P: TryFrom<&'a T, Error = TypeError>,
+    for<'a> &'a P: TryFrom<&'a T>,
+    for<'a> <&'a P as TryFrom<&'a T>>::Error: Into<TypeError>,
 {
     type Projected = CaptureReference<P>;
     type ProjectedRef<'v>
@@ -170,12 +174,12 @@ where
     where
         P: 'v,
     {
-        Ok(ProjectedValue::new(self, <&P>::try_from(&self.r#type)?.clone()))
+        Ok(ProjectedValue::new(self, <&P>::try_from(&self.r#type).map_err(Into::<TypeError>::into)?.clone()))
     }
 
     #[inline]
     fn into_projected(self) -> Result<Self::Projected, TypeError> {
-        let r#type = <&P>::try_from(&self.r#type)?.clone();
+        let r#type = <&P>::try_from(&self.r#type).map_err(Into::<TypeError>::into)?.clone();
         Ok(CaptureReference::new(self.index, r#type))
     }
 }
@@ -727,6 +731,21 @@ mod tests {
             <CaptureReference<ArrayIrType> as ValueProjection<ReferenceType<ArrayType>>>::from_projected(projected);
         assert_eq!(lifted.index(), 5);
         assert_eq!(lifted.r#type().as_ref(), &ArrayIrType::Reference(reference_type));
+    }
+
+    #[test]
+    fn test_capture_reference_projection_preserves_homogeneous_type() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let capture = CaptureReference::new(3, array_type.clone());
+        let borrowed = <CaptureReference<ArrayType> as ValueProjection<ArrayType>>::projected(&capture).unwrap();
+        assert!(std::ptr::eq(*borrowed.value(), &capture));
+        assert_eq!(borrowed.r#type().as_ref(), &array_type);
+
+        let projected =
+            <CaptureReference<ArrayType> as ValueProjection<ArrayType>>::into_projected(capture.clone()).unwrap();
+        assert_eq!(projected.index(), 3);
+        assert_eq!(projected.r#type().as_ref(), &array_type);
+        assert_eq!(<CaptureReference<ArrayType> as ValueProjection<ArrayType>>::from_projected(projected), capture,);
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::operations::{
     TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
     WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
-use crate::programs::{Value, ValueProjection};
+use crate::programs::{OperationProjection, Value, ValueProjection};
 
 #[cfg(doc)]
 use crate::programs::{Operation, TypeError, Typed};
@@ -142,6 +142,10 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     CustomCall(CustomCallOperation),
     Composite(CompositeOperation<V, ArrayOperation<V>>),
     CompositeTranspose(CompositeTransposeOperation<V, ArrayOperation<V>>),
+}
+
+impl<V: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayOperation<V> {
+    type Projected = Self;
 }
 
 /// Value-level capability bundle that groups every operation Ryft supports on arrays, so that generic array code can
@@ -1388,6 +1392,7 @@ mod tests {
     fn test_array_ir_operation_projection() {
         fn assert_projection<T: Type, O: Operation<Type = T>, Family: OperationProjection<T, Projected = O>>() {}
 
+        assert_projection::<ArrayType, ArrayOperation<Array>, ArrayOperation<Array>>();
         assert_projection::<ArrayType, ArrayOperation<Array>, ArrayIrOperation<Array>>();
         assert_projection::<DimensionType, DimensionOperation<DimensionValue>, ArrayIrOperation<Array>>();
 

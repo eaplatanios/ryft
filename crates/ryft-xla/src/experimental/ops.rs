@@ -39,6 +39,7 @@ use crate::operations::jit_call::JitCallOperation;
 
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
 /// literals preserve dimension-comparison proofs without allocating device storage or introducing a capture.
+/// Projection onto [`ArrayType`] is the identity and preserves both representations unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum XlaArrayConstant {
     /// A reference to array data in the enclosing capture table.
@@ -105,6 +106,29 @@ impl Value for XlaArrayConstant {
             Self::Captured(value) => Some(value.index()),
             Self::Boolean(_) => None,
         }
+    }
+}
+
+impl ValueProjection<ArrayType> for XlaArrayConstant {
+    type Projected = Self;
+    type ProjectedRef<'v> = &'v Self;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        Ok(self)
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        Ok(self)
     }
 }
 
@@ -1136,6 +1160,27 @@ pub(crate) mod tests {
                 in (%3)"},
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+    }
+
+    #[test]
+    fn test_xla_array_constant_value_projection() {
+        let array_type = vector_type().with_memory(Memory::Host { pinned: true });
+        let captured = XlaArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
+        let borrowed = ValueProjection::<ArrayType>::projected(&captured).unwrap();
+        assert!(std::ptr::eq(borrowed, &captured));
+        assert_eq!(borrowed.r#type().as_ref(), &array_type);
+        assert_eq!(borrowed.capture_index(), Some(2));
+        let owned = ValueProjection::<ArrayType>::into_projected(captured.clone()).unwrap();
+        assert_eq!(owned, captured);
+        assert_eq!(<XlaArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), captured);
+
+        let predicate = XlaArrayConstant::Boolean(true);
+        let borrowed = ValueProjection::<ArrayType>::projected(&predicate).unwrap();
+        assert!(std::ptr::eq(borrowed, &predicate));
+        assert_eq!(borrowed.capture_index(), None);
+        let owned = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
+        assert_eq!(owned, predicate);
+        assert_eq!(<XlaArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), predicate);
     }
 
     #[test]

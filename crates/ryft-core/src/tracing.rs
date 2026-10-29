@@ -100,6 +100,10 @@ pub enum TracerState {
 /// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values, and
 /// recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return _poisoned_
 /// tracers which are represented using [`TracerState::Poison`].
+///
+/// [`ValueProjection`] narrows the reported type without changing the staged atom. The borrowed type conversion may
+/// return any error convertible into [`TypeError`], including [`std::convert::Infallible`] when projecting a type onto
+/// itself.
 #[derive(Clone, Parameter)]
 pub struct Tracer<C: Context> {
     /// [`Context`] associated with this [`Tracer`].
@@ -240,7 +244,8 @@ impl<C: StagingContext> Value for Tracer<C> {
 
 impl<C: StagingContext, T: Type> ValueProjection<T> for Tracer<C>
 where
-    for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
+    for<'t> &'t T: TryFrom<&'t C::Type>,
+    for<'t> <&'t T as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
 {
     type Projected = ProjectedValue<T, Self>;
     type ProjectedRef<'v>
@@ -259,12 +264,12 @@ where
     where
         T: 'v,
     {
-        Ok(ProjectedValue::new(self, <&T>::try_from(&self.r#type)?.clone()))
+        Ok(ProjectedValue::new(self, <&T>::try_from(&self.r#type).map_err(Into::<TypeError>::into)?.clone()))
     }
 
     #[inline]
     fn into_projected(self) -> Result<Self::Projected, TypeError> {
-        let r#type = <&T>::try_from(&self.r#type)?.clone();
+        let r#type = <&T>::try_from(&self.r#type).map_err(Into::<TypeError>::into)?.clone();
         Ok(ProjectedValue::new(self, r#type))
     }
 }
@@ -1626,6 +1631,52 @@ mod tests {
         assert!(matches!(output.state(), TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_tracer_value_projection() {
+        // An infallible same-type projection retains the atom and stages array operations in the original builder.
+        let array_type = ArrayType::scalar(DataType::F64);
+        let (output_type, program) = TestArrayTracingContext::trace(
+            |input| {
+                let borrowed = ValueProjection::<ArrayType>::projected(&input)?;
+                assert!(std::ptr::eq(*borrowed.value(), &input));
+                assert_eq!(borrowed.r#type(), input.r#type());
+                let projected = ValueProjection::<ArrayType>::into_projected(input.clone())?;
+                assert_eq!(projected.value().atom_id(), input.atom_id());
+                assert_eq!(Tracer::<TestArrayTracingContext>::from_projected(projected.clone()), input);
+                let mut outputs = projected.domain().bind(NegOperation::new(), Vec::new(), &[projected])?;
+                Ok(Tracer::<TestArrayTracingContext>::from_projected(outputs.remove(0)))
+            },
+            array_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, array_type.clone());
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)"},
+        );
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(-3.0).unwrap()));
+
+        // Fallible member projections retain their `TypeError` diagnostics for both borrowed and owned inputs.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(array_type.clone().into());
+        assert_eq!(ValueProjection::<ArrayType>::projected(&input).unwrap().r#type().as_ref(), &array_type);
+        let projected = ValueProjection::<ArrayType>::into_projected(input.clone()).unwrap();
+        assert_eq!(projected.r#type().as_ref(), &array_type);
+        assert_eq!(projected.into_value(), input);
+        let dimension = context.input(DimensionType::from(Dimension::Static(2)).into());
+        assert_eq!(
+            ValueProjection::<ArrayType>::projected(&dimension).map(|_| ()),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            ValueProjection::<ArrayType>::into_projected(dimension).map(|_| ()),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -9,7 +10,8 @@ use crate::errors::CustomError;
 use crate::parameters::Parameter;
 use crate::programs::identities::{TypeIdentity, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming};
 
-/// Represents errors produced while inferring or validating [`Type`]s.
+/// Represents errors produced while inferring or validating [`Type`]s. Infallible type projections convert their
+/// uninhabited error into this type so that fallible and infallible projections can share the same bounds.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum TypeError {
     /// A generic type contract was invalid.
@@ -45,6 +47,16 @@ impl TypeError {
             Self::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
             _ => None,
         }
+    }
+}
+
+// `TryFrom` requires an error type even for conversions that cannot fail, such as `&ArrayType` to itself.
+// Rust uses `Infallible` for these conversions. This implementation satisfies the projection code's
+// `Into<TypeError>` bound, but can never run because `Infallible` has no possible values.
+impl From<Infallible> for TypeError {
+    #[inline]
+    fn from(error: Infallible) -> Self {
+        match error {}
     }
 }
 
