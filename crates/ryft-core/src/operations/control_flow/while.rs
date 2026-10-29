@@ -1802,11 +1802,9 @@ impl From<WhileOperation<ArrayType>> for WhileOperation<ArrayIrType> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Configuration of the `r#while` function of [`While`] and of [`r#while()`](fn@while). By default, the loop has no
-/// iteration bound and runs for as long as its condition holds. No option carries a value, so, unlike
-/// [`ScanOptions`](super::scan::ScanOptions), these options are not generic over a value type.
+/// Configuration of the `r#while` function of [`While`] and of [`r#while()`](fn@while). By default, the loop
+/// has no iteration bound and runs for as long as its condition holds. No option carries a value, so, unlike
+/// [`ScanOptions`](crate::ScanOptions), these options are not generic over a value type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhileOptions {
     /// Optional semantic iteration bound of the loop.
@@ -1829,8 +1827,8 @@ impl WhileOptions {
     ///
     /// Returns a [`ProgramError::Type`] when `bound` is zero or exceeds the maximum supported extent.
     pub fn with_iteration_bound<B: Into<Option<usize>>>(mut self, bound: B) -> Result<Self, ProgramError> {
-        // Reuse the operation's validation rather than define another bound contract for the frontend. The bound does
-        // not depend on the type universe, so any universe validates it.
+        // Reuse the operation's validation rather than define another bound contract for the frontend.
+        // The bound does not depend on the type universe, so any universe validates it.
         self.iteration_bound = WhileOperation::<ArrayType>::new().with_iteration_bound(bound)?.iteration_bound();
         Ok(self)
     }
@@ -1849,27 +1847,27 @@ impl Default for WhileOptions {
     }
 }
 
-/// Context construction capability for a structured [`WhileOperation`], the Ryft analogue of JAX's
-/// [`lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html). The loop is bound in this
-/// explicit context, which need not be the domain of the state values. The global [`r#while()`](fn@while) function
+/// Context construction capability for a structured [`WhileOperation`]. This is the Ryft analogue of JAX's
+/// [`jax.lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html). The loop is bound in
+/// this explicit context, which need not be the domain of the state values. The global [`r#while()`](fn@while) function
 /// instead recovers its context from the first state value.
 ///
 /// The condition receives the loop state and returns one Boolean predicate. The body receives the same state and
 /// returns the next state. The state may be a [`Parameterized`] structure with static fields. The body must return the
-/// same structure and static fields, and its leaf types must remain valid loop state. A batched (prefix-shaped)
+/// same structure and static fields, and its leaf types must remain valid loop state. A batched (i.e., prefix-shaped)
 /// predicate is accepted and gives the masked semantics of [`WhileOperation`]. The loop continues while any item's
-/// predicate holds, and items whose predicate is false keep their state. A reference leaf enters the loop whole, and
-/// the body must return the reference it received.
+/// predicate holds, and items whose predicate is false keep their state. A reference leaf enters the loop whole,
+/// and the body must return the reference it received.
 ///
-/// Both functions are traced, not called once per runtime iteration. They may be retraced while the manual variation of
-/// the state reaches a fixed point, so they must describe the same computation on every call. Inside a manual region
+/// Both functions are traced, not called once per runtime iteration. They may be retraced while the manual variation
+/// of the state reaches a fixed point, so they must describe the same computation on every call. Inside a manual region
 /// (e.g., the body of a [`ShardMapOperation`](crate::ShardMapOperation)), devices whose predicates differ run different
 /// numbers of iterations, so every array leaf of the state is widened to vary over every manual axis that the predicate
 /// varies over, in addition to every axis that the body makes it vary over. Reference leaves are not widened. The
-/// referent of a reference leaf must already vary over those predicate axes, or the loop is rejected. The widening of
-/// the initial state is applied before the loop, including when the loop runs no iterations, and its transpose
-/// preserves the corresponding reductions. Nonconstant values used by either function must be passed through the state.
-/// Constants may be closed over.
+/// referent of a reference leaf must already vary over those predicate axes, or the loop is rejected. The widening
+/// of the initial state is applied before the loop, including when the loop runs no iterations, and its transpose
+/// preserves the corresponding reductions. Non-constant values used by either function must be passed through the
+/// state. Constants may be closed over.
 pub trait While: Context {
     /// Traces `condition_fn` and `body_fn` and binds one [`WhileOperation`] in this context, returning its final state.
     ///
@@ -1885,7 +1883,11 @@ pub trait While: Context {
     /// Returns errors for invalid predicates, state structure/static-field changes, state signature changes, reference
     /// identities, or nonconvergent manual variation, and errors from tracing, alignment, or binding.
     fn r#while<
-        State: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        State: Parameterized<
+                Self::Value,
+                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>,
+                ParameterStructure: PartialEq,
+            >,
         ConditionFn: FnMut(
             State::To<Tracer<NestedTracingContext<Self>>>,
         ) -> Result<Tracer<NestedTracingContext<Self>>, ProgramError>,
@@ -1898,9 +1900,7 @@ pub trait While: Context {
         body_fn: BodyFn,
         state: State,
         options: WhileOptions,
-    ) -> Result<State, ProgramError>
-    where
-        State::ParameterStructure: PartialEq;
+    ) -> Result<State, ProgramError>;
 }
 
 impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> While for C
@@ -1908,7 +1908,11 @@ where
     Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
 {
     fn r#while<
-        State: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        State: Parameterized<
+                Self::Value,
+                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>,
+                ParameterStructure: PartialEq,
+            >,
         ConditionFn: FnMut(
             State::To<Tracer<NestedTracingContext<Self>>>,
         ) -> Result<Tracer<NestedTracingContext<Self>>, ProgramError>,
@@ -1921,10 +1925,7 @@ where
         mut body_fn: BodyFn,
         state: State,
         options: WhileOptions,
-    ) -> Result<State, ProgramError>
-    where
-        State::ParameterStructure: PartialEq,
-    {
+    ) -> Result<State, ProgramError> {
         // Preserve the state structure and its static fields separately from the runtime leaves that become the loop
         // state. The condition and the body rebuild their structured arguments from the same structure.
         let state_structure = state.parameter_structure();
@@ -1974,8 +1975,8 @@ where
                     if next_state.parameter_structure() != state_structure {
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
-                                "`{WHILE_OPERATION_NAME}` body must preserve the state parameter structure and static \
-                                 fields",
+                                "`{WHILE_OPERATION_NAME}` body must preserve the state parameter structure \
+                                 and static fields",
                             ),
                         });
                     }
@@ -2055,7 +2056,7 @@ where
 /// `state`. The condition can only compute its predicate from state values, so the state must contain at least one
 /// value alongside any static fields.
 ///
-/// ```
+/// ```rust
 /// # use ryft_core::{Array, Compare, Context, ProgramError, WhileOptions, r#while};
 /// # fn main() -> Result<(), ProgramError> {
 /// let (count, value) = r#while(
@@ -2081,7 +2082,11 @@ where
 #[inline]
 pub fn r#while<
     V: Value<Domain: While>,
-    State: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
+    State: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>,
+            ParameterStructure: PartialEq,
+        >,
     ConditionFn: FnMut(
         State::To<Tracer<NestedTracingContext<V::Domain>>>,
     ) -> Result<Tracer<NestedTracingContext<V::Domain>>, ProgramError>,
@@ -2093,15 +2098,14 @@ pub fn r#while<
     body_fn: BodyFn,
     state: State,
     options: WhileOptions,
-) -> Result<State, ProgramError>
-where
-    State::ParameterStructure: PartialEq,
-{
+) -> Result<State, ProgramError> {
     let context = state.parameters().next().map(Value::domain).ok_or_else(|| ProgramError::InvalidArgument {
         message: format!("`{WHILE_OPERATION_NAME}` requires a state value to recover its context from"),
     })?;
     context.r#while(condition_fn, body_fn, state, options)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: BatchingPolicy<C>>
     BatchingContext<C, P>
