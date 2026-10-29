@@ -7478,6 +7478,73 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_transposition_omits_structural_zero_seeds() {
+        // The primal `(p, x) ↦ (p · x, x + x)` is linear in `x`. When only its first output is live, the second
+        // output's seed is a structural zero: the transposed primal receives no input for it and stages none of the
+        // work that only that seed reaches. With both outputs live, the second seed contributes `ȳ₁ + ȳ₁`.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let primal = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let scale = builder.add_input(scalar_type.clone());
+            let linear = builder.add_input(scalar_type.clone());
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, scale], None).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![linear, linear], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![product, sum], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let operation = ArrayOperation::Composite(ArrayComposite::from_rule_regions(CompositeJvpRule::Absent, false));
+        let program = composite_call_program(operation, vec![primal], vec![scalar_type.clone(), scalar_type]);
+        let scalar = |value: f64| Array::scalar(value).unwrap();
+
+        // Projecting the program onto the first output keeps the two-output call, so its second output's seed reaches
+        // the call's transpose rule as a structural zero rather than being pruned away beforehand.
+        let projected = program.with_outputs(&[0]).unwrap();
+        assert_eq!(
+            projected.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[], %3:f64[] = composite %0 %1 [
+                    primal={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                            %3:f64[] = add %1 %1
+                        in (%2, %3)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let transposed = projected.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(transposed.interpret(vec![scalar(2.0), scalar(3.0)]), Ok(vec![scalar(6.0)]));
+
+        let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = add %1 %1
+                    %4:f64[] = mul %2 %0
+                    %5:f64[] = add %3 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(transposed.interpret(vec![scalar(2.0), scalar(5.0), scalar(3.0)]), Ok(vec![scalar(16.0)]));
+    }
+
+    #[test]
     fn test_composite_transposition_jvp_rule() {
         // Differentiation replaces the call with its replayed rule before transposition, so a direct transpose of an
         // un-linearized call transposes its primal region, whose nonlinear `sin` rejects it.

@@ -21970,7 +21970,7 @@ mod tests {
         // A dead stacked output's cotangent has the stacked type `f64[length, k]`, which no single value at the
         // transposition boundary carries. It stays a structural zero: the body is transposed without a seed for it, so
         // the reversed scan neither materializes a zero stack nor adds a zero slice in every iteration.
-        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let extent = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
         let item_type =
             ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
@@ -22006,7 +22006,7 @@ mod tests {
         let body_region = builder.import_region(body.entry_region_ref());
         let outputs = builder
             .add_instruction(
-                TestIrOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                TestIrOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length.clone()))),
                 vec![body_region],
                 vec![initial_carry, stacked_input, iteration_count],
                 None,
@@ -22024,7 +22024,7 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f64[k], %1:dimension<length \u{2208} [1, 8)> .
+                lambda %0:f64[k], %1:dimension<length \u{2208} [0, 8)> .
                 let %2:f64[k], %3:f64[length, k] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[k] .
@@ -22034,6 +22034,24 @@ mod tests {
                 in (%2, %3)
             "}
             .trim_end(),
+        );
+
+        // The same pullback runs at any runtime iteration count: the carry cotangent passes through unchanged and
+        // becomes every row of the stacked input's cotangent, including the empty stack of a zero-iteration scan,
+        // whose `k` extent the carry cotangent supplies.
+        let length_type = DimensionType::from(length);
+        let seed = array(Array::vector(vec![1.0f64, 2.0]).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), dimension(&length_type, 0)]),
+            Ok(vec![seed.clone(), array(Array::matrix(0, 2, Vec::<f64>::new()).unwrap())]),
+        );
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), dimension(&length_type, 1)]),
+            Ok(vec![seed.clone(), array(Array::matrix(1, 2, vec![1.0f64, 2.0]).unwrap())]),
+        );
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), dimension(&length_type, 3)]),
+            Ok(vec![seed, array(Array::matrix(3, 2, vec![1.0f64, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap())]),
         );
     }
 

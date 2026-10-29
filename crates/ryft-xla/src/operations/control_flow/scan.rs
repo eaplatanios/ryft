@@ -637,12 +637,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, AddOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, AssertOperation, BatchAxis,
-        BatchedProgram, ConditionOperation, ConvertElementType, Device, DeviceMesh, DimensionBounds,
-        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, Placeholder, PrintOperation,
-        ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation, ReferenceReadOperation, ReferenceType,
-        RngBitGeneratorOperation, ScanOptions, ShardMap, ShardMapOperation, Sharding, ShardingDimension,
-        TracingContext, TypeError, WhileOperation, scan,
+        BatchedProgram, CompositeTransposeOperation, ConditionOperation, ConvertElementType, Device, DeviceMesh,
+        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, Placeholder,
+        PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions, ShardMap, ShardMapOperation,
+        Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError, WhileOperation,
+        ZeroOperation, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
@@ -3863,6 +3864,105 @@ mod tests {
                 MixedValue::Dimension(0),
             ]),
         );
+    }
+
+    #[test]
+    fn test_scan_execution_transposed_without_cotangent_outputs_runs_backward_effects() {
+        // The body maps each item through a reverse-mode carrier whose backward rule prints its seed and returns a
+        // zero, so the transposed scan has no cotangent outputs and only its printing effect is observable.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let backward = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let seed = builder.add_input(scalar_type.clone().into());
+            builder
+                .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
+                .unwrap();
+            let zero = builder
+                .add_instruction(ZeroOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ArrayIrXlaProgramBuilder::new();
+            let backward = builder.import_region(backward.entry_region_ref());
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let item = builder.add_input(scalar_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                        0,
+                        vec![scalar_type.clone().into()],
+                        vec![scalar_type.clone().into()],
+                    ),
+                    vec![backward],
+                    vec![item],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ArrayIrXlaProgramBuilder::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
+        let outputs = builder
+            .add_instruction(XlaOperation::Scan(ScanOperation::new(0, 3)), vec![body_region], vec![items], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        ensure_print_handler_registered(&client).unwrap();
+
+        // Live seeds: the reversed scan prints each seed in reverse visit order and returns no cotangent stack.
+        let transposed = program.entry_region_ref().transpose(&[0], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        let pullback = transposed.into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let () = scan [carry_count=0, iteration_count=3, reverse=true] %0 [
+                    body={
+                        lambda %0:i64[], %1:f64[] .
+                        let %2:f64[] = print [label=backward] %1
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let (outputs, lines) = with_captured_prints(|| {
+            execute_mixed_program(&client, &pullback, &[MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])], &[])
+        });
+        assert_eq!(outputs, Ok(Vec::new()));
+        assert_eq!(lines, vec!["backward: 3.0", "backward: 2.0", "backward: 1.0"]);
+
+        // Structural-zero seeds: the stacked output is dead, so its seeds stay symbolic and the reversed scan has no
+        // seed input, but the backward rule's effect still runs once per reversed iteration on a materialized zero.
+        let transposed = program.with_outputs(&[]).unwrap().entry_region_ref().transpose(&[0], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        let pullback = transposed.into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda  .
+                let () = scan [carry_count=0, iteration_count=3, reverse=true] [
+                    body={
+                        lambda %0:i64[] .
+                        let %1:f64[] = zero [type=f64[]]
+                            %2:f64[] = print [label=backward] %1
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
+        assert_eq!(outputs, Ok(Vec::new()));
+        assert_eq!(lines, vec!["backward: 0.0", "backward: 0.0", "backward: 0.0"]);
     }
 
     #[test]
