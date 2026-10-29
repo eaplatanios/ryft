@@ -70,8 +70,9 @@ use crate::operations::collectives::parallel_vary::{
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero};
 use crate::operations::control_flow::{
-    ResidualStorageOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types,
-    stabilize_carry_axes, validate_output_identities, validate_reference_carry_roots, validate_region_input,
+    ResidualStorageOperation, canonicalize_carry_axes, passed_through_carries, refine_control_flow_output_types,
+    stabilize_carry_axes, validate_control_flow_output_identity_scope, validate_control_flow_region_input_refinement,
+    validate_reference_carry_roots,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::conversions::{CastOperation, CastType};
@@ -247,7 +248,13 @@ pub trait ScanType:
                     )));
                 }
             } else {
-                validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?;
+                validate_control_flow_region_input_refinement(
+                    SCAN_OPERATION_NAME,
+                    index,
+                    actual,
+                    expected,
+                    "expected type",
+                )?;
             }
         }
         validate_scan_iteration_count_type(iteration_count, input_types)?;
@@ -390,20 +397,21 @@ pub trait ScanType:
         }
         .declared_output_types(body_output_types)?;
 
-        // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
-        // separate step from the iteration count refinement above: the stacked outputs' leading axis describes the
-        // iteration count that is fixed before the first iteration, so it stays refined even when a first-class
-        // dimension carry shares the iteration count's identity and keeps every carry that refers to it symbolic. An
-        // iteration count of another type (e.g., the exact type of an eager dimension value) is a member of the facts
-        // like every other input, so that no carry declared with the iteration count's identity establishes an extent
-        // that disagrees with the iteration count, while one that carries the iteration count's own identity
-        // establishes nothing beyond the declared bounds. Only the carries preserve the identities of reference inputs.
+        // The facts that the inputs establish then refine the outputs (refer to `refine_control_flow_output_types`).
+        // This is a separate step from the iteration count refinement above: the stacked outputs' leading axis
+        // describes the iteration count that is fixed before the first iteration, so it stays refined even when a
+        // first-class dimension carry shares the iteration count's identity and keeps every carry that refers to it
+        // symbolic. An iteration count of another type (e.g., the exact type of an eager dimension value) is a member
+        // of the facts like every other input, so that no carry declared with the iteration count's identity
+        // establishes an extent that disagrees with the iteration count, while one that carries the iteration count's
+        // own identity establishes nothing beyond the declared bounds. Only the carries preserve the identities of
+        // reference inputs.
         let nominal_iteration_count = iteration_count.variable().is_some_and(|variable| {
             matches!(input_types.last().cloned().map(Into::into), Some(ArrayIrType::Dimension(r#type))
                 if r#type.variable() == Some(variable))
         });
         let fact_count = expected_input_types.len() - usize::from(nominal_iteration_count);
-        refine_output_types(
+        refine_control_flow_output_types(
             &expected_input_types[..fact_count],
             &input_types[..fact_count],
             output_types.as_slice(),
@@ -1356,7 +1364,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             &self.stacked_axis_shardings,
             input_types,
         )?;
-        validate_output_identities(SCAN_OPERATION_NAME, input_types, output_types.as_slice())?;
+        validate_control_flow_output_identity_scope(SCAN_OPERATION_NAME, input_types, output_types.as_slice())?;
         Ok(output_types)
     }
 

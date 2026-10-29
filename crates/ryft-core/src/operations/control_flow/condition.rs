@@ -58,7 +58,8 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::control_flow::{
-    RegionReferenceSource, refine_output_types, validate_output_identities, validate_region_input,
+    RegionReferenceSource, refine_control_flow_output_types, validate_control_flow_output_identity_scope,
+    validate_control_flow_region_input_refinement,
 };
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
@@ -504,19 +505,25 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        // Both branches must declare the same input types, the predicate must be a scalar Boolean, and every
-        // input must refine its declared branch input type (a reference input refines it by its referent, refer to
-        // `validate_region_input`). The declared branch outputs must agree after applying the facts that the inputs
-        // establish (e.g., `f64[extent]` and `f64[3]` agree for an `f64[3]` input, and a `ref<f64[extent]>` output
-        // becomes `ref<f64[3]>` for a `ref<f64[3]>` input), and every output must satisfy the predicate's manual
-        // variation requirements (refer to `ConditionType::validate_condition_output`).
+        // Both branches must declare the same input types, the predicate must be a scalar Boolean, and every input must
+        // refine its declared branch input type (a reference input refines it by its referent, refer to
+        // `validate_control_flow_region_input_refinement`). The declared branch outputs must agree after applying the
+        // facts that the inputs establish (e.g., `f64[extent]` and `f64[3]` agree for an `f64[3]` input, and a
+        // `ref<f64[extent]>` output becomes `ref<f64[3]>` for a `ref<f64[3]>` input), and every output must satisfy the
+        // predicate's manual variation requirements (refer to `ConditionType::validate_condition_output`).
         Self::validate_branch_input_types(region_interfaces)?;
         let (true_interface, false_interface) = (&region_interfaces[0], &region_interfaces[1]);
         let branch_input_types = true_interface.input_types();
         check_count!("input", input_types, branch_input_types.len() + 1, TypeError);
         Self::validate_predicate_type(&input_types[0])?;
         for (index, (declared, actual)) in branch_input_types.iter().zip(&input_types[1..]).enumerate() {
-            validate_region_input(CONDITION_OPERATION_NAME, index + 1, actual, declared, "branch input type")?;
+            validate_control_flow_region_input_refinement(
+                CONDITION_OPERATION_NAME,
+                index + 1,
+                actual,
+                declared,
+                "branch input type",
+            )?;
         }
 
         // Which input a branch forwards to a reference output is only visible in its body, so reference outputs are
@@ -524,7 +531,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         // identities stay symbolic, rather than inheriting facts about the entering values. Compare the two refined
         // output signatures before checking their variation.
         let [true_output_types, false_output_types] = [true_interface, false_interface].map(|interface| {
-            refine_output_types(branch_input_types, &input_types[1..], interface.output_types(), |_| None)
+            refine_control_flow_output_types(branch_input_types, &input_types[1..], interface.output_types(), |_| None)
         });
         let (true_output_types, false_output_types) = (true_output_types?, false_output_types?);
         check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
@@ -534,7 +541,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         for output_type in &true_output_types {
             output_type.validate_condition_output(&input_types[0])?;
         }
-        validate_output_identities(CONDITION_OPERATION_NAME, input_types, &true_output_types)?;
+        validate_control_flow_output_identity_scope(CONDITION_OPERATION_NAME, input_types, &true_output_types)?;
         Ok(true_output_types)
     }
 

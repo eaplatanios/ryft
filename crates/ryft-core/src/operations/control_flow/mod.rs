@@ -260,21 +260,19 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates that instruction input `index` of the control-flow operation named `operation_name`, of type
 /// `input_type`, may feed a region input of type `region_input_type`, i.e., that it refines that type (refer to
 /// [`Type::is_refined_by`]). A reference input refines its region input type by its referent (e.g., a `ref<f32[5]>`
-/// input feeds a `ref<f32[extent]>` region input), so the facts that its referent establishes (here, `extent = 5`)
-/// take part in refining the operation's outputs exactly like the facts of a value input, and conflicting facts are
-/// rejected (refer to [`refine_output_types`]). Its allocation keeps its own type: a reference output that aliases it
-/// takes that type, and the region only sees the refined facts.
+/// input feeds a `ref<f32[extent]>` region input), so the facts that its referent establishes (here, `extent = 5`) take
+/// part in refining the operation's outputs exactly like the facts of a value input, and conflicting facts are rejected
+/// (refer to [`refine_control_flow_output_types`]). Its allocation keeps its own type: a reference output that aliases
+/// it takes that type, and the region only sees the refined facts.
 ///
 /// # Errors
 ///
 /// Returns a [`TypeError`] that describes the region input type as `region_input_description` (e.g., `"state type"`)
 /// when the input does not refine it.
-pub(crate) fn validate_region_input<T: Type>(
+pub(crate) fn validate_control_flow_region_input_refinement<T: Type>(
     operation_name: &str,
     index: usize,
     input_type: &T,
@@ -290,26 +288,31 @@ pub(crate) fn validate_region_input<T: Type>(
     )))
 }
 
-/// Returns the output types of a control-flow operation whose `input_types` refine the `declared_input_types` of its
-/// regions, by applying the refinement facts that those inputs establish (e.g., `rows = 3` for an `f32[3]` input that
-/// a region declares as `f32[rows]`) to the `declared_output_types`. The facts are established from the complete input
+/// Returns the output types of a control flow operation whose `input_types` refine the `declared_input_types` of its
+/// regions, by applying the refinement facts that those inputs establish (e.g., `rows = 3` for an `f32[3]` input that a
+/// region declares as `f32[rows]`) to the `declared_output_types`. The facts are established from the complete input
 /// signature, so conflicting facts are rejected, but identities that an output type defines stay symbolic: a loop's
 /// first-class dimension carry may change its extent across iterations, and a branch produces the identities that its
 /// outputs define. A reference output whose aliased input is known (i.e., for which `aliased_input` returns that
 /// input's index) takes exactly that input's type, so the output denotes the input's allocation at the allocation's own
 /// type. Any other reference output (e.g., a `condition` output that either branch may forward from a different input)
 /// is refined by the same facts as a value output: every reference input refines its region input type by its referent
-/// (refer to [`validate_region_input`]), so a `ref<f32[extent]>` output of a region entered with a `ref<f32[5]>` input
-/// becomes `ref<f32[5]>`. Metadata that is not a fact about an identity (e.g., a sharding or layout that only the
-/// inputs carry) is never propagated to the outputs.
-pub(crate) fn refine_output_types<T: Type>(
+/// (refer to [`validate_control_flow_region_input_refinement`]), so a `ref<f32[extent]>` output of a region entered
+/// with a `ref<f32[5]>` input becomes `ref<f32[5]>`. Metadata that is not a fact about an identity (e.g., a sharding or
+/// layout that only the inputs carry) is never propagated to the outputs.
+pub(crate) fn refine_control_flow_output_types<T: Type>(
     declared_input_types: &[T],
     input_types: &[T],
     declared_output_types: &[T],
     aliased_input: impl Fn(usize) -> Option<usize>,
 ) -> Result<Vec<T>, TypeError> {
     let refinements = T::Refinements::new(declared_input_types, input_types)?;
-    let symbolic_identities = defined_identities(declared_output_types);
+    let symbolic_identities = declared_output_types
+        .iter()
+        .flat_map(Type::identities)
+        .filter(|&(position, _)| position == TypeIdentityPosition::Definition)
+        .map(|(_, identity)| identity.clone())
+        .collect::<Vec<_>>();
     declared_output_types
         .iter()
         .enumerate()
@@ -320,31 +323,24 @@ pub(crate) fn refine_output_types<T: Type>(
         .collect()
 }
 
-/// Returns the type identities that the `types` define (i.e., that occur at a [`TypeIdentityPosition::Definition`]
-/// position), in order of occurrence and with repetitions. These are the identities that a region produces through
-/// its outputs rather than receiving them through its inputs, so they stay symbolic when the facts that the inputs
-/// establish refine those outputs.
-pub(crate) fn defined_identities<T: Type>(types: &[T]) -> Vec<T::Identity> {
-    types
-        .iter()
-        .flat_map(Type::identities)
-        .filter_map(|(position, identity)| (position == TypeIdentityPosition::Definition).then(|| identity.clone()))
-        .collect()
-}
-
 /// Validates that every type identity that one of the `output_types` of a control-flow operation refers to is either
 /// carried by one of its `input_types` or defined by one of its `output_types`, so that the instruction only produces
-/// types whose identities it consumes or defines. [`refine_output_types`] substitutes only the exact facts that the
-/// inputs establish, so a refined output type can still refer to an identity that a region defines internally (e.g.,
-/// the extent of an array computed from a `dimension_from_scalar` result that the region does not return) or to a
-/// declared region identity that the inputs do not carry. This function rejects such an output as the final step of
+/// types whose identities it consumes or defines. [`refine_control_flow_output_types`] substitutes only the exact facts
+/// that the inputs establish, so a refined output type can still refer to an identity that a region defines internally
+/// (e.g., the extent of an array computed from a `dimension_from_scalar` result that the region does not return) or to
+/// a declared region identity that the inputs do not carry. This function rejects such an output as the final step of
 /// `while`, `scan`, and `condition` type inference.
-pub(crate) fn validate_output_identities<T: Type>(
+pub(crate) fn validate_control_flow_output_identity_scope<T: Type>(
     operation_name: &str,
     input_types: &[T],
     output_types: &[T],
 ) -> Result<(), TypeError> {
-    let defined_identities = defined_identities(output_types);
+    let defined_identities = output_types
+        .iter()
+        .flat_map(Type::identities)
+        .filter(|&(position, _)| position == TypeIdentityPosition::Definition)
+        .map(|(_, identity)| identity.clone())
+        .collect::<Vec<_>>();
     let input_identities =
         input_types.iter().flat_map(Type::identities).map(|(_, identity)| identity).collect::<Vec<_>>();
     for (index, output_type) in output_types.iter().enumerate() {
@@ -360,6 +356,8 @@ pub(crate) fn validate_output_identities<T: Type>(
     }
     Ok(())
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reference that a root of the reference analysis of a control-flow region (refer to
 /// [`RegionRef::reference_analysis_with_configuration`]) denotes at the boundary of that region. Control-flow rules
