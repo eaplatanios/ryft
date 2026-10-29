@@ -28,11 +28,11 @@
 //!   - **Batching:** A fixed point over the state batch axes batches the regions once. A predicate that becomes
 //!     batched widens every array state element, and the bound loop masks its updates per item.
 //!   - **Differentiation:** An eager loop runs its duals directly and resumes with the staged rule from the current
-//!     duals once its predicate stops concretizing to one scalar Boolean. A bounded staged loop stores per-iteration
-//!     residuals in `[bound, ...]` stacks and stages one masked tangent `scan`, whose transposition gives reverse mode,
-//!     after rewriting a batched predicate into a scalar-predicate masked form over the same state. An unbounded staged
-//!     loop stages one fused doubled-state loop, which supports forward mode only, because staged linear `while` loops
-//!     do not support transposition.
+//!     duals once its predicate stops concretizing to one scalar Boolean. A bounded staged loop stores loop-varying
+//!     residuals in `[bound, ...]` stacks and state-independent residuals once in loop carries, and stages one masked
+//!     tangent `scan`, whose transposition gives reverse mode, after rewriting a batched predicate into a
+//!     scalar-predicate masked form over the same state. An unbounded staged loop stages one fused doubled-state loop,
+//!     which supports forward mode only, because staged linear `while` loops do not support transposition.
 //!
 //! The XLA backend lowers a while loop to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 
@@ -2362,11 +2362,12 @@ where
     ///   - A bounded loop with a batched (per-item) predicate is first rewritten into its scalar-predicate masked form
     ///     over the same state, whose forward mode is this same rule.
     ///   - A bounded loop with a scalar predicate stages the reverse-capable hybrid of an augmented primal `while`
-    ///     that stores every per-iteration residual and a validity mask in `[bound, ...]` stacks, and one masked
-    ///     tangent `scan` of length `bound` (refer to [`Self::bind_bounded`]). The residuals and the mask are plain
-    ///     primal input edges. They leave the augmented primal `while` as ordinary stacked outputs and re-enter the
-    ///     tangent scan as ordinary stacked inputs, so the enclosing partial evaluation split discovers the residual
-    ///     input edges structurally, as it does for the scan and condition rules.
+    ///     that stores every loop-varying residual and a validity mask in `[bound, ...]` stacks and every
+    ///     state-independent residual once in a carry, and one masked tangent `scan` of length `bound` (refer to
+    ///     [`Self::bind_bounded`]). The residuals and the mask are plain primal input edges. They leave the augmented
+    ///     primal `while` as ordinary outputs and re-enter the tangent scan as ordinary stacked inputs or invariant
+    ///     carries, so the enclosing partial evaluation split discovers the residual input edges structurally, as it
+    ///     does for the scan and condition rules.
     fn bind<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         self,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -2518,27 +2519,34 @@ where
     ///
     /// For a bound `B`, the rule linearizes the body through its instruction-scoped driver, giving a primal body
     /// `[state] -> [next_state, residuals...]` and a tangent body `[state_tangent, residuals...] ->
-    /// [next_state_tangent]` together with the residual count. It then:
+    /// [next_state_tangent]` together with the residual count. A dimension residual that is exactly a forwarded
+    /// dimension-state input is threaded directly into the tangent scan instead of being stored. A _state-independent_
+    /// array residual, whose computation reads no body input and runs no effects or deferred work, has the same value
+    /// on every iteration, so it is stored once, in one residual carry that every body application overwrites. It is
+    /// not hoisted out of the loop, because a `while` loop never guarantees an iteration and even pure work may fail
+    /// when no iteration runs. Every other residual is stored per iteration in a `[B, ...]` stack. The rule then:
     ///
     ///   1. Builds the augmented primal `while` over the state `[original_state..., counter (i64 scalar),
-    ///      residual_stacks (one zero-initialized [B, ...] stack per residual), mask_stack (a false-initialized Boolean
-    ///      [B] stack)]` from the residual-extended primal body, keeping `iteration_bound = B` so the per-iteration
-    ///      writes can never clamp, and stages it over the input primals followed by the staged counter and stack
-    ///      zeros. Its outputs split into the original state outputs (the primal outputs), the dropped counter,
-    ///      the stacked residual outputs, and the mask stack.
-    ///   2. Stages a length-`B` tangent [`ScanOperation`] over the live tangent carries, residual storage stacks, and
-    ///      one Boolean validity stack. Each iteration reads one scalar validity item and conditionally evaluates the
-    ///      pushforward or forwards the carried tangent unchanged. Dimension residuals that vary across iterations
-    ///      cross the scan boundary through checked scalar-array gateways. Forwarded invariant dimensions are threaded
-    ///      directly as known carries. The condition guards both derivative arithmetic and gateway restoration,
-    ///      so placeholder storage after early exit is never evaluated as a residual.
+    ///      residual_carries (one zero-initialized carry per state-independent residual), residual_stacks (one
+    ///      zero-initialized [B, ...] stack per other stored residual), mask_stack (a false-initialized Boolean [B]
+    ///      stack)]` from the residual-extended primal body, keeping `iteration_bound = B` so the per-iteration
+    ///      writes can never clamp, and stages it over the input primals followed by the staged counter, carry, and
+    ///      stack zeros. Its outputs split into the original state outputs (the primal outputs), the dropped counter,
+    ///      the residual carries, the stacked residual outputs, and the mask stack.
+    ///   2. Stages a length-`B` tangent [`ScanOperation`] over the forwarded dimension residuals and residual carries
+    ///      as invariant carries, the live tangent carries, the residual storage stacks, and one Boolean validity
+    ///      stack. Each iteration reads one scalar validity item and conditionally evaluates the pushforward or
+    ///      forwards the carried tangent unchanged. Dimension residuals that vary across iterations cross the scan
+    ///      boundary through checked scalar-array gateways. The condition guards both derivative arithmetic and
+    ///      gateway restoration, so placeholder storage after early exit (including the placeholders that residual
+    ///      carries hold when the loop runs no iteration) is never evaluated as a residual.
     ///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
     ///
     /// Reverse mode is total with no while-specific transpose code. The staged tangent scan reads its residual and
-    /// validity stacks as known stacked inputs and its invariant residuals as known carries that its body passes
-    /// through unchanged, so the ordinary scan transposition flips the scan direction and transposes the body. The
-    /// per-iteration `condition` operation that guards each tangent step forwards cotangents through inactive
-    /// iterations without evaluating their placeholder residuals.
+    /// validity stacks as known stacked inputs and its forwarded dimension residuals and residual carries as known
+    /// carries that its body passes through unchanged, so the ordinary scan transposition flips the scan direction and
+    /// transposes the body. The per-iteration `condition` operation that guards each tangent step forwards cotangents
+    /// through inactive iterations without evaluating their placeholder residuals.
     fn bind_bounded<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -2570,7 +2578,7 @@ where
         // boundary identity for dynamic tangent-array carries and limits scalar gateway storage to varying dimensions.
         let primal_input_ids = primal_program.input_ids().to_vec();
         let primal_output_ids = primal_program.output_ids().to_vec();
-        let invariant_residual_sources = (0..residual_count)
+        let mut invariant_residual_sources = (0..residual_count)
             .map(|residual_index| {
                 if C::Operation::residual_from_storage(&residual_types[residual_index])?.is_none() {
                     return Ok(None);
@@ -2581,14 +2589,67 @@ where
                 }))
             })
             .collect::<Result<Vec<Option<usize>>, TypeError>>()?;
-        let stacked_residual_indices = invariant_residual_sources
-            .iter()
-            .enumerate()
-            .filter_map(|(index, source)| source.is_none().then_some(index))
+
+        // A dimension type names one identity, so every dimension residual of one type has the same runtime extent.
+        // Only the first residual of each dimension type is threaded or stored; every later one reuses its value in the
+        // tangent scan, which would otherwise store a stack that it never reads. A later residual that is a forwarded
+        // dimension-state input forwards that input for the first one instead, so that it still needs no storage.
+        let mut duplicate_residual_sources = vec![None; residual_count];
+        for residual_index in 0..residual_count {
+            if C::Operation::residual_from_storage(&residual_types[residual_index])?.is_none() {
+                continue;
+            }
+            let Some(first) = (0..residual_index).find(|&other| {
+                duplicate_residual_sources[other].is_none() && residual_types[other] == residual_types[residual_index]
+            }) else {
+                continue;
+            };
+            duplicate_residual_sources[residual_index] = Some(first);
+            if let Some(state_index) = invariant_residual_sources[residual_index].take() {
+                invariant_residual_sources[first].get_or_insert(state_index);
+            }
+        }
+
+        // An array residual is state-independent when its backward slice in the primal body reaches no body input and
+        // contains no instruction with effects or deferred work (including those of nested regions). It has the same
+        // value on every iteration, so it is stored once, in one augmented-loop carry that every body application
+        // overwrites, instead of in a `[bound, ...]` stack. It is not hoisted out of the loop, because a `while`
+        // loop never guarantees an iteration and even pure work may fail when no iteration runs.
+        let primal_region = primal_program.entry_region_ref();
+        let mut state_independent_atoms =
+            primal_region.atoms().iter().map(|atom| atom.is_constant()).collect::<Vec<_>>();
+        for (index, instruction) in primal_region.instructions().iter().enumerate() {
+            if primal_region.instruction_effects(index)?.is_pure()
+                && instruction.inputs().iter().all(|input| state_independent_atoms[input.index()])
+            {
+                for output in instruction.outputs() {
+                    state_independent_atoms[output.index()] = true;
+                }
+            }
+        }
+        let state_independent_residuals = (0..residual_count)
+            .map(|residual_index| {
+                Ok(C::Operation::residual_from_storage(&residual_types[residual_index])?.is_none()
+                    && state_independent_atoms[primal_output_ids[state_count + residual_index].index()])
+            })
+            .collect::<Result<Vec<bool>, TypeError>>()?;
+
+        // The augmented loop stores the carried (state-independent) residuals first, followed by the stacked ones.
+        let carried_residual_indices =
+            (0..residual_count).filter(|&index| state_independent_residuals[index]).collect::<Vec<_>>();
+        let stacked_residual_indices = (0..residual_count)
+            .filter(|&index| {
+                invariant_residual_sources[index].is_none()
+                    && duplicate_residual_sources[index].is_none()
+                    && !state_independent_residuals[index]
+            })
             .collect::<Vec<_>>();
-        let stacked_residual_types =
-            stacked_residual_indices.iter().map(|&index| residual_types[index].clone()).collect::<Vec<_>>();
-        let stacked_primal_program = if stacked_residual_indices.len() == residual_count {
+        let carried_residual_count = carried_residual_indices.len();
+        let stored_residual_indices =
+            carried_residual_indices.iter().chain(&stacked_residual_indices).copied().collect::<Vec<_>>();
+        let stored_residual_types =
+            stored_residual_indices.iter().map(|&index| residual_types[index].clone()).collect::<Vec<_>>();
+        let stored_primal_program = if stored_residual_indices.iter().copied().eq(0..residual_count) {
             primal_program
         } else {
             let input_types = primal_program.input_types();
@@ -2598,42 +2659,45 @@ where
             let selected_outputs = outputs[..state_count]
                 .iter()
                 .copied()
-                .chain(stacked_residual_indices.iter().map(|&index| outputs[state_count + index]))
+                .chain(stored_residual_indices.iter().map(|&index| outputs[state_count + index]))
                 .collect::<Vec<_>>();
             Arc::new(builder.build(
                 selected_outputs,
                 vec![Placeholder; inputs.len()],
-                vec![Placeholder; state_count + stacked_residual_indices.len()],
+                vec![Placeholder; state_count + stored_residual_indices.len()],
             )?)
         };
 
-        // Run the primal loop over its original state plus a counter, one stack per stored residual,
-        // and a validity mask.
+        // Run the primal loop over its original state plus a counter, one carry per state-independent residual,
+        // one stack per other stored residual, and a validity mask.
         let predicate_type = condition.output_types()[0].as_array_type()?.clone();
         let counter_type: C::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
         let boolean_scalar_type: C::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
         let mask_stack_type: C::Type =
             boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into())?.into();
-        let (extended_condition, augmented_body, stack_types) = {
-            let primal_body = stacked_primal_program.as_ref();
-            let residual_types = stacked_residual_types.as_slice();
+        let (extended_condition, augmented_body, carry_types, stack_types) = {
+            let primal_body = stored_primal_program.as_ref();
+            let residual_types = stored_residual_types.as_slice();
 
             // Build the augmented condition and body programs of the bounded staged while loop. The body replays
             // the original body through its tracing context before adding the augmented-state operations, while the
             // condition structurally relocates the original condition into a builder with the extended input boundary.
             //
-            // The augmented loop state is `[original_state..., counter (i64 scalar), residual_stacks..., mask_stack]`:
+            // The augmented loop state is `[original_state..., counter (i64 scalar), residual_carries...,
+            // residual_stacks..., mask_stack]`:
             //
-            //   - The body runs the residual-extended primal body (which outputs `[next_state..., residuals...]`) on
-            //     the original state slots, then _stores_ instead of returning each per-iteration residual. Residual
-            //     `k` is broadcast to `[1, ...]` and written into stack `k` at stack slot `counter` via
-            //     `dynamic_update_slice`. The body also writes a scalar Boolean `one` (i.e., `true`) into the Boolean
-            //     `[bound]` mask stack at stack slot `counter` and advances the counter by an `i64` `one`. Because the
-            //     enclosing while keeps `iteration_bound = bound`, the counter is always strictly below `bound`
-            //     whenever the body runs, so the writes can never clamp.
+            //   - The body runs the residual-extended primal body (which outputs `[next_state..., carried_residuals...,
+            //     stacked_residuals...]`) on the original state slots, then _stores_ instead of returning each
+            //     residual. Carried residual `k` overwrites carry `k`, which therefore holds the value of the last
+            //     body application. Stacked residual `k` is broadcast to `[1, ...]` and written into stack `k` at stack
+            //     slot `counter` via `dynamic_update_slice`. The body also writes a scalar Boolean `one` (i.e., `true`)
+            //     into the Boolean `[bound]` mask stack at stack slot `counter` and advances the counter by an `i64`
+            //     `one`. Because the enclosing while keeps `iteration_bound = bound`, the counter is always strictly
+            //     below `bound` whenever the body runs, so the writes can never clamp.
             //   - The condition is the original loop condition extended with ignored extra-state inputs.
             //
-            // Returns the extended condition, the augmented body, and the `[bound, ...]` residual stack types.
+            // Returns the extended condition, the augmented body, the residual carry types, and the `[bound, ...]`
+            // residual stack types.
             let storage_types =
                 residual_types.iter().map(C::Operation::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
             let predicate_axes =
@@ -2648,10 +2712,11 @@ where
                     .into());
                 }
 
-                // Devices whose predicates differ fill different numbers of stack slots, so every stack must vary over
-                // the predicate's manual axes. A residual that depends on loop state already does, because all array
-                // state varies over those axes. A residual that does not cannot be retyped without changing the tangent
-                // program that consumes it, so it is rejected instead of being mistyped.
+                // Devices whose predicates differ fill different numbers of stack slots, and a residual carry holds its
+                // placeholder on devices that run no iteration, so all residual storage must vary over the predicate's
+                // manual axes. A residual that depends on loop state already does, because all array state varies over
+                // those axes. A residual that does not cannot be retyped without changing the tangent program that
+                // consumes it, so it is rejected instead of being mistyped.
                 if !predicate_axes.iter().all(|axis| {
                     storage_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis))
                 }) {
@@ -2663,7 +2728,9 @@ where
                     .into());
                 }
             }
-            let stack_types = storage_types
+            let (carry_types, stacked_storage_types) = storage_types.split_at(carried_residual_count);
+            let carry_types = carry_types.to_vec();
+            let stack_types = stacked_storage_types
                 .iter()
                 .map(|storage_type| {
                     storage_type
@@ -2676,6 +2743,7 @@ where
                 .input_types()
                 .into_iter()
                 .chain(std::iter::once(counter_type.clone()))
+                .chain(carry_types.iter().cloned())
                 .chain(stack_types.iter().cloned())
                 .chain(std::iter::once(mask_stack_type.clone()))
                 .collect::<Vec<_>>();
@@ -2690,6 +2758,10 @@ where
                             "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the counter input",
                         ))
                     })?;
+
+                    // Every body application overwrites the residual carries, so the body never reads them.
+                    let carry_inputs = extra_inputs.by_ref().take(carry_types.len()).collect::<Vec<_>>();
+                    check_count!("input", carry_inputs, carry_types.len(), ProgramError);
                     let stack_inputs = extra_inputs.by_ref().take(stack_types.len()).cloned().collect::<Vec<_>>();
                     check_count!("input", stack_inputs, stack_types.len(), ProgramError);
                     let mask_input = extra_inputs.next().cloned().ok_or_else(|| {
@@ -2709,7 +2781,7 @@ where
                     // zero index. For each distinct stack variation, the counter, which is loop state, takes that
                     // variation through staged transitions, while the zero index is a non-differentiable constant
                     // and is therefore created directly with the variation of that varied counter.
-                    let zero_index = if storage_types.iter().any(|storage_type| {
+                    let zero_index = if stacked_storage_types.iter().any(|storage_type| {
                         storage_type.as_array_type().is_ok_and(|storage_type| {
                             storage_type.rank() > 0
                                 && storage_type
@@ -2723,9 +2795,11 @@ where
                     };
 
                     let mut varying_indices = Vec::new();
+                    let mut next_carries = Vec::with_capacity(carry_types.len());
                     let mut next_stacks = Vec::with_capacity(stack_types.len());
-                    for (((residual_output, residual_type), storage_type), stack_input) in
-                        residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
+                    let mut stack_inputs = stack_inputs.iter();
+                    for (residual_index, ((residual_output, residual_type), storage_type)) in
+                        residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).enumerate()
                     {
                         let storage_output = if let Some(operation) = C::Operation::residual_to_storage(residual_type)?
                         {
@@ -2736,6 +2810,11 @@ where
                         } else {
                             residual_output.clone()
                         };
+                        if residual_index < carry_types.len() {
+                            next_carries.push(storage_output);
+                            continue;
+                        }
+                        let stack_input = stack_inputs.next().unwrap();
                         let storage_array_type = storage_type.as_array_type()?;
                         let batch_item_type = storage_array_type.with_inserted_dimension(0, 1.into()).unwrap();
                         let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
@@ -2781,6 +2860,7 @@ where
                     let one_i64 = array_context.one(counter_type.as_array_type()?)?;
                     let next_counter = counter_input.add(&one_i64)?;
                     body_outputs.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(next_counter));
+                    body_outputs.extend(next_carries);
                     body_outputs.extend(next_stacks);
                     body_outputs.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(next_mask));
                     Ok(body_outputs)
@@ -2794,6 +2874,7 @@ where
                 .input_types()
                 .into_iter()
                 .chain(std::iter::once(counter_type.clone()))
+                .chain(carry_types.iter().cloned())
                 .chain(stack_types.iter().cloned())
                 .chain(std::iter::once(mask_stack_type.clone()))
                 .collect::<Vec<_>>();
@@ -2810,12 +2891,14 @@ where
                 vec![Placeholder; condition_input_count],
                 vec![Placeholder; condition_output_count],
             )?;
-            (extended_condition, body, stack_types)
+            (extended_condition, body, carry_types, stack_types)
         };
 
         let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        for zero_state_type in
-            std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
+        for zero_state_type in std::iter::once(&counter_type)
+            .chain(carry_types.iter())
+            .chain(stack_types.iter())
+            .chain(std::iter::once(&mask_stack_type))
         {
             primal_inputs.push(context.primal().zero(zero_state_type)?);
         }
@@ -2824,61 +2907,81 @@ where
             vec![extended_condition, augmented_body],
             primal_inputs.as_slice(),
         )?;
-        check_count!("output", while_outputs, state_count + 2 + stack_types.len(), ProgramError);
+        check_count!(
+            "output",
+            while_outputs,
+            state_count + 2 + carried_residual_count + stack_types.len(),
+            ProgramError,
+        );
         let mask_stack = while_outputs.pop().unwrap();
-        let residual_stacks = while_outputs.split_off(state_count + 1);
+        let residual_stacks = while_outputs.split_off(state_count + 1 + carried_residual_count);
+        let residual_carries = while_outputs.split_off(state_count + 1);
         while_outputs.truncate(state_count);
         let primal_outputs = while_outputs;
         let tangent_state_count = input_indices.len();
         check_count!("input", tangent_program.input_ids(), tangent_state_count + residual_count, ProgramError);
         check_count!("output", tangent_program.output_ids(), tangent_state_count, ProgramError);
-        let storage_types = stacked_residual_types
+        let stacked_storage_types = stacked_residual_indices
             .iter()
-            .map(C::Operation::residual_storage_type)
+            .map(|&index| C::Operation::residual_storage_type(&residual_types[index]))
             .collect::<Result<Vec<_>, _>>()?;
-        let invariant_residual_indices = invariant_residual_sources
+        let forwarded_residual_indices = invariant_residual_sources
             .iter()
             .enumerate()
             .filter_map(|(index, source)| source.is_some().then_some(index))
             .collect::<Vec<_>>();
-        let invariant_residual_count = invariant_residual_indices.len();
+
+        // The invariant carries of the tangent scan are the forwarded dimension residuals followed by the residual
+        // carries of the state-independent residuals, which its body passes through unchanged.
+        let invariant_carry_count = forwarded_residual_indices.len() + carried_residual_count;
         let tangent_input_types = tangent_program.input_types();
-        let iteration_input_types = invariant_residual_indices
+        let iteration_input_types = forwarded_residual_indices
             .iter()
             .map(|&index| residual_types[index].clone())
+            .chain(carry_types.iter().cloned())
             .chain(tangent_input_types[..tangent_state_count].iter().cloned())
-            .chain(storage_types.iter().cloned())
+            .chain(stacked_storage_types.iter().cloned())
             .collect::<Vec<_>>();
 
         // Conditional transposition requires linear tangent inputs before known residuals. The surrounding scan keeps
-        // invariant residual carries first, so its branch boundary reorders only the inputs consumed by the condition.
+        // invariant carries first, so its branch boundary reorders only the inputs consumed by the condition.
         let branch_input_types = tangent_input_types[..tangent_state_count]
             .iter()
             .cloned()
-            .chain(iteration_input_types[..invariant_residual_count].iter().cloned())
-            .chain(storage_types.iter().cloned())
+            .chain(iteration_input_types[..invariant_carry_count].iter().cloned())
+            .chain(stacked_storage_types.iter().cloned())
             .collect::<Vec<_>>();
         let active_body = TracingContext::<C::Constant, C::Operation>::trace(
             |inputs| -> Result<Vec<_>, ProgramError> {
                 let trace_context = inputs[0].context().clone();
-                let residual_start = tangent_state_count + invariant_residual_count;
-                let invariant_inputs = &inputs[tangent_state_count..residual_start];
+                let carried_start = tangent_state_count + forwarded_residual_indices.len();
+                let stacked_start = tangent_state_count + invariant_carry_count;
                 let carried_tangents = &inputs[..tangent_state_count];
                 let mut tangent_inputs = carried_tangents.to_vec();
                 let mut restored_residuals: Vec<(C::Type, Tracer<TracingContext<C::Constant, C::Operation>>)> =
                     Vec::new();
-                let storage_inputs = &inputs[residual_start..residual_start + stacked_residual_indices.len()];
-                let mut invariant_residuals = invariant_inputs.iter();
-                let mut storage_inputs = storage_inputs.iter().zip(storage_types.iter());
+                let mut forwarded_residuals = inputs[tangent_state_count..carried_start].iter();
+                let mut carried_storage_inputs = inputs[carried_start..stacked_start].iter().zip(carry_types.iter());
+                let mut stacked_storage_inputs = inputs[stacked_start..stacked_start + stacked_residual_indices.len()]
+                    .iter()
+                    .zip(stacked_storage_types.iter());
                 for (residual_index, residual_type) in residual_types.iter().enumerate() {
-                    if invariant_residual_sources[residual_index].is_some() {
-                        tangent_inputs.push(invariant_residuals.next().unwrap().clone());
+                    if let Some(first) = duplicate_residual_sources[residual_index] {
+                        tangent_inputs.push(tangent_inputs[tangent_state_count + first].clone());
                         continue;
                     }
-                    let (storage_input, storage_type) = storage_inputs.next().unwrap();
+                    if invariant_residual_sources[residual_index].is_some() {
+                        tangent_inputs.push(forwarded_residuals.next().unwrap().clone());
+                        continue;
+                    }
+                    let (storage_input, storage_type) = if state_independent_residuals[residual_index] {
+                        carried_storage_inputs.next().unwrap()
+                    } else {
+                        stacked_storage_inputs.next().unwrap()
+                    };
                     if storage_input.r#type().as_ref() != storage_type {
                         return Err(TypeError::invalid(format!(
-                            "bounded `{}` residual stack item has type `{}` but expected `{}`",
+                            "bounded `{}` residual storage item has type `{}` but expected `{}`",
                             WHILE_OPERATION_NAME,
                             storage_input.r#type().as_ref(),
                             storage_type,
@@ -2914,8 +3017,9 @@ where
         scan_body_input_types.extend(iteration_input_types.iter().cloned());
         scan_body_input_types.push(boolean_scalar_type);
         let scan_body = {
-            // Inactive iterations contain zero-filled placeholder residuals. Guard the whole pushforward so neither
-            // forward execution nor transposition can evaluate singular derivatives or dimension gateways on them.
+            // Inactive iterations read zero-filled placeholder stack slots, and also placeholder residual carries when
+            // the loop runs no iteration. Guard the whole pushforward so neither forward execution nor transposition
+            // can evaluate singular derivatives or dimension gateways on them.
             let mut passive_builder = ProgramBuilder::new();
             let passive_inputs = branch_input_types
                 .iter()
@@ -2933,19 +3037,19 @@ where
                     let mut conditional_inputs = Vec::with_capacity(inputs.len());
                     conditional_inputs.push(mask[0].clone());
                     conditional_inputs.extend_from_slice(
-                        &iteration_inputs[invariant_residual_count..invariant_residual_count + tangent_state_count],
+                        &iteration_inputs[invariant_carry_count..invariant_carry_count + tangent_state_count],
                     );
-                    conditional_inputs.extend_from_slice(&iteration_inputs[..invariant_residual_count]);
+                    conditional_inputs.extend_from_slice(&iteration_inputs[..invariant_carry_count]);
                     conditional_inputs
-                        .extend_from_slice(&iteration_inputs[invariant_residual_count + tangent_state_count..]);
+                        .extend_from_slice(&iteration_inputs[invariant_carry_count + tangent_state_count..]);
                     let conditional_outputs = trace_context.bind(
                         ConditionOperation::new(),
                         vec![active_body, passive_body],
                         conditional_inputs.as_slice(),
                     )?;
-                    // Invariant residuals remain structurally passed through at the scan boundary, which lets scan
+                    // Invariant carries remain structurally passed through at the scan boundary, which lets scan
                     // transposition treat them as invariant known carries.
-                    let mut outputs = iteration_inputs[..invariant_residual_count].to_vec();
+                    let mut outputs = iteration_inputs[..invariant_carry_count].to_vec();
                     outputs.extend(conditional_outputs);
                     Ok::<_, ProgramError>(outputs)
                 },
@@ -2954,14 +3058,21 @@ where
             .1
         };
 
-        // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks,
-        // and one scalar validity stack.
+        // The tangent scan consumes forwarded dimension residuals, residual carries, live tangent carries, residual
+        // stacks, and one scalar validity stack. When the loop runs no iteration, each residual carry holds its zero
+        // placeholder, which the guarded tangent steps never read, because every validity item is false.
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let mut tangent_scan_inputs = invariant_residual_sources
             .iter()
             .flatten()
             .map(|&state_index| tangent_inputs[state_index].primal().clone())
             .collect::<Vec<_>>();
+        tangent_scan_inputs.extend(
+            residual_carries
+                .into_iter()
+                .map(|value| context.primal_to_tangent(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
 
         // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits,
         // because the tangent type derivation preserves shapes exactly.
@@ -2975,10 +3086,10 @@ where
                 .collect::<Result<Vec<_>, _>>()?,
         );
         tangent_scan_inputs.push(context.primal_to_tangent(mask_stack)?);
-        let tangent_scan = ScanOperation::<C::Type>::new(invariant_residual_count + tangent_state_count, bound);
+        let tangent_scan = ScanOperation::<C::Type>::new(invariant_carry_count + tangent_state_count, bound);
         let tangent_outputs = context.tangent().bind(tangent_scan, vec![scan_body], tangent_scan_inputs.as_slice())?;
-        check_count!("output", tangent_outputs, invariant_residual_count + tangent_state_count, ProgramError);
-        let tangent_outputs = tangent_outputs.into_iter().skip(invariant_residual_count).collect();
+        check_count!("output", tangent_outputs, invariant_carry_count + tangent_state_count, ProgramError);
+        let tangent_outputs = tangent_outputs.into_iter().skip(invariant_carry_count).collect();
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 
@@ -2993,8 +3104,12 @@ where
     /// carry no tangent boundary input or output, and their output duals are restored as structural zeros. Because no
     /// residuals are stored, the rule applies to loops with _no_ [`WhileOperation::iteration_bound`].
     ///
-    /// Shared construction binds the fused loop directly. Separate construction partitions the generated loop while
-    /// requiring every primal state output to remain known. Loops that require an unbounded history are rejected.
+    /// Shared construction binds the fused loop directly. Separate construction binds it in the tangent context, whose
+    /// partial evaluation splits off the primal loop by the closed-knownness split of [`WhileOperation`] and binds it
+    /// once on its known side, and transfers the resulting primal outputs to the primal context (refer to
+    /// [`DifferentiationContext::tangent_to_primal`]). The tangent program keeps the fused loop whole and recomputes
+    /// the primal state on every application, so separate construction rejects loops with effects or deferred work,
+    /// whose recomputation would repeat them.
     fn bind_fused<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -3057,29 +3172,40 @@ where
             fused_inputs.push(context.materialize_dual_tangent(&inputs[index])?);
         }
         let fused_regions = [Arc::new(fused_condition), fused_body];
-        let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-            context.primal().bind(fused_while, AttachedRegions::Callees(&fused_regions), &fused_inputs)?
+        let (primal_outputs, tangent_outputs) = if std::ptr::eq(context.primal(), context.tangent()) {
+            let mut outputs =
+                context.primal().bind(fused_while, AttachedRegions::Callees(&fused_regions), &fused_inputs)?;
+            check_count!("output", outputs, fused_state_count, ProgramError);
+            let tangent_outputs = outputs.split_off(state_count);
+            (outputs, tangent_outputs)
         } else {
-            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-            let arguments =
-                fused_inputs.iter().map(|value| builder.add_input(value.r#type().into_owned())).collect::<Vec<_>>();
-            let regions =
-                fused_regions.iter().map(|program| builder.import_region(program.entry_region_ref())).collect();
-            let outputs = builder.add_instruction(fused_while, regions, arguments, None)?.to_vec();
-            let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                outputs,
-                vec![Placeholder; fused_state_count],
-                vec![Placeholder; fused_state_count],
-            )?;
-            let input_known = (0..fused_state_count).map(|index| index < state_count).collect::<Vec<_>>();
-            let required_outputs = (0..state_count).collect::<Vec<_>>();
-            let partition =
-                driver.partition_jvp_program(program.entry_region_ref(), &input_known, &required_outputs)?;
-            partition.interpret_in_context(context, &fused_inputs, state_count)?
+            // Binding the fused loop in the tangent context lets its partial evaluation split off the primal loop once,
+            // which a separate primal binding would duplicate. The tangent program recomputes the primal state on every
+            // application, which must not repeat effects or deferred work.
+            let effects = [condition.effects(), body.effects()];
+            if effects.iter().any(|effects| !effects.classes().is_empty() || effects.has_deferred_work()) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "separate linearization of a `{WHILE_OPERATION_NAME}` loop without an iteration bound \
+                         requires a condition and a body without effects or deferred work, because every \
+                         pushforward application recomputes the loop",
+                    ),
+                }
+                .into());
+            }
+            let mut tangent_inputs = Vec::with_capacity(fused_state_count);
+            for input in &fused_inputs[..state_count] {
+                tangent_inputs.push(context.primal_to_tangent(input.clone())?);
+            }
+            tangent_inputs.extend_from_slice(&fused_inputs[state_count..]);
+            let mut outputs =
+                context.tangent().bind(fused_while, AttachedRegions::Callees(&fused_regions), &tangent_inputs)?;
+            check_count!("output", outputs, fused_state_count, ProgramError);
+            let tangent_outputs = outputs.split_off(state_count);
+            let primal_outputs =
+                outputs.into_iter().map(|output| context.tangent_to_primal(output)).collect::<Result<Vec<_>, _>>()?;
+            (primal_outputs, tangent_outputs)
         };
-        check_count!("output", outputs, fused_state_count, ProgramError);
-        let mut primal_outputs = outputs;
-        let tangent_outputs = primal_outputs.split_off(state_count);
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 }
@@ -3279,7 +3405,7 @@ mod tests {
         ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
     };
     use crate::operations::sharding::shard_map::{ShardMap, ShardMapOperation};
-    use crate::operations::trigonometric::SinOperation;
+    use crate::operations::trigonometric::{SIN_OPERATION_NAME, SinOperation};
     use crate::parameters::Parameter;
     use crate::partial::{PartialTracer, ResidualInputSource};
     use crate::programs::{
@@ -3319,17 +3445,28 @@ mod tests {
 
     /// Eager test context that records the name and inputs of every operation bound through it before executing the
     /// operation in [`TestEagerContext`]. Clones share the record, so nested transformation contexts and region replay
-    /// contribute to one observation.
+    /// contribute to one observation. A context can also fail every bind of one operation, standing in for a backend
+    /// whose execution of that operation fails. Operations inside the regions of a bound operation execute in
+    /// [`TestEagerContext`] and are neither recorded nor failed.
     #[derive(Clone, Debug)]
     struct BindRecordingContext {
         /// Names and inputs of the operations bound through this context, in binding order.
         binds: Rc<RefCell<Vec<(&'static str, Vec<Array>)>>>,
+
+        /// Name of the operation whose every bind fails, if any.
+        failing_operation: Option<&'static str>,
     }
 
     impl BindRecordingContext {
         /// Creates a context that has recorded no binds.
         fn new() -> Self {
-            Self { binds: Rc::new(RefCell::new(Vec::new())) }
+            Self { binds: Rc::new(RefCell::new(Vec::new())), failing_operation: None }
+        }
+
+        /// Creates a context that has recorded no binds and fails every bind of the operation named `name` with
+        /// [`ProgramError::InvalidArgument`].
+        fn failing(name: &'static str) -> Self {
+            Self { failing_operation: Some(name), ..Self::new() }
         }
 
         /// Returns the inputs of each operation named `name` bound so far, in binding order.
@@ -3363,6 +3500,11 @@ mod tests {
         {
             let operation = operation.into();
             self.binds.borrow_mut().push((operation.name(), inputs.to_vec()));
+            if self.failing_operation == Some(operation.name()) {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("the test backend failed to execute `{}`", operation.name()),
+                });
+            }
             TestEagerContext::new().bind(operation, regions, inputs)
         }
 
@@ -6555,6 +6697,42 @@ mod tests {
                 Ok(vec![array(Array::scalar(expected).unwrap()), array(Array::scalar(expected).unwrap())]),
             );
         }
+        assert_eq!(
+            source(5).discharge_references(0).unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = const 1.0
+                    %2:f32[] = const 10.0
+                    %3:f32[] = add %0 %1
+                    %4:bool[] = compare [direction=LessThan] %3 %2
+                    %5:f32[], %6:bool[] = while [iteration_bound=4] %3 %4 [
+                        condition={
+                            lambda %0:f32[], %1:bool[] .
+                            in (%1)
+                        },
+                        body={
+                            lambda %0:f32[], %1:bool[] .
+                            let %2:f32[] = add %0 %0
+                                %3:f32[] = const 1.0
+                                %4:f32[] = const 10.0
+                                %5:f32[] = add %2 %3
+                                %6:bool[] = compare [direction=LessThan] %5 %4
+                            in (%5, %6)
+                        },
+                    ]
+                    %7:f32[] = condition %6 %5 [
+                        true={
+                            lambda %0:f32[] .
+                            let %1:f32[] = add %0 %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f32[] .
+                            in (%0)
+                        },
+                    ]
+                in (%7, %7)"},
+        );
         // A bound of one leaves no rotated loop. The condition runs once in the parent and the only body application is
         // the trailing one. A bound of two rotates one iteration into the loop before that trailing application.
         assert_eq!(
@@ -6957,6 +7135,114 @@ mod tests {
                     ]
                     %10:f32[] = reference_freeze %2
                 in (%7, %10)"},
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_binds_a_bounded_rotation_tail_for_body_deferred_work() {
+        // The condition increments the counter before testing it against 3, and the body passes the counter reference
+        // through while it stages a transposition carrier whose attached backward rule prints, so the body has deferred
+        // work but no effects. The rebuilt body therefore forwards every state position, but its deferred work must
+        // still be staged once more after the rotated loop under the final predicate, so the tail `condition` is bound
+        // with no outputs for that deferred work alone.
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
+        let mut backward_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let seed = backward_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        backward_builder.add_instruction(PrintOperation::new("seed"), Vec::new(), vec![seed], None).unwrap();
+        let backward = backward_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone());
+        let backward = body_builder.import_program(backward);
+        let seed = body_builder.add_constant(array(Array::scalar(1f32).unwrap()));
+        body_builder
+            .add_instruction(
+                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                vec![backward],
+                vec![seed],
+                None,
+            )
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let regions = vec![builder.import_program(incrementing_condition(3.0)), builder.import_program(body)];
+        let reference = builder.add_input(reference_type);
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
+        let reference = builder.add_instruction(operation, regions, vec![reference], None).unwrap()[0];
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let discharged = source.clone().discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = const 1.0
+                    %2:f32[] = const 3.0
+                    %3:f32[] = add %0 %1
+                    %4:bool[] = compare [direction=LessThan] %3 %2
+                    %5:f32[], %6:bool[] = while [iteration_bound=1] %3 %4 [
+                        condition={
+                            lambda %0:f32[], %1:bool[] .
+                            in (%1)
+                        },
+                        body={
+                            lambda %0:f32[], %1:bool[] .
+                            let %2:f32[] = const 1.0
+                                %3:f32[] = const 1.0
+                                %4:f32[] = const 3.0
+                                () = composite_transpose [leading_input_count=1] %2 [
+                                    backward={
+                                        lambda %0:f32[] .
+                                        let %1:f32[] = print [label=seed] %0
+                                        in ()
+                                    },
+                                ]
+                                %5:f32[] = add %0 %3
+                                %6:bool[] = compare [direction=LessThan] %5 %4
+                            in (%5, %6)
+                        },
+                    ]
+                    () = condition %6 %5 [
+                        true={
+                            lambda %0:f32[] .
+                            let %1:f32[] = const 1.0
+                                () = composite_transpose [leading_input_count=1] %1 [
+                                    backward={
+                                        lambda %0:f32[] .
+                                        let %1:f32[] = print [label=seed] %0
+                                        in ()
+                                    },
+                                ]
+                            in ()
+                        },
+                        false={
+                            lambda %0:f32[] .
+                            in ()
+                        },
+                    ]
+                in (%5, %5)"},
+        );
+
+        // A carrier has no forward program to execute, so only a loop whose body never runs interprets. From 5, the
+        // source tests 6 once and exits, and the discharged tail takes its `false` branch.
+        let initial = ArrayReference::new(Array::scalar(5f32).unwrap());
+        assert_eq!(
+            source.interpret(vec![TestIrValue::Reference(initial)]),
+            Ok(vec![array(Array::scalar(6f32).unwrap())]),
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![array(Array::scalar(5f32).unwrap())]),
+            Ok(vec![array(Array::scalar(6f32).unwrap()), array(Array::scalar(6f32).unwrap())]),
         );
     }
 
@@ -8000,6 +8286,129 @@ mod tests {
         assert_eq!(evaluation.interpret(&context, &[scalar(-1)]), Ok(vec![scalar(-1), scalar(0)]));
         assert_eq!(program.interpret(vec![scalar(2), scalar(0)]), Ok(vec![scalar(0), scalar(0)]));
         assert_eq!(evaluation.interpret(&context, &[scalar(2)]), Ok(vec![scalar(0), scalar(0)]));
+    }
+
+    #[test]
+    fn test_while_partial_evaluation_residualizes_loops_whose_invariance_probes_fail() {
+        // The invariance probes fold the condition and the body at the known invariant state through the known-side
+        // context, although the loop may never run them, so a probe that fails must not fail partial evaluation. The
+        // known-side context here fails every `sin`, as a backend whose execution of a pure operation fails would, so
+        // probing `sin(k)` at the known invariant `k = 1` fails, and the loop residualizes unchanged (the
+        // closed-knownness split declines as well, because the predicate reads the unknown `x`). The residual program
+        // then runs like the source program, whose regions execute every `sin` in the reference backend.
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let context = BindRecordingContext::failing(SIN_OPERATION_NAME);
+        let knowledge = [PartialValue::Unknown(scalar()), PartialValue::Known(Array::scalar(1.0).unwrap())];
+
+        // The body probe fails for `while (x < 4) { x = x + sin(k) }`. From `x = 5` the loop runs no iteration.
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+            let x = builder.add_input(scalar());
+            builder.add_input(scalar());
+            let limit = builder.add_constant(Array::scalar(4.0).unwrap());
+            let predicate = builder
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![x, limit], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+            let x = builder.add_input(scalar());
+            let k = builder.add_input(scalar());
+            let step = builder.add_instruction(SinOperation::new(), Vec::new(), vec![k], None).unwrap()[0];
+            let next_x = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, step], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![next_x, k], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let program = while_program(WhileOperation::new(), &[condition, body], vec![scalar(); 2]);
+        let evaluation = program.partially_evaluate_in_context(&context, &knowledge).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[], %3:f64[] = while %0 %1 [
+                    condition={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 4.0
+                            %3:bool[] = compare [direction=LessThan] %0 %2
+                        in (%3)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = sin %1
+                            %3:f64[] = add %0 %2
+                        in (%3, %1)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            evaluation.interpret(&context, &[Array::scalar(5.0).unwrap()]),
+            Ok(vec![Array::scalar(5.0).unwrap(), Array::scalar(1.0).unwrap()]),
+        );
+        assert_eq!(
+            evaluation.interpret(&context, &[Array::scalar(1.0).unwrap()]),
+            program.interpret(vec![Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap()]),
+        );
+
+        // The body probe of `while (x < 4 + sin(k)) { x = x + x }` succeeds, but its condition probe fails.
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+            let x = builder.add_input(scalar());
+            let k = builder.add_input(scalar());
+            let base = builder.add_constant(Array::scalar(4.0).unwrap());
+            let offset = builder.add_instruction(SinOperation::new(), Vec::new(), vec![k], None).unwrap()[0];
+            let limit = builder.add_instruction(AddOperation::new(), Vec::new(), vec![base, offset], None).unwrap()[0];
+            let predicate = builder
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![x, limit], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+            let x = builder.add_input(scalar());
+            let k = builder.add_input(scalar());
+            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![doubled, k], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let program = while_program(WhileOperation::new(), &[condition, body], vec![scalar(); 2]);
+        let evaluation = program.partially_evaluate_in_context(&context, &knowledge).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[], %3:f64[] = while %0 %1 [
+                    condition={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 4.0
+                            %3:f64[] = sin %1
+                            %4:f64[] = add %2 %3
+                            %5:bool[] = compare [direction=LessThan] %0 %4
+                        in (%5)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = add %0 %0
+                        in (%2, %1)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            evaluation.interpret(&context, &[Array::scalar(5.0).unwrap()]),
+            Ok(vec![Array::scalar(5.0).unwrap(), Array::scalar(1.0).unwrap()]),
+        );
+        assert_eq!(
+            evaluation.interpret(&context, &[Array::scalar(1.0).unwrap()]),
+            program.interpret(vec![Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap()]),
+        );
     }
 
     #[test]
@@ -9972,6 +10381,94 @@ mod tests {
     }
 
     #[test]
+    fn test_while_differentiation_eager_jvp_rejects_resuming_conditions_with_deferred_work() {
+        // The unbounded loop of the preceding tests with a condition that also runs the nested loop
+        // `while (false) { composite_transpose(z) }`, whose transposition carrier has a printing backward rule. The
+        // nested body never runs, so the condition evaluates eagerly, but it carries deferred work without any effect.
+        // Its predicate stops concretizing on the second iteration as well, but resuming under the staged rule would
+        // evaluate the condition, and therefore stage its deferred work, on the current state a second time, so the
+        // eager rule reports the concretization error instead.
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut backward_builder = ProgramBuilder::<Array, TestOperation>::new();
+        let seed = backward_builder.add_input(scalar_f64.clone());
+        backward_builder.add_instruction(PrintOperation::new("seed"), Vec::new(), vec![seed], None).unwrap();
+        let backward =
+            backward_builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let mut nested_condition_builder = ProgramBuilder::<Array, TestOperation>::new();
+        nested_condition_builder.add_input(scalar_f64.clone());
+        let never = nested_condition_builder.add_constant(Array::scalar(false).unwrap());
+        let nested_condition = nested_condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![never], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut nested_body_builder = ProgramBuilder::<Array, TestOperation>::new();
+        let z = nested_body_builder.add_input(scalar_f64.clone());
+        let backward = nested_body_builder.import_program(backward);
+        nested_body_builder
+            .add_instruction(
+                TestOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                vec![backward],
+                vec![z],
+                None,
+            )
+            .unwrap();
+        let nested_body = nested_body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![z], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut condition_builder = ProgramBuilder::<Array, TestOperation>::new();
+        let counter = condition_builder.add_input(scalar_f64.clone());
+        condition_builder.add_input(scalar_f64.clone());
+        condition_builder.add_input(scalar_f64);
+        let nested_regions =
+            vec![condition_builder.import_program(nested_condition), condition_builder.import_program(nested_body)];
+        let z = condition_builder.add_constant(Array::scalar(0.0).unwrap());
+        condition_builder.add_instruction(WhileOperation::new(), nested_regions, vec![z], None).unwrap();
+        let limit = condition_builder.add_constant(Array::scalar(3.0).unwrap());
+        let predicate = condition_builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert!(condition.effects().classes().is_empty());
+        assert!(condition.effects().has_deferred_work());
+        let (operation, mut regions) = stepping_counter_while_operation(false);
+        regions[0] = condition;
+        assert_eq!(
+            batch(
+                |(counter, step, scale, scale_tangent)| {
+                    Ok(differentiate_at(scale).with_captures((counter, step)).jvp(
+                        scale_tangent,
+                        |scale, (counter, step)| {
+                            Ok(bind_while(operation, regions.clone(), &[counter, step, scale])?.remove(2))
+                        },
+                    )?)
+                },
+                (
+                    Array::scalar(0.0).unwrap(),
+                    Array::vector(vec![1.0, 2.0]).unwrap(),
+                    Array::scalar(1.5).unwrap(),
+                    Array::scalar(2.0).unwrap(),
+                ),
+                (BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                None,
+            ),
+            Err(BatchingError::Program(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a value batched along axis 0".to_string(),
+            })),
+        );
+    }
+
+    #[test]
     fn test_while_differentiation_binds_the_original_loop_without_live_state_tangents() {
         // Forward mode with respect to `x` alone leaves every state tangent of a loop over the reference `r` a
         // structural zero, and the carry fixed point keeps it that way, so the staged rule binds the original loop with
@@ -10110,6 +10607,60 @@ mod tests {
                 in (%6, %7, %11, %12)"},
         );
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:f64[3] = zero [type=f64[3]]
+                    %4:bool[3] = zero [type=bool[3]]
+                    %5:f64[], %6:f64[], %7:i64[], %8:f64[3], %9:bool[3] = while [iteration_bound=3] %0 %1 %2 %3 %4 [
+                        condition={
+                            lambda %0:f64[], %1:f64[], %2:i64[], %3:f64[3], %4:bool[3] .
+                            let %5:bool[] = compare [direction=LessThan] %0 %1
+                            in (%5)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[], %2:i64[], %3:f64[3], %4:bool[3] .
+                            let %5:f64[] = mul %0 %0
+                                %6:i64[] = one [type=i64[]]
+                                %7:i64[] = add %2 %6
+                                %8:f64[1] = broadcast [output_type=f64[1], output_axes=[]] %0
+                                %9:f64[3] = dynamic_update_slice %3 %8 %2
+                                %10:bool[] = one [type=bool[]]
+                                %11:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %10
+                                %12:bool[3] = dynamic_update_slice %4 %11 %2
+                            in (%5, %1, %7, %9, %12)
+                        },
+                    ]
+                in (%5, %6, %9, %8)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[3], %2:f64[3] .
+                let %3:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:bool[], %3:f64[] .
+                        let %4:f64[] = condition %2 %1 %3 [
+                            true={
+                                lambda %0:f64[], %1:f64[] .
+                                let %2:f64[] = mul %1 %0
+                                    %3:f64[] = mul %1 %0
+                                    %4:f64[] = add %2 %3
+                                in (%4)
+                            },
+                            false={
+                                lambda %0:f64[], %1:f64[] .
+                                in (%0)
+                            },
+                        ]
+                        in (%4)
+                    },
+                ]
+                    %4:f64[] = zero [type=f64[]]
+                in (%3, %4)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(10.0).unwrap()])
@@ -10148,6 +10699,46 @@ mod tests {
                 in (%3, %4, %5, %6)"},
         );
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[], %3:f64[] = while %0 %1 [
+                    condition={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:bool[] = compare [direction=LessThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %0 %0
+                        in (%2, %1)
+                    },
+                ]
+                in (%2, %3, %0, %1)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[], %5:f64[] = while %1 %2 %0 [
+                    condition={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:bool[] = compare [direction=LessThan] %0 %1
+                        in (%3)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = mul %0 %0
+                            %4:f64[] = mul %0 %2
+                            %5:f64[] = mul %0 %2
+                            %6:f64[] = add %4 %5
+                        in (%3, %1, %6)
+                    },
+                ]
+                    %6:f64[] = zero [type=f64[]]
+                in (%5, %6)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(10.0).unwrap()])
@@ -10222,6 +10813,59 @@ mod tests {
                 in (%7, %8, %9, %10, %18, %15, %16, %17)"},
         );
         let linearization = program.linearize_with_respect_to(&[3]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:i64[] = zero [type=i64[]]
+                    %5:bool[4] = zero [type=bool[4]]
+                    %6:f64[], %7:f64[], %8:f64[], %9:f64[], %10:i64[], %11:bool[4] = while [iteration_bound=4] %0 %1 \
+                    %2 %3 %4 %5 [
+                        condition={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:i64[], %5:bool[4] .
+                            let %6:f64[] = const 0.0
+                                %7:bool[] = compare [direction=GreaterThan] %0 %6
+                            in (%7)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:i64[], %5:bool[4] .
+                            let %6:f64[] = const 1.0
+                                %7:f64[] = sub %0 %6
+                                %8:i64[] = one [type=i64[]]
+                                %9:i64[] = add %4 %8
+                                %10:bool[] = one [type=bool[]]
+                                %11:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %10
+                                %12:bool[4] = dynamic_update_slice %5 %11 %4
+                            in (%7, %2, %3, %3, %9, %12)
+                        },
+                    ]
+                in (%6, %7, %8, %9, %11)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[4] .
+                let %2:f64[] = zero [type=f64[]]
+                    %3:f64[] = zero [type=f64[]]
+                    %4:f64[] = zero [type=f64[]]
+                    %5:f64[], %6:f64[], %7:f64[] = scan [carry_count=3, iteration_count=4, reverse=false] %3 %4 %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:bool[] .
+                            let %5:f64[], %6:f64[], %7:f64[] = condition %4 %1 %2 %3 [
+                                true={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    in (%1, %2, %2)
+                                },
+                                false={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    in (%0, %1, %2)
+                                },
+                            ]
+                            in (%5, %6, %7)
+                        },
+                    ]
+                in (%2, %5, %6, %7)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
@@ -10291,6 +10935,50 @@ mod tests {
                 in (%7, %8, %9, %10, %14, %11, %12, %13)"},
         );
         let linearization = program.linearize_with_respect_to(&[3]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[] = while %0 %1 %2 %3 [
+                    condition={
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = const 0.0
+                            %5:bool[] = compare [direction=GreaterThan] %0 %4
+                        in (%5)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = const 1.0
+                            %5:f64[] = sub %0 %4
+                        in (%5, %2, %3, %3)
+                    },
+                ]
+                in (%4, %5, %6, %7, %0, %1, %2, %3)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                let %5:f64[] = zero [type=f64[]]
+                    %6:f64[] = zero [type=f64[]]
+                    %7:f64[] = zero [type=f64[]]
+                    %8:f64[], %9:f64[], %10:f64[], %11:f64[], %12:f64[], %13:f64[], %14:f64[] = while %1 %2 %3 %4 %6 \
+                    %7 %0 [
+                        condition={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
+                            let %7:f64[] = const 0.0
+                                %8:bool[] = compare [direction=GreaterThan] %0 %7
+                            in (%8)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
+                            let %7:f64[] = const 1.0
+                                %8:f64[] = sub %0 %7
+                            in (%8, %2, %3, %3, %5, %6, %6)
+                        },
+                    ]
+                in (%5, %12, %13, %14)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
@@ -10427,6 +11115,35 @@ mod tests {
         // and gradient `8 x⁷ = 1024`.
         let (operation, regions) = squaring_while_operation(100.0, Some(4));
         let (pullback, program) = trace_while_vjp(operation, regions.clone());
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:f64[4] = zero [type=f64[4]]
+                    %3:bool[4] = zero [type=bool[4]]
+                    %4:f64[], %5:i64[], %6:f64[4], %7:bool[4] = while [iteration_bound=4] %0 %1 %2 %3 [
+                        condition={
+                            lambda %0:f64[], %1:i64[], %2:f64[4], %3:bool[4] .
+                            let %4:f64[] = const 100.0
+                                %5:bool[] = compare [direction=LessThan] %0 %4
+                            in (%5)
+                        },
+                        body={
+                            lambda %0:f64[], %1:i64[], %2:f64[4], %3:bool[4] .
+                            let %4:f64[] = mul %0 %0
+                                %5:f64[1] = broadcast [output_type=f64[1], output_axes=[]] %0
+                                %6:f64[4] = dynamic_update_slice %2 %5 %1
+                                %7:bool[] = one [type=bool[]]
+                                %8:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %7
+                                %9:bool[4] = dynamic_update_slice %3 %8 %1
+                                %10:i64[] = one [type=i64[]]
+                                %11:i64[] = add %1 %10
+                            in (%4, %11, %6, %9)
+                        },
+                    ]
+                in (%4, %7, %6)"},
+        );
         let (output, residuals) = program.interpret(Array::scalar(2.0).unwrap()).unwrap();
         assert_eq!(output, Array::scalar(256.0).unwrap());
         assert_eq!(
@@ -10474,6 +11191,130 @@ mod tests {
     }
 
     #[test]
+    fn test_while_differentiation_carries_state_independent_residuals_once() {
+        // Batching `while (x < 8, iteration_bound = 5) { x = 2 * x }` over three items stages a body whose tangent
+        // reads the scale `broadcast 2.0`. That residual reads no loop state, so the bounded rule stores it once, in
+        // one `f64[3]` carry of the augmented loop that every body application overwrites, instead of in an
+        // `f64[5, 3]` stack, and the tangent scan threads it as an invariant carry. The per-item predicate of the
+        // masked form depends on the state, so it still fills a `bool[5, 3]` residual stack.
+        let (operation, regions) = bounded_doubling_while_operation(8.0, 5);
+        let program = batch_while_under_tracing(operation, regions, 3).to_flat_program();
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:f64[3] = zero [type=f64[3]]
+                    %4:bool[5, 3] = zero [type=bool[5, 3]]
+                    %5:bool[5] = zero [type=bool[5]]
+                    %6:f64[3], %7:i64[], %8:f64[3], %9:bool[5, 3], %10:bool[5] = while [iteration_bound=5] %0 %2 %3 %4 %5 [
+                        condition={
+                            lambda %0:f64[3], %1:i64[], %2:f64[3], %3:bool[5, 3], %4:bool[5] .
+                            let %5:f64[] = const 8.0
+                                %6:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %5
+                                %7:bool[3] = compare [direction=LessThan] %0 %6
+                                %8:bool[] = reduce [kind=any, axes=[0]] %7
+                            in (%8)
+                        },
+                        body={
+                            lambda %0:f64[3], %1:i64[], %2:f64[3], %3:bool[5, 3], %4:bool[5] .
+                            let %5:f64[] = const 8.0
+                                %6:f64[] = const 2.0
+                                %7:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %5
+                                %8:bool[3] = compare [direction=LessThan] %0 %7
+                                %9:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %6
+                                %10:f64[3] = mul %0 %9
+                                %11:f64[3] = select %8 %10 %0
+                                %12:i64[] = zero [type=i64[]]
+                                %13:bool[1, 3] = broadcast [output_type=bool[1, 3], output_axes=[1]] %8
+                                %14:bool[5, 3] = dynamic_update_slice %3 %13 %1 %12
+                                %15:bool[] = one [type=bool[]]
+                                %16:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %15
+                                %17:bool[5] = dynamic_update_slice %4 %16 %1
+                                %18:i64[] = one [type=i64[]]
+                                %19:i64[] = add %1 %18
+                            in (%11, %19, %9, %14, %17)
+                        },
+                    ]
+                    %11:f64[3], %12:f64[3] = scan [carry_count=2, iteration_count=5, reverse=false] %8 %1 %9 %10 [
+                        body={
+                            lambda %0:i64[], %1:f64[3], %2:f64[3], %3:bool[3], %4:bool[] .
+                            let %5:f64[3] = condition %4 %2 %1 %3 [
+                                true={
+                                    lambda %0:f64[3], %1:f64[3], %2:bool[3] .
+                                    let %3:f64[3] = mul %1 %0
+                                        %4:f64[3] = select %2 %3 %0
+                                    in (%4)
+                                },
+                                false={
+                                    lambda %0:f64[3], %1:f64[3], %2:bool[3] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%1, %5)
+                        },
+                    ]
+                in (%6, %12)"},
+        );
+
+        // Items `[1, 5, 9]` double 3, 1, and 0 times, so the primal is `[8, 10, 9]` and the tangent scale is
+        // `[8, 2, 1]`. From `[9, 10, 20]` the loop runs no iteration, so the carry keeps its zero placeholder, which
+        // the guarded tangent steps never read, and the tangent passes through unchanged.
+        let input = Array::vector(vec![1.0, 5.0, 9.0]).unwrap();
+        let finished = Array::vector(vec![9.0, 10.0, 20.0]).unwrap();
+        let tangent = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            jvp.interpret(vec![input.clone(), tangent.clone()]),
+            Ok(vec![Array::vector(vec![8.0, 10.0, 9.0]).unwrap(), Array::vector(vec![8.0, 4.0, 3.0]).unwrap()]),
+        );
+        assert_eq!(jvp.interpret(vec![finished.clone(), tangent.clone()]), Ok(vec![finished.clone(), tangent.clone()]));
+
+        // Reverse mode transposes the tangent scan, which passes the carry through as a known invariant carry. After
+        // some iterations, the carry holds the scale `[2, 2, 2]`. Without iterations, it holds its zero placeholder.
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![Array::vector(vec![8.0, 10.0, 9.0]).unwrap()]);
+        assert_eq!(
+            residuals,
+            vec![
+                Array::vector(vec![2.0, 2.0, 2.0]).unwrap(),
+                Array::vector(vec![true, true, true, false, false]).unwrap(),
+                Array::from_elements(
+                    ArrayType::new_static(DataType::Boolean, [5, 3]),
+                    &[
+                        true, true, false, true, false, false, true, false, false, false, false, false, false, false,
+                        false,
+                    ],
+                )
+                .unwrap(),
+            ],
+        );
+        let mut pullback_inputs = vec![tangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            pullback.program().interpret(pullback_inputs),
+            Ok(vec![Array::vector(vec![8.0, 4.0, 3.0]).unwrap()]),
+        );
+        let mut primal_outputs = linearization.primal().interpret(vec![finished.clone()]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![finished]);
+        assert_eq!(
+            residuals,
+            vec![
+                Array::vector(vec![0.0f64; 3]).unwrap(),
+                Array::vector(vec![false; 5]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::Boolean, [5, 3]), &[false; 15]).unwrap(),
+            ],
+        );
+        let mut pullback_inputs = vec![tangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.program().interpret(pullback_inputs), Ok(vec![tangent]));
+    }
+
+    #[test]
     fn test_while_differentiation_skips_inactive_singular_residuals() {
         // Quotient derivatives read the loop-varying denominator. Unused residual slots contain zero, so evaluating
         // their pushforward or pullback would divide by zero even though the actual loop never visits zero. The loop
@@ -10486,6 +11327,64 @@ mod tests {
         let regions = vec![scalar_threshold_condition(1.0), body];
         let operation = WhileOperation::new().with_iteration_bound(3).unwrap();
         let program = trace_while_value_and_gradient(operation, regions.clone(), ArrayType::scalar(DataType::F64));
+
+        // The staged program stores the state and the quotient-rule residual `-x / x²` per iteration, and its masked
+        // reverse scan divides by a stored state only in the steps of executed iterations.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:f64[3] = zero [type=f64[3]]
+                    %3:f64[3] = zero [type=f64[3]]
+                    %4:bool[3] = zero [type=bool[3]]
+                    %5:f64[], %6:i64[], %7:f64[3], %8:f64[3], %9:bool[3] = while [iteration_bound=3] %0 %1 %2 %3 %4 [
+                        condition={
+                            lambda %0:f64[], %1:i64[], %2:f64[3], %3:f64[3], %4:bool[3] .
+                            let %5:f64[] = const 1.0
+                                %6:bool[] = compare [direction=LessThan] %0 %5
+                            in (%6)
+                        },
+                        body={
+                            lambda %0:f64[], %1:i64[], %2:f64[3], %3:f64[3], %4:bool[3] .
+                            let %5:f64[] = div %0 %0
+                                %6:f64[] = mul %0 %0
+                                %7:f64[] = div %0 %6
+                                %8:f64[] = neg %7
+                                %9:f64[1] = broadcast [output_type=f64[1], output_axes=[]] %0
+                                %10:f64[3] = dynamic_update_slice %2 %9 %1
+                                %11:f64[1] = broadcast [output_type=f64[1], output_axes=[]] %8
+                                %12:f64[3] = dynamic_update_slice %3 %11 %1
+                                %13:bool[] = one [type=bool[]]
+                                %14:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %13
+                                %15:bool[3] = dynamic_update_slice %4 %14 %1
+                                %16:i64[] = one [type=i64[]]
+                                %17:i64[] = add %1 %16
+                            in (%5, %17, %10, %12, %15)
+                        },
+                    ]
+                    %10:f64[] = one [type=f64[]]
+                    %11:f64[] = scan [carry_count=1, iteration_count=3, reverse=true] %10 %9 %7 %8 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:bool[], %3:f64[], %4:f64[] .
+                            let %5:f64[] = condition %2 %1 %3 %4 [
+                                true={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    let %3:f64[] = mul %2 %0
+                                        %4:f64[] = div %0 %1
+                                        %5:f64[] = add %3 %4
+                                    in (%5)
+                                },
+                                false={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%5)
+                        },
+                    ]
+                in (%5, %11)"},
+        );
 
         // From `x = 0.5`, one iteration computes `x / x = 1`, whose derivative is zero.
         check_gradient!(
@@ -10583,6 +11482,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:f64[4, 2] = zero [type=f64[4, 2]]
+                    %3:bool[4] = zero [type=bool[4]]
+                    %4:f64[2], %5:i64[], %6:f64[4, 2], %7:bool[4] = while [iteration_bound=4] %0 %1 %2 %3 [
+                        condition={
+                            lambda %0:f64[2], %1:i64[], %2:f64[4, 2], %3:bool[4] .
+                            let %4:f64[] = const 20.0
+                                %5:f64[] = reduce [kind=sum, axes=[0]] %0
+                                %6:bool[] = compare [direction=LessThan] %5 %4
+                            in (%6)
+                        },
+                        body={
+                            lambda %0:f64[2], %1:i64[], %2:f64[4, 2], %3:bool[4] .
+                            let %4:f64[2] = mul %0 %0
+                                %5:i64[] = zero [type=i64[]]
+                                %6:f64[1, 2] = broadcast [output_type=f64[1, 2], output_axes=[1]] %0
+                                %7:f64[4, 2] = dynamic_update_slice %2 %6 %1 %5
+                                %8:bool[] = one [type=bool[]]
+                                %9:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %8
+                                %10:bool[4] = dynamic_update_slice %3 %9 %1
+                                %11:i64[] = one [type=i64[]]
+                                %12:i64[] = add %1 %11
+                            in (%4, %12, %7, %10)
+                        },
+                    ]
+                    %8:f64[] = reduce [kind=sum, axes=[0]] %4
+                    %9:f64[] = one [type=f64[]]
+                    %10:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %9
+                    %11:f64[2] = scan [carry_count=1, iteration_count=4, reverse=true] %10 %7 %6 [
+                        body={
+                            lambda %0:i64[], %1:f64[2], %2:bool[], %3:f64[2] .
+                            let %4:f64[2] = condition %2 %1 %3 [
+                                true={
+                                    lambda %0:f64[2], %1:f64[2] .
+                                    let %2:f64[2] = mul %1 %0
+                                        %3:f64[2] = mul %1 %0
+                                        %4:f64[2] = add %2 %3
+                                    in (%4)
+                                },
+                                false={
+                                    lambda %0:f64[2], %1:f64[2] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%4)
+                        },
+                    ]
+                in (%8, %11)"},
+        );
+        assert_eq!(
             program.interpret(Array::vector(vec![1.5, 2.0]).unwrap()),
             Ok((Array::scalar(21.0625).unwrap(), Array::vector(vec![13.5, 32.0]).unwrap())),
         );
@@ -10596,6 +11548,85 @@ mod tests {
         let (operation, regions) = squaring_while_operation(100.0, Some(4));
         let program = while_program(operation, &regions, vec![ArrayType::scalar(DataType::F64)]);
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:f64[4] = zero [type=f64[4]]
+                    %3:bool[4] = zero [type=bool[4]]
+                    %4:f64[], %5:i64[], %6:f64[4], %7:bool[4] = while [iteration_bound=4] %0 %1 %2 %3 [
+                        condition={
+                            lambda %0:f64[], %1:i64[], %2:f64[4], %3:bool[4] .
+                            let %4:f64[] = const 100.0
+                                %5:bool[] = compare [direction=LessThan] %0 %4
+                            in (%5)
+                        },
+                        body={
+                            lambda %0:f64[], %1:i64[], %2:f64[4], %3:bool[4] .
+                            let %4:f64[] = mul %0 %0
+                                %5:i64[] = one [type=i64[]]
+                                %6:i64[] = add %1 %5
+                                %7:f64[1] = broadcast [output_type=f64[1], output_axes=[]] %0
+                                %8:f64[4] = dynamic_update_slice %2 %7 %1
+                                %9:bool[] = one [type=bool[]]
+                                %10:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %9
+                                %11:bool[4] = dynamic_update_slice %3 %10 %1
+                            in (%4, %6, %8, %11)
+                        },
+                    ]
+                in (%4, %7, %6)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[4], %2:f64[4] .
+                let %3:f64[] = scan [carry_count=1, iteration_count=4, reverse=false] %0 %1 %2 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:bool[], %3:f64[] .
+                        let %4:f64[] = condition %2 %1 %3 [
+                            true={
+                                lambda %0:f64[], %1:f64[] .
+                                let %2:f64[] = mul %1 %0
+                                    %3:f64[] = mul %1 %0
+                                    %4:f64[] = add %2 %3
+                                in (%4)
+                            },
+                            false={
+                                lambda %0:f64[], %1:f64[] .
+                                in (%0)
+                            },
+                        ]
+                        in (%4)
+                    },
+                ]
+                in (%3)"},
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[4], %2:f64[4] .
+                let %3:f64[] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:bool[], %3:f64[] .
+                        let %4:f64[] = condition %2 %1 %3 [
+                            true={
+                                lambda %0:f64[], %1:f64[] .
+                                let %2:f64[] = mul %1 %0
+                                    %3:f64[] = mul %1 %0
+                                    %4:f64[] = add %2 %3
+                                in (%4)
+                            },
+                            false={
+                                lambda %0:f64[], %1:f64[] .
+                                in (%0)
+                            },
+                        ]
+                        in (%4)
+                    },
+                ]
+                in (%3)"},
+        );
         let mut primal_outputs = linearization.primal().interpret(vec![Array::scalar(200.0).unwrap()]).unwrap();
         let residuals = primal_outputs.split_off(1);
         assert_eq!(primal_outputs, vec![Array::scalar(200.0).unwrap()]);
@@ -10642,6 +11673,52 @@ mod tests {
             Ok((Array::scalar(16.0).unwrap(), Array::scalar(8.0).unwrap())),
         );
         let program = trace_while_value_and_gradient(operation, regions.clone(), ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:bool[3] = zero [type=bool[3]]
+                    %3:f64[], %4:i64[], %5:bool[3] = while [iteration_bound=3] %0 %1 %2 [
+                        condition={
+                            lambda %0:f64[], %1:i64[], %2:bool[3] .
+                            let %3:f64[] = const inf
+                                %4:bool[] = compare [direction=LessThan] %0 %3
+                            in (%4)
+                        },
+                        body={
+                            lambda %0:f64[], %1:i64[], %2:bool[3] .
+                            let %3:f64[] = const 2.0
+                                %4:f64[] = mul %0 %3
+                                %5:bool[] = one [type=bool[]]
+                                %6:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %5
+                                %7:bool[3] = dynamic_update_slice %2 %6 %1
+                                %8:i64[] = one [type=i64[]]
+                                %9:i64[] = add %1 %8
+                            in (%4, %9, %7)
+                        },
+                    ]
+                    %6:f64[] = one [type=f64[]]
+                    %7:f64[] = scan [carry_count=1, iteration_count=3, reverse=true] %6 %5 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:bool[] .
+                            let %3:f64[] = condition %2 %1 [
+                                true={
+                                    lambda %0:f64[] .
+                                    let %1:f64[] = const 2.0
+                                        %2:f64[] = mul %1 %0
+                                    in (%2)
+                                },
+                                false={
+                                    lambda %0:f64[] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%3)
+                        },
+                    ]
+                in (%3, %7)"},
+        );
         assert_eq!(
             program.interpret(Array::scalar(2.0).unwrap()),
             Ok((Array::scalar(16.0).unwrap(), Array::scalar(8.0).unwrap())),
@@ -10720,6 +11797,99 @@ mod tests {
 
         // The staged masked form reproduces the truncated values in both directions.
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:i64[] = zero [type=i64[]]
+                    %2:f64[2, 2] = zero [type=f64[2, 2]]
+                    %3:bool[2, 2] = zero [type=bool[2, 2]]
+                    %4:bool[2] = zero [type=bool[2]]
+                    %5:f64[2], %6:i64[], %7:f64[2, 2], %8:bool[2, 2], %9:bool[2] = while [iteration_bound=2] %0 %1 %2 \
+                    %3 %4 [
+                        condition={
+                            lambda %0:f64[2], %1:i64[], %2:f64[2, 2], %3:bool[2, 2], %4:bool[2] .
+                            let %5:f64[2] = const [100.0, 3.0]
+                                %6:bool[2] = compare [direction=LessThan] %0 %5
+                                %7:bool[] = reduce [kind=any, axes=[0]] %6
+                            in (%7)
+                        },
+                        body={
+                            lambda %0:f64[2], %1:i64[], %2:f64[2, 2], %3:bool[2, 2], %4:bool[2] .
+                            let %5:f64[2] = const [100.0, 3.0]
+                                %6:bool[2] = compare [direction=LessThan] %0 %5
+                                %7:f64[2] = mul %0 %0
+                                %8:f64[2] = select %6 %7 %0
+                                %9:i64[] = one [type=i64[]]
+                                %10:i64[] = add %1 %9
+                                %11:f64[1, 2] = broadcast [output_type=f64[1, 2], output_axes=[1]] %0
+                                %12:i64[] = zero [type=i64[]]
+                                %13:f64[2, 2] = dynamic_update_slice %2 %11 %1 %12
+                                %14:bool[1, 2] = broadcast [output_type=bool[1, 2], output_axes=[1]] %6
+                                %15:bool[2, 2] = dynamic_update_slice %3 %14 %1 %12
+                                %16:bool[] = one [type=bool[]]
+                                %17:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %16
+                                %18:bool[2] = dynamic_update_slice %4 %17 %1
+                            in (%8, %10, %13, %15, %18)
+                        },
+                    ]
+                in (%5, %9, %7, %8)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:bool[2], %2:f64[2, 2], %3:bool[2, 2] .
+                let %4:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:i64[], %1:f64[2], %2:bool[], %3:f64[2], %4:bool[2] .
+                        let %5:f64[2] = condition %2 %1 %3 %4 [
+                            true={
+                                lambda %0:f64[2], %1:f64[2], %2:bool[2] .
+                                let %3:f64[2] = mul %1 %0
+                                    %4:f64[2] = mul %1 %0
+                                    %5:f64[2] = add %3 %4
+                                    %6:f64[2] = select %2 %5 %0
+                                in (%6)
+                            },
+                            false={
+                                lambda %0:f64[2], %1:f64[2], %2:bool[2] .
+                                in (%0)
+                            },
+                        ]
+                        in (%5)
+                    },
+                ]
+                in (%4)"},
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:bool[2], %2:f64[2, 2], %3:bool[2, 2] .
+                let %4:f64[2] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:i64[], %1:f64[2], %2:bool[], %3:f64[2], %4:bool[2] .
+                        let %5:f64[2] = condition %2 %1 %3 %4 [
+                            true={
+                                lambda %0:f64[2], %1:f64[2], %2:bool[2] .
+                                let %3:f64[2] = zero [type=f64[2]]
+                                    %4:f64[2] = select %2 %0 %3
+                                    %5:f64[2] = select %2 %3 %0
+                                    %6:f64[2] = mul %1 %4
+                                    %7:f64[2] = add %5 %6
+                                    %8:f64[2] = mul %1 %4
+                                    %9:f64[2] = add %7 %8
+                                in (%9)
+                            },
+                            false={
+                                lambda %0:f64[2], %1:f64[2], %2:bool[2] .
+                                in (%0)
+                            },
+                        ]
+                        in (%5)
+                    },
+                ]
+                in (%4)"},
+        );
         let mut primal_outputs =
             linearization.primal().interpret(vec![Array::vector(vec![2.0, 2.0]).unwrap()]).unwrap();
         let residuals = primal_outputs.split_off(1);
@@ -10757,6 +11927,96 @@ mod tests {
             at = Array::vector(vec![2.0, 2.0]).unwrap(),
             step = 1e-4,
             tolerance = 1e-3,
+        );
+    }
+
+    #[test]
+    fn test_while_differentiation_reduces_every_axis_of_higher_rank_batched_predicates() {
+        // The masked form continues while any item's predicate holds, so its condition reduces every predicate axis,
+        // here both axes of the `bool[2, 2]` predicate `x < [[2, 4], [8, 16]]`. With the iteration bound 4, the loop
+        // `x = x + x` from all ones doubles item `(i, j)` exactly `2 i + j + 1` times, so the value and the per-item
+        // derivatives are both `[[2, 4], [8, 16]]`.
+        let state_type = ArrayType::new_static(DataType::F64, [2, 2]);
+        let matrix = |values: &[f64]| Array::from_elements(state_type.clone(), values).unwrap();
+        let mut condition_builder = ProgramBuilder::<Array, TestOperation>::new();
+        let state = condition_builder.add_input(state_type.clone());
+        let limits = condition_builder.add_constant(matrix(&[2.0, 4.0, 8.0, 16.0]));
+        let predicate = condition_builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![state, limits],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<Array, TestOperation>::new();
+        let state = body_builder.add_input(state_type.clone());
+        let doubled =
+            body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let operation = WhileOperation::new().with_iteration_bound(4).unwrap();
+        let program = while_program(operation, &[condition, body], vec![state_type.clone()]);
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 2], %1:f64[2, 2] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:bool[4, 2, 2] = zero [type=bool[4, 2, 2]]
+                    %4:bool[4] = zero [type=bool[4]]
+                    %5:f64[2, 2], %6:i64[], %7:bool[4, 2, 2], %8:bool[4] = while [iteration_bound=4] %0 %2 %3 %4 [
+                        condition={
+                            lambda %0:f64[2, 2], %1:i64[], %2:bool[4, 2, 2], %3:bool[4] .
+                            let %4:f64[2, 2] = const [[2.0, 4.0], [8.0, 16.0]]
+                                %5:bool[2, 2] = compare [direction=LessThan] %0 %4
+                                %6:bool[] = reduce [kind=any, axes=[0, 1]] %5
+                            in (%6)
+                        },
+                        body={
+                            lambda %0:f64[2, 2], %1:i64[], %2:bool[4, 2, 2], %3:bool[4] .
+                            let %4:f64[2, 2] = const [[2.0, 4.0], [8.0, 16.0]]
+                                %5:bool[2, 2] = compare [direction=LessThan] %0 %4
+                                %6:f64[2, 2] = add %0 %0
+                                %7:f64[2, 2] = select %5 %6 %0
+                                %8:i64[] = zero [type=i64[]]
+                                %9:bool[1, 2, 2] = broadcast [output_type=bool[1, 2, 2], output_axes=[1, 2]] %5
+                                %10:bool[4, 2, 2] = dynamic_update_slice %2 %9 %1 %8 %8
+                                %11:bool[] = one [type=bool[]]
+                                %12:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %11
+                                %13:bool[4] = dynamic_update_slice %3 %12 %1
+                                %14:i64[] = one [type=i64[]]
+                                %15:i64[] = add %1 %14
+                            in (%7, %15, %10, %13)
+                        },
+                    ]
+                    %9:f64[2, 2] = scan [carry_count=1, iteration_count=4, reverse=false] %1 %7 %8 [
+                        body={
+                            lambda %0:i64[], %1:f64[2, 2], %2:bool[2, 2], %3:bool[] .
+                            let %4:f64[2, 2] = condition %3 %1 %2 [
+                                true={
+                                    lambda %0:f64[2, 2], %1:bool[2, 2] .
+                                    let %2:f64[2, 2] = add %0 %0
+                                        %3:f64[2, 2] = select %1 %2 %0
+                                    in (%3)
+                                },
+                                false={
+                                    lambda %0:f64[2, 2], %1:bool[2, 2] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%4)
+                        },
+                    ]
+                in (%5, %9)"},
+        );
+        assert_eq!(
+            jvp.interpret(vec![matrix(&[1.0; 4]), matrix(&[1.0; 4])]),
+            Ok(vec![matrix(&[2.0, 4.0, 8.0, 16.0]), matrix(&[2.0, 4.0, 8.0, 16.0])]),
         );
     }
 
@@ -11036,113 +12296,26 @@ mod tests {
                     ]
                 in (%4, %7, %6)"},
         );
-        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
-        let residuals = primal_outputs.split_off(1);
-        assert_eq!(primal_outputs, vec![expected]);
-        let mut pullback_inputs = vec![Array::vector(vec![1.0, 2.0]).unwrap()];
-        pullback_inputs.extend(residuals);
-        assert_eq!(
-            linearization.pullback().unwrap().program().interpret(pullback_inputs),
-            Ok(vec![Array::vector(vec![2.25, 6.75]).unwrap()]),
-        );
-    }
-
-    #[test]
-    fn test_while_differentiation_pulls_back_array_ir_loops_with_batched_predicates() {
-        // Reverse mode runs through a bounded array IR loop with a batched predicate. The loop `while (x < [2, 4, 8],
-        // iteration_bound = 4) { x = x + x }` from `[1, 1, 1]` doubles item `i` exactly `i + 1` times before its own
-        // predicate turns false, so the primal is `[2, 4, 8]` and the pullback scales a unit cotangent by the matching
-        // per-item factors `[2, 4, 8]`. The augmented primal loop is the bounded rule over the masked form, whose
-        // condition reduces the per-item predicate of the current state and whose body recomputes it to select its
-        // updates.
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-
-        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
-        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
-        let predicate = condition_builder
-            .add_instruction(
-                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
-                Vec::new(),
-                vec![state, limits],
-                None,
-            )
-            .unwrap()[0];
-        let condition = condition_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let state = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
-        let doubled = body_builder
-            .add_instruction(
-                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
-                Vec::new(),
-                vec![state, state],
-                None,
-            )
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let operation = WhileOperation::new().with_iteration_bound(4).unwrap();
-        let program = while_program(operation, &[condition, body], vec![ArrayIrType::Array(vector_type)]);
-
-        let linearization = program.linearize().unwrap();
-        assert_eq!(
-            linearization.primal().to_string(),
-            indoc! {"
-                lambda %0:f64[3] .
-                let %1:i64[] = zero [type=i64[]]
-                    %2:bool[4, 3] = zero [type=bool[4, 3]]
-                    %3:bool[4] = zero [type=bool[4]]
-                    %4:f64[3], %5:i64[], %6:bool[4, 3], %7:bool[4] = while [iteration_bound=4] %0 %1 %2 %3 [
-                        condition={
-                            lambda %0:f64[3], %1:i64[], %2:bool[4, 3], %3:bool[4] .
-                            let %4:f64[3] = const [2.0, 4.0, 8.0]
-                                %5:bool[3] = compare [direction=LessThan] %0 %4
-                                %6:bool[] = reduce [kind=any, axes=[0]] %5
-                            in (%6)
-                        },
-                        body={
-                            lambda %0:f64[3], %1:i64[], %2:bool[4, 3], %3:bool[4] .
-                            let %4:f64[3] = const [2.0, 4.0, 8.0]
-                                %5:bool[3] = compare [direction=LessThan] %0 %4
-                                %6:f64[3] = add %0 %0
-                                %7:f64[3] = select %5 %6 %0
-                                %8:i64[] = one [type=i64[]]
-                                %9:i64[] = add %1 %8
-                                %10:bool[1, 3] = broadcast [output_type=bool[1, 3], output_axes=[1]] %5
-                                %11:i64[] = zero [type=i64[]]
-                                %12:bool[4, 3] = dynamic_update_slice %2 %10 %1 %11
-                                %13:bool[] = one [type=bool[]]
-                                %14:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %13
-                                %15:bool[4] = dynamic_update_slice %3 %14 %1
-                            in (%7, %9, %12, %15)
-                        },
-                    ]
-                in (%4, %7, %6)"},
-        );
         assert_eq!(
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
-                lambda %0:f64[3], %1:bool[4], %2:bool[4, 3] .
-                let %3:f64[3] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
+                lambda %0:f64[2], %1:bool[5], %2:bool[5, 2] .
+                let %3:f64[2] = scan [carry_count=1, iteration_count=5, reverse=true] %0 %1 %2 [
                     body={
-                        lambda %0:i64[], %1:f64[3], %2:bool[], %3:bool[3] .
-                        let %4:f64[3] = condition %2 %1 %3 [
+                        lambda %0:i64[], %1:f64[2], %2:bool[], %3:bool[2] .
+                        let %4:f64[2] = condition %2 %1 %3 [
                             true={
-                                lambda %0:f64[3], %1:bool[3] .
-                                let %2:f64[3] = zero [type=f64[3]]
-                                    %3:f64[3] = select %1 %0 %2
-                                    %4:f64[3] = select %1 %2 %0
-                                    %5:f64[3] = add %4 %3
-                                    %6:f64[3] = add %5 %3
-                                in (%6)
+                                lambda %0:f64[2], %1:bool[2] .
+                                let %2:f64[2] = zero [type=f64[2]]
+                                    %3:f64[2] = select %1 %0 %2
+                                    %4:f64[2] = select %1 %2 %0
+                                    %5:f64[2] = const [1.5, 1.5]
+                                    %6:f64[2] = mul %5 %3
+                                    %7:f64[2] = add %4 %6
+                                in (%7)
                             },
                             false={
-                                lambda %0:f64[3], %1:bool[3] .
+                                lambda %0:f64[2], %1:bool[2] .
                                 in (%0)
                             },
                         ]
@@ -11151,15 +12324,14 @@ mod tests {
                 ]
                 in (%3)"},
         );
-        let mut primal_outputs =
-            linearization.primal().interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]).unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        assert_eq!(primal_outputs, vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]);
-        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
+        assert_eq!(primal_outputs, vec![expected]);
+        let mut pullback_inputs = vec![Array::vector(vec![1.0, 2.0]).unwrap()];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().program().interpret(pullback_inputs),
-            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
+            Ok(vec![Array::vector(vec![2.25, 6.75]).unwrap()]),
         );
     }
 
@@ -11283,7 +12455,71 @@ mod tests {
             ]),
         );
 
+        // Reverse mode transposes the masked tangent scan. The augmented primal loop forwards the dimension carry and
+        // stores only the per-item predicates and the validity mask, because the doubling tangent reads no residual.
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[3] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:bool[4, 3] = zero [type=bool[4, 3]]
+                    %4:bool[4] = zero [type=bool[4]]
+                    %5:dimension<extent ∈ [1, 8)>, %6:f64[3], %7:i64[], %8:bool[4, 3], %9:bool[4] = while \
+                    [iteration_bound=4] %0 %1 %2 %3 %4 [
+                        condition={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[3], %2:i64[], %3:bool[4, 3], %4:bool[4] .
+                            let %5:f64[3] = const [2.0, 4.0, 8.0]
+                                %6:bool[3] = compare [direction=LessThan] %1 %5
+                                %7:bool[] = reduce [kind=any, axes=[0]] %6
+                            in (%7)
+                        },
+                        body={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[3], %2:i64[], %3:bool[4, 3], %4:bool[4] .
+                            let %5:f64[3] = const [2.0, 4.0, 8.0]
+                                %6:bool[3] = compare [direction=LessThan] %1 %5
+                                %7:f64[3] = add %1 %1
+                                %8:f64[3] = select %6 %7 %1
+                                %9:i64[] = one [type=i64[]]
+                                %10:i64[] = add %2 %9
+                                %11:bool[1, 3] = broadcast [output_type=bool[1, 3], output_axes=[1]] %6
+                                %12:i64[] = zero [type=i64[]]
+                                %13:bool[4, 3] = dynamic_update_slice %3 %11 %2 %12
+                                %14:bool[] = one [type=bool[]]
+                                %15:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %14
+                                %16:bool[4] = dynamic_update_slice %4 %15 %2
+                            in (%0, %8, %10, %13, %16)
+                        },
+                    ]
+                in (%5, %6, %9, %8)"},
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:bool[4], %2:bool[4, 3] .
+                let %3:f64[3] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
+                    body={
+                        lambda %0:i64[], %1:f64[3], %2:bool[], %3:bool[3] .
+                        let %4:f64[3] = condition %2 %1 %3 [
+                            true={
+                                lambda %0:f64[3], %1:bool[3] .
+                                let %2:f64[3] = zero [type=f64[3]]
+                                    %3:f64[3] = select %1 %0 %2
+                                    %4:f64[3] = select %1 %2 %0
+                                    %5:f64[3] = add %4 %3
+                                    %6:f64[3] = add %5 %3
+                                in (%6)
+                            },
+                            false={
+                                lambda %0:f64[3], %1:bool[3] .
+                                in (%0)
+                            },
+                        ]
+                        in (%4)
+                    },
+                ]
+                in (%3)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![dimension(&extent_type, 4), array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())])
@@ -11536,6 +12772,33 @@ mod tests {
         );
 
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:bool[4] = zero [type=bool[4]]
+                    %4:dimension<extent ∈ [1, 8)>, %5:f64[], %6:i64[], %7:bool[4] = while [iteration_bound=4] %0 %1 %2 \
+                    %3 [
+                        condition={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[], %2:i64[], %3:bool[4] .
+                            let %4:f64[] = const 8.0
+                                %5:bool[] = compare [direction=LessThan] %1 %4
+                            in (%5)
+                        },
+                        body={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[], %2:i64[], %3:bool[4] .
+                            let %4:f64[] = add %1 %1
+                                %5:i64[] = one [type=i64[]]
+                                %6:i64[] = add %2 %5
+                                %7:bool[] = one [type=bool[]]
+                                %8:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %7
+                                %9:bool[4] = dynamic_update_slice %3 %8 %2
+                            in (%0, %4, %6, %9)
+                        },
+                    ]
+                in (%4, %5, %7)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0).unwrap())])
@@ -11680,6 +12943,41 @@ mod tests {
                 ]
                 in (%4)"},
         );
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 8)>, %2:bool[4] .
+                let %3:dimension<extent ∈ [1, 8)>, %4:f64[extent] = scan [carry_count=2, iteration_count=4, \
+                reverse=true] %1 %0 %2 [
+                    body={
+                        lambda %0:i64[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:bool[] .
+                        let %4:f64[extent] = condition %3 %2 %1 [
+                            true={
+                                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 8)> .
+                                let %2:f64[extent] = linear_call [residual_count=1] %1 %0 [
+                                    forward={
+                                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent] .
+                                        let %2:f64[extent] = reshape [requires_runtime_assertion=false] %1 %0
+                                        in (%2)
+                                    },
+                                    transpose={
+                                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent] .
+                                        let %2:f64[extent] = reshape [requires_runtime_assertion=false] %1 %0
+                                        in (%2)
+                                    },
+                                ]
+                                in (%2)
+                            },
+                            false={
+                                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 8)> .
+                                in (%0)
+                            },
+                        ]
+                        in (%1, %4)
+                    },
+                ]
+                in (%4)"},
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
@@ -11709,7 +13007,8 @@ mod tests {
     fn test_while_differentiation_stacks_varying_dimension_residuals_through_scalar_gateways() {
         // The body broadcasts its state to an extent computed from the counter and sums it back, so the loop-varying
         // extent is stored per iteration through a scalar gateway on the primal side and restored on the tangent side.
-        // From `x = 2` and counter 1, the iterations with extents 1 and 2 give `x = 4` and the derivative 2.
+        // The derivatives of the broadcast and of the sum both name that extent, which is stored once. From `x = 2`
+        // and counter 1, the iterations with extents 1 and 2 give `x = 4` and the derivative 2.
         let iteration_variable = DimensionVariable::new("iteration", DimensionBounds::positive(Some(4)).unwrap());
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let scalar_u64 = ArrayType::scalar(DataType::U64);
@@ -11786,53 +13085,47 @@ mod tests {
                 lambda %0:f64[], %1:u64[] .
                 let %2:i64[] = zero [type=i64[]]
                     %3:i64[4] = zero [type=i64[4]]
-                    %4:i64[4] = zero [type=i64[4]]
-                    %5:bool[4] = zero [type=bool[4]]
-                    %6:f64[], %7:u64[], %8:i64[], %9:i64[4], %10:i64[4], %11:bool[4] = while [iteration_bound=4] %0 %1 \
-                    %2 %3 %4 %5 [
+                    %4:bool[4] = zero [type=bool[4]]
+                    %5:f64[], %6:u64[], %7:i64[], %8:i64[4], %9:bool[4] = while [iteration_bound=4] %0 %1 %2 %3 %4 [
                         condition={
-                            lambda %0:f64[], %1:u64[], %2:i64[], %3:i64[4], %4:i64[4], %5:bool[4] .
-                            let %6:u64[] = const 3
-                                %7:bool[] = compare [direction=LessThan] %1 %6
-                            in (%7)
+                            lambda %0:f64[], %1:u64[], %2:i64[], %3:i64[4], %4:bool[4] .
+                            let %5:u64[] = const 3
+                                %6:bool[] = compare [direction=LessThan] %1 %5
+                            in (%6)
                         },
                         body={
-                            lambda %0:f64[], %1:u64[], %2:i64[], %3:i64[4], %4:i64[4], %5:bool[4] .
-                            let %6:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %1
-                                %7:f64[iteration] = broadcast [output_axes=[]] %0 %6
-                                %8:f64[] = reduce [kind=sum, axes=[0]] %7
-                                %9:u64[] = const 1
-                                %10:u64[] = add %1 %9
-                                %11:i64[] = one [type=i64[]]
-                                %12:i64[] = add %2 %11
-                                %13:i64[] = dimension_to_scalar %6
-                                %14:i64[1] = broadcast [output_type=i64[1], output_axes=[]] %13
-                                %15:i64[4] = dynamic_update_slice %3 %14 %2
-                                %16:dimension<iteration ∈ [1, 4)> = dimension_size [axis=0] %7
-                                %17:i64[] = dimension_to_scalar %16
-                                %18:i64[1] = broadcast [output_type=i64[1], output_axes=[]] %17
-                                %19:i64[4] = dynamic_update_slice %4 %18 %2
-                                %20:bool[] = one [type=bool[]]
-                                %21:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %20
-                                %22:bool[4] = dynamic_update_slice %5 %21 %2
-                            in (%8, %10, %12, %15, %19, %22)
+                            lambda %0:f64[], %1:u64[], %2:i64[], %3:i64[4], %4:bool[4] .
+                            let %5:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %1
+                                %6:f64[iteration] = broadcast [output_axes=[]] %0 %5
+                                %7:f64[] = reduce [kind=sum, axes=[0]] %6
+                                %8:u64[] = const 1
+                                %9:u64[] = add %1 %8
+                                %10:i64[] = one [type=i64[]]
+                                %11:i64[] = add %2 %10
+                                %12:i64[] = dimension_to_scalar %5
+                                %13:i64[1] = broadcast [output_type=i64[1], output_axes=[]] %12
+                                %14:i64[4] = dynamic_update_slice %3 %13 %2
+                                %15:bool[] = one [type=bool[]]
+                                %16:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %15
+                                %17:bool[4] = dynamic_update_slice %4 %16 %2
+                            in (%7, %9, %11, %14, %17)
                         },
                     ]
-                in (%6, %7, %11, %9, %10)"},
+                in (%5, %6, %9, %8)"},
         );
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-                lambda %0:f64[], %1:bool[4], %2:i64[4], %3:i64[4] .
-                let %4:f64[] = scan [carry_count=1, iteration_count=4, reverse=false] %0 %1 %2 %3 [
+                lambda %0:f64[], %1:bool[4], %2:i64[4] .
+                let %3:f64[] = scan [carry_count=1, iteration_count=4, reverse=false] %0 %1 %2 [
                     body={
-                        lambda %0:i64[], %1:f64[], %2:bool[], %3:i64[], %4:i64[] .
-                        let %5:f64[] = condition %2 %1 %3 %4 [
+                        lambda %0:i64[], %1:f64[], %2:bool[], %3:i64[] .
+                        let %4:f64[] = condition %2 %1 %3 [
                             true={
-                                lambda %0:f64[], %1:i64[], %2:i64[] .
-                                let %3:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %1
-                                    %4:f64[iteration] = broadcast [output_axes=[]] %0 %3
-                                    %5:f64[] = linear_call [residual_count=1] %3 %4 [
+                                lambda %0:f64[], %1:i64[] .
+                                let %2:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %1
+                                    %3:f64[iteration] = broadcast [output_axes=[]] %0 %2
+                                    %4:f64[] = linear_call [residual_count=1] %2 %3 [
                                         forward={
                                             lambda %0:dimension<iteration ∈ [1, 4)>, %1:f64[iteration] .
                                             let %2:f64[] = reduce [kind=sum, axes=[0]] %1
@@ -11844,17 +13137,53 @@ mod tests {
                                             in (%2)
                                         },
                                     ]
-                                in (%5)
+                                in (%4)
                             },
                             false={
-                                lambda %0:f64[], %1:i64[], %2:i64[] .
+                                lambda %0:f64[], %1:i64[] .
                                 in (%0)
                             },
                         ]
-                        in (%5)
+                        in (%4)
                     },
                 ]
-                in (%4)"},
+                in (%3)"},
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[4], %2:i64[4] .
+                let %3:f64[] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:bool[], %3:i64[] .
+                        let %4:f64[] = condition %2 %1 %3 [
+                            true={
+                                lambda %0:f64[], %1:i64[] .
+                                let %2:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %1
+                                    %3:f64[iteration] = linear_call [residual_count=1] %2 %0 [
+                                        forward={
+                                            lambda %0:dimension<iteration ∈ [1, 4)>, %1:f64[] .
+                                            let %2:f64[iteration] = broadcast [output_axes=[]] %1 %0
+                                            in (%2)
+                                        },
+                                        transpose={
+                                            lambda %0:dimension<iteration ∈ [1, 4)>, %1:f64[iteration] .
+                                            let %2:f64[] = reduce [kind=sum, axes=[0]] %1
+                                            in (%2)
+                                        },
+                                    ]
+                                    %4:f64[] = reduce [kind=sum, axes=[0]] %3
+                                in (%4)
+                            },
+                            false={
+                                lambda %0:f64[], %1:i64[] .
+                                in (%0)
+                            },
+                        ]
+                        in (%4)
+                    },
+                ]
+                in (%3)"},
         );
         let mut primal_outputs = linearization
             .primal()
@@ -12132,6 +13461,42 @@ mod tests {
         // Reverse mode transposes the tangent scan, including its varying `condition` guard. At `x = 2` with limit
         // `10`, the loop squares twice, so `f(x) = x⁴` with value `16` and gradient `4 x³ = 32`.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {"
+                lambda %0:{varying_scalar} .
+                let %1:{varying_counter} = zero [type={varying_counter}]
+                    %2:{varying_stack} = zero [type={varying_stack}]
+                    %3:{varying_mask} = zero [type={varying_mask}]
+                    %4:{varying_scalar}, %5:{varying_counter}, %6:{varying_stack}, %7:{varying_mask} = while \
+                    [iteration_bound=3] %0 %1 %2 %3 [
+                        condition={{
+                            lambda %0:{varying_scalar}, %1:{varying_counter}, %2:{varying_stack}, %3:{varying_mask} .
+                            let %4:{varying_scalar} = const 10.0
+                                %5:{varying_predicate} = compare [direction=LessThan] %0 %4
+                            in (%5)
+                        }},
+                        body={{
+                            lambda %0:{varying_scalar}, %1:{varying_counter}, %2:{varying_stack}, %3:{varying_mask} .
+                            let %4:{varying_scalar} = mul %0 %0
+                                %5:{varying_counter} = one [type={varying_counter}]
+                                %6:{varying_counter} = add %1 %5
+                                %7:{varying_slice} = broadcast [
+                                    output_type={varying_slice},
+                                    output_axes=[],
+                                ] %0
+                                %8:{varying_stack} = dynamic_update_slice %2 %7 %1
+                                %9:{varying_predicate} = one [type={varying_predicate}]
+                                %10:{varying_mask_slice} = broadcast [
+                                    output_type={varying_mask_slice},
+                                    output_axes=[],
+                                ] %9
+                                %11:{varying_mask} = dynamic_update_slice %3 %10 %1
+                            in (%4, %6, %8, %11)
+                        }},
+                    ]
+                in (%4, %7, %6)"},
+        );
         let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
@@ -12245,8 +13610,107 @@ mod tests {
             .unwrap();
         let program = mapped_while_program(shard_map, vec![global_type.clone()], vec![condition, body]);
         let x = array(Array::vector(vec![2f32, 5.0, 5.0, 3.0]).unwrap());
+
+        // Each device stages the masked augmented loop and the masked tangent scan over its own shard, so the counter,
+        // the residual stacks, and the validity mask all vary over `x`.
+        let jvp = program.jvp().unwrap();
+        let global_state = "f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]";
+        let global_sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let local_state = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        let local_counter = "i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        let local_stack = "f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        let local_predicate_stack = "bool[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        let local_mask = "bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        let local_predicate = "bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        let local_active = "bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        let local_slice = "f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        let local_predicate_slice = "bool[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        let local_mask_slice = "bool[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
         assert_eq!(
-            program.jvp().unwrap().interpret(vec![x.clone(), array(Array::vector(vec![1f32; 4]).unwrap())]),
+            jvp.to_string(),
+            formatdoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:{global_state}, %3:{global_state} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{global_sharding}, {global_sharding}],
+                    out_shardings=[{global_sharding}, {global_sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_state}, {global_state}],
+                    global_output_types=[{global_state}, {global_state}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_state}, %1:{local_state} .
+                        let %2:{local_counter} = zero [type={local_counter}]
+                            %3:{local_stack} = zero [type={local_stack}]
+                            %4:{local_predicate_stack} = zero [type={local_predicate_stack}]
+                            %5:{local_mask} = zero [type={local_mask}]
+                            %6:{local_state}, %7:{local_counter}, %8:{local_stack}, %9:{local_predicate_stack}, \
+                            %10:{local_mask} = while [iteration_bound=3] %0 %2 %3 %4 %5 [
+                                condition={{
+                                    lambda %0:{local_state}, %1:{local_counter}, %2:{local_stack}, \
+                                    %3:{local_predicate_stack}, %4:{local_mask} .
+                                    let %5:{local_state} = const [10.0, 10.0]
+                                        %6:{local_predicate} = compare [direction=LessThan] %0 %5
+                                        %7:{local_active} = reduce [kind=any, axes=[0]] %6
+                                    in (%7)
+                                }},
+                                body={{
+                                    lambda %0:{local_state}, %1:{local_counter}, %2:{local_stack}, \
+                                    %3:{local_predicate_stack}, %4:{local_mask} .
+                                    let %5:{local_state} = const [10.0, 10.0]
+                                        %6:{local_predicate} = compare [direction=LessThan] %0 %5
+                                        %7:{local_state} = mul %0 %0
+                                        %8:{local_state} = select %6 %7 %0
+                                        %9:{local_slice} = broadcast [
+                                            output_type={local_slice},
+                                            output_axes=[1],
+                                        ] %0
+                                        %10:{local_counter} = zero [type={local_counter}]
+                                        %11:{local_stack} = dynamic_update_slice %2 %9 %1 %10
+                                        %12:{local_predicate_slice} = broadcast [
+                                            output_type={local_predicate_slice},
+                                            output_axes=[1],
+                                        ] %6
+                                        %13:{local_predicate_stack} = dynamic_update_slice %3 %12 %1 %10
+                                        %14:{local_active} = one [type={local_active}]
+                                        %15:{local_mask_slice} = broadcast [
+                                            output_type={local_mask_slice},
+                                            output_axes=[],
+                                        ] %14
+                                        %16:{local_mask} = dynamic_update_slice %4 %15 %1
+                                        %17:{local_counter} = one [type={local_counter}]
+                                        %18:{local_counter} = add %1 %17
+                                    in (%8, %18, %11, %13, %16)
+                                }},
+                            ]
+                            %11:{local_state} = scan [carry_count=1, iteration_count=3, reverse=false] %1 %8 %9 %10 [
+                                body={{
+                                    lambda %0:i64[], %1:{local_state}, %2:{local_state}, %3:{local_predicate}, \
+                                    %4:{local_active} .
+                                    let %5:{local_state} = condition %4 %1 %2 %3 [
+                                        true={{
+                                            lambda %0:{local_state}, %1:{local_state}, %2:{local_predicate} .
+                                            let %3:{local_state} = mul %1 %0
+                                                %4:{local_state} = mul %1 %0
+                                                %5:{local_state} = add %3 %4
+                                                %6:{local_state} = select %2 %5 %0
+                                            in (%6)
+                                        }},
+                                        false={{
+                                            lambda %0:{local_state}, %1:{local_state}, %2:{local_predicate} .
+                                            in (%0)
+                                        }},
+                                    ]
+                                    in (%5)
+                                }},
+                            ]
+                        in (%6, %11)
+                    }},
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            jvp.interpret(vec![x.clone(), array(Array::vector(vec![1f32; 4]).unwrap())]),
             Ok(vec![sharded_array(&[16.0, 25.0, 25.0, 81.0]), sharded_array(&[32.0, 10.0, 10.0, 108.0])]),
         );
         let linearization = program.linearize().unwrap();
@@ -12391,6 +13855,97 @@ mod tests {
         assert_eq!(
             fused.interpret(vec![Array::scalar(16.0).unwrap(), Array::scalar(1.0).unwrap()]),
             Ok(vec![Array::scalar(16.0).unwrap(), Array::scalar(1.0).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_while_differentiation_staged_jvp_stages_body_effects_once_per_iteration() {
+        // Staged forward mode of `while (x < 8) { print(x); x = 2 * x }` must run the body's `print` once per
+        // iteration, as the eager rule does. The unbounded rule binds one fused doubled-state loop whose body prints
+        // the primal state once, and the bounded rule's augmented primal loop prints it while its masked tangent scan,
+        // which carries no primal work, prints nothing. From `x = 1` both loops run three iterations, so
+        // `f(x) = 8 x`, with value 8 and derivative 8.
+        let (while_operation, while_regions) = effectful_doubling_while_operation();
+        let state_types = vec![ArrayType::scalar(DataType::F64)];
+        let fused = while_program(while_operation, &while_regions, state_types.clone()).jvp().unwrap();
+        assert_eq!(
+            fused.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[], %3:f64[] = while %0 %1 [
+                    condition={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 8.0
+                            %3:bool[] = compare [direction=LessThan] %0 %2
+                        in (%3)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[] = print [label=state] %0
+                            %4:f64[] = mul %3 %2
+                            %5:f64[] = mul %2 %1
+                        in (%4, %5)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            fused.interpret(vec![Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap()]),
+            Ok(vec![Array::scalar(8.0).unwrap(), Array::scalar(8.0).unwrap()]),
+        );
+
+        let bounded_operation = while_operation.with_iteration_bound(4).unwrap();
+        let bounded = while_program(bounded_operation, &while_regions, state_types).jvp().unwrap();
+        assert_eq!(
+            bounded.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:bool[4] = zero [type=bool[4]]
+                    %4:f64[], %5:i64[], %6:bool[4] = while [iteration_bound=4] %0 %2 %3 [
+                        condition={
+                            lambda %0:f64[], %1:i64[], %2:bool[4] .
+                            let %3:f64[] = const 8.0
+                                %4:bool[] = compare [direction=LessThan] %0 %3
+                            in (%4)
+                        },
+                        body={
+                            lambda %0:f64[], %1:i64[], %2:bool[4] .
+                            let %3:f64[] = const 2.0
+                                %4:f64[] = print [label=state] %0
+                                %5:f64[] = mul %4 %3
+                                %6:bool[] = one [type=bool[]]
+                                %7:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %6
+                                %8:bool[4] = dynamic_update_slice %2 %7 %1
+                                %9:i64[] = one [type=i64[]]
+                                %10:i64[] = add %1 %9
+                            in (%5, %10, %8)
+                        },
+                    ]
+                    %7:f64[] = scan [carry_count=1, iteration_count=4, reverse=false] %1 %6 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:bool[] .
+                            let %3:f64[] = condition %2 %1 [
+                                true={
+                                    lambda %0:f64[] .
+                                    let %1:f64[] = const 2.0
+                                        %2:f64[] = mul %1 %0
+                                    in (%2)
+                                },
+                                false={
+                                    lambda %0:f64[] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%3)
+                        },
+                    ]
+                in (%4, %7)"},
+        );
+        assert_eq!(
+            bounded.interpret(vec![Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap()]),
+            Ok(vec![Array::scalar(8.0).unwrap(), Array::scalar(8.0).unwrap()]),
         );
     }
 
@@ -12553,6 +14108,59 @@ mod tests {
             (scalar.clone(), scalar.clone(), scalar),
         )
         .unwrap();
+        // The traced program binds the primal loop once and inlines the fused loop of the pushforward once per
+        // application.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = while %0 [
+                    condition={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const 16.0
+                            %2:bool[] = compare [direction=LessThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                    %4:f64[], %5:f64[] = while %0 %1 [
+                        condition={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = const 16.0
+                                %3:bool[] = compare [direction=LessThan] %0 %2
+                            in (%3)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %0 %0
+                                %3:f64[] = mul %0 %1
+                                %4:f64[] = mul %0 %1
+                                %5:f64[] = add %3 %4
+                            in (%2, %5)
+                        },
+                    ]
+                    %6:f64[], %7:f64[] = while %0 %2 [
+                        condition={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = const 16.0
+                                %3:bool[] = compare [direction=LessThan] %0 %2
+                            in (%3)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %0 %0
+                                %3:f64[] = mul %0 %1
+                                %4:f64[] = mul %0 %1
+                                %5:f64[] = add %3 %4
+                            in (%2, %5)
+                        },
+                    ]
+                in (%3, %5, %7)"},
+        );
         assert_eq!(
             program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap())),
             Ok((Array::scalar(16.0).unwrap(), Array::scalar(32.0).unwrap(), Array::scalar(64.0).unwrap())),
@@ -12690,15 +14298,19 @@ mod tests {
 
     #[test]
     fn test_while_differentiation_rejects_staged_linearization_of_effectful_unbounded_loops() {
-        // Separate linearization must keep every primal output of the fused loop known, but the effects gate of the
-        // partial-evaluation rule residualizes an effectful loop unchanged, so the `print` loop cannot be linearized.
+        // Every application of the pushforward recomputes an unbounded loop from its initial primal state, which would
+        // repeat the `print` in its body, so separate linearization rejects the loop.
         let (operation, regions) = effectful_doubling_while_operation();
         let program = while_program(operation, &regions, vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(
             program.linearize().map(|_| ()),
-            Err(DifferentiationError::from(ProgramError::MalformedProgram(
-                "required output 0 depends on deferred work in a repeated residual computation".to_string(),
-            ))),
+            Err(DifferentiationError::from(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "separate linearization of a `{WHILE_OPERATION_NAME}` loop without an iteration bound requires a \
+                     condition and a body without effects or deferred work, because every pushforward application \
+                     recomputes the loop",
+                ),
+            })),
         );
     }
 
@@ -13276,9 +14888,10 @@ mod tests {
     fn test_while_differentiation_composes_with_earlier_batching() {
         // Forward mode differentiates a batched bounded loop under the non-concretizing tracing context. Batching
         // stages one bounded loop with the per-item predicate `x < 8` and the iteration bound 5, so the JVP rule takes
-        // the bounded staged path over its masked form, storing residual stacks and staging a masked linear
-        // scan. Batch items [1, 5, 9] double 3, 1, and 0 times, so the primal is [8, 10, 9] and the per-item tangent
-        // scale is two to the power of the number of iterations, [8, 2, 1].
+        // the bounded staged path over its masked form, storing the per-item predicate in a residual stack and the
+        // state-independent scale `broadcast 2.0` once in a residual carry, and staging a masked linear scan. Batch
+        // items [1, 5, 9] double 3, 1, and 0 times, so the primal is [8, 10, 9] and the per-item tangent scale is two
+        // to the power of the number of iterations, [8, 2, 1].
         fn batched_bounded_while<V>(x: V) -> Result<V, ProgramError>
         where
             V: Value<Type = ArrayType> + Broadcast + Transpose,
@@ -13318,12 +14931,12 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[3] .
                 let %2:i64[] = zero [type=i64[]]
-                    %3:f64[5, 3] = zero [type=f64[5, 3]]
+                    %3:f64[3] = zero [type=f64[3]]
                     %4:bool[5, 3] = zero [type=bool[5, 3]]
                     %5:bool[5] = zero [type=bool[5]]
-                    %6:f64[3], %7:i64[], %8:f64[5, 3], %9:bool[5, 3], %10:bool[5] = while [iteration_bound=5] %0 %2 %3 %4 %5 [
+                    %6:f64[3], %7:i64[], %8:f64[3], %9:bool[5, 3], %10:bool[5] = while [iteration_bound=5] %0 %2 %3 %4 %5 [
                         condition={
-                            lambda %0:f64[3], %1:i64[], %2:f64[5, 3], %3:bool[5, 3], %4:bool[5] .
+                            lambda %0:f64[3], %1:i64[], %2:f64[3], %3:bool[5, 3], %4:bool[5] .
                             let %5:f64[] = const 8.0
                                 %6:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %5
                                 %7:bool[3] = compare [direction=LessThan] %0 %6
@@ -13331,7 +14944,7 @@ mod tests {
                             in (%8)
                         },
                         body={
-                            lambda %0:f64[3], %1:i64[], %2:f64[5, 3], %3:bool[5, 3], %4:bool[5] .
+                            lambda %0:f64[3], %1:i64[], %2:f64[3], %3:bool[5, 3], %4:bool[5] .
                             let %5:f64[] = const 8.0
                                 %6:f64[] = const 2.0
                                 %7:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %5
@@ -13340,22 +14953,20 @@ mod tests {
                                 %10:f64[3] = mul %0 %9
                                 %11:f64[3] = select %8 %10 %0
                                 %12:i64[] = zero [type=i64[]]
-                                %13:f64[1, 3] = broadcast [output_type=f64[1, 3], output_axes=[1]] %9
-                                %14:f64[5, 3] = dynamic_update_slice %2 %13 %1 %12
-                                %15:bool[1, 3] = broadcast [output_type=bool[1, 3], output_axes=[1]] %8
-                                %16:bool[5, 3] = dynamic_update_slice %3 %15 %1 %12
-                                %17:bool[] = one [type=bool[]]
-                                %18:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %17
-                                %19:bool[5] = dynamic_update_slice %4 %18 %1
-                                %20:i64[] = one [type=i64[]]
-                                %21:i64[] = add %1 %20
-                            in (%11, %21, %14, %16, %19)
+                                %13:bool[1, 3] = broadcast [output_type=bool[1, 3], output_axes=[1]] %8
+                                %14:bool[5, 3] = dynamic_update_slice %3 %13 %1 %12
+                                %15:bool[] = one [type=bool[]]
+                                %16:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %15
+                                %17:bool[5] = dynamic_update_slice %4 %16 %1
+                                %18:i64[] = one [type=i64[]]
+                                %19:i64[] = add %1 %18
+                            in (%11, %19, %9, %14, %17)
                         },
                     ]
-                    %11:f64[3] = scan [carry_count=1, iteration_count=5, reverse=false] %1 %8 %9 %10 [
+                    %11:f64[3], %12:f64[3] = scan [carry_count=2, iteration_count=5, reverse=false] %8 %1 %9 %10 [
                         body={
                             lambda %0:i64[], %1:f64[3], %2:f64[3], %3:bool[3], %4:bool[] .
-                            let %5:f64[3] = condition %4 %1 %2 %3 [
+                            let %5:f64[3] = condition %4 %2 %1 %3 [
                                 true={
                                     lambda %0:f64[3], %1:f64[3], %2:bool[3] .
                                     let %3:f64[3] = mul %1 %0
@@ -13367,10 +14978,10 @@ mod tests {
                                     in (%0)
                                 },
                             ]
-                            in (%5)
+                            in (%1, %5)
                         },
                     ]
-                in (%6, %11)"},
+                in (%6, %12)"},
         );
         assert_eq!(
             program.interpret((input.clone(), ones.clone())),
@@ -13405,13 +15016,74 @@ mod tests {
             Ok((Array::vector(vec![8.0, 10.0, 9.0]).unwrap(), Array::vector(vec![8.0, 2.0, 1.0]).unwrap())),
         );
         assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:i64[] = zero [type=i64[]]
+                    %3:f64[3] = zero [type=f64[3]]
+                    %4:bool[5, 3] = zero [type=bool[5, 3]]
+                    %5:bool[5] = zero [type=bool[5]]
+                    %6:f64[3], %7:i64[], %8:f64[3], %9:bool[5, 3], %10:bool[5] = while [iteration_bound=5] %0 %2 %3 %4 \
+                    %5 [
+                        condition={
+                            lambda %0:f64[3], %1:i64[], %2:f64[3], %3:bool[5, 3], %4:bool[5] .
+                            let %5:f64[] = const 8.0
+                                %6:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %5
+                                %7:bool[3] = compare [direction=LessThan] %0 %6
+                                %8:bool[] = reduce [kind=any, axes=[0]] %7
+                            in (%8)
+                        },
+                        body={
+                            lambda %0:f64[3], %1:i64[], %2:f64[3], %3:bool[5, 3], %4:bool[5] .
+                            let %5:f64[] = const 8.0
+                                %6:f64[] = const 2.0
+                                %7:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %5
+                                %8:bool[3] = compare [direction=LessThan] %0 %7
+                                %9:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %6
+                                %10:f64[3] = mul %0 %9
+                                %11:f64[3] = select %8 %10 %0
+                                %12:i64[] = zero [type=i64[]]
+                                %13:bool[1, 3] = broadcast [output_type=bool[1, 3], output_axes=[1]] %8
+                                %14:bool[5, 3] = dynamic_update_slice %3 %13 %1 %12
+                                %15:bool[] = one [type=bool[]]
+                                %16:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %15
+                                %17:bool[5] = dynamic_update_slice %4 %16 %1
+                                %18:i64[] = one [type=i64[]]
+                                %19:i64[] = add %1 %18
+                            in (%11, %19, %9, %14, %17)
+                        },
+                    ]
+                    %11:f64[3], %12:f64[3] = scan [carry_count=2, iteration_count=5, reverse=true] %8 %1 %10 %9 [
+                        body={
+                            lambda %0:i64[], %1:f64[3], %2:f64[3], %3:bool[], %4:bool[3] .
+                            let %5:f64[3] = condition %3 %2 %1 %4 [
+                                true={
+                                    lambda %0:f64[3], %1:f64[3], %2:bool[3] .
+                                    let %3:f64[3] = zero [type=f64[3]]
+                                        %4:f64[3] = select %2 %0 %3
+                                        %5:f64[3] = select %2 %3 %0
+                                        %6:f64[3] = mul %1 %4
+                                        %7:f64[3] = add %5 %6
+                                    in (%7)
+                                },
+                                false={
+                                    lambda %0:f64[3], %1:f64[3], %2:bool[3] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%1, %5)
+                        },
+                    ]
+                in (%6, %12)"},
+        );
+        assert_eq!(
             transposed.unwrap(),
             indoc! {"
-                lambda %0:f64[3], %1:bool[5], %2:f64[5, 3], %3:bool[5, 3] .
-                let %4:f64[3] = scan [carry_count=1, iteration_count=5, reverse=true] %0 %1 %2 %3 [
+                lambda %0:f64[3], %1:f64[3], %2:bool[5], %3:bool[5, 3] .
+                let %4:f64[3], %5:f64[3] = scan [carry_count=2, iteration_count=5, reverse=true] %1 %0 %2 %3 [
                     body={
-                        lambda %0:i64[], %1:f64[3], %2:bool[], %3:f64[3], %4:bool[3] .
-                        let %5:f64[3] = condition %2 %1 %3 %4 [
+                        lambda %0:i64[], %1:f64[3], %2:f64[3], %3:bool[], %4:bool[3] .
+                        let %5:f64[3] = condition %3 %2 %1 %4 [
                             true={
                                 lambda %0:f64[3], %1:f64[3], %2:bool[3] .
                                 let %3:f64[3] = zero [type=f64[3]]
@@ -13426,10 +15098,10 @@ mod tests {
                                 in (%0)
                             },
                         ]
-                        in (%5)
+                        in (%1, %5)
                     },
                 ]
-                in (%4)"},
+                in (%5)"},
         );
     }
 
@@ -14557,6 +16229,51 @@ mod tests {
                 array(Array::from_elements(output_type.clone(), &[3f32, 3.0]).unwrap()),
                 array(Array::from_elements(output_type, &[8f32, 2.0]).unwrap()),
             ]),
+        );
+    }
+
+    #[test]
+    fn test_while_while_rejects_references_whose_referents_do_not_vary_with_the_predicate() {
+        // The counter varies over `m`, and so does the predicate computed from it, but the frontend cannot widen a
+        // reference leaf, because the loop must return the reference that it received. A reference whose referent is
+        // invariant over `m` therefore leaves the loop state typed as identical across devices that may run different
+        // numbers of iterations, so the loop is rejected.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let invariant_type = ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(replicated.with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let result = TestIrTracingContext::trace_with_named_axes(
+            |inputs: Vec<Tracer<_>>| {
+                let (counter, reference) = r#while(
+                    |(counter, _)| {
+                        let limit = Array::from_elements(varying_type.clone(), &[3f32]).unwrap();
+                        counter.less_than(&StagingContext::constant(counter.context(), array(limit)))
+                    },
+                    |(counter, reference)| {
+                        let one = Array::from_elements(varying_type.clone(), &[1f32]).unwrap();
+                        Ok((counter.clone() + StagingContext::constant(counter.context(), array(one)), reference))
+                    },
+                    (inputs[0].clone(), inputs[1].clone()),
+                    WhileOptions::new(),
+                )?;
+                Ok(vec![counter, reference])
+            },
+            vec![
+                ArrayIrType::Array(varying_type.clone()),
+                ArrayIrType::Reference(ReferenceType::new(invariant_type.clone())),
+            ],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        );
+        assert_eq!(
+            result.map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` state `f32[][sharding={{mesh<['m'=2:manual]>, []}}]` must vary over every \
+                 manual axis that the predicate \
+                 `bool[][sharding={{mesh<['m'=2:manual]>, [], varying_manual={{'m'}}}}]` varies over, because devices \
+                 may run different numbers of iterations; insert `{PARALLEL_VARY_OPERATION_NAME}` on the initial state",
+            )))),
         );
     }
 
