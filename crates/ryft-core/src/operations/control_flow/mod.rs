@@ -606,32 +606,47 @@ pub(crate) fn stabilize_loop_carry_batch_axes<C: Context, P: BatchingPolicy<C>, 
     Ok(None)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::cell::Cell;
+    use std::fmt::Display;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionValue, Memory,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
+        DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::axes::Axis;
     use crate::batching::{
-        BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
+        BatchAxis, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver, RecursiveBatchingPolicy,
     };
     use crate::captures::CaptureReference;
-    use crate::contexts::Context;
-    use crate::parameters::Placeholder;
+    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::operations::arithmetic::NegOperation;
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
+    use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+    use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
+    use crate::operations::references::ReferenceNewOperation;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{
-        Atom, AttachedRegions, Operation, Program, ProgramError, ReferenceType, Region, RegionDriver, RegionLiveness,
-        RegionRef, TypeError, Value,
+        Atom, AttachedRegions, InstructionId, Operation, Program, ProgramBuilder, ProgramError, ReferenceAnalysisError,
+        ReferenceId, ReferenceRoot, ReferenceType, Region, RegionDriver, RegionId, RegionLiveness, RegionRef,
+        TypeError, Typed, Value, ValueDirectDispatch, ValueId,
     };
+    use crate::tracing::TracingContext;
 
-    use super::{ResidualStorageOperation, SCAN_OPERATION_NAME, validate_loop_reference_carry_batch_axis};
+    use super::{
+        CONDITION_OPERATION_NAME, RegionReferenceSource, ResidualStorageOperation, SCAN_OPERATION_NAME,
+        WHILE_OPERATION_NAME, canonicalize_loop_carry_batch_axes, loop_carry_passthrough_mask,
+        refine_control_flow_output_types, stabilize_loop_carry_batch_axes, validate_control_flow_output_identity_scope,
+        validate_control_flow_region_input_refinement, validate_loop_reference_carry_batch_axis,
+        validate_loop_reference_carry_roots,
+    };
 
     /// Array IR value, which admits references and first-class dimensions.
     pub(super) type TestIrValue = ArrayIrValue<Array>;
@@ -645,9 +660,9 @@ mod tests {
     /// Operation family of the captured array IR programs in the reference discharge fixtures.
     pub(super) type DischargeCaptureOperation = ArrayIrOperation<CaptureReference<ArrayType>>;
 
-    /// [`RegionLiveness`] of an operation with a single attached region, whose live inputs `used_inputs` derives from
-    /// the used outputs of each query. The fixture records every query, so that region data flow tests can pin the
-    /// fixed-point passes that a rule performs over its region.
+    /// [`RegionLiveness`] of an operation with a single attached region, which derives the live region inputs from the
+    /// used region outputs of each query through `used_inputs`. The fixture records every query, so that region data
+    /// flow tests can pin the fixed-point passes that a rule performs over its region.
     pub(super) struct TestRegionLiveness<F: FnMut(&[bool]) -> Vec<bool>> {
         /// Derives the live region inputs from the used region outputs.
         used_inputs: F,
@@ -657,7 +672,7 @@ mod tests {
     }
 
     impl<F: FnMut(&[bool]) -> Vec<bool>> TestRegionLiveness<F> {
-        /// Creates a new [`TestRegionLiveness`] whose live region inputs `used_inputs` derives.
+        /// Creates a new [`TestRegionLiveness`] that derives the live region inputs through `used_inputs`.
         pub(super) fn new(used_inputs: F) -> Self {
             Self { used_inputs, queries: Vec::new() }
         }
@@ -740,8 +755,7 @@ mod tests {
     /// tests pin how many structural passes such a rule actually performs, which a program rendering alone cannot
     /// observe.
     pub(super) struct CountingBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
-        /// [`Region`](crate::programs::Region)s attached to the operation application under test,
-        /// in operation-defined order.
+        /// [`Region`]s attached to the operation application under test, in operation-defined order.
         regions: &'r AttachedRegions<'r, V, O>,
 
         /// Number of structural program-batching requests observed so far.
@@ -813,11 +827,11 @@ mod tests {
 
     #[test]
     fn test_residual_storage_operation_residual_storage_type() {
-        // Arrays keep their metadata in both families; dimensions use scalar array storage, and references are rejected.
+        // Arrays keep their metadata in both families, dimensions use scalar array storage, and references are
+        // rejected.
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true });
         assert_eq!(ArrayOperation::<Array>::residual_storage_type(&array_type), Ok(array_type.clone()));
         assert_eq!(TestIrOperation::residual_storage_type(&array_type.clone().into()), Ok(array_type.clone().into()));
-
         let dimension_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         assert_eq!(
             TestIrOperation::residual_storage_type(&dimension_type.into()),
@@ -828,6 +842,565 @@ mod tests {
             Err(TypeError::invalid(
                 "a reference cannot be stored in a residual stack; references are threaded as carries",
             )),
+        );
+    }
+
+    #[test]
+    fn test_residual_storage_operation_residual_to_storage() {
+        // Arrays are stored unchanged in both families, dimensions are saved as scalar arrays, and references are
+        // rejected.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        assert_eq!(ArrayOperation::<Array>::residual_to_storage(&array_type), Ok(None));
+        assert_eq!(TestIrOperation::residual_to_storage(&array_type.clone().into()), Ok(None));
+        assert_eq!(
+            TestIrOperation::residual_to_storage(
+                &DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()).into(),
+            ),
+            Ok(Some(TestIrOperation::from(DimensionToScalarOperation))),
+        );
+        assert_eq!(
+            TestIrOperation::residual_to_storage(&ReferenceType::new(array_type).into()),
+            Err(TypeError::invalid(
+                "a reference cannot be stored in a residual stack; references are threaded as carries",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_residual_storage_operation_residual_from_storage() {
+        // Arrays are restored unchanged in both families, dimensions are restored from scalar arrays at their own
+        // type, which preserves their identity, and references are rejected.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let dimension_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        assert_eq!(ArrayOperation::<Array>::residual_from_storage(&array_type), Ok(None));
+        assert_eq!(TestIrOperation::residual_from_storage(&array_type.clone().into()), Ok(None));
+        assert_eq!(
+            TestIrOperation::residual_from_storage(&dimension_type.clone().into()),
+            Ok(Some(TestIrOperation::from(DimensionFromScalarOperation::new(dimension_type)))),
+        );
+        assert_eq!(
+            TestIrOperation::residual_from_storage(&ReferenceType::new(array_type).into()),
+            Err(TypeError::invalid(
+                "a reference cannot be stored in a residual stack; references are threaded as carries",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_residual_storage_operation_residual_from_carrier() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let other = DimensionVariable::new("other", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = ArrayIrType::from(DimensionType::from(extent.clone()));
+        let carrier_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(extent.clone())]));
+
+        // Array IR recovers a dimension from the array axis that carries its identity (here, axis 1).
+        assert_eq!(
+            TestIrOperation::residual_from_carrier(&dimension_type, &carrier_type.clone().into()),
+            Ok(Some(TestIrOperation::from(DimensionSizeOperation::new(&carrier_type, 1).unwrap()))),
+        );
+
+        // There is nothing to recover from an array without an axis of that identity, or for a static dimension,
+        // which has no identity.
+        assert_eq!(
+            TestIrOperation::residual_from_carrier(
+                &dimension_type,
+                &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(other)])).into(),
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            TestIrOperation::residual_from_carrier(
+                &DimensionType::from(Dimension::Static(3)).into(),
+                &ArrayType::new_static(DataType::F32, [3]).into(),
+            ),
+            Ok(None),
+        );
+
+        // Only array axes are carriers: a dimension of the residual type is reused directly by callers, and the
+        // referent of a reference is never read for its extents. Array residuals need no recovery in either family.
+        assert_eq!(TestIrOperation::residual_from_carrier(&dimension_type, &dimension_type), Ok(None));
+        assert_eq!(
+            TestIrOperation::residual_from_carrier(&dimension_type, &ReferenceType::new(carrier_type.clone()).into()),
+            Ok(None),
+        );
+        assert_eq!(
+            TestIrOperation::residual_from_carrier(&carrier_type.clone().into(), &carrier_type.clone().into()),
+            Ok(None),
+        );
+        assert_eq!(ArrayOperation::<Array>::residual_from_carrier(&carrier_type, &carrier_type), Ok(None));
+    }
+
+    #[test]
+    fn test_region_reference_source_from_outputs() {
+        // A reference output reports the boundary source of its root, and every other output reports `None`.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = builder.add_input(ReferenceType::new(scalar_type.clone()).into());
+        let value = builder.add_input(scalar_type.into());
+        let allocation =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![value, reference, allocation],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            RegionReferenceSource::from_outputs(SCAN_OPERATION_NAME, program.entry_region_ref(), None),
+            Ok(vec![None, Some(RegionReferenceSource::Input(0)), Some(RegionReferenceSource::Allocation)]),
+        );
+    }
+
+    #[test]
+    fn test_region_reference_source_from_outputs_captures() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let capture = builder.add_constant(DischargeCapture::new(1, reference_type.into()));
+        let program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![capture], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        // An inherited capture reports the capture position that it names.
+        assert_eq!(
+            RegionReferenceSource::from_outputs(SCAN_OPERATION_NAME, program.entry_region_ref(), None),
+            Ok(vec![Some(RegionReferenceSource::Capture(1))]),
+        );
+
+        // An explicitly empty capture prefix leaves the capture unresolved, which the reference analysis rejects.
+        assert_eq!(
+            RegionReferenceSource::from_outputs(SCAN_OPERATION_NAME, program.entry_region_ref(), Some(0)),
+            Err(ProgramError::from(ReferenceAnalysisError::InvalidReferenceCapture {
+                region: program.entry(),
+                atom: capture,
+                capture_index: 1,
+                capture_count: 0,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_region_reference_source_from_root() {
+        /// Value family whose reference-typed program constants name a concrete allocation, or no allocation for
+        /// [`None`]. Array IR values reject reference constants when a region is sealed, so this family stands in for
+        /// one that admits them.
+        #[derive(Clone, Debug)]
+        struct ReferenceConstant(Option<ArrayReference<Array>>);
+
+        impl Display for ReferenceConstant {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("reference_constant")
+            }
+        }
+
+        impl Typed for ReferenceConstant {
+            type Type = ArrayIrType;
+
+            fn r#type(&self) -> Cow<'_, ArrayIrType> {
+                Cow::Owned(ReferenceType::new(ArrayType::scalar(DataType::F32)).into())
+            }
+        }
+
+        impl Parameter for ReferenceConstant {}
+
+        impl Value for ReferenceConstant {
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
+
+            fn domain(&self) -> EagerContext<Self> {
+                EagerContext::new()
+            }
+
+            fn reference_id(&self) -> Option<ReferenceId> {
+                self.0.as_ref().map(ArrayReference::id)
+            }
+        }
+
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let allocation = ArrayReference::new(Array::scalar(1f32).unwrap());
+        let mut builder = ProgramBuilder::<ReferenceConstant, TestIrOperation>::new();
+        let input = builder.add_input(reference_type.clone().into());
+        let allocated = builder.add_constant(ReferenceConstant(Some(allocation.clone())));
+        let unnamed = builder.add_constant(ReferenceConstant(None));
+        let program = builder
+            .build::<Vec<ReferenceConstant>, Vec<ReferenceConstant>>(
+                vec![input, allocated, unnamed],
+                vec![Placeholder],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let capture = builder.add_constant(DischargeCapture::new(1, reference_type.into()));
+        let captured_program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![capture], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let captured_region = captured_program.entry_region_ref();
+
+        // Inputs of the region, allocations, and constants that name a capture or an allocation are boundary sources.
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::RegionInput { region: region.id(), input_index: 0 },
+            ),
+            Ok(RegionReferenceSource::Input(0)),
+        );
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::Allocation { instruction: InstructionId::new(region.id(), 0), output_index: 0 },
+            ),
+            Ok(RegionReferenceSource::Allocation),
+        );
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                captured_region,
+                ReferenceRoot::Constant { value: ValueId::new(captured_region.id(), capture) },
+            ),
+            Ok(RegionReferenceSource::Capture(1)),
+        );
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::Constant { value: ValueId::new(region.id(), allocated) },
+            ),
+            Ok(RegionReferenceSource::Constant(allocation.id())),
+        );
+
+        // Roots that cannot denote a reference at the region boundary are malformed.
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::RegionInput { region: RegionId::new(1), input_index: 0 },
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region reference analysis reports a root that is an input of a nested region \
+                 at the region boundary",
+            ))),
+        );
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::Constant { value: ValueId::new(RegionId::new(1), allocated) },
+            ),
+            Err(ProgramError::MalformedProgram(format!("region {} is out of range", RegionId::new(1)))),
+        );
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::Constant { value: ValueId::new(region.id(), input) },
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region reference analysis reports a constant root whose atom is not a \
+                 constant",
+            ))),
+        );
+        assert_eq!(
+            RegionReferenceSource::from_root(
+                SCAN_OPERATION_NAME,
+                region,
+                ReferenceRoot::Constant { value: ValueId::new(region.id(), unnamed) },
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region reference analysis reports a constant root that names neither a \
+                 capture nor an allocation",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_region_reference_source_display() {
+        let allocation = ArrayReference::new(Array::scalar(1f32).unwrap());
+        assert_eq!(RegionReferenceSource::Input(2).to_string(), "region input 2");
+        assert_eq!(RegionReferenceSource::Capture(1).to_string(), "captured reference 1");
+        assert_eq!(RegionReferenceSource::Constant(allocation.id()).to_string(), "a reference constant");
+        assert_eq!(RegionReferenceSource::Allocation.to_string(), "a reference allocated in the region");
+    }
+
+    #[test]
+    fn test_validate_control_flow_region_input_refinement() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let region_input_type =
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
+        let reference_region_input_type = ArrayIrType::from(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent)]),
+        )));
+
+        // An input that refines its region input type is accepted, and a reference input refines a reference region
+        // input type by its referent.
+        assert_eq!(
+            validate_control_flow_region_input_refinement(
+                WHILE_OPERATION_NAME,
+                0,
+                &ArrayType::new_static(DataType::F32, [5]).into(),
+                &region_input_type,
+                "state type",
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_control_flow_region_input_refinement(
+                WHILE_OPERATION_NAME,
+                0,
+                &ReferenceType::new(ArrayType::new_static(DataType::F32, [5])).into(),
+                &reference_region_input_type,
+                "state type",
+            ),
+            Ok(()),
+        );
+
+        // An input that does not refine its region input type is rejected, describing the region input as requested.
+        assert_eq!(
+            validate_control_flow_region_input_refinement(
+                WHILE_OPERATION_NAME,
+                1,
+                &ArrayType::new_static(DataType::F64, [5]).into(),
+                &region_input_type,
+                "state type",
+            ),
+            Err(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` input 1 has type `f64[5]`, which does not refine its state type \
+                 `f32[extent]`",
+            ))),
+        );
+        assert_eq!(
+            validate_control_flow_region_input_refinement(
+                CONDITION_OPERATION_NAME,
+                2,
+                &ArrayType::new_static(DataType::F32, [5]).into(),
+                &reference_region_input_type,
+                "branch input type",
+            ),
+            Err(TypeError::invalid(format!(
+                "`{CONDITION_OPERATION_NAME}` input 2 has type `f32[5]`, which does not refine its branch input type \
+                 `ref<f32[extent]>`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_refine_control_flow_output_types() {
+        // Output types take the facts that the inputs establish (here, `rows = 3`) but not the input metadata (here,
+        // a sharding), except for a reference output that aliases a known input, which takes exactly that input's type.
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded_type =
+            ArrayType::new_static(DataType::F32, [3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        assert_eq!(
+            refine_control_flow_output_types(
+                &[declared_type.clone().into(), ReferenceType::new(declared_type.clone()).into()],
+                &[sharded_type.clone().into(), ReferenceType::new(sharded_type.clone()).into()],
+                &[
+                    declared_type.clone().into(),
+                    ReferenceType::new(declared_type.clone()).into(),
+                    ReferenceType::new(declared_type).into(),
+                ],
+                |index| (index == 1).then_some(1),
+            ),
+            Ok(vec![
+                ArrayIrType::from(ArrayType::new_static(DataType::F32, [3])),
+                ReferenceType::new(sharded_type).into(),
+                ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into(),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_refine_control_flow_output_types_rejects_conflicting_facts() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let declared_type =
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)])));
+        assert_eq!(
+            refine_control_flow_output_types(
+                &[declared_type.clone(), declared_type.clone()],
+                &[ArrayType::new_static(DataType::F32, [3]).into(), ArrayType::new_static(DataType::F32, [4]).into()],
+                &[declared_type],
+                |_| None,
+            ),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "rows".to_string(),
+                expected: 3,
+                actual: 4,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_refine_control_flow_output_types_keeps_output_definitions_symbolic() {
+        // An identity that an output type defines stays symbolic in every output, even though the inputs establish a
+        // fact about it, while the other identities of the same output types are still refined.
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = ArrayIrType::from(DimensionType::from(extent.clone()));
+        let declared_input_types = [
+            dimension_type.clone(),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())])).into(),
+        ];
+        let input_types =
+            [DimensionType::from(Dimension::Static(5)).into(), ArrayType::new_static(DataType::F32, [3]).into()];
+        let output_type = ArrayIrType::from(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Dynamic(rows)]),
+        ));
+        assert_eq!(
+            refine_control_flow_output_types(
+                &declared_input_types,
+                &input_types,
+                &[dimension_type.clone(), output_type],
+                |_| None,
+            ),
+            Ok(vec![
+                dimension_type,
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(3)]),
+                )
+                .into(),
+            ]),
+        );
+
+        // Without an output that defines it, the same identity is refined to the extent that the inputs establish.
+        assert_eq!(
+            refine_control_flow_output_types(
+                &declared_input_types,
+                &input_types,
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into()],
+                |_| None,
+            ),
+            Ok(vec![ArrayType::new_static(DataType::F32, [5]).into()]),
+        );
+    }
+
+    #[test]
+    fn test_validate_control_flow_output_identity_scope() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let other = DimensionVariable::new("other", DimensionBounds::positive(Some(8)).unwrap());
+        let extent_type =
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
+        let other_type =
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(other.clone())])));
+
+        // Outputs may refer to identities that an input carries, including through the referent of a reference, and
+        // to identities that an output defines.
+        assert_eq!(
+            validate_control_flow_output_identity_scope(
+                CONDITION_OPERATION_NAME,
+                &[ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])))
+                    .into()],
+                &[extent_type.clone(), DimensionType::from(other).into(), other_type.clone()],
+            ),
+            Ok(()),
+        );
+
+        // An output that refers to an identity that neither the inputs carry nor an output defines is rejected.
+        assert_eq!(
+            validate_control_flow_output_identity_scope(
+                CONDITION_OPERATION_NAME,
+                std::slice::from_ref(&extent_type),
+                &[extent_type.clone(), other_type],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{CONDITION_OPERATION_NAME}` output 1 has type `f32[other]`, which refers to the identity `other` \
+                 that no input carries and no output defines",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_validate_loop_reference_carry_roots() {
+        // A body that returns every reference carry as its own body input is accepted. Carries enter the body behind
+        // its leading index input.
+        let reference_type = ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let first = builder.add_input(reference_type.clone());
+        let value = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let second = builder.add_input(reference_type);
+        let next_value = builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::Neg(NegOperation::new())),
+                Vec::new(),
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first, next_value, second],
+                vec![Placeholder; 4],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        assert_eq!(validate_loop_reference_carry_roots(SCAN_OPERATION_NAME, body.entry_region_ref(), 1..4), Ok(()));
+
+        // Bodies without reference carries are not constrained, so their array carries may be returned in any order.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let first = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let second = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![second, first],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(validate_loop_reference_carry_roots(SCAN_OPERATION_NAME, body.entry_region_ref(), 1..3), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_loop_reference_carry_roots_rejects_other_references() {
+        // A body that returns a reference carry as another reference carry or as a reference that it allocates gives
+        // the loop state no fixed point, and the first such carry is reported.
+        let reference_type = ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first = builder.add_input(reference_type.clone());
+        let value = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let second = builder.add_input(reference_type.clone());
+        let swapped_body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![second, value, first],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            validate_loop_reference_carry_roots(WHILE_OPERATION_NAME, swapped_body.entry_region_ref(), 0..3),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` body does not return carry 0 as the reference it entered with, so the loop \
+                 state has no fixed point",
+            )))),
+        );
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first = builder.add_input(reference_type.clone());
+        let value = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        builder.add_input(reference_type);
+        let allocation =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
+        let allocating_body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first, value, allocation],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            validate_loop_reference_carry_roots(WHILE_OPERATION_NAME, allocating_body.entry_region_ref(), 0..3),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` body does not return carry 2 as the reference it entered with, so the loop \
+                 state has no fixed point",
+            )))),
         );
     }
 
@@ -851,11 +1424,11 @@ mod tests {
         assert_eq!(
             validate_loop_reference_carry_batch_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(1)),
             Err(BatchingError::UnsupportedOperation {
-                message:
-                    "`scan` reference carry 1 enters carrying `axis 0` but its body returns it carrying `axis 1`; a \
-                          reference carry cannot change its batch axis, so pass the reference as a batched input at \
-                          the axis the body produces"
-                        .to_string(),
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` reference carry 1 enters carrying `axis 0` but its body returns it \
+                     carrying `axis 1`; a reference carry cannot change its batch axis, so pass the reference as a \
+                     batched input at the axis the body produces",
+                ),
             }),
         );
         assert_eq!(
@@ -866,12 +1439,199 @@ mod tests {
                 BatchAxis::new(0),
             ),
             Err(BatchingError::UnsupportedOperation {
-                message:
-                    "`scan` reference carry 0 enters carrying `replicated` but its body returns it carrying `axis \
-                          0`; a reference carry cannot change its batch axis, so pass the reference as a batched input \
-                          at the axis the body produces"
-                        .to_string(),
+                message: format!(
+                    "`{SCAN_OPERATION_NAME}` reference carry 0 enters carrying `replicated` but its body returns it \
+                     carrying `axis 0`; a reference carry cannot change its batch axis, so pass the reference as a \
+                     batched input at the axis the body produces",
+                ),
             }),
         );
+    }
+
+    #[test]
+    fn test_loop_carry_passthrough_mask() {
+        // Only a carry whose next value is its own body input passes through. Returning another carry's input or a
+        // computed value does not.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64));
+        let first = builder.add_input(scalar_type.clone());
+        builder.add_input(scalar_type.clone());
+        let third = builder.add_input(scalar_type);
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![first, third, negated, first],
+                vec![Placeholder; 4],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        assert_eq!(loop_carry_passthrough_mask(body.entry_region_ref(), 1..4), vec![true, false, false]);
+    }
+
+    #[test]
+    fn test_canonicalize_loop_carry_batch_axes() {
+        // A replicated carry stays replicated and a mapped array carry moves to axis `0`, while a reference carry
+        // keeps the axis that its referent fixes.
+        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let extent = context.input(DimensionType::from(Dimension::Static(2)).into());
+        let replicated = context.input(ArrayType::new_static(DataType::F32, [3]).into());
+        let mapped = context.input(ArrayType::new_static(DataType::F32, [3, 2]).into());
+        let reference = context.input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])).into());
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(context.clone(), extent.clone());
+        let regions = AttachedRegions::from(Vec::<Program<TestIrValue, TestIrOperation, _, _>>::new());
+        let carries = canonicalize_loop_carry_batch_axes(
+            &batching_context,
+            &RecursiveBatchingDriver::new(&regions),
+            &[
+                ArrayIrBatch::replicated(replicated),
+                ArrayIrBatch::new(mapped, BatchAxis::new(1)).unwrap(),
+                ArrayIrBatch::new(reference, BatchAxis::new(1)).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            carries.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>(),
+            vec![BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::new(1)],
+        );
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                carries.iter().map(|carry| carry.value().atom_id().unwrap()).collect(),
+                vec![Placeholder; 4],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<2>, %1:f32[3], %2:f32[3, 2], %3:ref<f32[3, 2]> .
+                let %4:f32[2, 3] = transpose [permutation=[1, 0]] %2
+                in (%1, %4, %3)"},
+        );
+    }
+
+    #[test]
+    fn test_stabilize_loop_carry_batch_axes() {
+        // The second carry's next value is the mapped input, so the first pass widens it, which in turn makes the next
+        // value of the first carry mapped and widens it in the second pass. The third pass widens nothing and its
+        // batched body is returned. The third carry passes through and stays replicated.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first = builder.add_input(scalar_type.clone());
+        let second = builder.add_input(scalar_type.clone());
+        let third = builder.add_input(scalar_type.clone());
+        let input = builder.add_input(scalar_type);
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![second, negated, third, first],
+                vec![Placeholder; 4],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let regions = AttachedRegions::from(vec![body]);
+        let driver = CountingBatchingDriver::new(&regions);
+        let context = BatchingContext::new(TracingContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let mut input_axes =
+            vec![BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::new(0)];
+        let batched_body = stabilize_loop_carry_batch_axes(
+            SCAN_OPERATION_NAME,
+            &context,
+            &driver,
+            driver.region(0).unwrap(),
+            &mut input_axes,
+            0..3,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(driver.batch_program_calls(), 3);
+        assert_eq!(input_axes, vec![BatchAxis::new(0), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)]);
+        assert_eq!(
+            batched_body.output_axes(),
+            &[BatchAxis::new(0), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
+        );
+        assert_eq!(
+            batched_body.into_parts().0.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2], %2:f32[], %3:f32[2] .
+                let %4:f32[2] = neg %3
+                in (%1, %4, %2, %0)"},
+        );
+    }
+
+    #[test]
+    fn test_stabilize_loop_carry_batch_axes_reference_carries() {
+        let reference_type = ArrayIrType::from(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let extent = context.input(DimensionType::from(Dimension::Static(2)).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(context, extent);
+
+        // A reference carry is never widened, so a body that returns each reference carry at the axis it entered with
+        // converges in one pass and leaves the carry axes unchanged.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first = builder.add_input(reference_type.clone());
+        let second = builder.add_input(reference_type.clone());
+        let body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first, second],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let regions = AttachedRegions::from(vec![body]);
+        let driver = CountingBatchingDriver::new(&regions);
+        let mut input_axes = vec![BatchAxis::new(0), BatchAxis::replicated()];
+        let batched_body = stabilize_loop_carry_batch_axes(
+            WHILE_OPERATION_NAME,
+            &context,
+            &driver,
+            driver.region(0).unwrap(),
+            &mut input_axes,
+            0..2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(driver.batch_program_calls(), 1);
+        assert_eq!(input_axes, vec![BatchAxis::new(0), BatchAxis::replicated()]);
+        assert_eq!(batched_body.output_axes(), &[BatchAxis::new(0), BatchAxis::replicated()]);
+        assert_eq!(
+            batched_body.into_parts().0.to_string(),
+            indoc! {"
+                lambda %0:dimension<2>, %1:ref<f32[2, 3]>, %2:ref<f32[3]> .
+                in (%0, %1, %2)"},
+        );
+
+        // A body that returns a reference carry at another axis is rejected.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first = builder.add_input(reference_type.clone());
+        let second = builder.add_input(reference_type);
+        let body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![second, first],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let regions = AttachedRegions::from(vec![body]);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let mut input_axes = vec![BatchAxis::new(0), BatchAxis::replicated()];
+        assert!(matches!(
+            stabilize_loop_carry_batch_axes(
+                WHILE_OPERATION_NAME,
+                &context,
+                &driver,
+                driver.region(0).unwrap(),
+                &mut input_axes,
+                0..2,
+            ),
+            Err(BatchingError::UnsupportedOperation { message }) if message == format!(
+                "`{WHILE_OPERATION_NAME}` reference carry 0 enters carrying `axis 0` but its body returns it carrying \
+                 `replicated`; a reference carry cannot change its batch axis, so pass the reference as a batched \
+                 input at the axis the body produces",
+            ),
+        ));
     }
 }

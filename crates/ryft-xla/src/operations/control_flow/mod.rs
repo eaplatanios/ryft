@@ -258,11 +258,12 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Converts the lowered values of the results of one control-flow instruction from the `region_output_types` that its
-/// lowering produced them at to the instruction's `output_types`, which refine them (refer to `refine_output_types` in
-/// `ryft-core`). This is the inverse of [`lower_refined_region_input`]: refinements only replace dynamic dimensions
-/// with static extents, so a result is exposed as its full physical buffer, sliced to the static extent of every
-/// refined axis, and then given back the runtime size of every axis that stays dynamic with
-/// `stablehlo.set_dimension_size`. Results whose types the instruction does not refine are returned unchanged.
+/// lowering produced them at to the instruction's `output_types`, which refine them (refer to
+/// `refine_control_flow_output_types` in `ryft-core`). This is the inverse of [`lower_refined_region_input`]:
+/// refinements only replace dynamic dimensions with static extents, so a result is exposed as its full physical buffer,
+/// sliced to the static extent of every refined axis, and then given back the runtime size of every axis that stays
+/// dynamic with `stablehlo.set_dimension_size`. Results whose types the instruction does not refine are returned
+/// unchanged.
 pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     values: Vec<ValueRef<'b, 'c, 't>>,
     region_output_types: &[ArrayIrType],
