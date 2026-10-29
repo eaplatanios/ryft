@@ -329,8 +329,9 @@ pub(crate) struct ZeroBoundaryLeaf<T: Type> {
 /// of output `i` depends on no input tangent (e.g., the output of `stop_gradient` or of a constant), it is a structural
 /// zero, and a program output for it would only carry a materialized zero and the residuals that size it. A pushforward
 /// must still return a concrete `0ᵢ` for every omitted leaf when it rebuilds its complete user-facing output tangent
-/// boundary. Pullbacks do not use this type: they receive no cotangent for an omitted output and return input
-/// cotangents of zero-space types as structural zeros, which the consumer that owns an extent source materializes.
+/// boundary. Pullbacks do not use this type: they validate and then drop the cotangent seed of an omitted output and
+/// return input cotangents of zero-space types as structural zeros, which the consumer that owns an extent source
+/// materializes.
 ///
 /// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the tangent of a primal
 /// `u64[n]` output has type `zero[n]` which records the identity and bounds of `n`, but not its runtime extent. While

@@ -1956,8 +1956,11 @@ where
             let output_tangents = context.tangent().bind(operation, vec![pushforward], tangent_inputs.as_slice())?;
             (outputs, distribute(output_tangents, &output_activity)?)
         } else {
+            // A structural-zero output tangent depends on no input tangent, so no live output loses its slot;
+            // the position check rejects a linearization that would silently turn a live tangent into a zero.
             let linearization =
                 driver.linearize_program_with_instantiated_outputs(primal_region, &input_indices, &[])?;
+            linearization.tangent_output_positions(&output_liveness)?;
             let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
             let residuals = outputs.split_off(output_count);
             let mut tangent_inputs = tangents;

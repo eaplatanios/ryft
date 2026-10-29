@@ -1321,8 +1321,9 @@ impl<V: Value, O: Operation<Type = V::Type>> TransposedProgram<V, O> {
 /// reusing the work done during linearization and cached transposition.
 ///
 /// The stored programs are _compact_ meaning that leaves whose differential types contain only zero are omitted from
-/// their inputs and outputs. Application removes those output cotangent leaves before replay and restores typed zeros
-/// for omitted input cotangent leaves. Disconnected input cotangents also remain structural zeros.
+/// their inputs and outputs, as are the outputs whose tangents are structural zeros. Application validates and then
+/// drops the cotangent seeds of those outputs before replay and restores typed zeros for omitted input cotangent
+/// leaves. Disconnected input cotangents also remain structural zeros.
 ///
 /// # Zero Sources for Structural Cotangents
 ///
@@ -1369,8 +1370,9 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// consequently absent from [`linear_program`](Self::linear_program)'s inputs.
     primal_input_types: Vec<C::Type>,
 
-    /// Complete public primal output boundary, including leaves whose tangent spaces contain only zero and which are
-    /// consequently absent from [`linear_program`](Self::linear_program)'s outputs.
+    /// Complete public primal output boundary, including the values that
+    /// [`tangent_output_slots`](Self::tangent_output_slots) does not flag and which are consequently absent
+    /// from [`linear_program`](Self::linear_program)'s outputs.
     primal_output_types: Vec<C::Type>,
 
     /// One flag per entry of [`primal_output_types`](Self::primal_output_types) that is set when
@@ -1434,13 +1436,14 @@ impl<
     /// For `y = f(x)` at the fixed linearization point `x`, it computes the tangent map `ẏ = (∂f/∂x)(x) · ẋ`. The
     /// residuals `r`, returned by [`Self::residuals`], contain saved values from linearization that this computation
     /// needs. With those residuals fixed, the map is linear in the input tangents `ẋ`; it need not be linear in `r`.
-    /// Here, `live(...)` omits leaves whose differential types contain only zero. The program receives the remaining
-    /// input tangents followed by `r` and produces the remaining output tangents. This omission depends on the types,
-    /// not on whether a particular tangent value happens to be zero. Note that this is the pushforward program and not
-    /// the program computing the pullback `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. Application transposes it for the requested cotangent
-    /// destinations and reuses the resulting program through the transform cache. Retaining the pushforward allows one
-    /// pullback to return cotangent values, update caller-supplied buffers, or omit unrequested cotangents on different
-    /// applications.
+    /// Here, `live(ẋ)` omits input values whose differential types contain only zero, and `live(ẏ)` omits the output
+    /// values that [`tangent_output_slots`](Self::tangent_output_slots) does not flag (i.e., those whose differential
+    /// types contain only zero and those whose tangents are structural zeros that depend on no input tangent). The
+    /// program receives the remaining input tangents followed by `r` and produces the remaining output tangents.
+    /// Note that this is the pushforward program and not the program computing the pullback `x̄ = (∂f/∂x)(x)ᵀ · ȳ`.
+    /// Application transposes it for the requested cotangent destinations and reuses the resulting program through
+    /// the transform cache. Retaining the pushforward allows one pullback to return cotangent values, update
+    /// caller-supplied buffers, or omit unrequested cotangents on different applications.
     #[inline]
     pub fn linear_program(&self) -> &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
         &self.linear_program
@@ -1490,7 +1493,6 @@ impl<
         &self.residuals
     }
 
-    // TODO(eaplatanios): Why do we need this function?
     /// Returns one flag per public primal output that is set when [`linear_program`](Self::linear_program) has an
     /// output for that primal output's tangent, and so when its transposition has a seed input for that output's
     /// cotangent (unless the seed is a structural zero or the output is a reference). An unflagged output's seed
@@ -1502,9 +1504,11 @@ impl<
 
     /// Consumes this [`Pullback`] and returns its open parts (i.e., the compact linear pushforward program `(live(ẋ),
     /// r) ↦ live(ẏ)` and the linearization-point residuals `r` its trailing inputs consume, in that order). The
-    /// returned linear program omits public leaves whose differential spaces contain only zero from its Single Static
-    /// Assignment (SSA) boundary. [`into_transposed_parts`](Self::into_transposed_parts) returns its transpose with
-    /// metadata describing disconnected input cotangents.
+    /// returned linear program omits public input values whose differential spaces contain only zero and the output
+    /// values that [`tangent_output_slots`](Self::tangent_output_slots) does not flag from its Single Static Assignment
+    /// (SSA) boundary, so callers read those slots before consuming this pullback.
+    /// [`into_transposed_parts`](Self::into_transposed_parts) returns its transpose
+    /// with metadata describing disconnected input cotangents.
     #[inline]
     pub fn into_linear_parts(
         self,
@@ -1516,8 +1520,9 @@ impl<
     /// with the linearization-point residuals `r` its trailing inputs consume, in that order. The program is the
     /// all-[`Return`](CotangentDestinationKind::Return) transposition served from the linear program's retained
     /// transform cache, so it is valid only for a reference-free boundary and, like
-    /// [`into_linear_parts`](Self::into_linear_parts), it omits zero-space leaves from its Single Static Assignment
-    /// (SSA) boundary. Disconnected cotangents also have no executable output; their slots are recorded in the
+    /// [`into_linear_parts`](Self::into_linear_parts), it omits zero-space input leaves and the output leaves that
+    /// [`tangent_output_slots`](Self::tangent_output_slots) does not flag from its Single Static Assignment (SSA)
+    /// boundary. Disconnected cotangents also have no executable output; their slots are recorded in the
     /// returned metadata.
     ///
     /// # Errors
@@ -9816,6 +9821,39 @@ pub(crate) mod tests {
             .unwrap();
         assert_abs_diff_eq!(x_gradient.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-12);
         assert_eq!(z_gradient, Array::vector(vec![0.0, 0.0]).unwrap());
+    }
+
+    #[test]
+    fn test_vjp_omits_homogeneous_symbolic_structural_zero_output_tangents() {
+        // The homogeneous array universe cannot construct a zero whose type names a runtime extent without inputs. A
+        // pullback and a pushforward program never construct the omitted structural-zero tangent of `stop_gradient(z)`,
+        // so both linearize, but applying the pushforward must still rebuild that zero and fails.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let x = context.input(ArrayType::scalar(DataType::F32));
+        let z = context.input(vector_type.clone());
+        let function = |inputs: Vec<LinearizationTracer<TracingContext<Array, ArrayOperation<Array>>>>, ()| {
+            Ok(vec![inputs[0].sin()?, inputs[1].stop_gradient()?])
+        };
+        let (_, pullback) = context.vjp(function, vec![x.clone(), z.clone()], ()).unwrap();
+        assert_eq!(pullback.tangent_output_slots(), &[true, false]);
+        assert_eq!(
+            pullback.linear_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %2:f32[] .
+                let %3:f32[] = mul %2 %0
+                in (%3)"},
+        );
+        let (_, pushforward) = context.linearize(function, vec![x, z], ()).unwrap();
+        assert_eq!(pushforward.program().to_string(), pullback.linear_program().to_string());
+        let x_tangent = context.input(ArrayType::scalar(DataType::F32));
+        let z_tangent = context.input(vector_type);
+        assert!(matches!(
+            pushforward.apply(vec![x_tangent, z_tangent]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`zero` cannot construct type f32[n] without inputs because it references identity n",
+        ));
     }
 
     #[test]

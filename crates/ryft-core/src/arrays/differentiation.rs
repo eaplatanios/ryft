@@ -609,10 +609,12 @@ where
 
 impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
     /// Applies the explicitly selected member [`DifferentiationRule`]. Structural zero output tangents stay structural,
-    /// including those whose types name runtime extents: a consumer that needs a concrete zero reads those extents from
-    /// a primal that it owns (e.g., through [`materialize_array_tangent`], or at a linearization or fused
-    /// Jacobian-Vector Product output boundary), so a zero that nothing consumes stages nothing, and
-    /// linearization can omit it from its tangent program.
+    /// including those whose types name runtime extents, so a zero that nothing combines with a live tangent stages
+    /// nothing, and linearization can omit it from its tangent program. For example, the projected `complex`, `pad`,
+    /// `concatenate`, and `parallel_ragged_all_to_all` rules materialize a structural zero input tangent with the
+    /// type-only `zero` of their projected context once another input tangent is live, and that `zero` cannot name
+    /// runtime extents. For such operations, when any input tangent is live, this function therefore first materializes
+    /// every structural zero input tangent whose type names runtime extents, reading those extents from its primal.
     fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -639,6 +641,31 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
         ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
         ScatterOperation: MemberDifferentiableOperation<C>,
     {
+        let materialized_inputs;
+        let inputs =
+            if matches!(self, Self::Complex(_) | Self::Pad(_) | Self::Concatenate(_) | Self::ParallelRaggedAllToAll(_))
+                && inputs.iter().any(|input| !input.tangent().is_zero())
+                && inputs.iter().any(|input| has_runtime_extent_zero_tangent(input.tangent()))
+            {
+                materialized_inputs = inputs
+                    .iter()
+                    .map(|input| {
+                        if !has_runtime_extent_zero_tangent(input.tangent()) {
+                            return Ok(input.clone());
+                        }
+                        let tangent_primal = context.primal_to_tangent(input.primal().clone())?;
+                        let tangent = C::Operation::materialize_zero_from_residual_sources(
+                            context.tangent(),
+                            input.tangent().clone(),
+                            std::iter::once(&tangent_primal),
+                        )?;
+                        DifferentiationDual::new(input.primal().clone(), MaybeZero::Value(tangent))
+                    })
+                    .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                materialized_inputs.as_slice()
+            } else {
+                inputs
+            };
         Ok(match self {
             Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
@@ -782,6 +809,12 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
     }
 }
 
+/// Returns `true` when `tangent` is a structural zero whose type names a runtime extent, which the type-only `zero` of a
+/// projected array context cannot construct.
+fn has_runtime_extent_zero_tangent<V: Typed<Type = ArrayIrType>>(tangent: &MaybeZero<V>) -> bool {
+    tangent.is_zero() && tangent.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
+}
+
 /// Materializes one array input's forward mode tangent as a concrete projected array value, reading whatever runtime
 /// extents the tangent type omits from the input's primal. A mixed array rule that has to hand a concrete tangent to a
 /// staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
@@ -837,7 +870,9 @@ mod tests {
         DifferentiableType, Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate,
         TransposedProgramCotangent, differentiate_at,
     };
-    use crate::operations::{Add, Dot, DotDimensionNumbers, MulOperation, StopGradientOperation, TransposeOperation};
+    use crate::operations::{
+        Add, ComplexOperation, Dot, DotDimensionNumbers, MulOperation, StopGradientOperation, TransposeOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ReferenceType};
 
@@ -1875,6 +1910,80 @@ mod tests {
             Ok(ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::I32, [0, 1, 1]), &[] as &[i32]).unwrap(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_dynamic_mixed_structural_zero_input() {
+        // `complex(x, stop_gradient(y))` over a dynamic shape. The projected `complex` rule needs a concrete tangent for
+        // each part once either part is live, but its own type-only zero cannot name the runtime extent `n`, so the
+        // structural zero tangent of the stopped part is materialized from its primal before the rule runs. Under
+        // linearization that zero is known and crosses to the tangent program as a residual.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let x = builder.add_input(input_type.clone().into());
+        let y = builder.add_input(input_type.into());
+        let stopped = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
+                Vec::new(),
+                vec![y],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Complex(ComplexOperation::new())),
+                Vec::new(),
+                vec![x, stopped],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n], %2:f32[n], %3:f32[n] .
+                let %4:f32[n] = stop_gradient %1
+                    %5:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %4
+                    %6:f32[n] = zero [type=f32[n]] %5
+                    %7:c64[n] = complex %0 %4
+                    %8:c64[n] = complex %2 %6
+                in (%7, %8)"}
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[n] = stop_gradient %1
+                    %3:c64[n] = complex %0 %2
+                    %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %2
+                    %5:f32[n] = zero [type=f32[n]] %4
+                in (%3, %5)"}
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n], %2:f32[n] .
+                let %3:c64[n] = complex %0 %2
+                in (%3)"}
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:c64[n], %1:f32[n] .
+                let %2:f32[n] = real %0
+                    %3:c64[n] = neg %0
+                    %4:f32[n] = imaginary %3
+                in (%2)"}
         );
     }
 

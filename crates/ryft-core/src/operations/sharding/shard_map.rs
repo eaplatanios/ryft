@@ -5310,6 +5310,7 @@ mod tests {
                 self.tangent.clone(),
                 self.residual_count,
                 input_indices,
+                None,
             )?)
         }
 

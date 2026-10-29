@@ -249,10 +249,10 @@ where
 
     // Evaluate and linearize the differentiated output once. `linearize` returns only the differentiated output,
     // so capture the auxiliary primals while its closure runs and move them back out after constructing the Jacobian.
-    // Output types are validated inside the closure, before linearization materializes a structural zero in a nonzero
-    // dynamic array differential space, so a non-finite coordinate space retains the precise Jacobian diagnostic.
-    // Validate here because a dynamic structural zero still cannot be materialized by a nullary type-only constructor.
-    // A future input-relative zero operation may make this early validation redundant.
+    // Output types are validated inside the closure, before the forward Jacobian materializes a structural-zero output
+    // tangent in a nonzero dynamic array differential space, so a non-finite coordinate space retains the precise
+    // Jacobian diagnostic. Validate here because a dynamic structural zero still cannot be materialized by a nullary
+    // type-only constructor. A future input-relative zero operation may make this early validation redundant.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
         |input, capture| {
