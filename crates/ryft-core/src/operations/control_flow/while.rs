@@ -1780,15 +1780,57 @@ where
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         _accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // TODO(eaplatanios): Support transposition of unbounded while loops.
+        // TODO(eaplatanios): Support transposition of unbounded while loops. Reverse mode needs the primal state `x_i`
+        //  of every iteration in reverse order, and an unbounded loop has no static bound on how many of them there
+        //  are, so the question is where those states come from. The approaches below compose rather than compete:
+        //    1. Transposition rule for linear `while` loops. Instead of rejecting, recover the structure of the linear
+        //       loop from its known and unknown inputs. Validate that the predicate and the known state close over
+        //       known values alone (as `WhileOperation::split_by_closed_knownness` requires) and that the unknown state
+        //       is linear, split the body into its known step and its linear step, and transpose the linear step
+        //       through `TranspositionDriver::transpose_program`. The rule then counts the iterations `N` with a loop
+        //       over the known state and emits a reverse loop of `N` transposed steps, after rewriting a batched
+        //       predicate into its masked form. This covers linear loops from every source (i.e., `Program::transpose`,
+        //       the custom JVP rules of composites, and pullbacks converted from pushforwards), and on its own it
+        //       already handles loops whose linear step reads only loop-invariant known values (e.g., `ẋ ← A ẋ` with a
+        //       fixed `A`) in O(N) time and O(1) memory. Loops whose linear step reads known state that varies across
+        //       iterations still need one of the state sources below, which the rule should consume through a small
+        //       internal interface. It must also handle cotangent accumulators, structural zeros, reference state
+        //       (rejected), and predicates that vary over manual mesh axes.
+        //    2. Checkpointing as that state source. Count `N` with one extra primal sweep, then follow a binomial
+        //       checkpointing schedule (e.g., Revolve) that is computed at runtime from `N` for a fixed budget of `c`
+        //       checkpoint slots. This takes O(c) memory and recomputation that grows roughly logarithmically in `N`.
+        //       Counting first avoids the bookkeeping of truly online schedules (e.g., Stumm and Walther's, which the
+        //       `checkpointed` kind of Equinox's `while_loop` builds on) at the cost of one primal sweep. The budget
+        //       would be a new `WhileOptions` and `WhileOperation` setting, and loops without one would keep the
+        //       current rejection (JAX rejects the transposition of every `while` loop). The schedule has to be staged
+        //       as control flow (i.e., a fixed-size checkpoint buffer with dynamic slot indices and nested forward
+        //       re-sweeps interleaved with the reverse sweep), which makes the result hard to batch, to differentiate
+        //       again, and to partially evaluate. Only a reverse-specific rule can stage that interleaving, so (1) is
+        //       the natural home for this source.
+        //    3. Checkpointing for bounded loops. The bounded forward mode rule stores one residual per possible
+        //       iteration, which takes O(bound) memory. Once (2) exists, the same state source could replace those
+        //       residual stacks, which would unify the bounded and unbounded reverse paths and reduce the memory of
+        //       bounded loops to O(c).
+        //    4. Dynamically sized stacks, for backends that support them. A backend with growable arrays (e.g., an
+        //       eager backend, or a runtime without the static memory bounds that XLA requires) can store every `x_i`,
+        //       or every residual, in a stack whose length is the runtime iteration count. That takes O(N) time and
+        //       memory with no recomputation (i.e., the bounded rule without a bound). It needs a backend capability
+        //       that declares support for unbounded dynamic extents, so that the rule only selects it for programs that
+        //       the backend will run.
+        //  Naive recomputation (i.e., rebuilding each `x_i` from `x_0` with a nested loop) is deliberately not listed:
+        //  it is total and takes O(1) memory, but it takes O(N²) time. Though, we may want to consider making it an
+        //  option that users can opt-in for.
 
-        // This rule rejects the transposition of a staged linear `while` loop. The forward mode rule stages one
-        // for an unbounded loop (the doubled-state linear loop, which recomputes primal state _forward_ through the
-        // iterations, so transposing it would have to run that recomputation backwards, which a while loop cannot
-        // express), and a linear program handed to `Program::transpose` can contain one directly, whether or not it is
-        // bounded. Two paths avoid this rule. Eager domains execute the loop directly over concrete duals and record a
-        // straight-line pushforward during linearization. The forward mode rule never stages a linear `while` for a
-        // bounded loop, because its tangent side is a masked linear scan whose transpose is total.
+        // This rule rejects the transposition of a staged linear `while` loop. The forward mode rule stages one for an
+        // unbounded loop (i.e., the doubled-state linear loop, which recomputes the primal state _forward_ through the
+        // iterations), and a linear program handed to `Program::transpose` can contain one directly, whether or not it
+        // is bounded. Transposing such a loop runs its iterations in reverse, so it needs the primal state of every
+        // iteration in reverse order. Storing those states takes memory proportional to the runtime iteration count,
+        // which a backend with static memory bounds (e.g., the XLA backend) cannot allocate for a loop without a bound,
+        // and recomputing them instead takes either quadratic time or a checkpointing schedule. Two paths avoid this
+        // rule. Eager domains execute the loop directly over concrete duals and record a straight-line pushforward
+        // during linearization. The forward mode rule never stages a linear `while` for a bounded loop, because its
+        // tangent side is a masked linear scan whose transpose is total.
 
         // The loop is validated as every rule validates it before the unsupported transposition is reported.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
