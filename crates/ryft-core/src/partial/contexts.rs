@@ -499,9 +499,11 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Known inputs permit folding only when doing so preserves effect order. Once an ordered operation is deferred,
     /// later ordered operations remain residual so they cannot run ahead of it, even when their inputs are known.
     ///
-    /// An eager parent attempts to execute known operations. A pure regionless operation without reference inputs
-    /// or outputs remains residual if execution returns [`ProgramError::UnsupportedOperation`], allowing execution
-    /// environments that support it to run it later. Other failures propagate. [`ReferencePlacement::Stage`]
+    /// An eager parent attempts to execute known operations. A pure operation without reference inputs or outputs,
+    /// whose executable computation regions (if any) involve no references either, remains residual if execution
+    /// returns [`ProgramError::UnsupportedOperation`], allowing execution environments that support it to run it
+    /// later. This covers a region-carrying operation whose region contains such work (e.g., a loop whose body reduces
+    /// over a manual mesh axis) as well as the work itself. Other failures propagate. [`ReferencePlacement::Stage`]
     /// residualizes every operation touching references, including allocation and aliasing, so eager specialization
     /// cannot observe or mutate live reference state. [`ReferencePlacement::Execute`] permits known reference
     /// operations to execute. A staging parent appends folded operations to its outer program, which executes before
@@ -548,9 +550,10 @@ impl<C: Context> PartialEvaluationContext<C> {
         // execute it (i.e., returns `ProgramError::UnsupportedOperation`), rather than failing partial evaluation. This
         // is how work that has no eager value on this backend, such as a reduction over a manual mesh axis, survives
         // for an execution environment that supports it. The flag starts as `false` and becomes `true` only after the
-        // validation below proves that the operation is regionless and that no input, output, or effect declaration
-        // involves references as deferring such an operation cannot skip observable state changes. The eager binding
-        // further down also requires the operation to have no effects before it acts on this flag.
+        // validation below proves that no input, output, effect declaration, or executable computation region of the
+        // operation involves references, as deferring such an operation cannot skip observable state changes. The
+        // eager binding further down also requires the operation, including its regions, to have no effects before
+        // it acts on this flag.
         let mut can_defer_unsupported = false;
 
         // Reference and region applications retain their existing binding and failure-ordering paths. Local
@@ -595,6 +598,26 @@ impl<C: Context> PartialEvaluationContext<C> {
             .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()));
         let effects = summary.classes();
 
+        // A region-carrying operation can be deferred like a regionless one (e.g., a loop whose body contains work that
+        // the eager parent cannot execute) when neither its boundary nor any of its executable computation regions
+        // involves references. Its effect summary above already includes those regions.
+        if !regions.is_empty() {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let region_interfaces = regions.iter().map(Program::interface).collect::<Vec<_>>();
+            can_defer_unsupported = !input_types.iter().any(Type::is_reference)
+                && !operation.effects().has_reference_declarations()
+                && operation
+                    .infer_output_types(&input_types, &region_interfaces)
+                    .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
+                && !regions.iter().enumerate().any(|(index, region)| {
+                    operation.region_role(index) == Some(RegionRole::Computation)
+                        && region
+                            .entry_region_ref()
+                            .computation_regions()
+                            .any(|region| region.atoms().iter().any(|atom| atom.r#type().is_reference()))
+                });
+        }
+
         // Check reference placement only if the cheaper conditions have not already required residual execution.
         // Under eager specialization, reference accesses and root forwarding must remain residual so they do not
         // observe live state before the specialized program runs. Dormant rule regions do not execute here.
@@ -624,9 +647,9 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
         let outputs = if self.parent.is_eager() && can_defer_unsupported && effects.is_empty() {
-            // Unsupported pure kernels can remain residual without repeating observable work. The validation above
-            // excludes references and regions; execution errors other than unsupported kernels remain failures.
-            match self.parent.bind(operation.clone(), Vec::new(), &known) {
+            // Unsupported pure work can remain residual without repeating observable work. The validation above
+            // excludes references; execution errors other than unsupported kernels remain failures.
+            match self.parent.bind(operation.clone(), regions.clone(), &known) {
                 Err(ProgramError::UnsupportedOperation { .. }) => {
                     return self.residualize_with_effects(operation, regions, inputs, effects);
                 }
@@ -2004,10 +2027,10 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
     use crate::operations::{
-        AddOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation, DimensionSubOperation,
-        LinearCallOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-        RematerializeOperation, SubOperation, WhileOperation, Zero, ZeroOperation,
+        AddOperation, ConditionOperation, CustomCallOperation, DimensionAddOperation, DimensionSizeOperation,
+        DimensionSubOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
+        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation, RematerializeOperation, SubOperation, WhileOperation, Zero, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::evaluations::PartialEvaluation;
@@ -2472,6 +2495,72 @@ mod tests {
         let operation =
             TestOrderedStateOperation::Unavailable { error: invalid.clone(), effects: Effects::empty().clone() };
         assert_eq!(context.fold_or_residualize(operation, Vec::new(), &inputs).unwrap_err(), invalid);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_unsupported_eager_execution_in_regions() {
+        // A pure region-carrying operation whose region contains work that the eager parent cannot execute remains
+        // residual like that work itself, instead of failing partial evaluation.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                CustomCallOperation::new("kernel", vec![scalar_type.clone()]),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let inputs = [
+            PartialEvaluationValue::known(Array::scalar(true).unwrap()),
+            PartialEvaluationValue::known(Array::scalar(2f32).unwrap()),
+        ];
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let outputs = context
+            .fold_or_residualize(ConditionOperation::new(), vec![branch.clone(), branch], &inputs)
+            .unwrap();
+        assert!(outputs[0].is_unknown());
+        assert_eq!(
+            context.into_evaluation(outputs).unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[] .
+                let %2:f32[] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[] .
+                        let %1:f32[] = custom_call [target=kernel] %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        let %1:f32[] = custom_call [target=kernel] %0
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+
+        // A branch that prints before running the kernel may already have printed when execution fails, so the failure
+        // propagates instead of deferring the condition and printing again later.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let printed = builder.add_instruction(PrintOperation::new("input"), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(CustomCallOperation::new("kernel", vec![scalar_type]), Vec::new(), vec![printed], None)
+            .unwrap()[0];
+        let branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(
+            context
+                .fold_or_residualize(ConditionOperation::new(), vec![branch.clone(), branch], &inputs)
+                .unwrap_err(),
+            ProgramError::UnsupportedOperation {
+                message: "the reference array backend cannot execute the foreign kernel `kernel`".to_string(),
+            },
+        );
     }
 
     #[test]

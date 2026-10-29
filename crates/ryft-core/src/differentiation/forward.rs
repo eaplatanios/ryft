@@ -240,7 +240,7 @@ fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type
 ///   gradient --> hessian["Hessian by Differentiating the Gradient"]
 /// ```
 ///
-/// The diagram includes both direct forward mode and the reverse-mode path built from this structural split. Concrete
+/// The diagram includes both direct forward mode and the reverse mode path built from this structural split. Concrete
 /// [`Pushforward`] and [`Pullback`](crate::Pullback) callables additionally retain residual values from one
 /// linearization point; this [`Linearization`] itself does not.
 #[cfg_attr(doc, ryft_macros::mermaid)]
@@ -457,7 +457,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         (self.primal, self.tangent, self.residual_count)
     }
 
-    /// Returns the compact forward-mode pushforward program `(live(ẋ), r) ↦ live(ẏ)`. Because linearization already
+    /// Returns the compact forward mode pushforward program `(live(ẋ), r) ↦ live(ẏ)`. Because linearization already
     /// produces the pushforward as its unknown half, this clones the shared handle to [`tangent`](Self::tangent),
     /// without cloning its program (i.e., the identity counterpart of [`pullback`](Self::pullback), which derives its
     /// program by transposition). The returned program has the same unchecked
@@ -468,7 +468,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         self.tangent.clone()
     }
 
-    /// Builds the compact reverse-mode pullback program `(live(ȳ), r) ↦ live(x̄)` by transposing the
+    /// Builds the compact reverse mode pullback program `(live(ȳ), r) ↦ live(x̄)` by transposing the
     /// [`tangent`](Self::tangent) sub-program. Conceptually, it takes the output cotangents `ȳ` followed by the
     /// residuals `r` and produces the input cotangents `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this
     /// [`Linearization`]'s program family, alongside the stored [`primal`](Self::primal) and [`tangent`](Self::tangent)
@@ -522,7 +522,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
 
 /// Pushforward of a function `f` at a linearization point `x` (i.e., the linear map `ẋ ↦ (∂f/∂x)(x) · ẋ`), packaged
 /// as a reusable callable. This is what [`ForwardModeDifferentiate::linearize`] returns (i.e., the analogue of
-/// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)), and it is the forward-mode
+/// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)), and it is the forward mode
 /// dual of [`Pullback`](crate::Pullback), whose callable applies the transposed map `ȳ ↦ (∂f/∂x)(x)ᵀ · ȳ` instead.
 /// It wraps the pushforward program `(ẋ, r) ↦ ẏ` accumulated while partially evaluating the differentiated closure,
 /// closed over the residuals `r` recovered at the linearization point. [`apply`](Self::apply) computes
@@ -594,7 +594,7 @@ impl<
     /// positions or types, and the tangent-type mapping is not generally invertible. `primal_input_types` preserves
     /// the complete public input boundary so that [`apply`](Self::apply) can validate and filter its tangent arguments.
     /// `tangent_reconstruction` independently preserves the reconstruction plan for omitted output leaves, while
-    /// `primal_output_types` validates the compact program boundary and remains available to reverse-mode conversion.
+    /// `primal_output_types` validates the compact program boundary and remains available to reverse mode conversion.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume
     /// one leading input for every non-zero tangent in `primal_input_types`, followed by one input for every residual,
@@ -887,9 +887,10 @@ pub trait DifferentiationPolicy<C: Context>: Copy + Clone + Debug {
     /// that separate context instead.
     ///
     /// Both contexts have type `C` and use the same value and operation families, but may own different staged
-    /// [`Program`]s. A separate context must retain provenance tracking and support the value transfers defined
-    /// by [`primal_to_tangent`](Self::primal_to_tangent). For example, the partitioned policy creates a sibling
-    /// partial evaluation context whose effectful operations remain in the tangent program.
+    /// [`Program`]s. A separate context must retain provenance tracking and support the value transfers defined by
+    /// [`primal_to_tangent`](Self::primal_to_tangent) and [`tangent_to_primal`](Self::tangent_to_primal). For example,
+    /// the partitioned policy creates a sibling partial evaluation context whose effectful operations remain in the
+    /// tangent program.
     ///
     /// # Parameters
     ///
@@ -918,6 +919,64 @@ pub trait DifferentiationPolicy<C: Context>: Copy + Clone + Debug {
     ///   - `value`: Primal value needed by the tangent computation, such as a coefficient, predicate, or a value
     ///     supplying shape information.
     fn primal_to_tangent(tangent: &C, value: C::Value) -> Result<C::Value, DifferentiationError>;
+
+    /// Makes a value that the tangent [`Context`] computed from primal values alone usable by operations in the primal
+    /// [`Context`] (i.e., the inverse of [`primal_to_tangent`](Self::primal_to_tangent)). Rules use this when they bind
+    /// a fused computation in the tangent context and let that context separate its primal part (e.g., the fused
+    /// forward mode loop of a `while` loop, whose partial evaluation binds the primal loop on its known side), so that
+    /// the primal results are computed once rather than once for the primal outputs and again while separating the
+    /// tangent work.
+    ///
+    /// [`FusedDifferentiationPolicy`] returns the value unchanged because both computations share a context.
+    /// [`PartitionedDifferentiationPolicy`] imports it as a known value into the primal context, which shares the
+    /// known-side parent of the tangent context. As for [`primal_to_tangent`](Self::primal_to_tangent),
+    /// implementations must preserve live reference identity and any deferred errors.
+    ///
+    /// # Parameters
+    ///
+    ///   - `primal`: Context returned by [`DifferentiationContext::primal`], which will use the transferred value.
+    ///   - `value`: Value computed by the tangent context from primal values alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` depends on tangent work (e.g., an unknown value of a partitioned tangent context),
+    /// because every pushforward application recomputes such a value and the primal computation cannot read it.
+    fn tangent_to_primal(primal: &C, value: C::Value) -> Result<C::Value, DifferentiationError>;
+
+    /// Materializes a structural zero of type `r#type` in the tangent [`Context`] as a value that tangent work can pass
+    /// into a derived region as a real input (e.g., the initial tangent of a loop carry that only later iterations make
+    /// live). The zero takes the runtime extents that its type names from `primal`, the corresponding primal value
+    /// transferred to the tangent context (refer to [`ResidualZeroProvider::materialize_zero_from_residual_sources`]).
+    ///
+    /// The default binds the zero in the tangent context. [`PartitionedDifferentiationPolicy`] instead stages it in the
+    /// tangent program whenever its runtime extents can be captured from a known `primal`, so every pushforward
+    /// application constructs the zero rather than reading a zero that linearization computed and stored as a residual.
+    ///
+    /// # Parameters
+    ///
+    ///   - `tangent`: Context returned by [`DifferentiationContext::tangent`], which will use the materialized zero.
+    ///   - `r#type`: Type of the zero.
+    ///   - `primal`: Primal value of the zero's dual, transferred to the tangent context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of capturing the zero's runtime extents and of binding the zero.
+    #[inline]
+    fn materialize_tangent_zero(
+        tangent: &C,
+        r#type: C::Type,
+        primal: &C::Value,
+    ) -> Result<C::Value, DifferentiationError>
+    where
+        C: Zero<C::Value>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    {
+        Ok(C::Operation::materialize_zero_from_residual_sources(
+            tangent,
+            MaybeZero::Zero(r#type),
+            std::iter::once(primal),
+        )?)
+    }
 }
 
 /// [`DifferentiationPolicy`] that uses the same underlying [`Context`] for primal and tangent operations. This is the
@@ -925,9 +984,9 @@ pub trait DifferentiationPolicy<C: Context>: Copy + Clone + Debug {
 /// primal result and tangent result together. An eager context executes the operations and a staging context records
 /// them in the same program.
 ///
-/// No separate tangent context is created, and transferring a primal value to tangent work returns it unchanged.
-/// [`PartitionedDifferentiationPolicy`] instead separates the computations so the tangent program can be called
-/// repeatedly after computing the primal results once.
+/// No separate tangent context is created, and transferring a value between primal and tangent work returns it
+/// unchanged. [`PartitionedDifferentiationPolicy`] instead separates the computations so the tangent program can be
+/// called repeatedly after computing the primal results once.
 #[derive(Copy, Clone, Debug)]
 pub struct FusedDifferentiationPolicy;
 
@@ -939,6 +998,11 @@ impl<C: Context> DifferentiationPolicy<C> for FusedDifferentiationPolicy {
 
     #[inline]
     fn primal_to_tangent(_tangent: &C, value: C::Value) -> Result<C::Value, DifferentiationError> {
+        Ok(value)
+    }
+
+    #[inline]
+    fn tangent_to_primal(_primal: &C, value: C::Value) -> Result<C::Value, DifferentiationError> {
         Ok(value)
     }
 }
@@ -978,6 +1042,45 @@ where
     ) -> Result<PartialTracer<C>, DifferentiationError> {
         Ok(tangent.import_known(&value)?)
     }
+
+    #[inline]
+    fn tangent_to_primal(
+        primal: &PartialEvaluationContext<C>,
+        value: PartialTracer<C>,
+    ) -> Result<PartialTracer<C>, DifferentiationError> {
+        Ok(primal.import_known(&value)?)
+    }
+
+    fn materialize_tangent_zero(
+        tangent: &PartialEvaluationContext<C>,
+        r#type: C::Type,
+        primal: &PartialTracer<C>,
+    ) -> Result<PartialTracer<C>, DifferentiationError>
+    where
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Zero<PartialTracer<C>>,
+    {
+        // Binding a zero whose inputs are known would fold it into the shared parent, which would make linearization
+        // compute the zero once and pass it to every pushforward application as a stored residual. Like the zero
+        // output tangents of linearization, the zero is instead staged in the tangent program over the runtime extents
+        // captured from its known primal. A zero that needs a source of exactly its type (i.e., a symbolic zero of a
+        // family without first-class dimensions) or an unknown primal keeps the default binding.
+        let known = primal.value()?.as_known().cloned();
+        let residual_types = C::Operation::zero_residual_types(&r#type);
+        match known {
+            Some(known) if !residual_types.is_empty() || !C::Operation::requires_zero_source(&r#type) => {
+                let residuals =
+                    capture_and_validate_zero_residual_values(tangent.parent(), &known, &r#type, "tangent zero")?;
+                let zero = residualize_zero_from_residual_values(tangent, r#type, residuals)?;
+                Ok(PartialTracer::new(tangent.clone(), zero))
+            }
+            _ => Ok(C::Operation::materialize_zero_from_residual_sources(
+                tangent,
+                MaybeZero::Zero(r#type),
+                std::iter::once(primal),
+            )?),
+        }
+    }
 }
 
 /// Adapts an existing [`DifferentiationPolicy`] `P` to a [`ProjectedContext`] while preserving how it separates
@@ -1011,13 +1114,22 @@ impl<T: Type, C: ContextProjection<T>, P: DifferentiationPolicy<C>> Differentiat
         let value = <C::Value as ValueProjection<T>>::from_projected(value);
         P::primal_to_tangent(tangent.parent(), value)?.into_projected().map_err(Into::into)
     }
+
+    #[inline]
+    fn tangent_to_primal(
+        primal: &ProjectedContext<C, T>,
+        value: <C::Value as ValueProjection<T>>::Projected,
+    ) -> Result<<C::Value as ValueProjection<T>>::Projected, DifferentiationError> {
+        let value = <C::Value as ValueProjection<T>>::from_projected(value);
+        P::tangent_to_primal(primal.parent(), value)?.into_projected().map_err(Into::into)
+    }
 }
 
 /// Provides call-scoped access to the regions attached to the instruction being differentiated. Transform
 /// dispatch constructs a driver for one operation application and passes it directly to that operation's
 /// [`jvp`](DifferentiableOperation::jvp) rule. [`RegionDriver`] provides structural region access, while this
 /// trait adds differentiation-specific recursion. Region-free applications receive a driver with no regions.
-/// During reverse-mode differentiation, both fused and partitioned recursive requests use
+/// During reverse mode differentiation, both fused and partitioned recursive requests use
 /// [`DifferentiableOperation::jvp_for_transpose`] instead of [`DifferentiableOperation::jvp`].
 ///
 /// Structural transform requests accept borrowed [`RegionRef`]s directly, allowing the same request to serve both a
@@ -1031,7 +1143,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// `input_indices` select which region inputs to differentiate with respect to and specify their tangent-input
     /// order. Unselected inputs receive structural-zero tangents. All primal inputs remain available to the program.
     /// Selected inputs whose differential spaces contain only zero do not contribute tangent arguments. During
-    /// reverse-mode differentiation, this uses [`DifferentiableOperation::jvp_for_transpose`] and may produce
+    /// reverse mode differentiation, this uses [`DifferentiableOperation::jvp_for_transpose`] and may produce
     /// transpose-only carriers; callers must retain those carriers for partitioning and transposition instead of
     /// executing them as forward derivatives.
     ///
@@ -1077,7 +1189,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// Linearizes `region` into separate primal and tangent programs. As in [`Self::jvp_program`], `input_indices`
     /// select which region inputs to differentiate with respect to. All primal inputs remain available to the primal
     /// program. The tangent program receives the selected input tangents in the supplied order, omitting zero
-    /// differential spaces, followed by the residual values saved by the primal program. During reverse-mode
+    /// differential spaces, followed by the residual values saved by the primal program. During reverse mode
     /// differentiation, [`DifferentiableOperation::jvp_for_transpose`] determines the saved residuals and the
     /// tangent program, which need only support transposition.
     ///
@@ -1253,7 +1365,7 @@ impl<C: Context> DifferentiationDriver<C> for EmptyRegionDriver {
 /// [`AttachedRegions`], which preserve the operation-defined ordering of owned regions, borrowed regions, and shared
 /// callees without materializing a combined region collection. Recursive requests are answered through rule-specific
 /// cached fused and partitioned construction. Public region transforms always select forward rules; recursive requests
-/// from reverse-mode differentiation retain separate artifacts.
+/// from reverse mode differentiation retain separate artifacts.
 struct RecursiveDifferentiationDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Application-scoped [`AttachedRegions`], in operation-defined order.
     regions: &'r AttachedRegions<'r, V, O>,
@@ -1372,13 +1484,13 @@ where
 ///
 /// `#[derive(Operation)]` generates a [`DifferentiableOperation`] dispatcher when the enum
 /// specifies `#[ryft(dispatch(differentiation))]`. It forwards both [`jvp`](Self::jvp) and
-/// [`jvp_for_transpose`](Self::jvp_for_transpose). Enums that also need reverse-mode differentiation independently
+/// [`jvp_for_transpose`](Self::jvp_for_transpose). Enums that also need reverse mode differentiation independently
 /// select `transposition`, whose dispatcher reverse mode is built on. It follows the operation derivation's enum-shape
 /// inference rules and generates:
 ///
 ///   - An `impl DifferentiableOperation<C> for Enum` that is generic over a [`StagingContext`] `C` pinned to the enum's
 ///     primary type, program constant type, and the enum itself as its operation family. Every variant forwards
-///     [`jvp`](Self::jvp) to its payload's own rule, and so payloads without a forward-mode form must still implement
+///     [`jvp`](Self::jvp) to its payload's own rule, and so payloads without a forward mode form must still implement
 ///     the trait with a rule that returns an [`UnsupportedOperation`](ProgramError::UnsupportedOperation).
 ///   - A `where` clause following the same shape as the generated interpretation and partial-evaluation
 ///     implementations: a per-variant `Payload: DifferentiableOperation<C>` predicate for every payload which
@@ -1386,7 +1498,7 @@ where
 ///     so that the enum does not spell them, plus a `Self: From<Payload>` conversion for every concrete payload (the
 ///     rules stage ordinary primal-enum operations for both the primal and the tangent side) and the direct
 ///     `Self: OperationProvider<T, ZeroOperation<T>, Operation = Self>` bound that the nested-region differentiation
-///     drivers require. Higher-order payload rules request nested forward-mode and linearization work through their
+///     drivers require. Higher-order payload rules request nested forward mode and linearization work through their
 ///     instruction-scoped [`DifferentiationDriver`], whose concrete implementation establishes the finite program-level
 ///     bounds at its construction site. Output-level semantic queries such as [`Operation::is_zero`] are forwarded by
 ///     the base operation dispatcher and therefore introduce no additional witness bounds.
@@ -1398,7 +1510,7 @@ where
 /// type compatibility notes of [`InterpretableOperation`](crate::InterpretableOperation) for the trait solver
 /// limitations behind that rule.
 pub trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
-    /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
+    /// Applies this operation's capture-free forward mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
     /// `(y, ẏ) = (f(x), Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ)` where `f` is the function this operation computes. The returned vector
     /// must be aligned with this operation's outputs, each element pairing a primal output value with its tangent, both
     /// bound through `context`.
@@ -1423,14 +1535,14 @@ pub trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 
-    /// Applies this operation's derivative rule for subsequent transposition during reverse-mode differentiation.
+    /// Applies this operation's derivative rule for subsequent transposition during reverse mode differentiation.
     /// Like [`Self::jvp`], this function maps input duals to output duals, with primal and tangent operations bound
     /// through `context` and the returned vector aligned with this operation's outputs. The tangent computation
     /// represents the derivative to transpose; this function does not consume output cotangents or compute input
     /// cotangents itself.
     ///
     /// Reverse-mode differentiation uses this rule before computing primal outputs and saving residuals. Immediate
-    /// forward-mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
+    /// forward mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
     /// [`Self::jvp`], whose tangent computation must support execution as a pushforward. This rule's tangent
     /// computation need only support transposition (e.g., it may retain a custom backward program in a
     /// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation), which cannot be executed as a pushforward).
@@ -1441,13 +1553,13 @@ pub trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
     /// Override this function when reverse mode needs a custom backward program or different primal computations and
     /// saved residuals. For example, a forward rule for `x³` can save `3x²`, while this rule saves `x` and defers
     /// computing `3x²` to the backward program. Keep the default when transposing the ordinary JVP provides the
-    /// desired behavior. An override does not change forward-mode differentiation; the implementor is responsible
+    /// desired behavior. An override does not change forward mode differentiation; the implementor is responsible
     /// for consistency between the separately defined derivative rules.
     ///
     /// Primal outputs and observable primal effects must preserve the operation's declared semantics. Transfer
     /// saved values through [`DifferentiationContext::primal_to_tangent`], as in a JVP rule. Overrides follow the
     /// deterministic structural-rule contract of [`Self::jvp`] because their derived programs are also cached. Nested
-    /// requests through `driver` preserve selection of this rule during reverse-mode differentiation.
+    /// requests through `driver` preserve selection of this rule during reverse mode differentiation.
     ///
     /// Higher-order differentiation never inherits this selection. Transposing a transpose-only carrier replays its
     /// backward program inline, so a pullback consists of the backward program's ordinary operations. Any transform
@@ -1528,7 +1640,7 @@ pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: Differentia
     }
 }
 
-/// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
+/// [`DifferentiationDual`] flowing through a forward mode [`DifferentiationContext`]. The function being differentiated
 /// operates on [`DifferentiationTracer`]s directly, so each operation the closure performs (e.g., `x + y`, `x.sin()`,
 /// etc.) dispatches its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`] on the stamped
 /// [`DifferentiationContext`]. This is forward mode's counterpart of [`BatchingTracer`](crate::BatchingTracer):
@@ -1804,6 +1916,13 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         P::primal_to_tangent(self.tangent(), value)
     }
 
+    /// Transfers the provided value, which the tangent context computed from primal values alone, to the primal context
+    /// (refer to [`DifferentiationPolicy::tangent_to_primal`]). The transfer preserves reference identity.
+    #[inline]
+    pub fn tangent_to_primal(&self, value: C::Value) -> Result<C::Value, DifferentiationError> {
+        P::tangent_to_primal(self.primal(), value)
+    }
+
     /// Transfers each dual's primal value to the tangent context while retaining its existing tangent value. Use this
     /// when a rule needs primal coefficients alongside tangents, such as the input shapes used to construct a tangent
     /// reshape operation. As with [`Self::primal_to_tangent`], the transfer preserves reference identity and does not
@@ -1854,13 +1973,9 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     {
         match input.tangent() {
             MaybeZero::Value(tangent) => Ok(tangent.clone()),
-            zero => {
+            MaybeZero::Zero(r#type) => {
                 let primal = self.primal_to_tangent(input.primal().clone())?;
-                Ok(C::Operation::materialize_zero_from_residual_sources(
-                    self.tangent(),
-                    zero.clone(),
-                    std::iter::once(&primal),
-                )?)
+                P::materialize_tangent_zero(self.tangent(), r#type.clone(), &primal)
             }
         }
     }
@@ -2009,7 +2124,7 @@ where
         let output_duals = self.bind_duals(&operation, regions, &input_duals)?;
 
         // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
-        // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
+        // forward mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
         Ok(output_duals.into_iter().map(|dual| DifferentiationTracer::new(dual, self.clone())).collect())
     }
 }
@@ -2186,7 +2301,7 @@ where
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] for duplicate or out-of-range indices. Propagates errors from
-    /// tangent-type derivation and the replayed forward-mode rules.
+    /// tangent-type derivation and the replayed forward mode rules.
     #[inline]
     pub fn jvp(&self, input_indices: &[usize]) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.jvp_impl(&JvpAndLinearizationTransformArguments::new(*self, input_indices)?)
@@ -2824,7 +2939,7 @@ where
 {
     /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
     /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
-    /// computes `f` together with its _pushforward_ (i.e., the forward-mode Jacobian-vector product): given an input
+    /// computes `f` together with its _pushforward_ (i.e., the forward mode Jacobian-vector product): given an input
     /// tangent (i.e., perturbation direction) `ẋ`, the pushforward produces the output tangent `ẏ = (∂f/∂x)(x) · ẋ`,
     /// the directional derivative of `f` at `x` along `ẋ`. As a single map, the returned program computes
     /// `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`. In terms of the program boundaries, if the input program has inputs
@@ -2844,7 +2959,7 @@ where
     ///
     /// The program is *not* split into separate primal and tangent sub-programs unlike [`Self::linearize`], which
     /// directly composes differentiation with partial evaluation. This un-split form remains exposed for fused
-    /// higher-order JVP rules and direct forward-mode interpretation.
+    /// higher-order JVP rules and direct forward mode interpretation.
     ///
     /// Each primal instruction is replayed once through its [`DifferentiableOperation`] rule, which returns the dual
     /// (i.e., primal result plus tangent) for the instruction's outputs. Both are staged into the shared builder as
@@ -2899,7 +3014,7 @@ where
     /// [`PartialEvaluationContext`] whose known-side parent is a fresh [`TracingContext`]. This context composition
     /// handles each source instruction once while simultaneously separating its two halves: primal-only work stages
     /// into the primal trace, and tangent-dependent work stages into the residual tangent program. An instruction
-    /// normally dispatches its forward-mode rule once; the established nonempty all-structural-zero fast path instead
+    /// normally dispatches its forward mode rule once; the established nonempty all-structural-zero fast path instead
     /// binds only its primal operation and propagates typed structural zeros.
     ///
     /// The resulting [`Linearization`] has the boundary `x -> (y, r)` and `(live(dx), r) -> live(dy)`. Every source
@@ -3051,7 +3166,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     }
 }
 
-/// Extension trait carrying the value-level *forward-mode* differentiation transforms on every [`Context`], mirroring
+/// Extension trait carrying the value-level *forward mode* differentiation transforms on every [`Context`], mirroring
 /// how [`Batch`](crate::Batch) carries batching. [`ReverseModeDifferentiate`](crate::ReverseModeDifferentiate) is its
 /// sibling that shares its partitioning machinery while selecting [`DifferentiableOperation::jvp_for_transpose`]
 /// to construct derivatives for transposition.
@@ -3074,7 +3189,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     /// Evaluates `function` on the primal `primal` and runtime `capture`, and propagates the tangent `tangent`
     /// forward only with respect to `primal`, with this [`Context`] executing or staging the differentiated
     /// operations. Refer to the documentation of [`DifferentiationBuilder::jvp`](crate::DifferentiationBuilder::jvp)
-    /// for the forward-mode transform.
+    /// for the forward mode transform.
     #[inline]
     fn jvp<
         F: FnOnce(
@@ -3222,7 +3337,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     /// Linearizes `function` at `primal`, treating `capture` as known nondifferentiated runtime inputs and returning
     /// the primal output and a reusable [`Pushforward`], with this [`Context`] executing or staging primal-side work.
     /// Refer to the documentation of [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize)
-    /// for the forward-mode transform.
+    /// for the forward mode transform.
     #[allow(clippy::type_complexity)]
     #[inline]
     fn linearize<
@@ -3586,7 +3701,7 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 /// [`DifferentiationDriver`] (e.g., the body of a `scan` or `while` operation or a branch of a `condition` operation).
 /// [`Self::new`] selects the region inputs whose tangents are live and marks an output tangent live when it has a
 /// tangent slot (refer to [`RegionRef::tangent_output_mask`]) and depends on a selected input tangent in the region's
-/// fused forward-mode program (refer to [`Program::output_dependence`]). Other output tangents are structural zeros,
+/// fused forward mode program (refer to [`Program::output_dependence`]). Other output tangents are structural zeros,
 /// so rules that rebind the derived tangents in a context that partial evaluation inspects project the derived program
 /// to the live output tangents, as [`DifferentiationDriver::jvp_program`] requires.
 ///
@@ -3597,7 +3712,7 @@ pub struct TangentActivity<C: Context> {
     /// Indices of the region inputs whose tangents are live, in order.
     input_indices: Vec<usize>,
 
-    /// Fused forward-mode program of the region with respect to `input_indices`, whose outputs are the primal outputs
+    /// Fused forward mode program of the region with respect to `input_indices`, whose outputs are the primal outputs
     /// followed by one tangent output per tangent slot.
     jvp_program: Arc<FlatProgram<C>>,
 
@@ -3609,7 +3724,7 @@ pub struct TangentActivity<C: Context> {
 }
 
 impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
-    /// Analyzes the forward-mode activity of an application of `region` whose inputs have live tangents exactly where
+    /// Analyzes the forward mode activity of an application of `region` whose inputs have live tangents exactly where
     /// `input_tangent_liveness` is set (one flag per region input), differentiating the region through `driver`, and
     /// returning a new [`TangentActivity`] instance.
     pub fn new<D: DifferentiationDriver<C>>(
@@ -3633,7 +3748,7 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
         Ok(Self { input_indices, jvp_program, tangent_slot_mask, output_tangent_liveness })
     }
 
-    /// Analyzes the forward-mode activity of a loop whose `body` region receives its carried state at the region inputs
+    /// Analyzes the forward mode activity of a loop whose `body` region receives its carried state at the region inputs
     /// `carry_inputs` and returns the next state at the region outputs `carry_outputs`, which pair with them in order,
     /// starting from `input_tangent_liveness` (one flag per region input). Returns the converged input tangent liveness
     /// together with the activity of the body under it.
@@ -3647,7 +3762,7 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
     /// at most one more round than there are carries. Carries that stay inactive keep structural-zero tangents, so
     /// linearization never sees a tangent that depends on no tangent input. A live carry keeps its tangent output even
     /// when the body resets it to a value that depends on no tangent, because carry tangent slots must pair across
-    /// iterations. This is the carry fixed point of the forward-mode rules of JAX's
+    /// iterations. This is the carry fixed point of the forward mode rules of JAX's
     /// [`scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html) and
     /// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html).
     pub fn from_loop_body<D: DifferentiationDriver<C>>(
@@ -3681,7 +3796,7 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
         &self.input_indices
     }
 
-    /// Returns the fused forward-mode program of the region with respect to [`Self::input_indices`].
+    /// Returns the fused forward mode program of the region with respect to [`Self::input_indices`].
     #[inline]
     pub fn jvp_program(&self) -> &Arc<FlatProgram<C>> {
         &self.jvp_program
@@ -4052,7 +4167,7 @@ pub(crate) mod tests {
     /// Tracer over which the rules of the composite fixtures are written.
     type CompositeTracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 
-    /// Composite with an explicit JVP rule and reverse-mode rules that save residuals of type `Residual`.
+    /// Composite with an explicit JVP rule and reverse mode rules that save residuals of type `Residual`.
     type CompositeWithRules<Input, Residual> = Composite<
         Input,
         CompositeTracer,
@@ -4060,8 +4175,8 @@ pub(crate) mod tests {
         ExplicitVjp<Input, CompositeTracer, Residual>,
     >;
 
-    /// Returns the composite computing `x³` with independent JVP and reverse-mode rules. Its JVP rule computes and
-    /// saves `3x²`, while its reverse-mode rules save only `x` and compute `3x²` in the backward rule when the pullback
+    /// Returns the composite computing `x³` with independent JVP and reverse mode rules. Its JVP rule computes and
+    /// saves `3x²`, while its reverse mode rules save only `x` and compute `3x²` in the backward rule when the pullback
     /// is applied. Both produce the same derivative values, but their saved residuals and primal computations differ,
     /// allowing tests to detect accidental use of the JVP rule by
     /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) through reusable differentiation,
@@ -4097,7 +4212,7 @@ pub(crate) mod tests {
     }
 
     /// Returns the composite computing `w ⊙ x³` elementwise over two inputs of the same type, with independent JVP and
-    /// reverse-mode rules. Its JVP rule saves the coefficients `x³` and `3w ⊙ x²`, while its reverse-mode rules save
+    /// reverse mode rules. Its JVP rule saves the coefficients `x³` and `3w ⊙ x²`, while its reverse mode rules save
     /// both inputs and compute both coefficients in a backward rule with two cotangent outputs. It extends
     /// [`custom_cube`] to multiple residuals, multiple differentiated inputs, and non-scalar values.
     fn custom_weighted_cube()
@@ -5215,7 +5330,7 @@ pub(crate) mod tests {
     #[test]
     fn test_differentiable_operation_jvp_for_transpose_nested_rule_selection() {
         // The pullback of `nested` is its backward rule `ȳ ↦ marker(ȳ)`, where `marker` is an identity whose JVP rule
-        // doubles tangents and whose reverse-mode rules triple cotangents. A transform applied to the pullback starts a
+        // doubles tangents and whose reverse mode rules triple cotangents. A transform applied to the pullback starts a
         // fresh transform that selects the nested call's rule by its own kind.
         let marker = composite(|seed: CompositeTracer| Ok(seed))
             .with_jvp(|seed: CompositeTracer, tangent: CompositeTracer| Ok((seed, tangent.clone() + tangent)))
@@ -5396,6 +5511,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_differentiation_context_tangent_to_primal() {
+        // A fused context computes primal and tangent work in one context, so the transfer returns the value unchanged.
+        let fused = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(fused.tangent_to_primal(Array::scalar(3f32).unwrap()), Ok(Array::scalar(3f32).unwrap()));
+
+        // A partitioned context imports a known value of its tangent context into its primal context, which then owns
+        // it, and rejects a value that depends on tangent work.
+        let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
+            Array,
+            ArrayOperation<Array>,
+        >::new()));
+        let primal = context.primal().lift(Array::scalar(3f32).unwrap()).unwrap();
+        let tangent = context.primal_to_tangent(primal).unwrap();
+        let transferred = context.tangent_to_primal(tangent).unwrap();
+        assert_eq!(transferred.value().unwrap().as_known(), Some(&Array::scalar(3f32).unwrap()));
+        assert_eq!(context.primal().import_known(&transferred), Ok(transferred));
+        let unknown = PartialTracer::new(
+            context.tangent().clone(),
+            context.tangent().unknown_input(ArrayType::scalar(DataType::F32), 0),
+        );
+        assert_eq!(
+            context.tangent_to_primal(unknown),
+            Err(DifferentiationError::from(ProgramError::MalformedProgram(
+                "cannot import an unknown value from another partial-evaluation context".to_string(),
+            ))),
+        );
+    }
+
+    #[test]
     fn test_differentiation_context_dual_primal_to_tangent() {
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
             Array,
@@ -5462,7 +5606,8 @@ pub(crate) mod tests {
             Ok(vec![Array::vector(vec![0f32; 3]).unwrap()]),
         );
 
-        // Partitioned differentiation transfers a known primal before constructing its tangent zero.
+        // Partitioned differentiation stages the zero in the tangent program, so every pushforward application
+        // constructs it instead of reading a zero that linearization computed and stored as a residual.
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
             Array,
             ArrayOperation<Array>,
@@ -5470,9 +5615,20 @@ pub(crate) mod tests {
         let primal = context.primal().lift(Array::scalar(2f32).unwrap()).unwrap();
         let zero = context
             .materialize_dual_tangent(&DifferentiationDual::new_with_zero_tangent(primal).unwrap())
-            .unwrap();
-        assert!(matches!(context.tangent().resolve(&zero), ValueResolution::Constant(value)
-            if value == Array::scalar(0f32).unwrap()));
+            .unwrap()
+            .value()
+            .unwrap()
+            .clone();
+        let tangent = context.tangent().clone();
+        drop(context);
+        let evaluation = tangent.into_evaluation(vec![zero]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = zero [type=f32[]]
+                in (%0)"},
+        );
     }
 
     #[test]
@@ -7098,7 +7254,7 @@ pub(crate) mod tests {
             .trim_end(),
         );
 
-        // The two halves agree with the fused forward-mode program at the same point.
+        // The two halves agree with the fused forward mode program at the same point.
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
             ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
@@ -7971,7 +8127,7 @@ pub(crate) mod tests {
         );
         assert_eq!(tangent_reference.read(), Ok(Array::scalar(2.5_f32).unwrap()));
 
-        // The fused forward-mode evaluation at the same point agrees on the primal output and on the final state of the
+        // The fused forward mode evaluation at the same point agrees on the primal output and on the final state of the
         // primal reference, and pushes the tangent through the tangent reference directly: `ṫ = ṟ + ẋ = 0.5 + 2`.
         let reference = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         let tangent_reference = ArrayReference::new(Array::scalar(0.5_f32).unwrap());

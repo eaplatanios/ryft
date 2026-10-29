@@ -12,7 +12,7 @@
 //!     Input shapes broadcast and branch element types promote, so a scalar mask can select a whole array or a shaped
 //!     mask can select individual elements. This does not defer either input's computation.
 //!   - **Predicate-Controlled Loops:** [`WhileOperation`] repeatedly tests its condition region and applies its body
-//!     to loop-carried state while the predicate is true. The `r#while` function of [`While`] traces a condition and
+//!     to loop-carried state while the predicate is `true`. The `r#while` function of [`While`] traces a condition and
 //!     a body over structured state in an explicit context; [`r#while()`](fn@while) recovers the context from state
 //!     values. A batched predicate masks the state updates per item, which predicate values implement through
 //!     [`WhilePredicate`]. An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the
@@ -32,9 +32,9 @@
 //! care under batching. A concrete predicate known during partial evaluation instead specializes the condition to its
 //! selected branch.
 //!
-//! XLA lowers conditional execution to [StableHLO `if`](https://openxla.org/stablehlo/spec#if), and both loop forms to
-//! [StableHLO `while`](https://openxla.org/stablehlo/spec#while). Individual operation types document their boundary,
-//! effect and transformation constraints.
+//! The XLA backend lowers conditional execution to [StableHLO `if`](https://openxla.org/stablehlo/spec#if), and both
+//! loop forms to [StableHLO `while`](https://openxla.org/stablehlo/spec#while). Individual operation types document
+//! their boundary, effect and transformation constraints.
 //!
 //! # Examples
 //!
@@ -85,9 +85,6 @@ use crate::programs::{
     Operation, ProgramError, ReferenceId, ReferenceRoot, RegionRef, Type, TypeError, TypeIdentityPosition,
     TypeRefinements, Value,
 };
-
-// TODO(eaplatanios): Review this module since it is mostly vibe coded and also add a module docstring that follows
-//  our established conventions.
 
 pub mod condition;
 pub mod scan;
