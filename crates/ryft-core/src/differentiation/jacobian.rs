@@ -249,10 +249,11 @@ where
 
     // Evaluate and linearize the differentiated output once. `linearize` returns only the differentiated output,
     // so capture the auxiliary primals while its closure runs and move them back out after constructing the Jacobian.
-    // Output types are validated inside the closure, before the forward Jacobian materializes a structural-zero output
+    // Output types are validated inside the closure, before the forward Jacobian materializes a structural zero output
     // tangent in a nonzero dynamic array differential space, so a non-finite coordinate space retains the precise
-    // Jacobian diagnostic. Validate here because a dynamic structural zero still cannot be materialized by a nullary
-    // type-only constructor. A future input-relative zero operation may make this early validation redundant.
+    // Jacobian diagnostic. Validate here because a nullary constructor, which sees only the type, still cannot
+    // materialize a dynamic structural zero. A future input-relative zero operation may make this early validation
+    // redundant.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
         |input, capture| {
@@ -352,7 +353,7 @@ where
     // Replay all basis tangents together. Each packed output now contains the derivative of one output parameter
     // with respect to every flattened input coordinate. An output parameter without a tangent slot has a structural
     // zero tangent, so its packed derivative is a zero shared across every direction. Dense coordinate spaces were
-    // validated above, so a type-only zero is sufficient.
+    // validated above, so a zero constructed from the type alone is sufficient.
     let packed_outputs =
         C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
     check_count!("output", tangent_output_slots, output_types.parameter_count(), ProgramError);
@@ -523,7 +524,7 @@ where
     // primal residuals. Verify that the derived program exposes that input contract before constructing the packed
     // cotangents. The reverse Jacobian materializes returned cotangents only, so it takes the reference-free,
     // all-`Return` transposition of the retained linear program. An output parameter without a tangent slot has a
-    // structural-zero tangent and seeds nothing, so its coordinates receive no contribution and its rows of the
+    // structural zero tangent and seeds nothing, so its coordinates receive no contribution and its rows of the
     // Jacobian are zero.
     let tangent_output_slots = pullback.tangent_output_slots().to_vec();
     let (transposed, residuals) = pullback.into_transposed_parts()?;

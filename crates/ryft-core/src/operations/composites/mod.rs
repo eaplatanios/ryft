@@ -531,6 +531,7 @@ mod tests {
             &self,
             _region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
             _input_indices: &[usize],
+            _instantiated_outputs: Option<&[bool]>,
         ) -> Result<Linearization<ArrayIrValue<Array>, ArrayIrOperation<Array>>, DifferentiationError> {
             unreachable!("custom derivative rules replay their rule regions instead of linearizing them")
         }

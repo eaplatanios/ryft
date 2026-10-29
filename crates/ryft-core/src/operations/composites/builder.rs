@@ -2541,7 +2541,7 @@ mod tests {
         let linearization = program
             .into_flat_program()
             .entry_region_ref()
-            .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(
             linearization.primal().to_string(),
@@ -2782,7 +2782,7 @@ mod tests {
             program
                 .into_flat_program()
                 .entry_region_ref()
-                .linearize_shared_for_rule(&[1, 2], DifferentiationRule::JvpForTranspose)
+                .linearize_shared_for_rule(&[1, 2], DifferentiationRule::JvpForTranspose, None)
                 .and_then(|linearization| linearization.tangent().transpose_with_respect_to(&[0, 1], &[]))
                 .map(|_| ())
                 .map_err(ProgramError::from),
@@ -3290,7 +3290,7 @@ mod tests {
             .0;
         let linearization = batched
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let pullback = linearization.tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(
@@ -3950,7 +3950,7 @@ mod tests {
         );
         let reverse = batched
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let mut pullback_inputs = vec![ones];
         pullback_inputs
@@ -4806,7 +4806,7 @@ mod tests {
         let reverse = program
             .into_flat_program()
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(
             reverse.tangent().to_string(),

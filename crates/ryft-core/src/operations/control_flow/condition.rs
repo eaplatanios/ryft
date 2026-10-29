@@ -1081,8 +1081,7 @@ where
             let live_input_count = input_indices.len();
             let mut partitions = Vec::with_capacity(2);
             for branch in branches {
-                let linearization =
-                    driver.linearize_program_with_instantiated_outputs(branch, input_indices, &output_activity)?;
+                let linearization = driver.linearize_program(branch, input_indices, Some(&output_activity))?;
                 let branch_tangent_slots = linearization.tangent_output_positions(&output_activity)?;
                 let (primal, tangent, residual_count, _) = linearization.into_parts();
                 partitions.push(PartitionedProgram::from_parts(
@@ -13292,7 +13291,7 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![outputs[1]], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
-        // Neither the projection nor the condition rule reads the severed primal's runtime extent: the condition
+        // Neither the projection nor the condition rule reads the severed primal's runtime extent. The condition
         // receives only the live tangent of `left`, and its output tangent is that tangent alone.
         let jvp = program.jvp().unwrap();
         assert_eq!(

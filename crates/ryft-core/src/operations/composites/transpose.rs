@@ -1852,7 +1852,7 @@ mod tests {
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let reverse = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let squares = Array::vector(vec![1f64, 4f64, 9f64]).unwrap();
         let seeds = Array::vector(vec![1f64, 2f64, 3f64]).unwrap();
@@ -1934,7 +1934,7 @@ mod tests {
         let program = ir_custom_rule_program(&definition, 0, primal.into_flat_program());
         let reverse = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let extent = DimensionValue::constant(3).unwrap();
         let batched = reverse
@@ -2019,7 +2019,7 @@ mod tests {
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let reverse = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert!(matches!(
             reverse.tangent().batched(
@@ -2787,7 +2787,7 @@ mod tests {
         let renderings = |program: &ConvertedProgram| {
             let reverse = program
                 .entry_region_ref()
-                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
                 .unwrap();
             let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
             (reverse.primal().to_string(), reverse.tangent().to_string(), pullback.to_string())

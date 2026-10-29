@@ -20,7 +20,7 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// Dynamic array types carry dimension identities and bounds, rather than defining runtime extents. Constructing
 /// a zero of such a type can therefore require explicit extent inputs. This trait declares those inputs and obtains
 /// them from values in scope. Reference transposition also uses the protocol to retain allocation shapes, including
-/// dimensions hidden by a live view. Forward-mode output tangents retain their own zero reconstruction data. The
+/// dimensions hidden by a live view. Forward mode output tangents retain their own zero reconstruction data. The
 /// associated functions have no receiver because no zero operation exists until the values have been gathered.
 ///
 /// The provider itself need not be an operation. Its emitted family is [`OperationProvider::Operation`], which fixes
@@ -328,9 +328,10 @@ pub(crate) struct ZeroBoundaryLeaf<T: Type> {
 /// output for a value that cannot vary would add IR and ABI overhead without conveying information. When the tangent
 /// of output `i` depends on no input tangent (e.g., the output of `stop_gradient` or of a constant), it is a structural
 /// zero, and a program output for it would only carry a materialized zero and the residuals that size it. A pushforward
-/// must still return a concrete `0ᵢ` for every omitted leaf when it rebuilds its complete user-facing output tangent
-/// boundary. Pullbacks do not use this type: they validate and then drop the cotangent seed of an omitted output and
-/// return input cotangents of zero-space types as structural zeros, which the consumer that owns an extent source
+/// must still return a concrete `0ᵢ` for every omitted leaf when it rebuilds its complete public output tangent
+/// boundary. Pullbacks do not use this type. They validate and then drop the cotangent seed of an omitted output and
+/// return input cotangents whose types are zero differential spaces as structural zeros, which the consumer that owns
+/// an extent source
 /// materializes.
 ///
 /// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the tangent of a primal
@@ -341,13 +342,13 @@ pub(crate) struct ZeroBoundaryLeaf<T: Type> {
 /// omitted leaves. [`Self::rebuild`] replays that plan to materialize each omitted `0ᵢ` and interleave it with the
 /// live output tangents produced by the compact program.
 ///
-/// These are _boundary reconstruction residuals_, not ordinary executable-program residuals. They are retained beside
+/// These are _boundary reconstruction residuals_, not ordinary executable program residuals. They are retained beside
 /// the reusable derivative callable and are consumed only while restoring its public boundary. They never become
 /// otherwise-unused inputs of the derivative program. The wrapper retains the boundary size, the position and type of
 /// every omitted zero, and the range of residuals that reconstructs it. The tangent mapping and primal boundary are
 /// therefore consumed exactly once during capture and cannot be changed later during reconstruction.
 pub(crate) struct ZeroBoundaryReconstruction<V: Value> {
-    /// Residual values supplying runtime dimensions, flattened in zero-leaf and provider-declaration order.
+    /// Residual values supplying runtime dimensions, flattened in zero leaf order and then in provider declaration order.
     residuals: Vec<V>,
 
     /// Number of leaves in the complete public differential boundary.
@@ -431,7 +432,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroBoundaryReconstruction<V> {
     }
 
     /// Rebuilds the complete output tangent boundary described by this instance, interleaving materialized omitted
-    /// zero leaves with the compact tangent program's `live_values`. The boundary size, zero-leaf positions, tangent
+    /// zero leaves with the compact tangent program's `live_values`. The boundary size, zero leaf positions, tangent
     /// types, and residual partitions were fixed and validated by [`Self::capture`]. Reconstruction consequently needs
     /// only the context in which to bind each zero and the live values produced by the compact tangent program.
     ///

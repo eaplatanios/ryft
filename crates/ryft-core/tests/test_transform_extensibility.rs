@@ -131,6 +131,7 @@ fn test_external_tangent_activity_uses_custom_differentiation_driver() {
             &self,
             region: RegionRef<'_, Array, ArrayOperation<Array>>,
             input_indices: &[usize],
+            _instantiated_outputs: Option<&[bool]>,
         ) -> Result<Linearization<Array, ArrayOperation<Array>>, DifferentiationError> {
             region.linearize_shared(input_indices)
         }

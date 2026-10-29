@@ -612,9 +612,10 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
     /// including those whose types name runtime extents, so a zero that nothing combines with a live tangent stages
     /// nothing, and linearization can omit it from its tangent program. For example, the projected `complex`, `pad`,
     /// `concatenate`, and `parallel_ragged_all_to_all` rules materialize a structural zero input tangent with the
-    /// type-only `zero` of their projected context once another input tangent is live, and that `zero` cannot name
-    /// runtime extents. For such operations, when any input tangent is live, this function therefore first materializes
-    /// every structural zero input tangent whose type names runtime extents, reading those extents from its primal.
+    /// `zero` that their projected context constructs from the type alone once another input tangent is live, and that
+    /// `zero` cannot name runtime extents. For such operations, when any input tangent is live, this function therefore
+    /// first materializes every structural zero input tangent whose type names runtime extents, reading those extents
+    /// from its primal.
     fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -641,8 +642,8 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
         ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
         ScatterOperation: MemberDifferentiableOperation<C>,
     {
-        // Structural zero input tangents whose types name runtime extents, which the type-only `zero` of a projected
-        // array context cannot construct.
+        // Structural zero input tangents whose types name runtime extents, which a projected array context cannot
+        // construct from the types alone.
         let runtime_extent_zeros = inputs
             .iter()
             .map(|input| {
@@ -1924,10 +1925,10 @@ mod tests {
 
     #[test]
     fn test_array_operation_jvp_in_parent_dynamic_mixed_structural_zero_input() {
-        // `complex(x, stop_gradient(y))` over a dynamic shape. The projected `complex` rule needs a concrete tangent for
-        // each part once either part is live, but its own type-only zero cannot name the runtime extent `n`, so the
-        // structural zero tangent of the stopped part is materialized from its primal before the rule runs. Under
-        // linearization that zero is known and crosses to the tangent program as a residual.
+        // `complex(x, stop_gradient(y))` over a dynamic shape. The projected `complex` rule needs a concrete tangent
+        // for each part once either part is live, but the zero it constructs from the type alone cannot name the
+        // runtime extent `n`, so the structural zero tangent of the stopped part is materialized from its primal before
+        // the rule runs. Under linearization that zero is known and crosses to the tangent program as a residual.
         let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

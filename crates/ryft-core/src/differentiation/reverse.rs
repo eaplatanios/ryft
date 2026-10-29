@@ -1520,10 +1520,10 @@ impl<
     /// with the linearization-point residuals `r` its trailing inputs consume, in that order. The program is the
     /// all-[`Return`](CotangentDestinationKind::Return) transposition served from the linear program's retained
     /// transform cache, so it is valid only for a reference-free boundary and, like
-    /// [`into_linear_parts`](Self::into_linear_parts), it omits zero-space input leaves and the output leaves that
-    /// [`tangent_output_slots`](Self::tangent_output_slots) does not flag from its Single Static Assignment (SSA)
-    /// boundary. Disconnected cotangents also have no executable output; their slots are recorded in the
-    /// returned metadata.
+    /// [`into_linear_parts`](Self::into_linear_parts), it omits input leaves in zero differential spaces and the output
+    /// leaves that [`tangent_output_slots`](Self::tangent_output_slots) does not flag from its Single Static Assignment
+    /// (SSA) boundary. Disconnected cotangents also have no executable output, and the returned metadata records their
+    /// slots.
     ///
     /// # Errors
     ///
@@ -1898,7 +1898,7 @@ impl<
         // spaces contain only zero. Three index spaces meet here: the public output leaves (one seed each), the linear
         // program's outputs (the public leaves that `tangent_output_slots` flags, including reference outputs), and
         // the transposed program's seed inputs (the linear outputs that are neither references nor structural zeros).
-        // The structural zero mask follows the linear program's outputs. Only information-carrying values become
+        // The structural zero mask follows the linear program's outputs. Only values that carry information become
         // program inputs because the compact program has no Single Static Assignment (SSA) input for an output without
         // a tangent slot (e.g., a zero differential space), none for a structural zero seed, and none for a reference
         // output, whose state cotangent is owned by the destination of the input root it forwards.
@@ -9826,8 +9826,8 @@ pub(crate) mod tests {
     #[test]
     fn test_vjp_omits_homogeneous_symbolic_structural_zero_output_tangents() {
         // The homogeneous array universe cannot construct a zero whose type names a runtime extent without inputs. A
-        // pullback and a pushforward program never construct the omitted structural-zero tangent of `stop_gradient(z)`,
-        // so both linearize, but applying the pushforward must still rebuild that zero and fails.
+        // pullback and a pushforward program never construct the omitted structural zero tangent of
+        // `stop_gradient(z)`, so both linearize, but applying the pushforward must still rebuild that zero and fails.
         let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();

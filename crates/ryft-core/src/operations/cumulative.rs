@@ -417,8 +417,7 @@ impl_differentiable_operation! {
 
             // Separate contexts replay the primal first, then transfer its saved residuals into the tangent context.
             // Linearizing through the driver preserves the active differentiation rules and policy.
-            let linearization =
-                driver.linearize_program_with_instantiated_outputs(decomposition.entry_region_ref(), &[0], &[])?;
+            let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[0], Some(&[]))?;
             let mut primal_outputs =
                 linearization.primal().interpret_in_context(context.primal(), vec![primal_input.clone()])?;
             check_count!("output", primal_outputs, 1 + linearization.residual_count(), ProgramError);

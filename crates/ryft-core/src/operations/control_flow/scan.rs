@@ -3311,10 +3311,10 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         let body_input_count = self.input_order.len() - self.activity.input_indices().len();
         let body_output_count = self.activity.output_tangent_liveness().len();
         let live_input_count = self.activity.input_indices().len();
-        let linearization = driver.linearize_program_with_instantiated_outputs(
+        let linearization = driver.linearize_program(
             body,
             self.activity.input_indices(),
-            self.activity.output_tangent_liveness(),
+            Some(self.activity.output_tangent_liveness()),
         )?;
 
         // The structural zeros that the fixed point identified are projected out of the linearized tangent program,
@@ -4500,6 +4500,7 @@ mod tests {
             &self,
             region: RegionRef<'_, C::Constant, C::Operation>,
             input_indices: &[usize],
+            _instantiated_outputs: Option<&[bool]>,
         ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
             region.linearize_shared(input_indices)
         }

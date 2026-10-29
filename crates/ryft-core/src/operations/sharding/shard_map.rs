@@ -3890,7 +3890,7 @@ where
         .enumerate()
         .filter_map(|(index, &active)| active.then_some(index))
         .collect::<Vec<_>>();
-    let linearization = driver.linearize_program_with_instantiated_outputs(body, &input_indices, &[])?;
+    let linearization = driver.linearize_program(body, &input_indices, Some(&[]))?;
     let (primal_program, tangent_program, residual_count, tangent_slots) = linearization.into_parts();
 
     // Linearization validates this partition: the tangent inputs precede the trailing primal residuals. Dependence
@@ -5304,6 +5304,7 @@ mod tests {
             &self,
             _region: RegionRef<'_, TestValue, TestOperation>,
             input_indices: &[usize],
+            _instantiated_outputs: Option<&[bool]>,
         ) -> Result<Linearization<TestValue, TestOperation>, DifferentiationError> {
             Ok(Linearization::new_with_respect_to(
                 self.primal.clone(),
@@ -6055,7 +6056,7 @@ mod tests {
     fn evaluate_pullback(program: &TestProgram, input: TestValue, application_count: usize) -> Vec<Vec<f64>> {
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
         let mut outputs = linearization.primal().interpret(vec![input]).unwrap();
@@ -12912,7 +12913,7 @@ mod tests {
         );
         let reverse = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(reverse.primal().to_string(), linearization.primal().to_string());
         assert_eq!(reverse.tangent().to_string(), linearization.tangent().to_string());
@@ -13456,7 +13457,7 @@ mod tests {
         );
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(
             linearization.pullback().unwrap().program().to_string(),
@@ -13642,7 +13643,7 @@ mod tests {
             let unmapped = body_allocated_reference_program(f32_scalar_type(), None, call);
             let linearization = program
                 .entry_region_ref()
-                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
                 .unwrap();
             assert_eq!(
                 linearization.primal().to_string(),
@@ -13725,7 +13726,7 @@ mod tests {
         let unmapped = body_allocated_reference_program(f32_vector_type(4), None, call);
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
         let global = "f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]";
@@ -13834,7 +13835,7 @@ mod tests {
         );
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
         let global = "f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]";
@@ -14815,7 +14816,7 @@ mod tests {
 
         let linearization = mapped
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let replicated = "f32[3, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}]";
         let varying = "f32[3, 1][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
@@ -14866,7 +14867,7 @@ mod tests {
         let pullback = |program: &TestProgram| {
             let linearization = program
                 .entry_region_ref()
-                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
                 .unwrap();
             let mut outputs = linearization.primal().interpret(vec![input.clone()]).unwrap();
             let residuals = outputs.split_off(1);
@@ -14905,7 +14906,7 @@ mod tests {
         let replicated = "f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]";
         let linearization = mapped
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(
             linearization.pullback().unwrap().program().to_string(),

@@ -62,6 +62,16 @@ code comments. Preserve the documented contract, technical rationale, and links 
   cells across multiple lines instead of leaving oversized single-line blocks.
 - When revising one sentence inside a documentation paragraph, reread and polish the whole paragraph so the final
   wording is coherent as a unit instead of sounding locally patched.
+- Avoid colons and semicolons in comments and documentation strings unless they are genuinely necessary. Split the
+  text into separate sentences or join clauses with words such as "because", "so", "and", or "which" instead (e.g.,
+  write "The outputs must be unknown, because a known tangent would make the map affine." rather than "The outputs must
+  be unknown: a known tangent would make the map affine."). The `# Parameters` bullet format, code, and labels inside
+  tables and diagrams keep their colons.
+- Do not hyphenate word pairs unnecessarily (e.g., write "structural zero tangent", "forward mode", and "zero leaf
+  positions" rather than "structural-zero tangent", "forward-mode", and "zero-leaf positions"). Keep hyphens only where
+  the spelling requires them (e.g., "non-empty") or in established names (e.g., "Jacobian-Vector Product"). When an
+  unhyphenated pair would be ambiguous, rephrase the sentence instead (e.g., "a zero constructed from its type alone"
+  rather than "a type-only zero").
 - When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
   allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
   readability-driven sentence breaks.

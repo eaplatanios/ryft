@@ -1276,7 +1276,7 @@ where
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
-        let linearization = driver.linearize_program_with_instantiated_outputs(callee, &input_indices, &[])?;
+        let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
 
         // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
         // output computed only from inactive inputs) is a structural zero (JAX's `which_nz_out`), so the tangent callee

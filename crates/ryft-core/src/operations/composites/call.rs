@@ -1929,7 +1929,7 @@ where
     // A fused differentiation context stages primal and tangent work in the same context, so the fused JVP program
     // replays there directly. Otherwise, the linearized primal replays in the primal context and its tangent map
     // replays in the tangent context over the residuals. Each path pairs its tangents with the outputs that it gives a
-    // tangent slot: the derivative program's slots follow `output_activity`, and the linearization reports its own.
+    // tangent slot. The derivative program's slots follow `output_activity`, and the linearization reports its own.
     let (outputs, output_tangents): (Vec<_>, Vec<Option<C::Value>>) =
         if std::ptr::eq(context.primal(), context.tangent()) {
             let program = jvp_program;
@@ -1944,7 +1944,7 @@ where
         } else if let Some(call) = call.filter(|_| primal_region.effects() == EffectsSummary::PURE) {
             // The known side computes the outputs with the call itself, and the tangent side stages a pushforward call
             // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is only
-            // valid for a pure primal: the effects of any other primal (e.g., reference updates, or reference reads that
+            // valid for a pure primal, because the effects of any other primal (e.g., reference updates, or reference reads that
             // later effects would change) must run once, when the known side runs, so it is linearized inline instead.
             let pushforward =
                 jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
@@ -1956,10 +1956,9 @@ where
             let output_tangents = context.tangent().bind(operation, vec![pushforward], tangent_inputs.as_slice())?;
             (outputs, distribute(output_tangents, &output_activity)?)
         } else {
-            // A structural-zero output tangent depends on no input tangent, so no live output loses its slot;
-            // the position check rejects a linearization that would silently turn a live tangent into a zero.
-            let linearization =
-                driver.linearize_program_with_instantiated_outputs(primal_region, &input_indices, &[])?;
+            // A structural zero output tangent depends on no input tangent, so no live output loses its slot. The
+            // position check rejects a linearization that would silently turn a live tangent into a zero.
+            let linearization = driver.linearize_program(primal_region, &input_indices, Some(&[]))?;
             linearization.tangent_output_positions(&output_liveness)?;
             let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
             let residuals = outputs.split_off(output_count);
@@ -3621,7 +3620,7 @@ mod tests {
         let reverse = |program: &FlatProgram<ArrayContext>, x: Array, seed: Array| {
             let linearization = program
                 .entry_region_ref()
-                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
                 .unwrap();
             let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
             let mut pullback_inputs = vec![seed];
@@ -3825,7 +3824,7 @@ mod tests {
         assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![input.clone()]));
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
         let mut cotangents = vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())];
@@ -4290,7 +4289,7 @@ mod tests {
         let linearization = evaluation
             .program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let mut outputs = linearization.primal().interpret(vec![Array::scalar(2.0).unwrap()]).unwrap();
         assert_eq!(outputs.remove(0), Array::scalar(2.0f64.sin()).unwrap());
@@ -4704,7 +4703,7 @@ mod tests {
         // Unequal output cotangents verify the actual reduction, not just the presence of a reduce instruction.
         let linearization = batched
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let mut outputs = linearization
             .primal()
@@ -4962,7 +4961,7 @@ mod tests {
         // Reverse mode batches the forward rule, stages a batched carrier, and batches the backward specialization.
         let reverse = batched
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(
             reverse.tangent().to_string(),
@@ -5010,7 +5009,7 @@ mod tests {
         let ones = Array::vector(vec![1f64; 3]).unwrap();
         let reverse = batched
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(
             reverse.primal().to_string(),
@@ -6243,7 +6242,7 @@ mod tests {
         let linearize = |uses_call: bool| {
             let linearization = program(uses_call)
                 .entry_region_ref()
-                .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+                .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose, None)
                 .unwrap();
             let pullback = linearization.tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
             (linearization.tangent().to_string(), pullback)
@@ -6342,7 +6341,7 @@ mod tests {
             .unwrap();
         let pullback = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose, None)
             .unwrap()
             .pullback()
             .unwrap();
@@ -6392,7 +6391,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let linearization = custom
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(linearization.residual_count(), 0);
         let custom_pullback = linearization.tangent().transpose().unwrap();
@@ -6439,7 +6438,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(linearization.residual_count(), 1);
         let residuals = linearization.primal().interpret(vec![Array::scalar(0.7).unwrap()]).unwrap();
@@ -6609,7 +6608,7 @@ mod tests {
         );
         let linearization = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let mut outputs =
             linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]).unwrap();
@@ -7043,7 +7042,7 @@ mod tests {
         let forward = program.linearize().unwrap();
         let reverse = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(counters.counts(), (1, 1, 0));
         assert_eq!(
@@ -7137,7 +7136,7 @@ mod tests {
         // The forward rule is traced while the carrier is staged, which validates that it is pure.
         let reverse = program
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         assert_eq!(counters.counts(), (0, 1, 0));
         assert_eq!(
@@ -7329,7 +7328,7 @@ mod tests {
         let forward = renamed.linearize().unwrap();
         let reverse = renamed
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
@@ -7678,7 +7677,7 @@ mod tests {
         // Reverse mode uses the converted reverse-mode rules.
         let reverse = converted
             .entry_region_ref()
-            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
         let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
         let primals = reverse.primal().interpret(vec![x.clone()]).unwrap();

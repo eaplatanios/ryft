@@ -594,7 +594,7 @@ where
 
         // Differentiate the dependence on residual parameters as well as the map's linear arguments.
         let input_indices = (0..forward.input_ids().len()).collect::<Vec<_>>();
-        let linearization = driver.linearize_program_with_instantiated_outputs(forward, &input_indices, &[])?;
+        let linearization = driver.linearize_program(forward, &input_indices, Some(&[]))?;
         let output_types = forward.output_types();
         let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
         let residuals = outputs.split_off(output_types.len());

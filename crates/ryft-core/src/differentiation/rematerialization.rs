@@ -602,10 +602,10 @@ where
     let (_, program) = TracingContext::<V, O>::trace(function, input_types)?;
     let program = program.into_flat_program();
     let input_indices = (0..program.input_ids().len()).collect::<Vec<_>>();
-    let linearization = program.entry_region_ref().linearize_shared_for_rule_with_instantiated_outputs(
+    let linearization = program.entry_region_ref().linearize_shared_for_rule(
         &input_indices,
         DifferentiationRule::JvpForTranspose,
-        &[],
+        Some(&[]),
     )?;
     let primal = linearization.primal();
     let instruction_by_output = primal.instruction_by_output();
