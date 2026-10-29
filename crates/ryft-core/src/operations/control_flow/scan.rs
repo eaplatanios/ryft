@@ -70,9 +70,9 @@ use crate::operations::collectives::parallel_vary::{
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero};
 use crate::operations::control_flow::{
-    ResidualStorageOperation, canonicalize_carry_axes, passed_through_carries, refine_control_flow_output_types,
-    stabilize_carry_axes, validate_control_flow_output_identity_scope, validate_control_flow_region_input_refinement,
-    validate_reference_carry_roots,
+    ResidualStorageOperation, canonicalize_loop_carry_batch_axes, loop_carry_passthrough_mask,
+    refine_control_flow_output_types, stabilize_loop_carry_batch_axes, validate_control_flow_output_identity_scope,
+    validate_control_flow_region_input_refinement, validate_loop_reference_carry_roots,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::conversions::{CastOperation, CastType};
@@ -1213,7 +1213,7 @@ impl<T: ScanType> ScanOperation<T> {
     /// discharges, or stages the body, so that whether an application is accepted does not depend on the transform that
     /// reaches it. The contract consists of the boundary that [`Operation::infer_output_types`] validates and of the
     /// reference contract that only the body reveals: the body must return every reference carry as its own body input
-    /// (refer to [`validate_reference_carry_roots`]), however the inputs of the application alias.
+    /// (refer to [`validate_loop_reference_carry_roots`]), however the inputs of the application alias.
     ///
     /// The boundary relates every stacked leading extent to the iteration count (refer to [`ScanType`]). Conflicting
     /// static extents are rejected here, while a relationship that the input types leave unproven (e.g., an exact
@@ -1247,7 +1247,7 @@ impl<T: ScanType> ScanOperation<T> {
         let output_types = self.infer_output_types(input_types, &[body.interface()])?;
 
         // The intrinsic index (body input 0) is never a reference, and carry `i` is body input `i + 1`.
-        validate_reference_carry_roots(SCAN_OPERATION_NAME, body, 1..1 + self.carry_count)?;
+        validate_loop_reference_carry_roots(SCAN_OPERATION_NAME, body, 1..1 + self.carry_count)?;
         Ok(output_types)
     }
 
@@ -1263,7 +1263,9 @@ impl<T: ScanType> ScanOperation<T> {
         outputs: &mut [Carry],
     ) {
         let body_input_types = body.input_types();
-        for (index, passes_through) in passed_through_carries(body, 1..1 + self.carry_count).into_iter().enumerate() {
+        for (index, passes_through) in
+            loop_carry_passthrough_mask(body, 1..1 + self.carry_count).into_iter().enumerate()
+        {
             if passes_through && !body_input_types[index + 1].is_reference() {
                 outputs[index] = inputs[index].clone();
             }
@@ -2185,7 +2187,7 @@ where
             // reference carry is loop state that passes through by the validated contract (the body returns it as its
             // own root, possibly through a nested region, so its atom need not be its input atom), whatever the body
             // does to its state.
-            let passes_through = passed_through_carries(body, 1..1 + carry_count);
+            let passes_through = loop_carry_passthrough_mask(body, 1..1 + carry_count);
             let input_linear = inputs[..scan_input_count]
                 .iter()
                 .enumerate()
@@ -3043,7 +3045,7 @@ impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>, P: Bat
 
         // Pack mapped array carries at axis 0 and mapped array stacks behind their leading scan axis. Reference
         // stacks keep the physical axis fixed by their roots, which cannot be moved onto or ahead of the scan axis.
-        let mut carries = canonicalize_carry_axes(self, driver, &scan_inputs[..carry_count])?;
+        let mut carries = canonicalize_loop_carry_batch_axes(self, driver, &scan_inputs[..carry_count])?;
         let stacks = scan_inputs[carry_count..]
             .iter()
             .enumerate()
@@ -3089,14 +3091,20 @@ impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>, P: Bat
             .collect::<Vec<_>>();
 
         let carry_inputs = 1..1 + carry_count;
-        let batched_body =
-            stabilize_carry_axes(SCAN_OPERATION_NAME, self, driver, body, &mut iteration_axes, carry_inputs.clone())?
-                .ok_or_else(|| BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{SCAN_OPERATION_NAME}` batching failed to stabilize the carry batch axes \
+        let batched_body = stabilize_loop_carry_batch_axes(
+            SCAN_OPERATION_NAME,
+            self,
+            driver,
+            body,
+            &mut iteration_axes,
+            carry_inputs.clone(),
+        )?
+        .ok_or_else(|| BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{SCAN_OPERATION_NAME}` batching failed to stabilize the carry batch axes \
                      within {carry_count} widening passes",
-                ),
-            })?;
+            ),
+        })?;
         let (batched_body, mut output_axes) = batched_body.into_parts();
         for (carry, axis) in carries.iter_mut().zip(&iteration_axes[carry_inputs]) {
             if !axis.is_replicated() && P::batch_axis(carry).is_replicated() {

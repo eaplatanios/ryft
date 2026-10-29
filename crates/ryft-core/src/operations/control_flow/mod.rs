@@ -260,6 +260,98 @@ impl<
     }
 }
 
+/// Reference that a root of the reference analysis of a control flow region denotes at the boundary of that region.
+/// Control flow rules compare these sources to validate which reference a region returns (e.g., that a loop body
+/// returns every reference carry as the reference it entered with).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegionReferenceSource {
+    /// Input of the region at this position.
+    Input(usize),
+
+    /// Captured reference that names this capture position.
+    Capture(usize),
+
+    /// Concrete reference allocation embedded as a constant.
+    Constant(ReferenceId),
+
+    /// Reference allocated inside the region.
+    Allocation,
+}
+
+impl RegionReferenceSource {
+    /// Returns the [`RegionReferenceSource`] of every output of `region`, with [`None`] for each output that is not
+    /// a reference, as the reference analysis of `region` with the capture prefix `capture_input_count` reports it
+    /// (refer to [`Operation::region_capture_input_count`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference analysis of `region` fails, or when it reports a root that is an input
+    /// of a nested region or a constant that names neither a capture nor an allocation.
+    pub(crate) fn from_outputs<V: Value, O: Operation<Type = V::Type>>(
+        operation_name: &str,
+        region: RegionRef<'_, V, O>,
+        capture_input_count: Option<usize>,
+    ) -> Result<Vec<Option<Self>>, ProgramError> {
+        let analysis = region.reference_analysis_with_configuration(capture_input_count, true, &[])?;
+        analysis
+            .output_roots()
+            .iter()
+            .map(|root| root.map(|root| Self::from_root(operation_name, region, root)).transpose())
+            .collect()
+    }
+
+    /// Returns the [`RegionReferenceSource`] that `root`, a root of the reference analysis of `region`, denotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `root` is an input of a region other than `region`,
+    /// or a constant root whose atom is not a reference constant that names a capture or an allocation.
+    pub(crate) fn from_root<V: Value, O: Operation<Type = V::Type>>(
+        operation_name: &str,
+        region: RegionRef<'_, V, O>,
+        root: ReferenceRoot,
+    ) -> Result<Self, ProgramError> {
+        match root {
+            ReferenceRoot::RegionInput { region: owner, input_index } if owner == region.id() => {
+                Ok(Self::Input(input_index))
+            }
+            ReferenceRoot::RegionInput { .. } => Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` region reference analysis reports a root that is an input of a nested region at \
+                 the region boundary",
+            ))),
+            ReferenceRoot::Allocation { .. } => Ok(Self::Allocation),
+            ReferenceRoot::Constant { value } => {
+                let owner = region.with_id(value.region())?;
+                match owner.atoms()[value.atom().index()].as_constant() {
+                    Some(constant) => match (constant.capture_index(), constant.reference_id()) {
+                        (Some(index), _) => Ok(Self::Capture(index)),
+                        (None, Some(reference)) => Ok(Self::Constant(reference)),
+                        (None, None) => Err(ProgramError::MalformedProgram(format!(
+                            "`{operation_name}` region reference analysis reports a constant root that names neither \
+                             a capture nor an allocation",
+                        ))),
+                    },
+                    None => Err(ProgramError::MalformedProgram(format!(
+                        "`{operation_name}` region reference analysis reports a constant root whose atom is not a \
+                         constant",
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+impl Display for RegionReferenceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(index) => write!(formatter, "region input {index}"),
+            Self::Capture(index) => write!(formatter, "captured reference {index}"),
+            Self::Constant(_) => formatter.write_str("a reference constant"),
+            Self::Allocation => formatter.write_str("a reference allocated in the region"),
+        }
+    }
+}
+
 /// Validates that instruction input `index` of the control-flow operation named `operation_name`, of type
 /// `input_type`, may feed a region input of type `region_input_type`, i.e., that it refines that type (refer to
 /// [`Type::is_refined_by`]). A reference input refines its region input type by its referent (e.g., a `ref<f32[5]>`
@@ -357,104 +449,6 @@ pub(crate) fn validate_control_flow_output_identity_scope<T: Type>(
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Reference that a root of the reference analysis of a control-flow region (refer to
-/// [`RegionRef::reference_analysis_with_configuration`]) denotes at the boundary of that region. Control-flow rules
-/// compare these sources to validate which reference a region returns (e.g., that a loop body returns every reference
-/// carry as the reference it entered with; refer to [`validate_reference_carry_roots`]).
-///
-/// [`Display`] describes sources relative to the region: input positions count region inputs independently of the
-/// enclosing instruction's input layout.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RegionReferenceSource {
-    /// Input of the region at this position.
-    Input(usize),
-
-    /// Captured reference that names this capture position.
-    Capture(usize),
-
-    /// Concrete reference allocation embedded as a constant.
-    Constant(ReferenceId),
-
-    /// Reference allocated inside the region.
-    Allocation,
-}
-
-impl RegionReferenceSource {
-    /// Returns the [`RegionReferenceSource`] of every output of `region`, with [`None`] for each output that is not a
-    /// reference, as the reference analysis of `region` with the capture prefix `capture_input_count` reports it
-    /// (refer to [`Operation::region_capture_input_count`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the reference analysis of `region` fails, or when it reports a root that is an input of a
-    /// nested region or a constant that names neither a capture nor an allocation.
-    pub(crate) fn of_outputs<V: Value, O: Operation<Type = V::Type>>(
-        operation_name: &str,
-        region: RegionRef<'_, V, O>,
-        capture_input_count: Option<usize>,
-    ) -> Result<Vec<Option<Self>>, ProgramError> {
-        let analysis = region.reference_analysis_with_configuration(capture_input_count, true, &[])?;
-        analysis
-            .output_roots()
-            .iter()
-            .map(|root| root.map(|root| Self::from_root(operation_name, region, root)).transpose())
-            .collect()
-    }
-
-    /// Returns the [`RegionReferenceSource`] that `root`, a root of the reference analysis of `region`, denotes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `root` is an input of a region other than `region`, or a
-    /// constant root whose atom is not a reference constant that names a capture or an allocation.
-    pub(crate) fn from_root<V: Value, O: Operation<Type = V::Type>>(
-        operation_name: &str,
-        region: RegionRef<'_, V, O>,
-        root: ReferenceRoot,
-    ) -> Result<Self, ProgramError> {
-        match root {
-            ReferenceRoot::RegionInput { region: owner, input_index } if owner == region.id() => {
-                Ok(Self::Input(input_index))
-            }
-            ReferenceRoot::RegionInput { .. } => Err(ProgramError::MalformedProgram(format!(
-                "`{operation_name}` region reference analysis reports a root that is an input of a nested region at \
-                 the region boundary",
-            ))),
-            ReferenceRoot::Allocation { .. } => Ok(Self::Allocation),
-            ReferenceRoot::Constant { value } => {
-                let owner = region.with_id(value.region())?;
-                match owner.atoms()[value.atom().index()].as_constant() {
-                    Some(constant) => match (constant.capture_index(), constant.reference_id()) {
-                        (Some(index), _) => Ok(Self::Capture(index)),
-                        (None, Some(reference)) => Ok(Self::Constant(reference)),
-                        (None, None) => Err(ProgramError::MalformedProgram(format!(
-                            "`{operation_name}` region reference analysis reports a constant root that names neither \
-                             a capture nor an allocation",
-                        ))),
-                    },
-                    None => Err(ProgramError::MalformedProgram(format!(
-                        "`{operation_name}` region reference analysis reports a constant root whose atom is not a \
-                         constant",
-                    ))),
-                }
-            }
-        }
-    }
-}
-
-impl Display for RegionReferenceSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Input(index) => write!(formatter, "region input {index}"),
-            Self::Capture(index) => write!(formatter, "captured reference {index}"),
-            Self::Constant(_) => formatter.write_str("a reference constant"),
-            Self::Allocation => formatter.write_str("a reference allocated in the region"),
-        }
-    }
-}
-
 /// Validates that the `body` of the loop operation named `operation_name` returns every reference carry as the
 /// reference that it entered with, i.e., as its own body input: carry `i` enters `body` at input `carry_inputs.start
 /// + i` and leaves it at output `i`. A loop threads the allocation of a reference carry through every iteration and its
@@ -468,8 +462,8 @@ impl Display for RegionReferenceSource {
 /// # Errors
 ///
 /// Returns a [`TypeError`] naming the first carry that leaves the body as a different reference, and the errors of the
-/// reference analysis of `body` otherwise (refer to [`RegionReferenceSource::of_outputs`]).
-pub(crate) fn validate_reference_carry_roots<V: Value, O: Operation<Type = V::Type>>(
+/// reference analysis of `body` otherwise (refer to [`RegionReferenceSource::from_outputs`]).
+pub(crate) fn validate_loop_reference_carry_roots<V: Value, O: Operation<Type = V::Type>>(
     operation_name: &str,
     body: RegionRef<'_, V, O>,
     carry_inputs: Range<usize>,
@@ -478,7 +472,7 @@ pub(crate) fn validate_reference_carry_roots<V: Value, O: Operation<Type = V::Ty
     if !body_input_types[carry_inputs.clone()].iter().any(Type::is_reference) {
         return Ok(());
     }
-    let sources = RegionReferenceSource::of_outputs(operation_name, body, None)?;
+    let sources = RegionReferenceSource::from_outputs(operation_name, body, None)?;
     for (position, input) in carry_inputs.enumerate() {
         let entering = body_input_types[input].is_reference().then_some(RegionReferenceSource::Input(input));
         if sources.get(position).copied().flatten() != entering {
@@ -492,10 +486,42 @@ pub(crate) fn validate_reference_carry_roots<V: Value, O: Operation<Type = V::Ty
     Ok(())
 }
 
-/// Returns whether the body of a loop passes each of its carries through unchanged (i.e., returns the input atom of the
-/// carry as its next value), where carry `i` enters the body at the input position `carry_inputs.start + i` and
+/// Requires a reference carry of a batched loop to leave its body carrying the batch axis it entered with.
+/// A reference's batch axis is fixed by its referent, so the fixed-point iteration over carry axes can neither
+/// widen nor move it, and a body that returns the carry at any other axis is rejected.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the looping operation, used in the rejection diagnostic.
+///   - `index`: Position of the reference carry among the loop's carries.
+///   - `entering`: Batch axis the carry enters the body with.
+///   - `returned`: Batch axis the batched body returns the carry with.
+///
+/// # Errors
+///
+/// Returns [`BatchingError::UnsupportedOperation`] when `returned` differs from `entering`.
+pub(crate) fn validate_loop_reference_carry_batch_axis(
+    operation_name: &str,
+    index: usize,
+    entering: BatchAxis,
+    returned: BatchAxis,
+) -> Result<(), BatchingError> {
+    if entering == returned {
+        return Ok(());
+    }
+    Err(BatchingError::UnsupportedOperation {
+        message: format!(
+            "`{operation_name}` reference carry {index} enters carrying `{entering}` but its body returns it carrying \
+             `{returned}`; a reference carry cannot change its batch axis, so pass the reference as a batched input at \
+             the axis the body produces",
+        ),
+    })
+}
+
+/// Returns whether the body of a loop passes each of its carries through unchanged (i.e., returns the input atom of
+/// the carry as its next value), where carry `i` enters the body at the input position `carry_inputs.start + i` and
 /// leaves it at output position `i`. Such a carry holds its initial value on every iteration.
-pub(crate) fn passed_through_carries<V: Value, O: Operation<Type = V::Type>>(
+pub(crate) fn loop_carry_passthrough_mask<V: Value, O: Operation<Type = V::Type>>(
     body: RegionRef<'_, V, O>,
     carry_inputs: Range<usize>,
 ) -> Vec<bool> {
@@ -506,10 +532,10 @@ pub(crate) fn passed_through_carries<V: Value, O: Operation<Type = V::Type>>(
 }
 
 /// Aligns every mapped carry among the `carries` of a batched loop to batch axis `0`, so that the fixed point over the
-/// carry batch axes (refer to [`stabilize_carry_axes`]) only distinguishes replicated carries from carries batched at
-/// axis `0`. A replicated carry stays replicated, and a reference carry keeps the batch axis that its referent fixes,
-/// because shared storage cannot be moved.
-pub(crate) fn canonicalize_carry_axes<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
+/// carry batch axes (refer to [`stabilize_loop_carry_batch_axes`]) only distinguishes replicated carries from carries
+/// batched at axis `0`. A replicated carry stays replicated, and a reference carry keeps the batch axis that its
+/// referent fixes, because shared storage cannot be moved.
+pub(crate) fn canonicalize_loop_carry_batch_axes<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
     context: &BatchingContext<C, P>,
     driver: &D,
     carries: &[P::Batch],
@@ -534,12 +560,12 @@ pub(crate) fn canonicalize_carry_axes<C: Context, P: BatchingPolicy<C>, D: Batch
 /// [`ProgramBatchingOutputAxesPolicy::AlignEachTo`], whose replicated entries are lower bounds that keep the natural
 /// axes of the other outputs), so the stabilizing pass is already aligned to the loop-invariant carry layout. A
 /// reference carry is never widened: its referent fixes its axis, so its body must return it at that axis (refer to
-/// [`validate_reference_carry_axis`]).
+/// [`validate_loop_reference_carry_batch_axis`]).
 ///
 /// Every pass that does not converge widens at least one carry, so the fixed point converges within one more pass than
 /// there are carries. The returned [`None`] reports a fixed point that did not converge within those passes, which only
 /// a batching rule that reports widening non-monotonically can cause.
-pub(crate) fn stabilize_carry_axes<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
+pub(crate) fn stabilize_loop_carry_batch_axes<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
     operation_name: &str,
     context: &BatchingContext<C, P>,
     driver: &D,
@@ -567,7 +593,7 @@ pub(crate) fn stabilize_carry_axes<C: Context, P: BatchingPolicy<C>, D: Batching
         let mut widened = false;
         for (index, (input, output_axis)) in carry_inputs.clone().zip(candidate.output_axes()).enumerate() {
             if body_input_types[input].is_reference() {
-                validate_reference_carry_axis(operation_name, index, input_axes[input], *output_axis)?;
+                validate_loop_reference_carry_batch_axis(operation_name, index, input_axes[input], *output_axis)?;
             } else if input_axes[input].is_replicated() && !output_axis.is_replicated() {
                 input_axes[input] = BatchAxis::new(0);
                 widened = true;
@@ -580,37 +606,7 @@ pub(crate) fn stabilize_carry_axes<C: Context, P: BatchingPolicy<C>, D: Batching
     Ok(None)
 }
 
-/// Requires a reference carry of a batched loop to leave its body carrying the batch axis it entered with. A
-/// reference's batch axis is fixed by its referent, so the fixed-point iteration over carry axes can neither widen nor
-/// move it, and a body that returns the carry at any other axis is rejected.
-///
-/// # Parameters
-///
-///   - `operation_name`: Name of the looping operation, used in the rejection diagnostic.
-///   - `index`: Position of the reference carry among the loop's carries.
-///   - `entering`: Batch axis the carry enters the body with.
-///   - `returned`: Batch axis the batched body returns the carry with.
-///
-/// # Errors
-///
-/// Returns [`BatchingError::UnsupportedOperation`] when `returned` differs from `entering`.
-pub(crate) fn validate_reference_carry_axis(
-    operation_name: &str,
-    index: usize,
-    entering: BatchAxis,
-    returned: BatchAxis,
-) -> Result<(), BatchingError> {
-    if entering == returned {
-        return Ok(());
-    }
-    Err(BatchingError::UnsupportedOperation {
-        message: format!(
-            "`{operation_name}` reference carry {index} enters carrying `{entering}` but its body returns it carrying \
-             `{returned}`; a reference carry cannot change its batch axis, so pass the reference as a batched input at \
-             the axis the body produces",
-        ),
-    })
-}
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -635,7 +631,7 @@ mod tests {
         RegionRef, TypeError, Value,
     };
 
-    use super::{ResidualStorageOperation, SCAN_OPERATION_NAME, validate_reference_carry_axis};
+    use super::{ResidualStorageOperation, SCAN_OPERATION_NAME, validate_loop_reference_carry_batch_axis};
 
     /// Array IR value, which admits references and first-class dimensions.
     pub(super) type TestIrValue = ArrayIrValue<Array>;
@@ -836,16 +832,24 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_reference_carry_axis() {
+    fn test_validate_loop_reference_carry_batch_axis() {
         // A reference carry that leaves the body at the axis it entered with is accepted whether mapped or replicated,
         // while any change of axis is rejected because the referent fixes the axis.
-        assert_eq!(validate_reference_carry_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(0)), Ok(()));
         assert_eq!(
-            validate_reference_carry_axis(SCAN_OPERATION_NAME, 1, BatchAxis::replicated(), BatchAxis::replicated()),
+            validate_loop_reference_carry_batch_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(0)),
             Ok(()),
         );
         assert_eq!(
-            validate_reference_carry_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(1)),
+            validate_loop_reference_carry_batch_axis(
+                SCAN_OPERATION_NAME,
+                1,
+                BatchAxis::replicated(),
+                BatchAxis::replicated(),
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_loop_reference_carry_batch_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(1)),
             Err(BatchingError::UnsupportedOperation {
                 message:
                     "`scan` reference carry 1 enters carrying `axis 0` but its body returns it carrying `axis 1`; a \
@@ -855,7 +859,12 @@ mod tests {
             }),
         );
         assert_eq!(
-            validate_reference_carry_axis(SCAN_OPERATION_NAME, 0, BatchAxis::replicated(), BatchAxis::new(0)),
+            validate_loop_reference_carry_batch_axis(
+                SCAN_OPERATION_NAME,
+                0,
+                BatchAxis::replicated(),
+                BatchAxis::new(0),
+            ),
             Err(BatchingError::UnsupportedOperation {
                 message:
                     "`scan` reference carry 0 enters carrying `replicated` but its body returns it carrying `axis \
