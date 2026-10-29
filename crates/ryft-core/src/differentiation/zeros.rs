@@ -626,11 +626,11 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[], %2:f8e8m0fnu[k], %5:dimension<length \u{2208} [1, 8)>, %6:f64[k] .
+                lambda %0:f64[], %2:f8e8m0fnu[k], %5:dimension<length ∈ [1, 8)>, %6:f64[k] .
                 let %1:f64[2] = zero [type=f64[2]]
-                    %3:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %2
+                    %3:dimension<k ∈ [1, 8)> = dimension_size [axis=0] %2
                     %4:f32[k] = zero [type=f32[k]] %3
-                    %7:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %6
+                    %7:dimension<k ∈ [1, 8)> = dimension_size [axis=0] %6
                     %8:f64[length, k] = zero [type=f64[length, k]] %5 %7
                 in (%8)
             "}
@@ -648,7 +648,7 @@ mod tests {
             error,
             ProgramError::UnsupportedOperation {
                 message: "cannot materialize a zero of type f64[length, k] because no value in scope supplies the \
-                          runtime extent dimension<length \u{2208} [1, 8)> that its residual 0 names"
+                          runtime extent dimension<length ∈ [1, 8)> that its residual 0 names"
                     .to_string(),
             },
         );

@@ -4351,7 +4351,7 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:dimension<extent \u{2208} [1, 5)> .
+                lambda %0:f64[], %1:dimension<extent ∈ [1, 5)> .
                 let %2:f64[extent] = broadcast [output_axes=[]] %0 %1
                 in (%2)
             "}

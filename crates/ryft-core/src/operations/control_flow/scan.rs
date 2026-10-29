@@ -21892,7 +21892,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[extent] .
-                let %1:dimension<extent \u{2208} [1, 8)> = dimension_size [axis=0] %0
+                let %1:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %0
                     %2:f64[extent] = zero [type=f64[extent]] %1
                     %3:f64[extent], %4:f64[extent] = scan [carry_count=2, iteration_count=2, reverse=true] %0 %2 [
                         body={
@@ -22024,7 +22024,7 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f64[k], %1:dimension<length \u{2208} [0, 8)> .
+                lambda %0:f64[k], %1:dimension<length ∈ [0, 8)> .
                 let %2:f64[k], %3:f64[length, k] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[k] .
