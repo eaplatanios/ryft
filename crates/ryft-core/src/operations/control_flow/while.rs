@@ -1608,11 +1608,14 @@ where
         >,
     for<'t> &'t ArrayType: TryFrom<&'t T>,
     for<'t> <&'t ArrayType as TryFrom<&'t T>>::Error: Into<TypeError>,
-    WhileArrayValue<C>: Value<Type = ArrayType> + Add + Broadcast + DynamicUpdateSlice + Select + Reduce + ParallelVary,
+    ProjectedValue<ArrayType, Tracer<TracingContext<C::Constant, C::Operation>>>:
+        Value<Type = ArrayType> + Add + Broadcast + DynamicUpdateSlice + Select + Reduce + ParallelVary,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
     ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
-        Zero<WhileArrayValue<C>> + One<WhileArrayValue<C>>,
+        Zero<ProjectedValue<ArrayType, Tracer<TracingContext<C::Constant, C::Operation>>>>,
+    ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
+        One<ProjectedValue<ArrayType, Tracer<TracingContext<C::Constant, C::Operation>>>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2105,8 +2108,6 @@ pub fn r#while<
     context.r#while(condition_fn, body_fn, state, options)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: BatchingPolicy<C>>
     BatchingContext<C, P>
 {
@@ -2147,8 +2148,8 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
         //      masks carry updates with a broadcast select. Dimension state rides through the loop as loop-invariant
         //      state that masking never touches (the relaxed `WhileType` contract documents that invariance
         //      requirement), and the rebuilt loop's type contract decides whether reference state may ride under a
-        //      batched predicate. The iteration bound is preserved (batch items share masked iterations, so capping the
-        //      loop matches per-item truncation exactly).
+        //      batched predicate. The iteration bound is preserved (batch items share masked iterations, so capping
+        //      the loop matches per-item truncation exactly).
         //
         // The policy's bookkeeping inputs (refer to `BatchingPolicy::boundary_inputs`) lead the state of the bound
         // loop. The condition consumes them as loop state but returns only its predicate, so their forwarded outputs
@@ -2216,8 +2217,9 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
                 ProgramBatchingOutputAxesPolicy::Natural,
             )?;
         }
-        // The condition batched above used these same state axes, so a predicate that naturally landed on axis 0 keeps
-        // that program instead of being replayed for an alignment that would stage nothing.
+
+        // The condition batched above used these same state axes, so a predicate that naturally landed on axis `0`
+        // keeps that program instead of being replayed for an alignment that would stage nothing.
         let batched_condition = match batch_varying {
             true => self.align_batched_program_outputs(
                 driver,
@@ -2272,20 +2274,16 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
     }
 }
 
-/// Array member of a helper tracer used to stage `while` bookkeeping in the original operation universe.
-type WhileArrayValue<C> =
-    ProjectedValue<ArrayType, Tracer<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>>;
-
 /// Represents a staged forward-mode application of a [`WhileOperation`] whose state enters as the instruction input
-/// duals. The state elements keep their positions across the body boundary, so every state element is a loop carry and
-/// the body's region input mask is the live state mask. A state element starts live when its tangent is live
+/// duals. The state elements keep their positions across the body boundary, so every state element is a loop carry
+/// and the body's region input mask is the live state mask. A state element starts live when its tangent is live
 /// (structural zeros are not), and carry liveness is the monotone fixed point of [`TangentActivity::from_loop_body`],
 /// so inactive elements, such as a pass-through loop limit, keep structural-zero tangents instead of threading
-/// materialized zeros through the loop. [`Self::bind`] stages the regime that the loop's iteration bound and predicate
-/// select.
+/// materialized zeros through the loop. [`Self::bind`] stages the regime that the loop's iteration bound and
+/// predicate select.
 struct WhileJvp<C: Context> {
-    /// [`WhileOperation`] being differentiated, whose iteration bound selects between the bounded and the fused
-    /// regimes.
+    /// [`WhileOperation`] being differentiated, whose iteration bound selects between the bounded
+    /// and the fused regimes.
     operation: WhileOperation<C::Type>,
 
     /// Canonical body [`TangentActivity`] after the carry fixed point, including its live state indices, fused program,
@@ -2296,16 +2294,6 @@ struct WhileJvp<C: Context> {
 
 impl<C: Context<Type: DifferentiableType + WhileType> + Zero<C::Value>> WhileJvp<C>
 where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: OperationProvider<
-            ArrayType,
-            GuardOperation<ArrayType>,
-            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
-        >,
-    ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
-        Zero<WhileArrayValue<C>> + One<WhileArrayValue<C>>,
-    WhileArrayValue<C>: Value<Type = ArrayType> + Add + Broadcast + DynamicUpdateSlice + Select + Reduce + ParallelVary,
     C::Value: Concretizable<bool>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -2314,6 +2302,19 @@ where
         + From<ScanOperation<C::Type>>
         + ResidualStorageOperation<C::Type>
         + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: OperationProvider<
+            ArrayType,
+            GuardOperation<ArrayType>,
+            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
+        >,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
+        Zero<ProjectedValue<ArrayType, Tracer<TracingContext<C::Constant, C::Operation>>>>,
+    ProjectedContext<TracingContext<C::Constant, C::Operation>, ArrayType>:
+        One<ProjectedValue<ArrayType, Tracer<TracingContext<C::Constant, C::Operation>>>>,
+    ProjectedValue<ArrayType, Tracer<TracingContext<C::Constant, C::Operation>>>:
+        Value<Type = ArrayType> + Add + Broadcast + DynamicUpdateSlice + Select + Reduce + ParallelVary,
     for<'t> &'t ArrayType: TryFrom<&'t C::Type>,
     for<'t> <&'t ArrayType as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
 {
@@ -2338,26 +2339,27 @@ where
         Ok(Self { operation: *operation, activity })
     }
 
-    /// Stages the forward-mode application of this loop with the condition and body programs `condition` and `body` to
+    /// Stages the forward mode application of this loop with the condition and body programs `condition` and `body` to
     /// the input duals `inputs`, and returns the output duals. This rule serves staging contexts, and eager contexts
-    /// whose loop predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate, which has no
-    /// single continuation decision). The loop selects one of four regimes:
+    /// whose loop predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate, which has
+    /// no single continuation decision). The loop selects one of four regimes:
     ///
     ///   - A loop with no live state tangent after the carry fixed point is bound as it is, with structural-zero
     ///     tangents, because no residual stack, mask, or doubled tangent state would ever be read.
     ///   - A loop without a semantic [`iteration_bound`](WhileOperation::with_iteration_bound) has no statically shaped
     ///     residual stack, so it stages one fused loop over `[primal_state..., tangent_state...]` whose continuation
-    ///     decision reads the primal half (refer to [`Self::bind_fused`]). That loop is forward-total but not
-    ///     transposable. Reverse mode through a staged unbounded loop reports the transposition error, as JAX's
-    ///     `lax.while_loop` does.
+    ///     decision reads the primal half (refer to [`Self::bind_fused`]). This loop supports forward mode
+    ///     differentiation without an iteration bound, but it cannot be transposed for reverse-mode differentiation.
+    ///     Reverse mode through a staged unbounded loop reports the transposition error, as JAX's `jax.lax.while_loop`
+    ///     does.
     ///   - A bounded loop with a batched (per-item) predicate is first rewritten into its scalar-predicate masked form
     ///     over the same state, whose forward mode is this same rule.
-    ///   - A bounded loop with a scalar predicate stages the reverse-capable hybrid of an augmented primal `while` that
-    ///     stores every per-iteration residual and a validity mask in `[bound, …]` stacks, and one masked tangent
-    ///     `scan` of length `bound` (refer to [`Self::bind_bounded`]). The residuals and the mask are plain primal
-    ///     input edges. They leave the augmented primal `while` as ordinary stacked outputs and re-enter the tangent
-    ///     scan as ordinary stacked inputs, so the enclosing partial-evaluation split discovers the residual input
-    ///     edges structurally, as it does for the scan and condition rules.
+    ///   - A bounded loop with a scalar predicate stages the reverse-capable hybrid of an augmented primal `while`
+    ///     that stores every per-iteration residual and a validity mask in `[bound, ...]` stacks, and one masked
+    ///     tangent `scan` of length `bound` (refer to [`Self::bind_bounded`]). The residuals and the mask are plain
+    ///     primal input edges. They leave the augmented primal `while` as ordinary stacked outputs and re-enter the
+    ///     tangent scan as ordinary stacked inputs, so the enclosing partial evaluation split discovers the residual
+    ///     input edges structurally, as it does for the scan and condition rules.
     fn bind<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         self,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -2389,8 +2391,8 @@ where
             return self.bind_fused(condition, context, driver, inputs);
         };
 
-        // A batched (per-item) predicate cannot thread the bounded rule's augmented differentiation state through the
-        // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
+        // A batched (i.e., per-item) predicate cannot thread the bounded rule's augmented differentiation state through
+        // the predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
         // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked form over the same state
         // and differentiated recursively, since the masked loop's forward mode is this same rule. The masked condition
         // reduces the predicate of the state it receives and the masked body recomputes that predicate to select its
@@ -2399,26 +2401,26 @@ where
         // the last one that the bound admits, where no other path (interpretation, which stops at the bound before
         // evaluating the condition, or the lowering) evaluates the condition.
         if condition.output_types()[0].is_batched_while_predicate() {
-            // Rewrite the condition and body of a while loop with a batched (per-item) predicate into its
+            // Rewrite the condition and body of a while loop with a batched (i.e., per-item) predicate into its
             // scalar-predicate _masked form_ over the same state, as JAX's `_while_loop_batching_rule` does. The masked
             // condition evaluates the original condition on the state and reduces the per-item predicate with a Boolean
             // `any` over every predicate axis, and the masked body evaluates the original condition on the same state
             // again, replays the original body for candidate updates, and selects per array state element between the
             // candidate and the carried state under the (broadcast) predicate. A first-class dimension carry is
             // loop-invariant under a batched predicate, so it carries no selection and its candidate is forwarded
-            // directly (refer to the documentation of [`WhileType`]).
+            // directly (refer to the documentation of `WhileType`).
             //
             // The masked form evaluates the condition on exactly the states that the source loop evaluates it on. The
             // masked condition runs on the entry state and on the state after every body application that the iteration
             // bound admits, and the masked body re-evaluates it only on the state that the masked condition has just
-            // accepted. Interpretation likewise stops at the bound before evaluating the condition, and the XLA
+            // accepted. Interpretation likewise stops at the bound before evaluating the condition, and the XLA backend
             // lowering threads the predicate so that reaching the bound skips the condition, so a condition that
             // errors, diverges, or differs on the state after the last admitted body application behaves alike on every
-            // path. Both regions are pure under a batched predicate (refer to [`WhileOperation::validate_interfaces`]),
+            // path. Both regions are pure under a batched predicate (refer to `WhileOperation::validate_interfaces`),
             // so the repeated evaluation is unobservable. The bounded while forward-mode rule uses this form for
             // batched-predicate loops, whose counter- and stack-augmented differentiation state is not
-            // predicate-prefixed and therefore needs the loop's masking made explicit as program data hanging off a
-            // scalar predicate.
+            // predicate-prefixed and therefore needs the loop's masking made explicit as program data
+            // hanging off a scalar predicate.
             let state_types = body.input_types();
             let state_count = state_types.len();
             let mask_axes = (0..condition.output_types()[0].as_array_type()?.rank()).collect::<Vec<_>>();
@@ -2428,8 +2430,7 @@ where
                 |trace_context, state: Vec<Tracer<TracingContext<C::Constant, C::Operation>>>| {
                     let predicate = condition.interpret_in_context(trace_context, state)?;
                     check_count!("output", predicate, 1, ProgramError);
-                    let predicate: WhileArrayValue<C> =
-                        ValueProjection::<ArrayType>::into_projected(predicate[0].clone())?;
+                    let predicate = ValueProjection::<ArrayType>::into_projected(predicate[0].clone())?;
                     let predicate = predicate.reduce_any(&mask_axes)?;
                     Ok(vec![<Tracer<_> as ValueProjection<ArrayType>>::from_projected(predicate)])
                 },
@@ -2460,8 +2461,7 @@ where
                         // element that it selects through staged transitions. It then broadcasts to the state element's
                         // shape with its own sharding extended over the trailing axes, so that the selection is per
                         // predicate item. A state element already shaped like the mask reuses it directly.
-                        let array_mask: WhileArrayValue<C> =
-                            ValueProjection::<ArrayType>::into_projected(mask.clone())?;
+                        let array_mask = ValueProjection::<ArrayType>::into_projected(mask.clone())?;
                         let varied_mask = vary_while_index_or_mask(array_mask, state_array_type)?;
                         let varied_mask_type = varied_mask.r#type().as_array_type()?.clone();
                         let element_mask_sharding = varied_mask_type
@@ -2477,10 +2477,8 @@ where
                         } else {
                             varied_mask.broadcast(element_mask_type, &mask_axes)?
                         };
-                        let candidate: WhileArrayValue<C> =
-                            ValueProjection::<ArrayType>::into_projected(candidate.clone())?;
-                        let carried: WhileArrayValue<C> =
-                            ValueProjection::<ArrayType>::into_projected(carried.clone())?;
+                        let candidate = ValueProjection::<ArrayType>::into_projected(candidate.clone())?;
+                        let carried = ValueProjection::<ArrayType>::into_projected(carried.clone())?;
                         let selected = Select::select(&element_mask, &candidate, &carried)?;
                         next_state.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(selected));
                     }
@@ -2493,8 +2491,9 @@ where
                 state_types.clone(),
                 Vec::new(),
             )?;
-            // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
-            // requested through the instruction-scoped driver over them.
+
+            // The masked loop's condition and body are freshly built region programs, so the recursive `jvp`
+            // is requested through the instruction-scoped driver over them.
             let masked_while = C::Operation::from(self.operation);
             let outputs =
                 driver.bind_jvp_operation(context, &masked_while, vec![masked_condition, masked_body], inputs)?;
@@ -2505,10 +2504,10 @@ where
         self.bind_bounded(condition, context, driver, inputs, bound)
     }
 
-    /// Stages the reverse-capable forward-mode rule of a bounded loop with a scalar predicate and at least one live
+    /// Stages the reverse-capable forward mode rule of a bounded loop with a scalar predicate and at least one live
     /// state tangent, given its condition program `condition`, its input duals `inputs`, and its iteration bound
-    /// `bound`, and returns the output duals. It stages an augmented primal `while` and one masked tangent `scan` of
-    /// length `bound`.
+    /// `bound`, and returns the output duals. It stages an augmented primal `while` and one masked tangent `scan`
+    /// of length `bound`.
     ///
     /// For a bound `B`, the rule linearizes the body through its instruction-scoped driver, giving a primal body
     /// `[state] -> [next_state, residuals...]` and a tangent body `[state_tangent, residuals...] ->
@@ -2516,16 +2515,16 @@ where
     ///
     ///   1. Builds the augmented primal `while` over the state `[original_state..., counter (i64 scalar),
     ///      residual_stacks (one zero-initialized [B, ...] stack per residual), mask_stack (a false-initialized Boolean
-    ///      [B] stack)]` from the residual-extended primal body, keeping
-    ///      `iteration_bound = B` so the per-iteration writes can never clamp, and stages it over the input primals
-    ///      followed by the staged counter and stack zeros. Its outputs split into the original state outputs (the
-    ///      primal outputs), the dropped counter, the stacked residual outputs, and the mask stack.
+    ///      [B] stack)]` from the residual-extended primal body, keeping `iteration_bound = B` so the per-iteration
+    ///      writes can never clamp, and stages it over the input primals followed by the staged counter and stack
+    ///      zeros. Its outputs split into the original state outputs (the primal outputs), the dropped counter,
+    ///      the stacked residual outputs, and the mask stack.
     ///   2. Stages a length-`B` tangent [`ScanOperation`] over the live tangent carries, residual storage stacks, and
     ///      one Boolean validity stack. Each iteration reads one scalar validity item and conditionally evaluates the
     ///      pushforward or forwards the carried tangent unchanged. Dimension residuals that vary across iterations
     ///      cross the scan boundary through checked scalar-array gateways. Forwarded invariant dimensions are threaded
-    ///      directly as known carries. The condition guards both derivative arithmetic and gateway restoration, so
-    ///      placeholder storage after early exit is never evaluated as a residual.
+    ///      directly as known carries. The condition guards both derivative arithmetic and gateway restoration,
+    ///      so placeholder storage after early exit is never evaluated as a residual.
     ///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
     ///
     /// Reverse mode is total with no while-specific transpose code. The staged tangent scan reads its residual and
@@ -2545,7 +2544,7 @@ where
         let state_count = state_types.len();
 
         // Linearize the body once under the converged tangent liveness of the state (state elements keep positional
-        // identity, so the body's region input mask is the live state mask). The nonlinear half returns the next state
+        // identity, so the body's region input mask is the live state mask). The non-linear half returns the next state
         // followed by ordinary residuals, and the linear half consumes the live state tangents followed by those
         // residuals and returns the tangents of the live state elements alone.
         check_count!("input", inputs, state_count, ProgramError);
@@ -2601,8 +2600,8 @@ where
             )?)
         };
 
-        // Run the primal loop over its original state plus a counter, one stack per stored residual, and a validity
-        // mask.
+        // Run the primal loop over its original state plus a counter, one stack per stored residual,
+        // and a validity mask.
         let predicate_type = condition.output_types()[0].as_array_type()?.clone();
         let counter_type: C::Type = bounded_while_scalar_type(DataType::I64, &predicate_type)?.into();
         let boolean_scalar_type: C::Type = bounded_while_scalar_type(DataType::Boolean, &predicate_type)?.into();
@@ -2611,22 +2610,23 @@ where
         let (extended_condition, augmented_body, stack_types) = {
             let primal_body = stacked_primal_program.as_ref();
             let residual_types = stacked_residual_types.as_slice();
-            // Build the augmented condition and body programs of the bounded staged while loop. The body replays the
-            // original body through its tracing context before adding the augmented-state operations, while the
+
+            // Build the augmented condition and body programs of the bounded staged while loop. The body replays
+            // the original body through its tracing context before adding the augmented-state operations, while the
             // condition structurally relocates the original condition into a builder with the extended input boundary.
             //
             // The augmented loop state is `[original_state..., counter (i64 scalar), residual_stacks..., mask_stack]`:
             //
             //   - The body runs the residual-extended primal body (which outputs `[next_state..., residuals...]`) on
             //     the original state slots, then _stores_ instead of returning each per-iteration residual. Residual
-            //     `k` is broadcast to `[1, …]` and written into stack `k` at stack slot `counter` via
-            //     `dynamic_update_slice`. The body also writes a scalar Boolean `one` (true) into the Boolean `[bound]`
-            //     mask stack at stack slot `counter` and advances the counter by an i64 `one`. Because the enclosing
-            //     while keeps `iteration_bound = bound`, the counter is always strictly below `bound` whenever the body
-            //     runs, so the writes can never clamp.
+            //     `k` is broadcast to `[1, ...]` and written into stack `k` at stack slot `counter` via
+            //     `dynamic_update_slice`. The body also writes a scalar Boolean `one` (i.e., `true`) into the Boolean
+            //     `[bound]` mask stack at stack slot `counter` and advances the counter by an `i64` `one`. Because the
+            //     enclosing while keeps `iteration_bound = bound`, the counter is always strictly below `bound`
+            //     whenever the body runs, so the writes can never clamp.
             //   - The condition is the original loop condition extended with ignored extra-state inputs.
             //
-            // Returns the extended condition, the augmented body, and the `[bound, …]` residual stack types.
+            // Returns the extended condition, the augmented body, and the `[bound, ...]` residual stack types.
             let storage_types =
                 residual_types.iter().map(C::Operation::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
             let predicate_axes =
@@ -2690,31 +2690,32 @@ where
                             "bounded `{WHILE_OPERATION_NAME}` body adapter is missing the mask input",
                         ))
                     })?;
-                    let counter_input: WhileArrayValue<C> =
-                        ValueProjection::<ArrayType>::into_projected(counter_input)?;
-                    let mask_input: WhileArrayValue<C> = ValueProjection::<ArrayType>::into_projected(mask_input)?;
+                    let counter_input = ValueProjection::<ArrayType>::into_projected(counter_input)?;
+                    let mask_input = ValueProjection::<ArrayType>::into_projected(mask_input)?;
                     let mut body_outputs =
                         primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
                     let residual_outputs = body_outputs.split_off(state_count);
                     check_count!("output", residual_outputs, residual_types.len(), ProgramError);
+
                     // Integer indices carry no tangent, but `dynamic_update_slice` requires them to vary over the same
                     // manual mesh axes as the stack that they index. Invariant stacks use the counter and one shared
                     // zero index. For each distinct stack variation, the counter, which is loop state, takes that
-                    // variation through staged transitions, while the zero index is a non-differentiable constant and
-                    // is therefore created directly with the variation of that varied counter.
-                    let manual_variation = |storage_type: &ArrayType| {
-                        storage_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default()
-                    };
+                    // variation through staged transitions, while the zero index is a non-differentiable constant
+                    // and is therefore created directly with the variation of that varied counter.
                     let zero_index = if storage_types.iter().any(|storage_type| {
                         storage_type.as_array_type().is_ok_and(|storage_type| {
-                            storage_type.rank() > 0 && manual_variation(storage_type).is_empty()
+                            storage_type.rank() > 0
+                                && storage_type
+                                    .sharding()
+                                    .is_none_or(|sharding| sharding.varying_manual_axes().is_empty())
                         })
                     }) {
                         Some(array_context.zero(counter_type.as_array_type()?)?)
                     } else {
                         None
                     };
-                    let mut varying_indices = Vec::<(BTreeSet<String>, WhileArrayValue<C>, Option<_>)>::new();
+
+                    let mut varying_indices = Vec::new();
                     let mut next_stacks = Vec::with_capacity(stack_types.len());
                     for (((residual_output, residual_type), storage_type), stack_input) in
                         residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
@@ -2731,14 +2732,17 @@ where
                         let storage_array_type = storage_type.as_array_type()?;
                         let batch_item_type = storage_array_type.with_inserted_dimension(0, 1.into()).unwrap();
                         let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
-                        let storage_output: WhileArrayValue<C> =
-                            ValueProjection::<ArrayType>::into_projected(storage_output)?;
+                        let storage_output = ValueProjection::<ArrayType>::into_projected(storage_output)?;
                         let expanded = storage_output.broadcast(batch_item_type, &output_axes)?;
-                        let variation = manual_variation(storage_array_type);
+                        let variation = storage_array_type
+                            .sharding()
+                            .map(Sharding::varying_manual_axes)
+                            .cloned()
+                            .unwrap_or_default();
                         let (counter_index, zero_index) = if variation.is_empty() {
                             (counter_input.clone(), zero_index.clone())
                         } else {
-                            let position = match varying_indices.iter().position(|(axes, ..)| *axes == variation) {
+                            let position = match varying_indices.iter().position(|(axes, _, _)| *axes == variation) {
                                 Some(position) => position,
                                 None => {
                                     let counter = vary_while_index_or_mask(counter_input.clone(), storage_array_type)?;
@@ -2756,11 +2760,11 @@ where
                         if let Some(zero_index) = zero_index {
                             start_indices.extend((0..storage_array_type.rank()).map(|_| zero_index.clone()));
                         }
-                        let stack_input: WhileArrayValue<C> =
-                            ValueProjection::<ArrayType>::into_projected(stack_input.clone())?;
+                        let stack_input = ValueProjection::<ArrayType>::into_projected(stack_input.clone())?;
                         let next_stack = stack_input.dynamic_update_slice(&expanded, &start_indices)?;
                         next_stacks.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(next_stack));
                     }
+
                     let true_scalar = array_context.one(boolean_scalar_type.as_array_type()?)?;
                     let true_item_type =
                         boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, 1.into()).unwrap();
@@ -2801,6 +2805,7 @@ where
             )?;
             (extended_condition, body, stack_types)
         };
+
         let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         for zero_state_type in
             std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
@@ -2817,9 +2822,7 @@ where
         let residual_stacks = while_outputs.split_off(state_count + 1);
         while_outputs.truncate(state_count);
         let primal_outputs = while_outputs;
-
         let tangent_state_count = input_indices.len();
-
         check_count!("input", tangent_program.input_ids(), tangent_state_count + residual_count, ProgramError);
         check_count!("output", tangent_program.output_ids(), tangent_state_count, ProgramError);
         let storage_types = stacked_residual_types
@@ -2839,6 +2842,7 @@ where
             .chain(tangent_input_types[..tangent_state_count].iter().cloned())
             .chain(storage_types.iter().cloned())
             .collect::<Vec<_>>();
+
         // Conditional transposition requires linear tangent inputs before known residuals. The surrounding scan keeps
         // invariant residual carries first, so its branch boundary reorders only the inputs consumed by the condition.
         let branch_input_types = tangent_input_types[..tangent_state_count]
@@ -2867,7 +2871,8 @@ where
                     let (storage_input, storage_type) = storage_inputs.next().unwrap();
                     if storage_input.r#type().as_ref() != storage_type {
                         return Err(TypeError::invalid(format!(
-                            "bounded `{WHILE_OPERATION_NAME}` residual stack item has type `{}` but expected `{}`",
+                            "bounded `{}` residual stack item has type `{}` but expected `{}`",
+                            WHILE_OPERATION_NAME,
                             storage_input.r#type().as_ref(),
                             storage_type,
                         ))
@@ -2897,6 +2902,7 @@ where
             branch_input_types.clone(),
         )?
         .1;
+
         let mut scan_body_input_types: Vec<C::Type> = vec![ArrayType::scalar(DataType::I64).into()];
         scan_body_input_types.extend(iteration_input_types.iter().cloned());
         scan_body_input_types.push(boolean_scalar_type);
@@ -2941,16 +2947,17 @@ where
             .1
         };
 
-        // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks, and
-        // one scalar validity stack.
+        // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks,
+        // and one scalar validity stack.
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let mut tangent_scan_inputs = invariant_residual_sources
             .iter()
             .flatten()
             .map(|&state_index| tangent_inputs[state_index].primal().clone())
             .collect::<Vec<_>>();
-        // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits, because
-        // the tangent type derivation preserves shapes exactly.
+
+        // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits,
+        // because the tangent type derivation preserves shapes exactly.
         for &index in input_indices {
             tangent_scan_inputs.push(context.materialize_dual_tangent(&inputs[index])?);
         }
@@ -2968,11 +2975,11 @@ where
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 
-    /// Stages __one fused__ doubled-state forward-mode `while` for the condition program `condition` and the input
-    /// duals `inputs`, and returns the output duals. Like [JAX's `jvp` of
-    /// `lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), the fused loop runs the
-    /// pushforward alongside the primal loop instead of storing per-iteration residuals. The fused state is
-    /// `[primal_state..., tangent_state...]`. The body is the loop body's fused forward-mode program (built through the
+    /// Stages one fused doubled-state forward-mode `while` for the condition program
+    /// `condition` and the input duals `inputs`, and returns the output duals. Like [JAX's `jvp` of
+    /// `jax.lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), the fused loop
+    /// runs the pushforward alongside the primal loop instead of storing per-iteration residuals. The fused state is
+    /// `[primal_state..., tangent_state...]`. The body is the loop body's fused forward mode program (built through the
     /// instruction-scoped driver) and the condition is the original condition extended with ignored tangent-state
     /// inputs, so the continuation decision reads the primal state alone and the fused loop runs exactly as long as the
     /// primal loop. The fused state is compact because state elements whose tangent type is a zero differential space
@@ -2991,19 +2998,20 @@ where
         let state_count = inputs.len();
 
         // Build the fused body over the compact state `[primal_state..., live(tangent_state)...]` through the
-        // instruction-scoped driver (region 1 is the loop body). The fused body carries a tangent exactly for the state
-        // elements whose tangent is live after the carry fixed point (refer to `WhileJvp::new`), so inactive elements,
-        // such as a pass-through loop limit, keep structural-zero tangents instead of threading materialized zeros
-        // through the loop.
+        // instruction-scoped driver (region `1` is the loop body). The fused body carries a tangent exactly for the
+        // state elements whose tangent is live after the carry fixed point (refer to `WhileJvp::new`), so inactive
+        // elements, such as a pass-through loop limit, keep structural-zero tangents instead of threading materialized
+        // zeros through the loop.
         let body = driver.region(1)?;
         check_count!("input", inputs, body.input_types().len(), ProgramError);
         let activity = &self.activity;
         let live_tangent_slots = activity.live_tangent_slots(activity.output_tangent_liveness());
         let tangent_state_count = activity.input_indices().len();
         let fused_state_count = state_count + tangent_state_count;
+
         // The body is differentiated through its region's retained transform cache, so a body shared by several
-        // programs is differentiated once and repeated attachments of the result intern by `Arc` identity. Its tangent
-        // outputs are projected to the live state elements only when some state element is inactive.
+        // programs is differentiated once and repeated attachments of the result intern by `Arc` identity. Its
+        // tangent outputs are projected to the live state elements only when some state element is inactive.
         let fused_body = activity.jvp_program().clone();
         let fused_outputs = (0..state_count)
             .chain(live_tangent_slots.iter().map(|&slot| state_count + slot))
@@ -3119,9 +3127,9 @@ impl<C: Context> PartialEvaluationContext<C> {
 /// Validates that `predicate` is a Boolean [`while`](WhileOperation) predicate for array state of types `state_types`.
 /// A scalar predicate is always valid, and a batched predicate's shape must be a prefix of every array state shape, so
 /// that it broadcasts against each state element along its leading axes.
-fn validate_while_predicate_type_and_shape<'t>(
+fn validate_while_predicate_type_and_shape<'t, S: IntoIterator<Item = &'t ArrayType>>(
     predicate: &ArrayType,
-    state_types: impl IntoIterator<Item = &'t ArrayType>,
+    state_types: S,
 ) -> Result<(), TypeError> {
     if !predicate.data_type().is_boolean() {
         return Err(TypeError::invalid(format!(
@@ -3132,8 +3140,8 @@ fn validate_while_predicate_type_and_shape<'t>(
     for state_type in state_types {
         if !state_type.shape().dimensions().starts_with(predicate_dimensions) {
             return Err(TypeError::invalid(format!(
-                "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
-                 predicate `{predicate}` is not a prefix of state `{state_type}`",
+                "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, \
+                 but predicate `{predicate}` is not a prefix of state `{state_type}`",
             )));
         }
     }
@@ -3143,15 +3151,15 @@ fn validate_while_predicate_type_and_shape<'t>(
 /// Validates that every array state element of a [`while`](WhileOperation) loop varies over each manual mesh axis that
 /// its `predicate` varies over. Devices whose predicates differ run different numbers of iterations, so any state that
 /// the body may change can differ across those devices, and its type must say so. JAX does not enforce this, which
-/// leaves such state typed as identical across devices. A first-class dimension carries no manual variation and is not
-/// checked.
+/// leaves such state typed as identical across devices. A first-class dimension carries no manual variation and is
+/// not checked.
 ///
 /// # Errors
 ///
 /// Returns a [`TypeError`] naming the first state type that lacks one of the predicate's varying manual axes.
-fn validate_while_state_manual_variation<'t>(
+fn validate_while_state_manual_variation<'t, S: IntoIterator<Item = &'t ArrayType>>(
     predicate: &ArrayType,
-    state_types: impl IntoIterator<Item = &'t ArrayType>,
+    state_types: S,
 ) -> Result<(), TypeError> {
     if !predicate.is_varying() {
         return Ok(());
@@ -3211,6 +3219,8 @@ fn bounded_while_scalar_type(data_type: DataType, predicate_type: &ArrayType) ->
         .map_err(|error| TypeError::invalid(error.to_string()))?;
     scalar_type.with_sharding(scalar_sharding).map_err(|error| TypeError::invalid(error.to_string()))
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
