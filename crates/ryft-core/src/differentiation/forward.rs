@@ -11,7 +11,7 @@ use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, Stag
 use crate::differentiation::reverse::{TransposableOperation, TransposedProgram};
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
-    ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, capture_and_validate_zero_residual_values,
+    ResidualZeroProvider, ZeroBoundaryReconstruction, capture_and_validate_zero_residual_values,
 };
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::macros::check_count;
@@ -192,16 +192,18 @@ fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type
 ///     `cos(x)` when `f` is `sin`), and
 ///   - the [`tangent`](Self::tangent) sub-program `(live(ẋ), r) ↦ live(ẏ)`, computing
 ///     `ẏ = (∂f/∂x)(x) · ẋ`. Here `live(ẋ)` contains one SSA input for each primal input whose tangent type is not a
-///     zero differential space, and `live(ẏ)` similarly contains one Single Static Assignment (SSA) output for each
-///     primal output whose tangent type is not a zero differential space. A tangent in a zero differential space can
-///     only be zero, so it requires no SSA slot; the corresponding primal value remains in the primal program, and
-///     structured callable APIs reconstruct the uniquely determined typed zero where their public result structure
-///     requires it. The tangent program is linear in `ẋ`, with the linearization point `x` entering only through the
-///     residuals `r`.
+///     zero differential space, and `live(ẏ)` contains one Single Static Assignment (SSA) output for each primal output
+///     flagged in [`tangent_output_slots`](Self::tangent_output_slots). A tangent in a zero differential space can only
+///     be zero, so it never has a slot, and a compact linearization (e.g., one requested through
+///     [`DifferentiationDriver::linearize_program_with_instantiated_outputs`]) also omits structural-zero tangents
+///     that depend on no input tangent. The corresponding primal values remain in the primal program, and structured
+///     callable APIs reconstruct the typed zeros where their public result structure requires them. The tangent program
+///     is linear in `ẋ`, with the linearization point `x` entering only through the residuals `r`.
 ///
 /// This is the domain-free, interpretation-free core shared by every linearization entry point. It carries only the
-/// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
-/// callers that interpret [`primal`](Self::primal) under a value semantics of their choice.
+/// two sub-programs, the residual count that relates them, and the primal outputs that have tangent outputs, leaving
+/// the concrete primal outputs to be recovered by callers that interpret [`primal`](Self::primal) under a value
+/// semantics of their choice.
 ///
 /// # Reference Arguments
 ///
@@ -255,13 +257,19 @@ pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. It has one leading Single Static Assignment (SSA) input
     /// for each selected primal input, in selection order and omitting zero differential spaces. [`Self::new`] selects
     /// all inputs in source order. These tangent inputs are followed by the residuals `r`, and one SSA output for each
-    /// primal output with a non-zero differential space and a live tangent root. Inactive reference outputs have no
-    /// tangent slot. Shared ownership lets callers retain this program independently of the primal program.
+    /// primal output flagged in [`tangent_output_slots`](Self::tangent_output_slots). Shared ownership lets callers
+    /// retain this program independently of the primal program.
     tangent: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Number of residuals `r` threaded from the primal sub-program into the tangent sub-program (i.e., the count of
     /// the trailing outputs of [`primal`](Self::primal) and of the trailing inputs of [`tangent`](Self::tangent)).
     residual_count: usize,
+
+    /// One flag per primal output (excluding the residuals) that is set when the [`tangent`](Self::tangent)
+    /// sub-program has an output for that primal output's tangent. Flagged outputs map to the tangent outputs
+    /// in order. Refer to the documentation of [`tangent_output_slots`](Self::tangent_output_slots) for more
+    /// information.
+    tangent_output_slots: Vec<bool>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
@@ -284,6 +292,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     ///   - `tangent`: Tangent sub-program `(live(ẋ), r) ↦ live(ẏ)` whose leading tangent inputs correspond to the
     ///     active primal inputs.
     ///   - `residual_count`: Number of trailing primal outputs that are residuals consumed by `tangent`.
+    #[inline]
     pub fn new(
         primal: Program<V, O, Vec<V>, Vec<V>>,
         tangent: Program<V, O, Vec<V>, Vec<V>>,
@@ -293,14 +302,15 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         V::Type: DifferentiableType,
     {
         let input_indices = (0..primal.input_ids().len()).collect::<Vec<_>>();
-        Self::new_with_respect_to(primal, tangent, residual_count, &input_indices)
+        Self::new_with_respect_to(primal, tangent, residual_count, &input_indices, None)
     }
 
-    /// Creates a new [`Linearization`] from its parts with respect to selected primal inputs. The tangent program
-    /// consumes their tangents in `input_indices` order, omitting zero differential spaces, followed by the residuals.
-    /// Primal inputs and outputs retain their original order. [`Self::new`] selects every input in source order.
-    /// Reference outputs rooted in unselected inputs or captures have no tangent slot. All other boundary checks are
-    /// the same as [`Self::new`].
+    /// Creates a new [`Linearization`] from its parts with respect to selected primal inputs, whose tangent program
+    /// may omit the tangents of some primal outputs. The tangent program consumes the selected input tangents in
+    /// `input_indices` order, omitting zero differential spaces, followed by the residuals, and produces one output
+    /// for each primal output that `tangent_output_slots` flags. Primal inputs and outputs retain their original order.
+    /// [`Self::new`] selects every input in source order with the nominal slots. All other boundary checks are the same
+    /// as [`Self::new`].
     ///
     /// # Parameters
     ///
@@ -309,17 +319,25 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     ///   - `residual_count`: Number of trailing primal outputs that are residuals consumed by `tangent`.
     ///   - `input_indices`: Unique primal input indices in tangent-input order. Selected zero-space inputs have no
     ///     tangent slot and are omitted when validating that order.
+    ///   - `tangent_output_slots`: One flag per primal output (excluding the residuals), set when `tangent` has an
+    ///     output for that primal output's tangent, or [`None`] for the nominal slots: every output that
+    ///     [`RegionRef::tangent_output_mask`] gives a tangent slot (i.e., outputs whose tangents are not in zero
+    ///     differential spaces, excluding reference outputs rooted in unselected inputs or captures). A flagged output
+    ///     must have a nominal slot, and an unflagged output with a nominal slot has a structural-zero tangent (or,
+    ///     for a reference output, no tangent reference).
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] for duplicate or out-of-range indices, including repeated zero-space
-    /// inputs. Returns [`ProgramError::MalformedProgram`] for incompatible program boundaries and propagates
-    /// differential-type and reference-analysis errors.
+    /// inputs. Returns [`ProgramError::MalformedProgram`] for incompatible program boundaries, including a
+    /// `tangent_output_slots` that does not have one flag per primal output or that flags an output without
+    /// a nominal slot, and propagates differential-type and reference-analysis errors.
     pub fn new_with_respect_to(
         primal: Program<V, O, Vec<V>, Vec<V>>,
         tangent: Program<V, O, Vec<V>, Vec<V>>,
         residual_count: usize,
         input_indices: &[usize],
+        tangent_output_slots: Option<&[bool]>,
     ) -> Result<Self, ProgramError>
     where
         V::Type: DifferentiableType,
@@ -352,17 +370,35 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 differentiable_primal_inputs.len(),
             )));
         }
-        let output_activity = primal.entry_region_ref().tangent_output_mask(&arguments.input_indices)?;
+        let nominal_slots = primal.entry_region_ref().tangent_output_mask(&arguments.input_indices)?;
+        let tangent_output_slots = match tangent_output_slots {
+            None => nominal_slots[..primal_output_count].to_vec(),
+            Some(slots) => {
+                if slots.len() != primal_output_count {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "linearization has {} tangent output slot flags for {} primal outputs",
+                        slots.len(),
+                        primal_output_count,
+                    )));
+                }
+                if let Some(index) = (0..primal_output_count).find(|&index| slots[index] && !nominal_slots[index]) {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "linearization gives primal output {index} a tangent output but that output has no tangent slot",
+                    )));
+                }
+                slots.to_vec()
+            }
+        };
         let differentiable_primal_outputs = primal
             .outputs()
             .take(primal_output_count)
-            .zip(output_activity)
-            .filter_map(|(output, active)| active.then_some(output))
+            .zip(&tangent_output_slots)
+            .filter_map(|(output, &has_slot)| has_slot.then_some(output))
             .collect::<Vec<_>>();
         if tangent.output_ids().len() != differentiable_primal_outputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linearization tangent program produces {} outputs \
-                 while the primal program has {} non-zero differential outputs",
+                 while the primal program has {} outputs with tangent slots",
                 tangent.output_ids().len(),
                 differentiable_primal_outputs.len(),
             )));
@@ -409,7 +445,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 )));
             }
         }
-        Ok(Self { primal: Arc::new(primal), tangent: Arc::new(tangent), residual_count })
+        Ok(Self { primal: Arc::new(primal), tangent: Arc::new(tangent), residual_count, tangent_output_slots })
     }
 
     /// Returns the nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal
@@ -447,14 +483,59 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         self.residual_count
     }
 
+    /// Returns one flag per primal output (excluding the residuals) that is set when the [`tangent`](Self::tangent)
+    /// sub-program has an output for that primal output's tangent. The flagged outputs map to the tangent outputs in
+    /// order. An unflagged output has a tangent in a zero differential space, a structural-zero tangent, or (for a
+    /// reference output) no tangent reference.
+    #[inline]
+    pub fn tangent_output_slots(&self) -> &[bool] {
+        &self.tangent_output_slots
+    }
+
+    /// Returns the position, among the outputs of the [`tangent`](Self::tangent) sub-program, of each primal output
+    /// that `liveness` flags, in primal output order. `liveness` has one flag per primal output (excluding the
+    /// residuals).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `liveness` does not have one flag per primal output or flags an
+    /// output without a tangent output (refer to [`Self::tangent_output_slots`]).
+    pub fn tangent_output_positions(&self, liveness: &[bool]) -> Result<Vec<usize>, ProgramError> {
+        if liveness.len() != self.tangent_output_slots.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "linearization received {} output liveness flags for {} primal outputs",
+                liveness.len(),
+                self.tangent_output_slots.len(),
+            )));
+        }
+        let mut positions = Vec::new();
+        let mut position = 0;
+        for (index, (&has_slot, &live)) in self.tangent_output_slots.iter().zip(liveness).enumerate() {
+            if live && !has_slot {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "primal output {index} has a live tangent but the linearization has no tangent output for it",
+                )));
+            }
+            if live {
+                positions.push(position);
+            }
+            if has_slot {
+                position += 1;
+            }
+        }
+        Ok(positions)
+    }
+
     /// Consumes this [`Linearization`] and returns its [`primal`](Self::primal) sub-program, [`tangent`](Self::tangent)
-    /// sub-program, and [`residual_count`](Self::residual_count), in that order, moving the shared handles without
-    /// cloning the programs. Executing the returned programs retains the caller obligations in the
-    /// [reference argument contract](Linearization#reference-arguments).
+    /// sub-program, [`residual_count`](Self::residual_count), and [`tangent_output_slots`](Self::tangent_output_slots),
+    /// in that order, moving the shared handles without cloning the programs. Executing the returned programs retains
+    /// the caller obligations in the [reference argument contract](Linearization#reference-arguments).
     #[allow(clippy::type_complexity)]
     #[inline]
-    pub fn into_parts(self) -> (Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize) {
-        (self.primal, self.tangent, self.residual_count)
+    pub fn into_parts(
+        self,
+    ) -> (Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize, Vec<bool>) {
+        (self.primal, self.tangent, self.residual_count, self.tangent_output_slots)
     }
 
     /// Returns the compact forward mode pushforward program `(live(ẋ), r) ↦ live(ẏ)`. Because linearization already
@@ -530,8 +611,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
 /// and reshaping the flat tangent outputs against the closure's output structure. It thus pushes any number of tangents
 /// through the function's Jacobian without re-tracing or re-differentiating (e.g., replaying every coordinate basis
 /// tangent to build a Jacobian), amortizing the cost of differentiating once over many tangent applications.
-/// The stored program is compact as zero differential input and output leaves are absent. [`apply`](Self::apply)
-/// filters those input leaves and restores typed zeros in the returned public structure.
+/// The stored program is compact as zero differential input and output values are absent, as are the outputs whose
+/// tangents are structural zeros (i.e., depend on no input tangent). [`apply`](Self::apply) filters those input
+/// values and restores typed zeros for the omitted outputs in the returned public structure.
 ///
 /// The context `C` supplies the value semantics and operation family, `Input` is the closure's structured input type,
 /// and `Output` is its structured output type, whose [`ParameterStructure`](Parameterized::ParameterStructure) is
@@ -552,22 +634,28 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// interpreting it.
     residuals: Vec<C::Value>,
 
-    /// Reconstruction plan used by [`apply`](Self::apply) to restore zero-space output tangents
-    /// omitted from [`program`](Self::program). It is [`None`] for a pushforward linearized with
-    /// [`DifferentiationRule::JvpForTranspose`], which is converted into a [`Pullback`](crate::Pullback) and
-    /// never applied, so that linearization captures no runtime dimensions solely to rebuild output tangents.
-    tangent_reconstruction: Option<ZeroSpaceBoundaryReconstruction<C::Value>>,
+    /// Reconstruction plan used by [`apply`](Self::apply) to restore the zero output tangents omitted from
+    /// [`program`](Self::program) (refer to [`tangent_output_slots`](Self::tangent_output_slots)). It is [`None`]
+    /// for a pushforward linearized with [`DifferentiationRule::JvpForTranspose`], which is converted into a
+    /// [`Pullback`](crate::Pullback) and never applied, so that linearization captures no runtime dimensions
+    /// solely to rebuild output tangents.
+    tangent_reconstruction: Option<ZeroBoundaryReconstruction<C::Value>>,
 
-    /// Complete public primal input boundary. The executable pushforward omits inputs whose derived tangent type is a
-    /// zero differential space.
+    /// Complete public primal input boundary. The executable pushforward omits inputs whose derived tangent type
+    /// is a zero differential space.
     primal_input_types: Vec<C::Type>,
 
-    /// Complete public primal output boundary. The executable pushforward omits outputs whose derived tangent type is
-    /// a zero differential space.
+    /// Complete public primal output boundary. The executable pushforward omits the outputs that
+    /// [`tangent_output_slots`](Self::tangent_output_slots) does not flag.
     primal_output_types: Vec<C::Type>,
 
+    /// One flag per public primal output that is set when [`program`](Self::program) has an output for that primal
+    /// output's tangent. Flagged outputs map to the program outputs in order. Unflagged outputs have tangents in zero
+    /// differential spaces or structural zero tangents.
+    tangent_output_slots: Vec<bool>,
+
     /// Contains the canonical identities of every reference bound at the primal boundary (inputs and captures alike),
-    /// etained so that [`apply`](Self::apply) can reject a tangent reference aliasing one of them, exactly as
+    /// retained so that [`apply`](Self::apply) can reject a tangent reference aliasing one of them, exactly as
     /// [`Pullback`](crate::Pullback) rejects an aliasing cotangent destination.
     primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
 
@@ -577,8 +665,8 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// Encodes the closure's input family `Input` so that [`apply`](Self::apply) can flatten the tangents without a
     /// turbofish. No `Input::ParameterStructure` is stored alongside it because [`apply`](Self::apply) only _flattens_
     /// its structured tangent argument, which needs no stored structure, and rebuilds structure only on the
-    /// tangent-output side through `output_structure`. [`Pullback`](crate::Pullback) mirrors this with a stored input
-    /// structure and a phantom `Output`.
+    /// tangent-output side through `output_structure`. [`Pullback`](crate::Pullback) mirrors this with a
+    /// stored input structure and a phantom `Output`.
     marker: PhantomData<fn() -> Input>,
 }
 
@@ -589,17 +677,19 @@ impl<
 > Pushforward<C, Input, Output>
 {
     /// Creates a [`Pushforward`] from a compact tangent [`Program`] and the complete primal boundary from which that
-    /// program was derived. The program has the boundary `(live(ẋ), r) ↦ live(ẏ)`. It omits every tangent input and
-    /// output whose differential space contains only zero. Its boundary therefore cannot recover the omitted leaves'
-    /// positions or types, and the tangent-type mapping is not generally invertible. `primal_input_types` preserves
-    /// the complete public input boundary so that [`apply`](Self::apply) can validate and filter its tangent arguments.
-    /// `tangent_reconstruction` independently preserves the reconstruction plan for omitted output leaves, while
-    /// `primal_output_types` validates the compact program boundary and remains available to reverse mode conversion.
+    /// program was derived. The program has the boundary `(live(ẋ), r) ↦ live(ẏ)`. It omits every tangent input whose
+    /// differential space contains only zero and every output that `tangent_output_slots` does not flag. Its boundary
+    /// therefore cannot recover the omitted values' positions or types, and the tangent-type mapping is not generally
+    /// invertible. `primal_input_types` preserves the complete public input boundary so that [`apply`](Self::apply)
+    /// can validate and filter its tangent arguments. `tangent_reconstruction` independently preserves the
+    /// reconstruction plan for omitted output values, while `primal_output_types` validates the compact
+    /// program boundary and remains available to reverse mode conversion.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume
     /// one leading input for every non-zero tangent in `primal_input_types`, followed by one input for every residual,
-    /// and must produce one output for every non-zero tangent in `primal_output_types`. A mismatch is reported as a
-    /// [`MalformedProgram`](ProgramError::MalformedProgram) error.
+    /// and must produce one output for every output that `tangent_output_slots` flags, none of which may have a tangent
+    /// in a zero differential space, and `tangent_reconstruction` must reconstruct exactly the unflagged outputs. A
+    /// mismatch is reported as a [`MalformedProgram`](ProgramError::MalformedProgram) error.
     ///
     /// # Parameters
     ///
@@ -608,23 +698,27 @@ impl<
     ///     residual values.
     ///   - `residuals`: Primal values `r` captured at the linearization point, in the same order as the program's
     ///     trailing inputs.
-    ///   - `tangent_reconstruction`: Reconstruction plan for zero-space output tangents rebuilt by
+    ///   - `tangent_reconstruction`: Reconstruction plan for the omitted output tangents rebuilt by
     ///     [`apply`](Self::apply), or [`None`] for a pushforward that is only transposed and never applied.
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
     ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
-    ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
+    ///     the leaves whose tangents are absent from `program`.
+    ///   - `tangent_output_slots`: One flag per entry of `primal_output_types`, set when `program` has an output for
+    ///     that primal output's tangent.
     ///   - `primal_references`: Contains the canonical identities of every reference bound at the primal boundary,
     ///     which the tangent references supplied to [`apply`](Self::apply) must not alias.
     ///   - `output_structure`: Parameter structure used to rebuild the complete public tangent output after typed
     ///     zeros have been inserted for the omitted leaves.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
-        tangent_reconstruction: Option<ZeroSpaceBoundaryReconstruction<C::Value>>,
+        tangent_reconstruction: Option<ZeroBoundaryReconstruction<C::Value>>,
         primal_input_types: Vec<C::Type>,
         primal_output_types: Vec<C::Type>,
+        tangent_output_slots: Vec<bool>,
         primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
         output_structure: Output::ParameterStructure,
     ) -> Result<Self, ProgramError> {
@@ -671,17 +765,37 @@ impl<
                 )));
             }
         }
-        let live_output_tangent_types = primal_output_types
-            .iter()
-            .map(DifferentiableType::tangent)
-            .collect::<Result<Vec<_>, DifferentiationError>>()?
-            .into_iter()
-            .filter(|r#type| !r#type.is_zero_space())
-            .collect::<Vec<_>>();
+        if tangent_output_slots.len() != primal_output_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pushforward has {} tangent output slot flags for {} primal outputs",
+                tangent_output_slots.len(),
+                primal_output_types.len(),
+            )));
+        }
+        let mut live_output_tangent_types = Vec::with_capacity(primal_output_types.len());
+        for (index, (primal_type, &has_slot)) in primal_output_types.iter().zip(&tangent_output_slots).enumerate() {
+            let tangent_type = primal_type.tangent()?;
+            if has_slot && tangent_type.is_zero_space() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pushforward gives primal output {index} a tangent output but its tangent type {tangent_type} is a \
+                     zero differential space",
+                )));
+            }
+            if has_slot {
+                live_output_tangent_types.push(tangent_type);
+            }
+        }
+        if let Some(reconstruction) = &tangent_reconstruction
+            && !reconstruction.matches_tangent_output_slots(&tangent_output_slots)
+        {
+            return Err(ProgramError::MalformedProgram(
+                "pushforward output tangent reconstruction does not match its tangent output slots".to_string(),
+            ));
+        }
         if live_output_tangent_types.len() != program.output_ids().len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "pushforward program produces {} tangent outputs but its public boundary has {} non-zero differential \
-                 outputs",
+                "pushforward program produces {} tangent outputs but its public boundary has {} outputs with tangent \
+                 slots",
                 program.output_ids().len(),
                 live_output_tangent_types.len(),
             )));
@@ -704,6 +818,7 @@ impl<
             tangent_reconstruction,
             primal_input_types,
             primal_output_types,
+            tangent_output_slots,
             primal_references,
             output_structure,
             marker: PhantomData,
@@ -724,14 +839,21 @@ impl<
         &self.residuals
     }
 
+    /// Returns one flag per public primal output that is set when [`program`](Self::program) has an output for that
+    /// primal output's tangent. The flagged outputs map to the program outputs in order.
+    #[inline]
+    pub fn tangent_output_slots(&self) -> &[bool] {
+        &self.tangent_output_slots
+    }
+
     /// Consumes this [`Pushforward`] and returns its context, compact pushforward program, linearization-point
-    /// residuals, primal input types, primal output types, and retained primal reference boundary, in that order.
-    /// The program maps `(live(ẋ), r)` to `live(ẏ)`, with the residuals `r` aligned to its trailing inputs. The
-    /// complete primal types and reference boundary retain information needed to validate subsequent derivative calls
-    /// that cannot be recovered from the compact program alone.
+    /// residuals, primal input types, primal output types, tangent output slots, and retained primal reference
+    /// boundary, in that order. The program maps `(live(ẋ), r)` to `live(ẏ)`, with the residuals `r` aligned to
+    /// its trailing inputs. The complete primal types and reference boundary retain information needed to validate
+    /// subsequent derivative calls that cannot be recovered from the compact program alone.
     ///
-    /// Unlike [`apply`](Self::apply), the returned program does not insert typed-zero values for public tangent leaves
-    /// omitted from its Single Static Assignment (SSA) boundary because their differential spaces contain only zero.
+    /// Unlike [`apply`](Self::apply), the returned program does not insert typed-zero values for the public tangent
+    /// leaves omitted from its Single Static Assignment (SSA) boundary.
     #[allow(clippy::type_complexity)]
     #[inline]
     pub fn into_parts(
@@ -742,6 +864,7 @@ impl<
         Vec<C::Value>,
         Vec<C::Type>,
         Vec<C::Type>,
+        Vec<bool>,
         ReferenceBoundary<DifferentiationBoundaryPosition>,
     ) {
         (
@@ -750,6 +873,7 @@ impl<
             self.residuals,
             self.primal_input_types,
             self.primal_output_types,
+            self.tangent_output_slots,
             self.primal_references,
         )
     }
@@ -815,8 +939,8 @@ impl<
         program_inputs.extend(self.residuals.iter().cloned());
         let tangent_outputs = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
 
-        // Reconstruct the complete flattened public output boundary. Consume one program result for each non-zero
-        // tangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
+        // Reconstruct the complete flattened public output boundary. Consume one program result for each tangent output
+        // slot and materialize a typed zero, sized from the retained extents, for every omitted leaf.
         let Some(tangent_reconstruction) = &self.tangent_reconstruction else {
             return Err(ProgramError::MalformedProgram(
                 "a pushforward linearized for transposition cannot be applied".to_string(),
@@ -847,6 +971,7 @@ impl<C: Context> Pushforward<C, Vec<C::Value>, Vec<C::Value>> {
             tangent_reconstruction: self.tangent_reconstruction,
             primal_input_types: self.primal_input_types,
             primal_output_types: self.primal_output_types,
+            tangent_output_slots: self.tangent_output_slots,
             primal_references: self.primal_references,
             output_structure,
             marker: PhantomData,
@@ -1227,6 +1352,37 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
         input_indices: &[usize],
     ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError>;
 
+    // TODO(eaplatanios): Should this be merged with the pre-existing `linearize_program`?
+    /// Linearizes `region` like [`Self::linearize_program`] while allowing the tangent program to omit the outputs
+    /// whose tangents are structural zeros, unless `instantiated_outputs` flags them. An omitted output has no tangent
+    /// output slot (refer to [`Linearization::tangent_output_slots`]), so the tangent program carries neither its zero
+    /// nor the residuals that would only size that zero. A structural-zero output tangent depends on no selected input
+    /// tangent, so rules that keep only the live output tangents of [`TangentActivity`] instantiate nothing, while
+    /// rules that align output tangent boundaries across regions (e.g., the branches of a `condition` operation or the
+    /// carries of a loop) instantiate the outputs that are live in the aligned boundary.
+    ///
+    /// The default implementation delegates to [`Self::linearize_program`], whose tangent program has an output for
+    /// every output with a tangent slot and therefore satisfies every instantiation request. Callers must consult
+    /// [`Linearization::tangent_output_slots`] (e.g., through [`Linearization::tangent_output_positions`]) rather than
+    /// assuming either boundary.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Region to linearize.
+    ///   - `input_indices`: Unique region input indices in tangent-input order, as for [`Self::linearize_program`].
+    ///   - `instantiated_outputs`: One flag per region output, set when that output must have a tangent output slot
+    ///     even if its tangent is a structural zero. An empty slice instantiates no output.
+    #[inline]
+    fn linearize_program_with_instantiated_outputs(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_indices: &[usize],
+        instantiated_outputs: &[bool],
+    ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
+        let _ = instantiated_outputs;
+        self.linearize_program(region, input_indices)
+    }
+
     /// Partitions an existing fused Jacobian-Vector Product (JVP) [`Region`] into a known primal program and a residual
     /// tangent program. The region already computes primal and tangent results; this function separates their
     /// computations without differentiating the region again. Custom JVP rules and reconstructed control-flow JVPs
@@ -1422,6 +1578,16 @@ where
         input_indices: &[usize],
     ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
         region.linearize_shared_for_rule(input_indices, self.rule)
+    }
+
+    #[inline]
+    fn linearize_program_with_instantiated_outputs(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_indices: &[usize],
+        instantiated_outputs: &[bool],
+    ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
+        region.linearize_shared_for_rule_with_instantiated_outputs(input_indices, self.rule, instantiated_outputs)
     }
 
     #[inline]
@@ -2630,17 +2796,47 @@ where
     ) -> Result<Linearization<V, O>, DifferentiationError> {
         let mut arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
         arguments.rule = rule;
+        self.linearize_shared_with_arguments(arguments)
+    }
+
+    // TODO(eaplatanios): Should this be merged with the pre-existing `linearize_shared_for_rule`?
+    /// Returns a cached [`Linearization`] of this region like [`Self::linearize_shared_for_rule`] whose tangent program
+    /// has an output for a structural zero output tangent only when `instantiated_outputs` flags that output, with the
+    /// instantiation included in the cache key. The tangent outputs of all other structural zeros, and the residuals
+    /// that would only size them, are omitted (refer to [`Linearization::tangent_output_slots`]). An empty
+    /// `instantiated_outputs` instantiates no output; otherwise, it has one flag per region output. A structural
+    /// zero output tangent depends on no input tangent, so consumers that keep only the output tangents with such a
+    /// dependence (refer to [`TangentActivity`]) instantiate nothing, while consumers that must align a boundary across
+    /// regions (e.g., `condition` branches or loop carries) instantiate the outputs that are live in that boundary.
+    pub(crate) fn linearize_shared_for_rule_with_instantiated_outputs(
+        &self,
+        input_indices: &[usize],
+        rule: DifferentiationRule,
+        instantiated_outputs: &[bool],
+    ) -> Result<Linearization<V, O>, DifferentiationError> {
+        let mut arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?
+            .with_instantiated_outputs(instantiated_outputs)?;
+        arguments.rule = rule;
+        self.linearize_shared_with_arguments(arguments)
+    }
+
+    /// Returns the cached [`Linearization`] of this region for validated, normalized `arguments`.
+    fn linearize_shared_with_arguments(
+        &self,
+        arguments: JvpAndLinearizationTransformArguments,
+    ) -> Result<Linearization<V, O>, DifferentiationError> {
         let artifact =
             (*self).transform::<LinearizationTransform, _, DifferentiationError>(arguments, |region, arguments| {
-                let (primal, tangent, residual_count) = region.linearize_impl(arguments)?.into_parts();
-                Ok(TransformArtifact::new(vec![primal, tangent], residual_count))
+                let (primal, tangent, residual_count, tangent_output_slots) =
+                    region.linearize_impl(arguments)?.into_parts();
+                Ok(TransformArtifact::new(vec![primal, tangent], (residual_count, tangent_output_slots)))
             })?;
-        let (programs, residual_count) = artifact.into_parts();
+        let (programs, (residual_count, tangent_output_slots)) = artifact.into_parts();
         let mut programs = programs.into_iter();
         let primal = programs.next().unwrap();
         let tangent = programs.next().unwrap();
         assert!(programs.next().is_none(), "linearization transform retained more than two programs");
-        Ok(Linearization { primal, tangent, residual_count })
+        Ok(Linearization { primal, tangent, residual_count, tangent_output_slots })
     }
 
     /// Linearizes this region from validated, normalized `arguments`. Both [`linearize`](Self::linearize) and
@@ -2715,16 +2911,18 @@ where
             },
         )?;
 
-        // Split the direct output duals. Primal halves must be known tracers in the primal builder. Structural-zero
-        // tangent halves become residualized typed zeros so the tangent program preserves the source output arity. A
-        // value tangent that folded to known is malformed: rules must preserve input-independent zeros structurally,
-        // and accepting any other known value would turn the tangent program into an affine map. Do not bind through
-        // `Zero` here as partial evaluation could classify that value as known and remove it from the tangent boundary.
-        // Forced residualization keeps a structural zero as an unknown Single Static Assignment (SSA) output,
-        // preserving the linear program's output arity without admitting an affine constant.
+        // Split the direct output duals. Primal halves must be known tracers in the primal builder. A structural zero
+        // tangent half has a tangent output slot only when the request instantiates its output, in which case it
+        // becomes a residualized typed zero; otherwise, the tangent program omits it along with the residuals that
+        // would size it. A value tangent that folded to known is malformed: rules must preserve input-independent zeros
+        // structurally, and accepting any other known value would turn the tangent program into an affine map. Do not
+        // bind through `Zero` here as partial evaluation could classify that value as known and remove it from the
+        // tangent boundary. Forced residualization keeps an instantiated structural zero as an unknown Single Static
+        // Assignment (SSA) output without admitting an affine constant.
         let mut primal_output_atoms = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-        for dual in output_duals {
+        let mut tangent_output_slots = Vec::with_capacity(output_duals.len());
+        for (dual, &instantiated) in output_duals.into_iter().zip(&arguments.instantiated_outputs) {
             let (primal, tangent) = dual.into_dual().into_parts();
             let primal = primal.into_value()?;
             let primal = match primal.value() {
@@ -2745,12 +2943,12 @@ where
                 .into());
             }
             primal_output_atoms.push(primal.atom_id()?);
-            if tangent.r#type().is_zero_space() {
-                continue;
-            }
 
-            // Inactive reference carries remain in the primal boundary and have no tangent allocation to return.
-            if primal.r#type().is_reference() && tangent.is_zero() {
+            // Zero differential spaces have no tangent slot, and inactive reference carries remain in the primal
+            // boundary without a tangent allocation to return. Normalization never instantiates either of them.
+            let has_slot = !tangent.r#type().is_zero_space() && (!tangent.is_zero() || instantiated);
+            tangent_output_slots.push(has_slot);
+            if !has_slot {
                 continue;
             }
 
@@ -2923,9 +3121,16 @@ where
             .into_simplified()?;
 
         // Partial evaluation already gives the tangent program its flat vector boundary.
-        // `Linearization::new_with_respect_to` is the sole cross-program contract validation.
-        Linearization::new_with_respect_to(primal_program, tangent_program, residual_count, &arguments.input_indices)
-            .map_err(DifferentiationError::from)
+        // `Linearization::new_with_respect_to` is the sole cross-program contract validation, and it checks
+        // the slots derived from the output duals against the nominal tangent slots of the source boundary.
+        Linearization::new_with_respect_to(
+            primal_program,
+            tangent_program,
+            residual_count,
+            &arguments.input_indices,
+            Some(&tangent_output_slots),
+        )
+        .map_err(DifferentiationError::from)
     }
 }
 
@@ -3534,11 +3739,13 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let output_duals = function(input_duals, capture_duals)?;
 
-    // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
-    // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a Single
-    // Static Assignment (SSA) value.
+    // Structural zero output tangents have no tangent output slot. The pushforward program thus carries neither the
+    // zeros nor the residuals that would size them, and only an applied pushforward rebuilds them (from extents that
+    // the reconstruction below reads from the primal outputs). The remaining tangent outputs must be unknown: a known
+    // value tangent would turn the pushforward into an affine map.
     let mut primal_outputs = Vec::with_capacity(output_duals.len());
     let mut tangent_outputs = Vec::with_capacity(output_duals.len());
+    let mut tangent_output_slots = Vec::with_capacity(output_duals.len());
     let mut output_types = Vec::with_capacity(output_duals.len());
     for (output_index, output_dual) in output_duals.into_iter().enumerate() {
         let (primal, tangent) = output_dual.into_dual().into_parts();
@@ -3556,6 +3763,7 @@ where
         let tangent_type = tangent.r#type().into_owned();
         output_types.push(primal.r#type().into_owned());
         if tangent_type.is_zero_space() {
+            tangent_output_slots.push(false);
             primal_outputs.push(primal);
             continue;
         }
@@ -3572,36 +3780,30 @@ where
             .into());
         }
 
-        let tangent = match tangent {
-            MaybeZero::Value(tracer) => {
-                let value = tracer.into_value()?;
-                match value.value() {
-                    PartialValue::Unknown(_) => value,
-                    PartialValue::Known(_) => {
-                        return Err(ProgramError::MalformedProgram(
-                            "linearization produced a known tangent output; differentiation rules must represent \
-                             input-independent zero tangents structurally"
-                                .to_string(),
-                        )
-                        .into());
-                    }
-                }
-            }
-            MaybeZero::Zero(r#type) => {
-                let residuals =
-                    capture_and_validate_zero_residual_values(context, &primal, &r#type, "pushforward output tangent")?;
-                residualize_zero_from_residual_values(&evaluation_context, r#type, residuals)?
-            }
+        let MaybeZero::Value(tracer) = tangent else {
+            tangent_output_slots.push(false);
+            primal_outputs.push(primal);
+            continue;
         };
+        let tangent = tracer.into_value()?;
+        if let PartialValue::Known(_) = tangent.value() {
+            return Err(ProgramError::MalformedProgram(
+                "linearization produced a known tangent output; differentiation rules must represent \
+                 input-independent zero tangents structurally"
+                    .to_string(),
+            )
+            .into());
+        }
+        tangent_output_slots.push(true);
         primal_outputs.push(primal);
         tangent_outputs.push(tangent);
     }
 
-    // Only an applied pushforward rebuilds zero-space output tangents. A pullback converts the pushforward and returns
-    // input cotangents instead, so transposition captures no runtime dimensions for the output tangents.
+    // Only an applied pushforward rebuilds the omitted output tangents. A pullback converts the pushforward and
+    // returns input cotangents instead, so transposition captures no runtime dimensions for the output tangents.
     let tangent_reconstruction = match rule {
         DifferentiationRule::Jvp => {
-            Some(ZeroSpaceBoundaryReconstruction::capture(context, primal_outputs.as_slice(), output_types.as_slice())?)
+            Some(ZeroBoundaryReconstruction::capture(context, &primal_outputs, &output_types, &tangent_output_slots)?)
         }
         DifferentiationRule::JvpForTranspose => None,
     };
@@ -3688,6 +3890,7 @@ where
         tangent_reconstruction,
         input_types,
         output_types,
+        tangent_output_slots,
         primal_references,
         vec![Placeholder; primal_outputs.len()],
     )?;
@@ -3971,12 +4174,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for JvpTran
     const DEFAULT_CACHE_CAPACITY: usize = 8;
 }
 
-/// [`Region`] [`Transform`] marker for retained linearized [`Program`]s.
+/// [`Region`] [`Transform`] marker for retained linearized [`Program`]s. Its artifact retains the primal and tangent
+/// programs with their residual count and tangent output slots (refer to [`Linearization::tangent_output_slots`]).
 struct LinearizationTransform;
 
 impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for LinearizationTransform {
     type Arguments = JvpAndLinearizationTransformArguments;
-    type Artifact = TransformArtifact<V, O, usize>;
+    type Artifact = TransformArtifact<V, O, (usize, Vec<bool>)>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 8;
 }
@@ -3991,6 +4195,15 @@ struct JvpAndLinearizationTransformArguments {
 
     /// Distinguishes artifacts constructed with JVP rules from those constructed with JVP-for-transpose rules.
     rule: DifferentiationRule,
+
+    /// One flag per region output that is set when a linearization gives that output a tangent output slot even when
+    /// its tangent is a structural zero (refer to [`Linearization::tangent_output_slots`]). Flags are normalized to
+    /// `false` for outputs that can never have such a slot (i.e., reference outputs and outputs whose tangents are in
+    /// zero differential spaces), so equivalent requests share one cache entry. [`Self::new`] sets every other flag,
+    /// which is the dense boundary of the public linearization functions. The fused Jacobian-Vector Product (JVP)
+    /// program has one tangent output per tangent slot regardless, so [`JvpTransform`] requests always use that
+    /// dense default.
+    instantiated_outputs: Vec<bool>,
 }
 
 impl JvpAndLinearizationTransformArguments {
@@ -4005,6 +4218,14 @@ impl JvpAndLinearizationTransformArguments {
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
     ) -> Result<Self, DifferentiationError> {
+        let instantiated_outputs = region
+            .output_ids()
+            .iter()
+            .map(|output| {
+                let r#type = region.atoms()[output.index()].r#type();
+                Ok(!r#type.is_reference() && !r#type.tangent()?.is_zero_space())
+            })
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         let input_count = region.input_ids().len();
         let mut selected = vec![false; input_count];
         let mut indices = Vec::with_capacity(input_indices.len());
@@ -4024,7 +4245,35 @@ impl JvpAndLinearizationTransformArguments {
                 indices.push(index);
             }
         }
-        Ok(Self { input_indices: indices, rule: DifferentiationRule::Jvp })
+        Ok(Self { input_indices: indices, rule: DifferentiationRule::Jvp, instantiated_outputs })
+    }
+
+    /// Restricts the outputs whose structural zero tangents a linearization instantiates to those that
+    /// `instantiated_outputs` flags. An empty slice instantiates none. Otherwise, it must have one flag
+    /// per region output, and the flags of outputs that can never have a tangent slot are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when a non-empty `instantiated_outputs` does not have one flag
+    /// per region output.
+    fn with_instantiated_outputs(mut self, instantiated_outputs: &[bool]) -> Result<Self, DifferentiationError> {
+        if instantiated_outputs.is_empty() {
+            self.instantiated_outputs.fill(false);
+        } else if instantiated_outputs.len() != self.instantiated_outputs.len() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "linearization received {} output instantiation flags for a region with {} outputs",
+                    instantiated_outputs.len(),
+                    self.instantiated_outputs.len(),
+                ),
+            }
+            .into());
+        } else {
+            self.instantiated_outputs.iter_mut().zip(instantiated_outputs).for_each(|(flag, &instantiated)| {
+                *flag &= instantiated;
+            });
+        }
+        Ok(self)
     }
 }
 
@@ -4364,8 +4613,14 @@ pub(crate) mod tests {
         let context = EagerContext::new();
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
         let output_types = outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(&context, outputs, &output_types)?;
         let references = ReferenceBoundary::new_for_differentiation(&context, inputs, &[], &[])?;
+        let tangent_output_slots = output_types
+            .iter()
+            .map(|r#type| Ok(!r#type.tangent()?.is_zero_space()))
+            .collect::<Result<Vec<_>, DifferentiationError>>()
+            .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+        let reconstruction =
+            ZeroBoundaryReconstruction::capture(&context, outputs, &output_types, &tangent_output_slots)?;
         Pushforward::new(
             context,
             program,
@@ -4373,6 +4628,7 @@ pub(crate) mod tests {
             Some(reconstruction),
             input_types,
             output_types,
+            tangent_output_slots,
             references,
             vec![Placeholder; outputs.len()],
         )
@@ -4396,14 +4652,18 @@ pub(crate) mod tests {
                 ));
             }
         }
-        let arguments =
-            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp };
+        let arguments = JvpAndLinearizationTransformArguments {
+            input_indices: vec![0],
+            rule: DifferentiationRule::Jvp,
+            instantiated_outputs: vec![true],
+        };
         format!(
-            "nondeterministic transform rule detected for `{}` with arguments `{arguments:?}`: re-derivation \
+            "nondeterministic transform rule detected for `{}` with arguments `{:?}`: re-derivation \
              produced a different artifact than the region cache retained, but region transforms must be deterministic \
              structural functions of their complete reachable contents and arguments\n\n\
              cached metadata: {}\nderived metadata: {}\n\n{}",
             std::any::type_name::<T>(),
+            arguments,
             cached_metadata,
             derived_metadata,
             programs,
@@ -4532,7 +4792,7 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(cloned.primal(), linearization.primal()));
         assert!(Arc::ptr_eq(cloned.tangent(), linearization.tangent()));
         assert!(Arc::ptr_eq(&linearization.pushforward(), linearization.tangent()));
-        let (actual_primal, actual_tangent, residual_count) = linearization.into_parts();
+        let (actual_primal, actual_tangent, residual_count, _) = linearization.into_parts();
         assert!(Arc::ptr_eq(&actual_primal, cloned.primal()));
         assert!(Arc::ptr_eq(&actual_tangent, cloned.tangent()));
         assert_eq!(actual_primal.to_string(), primal.to_string());
@@ -4572,7 +4832,7 @@ pub(crate) mod tests {
         assert!(matches!(
             Linearization::new(boundary_program(&[], &[Array::scalar(1.0_f64).unwrap()]), boundary_program(&[], &[]), 0),
             Err(ProgramError::MalformedProgram(message)) if message == "linearization tangent program produces 0 \
-                outputs while the primal program has 1 non-zero differential outputs",
+                outputs while the primal program has 1 outputs with tangent slots",
         ));
     }
 
@@ -4604,27 +4864,115 @@ pub(crate) mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![first, last], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         let linearization = program.entry_region_ref().linearize(&[2, 0]).unwrap();
-        let (primal, tangent, residual_count) = linearization.into_parts();
+        let (primal, tangent, residual_count, _) = linearization.into_parts();
         let primal = Arc::unwrap_or_clone(primal);
         let tangent = Arc::unwrap_or_clone(tangent);
         // Constructor validation uses selected order and omits zero spaces just like the transform.
         let reconstructed =
-            Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[2, 1, 0]).unwrap();
+            Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[2, 1, 0], None)
+                .unwrap();
         assert_eq!(reconstructed.primal().to_string(), primal.to_string());
         assert_eq!(reconstructed.tangent().to_string(), tangent.to_string());
         assert_eq!(reconstructed.residual_count(), residual_count);
-        assert!(matches!(Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[0, 2]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "linearization tangent input 0 has type f32[] but primal input type f64[] requires \
-                    tangent type f64[]",
-        ));
-        assert!(matches!(Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[1, 1]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "differentiation input index 1 is selected more than once",
-        ));
-        assert!(matches!(Linearization::new_with_respect_to(primal, tangent, residual_count, &[3]),
+        assert!(
+            matches!(Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[0, 2], None),
+                Err(ProgramError::MalformedProgram(message))
+                    if message == "linearization tangent input 0 has type f32[] but primal input type f64[] requires \
+                        tangent type f64[]",
+            )
+        );
+        assert!(
+            matches!(Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[1, 1], None),
+                Err(ProgramError::InvalidArgument { message })
+                    if message == "differentiation input index 1 is selected more than once",
+            )
+        );
+        assert!(matches!(Linearization::new_with_respect_to(primal, tangent, residual_count, &[3], None),
             Err(ProgramError::InvalidArgument { message })
                 if message == "differentiation input index 3 is out of range for a region with 3 inputs",
+        ));
+
+        // The `f64` output has a nominal tangent slot, while the `i64` output's tangent is a zero differential space and
+        // has none. The dense constructor gives the `f64` output a tangent output, and an explicit slot mask can omit it
+        // as a structural zero.
+        let primal =
+            boundary_program(&[DataType::F64], &[Array::scalar(2.0_f64).unwrap(), Array::scalar(3_i64).unwrap()]);
+        let dense_tangent = boundary_program(&[DataType::F64], &[Array::scalar(0.0_f64).unwrap()]);
+        let compact_tangent = boundary_program(&[DataType::F64], &[]);
+        let dense = Linearization::new(primal.clone(), dense_tangent.clone(), 0).unwrap();
+        assert_eq!(dense.tangent_output_slots(), &[true, false]);
+        let compact =
+            Linearization::new_with_respect_to(primal.clone(), compact_tangent.clone(), 0, &[0], Some(&[false, false]))
+                .unwrap();
+        assert_eq!(compact.tangent_output_slots(), &[false, false]);
+        let (.., tangent_output_slots) = compact.into_parts();
+        assert_eq!(tangent_output_slots, vec![false, false]);
+
+        // The mask has one flag per primal output, may not give an output without a nominal slot a tangent output,
+        // and must agree with the tangent program's outputs.
+        assert!(matches!(
+            Linearization::new_with_respect_to(
+                primal.clone(),
+                compact_tangent.clone(),
+                0,
+                &[0],
+                Some(&[false]),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "linearization has 1 tangent output slot flags for 2 primal outputs",
+        ));
+        assert!(matches!(
+            Linearization::new_with_respect_to(
+                primal.clone(),
+                dense_tangent,
+                0,
+                &[0],
+                Some(&[false, true]),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "linearization gives primal output 1 a tangent output but that output has no tangent slot",
+        ));
+        assert!(matches!(
+            Linearization::new_with_respect_to(primal, compact_tangent, 0, &[0], Some(&[true, false])),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "linearization tangent program produces 0 outputs while the primal program has 1 \
+                    outputs with tangent slots",
+        ));
+    }
+
+    #[test]
+    fn test_linearization_tangent_output_slots() {
+        // Linearizing a region records the slots of its output duals, and the region transform cache retains them.
+        let program =
+            boundary_program(&[DataType::F64], &[Array::scalar(2.0_f64).unwrap(), Array::scalar(3_i64).unwrap()]);
+        assert_eq!(program.linearize().unwrap().tangent_output_slots(), &[true, false]);
+        assert_eq!(program.entry_region_ref().linearize_shared(&[0]).unwrap().tangent_output_slots(), &[true, false]);
+        assert_eq!(program.entry_region_ref().linearize_shared(&[0]).unwrap().tangent_output_slots(), &[true, false]);
+    }
+
+    #[test]
+    fn test_linearization_tangent_output_positions() {
+        // The first and last outputs have tangent outputs at positions 0 and 1, and the middle one has none.
+        let primal = boundary_program(
+            &[DataType::F64],
+            &[Array::scalar(1.0_f64).unwrap(), Array::scalar(2.0_f64).unwrap(), Array::scalar(3.0_f64).unwrap()],
+        );
+        let tangent =
+            boundary_program(&[DataType::F64], &[Array::scalar(0.0_f64).unwrap(), Array::scalar(0.0_f64).unwrap()]);
+        let linearization =
+            Linearization::new_with_respect_to(primal, tangent, 0, &[0], Some(&[true, false, true])).unwrap();
+        assert_eq!(linearization.tangent_output_positions(&[true, false, true]), Ok(vec![0, 1]));
+        assert_eq!(linearization.tangent_output_positions(&[false, false, true]), Ok(vec![1]));
+        assert_eq!(linearization.tangent_output_positions(&[false, false, false]), Ok(Vec::new()));
+        assert!(matches!(
+            linearization.tangent_output_positions(&[false, true, false]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "primal output 1 has a live tangent but the linearization has no tangent output for it",
+        ));
+        assert!(matches!(
+            linearization.tangent_output_positions(&[true]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "linearization received 1 output liveness flags for 3 primal outputs",
         ));
     }
 
@@ -4669,7 +5017,7 @@ pub(crate) mod tests {
         assert_eq!(pushforward.program().to_string(), program.to_string());
         assert_eq!(pushforward.residuals(), &[Array::scalar(7.0_f32).unwrap()]);
         assert_eq!(pushforward.apply(vec![Array::scalar(5.0_f64).unwrap()]), Ok(vec![Array::scalar(0.0_f64).unwrap()]));
-        let (_, actual_program, residuals, input_types, output_types, _) = pushforward.into_parts();
+        let (_, actual_program, residuals, input_types, output_types, _, _) = pushforward.into_parts();
         assert_eq!(input_types, vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(output_types, vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(actual_program.to_string(), program.to_string());
@@ -4717,7 +5065,7 @@ pub(crate) mod tests {
         assert!(matches!(
             pushforward_with_boundary(boundary_program(&[], &[]), vec![], &[], &[Array::scalar(1.0_f64).unwrap()]),
             Err(ProgramError::MalformedProgram(message)) if message == "pushforward program produces 0 tangent \
-                outputs but its public boundary has 1 non-zero differential outputs",
+                outputs but its public boundary has 1 outputs with tangent slots",
         ));
     }
 
@@ -4728,6 +5076,55 @@ pub(crate) mod tests {
             Err(ProgramError::MalformedProgram(message)) if message == "pushforward program tangent output 0 has type \
                 f32[] but its public boundary requires tangent type f64[]",
         ));
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_tangent_output_slots() {
+        // The slot mask has one flag per public output, cannot give a zero-space output a tangent output, and must
+        // agree with the outputs that the reconstruction plan rebuilds.
+        let new = |output: Array, tangent_output_slots: Vec<bool>, reconstructed_slots: &[bool]| {
+            let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let output_type = output.r#type().into_owned();
+            let reconstruction = ZeroBoundaryReconstruction::capture(
+                &context,
+                std::slice::from_ref(&output),
+                &[output_type.clone()],
+                reconstructed_slots,
+            )?;
+            let references = ReferenceBoundary::new_for_differentiation(&context, &[], &[], &[])?;
+            Pushforward::<_, Vec<Array>, Vec<Array>>::new(
+                context,
+                boundary_program(&[], &[]),
+                Vec::new(),
+                Some(reconstruction),
+                Vec::new(),
+                vec![output_type],
+                tangent_output_slots,
+                references,
+                vec![Placeholder],
+            )
+        };
+        assert!(matches!(
+            new(Array::scalar(1.0_f64).unwrap(), Vec::new(), &[false]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward has 0 tangent output slot flags for 1 primal outputs",
+        ));
+        assert!(matches!(
+            new(Array::scalar(1_i32).unwrap(), vec![true], &[true]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward gives primal output 0 a tangent output but its tangent type zero[] is a \
+                    zero differential space",
+        ));
+        assert!(matches!(
+            new(Array::scalar(1.0_f64).unwrap(), vec![false], &[true]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward output tangent reconstruction does not match its tangent output slots",
+        ));
+        assert_eq!(
+            new(Array::scalar(1.0_f64).unwrap(), vec![false], &[false])
+                .map(|pushforward| pushforward.tangent_output_slots().to_vec()),
+            Ok(vec![false])
+        );
     }
 
     #[test]
@@ -4750,6 +5147,155 @@ pub(crate) mod tests {
             0.5,
             epsilon = 1e-9,
         );
+    }
+
+    #[test]
+    fn test_pushforward_omits_structural_zero_output_tangents() {
+        // For `f(x, z) = (x * x, stop_gradient(z))`, the tangent of the second output depends on no input tangent, so
+        // the pushforward program has no output for it and saves no extent residual to size it. Only an applied
+        // pushforward rebuilds that zero, from the extent of `z` that linearization reads beside the program.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let x = context.input(scalar_type.clone().into());
+        let z = context.input(vector_type.clone().into());
+        let (_, pushforward) = context
+            .linearize(
+                |inputs: Vec<LinearizationTracer<TracingContext<TestValue, TestOperation>>>, ()| {
+                    Ok(vec![inputs[0].clone() * inputs[0].clone(), inputs[1].stop_gradient()?])
+                },
+                vec![x, z],
+                (),
+            )
+            .unwrap();
+        assert_eq!(pushforward.tangent_output_slots(), &[true, false]);
+        assert_eq!(pushforward.residuals().len(), 1);
+        assert_eq!(
+            pushforward.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %2:f32[] .
+                let %3:f32[] = mul %2 %0
+                    %4:f32[] = mul %2 %0
+                    %5:f32[] = add %3 %4
+                in (%5)"}
+        );
+        let x_tangent = context.input(scalar_type.into());
+        let z_tangent = context.input(vector_type.tangent().unwrap().into());
+        let tangents = pushforward.apply(vec![x_tangent, z_tangent]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                tangents.iter().map(|tangent| tangent.atom_id().unwrap()).collect(),
+                vec![Placeholder; 4],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %5:f32[], %6:f32[n] .
+                let %2:f32[] = mul %0 %0
+                    %3:f32[n] = stop_gradient %1
+                    %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %3
+                    %7:f32[] = mul %0 %5
+                    %8:f32[] = mul %0 %5
+                    %9:f32[] = add %7 %8
+                    %10:f32[n] = zero [type=f32[n]] %4
+                in (%9, %10)"}
+        );
+
+        // Eager linearization over static shapes rebuilds the omitted zero from its type alone.
+        let (outputs, pushforward) =
+            differentiate_at((Array::scalar(0.5_f64).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap()))
+                .linearize(|(x, z)| Ok::<_, ProgramError>((x.clone() * x, z.stop_gradient()?)))
+                .unwrap();
+        assert_eq!(outputs.1, Array::vector(vec![1.0, 2.0]).unwrap());
+        assert_eq!(pushforward.tangent_output_slots(), &[true, false]);
+        assert_eq!(pushforward.program().output_types(), vec![ArrayType::scalar(DataType::F64)]);
+        let (x_tangent, z_tangent) =
+            pushforward.apply((Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0]).unwrap())).unwrap();
+        assert_eq!(x_tangent, Array::scalar(2.0).unwrap());
+        assert_eq!(z_tangent, Array::vector(vec![0.0, 0.0]).unwrap());
+    }
+
+    #[test]
+    fn test_region_linearize_instantiated_outputs() {
+        // `f(x, z) = (x * x, stop_gradient(z))` with a dynamic `z`. The dense linearization instantiates the
+        // structural-zero tangent of the second output from an extent residual, while a compact one omits both.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
+                Ok(vec![inputs[0].clone() * inputs[0].clone(), inputs[1].stop_gradient()?])
+            },
+            vec![ArrayIrType::from(ArrayType::scalar(DataType::F32)), ArrayIrType::from(vector_type)],
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+        let region = program.entry_region_ref();
+        let dense = region.linearize_shared(&[0, 1]).unwrap();
+        assert_eq!(dense.tangent_output_slots(), &[true, true]);
+        assert_eq!(
+            dense.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n] .
+                let %2:f32[] = mul %0 %0
+                    %3:f32[n] = stop_gradient %1
+                    %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %3
+                in (%2, %3, %0, %4)"}
+        );
+        assert_eq!(
+            dense.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %2:f32[], %3:dimension<n ∈ [1, 5)> .
+                let %4:f32[] = mul %2 %0
+                    %5:f32[] = mul %2 %0
+                    %6:f32[] = add %4 %5
+                    %7:f32[n] = zero [type=f32[n]] %3
+                in (%6, %7)"}
+        );
+        let compact = region
+            .linearize_shared_for_rule_with_instantiated_outputs(&[0, 1], DifferentiationRule::Jvp, &[])
+            .unwrap();
+        assert_eq!(compact.tangent_output_slots(), &[true, false]);
+        assert_eq!(
+            compact.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n] .
+                let %2:f32[] = mul %0 %0
+                    %3:f32[n] = stop_gradient %1
+                in (%2, %3, %0)"}
+        );
+        assert_eq!(
+            compact.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %2:f32[] .
+                let %3:f32[] = mul %2 %0
+                    %4:f32[] = mul %2 %0
+                    %5:f32[] = add %3 %4
+                in (%5)"}
+        );
+        assert_eq!(compact.tangent_output_positions(&[true, false]), Ok(vec![0]));
+
+        // Instantiation is part of the cache key, so the compact and dense requests retain distinct artifacts and a
+        // repeated compact request reuses its artifact. Instantiating only the structural-zero output is dense here.
+        let instantiated = region
+            .linearize_shared_for_rule_with_instantiated_outputs(&[0, 1], DifferentiationRule::Jvp, &[false, true])
+            .unwrap();
+        assert_eq!(instantiated.tangent_output_slots(), &[true, true]);
+        let repeated = region
+            .linearize_shared_for_rule_with_instantiated_outputs(&[0, 1], DifferentiationRule::Jvp, &[false, false])
+            .unwrap();
+        assert!(Arc::ptr_eq(repeated.tangent(), compact.tangent()));
+        assert!(!Arc::ptr_eq(compact.tangent(), dense.tangent()));
+        assert!(matches!(
+            region.linearize_shared_for_rule_with_instantiated_outputs(&[0, 1], DifferentiationRule::Jvp, &[true]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "linearization received 1 output instantiation flags for a region with 2 outputs",
+        ));
     }
 
     #[test]
@@ -6192,7 +6738,11 @@ pub(crate) mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
         program.entry_region_ref().insert_transform_artifact_for_testing::<JvpTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
+            JvpAndLinearizationTransformArguments {
+                input_indices: vec![0],
+                rule: DifferentiationRule::Jvp,
+                instantiated_outputs: vec![true],
+            },
             TransformArtifact::new(vec![unrelated.clone()], ()),
         );
 
@@ -6447,7 +6997,8 @@ pub(crate) mod tests {
         let callee = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
-        let (primal, tangent, residual_count) = callee.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
+        let (primal, tangent, residual_count, _) =
+            callee.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         assert_eq!(residual_count, 1);
         assert_eq!(primal.to_string(), callee.linearize().unwrap().primal().to_string());
         assert_eq!(tangent.to_string(), callee.linearize().unwrap().tangent().to_string());
@@ -6570,8 +7121,12 @@ pub(crate) mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
-            TransformArtifact::new(vec![unrelated.clone(), unrelated.clone()], 0),
+            JvpAndLinearizationTransformArguments {
+                input_indices: vec![0],
+                rule: DifferentiationRule::Jvp,
+                instantiated_outputs: vec![true],
+            },
+            TransformArtifact::new(vec![unrelated.clone(), unrelated.clone()], (0, vec![true])),
         );
 
         // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
@@ -6586,8 +7141,8 @@ pub(crate) mod tests {
             &transform_mismatch_message::<LinearizationTransform, _>(
                 &[&unrelated, &unrelated],
                 &[fresh.primal(), fresh.tangent()],
-                "0",
-                &format!("{:?}", fresh.residual_count())
+                "(0, [true])",
+                &format!("{:?}", (fresh.residual_count(), fresh.tangent_output_slots()))
             )
         );
     }
@@ -6611,10 +7166,18 @@ pub(crate) mod tests {
 
         // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule that
         // is not a structural function of its operation would leave behind.
-        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
+        let (primal, tangent, residual_count, tangent_output_slots) =
+            other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
-            TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
+            JvpAndLinearizationTransformArguments {
+                input_indices: vec![0],
+                rule: DifferentiationRule::Jvp,
+                instantiated_outputs: vec![true],
+            },
+            TransformArtifact::new(
+                vec![primal.clone(), tangent.clone()],
+                (residual_count, tangent_output_slots.clone()),
+            ),
         );
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6628,8 +7191,8 @@ pub(crate) mod tests {
             &transform_mismatch_message::<LinearizationTransform, _>(
                 &[&primal, &tangent],
                 &[fresh.primal(), fresh.tangent()],
-                &format!("{residual_count:?}"),
-                &format!("{:?}", fresh.residual_count())
+                &format!("{:?}", (residual_count, &tangent_output_slots)),
+                &format!("{:?}", (fresh.residual_count(), fresh.tangent_output_slots()))
             )
         );
     }
@@ -6649,10 +7212,18 @@ pub(crate) mod tests {
 
         // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule
         // that is not a structural function of the constants it embeds would leave behind.
-        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
+        let (primal, tangent, residual_count, tangent_output_slots) =
+            other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
-            TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
+            JvpAndLinearizationTransformArguments {
+                input_indices: vec![0],
+                rule: DifferentiationRule::Jvp,
+                instantiated_outputs: vec![true],
+            },
+            TransformArtifact::new(
+                vec![primal.clone(), tangent.clone()],
+                (residual_count, tangent_output_slots.clone()),
+            ),
         );
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6666,8 +7237,8 @@ pub(crate) mod tests {
             &transform_mismatch_message::<LinearizationTransform, _>(
                 &[&primal, &tangent],
                 &[fresh.primal(), fresh.tangent()],
-                &format!("{residual_count:?}"),
-                &format!("{:?}", fresh.residual_count())
+                &format!("{:?}", (residual_count, &tangent_output_slots)),
+                &format!("{:?}", (fresh.residual_count(), fresh.tangent_output_slots()))
             )
         );
     }
@@ -6684,7 +7255,7 @@ pub(crate) mod tests {
         let source_cache = program.entry_region().transform_cache.downgrade();
         let materialized = program.entry_region_ref().to_program();
         assert!(program.entry_region().transform_cache.ptr_eq(&materialized.entry_region().transform_cache));
-        let (primal, tangent, _) = materialized.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
+        let (primal, tangent, ..) = materialized.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
 
         drop(program);
         drop(materialized);

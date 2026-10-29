@@ -641,31 +641,46 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
         ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
         ScatterOperation: MemberDifferentiableOperation<C>,
     {
-        let materialized_inputs;
-        let inputs =
+        // Structural zero input tangents whose types name runtime extents, which the type-only `zero` of a projected
+        // array context cannot construct.
+        let runtime_extent_zeros = inputs
+            .iter()
+            .map(|input| {
+                input.tangent().is_zero()
+                    && input
+                        .tangent()
+                        .r#type()
+                        .identities()
+                        .any(|(position, _)| position == TypeIdentityPosition::Reference)
+            })
+            .collect::<Vec<_>>();
+        let materialized_inputs =
             if matches!(self, Self::Complex(_) | Self::Pad(_) | Self::Concatenate(_) | Self::ParallelRaggedAllToAll(_))
                 && inputs.iter().any(|input| !input.tangent().is_zero())
-                && inputs.iter().any(|input| has_runtime_extent_zero_tangent(input.tangent()))
+                && runtime_extent_zeros.contains(&true)
             {
-                materialized_inputs = inputs
-                    .iter()
-                    .map(|input| {
-                        if !has_runtime_extent_zero_tangent(input.tangent()) {
-                            return Ok(input.clone());
-                        }
-                        let tangent_primal = context.primal_to_tangent(input.primal().clone())?;
-                        let tangent = C::Operation::materialize_zero_from_residual_sources(
-                            context.tangent(),
-                            input.tangent().clone(),
-                            std::iter::once(&tangent_primal),
-                        )?;
-                        DifferentiationDual::new(input.primal().clone(), MaybeZero::Value(tangent))
-                    })
-                    .collect::<Result<Vec<_>, DifferentiationError>>()?;
-                materialized_inputs.as_slice()
+                Some(
+                    inputs
+                        .iter()
+                        .zip(&runtime_extent_zeros)
+                        .map(|(input, &runtime_extent_zero)| {
+                            if !runtime_extent_zero {
+                                return Ok(input.clone());
+                            }
+                            let tangent_primal = context.primal_to_tangent(input.primal().clone())?;
+                            let tangent = C::Operation::materialize_zero_from_residual_sources(
+                                context.tangent(),
+                                input.tangent().clone(),
+                                std::iter::once(&tangent_primal),
+                            )?;
+                            DifferentiationDual::new(input.primal().clone(), MaybeZero::Value(tangent))
+                        })
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                )
             } else {
-                inputs
+                None
             };
+        let inputs = materialized_inputs.as_deref().unwrap_or(inputs);
         Ok(match self {
             Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
@@ -807,12 +822,6 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
             operation => rule.apply_projected(context, operation, inputs)?,
         })
     }
-}
-
-/// Returns `true` when `tangent` is a structural zero whose type names a runtime extent, which the type-only `zero` of a
-/// projected array context cannot construct.
-fn has_runtime_extent_zero_tangent<V: Typed<Type = ArrayIrType>>(tangent: &MaybeZero<V>) -> bool {
-    tangent.is_zero() && tangent.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
 }
 
 /// Materializes one array input's forward mode tangent as a concrete projected array value, reading whatever runtime
