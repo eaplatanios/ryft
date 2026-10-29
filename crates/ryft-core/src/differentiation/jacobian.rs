@@ -291,7 +291,7 @@ where
 
     // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
     // Verify that the derived program still satisfies this contract before constructing its packed inputs.
-    let (_, program, residuals, _, _, _) = pushforward.into_parts();
+    let (_, program, residuals, _, _, tangent_output_slots, _) = pushforward.into_parts();
     let program_input_types = program.input_types();
     let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(
@@ -350,10 +350,35 @@ where
     packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
 
     // Replay all basis tangents together. Each packed output now contains the derivative of one output parameter
-    // with respect to every flattened input coordinate.
+    // with respect to every flattened input coordinate. An output parameter without a tangent slot has a structural
+    // zero tangent, so its packed derivative is a zero shared across every direction. Dense coordinate spaces were
+    // validated above, so a type-only zero is sufficient.
     let packed_outputs =
         C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
-    check_count!("output", packed_outputs, output_types.parameter_count(), ProgramError);
+    check_count!("output", tangent_output_slots, output_types.parameter_count(), ProgramError);
+    check_count!(
+        "output",
+        packed_outputs,
+        tangent_output_slots.iter().filter(|&&has_slot| has_slot).count(),
+        ProgramError,
+    );
+    let mut packed_outputs = packed_outputs.into_iter();
+    let packed_outputs = output_types
+        .parameters()
+        .zip(&tangent_output_slots)
+        .map(|(output_type, &has_slot)| {
+            if has_slot {
+                return Ok(packed_outputs.next().unwrap());
+            }
+            let mut zero = context.bind(
+                C::Operation::provide(ZeroOperation::new(output_type.tangent()?), &[])?,
+                Vec::new(),
+                &[],
+            )?;
+            check_count!("output", zero, 1, ProgramError);
+            Ok(C::Type::replicated(zero.remove(0)))
+        })
+        .collect::<Result<Vec<_>, DifferentiationError>>()?;
 
     // Slice each packed output by the coordinate range of each input parameter. Iterating outputs outside inputs
     // produces the output-major/input-minor block order required by `Jacobian`.
@@ -494,10 +519,13 @@ where
     )?;
     let batch_size = output_offsets.last().copied().unwrap();
 
-    // A pullback program consumes one cotangent per output parameter followed by its closed-over primal residuals.
-    // Verify that the derived program exposes that input contract before constructing the packed cotangents.
-    // The reverse Jacobian materializes returned cotangents only, so it takes the reference-free, all-`Return`
-    // transposition of the retained linear program.
+    // A pullback program consumes one cotangent per output parameter with a tangent slot followed by its closed-over
+    // primal residuals. Verify that the derived program exposes that input contract before constructing the packed
+    // cotangents. The reverse Jacobian materializes returned cotangents only, so it takes the reference-free,
+    // all-`Return` transposition of the retained linear program. An output parameter without a tangent slot has a
+    // structural-zero tangent and seeds nothing, so its coordinates receive no contribution and its rows of the
+    // Jacobian are zero.
+    let tangent_output_slots = pullback.tangent_output_slots().to_vec();
     let (transposed, residuals) = pullback.into_transposed_parts()?;
     let program = transposed.program();
     let program_input_types = program.input_types();
@@ -508,40 +536,53 @@ where
             residuals.len(),
         ))
     })?;
-    if cotangent_input_count != output_types.parameter_count() {
+    check_count!("output", tangent_output_slots, output_types.parameter_count(), ProgramError);
+    let seeded_output_count = tangent_output_slots.iter().filter(|&&has_slot| has_slot).count();
+    if cotangent_input_count != seeded_output_count {
         return Err(ProgramError::MalformedProgram(format!(
-            "pullback program consumes {} cotangent inputs but the differentiated output has {} leaves",
-            cotangent_input_count,
-            output_types.parameter_count(),
+            "pullback program consumes {} cotangent inputs but the differentiated output has {} leaves with tangent \
+             slots",
+            cotangent_input_count, seeded_output_count,
         ))
         .into());
     }
 
-    // Construct one packed standard cotangent basis for each output parameter in its assigned coordinate range.
-    // Replicate residuals so every cotangent direction reuses the same primal linearization point.
-    let mut packed_inputs = output_types
-        .named_parameters()
-        .enumerate()
-        .map(|(index, (path, r#type))| {
-            let cotangent_type = r#type.cotangent()?;
-            if cotangent_type.is_zero_space() {
-                return Err(DifferentiationError::NonDifferentiableParameter {
-                    transform: DerivativeTransform::JacobianReverse,
-                    role: DifferentiationParameterRole::Output,
-                    path: path.to_string(),
-                    r#type: r#type.to_string(),
-                });
-            }
-            if program_input_types[index] != cotangent_type {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "pullback cotangent input {} has type {} but output parameter {} has cotangent type {}",
-                    index, program_input_types[index], path, cotangent_type,
-                ))
-                .into());
-            }
-            C::Type::coordinate_basis(context, r#type, &cotangent_type, output_offsets[index], batch_size)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Construct one packed standard cotangent basis in its assigned coordinate range for each output parameter that
+    // the pullback program seeds. Replicate residuals so every cotangent direction reuses the same primal
+    // linearization point.
+    let mut packed_inputs = Vec::with_capacity(seeded_output_count + residuals.len());
+    for (index, ((path, r#type), &has_slot)) in output_types.named_parameters().zip(&tangent_output_slots).enumerate() {
+        let cotangent_type = r#type.cotangent()?;
+        if cotangent_type.is_zero_space() {
+            return Err(DifferentiationError::NonDifferentiableParameter {
+                transform: DerivativeTransform::JacobianReverse,
+                role: DifferentiationParameterRole::Output,
+                path: path.to_string(),
+                r#type: r#type.to_string(),
+            });
+        }
+        if !has_slot {
+            continue;
+        }
+        let program_input_type = &program_input_types[packed_inputs.len()];
+        if program_input_type != &cotangent_type {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pullback cotangent input {} has type {} but output parameter {} has cotangent type {}",
+                packed_inputs.len(),
+                program_input_type,
+                path,
+                cotangent_type,
+            ))
+            .into());
+        }
+        packed_inputs.push(C::Type::coordinate_basis(
+            context,
+            r#type,
+            &cotangent_type,
+            output_offsets[index],
+            batch_size,
+        )?);
+    }
     packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
 
     // Replay all output cotangent directions together. Each packed result corresponds to one input parameter and

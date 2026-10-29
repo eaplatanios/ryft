@@ -1373,6 +1373,11 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// consequently absent from [`linear_program`](Self::linear_program)'s outputs.
     primal_output_types: Vec<C::Type>,
 
+    /// One flag per entry of [`primal_output_types`](Self::primal_output_types) that is set when
+    /// [`linear_program`](Self::linear_program) has an output for that primal output's tangent. Refer to the
+    /// documentation of [`Self::tangent_output_slots`] for more information.
+    tangent_output_slots: Vec<bool>,
+
     /// Runtime identities of every reference bound at the primal boundary (inputs and captures alike), retained so that
     /// a cotangent destination aliasing one of them is rejected on application.
     primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
@@ -1402,8 +1407,15 @@ impl<
         input_structure: Input::ParameterStructure,
         zero_sources: Vec<Option<C::Value>>,
     ) -> Self {
-        let (context, linear_program, residuals, primal_input_types, primal_output_types, primal_references) =
-            pushforward.into_parts();
+        let (
+            context,
+            linear_program,
+            residuals,
+            primal_input_types,
+            primal_output_types,
+            tangent_output_slots,
+            primal_references,
+        ) = pushforward.into_parts();
         Self {
             context,
             linear_program,
@@ -1411,6 +1423,7 @@ impl<
             zero_sources,
             primal_input_types,
             primal_output_types,
+            tangent_output_slots,
             primal_references,
             input_structure,
             marker: PhantomData,
@@ -1475,6 +1488,16 @@ impl<
     #[inline]
     pub fn residuals(&self) -> &[C::Value] {
         &self.residuals
+    }
+
+    // TODO(eaplatanios): Why do we need this function?
+    /// Returns one flag per public primal output that is set when [`linear_program`](Self::linear_program) has an
+    /// output for that primal output's tangent, and so when its transposition has a seed input for that output's
+    /// cotangent (unless the seed is a structural zero or the output is a reference). An unflagged output's seed
+    /// reaches no input of the linear map, so the application validates and then drops it.
+    #[inline]
+    pub fn tangent_output_slots(&self) -> &[bool] {
+        &self.tangent_output_slots
     }
 
     /// Consumes this [`Pullback`] and returns its open parts (i.e., the compact linear pushforward program `(live(ẋ),
@@ -1868,12 +1891,12 @@ impl<
     {
         // Validate the seeds against the complete primal output boundary, including the leaves whose differential
         // spaces contain only zero. Three index spaces meet here: the public output leaves (one seed each), the linear
-        // program's outputs (the public leaves whose differential spaces are not only zero, including reference
-        // outputs), and the transposed program's seed inputs (the linear outputs that are neither references nor
-        // structural zeros). The structural zero mask follows the linear program's outputs. Only information-carrying
-        // values become program inputs because the compact program has no Single Static Assignment (SSA) input for a
-        // zero differential space, none for a structural zero seed, and none for a reference output, whose state
-        // cotangent is owned by the destination of the input root it forwards.
+        // program's outputs (the public leaves that `tangent_output_slots` flags, including reference outputs), and
+        // the transposed program's seed inputs (the linear outputs that are neither references nor structural zeros).
+        // The structural zero mask follows the linear program's outputs. Only information-carrying values become
+        // program inputs because the compact program has no Single Static Assignment (SSA) input for an output without
+        // a tangent slot (e.g., a zero differential space), none for a structural zero seed, and none for a reference
+        // output, whose state cotangent is owned by the destination of the input root it forwards.
         if seeds.len() != self.primal_output_types.len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: self.primal_output_types.len(),
@@ -1882,7 +1905,9 @@ impl<
         }
         let mut program_inputs = Vec::new();
         let mut zero_output_cotangents = Vec::with_capacity(seeds.len());
-        for (index, (seed, primal_type)) in seeds.into_iter().zip(&self.primal_output_types).enumerate() {
+        for (index, ((seed, primal_type), &has_slot)) in
+            seeds.into_iter().zip(&self.primal_output_types).zip(&self.tangent_output_slots).enumerate()
+        {
             let cotangent_type = primal_type.cotangent()?;
             let is_zero = matches!(seed, CotangentSeed::Zero);
             match seed {
@@ -1903,7 +1928,7 @@ impl<
                             cotangent_type,
                         )));
                     }
-                    if !cotangent_type.is_zero_space() {
+                    if has_slot {
                         program_inputs.push(value);
                     }
                 }
@@ -1929,7 +1954,7 @@ impl<
                     }
                 }
             }
-            if !cotangent_type.is_zero_space() {
+            if has_slot {
                 zero_output_cotangents.push(is_zero);
             }
         }
@@ -4619,7 +4644,7 @@ pub(crate) mod tests {
         AddOperation, CastOperation, ConditionOperation, Constant, MulOperation, PrintOperation, ReduceOperation,
         ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
         ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
-        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, ZeroOperation,
+        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, StopGradient, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -5956,6 +5981,15 @@ pub(crate) mod tests {
         // Identity needs no saved primal values to evaluate its pullback.
         let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(Ok).unwrap();
         assert_eq!(pullback.residuals(), &[]);
+    }
+
+    #[test]
+    fn test_pullback_tangent_output_slots() {
+        // The integer output's tangent is a zero differential space, so the linear program has no output for it.
+        let (_, pullback) = differentiate_at((Array::scalar(2.0_f64).unwrap(), Array::scalar(3_i32).unwrap()))
+            .vjp(|(x, n)| Ok::<_, ProgramError>((x.clone() * x, n)))
+            .unwrap();
+        assert_eq!(pullback.tangent_output_slots(), &[true, false]);
     }
 
     #[test]
@@ -9720,6 +9754,68 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_vjp_omits_structural_zero_output_tangents() {
+        // For `f(x, z) = (sin(x), stop_gradient(z))`, the tangent of the second output depends on no input tangent, so
+        // the pullback has no seed input and no extent residual for it, and linearization reads no extent of `z`.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let x = context.input(scalar_type.clone().into());
+        let z = context.input(vector_type.clone().into());
+        let (_, pullback) = context
+            .vjp(
+                |inputs: Vec<LinearizationTracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>, ()| {
+                    Ok(vec![inputs[0].sin()?, inputs[1].stop_gradient()?])
+                },
+                vec![x, z],
+                (),
+            )
+            .unwrap();
+        assert_eq!(pullback.tangent_output_slots(), &[true, false]);
+        assert_eq!(pullback.residuals().len(), 1);
+        assert!(
+            context
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .all(|instruction| instruction.operation().name() != "dimension_size")
+        );
+        assert_eq!(
+            pullback.linear_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[n], %2:f32[] .
+                let %3:f32[] = mul %2 %0
+                in (%3)"}
+        );
+        assert_eq!(
+            pullback.transposed_program(&[]).unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = mul %1 %0
+                in (%2)"}
+        );
+
+        // The seed of the omitted output is still validated, and the gradient of `z` is a structural zero.
+        let (_, pullback) = differentiate_at((Array::scalar(0.5_f64).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap()))
+            .vjp(|(x, z)| Ok::<_, ProgramError>((x.sin()?, z.stop_gradient()?)))
+            .unwrap();
+        assert_eq!(pullback.tangent_output_slots(), &[true, false]);
+        assert!(matches!(
+            pullback.apply_materialized((Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap())),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pullback cotangent 1 has type f64[] but its primal boundary requires cotangent type \
+                    f64[2]",
+        ));
+        let (x_gradient, z_gradient) = pullback
+            .apply_materialized((Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0]).unwrap()))
+            .unwrap();
+        assert_abs_diff_eq!(x_gradient.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-12);
+        assert_eq!(z_gradient, Array::vector(vec![0.0, 0.0]).unwrap());
     }
 
     #[test]

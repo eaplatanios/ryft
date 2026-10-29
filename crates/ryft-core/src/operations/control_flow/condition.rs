@@ -1081,10 +1081,13 @@ where
             let live_input_count = input_indices.len();
             let mut partitions = Vec::with_capacity(2);
             for branch in branches {
-                let (primal, tangent, residual_count) = driver.linearize_program(branch, input_indices)?.into_parts();
+                let linearization =
+                    driver.linearize_program_with_instantiated_outputs(branch, input_indices, &output_activity)?;
+                let branch_tangent_slots = linearization.tangent_output_positions(&output_activity)?;
+                let (primal, tangent, residual_count, _) = linearization.into_parts();
                 partitions.push(PartitionedProgram::from_parts(
                     Arc::unwrap_or_clone(primal),
-                    tangent.with_outputs(&live_tangent_slots)?,
+                    tangent.with_outputs(&branch_tangent_slots)?,
                     primal_input_count + live_input_count,
                     (0..primal_input_count).collect(),
                     (primal_input_count..primal_input_count + live_input_count)
@@ -13231,8 +13234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_differentiation_jvp_receives_projection_materialized_zero_tangents() {
-        // The `stop_gradient` projection owns the shaped-zero materialization; no test in this module owns it.
+    fn test_condition_differentiation_jvp_receives_projection_structural_zero_tangents() {
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let branch = || {
@@ -13262,9 +13264,9 @@ mod tests {
         let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
 
-        // In the array IR family, the projection of `stop_gradient` materializes the severed tangent of the last
-        // instruction input as a zero shaped by its primal's runtime extent, so that tangent reaches the condition rule
-        // as a live value rather than as a structural zero.
+        // In the array IR family, the projection of `stop_gradient` keeps the severed tangent of the last instruction
+        // input a structural zero even though its type names a runtime extent, so that tangent reaches the condition
+        // rule as a structural zero rather than as a materialized live value.
         let severed = builder
             .add_instruction(
                 TestIrOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
@@ -13290,8 +13292,8 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![outputs[1]], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
-        // The projection, not the condition rule, reads the severed primal's runtime extent to construct the dynamic
-        // zero, and the condition differentiates that materialized tangent like any other live tangent.
+        // Neither the projection nor the condition rule reads the severed primal's runtime extent: the condition
+        // receives only the live tangent of `left`, and its output tangent is that tangent alone.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -13299,25 +13301,19 @@ mod tests {
                 lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:f64[extent], \
                     %4:f64[extent], %5:f64[extent] .
                 let %6:f64[extent] = stop_gradient %3
-                    %7:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %6
-                    %8:f64[extent] = zero [type=f64[extent]] %7
-                    %9:dimension<extent ∈ [1, 8)>, %10:f64[extent], %11:f64[extent] = condition %0 %1 %2 %6 %4 %8 [
+                    %7:dimension<extent ∈ [1, 8)>, %8:f64[extent], %9:f64[extent] = condition %0 %1 %2 %6 %4 [
                         true={
-                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], \
-                                %3:f64[extent], %4:f64[extent] .
-                            let %5:f64[extent] = add %1 %2
-                                %6:f64[extent] = add %3 %4
-                            in (%0, %5, %6)
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], %3:f64[extent] .
+                            let %4:f64[extent] = add %1 %2
+                            in (%0, %4, %3)
                         },
                         false={
-                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], \
-                                %3:f64[extent], %4:f64[extent] .
-                            let %5:f64[extent] = add %1 %2
-                                %6:f64[extent] = add %3 %4
-                            in (%0, %5, %6)
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], %3:f64[extent] .
+                            let %4:f64[extent] = add %1 %2
+                            in (%0, %4, %3)
                         },
                     ]
-                in (%10, %11)
+                in (%8, %9)
             "}
             .trim_end(),
         );

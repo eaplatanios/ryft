@@ -2611,9 +2611,13 @@ where
         let body = driver.region(1)?;
         let activity = &self.activity;
         let input_indices = activity.input_indices();
-        let live_tangent_slots = activity.live_tangent_slots(activity.output_tangent_liveness());
-        let (primal_program, tangent_program, residual_count) =
-            driver.linearize_program(body, input_indices)?.into_parts();
+        let linearization = driver.linearize_program_with_instantiated_outputs(
+            body,
+            input_indices,
+            activity.output_tangent_liveness(),
+        )?;
+        let live_tangent_slots = linearization.tangent_output_positions(activity.output_tangent_liveness())?;
+        let (primal_program, tangent_program, residual_count, _) = linearization.into_parts();
         let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
         let residual_types = primal_program.output_types().split_off(state_count);
         check_count!("output", residual_types, residual_count, ProgramError);

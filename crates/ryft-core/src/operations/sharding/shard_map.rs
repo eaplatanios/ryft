@@ -3890,8 +3890,9 @@ where
         .enumerate()
         .filter_map(|(index, &active)| active.then_some(index))
         .collect::<Vec<_>>();
-    let linearization = driver.linearize_program(body, &input_indices)?;
-    let (primal_program, tangent_program, residual_count) = linearization.into_parts();
+    let linearization = driver.linearize_program_with_instantiated_outputs(body, &input_indices, &[])?;
+    let (primal_program, tangent_program, residual_count, tangent_slots) = linearization.into_parts();
+
     // Linearization validates this partition: the tangent inputs precede the trailing primal residuals. Dependence
     // must start from that compact tangent-input prefix, not from the original primal input indices or the residuals.
     let tangent_input_count = tangent_program.input_count() - residual_count;
@@ -3899,7 +3900,6 @@ where
     // Map compact tangent outputs back to primal output order, excluding the primal program's trailing residuals.
     // Zero differential spaces and inactive reference outputs have no tangent slot and consume no dependence entry.
     // Every remaining output that depends on no tangent input is a structural zero, so it does not cross the boundary.
-    let tangent_slots = primal_program.entry_region_ref().tangent_output_mask(&input_indices)?;
     let mut dependence = tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
     let output_activity = tangent_slots[..output_count]
         .iter()

@@ -1276,7 +1276,7 @@ where
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
-        let linearization = driver.linearize_program(callee, &input_indices)?;
+        let linearization = driver.linearize_program_with_instantiated_outputs(callee, &input_indices, &[])?;
 
         // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
         // output computed only from inactive inputs) is a structural zero (JAX's `which_nz_out`), so the tangent callee
@@ -1289,7 +1289,7 @@ where
         // boundaries, so subtracting the residual count cannot underflow.
         let tangent_program = linearization.tangent();
         let tangent_input_count = tangent_program.input_count() - linearization.residual_count();
-        let tangent_slots = linearization.primal().entry_region_ref().tangent_output_mask(&input_indices)?;
+        let tangent_slots = linearization.tangent_output_slots().to_vec();
         let mut dependence =
             tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
 
@@ -1322,7 +1322,7 @@ where
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect();
         }
-        let (primal_program, _, _) = linearization.into_parts();
+        let (primal_program, ..) = linearization.into_parts();
 
         // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
         // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so

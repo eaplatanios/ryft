@@ -417,7 +417,8 @@ impl_differentiable_operation! {
 
             // Separate contexts replay the primal first, then transfer its saved residuals into the tangent context.
             // Linearizing through the driver preserves the active differentiation rules and policy.
-            let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[0])?;
+            let linearization =
+                driver.linearize_program_with_instantiated_outputs(decomposition.entry_region_ref(), &[0], &[])?;
             let mut primal_outputs =
                 linearization.primal().interpret_in_context(context.primal(), vec![primal_input.clone()])?;
             check_count!("output", primal_outputs, 1 + linearization.residual_count(), ProgramError);
@@ -428,11 +429,11 @@ impl_differentiable_operation! {
             );
             let mut tangent_outputs =
                 linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
-            check_count!("output", tangent_outputs, 1, ProgramError);
-            Ok(vec![DifferentiationDual::new(
-                primal_outputs.remove(0),
-                MaybeZero::Value(tangent_outputs.remove(0)),
-            )?])
+            check_count!("output", tangent_outputs, usize::from(linearization.tangent_output_slots()[0]), ProgramError);
+            Ok(vec![match tangent_outputs.pop() {
+                Some(tangent) => DifferentiationDual::new(primal_outputs.remove(0), MaybeZero::Value(tangent))?,
+                None => DifferentiationDual::new_with_zero_tangent(primal_outputs.remove(0))?,
+            }])
         }
     },
     transpose<V, O>

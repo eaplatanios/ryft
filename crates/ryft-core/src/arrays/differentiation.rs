@@ -608,8 +608,11 @@ where
 }
 
 impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
-    /// Applies the explicitly selected member [`DifferentiationRule`] and materializes parent universe
-    /// structural zero values.
+    /// Applies the explicitly selected member [`DifferentiationRule`]. Structural zero output tangents stay structural,
+    /// including those whose types name runtime extents: a consumer that needs a concrete zero reads those extents from
+    /// a primal that it owns (e.g., through [`materialize_array_tangent`], or at a linearization or fused
+    /// Jacobian-Vector Product output boundary), so a zero that nothing consumes stages nothing, and
+    /// linearization can omit it from its tangent program.
     fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -636,7 +639,7 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
         ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
         ScatterOperation: MemberDifferentiableOperation<C>,
     {
-        let output_duals = match self {
+        Ok(match self {
             Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::DynamicSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
@@ -775,32 +778,7 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
                 rule.apply_projected(context, operation, replicated.as_deref().unwrap_or(inputs))?
             }
             operation => rule.apply_projected(context, operation, inputs)?,
-        };
-        output_duals
-            .into_iter()
-            .map(|output| {
-                let tangent_type = output.tangent().r#type().into_owned();
-                if !output.tangent().is_zero()
-                    || tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
-                {
-                    return Ok(output);
-                }
-
-                // A projected rule can return a structural zero whose shape still has runtime extents. Capture
-                // those extents from the primal in the tangent context, then let the mixed family's residual-zero
-                // protocol construct the tangent with its own element type. For example, transposing integer indices
-                // of shape `[1, items, 1]` produces a zero-typed tangent of shape `[items, 1, 1]`: converting the
-                // integer primal to `zero` is invalid, but its runtime `items` extent still defines that zero.
-                let (primal, tangent) = output.into_parts();
-                let tangent_primal = context.primal_to_tangent(primal.clone())?;
-                let tangent = C::Operation::materialize_zero_from_residual_sources(
-                    context.tangent(),
-                    tangent,
-                    std::iter::once(&tangent_primal),
-                )?;
-                DifferentiationDual::new(primal, MaybeZero::Value(tangent))
-            })
-            .collect()
+        })
     }
 }
 
@@ -1789,6 +1767,7 @@ mod tests {
         let dynamic_shape = Shape::new(vec![Dimension::Dynamic(extent)]);
 
         // These cases use ordinary projected rules: static results, aligned dynamic inputs, and zero tangent spaces.
+        // The structural zero output tangents stay structural, so nothing reads the runtime extents of dynamic results.
         for (left_type, right_type, expected) in [
             (
                 ArrayType::scalar(DataType::F64),
@@ -1806,8 +1785,6 @@ mod tests {
                 indoc! {"
                     lambda %0:f64[extent], %1:f64[extent] .
                     let %2:f64[extent] = mul %0 %1
-                        %3:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %2
-                        %4:f64[extent] = zero [type=f64[extent]] %3
                     in (%2)
                 "}
                 .trim_end(),
@@ -1818,8 +1795,6 @@ mod tests {
                 indoc! {"
                     lambda %0:i32[], %1:i32[extent] .
                     let %2:i32[extent] = mul %0 %1
-                        %3:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %2
-                        %4:zero[extent] = zero [type=zero[extent]] %3
                     in (%2)
                 "}
                 .trim_end(),
@@ -1881,8 +1856,6 @@ mod tests {
             indoc! {"
                 lambda %0:i32[1, extent, 1] .
                 let %1:i32[extent, 1, 1] = transpose [permutation=[1, 0, 2]] %0
-                    %2:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %1
-                    %3:zero[extent, 1, 1] = zero [type=zero[extent, 1, 1]] %2
                 in (%1)
             "}
             .trim_end(),

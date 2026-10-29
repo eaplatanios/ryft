@@ -1918,55 +1918,65 @@ where
         _ => Ok(None),
     };
 
+    // Pairs the tangents of one derivative path with the outputs that `slots` flags, in output order, leaving the other
+    // outputs without a tangent.
+    let distribute = |tangents: Vec<C::Value>, slots: &[bool]| {
+        check_count!("output", tangents, slots.iter().filter(|&&has_slot| has_slot).count(), ProgramError);
+        let mut tangents = tangents.into_iter();
+        Ok::<_, ProgramError>(slots.iter().map(|&has_slot| has_slot.then(|| tangents.next().unwrap())).collect())
+    };
+
     // A fused differentiation context stages primal and tangent work in the same context, so the fused JVP program
     // replays there directly. Otherwise, the linearized primal replays in the primal context and its tangent map
-    // replays in the tangent context over the residuals.
-    let (outputs, output_tangents) = if std::ptr::eq(context.primal(), context.tangent()) {
-        let program = jvp_program;
-        let mut values = primals;
-        values.extend(tangents);
-        let mut outputs = match derived_call(CustomRuleDerivationKind::Jvp)? {
-            Some(operation) => context.primal().bind(operation, vec![(*program).clone()], values.as_slice())?,
-            None => program.interpret_in_context(context.primal(), values)?,
+    // replays in the tangent context over the residuals. Each path pairs its tangents with the outputs that it gives a
+    // tangent slot: the derivative program's slots follow `output_activity`, and the linearization reports its own.
+    let (outputs, output_tangents): (Vec<_>, Vec<Option<C::Value>>) =
+        if std::ptr::eq(context.primal(), context.tangent()) {
+            let program = jvp_program;
+            let mut values = primals;
+            values.extend(tangents);
+            let mut outputs = match derived_call(CustomRuleDerivationKind::Jvp)? {
+                Some(operation) => context.primal().bind(operation, vec![(*program).clone()], values.as_slice())?,
+                None => program.interpret_in_context(context.primal(), values)?,
+            };
+            let output_tangents = outputs.split_off(output_count);
+            (outputs, distribute(output_tangents, &output_activity)?)
+        } else if let Some(call) = call.filter(|_| primal_region.effects() == EffectsSummary::PURE) {
+            // The known side computes the outputs with the call itself, and the tangent side stages a pushforward call
+            // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is only
+            // valid for a pure primal: the effects of any other primal (e.g., reference updates, or reference reads that
+            // later effects would change) must run once, when the known side runs, so it is linearized inline instead.
+            let pushforward =
+                jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
+            let outputs = context.primal().bind(call.clone(), vec![primal_region.to_program()], primals.as_slice())?;
+            let mut tangent_inputs =
+                primals.into_iter().map(|primal| context.primal_to_tangent(primal)).collect::<Result<Vec<_>, _>>()?;
+            tangent_inputs.extend(tangents);
+            let operation = derived_call(CustomRuleDerivationKind::Pushforward)?.unwrap();
+            let output_tangents = context.tangent().bind(operation, vec![pushforward], tangent_inputs.as_slice())?;
+            (outputs, distribute(output_tangents, &output_activity)?)
+        } else {
+            let linearization =
+                driver.linearize_program_with_instantiated_outputs(primal_region, &input_indices, &[])?;
+            let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
+            let residuals = outputs.split_off(output_count);
+            let mut tangent_inputs = tangents;
+            for residual in residuals {
+                tangent_inputs.push(context.primal_to_tangent(residual)?);
+            }
+            let output_tangents = linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
+            (outputs, distribute(output_tangents, linearization.tangent_output_slots())?)
         };
-        let output_tangents = outputs.split_off(output_count);
-        (outputs, output_tangents)
-    } else if let Some(call) = call.filter(|_| primal_region.effects() == EffectsSummary::PURE) {
-        // The known side computes the outputs with the call itself, and the tangent side stages a pushforward call
-        // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is only
-        // valid for a pure primal: the effects of any other primal (e.g., reference updates, or reference reads that
-        // later effects would change) must run once, when the known side runs, so it is linearized inline instead.
-        let pushforward = jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
-        let outputs = context.primal().bind(call.clone(), vec![primal_region.to_program()], primals.as_slice())?;
-        let mut tangent_inputs =
-            primals.into_iter().map(|primal| context.primal_to_tangent(primal)).collect::<Result<Vec<_>, _>>()?;
-        tangent_inputs.extend(tangents);
-        let operation = derived_call(CustomRuleDerivationKind::Pushforward)?.unwrap();
-        (outputs, context.tangent().bind(operation, vec![pushforward], tangent_inputs.as_slice())?)
-    } else {
-        let linearization = driver.linearize_program(primal_region, &input_indices)?;
-        let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
-        let residuals = outputs.split_off(output_count);
-        let mut tangent_inputs = tangents;
-        for residual in residuals {
-            tangent_inputs.push(context.primal_to_tangent(residual)?);
-        }
-        (outputs, linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?)
-    };
     check_count!("output", outputs, output_count, ProgramError);
-    check_count!("output", output_tangents, output_activity.iter().filter(|&&active| active).count(), ProgramError);
-    // The tangents of outputs that are not live are unused zeros, which dead-code elimination removes.
-    let mut output_tangents = output_tangents.into_iter();
+
+    // The tangents of outputs that are not live are unused zeros, which dead code elimination removes.
     outputs
         .into_iter()
-        .zip(output_activity)
+        .zip(output_tangents)
         .zip(output_liveness)
-        .map(|((primal, has_tangent), live)| {
-            let tangent = has_tangent.then(|| output_tangents.next().unwrap());
-            match tangent.filter(|_| live) {
-                Some(tangent) => DifferentiationDual::new(primal, MaybeZero::Value(tangent)),
-                None => DifferentiationDual::new_with_zero_tangent(primal),
-            }
+        .map(|((primal, tangent), live)| match tangent.filter(|_| live) {
+            Some(tangent) => DifferentiationDual::new(primal, MaybeZero::Value(tangent)),
+            None => DifferentiationDual::new_with_zero_tangent(primal),
         })
         .collect::<Result<Vec<_>, _>>()
 }

@@ -596,13 +596,17 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     // The program is linearized with the `jvp_for_transpose` rules that reverse mode differentiation uses, which can
-    // save different values than the `jvp` rules (e.g., for composites with distinct rules).
+    // save different values than the `jvp` rules (e.g., for composites with distinct rules). Like the linearization
+    // of reverse mode differentiation, it instantiates no structural zero output tangent, so the reported residuals
+    // exclude those that would only size such zeros.
     let (_, program) = TracingContext::<V, O>::trace(function, input_types)?;
     let program = program.into_flat_program();
     let input_indices = (0..program.input_ids().len()).collect::<Vec<_>>();
-    let linearization = program
-        .entry_region_ref()
-        .linearize_shared_for_rule(&input_indices, DifferentiationRule::JvpForTranspose)?;
+    let linearization = program.entry_region_ref().linearize_shared_for_rule_with_instantiated_outputs(
+        &input_indices,
+        DifferentiationRule::JvpForTranspose,
+        &[],
+    )?;
     let primal = linearization.primal();
     let instruction_by_output = primal.instruction_by_output();
     let output_ids = primal.output_ids();

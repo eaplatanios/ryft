@@ -3311,12 +3311,16 @@ impl<C: Context<Type: ScanType + DifferentiableType>> ScanJvp<C> {
         let body_input_count = self.input_order.len() - self.activity.input_indices().len();
         let body_output_count = self.activity.output_tangent_liveness().len();
         let live_input_count = self.activity.input_indices().len();
-        let (primal_program, tangent_program, residual_count) =
-            driver.linearize_program(body, self.activity.input_indices())?.into_parts();
+        let linearization = driver.linearize_program_with_instantiated_outputs(
+            body,
+            self.activity.input_indices(),
+            self.activity.output_tangent_liveness(),
+        )?;
 
-        // The linearized tangent program returns one tangent per output tangent slot, so the structural zeros that the
-        // fixed point identified are projected out exactly as for the fused body.
-        let live_tangent_slots = self.activity.live_tangent_slots(self.activity.output_tangent_liveness());
+        // The structural zeros that the fixed point identified are projected out of the linearized tangent program,
+        // exactly as for the fused body, at the positions of the live output tangents among its outputs.
+        let live_tangent_slots = linearization.tangent_output_positions(self.activity.output_tangent_liveness())?;
+        let (primal_program, tangent_program, residual_count, _) = linearization.into_parts();
         let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
         let mut fused_input_types = body.input_types();
         fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
@@ -16857,27 +16861,33 @@ mod tests {
     fn test_scan_differentiation_linearizes_zero_iteration_count_reference_carries() {
         // Restoring a dimension shared by a numeric carry and a reference carry must keep one nominal identity.
         // Cover an empty scan and a pass-through scan, with the numeric carry tangent active or structural zero.
+        // A structural zero carry tangent is not live, so the body linearization omits it together with the stacked
+        // dimension residual that would only size it, and the primal scan of the empty scan folds away.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()]));
         let body = pass_through_body(&[vector_type.clone().into(), ReferenceType::new(vector_type).into()]);
+        let folded_primal_rendering = indoc! {"
+            lambda %0:f32[n], %1:ref<f32[n]> .
+            let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+            in (%0, %1, %2)"};
         for length in [0, 2] {
             let program = single_scan_program(&body, 2, length);
-            let (primal_rendering, tangent_renderings) = if length == 0 {
-                (
-                    indoc! {"
-                        lambda %0:f32[n], %1:ref<f32[n]> .
-                        let %2:f32[n], %3:ref<f32[n]>, %4:i64[0] = scan [carry_count=2, iteration_count=0, \
-                        reverse=false] %0 %1 [
-                            body={
-                                lambda %0:i64[], %1:f32[n], %2:ref<f32[n]> .
-                                let %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %1
-                                    %4:i64[] = dimension_to_scalar %3
-                                in (%1, %2, %4)
-                            },
-                        ]
-                            %5:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                        in (%0, %1, %4, %5)"},
-                    [
+            let renderings = if length == 0 {
+                [
+                    (
+                        indoc! {"
+                            lambda %0:f32[n], %1:ref<f32[n]> .
+                            let %2:f32[n], %3:ref<f32[n]>, %4:i64[0] = scan [carry_count=2, iteration_count=0, \
+                            reverse=false] %0 %1 [
+                                body={
+                                    lambda %0:i64[], %1:f32[n], %2:ref<f32[n]> .
+                                    let %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %1
+                                        %4:i64[] = dimension_to_scalar %3
+                                    in (%1, %2, %4)
+                                },
+                            ]
+                                %5:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                            in (%0, %1, %4, %5)"},
                         indoc! {"
                             lambda %0:f32[n], %1:ref<f32[n]>, %2:i64[0], %3:dimension<n ∈ [1, 8)> .
                             let %4:f32[n], %5:ref<f32[n]> = scan [carry_count=2, iteration_count=0, reverse=false] %0 \
@@ -16888,25 +16898,25 @@ mod tests {
                                 },
                             ]
                             in (%0, %5)"},
+                    ),
+                    (
+                        folded_primal_rendering,
                         indoc! {"
-                            lambda %0:ref<f32[n]>, %1:i64[0], %2:dimension<n ∈ [1, 8)> .
-                            let %3:f32[n] = zero [type=f32[n]] %2
-                                %4:ref<f32[n]> = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
+                            lambda %0:ref<f32[n]>, %1:dimension<n ∈ [1, 8)> .
+                            let %2:f32[n] = zero [type=f32[n]] %1
+                                %3:ref<f32[n]> = scan [carry_count=1, iteration_count=0, reverse=false] %0 [
                                     body={
-                                        lambda %0:i64[], %1:ref<f32[n]>, %2:i64[] .
+                                        lambda %0:i64[], %1:ref<f32[n]> .
                                         in (%1)
                                     },
                                 ]
-                            in (%3, %4)"},
-                    ],
-                )
+                            in (%2, %3)"},
+                    ),
+                ]
             } else {
-                (
-                    indoc! {"
-                        lambda %0:f32[n], %1:ref<f32[n]> .
-                        let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                        in (%0, %1, %2)"},
-                    [
+                [
+                    (
+                        folded_primal_rendering,
                         indoc! {"
                             lambda %0:f32[n], %1:ref<f32[n]>, %2:dimension<n ∈ [1, 8)> .
                             let %3:f32[n], %4:ref<f32[n]> = scan [carry_count=2, iteration_count=2, reverse=false] %0 \
@@ -16917,6 +16927,9 @@ mod tests {
                                 },
                             ]
                             in (%0, %4)"},
+                    ),
+                    (
+                        folded_primal_rendering,
                         indoc! {"
                             lambda %0:ref<f32[n]>, %1:dimension<n ∈ [1, 8)> .
                             let %2:f32[n] = zero [type=f32[n]] %1
@@ -16927,10 +16940,12 @@ mod tests {
                                     },
                                 ]
                             in (%2, %3)"},
-                    ],
-                )
+                    ),
+                ]
             };
-            for (input_indices, tangent_rendering) in [vec![0, 1], vec![1]].into_iter().zip(tangent_renderings) {
+            for (input_indices, (primal_rendering, tangent_rendering)) in
+                [vec![0, 1], vec![1]].into_iter().zip(renderings)
+            {
                 let linearization = program.linearize_with_respect_to(&input_indices).unwrap();
                 assert_eq!(linearization.primal().to_string(), primal_rendering);
                 assert_eq!(linearization.tangent().to_string(), tangent_rendering);
@@ -16938,7 +16953,7 @@ mod tests {
                 let reference =
                     TestIrValue::Reference(ArrayReference::new(Array::vector(vec![4f32, 5.0, 6.0]).unwrap()));
                 let mut expected = vec![vector.clone(), reference.clone()];
-                if length == 0 {
+                if primal_rendering != folded_primal_rendering {
                     expected.push(array(Array::vector(Vec::<i64>::new()).unwrap()));
                 }
                 expected.push(dimension(&n_type, 3));

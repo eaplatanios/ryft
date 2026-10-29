@@ -2911,7 +2911,7 @@ mod tests {
         // `[ȳ, r̄]` and returns `[r̄, x̄]`, where the destination is returned by identity. The stateful ABI cannot
         // return a forwarded reference, so the compiled closure keeps `x̄` and lets the destination commit as a public
         // holder.
-        let (_, tangent, residual_count) =
+        let (_, tangent, residual_count, _) =
             accumulate_and_read_program(&reference_type, &array_type).linearize().unwrap().into_parts();
         assert_eq!(residual_count, 0);
         let pullback = tangent
@@ -3743,7 +3743,7 @@ mod tests {
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
         let array_type = <&ArrayType>::try_from(&input_types[1]).unwrap().clone();
         input_types.extend(input_types.clone());
-        let (primal, tangent, _) = program.linearize().unwrap().into_parts();
+        let (primal, tangent, ..) = program.linearize().unwrap().into_parts();
         let pullback = tangent
             .transpose_with_respect_to(
                 &[0, 1],
@@ -6446,7 +6446,7 @@ mod tests {
         // Re-wrap the two halves as a compiled `(x, dx) -> (primal, tangent)` function. This mirrors the
         // structure the value-level reroute will stage and exercises the real XLA lowering and execution of both
         // jit_call boundaries.
-        let (primal_half, tangent_half, residual_count) = linearization.into_parts();
+        let (primal_half, tangent_half, residual_count, _) = linearization.into_parts();
         let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal_input, tangent_input)| {
                 let context = primal_input.value().context().clone();

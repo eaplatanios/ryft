@@ -594,7 +594,7 @@ where
 
         // Differentiate the dependence on residual parameters as well as the map's linear arguments.
         let input_indices = (0..forward.input_ids().len()).collect::<Vec<_>>();
-        let linearization = driver.linearize_program(forward, &input_indices)?;
+        let linearization = driver.linearize_program_with_instantiated_outputs(forward, &input_indices, &[])?;
         let output_types = forward.output_types();
         let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
         let residuals = outputs.split_off(output_types.len());
@@ -618,16 +618,20 @@ where
             residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
         );
         let tangent_outputs = linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
+        let tangent_output_slots = linearization.tangent_output_slots();
+        check_count!(
+            "output",
+            tangent_outputs,
+            tangent_output_slots.iter().filter(|&&has_slot| has_slot).count(),
+            ProgramError,
+        );
         let mut tangent_outputs = tangent_outputs.into_iter();
         outputs
             .into_iter()
-            .zip(output_types)
-            .map(|(primal, output_type)| {
-                if output_type.tangent()?.is_zero_space() {
-                    DifferentiationDual::new_with_zero_tangent(primal)
-                } else {
-                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
-                }
+            .zip(tangent_output_slots)
+            .map(|(primal, &has_slot)| match has_slot {
+                true => DifferentiationDual::new(primal, tangent_outputs.next().unwrap()),
+                false => DifferentiationDual::new_with_zero_tangent(primal),
             })
             .collect::<Result<Vec<_>, _>>()
     }
