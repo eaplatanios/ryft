@@ -1,15 +1,8 @@
-//! The [`Composite`] builder, which pairs a primal closure with structured rule closures. Each call of a composite
-//! stages a [`CompositeOperation`] with retained rules.
-
-// TODO(eaplatanios): Review this module.
-
 use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
-
-use thiserror::Error;
 
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
@@ -42,40 +35,8 @@ use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 #[cfg(doc)]
 use crate::programs::Program;
 
-/// Error returned by [`check_batching_rule_consistency`].
-#[derive(Error, Clone, Debug, PartialEq)]
-pub enum BatchingRuleConsistencyError {
-    /// Broadcasting a replicated input changes a batched output, so the batching rule behind the function depends on
-    /// its input batch axes beyond computing the batched function (refer to
-    /// [`Composite::with_broadcast_sensitive_batching`]).
-    #[error("broadcasting the replicated input leaf {input} changes the batched output leaf {output}")]
-    Inconsistent {
-        /// Index of the replicated input leaf whose broadcast changes the batched outputs.
-        input: usize,
-
-        /// Index of the first batched output leaf that changes.
-        output: usize,
-    },
-
-    /// Batching the function failed.
-    #[error(transparent)]
-    Batching(#[from] BatchingError),
-}
-
-/// [`Context`] in which [`Composite`]s can be called (refer to [`Composite::call`]). It names, once, what a call
-/// requires of the context's universe: the context resolves named axes (with which the primal and the rules are
-/// traced), its types are differentiable and batchable with a batching policy that can batch traced rule programs and
-/// sum the cotangents of replicated inputs, its constants and operations are `'static`, and its constants, operations,
-/// types, and type identities are [`Send`] and [`Sync`], because the registered rule definitions and their
-/// specialization caches store them and are shared across threads (which is also what makes each
-/// [`CustomRuleRegistration`] [`Send`]). Wrappers around a [`Composite`] state this one bound for their context instead
-/// of restating those requirements. It is implemented for every context that satisfies them.
-///
-/// The bound covers only requirements on the context and its associated types, which Rust propagates from a trait
-/// bound. The requirements that [`Composite::call`] places on its configurations (e.g.,
-/// `CustomRuleDefinition<C::Constant, C::Operation>: CompositeVjp<Vjp, DomainTracer<C>, Input, Output>`), and on its
-/// input and output structures concern other types, so a generic wrapper whose configuration is not one of the
-/// defaults still states them separately.
+/// Collects the [`Context`] bounds required by [`Composite::call`], so that wrappers can reuse them. Implemented for
+/// every context that satisfies these bounds. The call's input, output, and rule configuration bounds remain separate.
 pub trait CompositeCallContext:
     NamedAxes
     + Context<
@@ -114,10 +75,15 @@ impl<C> CompositeCallContext for C where
 {
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Retained definitions that one [`Composite`] registered, one per operation family, call structure (i.e., input and
 /// output parameter structure), and visible named axes. The registration handles live as long as the composite, so
 /// every call staged by the composite shares the specialization caches of its structure and named axes until the
 /// composite is dropped.
+///
+/// Entries erase their constant, operation, and parameter structure types behind [`Any`], which requires those types
+/// to be `'static`. Registrations must also be [`Send`] so this registry can be shared through its mutex.
 #[derive(Default)]
 struct CompositeRegistrations {
     /// Registrations, each a [`CompositeRegistration`] of some family and structure types.
@@ -1346,15 +1312,15 @@ pub fn composite<Input, Output, Primal: 'static + Fn(Input) -> Result<Output, Pr
 ///
 /// # Errors
 ///
-/// Returns [`BatchingRuleConsistencyError::Inconsistent`] for the first replicated input leaf whose broadcast changes
-/// a batched output leaf, and [`BatchingRuleConsistencyError::Batching`] when batching fails.
+/// Returns [`BatchingError::BroadcastInvarianceViolation`] for the first replicated input leaf whose broadcast changes
+/// a batched output leaf. Failures during batching propagate as their existing [`BatchingError`] variants.
 pub fn check_batching_rule_consistency<V, F, Input, Output, Specification, Equivalent>(
     function: F,
     input: Input,
     input_batch_axes: Input::To<BatchAxis>,
     batch_axis: Specification,
     equivalent: Equivalent,
-) -> Result<(), BatchingRuleConsistencyError>
+) -> Result<(), BatchingError>
 where
     V: Value<Domain: Batch>,
     F: Fn(Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<Output, ProgramError>,
@@ -1374,10 +1340,9 @@ where
     let structure = input.parameter_structure();
     let inputs = input.into_parameters().collect::<Vec<_>>();
     let input_axes = input_batch_axes.into_parameters().collect::<Vec<_>>();
-    let batched = |inputs: Vec<V>, input_axes: Vec<BatchAxis>| -> Result<Vec<V>, BatchingRuleConsistencyError> {
-        let input = Input::from_parameters(structure.clone(), inputs).map_err(BatchingError::from)?;
-        let input_axes =
-            Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes).map_err(BatchingError::from)?;
+    let batched = |inputs: Vec<V>, input_axes: Vec<BatchAxis>| -> Result<Vec<V>, BatchingError> {
+        let input = Input::from_parameters(structure.clone(), inputs)?;
+        let input_axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes)?;
         let outputs = batch(|input| function(input), input, input_axes, BatchAxis::new(0), batch_axis.clone())?;
         Ok(outputs.into_parameters().collect())
     };
@@ -1388,9 +1353,8 @@ where
         }
         // The leaf is broadcast by a batch of the complete input that returns only that leaf, so that its extent is
         // inferred exactly as in the batches that it is compared with.
-        let input_value = Input::from_parameters(structure.clone(), inputs.clone()).map_err(BatchingError::from)?;
-        let axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone())
-            .map_err(BatchingError::from)?;
+        let input_value = Input::from_parameters(structure.clone(), inputs.clone())?;
+        let axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone())?;
         let broadcast: V = batch(
             |tracers: Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>| {
                 Ok(tracers.into_parameters().nth(input).unwrap())
@@ -1407,7 +1371,7 @@ where
         let actual = batched(broadcast_inputs, broadcast_axes)?;
         if let Some(output) = expected.iter().zip(&actual).position(|(expected, actual)| !equivalent(expected, actual))
         {
-            return Err(BatchingRuleConsistencyError::Inconsistent { input, output });
+            return Err(BatchingError::BroadcastInvarianceViolation { input, output });
         }
     }
     Ok(())
@@ -5835,7 +5799,7 @@ mod tests {
 
     #[test]
     fn test_check_batching_rule_consistency() {
-        // A rule that computes `2xy` when both inputs are mapped and `3xy` otherwise changes its batched output when the
+        // A rule that computes `2xy` when both inputs are mapped and `xy` otherwise changes its batched output when the
         // replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
         type Tracer = DomainTracer<ArrayContext>;
         let scaled_product = |inconsistent: bool| {
@@ -5866,7 +5830,7 @@ mod tests {
             )
         };
         assert_eq!(check(false), Ok(()));
-        assert_eq!(check(true), Err(BatchingRuleConsistencyError::Inconsistent { input: 1, output: 0 }));
+        assert_eq!(check(true), Err(BatchingError::BroadcastInvarianceViolation { input: 1, output: 0 }));
 
         // Every input of a fully replicated batch is broadcast in turn, which requires an explicit extent.
         let function = scaled_product(true);
@@ -5879,6 +5843,20 @@ mod tests {
                 |expected: &Array, actual: &Array| expected == actual,
             ),
             Ok(()),
+        );
+    }
+
+    #[test]
+    fn test_check_batching_rule_consistency_batching_error() {
+        assert_eq!(
+            check_batching_rule_consistency(
+                |input| Ok(input),
+                Array::scalar(1f64).unwrap(),
+                BatchAxis::replicated(),
+                None,
+                |expected: &Array, actual: &Array| expected == actual,
+            ),
+            Err(BatchingError::EmptyBatch),
         );
     }
 }

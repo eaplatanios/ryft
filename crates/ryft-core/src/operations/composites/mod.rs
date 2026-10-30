@@ -55,8 +55,8 @@ pub mod operations;
 pub mod rules;
 
 pub use builders::{
-    BatchedComposite, BatchingRuleConsistencyError, Composite, CompositeCallContext, JvpComposite, VjpComposite,
-    check_batching_rule_consistency, composite,
+    BatchedComposite, Composite, CompositeCallContext, JvpComposite, VjpComposite, check_batching_rule_consistency,
+    composite,
 };
 pub use configurations::{
     AccumulatingVjp, BroadcastInvariantBatching, BroadcastSensitiveBatching, CompositeBatching, CompositeJvp,

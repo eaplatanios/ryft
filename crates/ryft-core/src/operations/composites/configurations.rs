@@ -1774,9 +1774,9 @@ mod tests {
         assert_eq!(
             forward.program.to_string(),
             indoc! {"
-            lambda %0:f64[] .
-            in (%0, %0)
-        "}
+                lambda %0:f64[] .
+                in (%0, %0)
+            "}
             .trim_end(),
         );
         let backward = registration
@@ -1787,10 +1787,10 @@ mod tests {
         assert_eq!(
             backward.program.to_string(),
             indoc! {"
-            lambda %0:f64[], %1:f64[] .
-            let %2:f64[] = mul %1 %0
-            in (%2)
-        "}
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
             .trim_end(),
         );
         assert_eq!(
@@ -1868,9 +1868,9 @@ mod tests {
         assert_eq!(
             forward.program.to_string(),
             indoc! {"
-            lambda %0:f64[], %1:f64[] .
-            in (%1, %0)
-        "}
+                lambda %0:f64[], %1:f64[] .
+                in (%1, %0)
+            "}
             .trim_end(),
         );
         // Returning only the differentiated suffix must fail before the adapter drops the leading cotangent.
@@ -1940,10 +1940,10 @@ mod tests {
         assert_eq!(
             specialization.program.to_string(),
             indoc! {"
-            lambda %0:f64[] .
-            let %1:f64[] = add %0 %0
-            in (%1)
-        "}
+                lambda %0:f64[] .
+                let %1:f64[] = add %0 %0
+                in (%1)
+            "}
             .trim_end(),
         );
         assert_eq!(
@@ -2020,7 +2020,7 @@ mod tests {
         let actual = vec![vec![], vec![Placeholder]];
         assert_eq!(
             structures.record(COMPOSITE_OPERATION_NAME, vec![ArrayType::scalar(DataType::F64)], expected.clone()),
-            Ok(())
+            Ok(()),
         );
         assert_eq!(
             structures.record(COMPOSITE_OPERATION_NAME, vec![ArrayType::scalar(DataType::F64)], actual.clone()),
@@ -2102,10 +2102,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-            lambda %0:f64[2], %1:f64[] .
-            let %2:f64[] = add %1 %1
-            in (%2)
-        "}
+                lambda %0:f64[2], %1:f64[] .
+                let %2:f64[] = add %1 %1
+                in (%2)
+            "}
             .trim_end(),
         );
         assert_eq!(

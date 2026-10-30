@@ -146,6 +146,9 @@ pub enum BatchingError {
     #[error("mismatched batch output axes; expected {expected} but got {actual}")]
     MismatchedOutputAxes { expected: BatchAxis, actual: BatchAxis },
 
+    #[error("broadcasting the replicated input leaf {input} changes the batched output leaf {output}")]
+    BroadcastInvarianceViolation { input: usize, output: usize },
+
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 
