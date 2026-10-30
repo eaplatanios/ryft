@@ -2,6 +2,8 @@
 //! stores its JVP, VJP, and batching callbacks, and the [`CustomVjpOperation`] requirements that its reverse mode rules
 //! place on the operation family.
 
+// TODO(eaplatanios): Review from here onwards.
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;

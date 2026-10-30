@@ -2,6 +2,8 @@
 //! with the [`CustomRuleReference`] and [`WeakCustomRuleRegistration`] handles through which calls and rules refer to a
 //! registered definition without forming reference cycles.
 
+// TODO(eaplatanios): Review from here onwards.
+
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::fmt::Debug;

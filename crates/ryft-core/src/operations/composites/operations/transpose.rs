@@ -2,6 +2,8 @@
 //! [`CompositeOperation`]. The carrier holds its rules either as attached rule regions or as retained rule sets (refer
 //! to [`CustomRuleSource`]), and its transposition applies the backward rule.
 
+// TODO(eaplatanios): Review from here onwards.
+
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
