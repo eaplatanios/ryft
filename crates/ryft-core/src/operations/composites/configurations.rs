@@ -937,14 +937,11 @@ where
 pub struct DefaultBatching;
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
-/// `(x, x_axes, extent) ↦ (y, y_axes)`. `Tracer` is the tracer type of the closure's leaves, which is also
-/// the type of dynamic extents. Refer to [`Composite::with_batching`] for more information.
-///
-/// The name follows the vocabulary of JAX's
-/// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html) for a
-/// user-supplied batching rule, whereas the `Explicit*` configurations (e.g., [`ExplicitJvp`]) name user-supplied
-/// derivative rules that replace the ones otherwise derived from the primal.
-pub struct CustomBatching<Tracer: Parameter, Input, Output>
+/// `(x, x_axes, extent) ↦ (y, y_axes)` whose per-item numerical behavior is preserved when a replicated input is
+/// broadcast. `Tracer` is the tracer type of the closure's leaves, which is also the type of dynamic extents. Refer
+/// to [`Composite::with_batching`] for more information. Rules whose numerical behavior may change when a replicated
+/// input is broadcast use [`BroadcastSensitiveBatching`] instead.
+pub struct BroadcastInvariantBatching<Tracer: Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -962,22 +959,22 @@ where
     >,
 }
 
-impl<Tracer: Parameter, Input, Output> Debug for CustomBatching<Tracer, Input, Output>
+impl<Tracer: Parameter, Input, Output> Debug for BroadcastInvariantBatching<Tracer, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("CustomBatching").finish_non_exhaustive()
+        formatter.debug_struct("BroadcastInvariantBatching").finish_non_exhaustive()
     }
 }
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
-/// `(x, x_axes, extent) ↦ (y, y_axes)` whose result may depend on its input batch axes. `Tracer` is the tracer
-/// type of the closure's leaves, which is also the type of dynamic extents. Refer to
-/// [`Composite::with_axis_dependent_batching`] for more information.
-pub struct AxisDependentBatching<Tracer: Parameter, Input, Output>
+/// `(x, x_axes, extent) ↦ (y, y_axes)` whose per-item numerical behavior may change when a replicated input is
+/// broadcast. `Tracer` is the tracer type of the closure's leaves, which is also the type of dynamic extents.
+/// Refer to [`Composite::with_broadcast_sensitive_batching`] for more information.
+pub struct BroadcastSensitiveBatching<Tracer: Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -995,14 +992,14 @@ where
     >,
 }
 
-impl<Tracer: Parameter, Input, Output> Debug for AxisDependentBatching<Tracer, Input, Output>
+impl<Tracer: Parameter, Input, Output> Debug for BroadcastSensitiveBatching<Tracer, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("AxisDependentBatching").finish_non_exhaustive()
+        formatter.debug_struct("BroadcastSensitiveBatching").finish_non_exhaustive()
     }
 }
 
@@ -1053,8 +1050,12 @@ where
 }
 
 impl<V, O, Input, Output>
-    CompositeBatching<CustomBatching<CustomRuleTracer<V, O>, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
-    for CustomRuleDefinition<V, O>
+    CompositeBatching<
+        BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
+        CustomRuleTracer<V, O>,
+        Input,
+        Output,
+    > for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -1071,7 +1072,7 @@ where
 {
     fn configure_batching(
         self,
-        configuration: &CustomBatching<CustomRuleTracer<V, O>, Input, Output>,
+        configuration: &BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
     ) -> Self {
@@ -1087,7 +1088,7 @@ where
 
 impl<V, O, Input, Output>
     CompositeBatching<
-        AxisDependentBatching<CustomRuleTracer<V, O>, Input, Output>,
+        BroadcastSensitiveBatching<CustomRuleTracer<V, O>, Input, Output>,
         CustomRuleTracer<V, O>,
         Input,
         Output,
@@ -1112,7 +1113,7 @@ where
 {
     fn configure_batching(
         self,
-        configuration: &AxisDependentBatching<CustomRuleTracer<V, O>, Input, Output>,
+        configuration: &BroadcastSensitiveBatching<CustomRuleTracer<V, O>, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
     ) -> Self {
@@ -1122,7 +1123,7 @@ where
             input_structure,
             output_structure,
         );
-        self.with_axis_dependent_batching_rule(rule)
+        self.with_broadcast_sensitive_batching_rule(rule)
     }
 }
 
@@ -1550,7 +1551,7 @@ mod tests {
     #[test]
     fn test_custom_rule_definition_configure_batching() {
         let registration = {
-            let configuration = CustomBatching::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+            let configuration = BroadcastInvariantBatching::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
                 rule: Arc::new(|input, axis, _| Ok((vec![input.clone(), input], vec![axis, axis]))),
             };
             CustomRuleRegistration::new(ArrayDefinition::new(String::from("batching_definition")).configure_batching(
