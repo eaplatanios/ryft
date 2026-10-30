@@ -29,7 +29,7 @@ use crate::operations::composites::rules::{
 };
 use crate::operations::composites::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 use crate::operations::composites::{
-    describe_composite, replay_custom_jvp_rule, retained_carrier_batching, validate_composite_discharge_inputs,
+    replay_custom_jvp_rule, retained_carrier_batching, validate_composite_discharge_inputs,
     validate_composite_reference_boundary, validate_composite_replay, validate_deferred_forward_rule,
     validate_non_differentiated_count,
 };
@@ -267,7 +267,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     "batched {} must have at least {boundary_input_count} \
                      non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
                      its inputs, but got {non_differentiated_count}",
-                    describe_composite(rules.name()),
+                    {
+                        let name = rules.name();
+                        if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        }
+                    },
                 )));
             }
         }
@@ -548,7 +555,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                         ProgramError::MalformedProgram(format!(
                             "batched {} has fewer non-differentiated inputs \
                              than boundary inputs",
-                            describe_composite(rules.name()),
+                            {
+                                let name = rules.name();
+                                if name == COMPOSITE_OPERATION_NAME {
+                                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                                } else {
+                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                }
+                            },
                         ))
                     })?,
                 tangent_activity: Vec::new(),
@@ -732,7 +746,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                         return Err(TypeError::invalid(format!(
                             "batched {} has {} inputs but its batching levels \
                              record {} boundary inputs and {} unbatched inputs",
-                            describe_composite(rules.name()),
+                            {
+                                let name = rules.name();
+                                if name == COMPOSITE_OPERATION_NAME {
+                                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                                } else {
+                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                }
+                            },
                             input_types.len(),
                             boundary_input_count,
                             batching.input_types.len(),
@@ -820,7 +841,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                             true => used.next().ok_or_else(|| {
                                 ProgramError::MalformedProgram(format!(
                                     "{} keeps more rule outputs than it has outputs",
-                                    describe_composite(rules.name()),
+                                    {
+                                        let name = rules.name();
+                                        if name == COMPOSITE_OPERATION_NAME {
+                                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                                        } else {
+                                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                        }
+                                    },
                                 ))
                             }),
                             false => Ok(false),
@@ -953,7 +981,14 @@ where
             CompositeRules::Attached { .. } => COMPOSITE_OPERATION_NAME,
             CompositeRules::Retained { rules, .. } => rules.name(),
         };
-        validate_composite_discharge_inputs(&describe_composite(name), inputs)?;
+        validate_composite_discharge_inputs(
+            &if name == COMPOSITE_OPERATION_NAME {
+                format!("`{COMPOSITE_OPERATION_NAME}`")
+            } else {
+                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+            },
+            inputs,
+        )?;
         match &self.rules {
             CompositeRules::Attached { .. } => discharge_local_reference_operation(self, context, driver, inputs),
             CompositeRules::Retained { rules, batching, kept_outputs, .. } => {
@@ -1296,7 +1331,14 @@ where
                 return Err(TypeError::invalid(format!(
                     "{} batching rule output type signature mismatch: expected per-item output types [{expected}] \
                      but got [{actual}]{reason}",
-                    describe_composite(rules.name()),
+                    {
+                        let name = rules.name();
+                        if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        }
+                    },
                 ))
                 .into());
             }
@@ -1771,10 +1813,15 @@ where
     let level = driver.batching_level(context)?;
     let BatchingLevelExtent::Static(length) = level.extent() else {
         return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "{} batches its calls sequentially, which requires a static batch extent",
-                describe_composite(rules.name()),
-            ),
+            message: {
+                let name = rules.name();
+                let description = if name == COMPOSITE_OPERATION_NAME {
+                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                } else {
+                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                };
+                format!("{description} batches its calls sequentially, which requires a static batch extent")
+            },
         });
     };
     if inputs.iter().all(|input| P::batch_axis(input).is_replicated()) {

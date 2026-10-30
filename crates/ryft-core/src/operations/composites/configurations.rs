@@ -16,7 +16,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::describe_composite;
+use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{
     CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation, derive_bijective_identity_renaming,
 };
@@ -916,7 +916,14 @@ where
                     message: format!(
                         "{} batching rule requires a dynamic batch extent to be the leading boundary input of its \
                          batching level, but the level has no boundary inputs",
-                        describe_composite(&name),
+                        {
+                            let name: &str = &name;
+                            if name == COMPOSITE_OPERATION_NAME {
+                                format!("`{COMPOSITE_OPERATION_NAME}`")
+                            } else {
+                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                            }
+                        },
                     ),
                 });
             }
@@ -1491,7 +1498,11 @@ where
                             return Err(TypeError::invalid(format!(
                                 "{} JVP rule returned a structural-zero tangent of type `{type}` for output {index}, \
                                  whose tangent type is `{expected}`",
-                                describe_composite(name),
+                                if name == COMPOSITE_OPERATION_NAME {
+                                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                                } else {
+                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                },
                             ))
                             .into());
                         }
@@ -1526,7 +1537,11 @@ fn rule_structure_mismatch<Structure: Debug>(
 ) -> TypeError {
     TypeError::invalid(format!(
         "{} {rule} rule {value} structure mismatch: expected {expected:?} but got {actual:?}",
-        describe_composite(name),
+        if name == COMPOSITE_OPERATION_NAME {
+            format!("`{COMPOSITE_OPERATION_NAME}`")
+        } else {
+            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+        },
     ))
 }
 

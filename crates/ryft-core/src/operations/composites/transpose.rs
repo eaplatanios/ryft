@@ -28,8 +28,7 @@ use crate::operations::composites::rules::{
     boundary_input_count, validate_rule_output_types,
 };
 use crate::operations::composites::{
-    describe_composite_transpose, retained_carrier_batching, validate_composite_discharge_inputs,
-    validate_deferred_forward_rule,
+    retained_carrier_batching, validate_composite_discharge_inputs, validate_deferred_forward_rule,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -348,7 +347,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     fn description(&self) -> String {
         match &self.rules {
             CompositeTransposeRules::Attached => format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`"),
-            CompositeTransposeRules::Retained { rules, .. } => describe_composite_transpose(rules.name()),
+            CompositeTransposeRules::Retained { rules, .. } => {
+                let name = rules.name();
+                if name == COMPOSITE_OPERATION_NAME {
+                    format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+                } else {
+                    format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+                }
+            }
         }
     }
 
@@ -635,7 +641,14 @@ where
             CompositeTransposeRules::Attached => COMPOSITE_OPERATION_NAME,
             CompositeTransposeRules::Retained { rules, .. } => rules.name(),
         };
-        validate_composite_discharge_inputs(&describe_composite_transpose(name), inputs)?;
+        validate_composite_discharge_inputs(
+            &if name == COMPOSITE_OPERATION_NAME {
+                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+            } else {
+                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+            },
+            inputs,
+        )?;
         match &self.rules {
             CompositeTransposeRules::Attached => discharge_local_reference_operation(self, context, driver, inputs),
             CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, deferred_forward, .. } => {
@@ -732,11 +745,14 @@ where
                 });
             }
             CompositeTransposeRules::Retained { invokes_rule_directly: true, rules, .. } => {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "{} source carriers are never batched",
-                    describe_composite_transpose(rules.name()),
-                ))
-                .into());
+                let name = rules.name();
+                let description = if name == COMPOSITE_OPERATION_NAME {
+                    format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+                } else {
+                    format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+                };
+                let message = format!("{description} source carriers are never batched");
+                return Err(ProgramError::MalformedProgram(message).into());
             }
 
             // Transposing a deferred carrier replays the forward rule at the batching levels of the call from which it
@@ -748,7 +764,14 @@ where
                         "{} defers its forward rule to the backward pass (refer to `with_deferred_forward`), so it \
                          cannot be batched after it is differentiated; batch the call before differentiating it, or \
                          transpose the derivative before batching it",
-                        describe_composite_transpose(rules.name()),
+                        {
+                            let name = rules.name();
+                            if name == COMPOSITE_OPERATION_NAME {
+                                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+                            } else {
+                                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+                            }
+                        },
                     ),
                 });
             }
@@ -967,7 +990,15 @@ where
         if invokes_rule_directly {
             let Some(backward) = rules.native_definition().and_then(|definition| definition.backward.as_ref()) else {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: format!("{} has no backward rule", describe_composite_transpose(rules.name())),
+                    message: {
+                        let name = rules.name();
+                        let description = if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+                        };
+                        format!("{description} has no backward rule")
+                    },
                 }
                 .into());
             };
@@ -1047,7 +1078,14 @@ where
                     return Err(ProgramError::MalformedProgram(format!(
                         "{} has {call_input_count} call inputs but its deferred forward rule expects {} boundary \
                          inputs and {} call inputs",
-                        describe_composite_transpose(rules.name()),
+                        {
+                            let name = rules.name();
+                            if name == COMPOSITE_OPERATION_NAME {
+                                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+                            } else {
+                                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+                            }
+                        },
                         call_boundary_input_count,
                         key.input_types.len(),
                     ))

@@ -97,91 +97,6 @@ pub use rules::{
 };
 pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 
-/// Renders the [`composite`](COMPOSITE_OPERATION_NAME) operation name for diagnostics, followed by the name of the
-/// retained definition `name` unless it is the default name of [`Composite`](crate::Composite)s (i.e., the operation
-/// name itself), so that diagnostics never print the default name twice.
-fn describe_composite(name: &str) -> String {
-    describe_composite_operation(COMPOSITE_OPERATION_NAME, name)
-}
-
-/// Renders the [`composite_transpose`](COMPOSITE_TRANSPOSE_OPERATION_NAME) operation name for diagnostics, followed
-/// by the name of the retained definition `name` unless it is the default name of [`Composite`](crate::Composite)s.
-fn describe_composite_transpose(name: &str) -> String {
-    describe_composite_operation(COMPOSITE_TRANSPOSE_OPERATION_NAME, name)
-}
-
-/// Renders `operation` for diagnostics, followed by the definition name `name` unless it is the default one.
-fn describe_composite_operation(operation: &str, name: &str) -> String {
-    if name == COMPOSITE_OPERATION_NAME { format!("`{operation}`") } else { format!("`{operation}` `{name}`") }
-}
-
-/// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode stages for a batched call with
-/// retained rules whose forward rule specialization key is `key` (whose levels are those of the call), whose rules have
-/// `rule_output_count` outputs, whose carrier receives seed extents of types `seed_extent_types`, and whose output
-/// tangents have the unbatched types `extent_types`. At each level, the carrier's inputs have the batch axes of the
-/// corresponding call inputs, except for the residuals, which have the axes of that level's forward specialization, and
-/// for the seed extents, which are replicated, while its outputs have the call's batch axes, or those of the forward
-/// specialization for the outputs that the call does not keep. The carrier's unbatched input types are those of the
-/// unbatched forward rule.
-fn retained_carrier_batching<V, O, S>(
-    rules: &S,
-    key: &CustomRuleSpecializationKey<V::Type>,
-    rule_output_count: usize,
-    seed_extent_types: &[V::Type],
-    extent_types: Vec<V::Type>,
-) -> Result<CustomRuleBatching<V::Type>, DifferentiationError>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: Value<Type: DifferentiableType + Eq + Hash>,
-    O: Operation<Type = V::Type>,
-    S: CustomRuleSpecializer<V, O>,
-{
-    let unbatched = rules.forward_specialization(CustomRuleSpecializationKey { levels: Vec::new(), ..key.clone() })?;
-    let non_differentiated_count = key.non_differentiated_count;
-    let mut input_types = key.input_types[..non_differentiated_count].to_vec();
-    input_types.extend_from_slice(&unbatched.program.output_types()[rule_output_count..]);
-    input_types.extend_from_slice(seed_extent_types);
-    for r#type in &key.input_types[non_differentiated_count..] {
-        input_types.push(r#type.tangent()?);
-    }
-    let mut levels = Vec::with_capacity(key.levels.len());
-    for (index, level) in key.levels.iter().enumerate() {
-        let level_key = CustomRuleSpecializationKey { levels: key.levels[..=index].to_vec(), ..key.clone() };
-        let level_specialization = rules.forward_specialization(level_key)?;
-        let leading_input_count = non_differentiated_count + boundary_input_count(&key.levels[..index]);
-        let mut input_axes = level.input_axes[..leading_input_count].to_vec();
-        input_axes.extend_from_slice(&level_specialization.output_axes[rule_output_count..]);
-        input_axes.extend(std::iter::repeat_n(BatchAxis::replicated(), seed_extent_types.len()));
-        input_axes.extend_from_slice(&level.input_axes[leading_input_count..]);
-        let output_axes = match key.kept_outputs {
-            None => level.output_axes.clone(),
-            Some(_) => level_specialization.output_axes[..rule_output_count].to_vec(),
-        };
-        levels.push(CustomRuleBatchingLevel { input_axes, output_axes, ..level.clone() });
-    }
-    Ok(CustomRuleBatching { input_types, output_types: extent_types, levels })
-}
-
-/// Validates that the forward rule of the retained definition named `name`, which defers that rule to the backward pass
-/// (refer to [`CustomRuleSource::defers_forward`]), has a specialization with the pure `effects`, because effects of a
-/// forward rule that runs in the backward pass would execute out of order with the rest of the program.
-///
-/// # Errors
-///
-/// Returns a [`ProgramError::UnsupportedOperation`] that names `with_deferred_forward` when `effects` is not pure.
-fn validate_deferred_forward_rule(name: &str, effects: EffectsSummary) -> Result<(), ProgramError> {
-    if effects.is_pure() {
-        return Ok(());
-    }
-    Err(ProgramError::UnsupportedOperation {
-        message: format!(
-            "{} defers its forward rule to the backward pass (refer to `with_deferred_forward`), which requires a \
-             pure forward rule, but its forward rule has effects, which would run out of order in the backward pass",
-            describe_composite(name),
-        ),
-    })
-}
-
 /// Validates that the leading `non_differentiated_count` input positions of a composite call named `name` fit within
 /// its `input_count` inputs.
 ///
@@ -314,6 +229,30 @@ fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
         });
     }
     Ok(())
+}
+
+/// Validates that the forward rule of the retained definition named `name`, which defers that rule to the backward pass
+/// (refer to [`CustomRuleSource::defers_forward`]), has a specialization with the pure `effects`, because effects of a
+/// forward rule that runs in the backward pass would execute out of order with the rest of the program.
+///
+/// # Errors
+///
+/// Returns a [`ProgramError::UnsupportedOperation`] that names `with_deferred_forward` when `effects` is not pure.
+fn validate_deferred_forward_rule(name: &str, effects: EffectsSummary) -> Result<(), ProgramError> {
+    if effects.is_pure() {
+        return Ok(());
+    }
+    Err(ProgramError::UnsupportedOperation {
+        message: format!(
+            "{} defers its forward rule to the backward pass (refer to `with_deferred_forward`), which requires a \
+             pure forward rule, but its forward rule has effects, which would run out of order in the backward pass",
+            if name == COMPOSITE_OPERATION_NAME {
+                format!("`{COMPOSITE_OPERATION_NAME}`")
+            } else {
+                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+            },
+        ),
+    })
 }
 
 /// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose leading
@@ -453,6 +392,53 @@ where
             }
         })
         .collect::<Result<Vec<_>, _>>()
+}
+
+/// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode stages for a batched call with
+/// retained rules whose forward rule specialization key is `key` (whose levels are those of the call), whose rules have
+/// `rule_output_count` outputs, whose carrier receives seed extents of types `seed_extent_types`, and whose output
+/// tangents have the unbatched types `extent_types`. At each level, the carrier's inputs have the batch axes of the
+/// corresponding call inputs, except for the residuals, which have the axes of that level's forward specialization, and
+/// for the seed extents, which are replicated, while its outputs have the call's batch axes, or those of the forward
+/// specialization for the outputs that the call does not keep. The carrier's unbatched input types are those of the
+/// unbatched forward rule.
+fn retained_carrier_batching<V, O, S>(
+    rules: &S,
+    key: &CustomRuleSpecializationKey<V::Type>,
+    rule_output_count: usize,
+    seed_extent_types: &[V::Type],
+    extent_types: Vec<V::Type>,
+) -> Result<CustomRuleBatching<V::Type>, DifferentiationError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    V: Value<Type: DifferentiableType + Eq + Hash>,
+    O: Operation<Type = V::Type>,
+    S: CustomRuleSpecializer<V, O>,
+{
+    let unbatched = rules.forward_specialization(CustomRuleSpecializationKey { levels: Vec::new(), ..key.clone() })?;
+    let non_differentiated_count = key.non_differentiated_count;
+    let mut input_types = key.input_types[..non_differentiated_count].to_vec();
+    input_types.extend_from_slice(&unbatched.program.output_types()[rule_output_count..]);
+    input_types.extend_from_slice(seed_extent_types);
+    for r#type in &key.input_types[non_differentiated_count..] {
+        input_types.push(r#type.tangent()?);
+    }
+    let mut levels = Vec::with_capacity(key.levels.len());
+    for (index, level) in key.levels.iter().enumerate() {
+        let level_key = CustomRuleSpecializationKey { levels: key.levels[..=index].to_vec(), ..key.clone() };
+        let level_specialization = rules.forward_specialization(level_key)?;
+        let leading_input_count = non_differentiated_count + boundary_input_count(&key.levels[..index]);
+        let mut input_axes = level.input_axes[..leading_input_count].to_vec();
+        input_axes.extend_from_slice(&level_specialization.output_axes[rule_output_count..]);
+        input_axes.extend(std::iter::repeat_n(BatchAxis::replicated(), seed_extent_types.len()));
+        input_axes.extend_from_slice(&level.input_axes[leading_input_count..]);
+        let output_axes = match key.kept_outputs {
+            None => level.output_axes.clone(),
+            Some(_) => level_specialization.output_axes[..rule_output_count].to_vec(),
+        };
+        levels.push(CustomRuleBatchingLevel { input_axes, output_axes, ..level.clone() });
+    }
+    Ok(CustomRuleBatching { input_types, output_types: extent_types, levels })
 }
 
 #[cfg(test)]
