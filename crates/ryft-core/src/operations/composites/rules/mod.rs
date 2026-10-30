@@ -40,9 +40,7 @@ pub(in crate::operations::composites) use definition::CustomVjpBackward;
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
 pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleRegistration};
 pub use specialization::{CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules};
-pub(in crate::operations::composites) use specialization::{
-    boundary_input_count, derive_bijective_identity_renaming, validate_rule_output_types,
-};
+pub(in crate::operations::composites) use specialization::{boundary_input_count, validate_rule_output_types};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
 pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;

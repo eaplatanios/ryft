@@ -12,10 +12,9 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
-use crate::operations::composites::rules::{
-    CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation, derive_bijective_identity_renaming,
-};
+use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation};
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -1147,10 +1146,8 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Residual structures that the forward rule of one [`Composite`] registration returned, from which its backward rule
-/// learns the structure of the residuals that it receives as flat leading inputs. The backward rule of each
+/// Residual structures that the forward rule of one [`Composite`] registration returned, from which its backward
+/// rule learns the structure of the residuals that it receives as flat leading inputs. The backward rule of each
 /// specialization is traced after the forward rule of that specialization, but specializations of one call structure
 /// may return differently structured residuals (e.g., collections whose lengths depend on the input shapes), so the
 /// structures are recorded by the flat residual types that the forward rule returned. Different structures are
@@ -1164,6 +1161,8 @@ struct CompositeResidualStructures<T, Structure> {
     /// Recorded flat residual types, each with the structure of the residuals that had them.
     structures: Arc<Mutex<Vec<(Vec<T>, Structure)>>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<T, Structure> {
     /// Records that the forward rule of the function named `name` returned residuals of the provided flat types with

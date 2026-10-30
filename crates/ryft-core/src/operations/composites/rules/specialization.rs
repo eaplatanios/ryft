@@ -18,6 +18,7 @@ use crate::differentiation::{
     TransposedProgramCotangent,
 };
 use crate::macros::{check_count, check_types};
+use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
@@ -33,8 +34,8 @@ use crate::operations::composites::rules::{
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    MaybeZero, Operation, Program, ProgramBuilder, ProgramError, ReferenceMemberType, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    MaybeZero, Operation, Program, ProgramBuilder, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
+    ValueProjection,
 };
 use crate::specialization::SpecializationCacheError;
 use crate::tracing::TracingContext;
@@ -2133,27 +2134,6 @@ where
     program.rename_type_identities(&renaming)
 }
 
-/// Returns the renaming of the type identities of `source` onto those of `target` when the two type signatures are
-/// equal up to a bijective renaming of their identities, which holds exactly when each renames into the other.
-pub(in crate::operations::composites) fn derive_bijective_identity_renaming<T: Type>(
-    source: &[T],
-    target: &[T],
-) -> Option<TypeIdentityRenaming<T::Identity>> {
-    let renames_into = |declared: &[T], actual: &[T]| {
-        let renaming = T::derive_identity_renaming(declared, actual).ok()?;
-        declared
-            .iter()
-            .zip(actual)
-            .all(|(declared, actual)| declared.rename_identities(&renaming).is_ok_and(|renamed| &renamed == actual))
-            .then_some(renaming)
-    };
-    if source.len() != target.len() {
-        return None;
-    }
-    renames_into(target, source)?;
-    renames_into(source, target)
-}
-
 /// Converts a failed or reentrant specialization of a retained rule of the custom rule set named `name` into a
 /// [`DifferentiationError`], keeping the rule's own error when it produced one.
 pub(super) fn specialization_error<E: Debug + Display + Into<DifferentiationError>>(
@@ -3079,55 +3059,5 @@ mod tests {
                 if message == "`composite` `pair` JVP rule output type signature mismatch: expected [f32[n], f32[n]] \
                                but got [f32[n], f32[n]] with different type identities",
         ));
-    }
-
-    #[test]
-    fn test_derive_bijective_identity_renaming() {
-        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
-        let (a, b, c) = (
-            DimensionVariable::new("a", bounds),
-            DimensionVariable::new("b", bounds),
-            DimensionVariable::new("c", bounds),
-        );
-        let vector_type =
-            |variable: &DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
-
-        // Equal signatures are related by the identity renaming.
-        let renaming = derive_bijective_identity_renaming(&[vector_type(&a)], &[vector_type(&a)]).unwrap();
-        assert!(renaming.is_identity());
-
-        // A bijective renaming maps each source identity onto its target identity.
-        let renaming = derive_bijective_identity_renaming(
-            &[vector_type(&a), vector_type(&b)],
-            &[vector_type(&c), vector_type(&b)],
-        )
-        .unwrap();
-        assert!(!renaming.is_identity());
-        assert_eq!(vector_type(&a).rename_identities(&renaming), Ok(vector_type(&c)));
-        assert_eq!(vector_type(&b).rename_identities(&renaming), Ok(vector_type(&b)));
-
-        // Renamings that merge or split identities, and signatures that differ beyond their identities, have none.
-        assert!(
-            derive_bijective_identity_renaming(
-                &[vector_type(&a), vector_type(&b)],
-                &[vector_type(&c), vector_type(&c)]
-            )
-            .is_none()
-        );
-        assert!(
-            derive_bijective_identity_renaming(
-                &[vector_type(&a), vector_type(&a)],
-                &[vector_type(&b), vector_type(&c)]
-            )
-            .is_none()
-        );
-        assert!(derive_bijective_identity_renaming(&[vector_type(&a)], &[vector_type(&a), vector_type(&a)]).is_none());
-        assert!(
-            derive_bijective_identity_renaming(
-                &[vector_type(&a)],
-                &[ArrayType::new(DataType::F64, Shape::new(vec![a.clone().into()]))]
-            )
-            .is_none()
-        );
     }
 }

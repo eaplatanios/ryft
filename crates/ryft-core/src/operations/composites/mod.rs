@@ -47,6 +47,8 @@
 //! # }
 //! ```
 
+use crate::programs::{Type, TypeIdentityRenaming};
+
 pub mod builders;
 pub mod configurations;
 pub mod operations;
@@ -70,12 +72,35 @@ pub use rules::{
     CustomRuleTracer, CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
 };
 
+/// Returns the renaming of the type identities of `source` onto those of `target` when the two type signatures are
+/// equal up to a bijective renaming of their identities, which holds exactly when each renames into the other.
+fn derive_bijective_identity_renaming<T: Type>(
+    source: &[T],
+    target: &[T],
+) -> Option<TypeIdentityRenaming<T::Identity>> {
+    let renames_into = |declared: &[T], actual: &[T]| {
+        let renaming = T::derive_identity_renaming(declared, actual).ok()?;
+        declared
+            .iter()
+            .zip(actual)
+            .all(|(declared, actual)| declared.rename_identities(&renaming).is_ok_and(|renamed| &renamed == actual))
+            .then_some(renaming)
+    };
+    if source.len() != target.len() {
+        return None;
+    }
+    renames_into(target, source)?;
+    renames_into(source, target)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType};
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, DimensionBounds, DimensionVariable, Shape};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DifferentiationError, ForwardModeDifferentiate};
     use crate::operations::arithmetic::MulOperation;
@@ -212,5 +237,55 @@ mod tests {
             tangent,
             (),
         )
+    }
+
+    #[test]
+    fn test_derive_bijective_identity_renaming() {
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let (a, b, c) = (
+            DimensionVariable::new("a", bounds),
+            DimensionVariable::new("b", bounds),
+            DimensionVariable::new("c", bounds),
+        );
+        let vector_type =
+            |variable: &DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
+
+        // Equal signatures are related by the identity renaming.
+        let renaming = derive_bijective_identity_renaming(&[vector_type(&a)], &[vector_type(&a)]).unwrap();
+        assert!(renaming.is_identity());
+
+        // A bijective renaming maps each source identity onto its target identity.
+        let renaming = derive_bijective_identity_renaming(
+            &[vector_type(&a), vector_type(&b)],
+            &[vector_type(&c), vector_type(&b)],
+        )
+        .unwrap();
+        assert!(!renaming.is_identity());
+        assert_eq!(vector_type(&a).rename_identities(&renaming), Ok(vector_type(&c)));
+        assert_eq!(vector_type(&b).rename_identities(&renaming), Ok(vector_type(&b)));
+
+        // Renamings that merge or split identities, and signatures that differ beyond their identities, have none.
+        assert!(
+            derive_bijective_identity_renaming(
+                &[vector_type(&a), vector_type(&b)],
+                &[vector_type(&c), vector_type(&c)]
+            )
+            .is_none()
+        );
+        assert!(
+            derive_bijective_identity_renaming(
+                &[vector_type(&a), vector_type(&a)],
+                &[vector_type(&b), vector_type(&c)]
+            )
+            .is_none()
+        );
+        assert!(derive_bijective_identity_renaming(&[vector_type(&a)], &[vector_type(&a), vector_type(&a)]).is_none());
+        assert!(
+            derive_bijective_identity_renaming(
+                &[vector_type(&a)],
+                &[ArrayType::new(DataType::F64, Shape::new(vec![a.clone().into()]))]
+            )
+            .is_none()
+        );
     }
 }
