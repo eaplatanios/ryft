@@ -248,11 +248,57 @@ where
     }
 }
 
+/// Installs a reverse mode differentiation configuration in a [`CustomRuleDefinition`]. User-supplied rules are adapted
+/// to the flat interface of retained rules as described for [`CompositeJvp`]. The backward rule receives the residuals
+/// with the structure that the forward rule returned for the same specialization. Different specializations of one call
+/// structure may return differently structured residuals. Residuals whose flat types are equal up to a renaming of
+/// their type identities (e.g., their dimension variables) must always have the same structure. The forward rule
+/// is rejected otherwise.
+pub trait CompositeVjp<Vjp, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
+    Sized
+{
+    /// Returns this definition with the provided reverse mode differentiation configuration applied. [`DefaultVjp`]
+    /// leaves the definition unchanged. Retained rules use the definition's name and named axes.
+    ///
+    /// # Parameters
+    ///
+    ///   - `configuration`: Reverse mode differentiation configuration to apply.
+    ///   - `input_structure`: Structure of the call's inputs.
+    ///   - `output_structure`: Structure of the call's outputs.
+    ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
+    fn configure_vjp(
+        self,
+        configuration: &Vjp,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> Self;
+}
+
 /// Reverse mode differentiation configuration of a [`Composite`] without configured reverse mode differentiation
 /// rules. Reverse mode differentiation then transposes the forward mode rule, which is derived from the primal when
 /// none is configured. Refer to the documentation of [`composite`] for more information on rule selection.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultVjp;
+
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
+    CompositeVjp<DefaultVjp, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
+where
+    Input: Parameterized<CustomRuleTracer<V, O>>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    #[inline]
+    fn configure_vjp(
+        self,
+        _configuration: &DefaultVjp,
+        _input_structure: &Input::ParameterStructure,
+        _output_structure: &Output::ParameterStructure,
+        _non_differentiated_count: usize,
+    ) -> Self {
+        self
+    }
+}
 
 /// Reverse mode differentiation configuration of a [`Composite`] with explicit, user-supplied forward and backward
 /// rule closures implementing `x ↦ (y, r)` and the Vector-Jacobian Product (VJP) `(r, ȳ) ↦ x̄`, where `r` is a value
@@ -276,6 +322,82 @@ impl<Input, Output, Residual> Debug for ExplicitVjp<Input, Output, Residual> {
             debug.field("deferred_forward", &true);
         }
         debug.finish_non_exhaustive()
+    }
+}
+
+impl<V, O, Input, Output, Residual>
+    CompositeVjp<ExplicitVjp<Input, Output, Residual>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
+where
+    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
+    O: 'static + CustomVjpOperation<V>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Residual::ParameterStructure: Debug + PartialEq + Send,
+    Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn configure_vjp(
+        self,
+        configuration: &ExplicitVjp<Input, Output, Residual>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> Self {
+        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
+        let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
+            configuration.forward.clone(),
+            self.name.clone(),
+            input_structure,
+            output_structure,
+            &residual_structures,
+            self.named_axes(),
+        );
+        let backward = {
+            let (backward, name, named_axes) =
+                (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
+            let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[CustomRuleTracer<V, O>]| {
+                let residual_types = leading_inputs[non_differentiated_count..]
+                    .iter()
+                    .map(|value| value.r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let structure = residual_structures.get(&name, &residual_types)?;
+                let Some(context) = leading_inputs.iter().chain(seeds).next().map(|value| value.context().clone())
+                else {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{name}` backward rule has neither leading inputs nor seeds",
+                    )));
+                };
+                let program = trace_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
+                    &name,
+                    backward.as_ref(),
+                    &input_structure,
+                    leading_inputs[..non_differentiated_count]
+                        .iter()
+                        .map(|value| value.r#type().into_owned())
+                        .collect::<Vec<_>>(),
+                    structure,
+                    residual_types,
+                    output_structure.clone(),
+                    seeds.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(),
+                    named_axes.clone(),
+                )?;
+                let mut values = leading_inputs.to_vec();
+                values.extend_from_slice(seeds);
+                program.interpret_in_context(&context, values)
+            }
+        };
+        let definition = self.with_vjp(forward, backward);
+        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
@@ -315,6 +437,101 @@ where
             debug.field("deferred_forward", &true);
         }
         debug.finish_non_exhaustive()
+    }
+}
+
+impl<V, O, Input, Output, Residual>
+    CompositeVjp<
+        SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
+        CustomRuleTracer<V, O>,
+        Input,
+        Output,
+    > for CustomRuleDefinition<V, O>
+where
+    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
+    O: 'static + CustomVjpOperation<V>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Input::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Output::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+    Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Residual::ParameterStructure: Debug + PartialEq + Send,
+    Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn configure_vjp(
+        self,
+        configuration: &SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> Self {
+        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
+        let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
+            configuration.forward.clone(),
+            self.name.clone(),
+            input_structure,
+            output_structure,
+            &residual_structures,
+            self.named_axes(),
+        );
+        let backward = {
+            let (backward, name, named_axes) =
+                (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
+            let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
+                let residual_types = leading_inputs[non_differentiated_count..]
+                    .iter()
+                    .map(|value| value.r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let structure = residual_structures.get(&name, &residual_types)?;
+                let live_seeds = seeds.iter().filter_map(MaybeZero::as_value).cloned().collect::<Vec<_>>();
+                let Some(context) =
+                    leading_inputs.iter().chain(&live_seeds).next().map(|value| value.context().clone())
+                else {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{name}` backward rule has neither leading inputs nor non-zero seeds",
+                    )));
+                };
+                let (program, cotangent_zeros) =
+                    trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
+                        &name,
+                        backward.as_ref(),
+                        &input_structure,
+                        leading_inputs[..non_differentiated_count]
+                            .iter()
+                            .map(|value| value.r#type().into_owned())
+                            .collect::<Vec<_>>(),
+                        structure,
+                        residual_types,
+                        output_structure.clone(),
+                        seeds,
+                        named_axes.clone(),
+                    )?;
+                let mut values = leading_inputs.to_vec();
+                values.extend(live_seeds);
+                let mut live_cotangents = program.interpret_in_context(&context, values)?.into_iter();
+
+                // The traced program returns only the live cotangents, so the structural zeros are reinserted at their
+                // positions. Their types were traced at the actual types of the leading inputs and seeds.
+                Ok(cotangent_zeros
+                    .into_iter()
+                    .map(|zero| match zero {
+                        Some(r#type) => MaybeZero::Zero(r#type),
+                        None => MaybeZero::Value(live_cotangents.next().unwrap()),
+                    })
+                    .collect::<Vec<_>>())
+            }
+        };
+        let definition = self.with_symbolic_zero_vjp(forward, backward);
+        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
@@ -365,221 +582,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Installs a reverse mode differentiation configuration in a [`CustomRuleDefinition`]. The supported configurations
-/// are [`DefaultVjp`], [`ExplicitVjp`], [`SymbolicZeroVjp`], and [`AccumulatingVjp`].
-///
-/// User-supplied rules are adapted to the flat interface of retained rules as described for [`CompositeJvp`]. The
-/// backward rule receives the residuals with the structure that the forward rule returned for the same specialization.
-/// Different specializations of one call structure may return differently structured residuals. Residuals whose flat
-/// types are equal up to a renaming of their type identities (e.g., their dimension variables) must always have the
-/// same structure. The forward rule is rejected otherwise.
-pub trait CompositeVjp<Vjp, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
-    Sized
-{
-    /// Returns this definition with the provided reverse mode differentiation configuration applied. [`DefaultVjp`]
-    /// leaves the definition unchanged. Retained rules use the definition's name and named axes.
-    ///
-    /// # Parameters
-    ///
-    ///   - `configuration`: Reverse mode differentiation configuration to apply.
-    ///   - `input_structure`: Structure of the call's inputs.
-    ///   - `output_structure`: Structure of the call's outputs.
-    ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
-    fn configure_vjp(
-        self,
-        configuration: &Vjp,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> Self;
-}
-
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
-    CompositeVjp<DefaultVjp, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
-{
-    #[inline]
-    fn configure_vjp(
-        self,
-        _configuration: &DefaultVjp,
-        _input_structure: &Input::ParameterStructure,
-        _output_structure: &Output::ParameterStructure,
-        _non_differentiated_count: usize,
-    ) -> Self {
-        self
-    }
-}
-
-impl<V, O, Input, Output, Residual>
-    CompositeVjp<ExplicitVjp<Input, Output, Residual>, CustomRuleTracer<V, O>, Input, Output>
-    for CustomRuleDefinition<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
-    O: 'static + CustomVjpOperation<V>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Residual::ParameterStructure: Debug + PartialEq + Send,
-    Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
-{
-    fn configure_vjp(
-        self,
-        configuration: &ExplicitVjp<Input, Output, Residual>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> Self {
-        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
-        let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
-            configuration.forward.clone(),
-            self.name.clone(),
-            input_structure,
-            output_structure,
-            &residual_structures,
-            self.named_axes(),
-        );
-        let backward = {
-            let (backward, name, named_axes) =
-                (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
-            let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[CustomRuleTracer<V, O>]| {
-                let types = |values: &[CustomRuleTracer<V, O>]| {
-                    values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>()
-                };
-                let residual_types = types(&leading_inputs[non_differentiated_count..]);
-                let structure = residual_structures.get(&name, &residual_types)?;
-                let Some(context) = leading_inputs.iter().chain(seeds).next().map(|value| value.context().clone())
-                else {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "`{name}` backward rule has neither leading inputs nor seeds",
-                    )));
-                };
-                let program = trace_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
-                    &name,
-                    backward.as_ref(),
-                    &input_structure,
-                    types(&leading_inputs[..non_differentiated_count]),
-                    structure,
-                    residual_types,
-                    output_structure.clone(),
-                    types(seeds),
-                    named_axes.clone(),
-                )?;
-                let mut values = leading_inputs.to_vec();
-                values.extend_from_slice(seeds);
-                program.interpret_in_context(&context, values)
-            }
-        };
-        let definition = self.with_vjp(forward, backward);
-        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
-    }
-}
-
-impl<V, O, Input, Output, Residual>
-    CompositeVjp<
-        SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
-        CustomRuleTracer<V, O>,
-        Input,
-        Output,
-    > for CustomRuleDefinition<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
-    O: 'static + CustomVjpOperation<V>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Input::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Input::Family:
-        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
-    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Output::Family:
-        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
-    Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Residual::ParameterStructure: Debug + PartialEq + Send,
-    Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
-{
-    fn configure_vjp(
-        self,
-        configuration: &SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> Self {
-        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
-        let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
-            configuration.forward.clone(),
-            self.name.clone(),
-            input_structure,
-            output_structure,
-            &residual_structures,
-            self.named_axes(),
-        );
-        let backward = {
-            let (backward, name, named_axes) =
-                (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
-            let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
-                let types = |values: &[CustomRuleTracer<V, O>]| {
-                    values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>()
-                };
-                let residual_types = types(&leading_inputs[non_differentiated_count..]);
-                let structure = residual_structures.get(&name, &residual_types)?;
-                let live_seeds = seeds.iter().filter_map(MaybeZero::as_value).cloned().collect::<Vec<_>>();
-                let Some(context) =
-                    leading_inputs.iter().chain(&live_seeds).next().map(|value| value.context().clone())
-                else {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "`{name}` backward rule has neither leading inputs nor non-zero seeds",
-                    )));
-                };
-                let (program, cotangent_zeros) =
-                    trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
-                        &name,
-                        backward.as_ref(),
-                        &input_structure,
-                        types(&leading_inputs[..non_differentiated_count]),
-                        structure,
-                        residual_types,
-                        output_structure.clone(),
-                        seeds,
-                        named_axes.clone(),
-                    )?;
-                let mut values = leading_inputs.to_vec();
-                values.extend(live_seeds);
-                let mut live_cotangents = program.interpret_in_context(&context, values)?.into_iter();
-
-                // The traced program returns only the live cotangents, so the structural zeros are reinserted at their
-                // positions. Their types were traced at the actual types of the leading inputs and seeds.
-                Ok(cotangent_zeros
-                    .into_iter()
-                    .map(|zero| match zero {
-                        Some(r#type) => MaybeZero::Zero(r#type),
-                        None => MaybeZero::Value(live_cotangents.next().unwrap()),
-                    })
-                    .collect::<Vec<_>>())
-            }
-        };
-        let definition = self.with_symbolic_zero_vjp(forward, backward);
-        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
-    }
-}
-
 impl<V, O, Input, Output, Residual>
     CompositeVjp<
         AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>,
@@ -588,7 +590,6 @@ impl<V, O, Input, Output, Residual>
         Output,
     > for CustomRuleDefinition<V, O>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
@@ -604,6 +605,7 @@ where
     Residual::ParameterStructure: Debug + PartialEq + Send,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn configure_vjp(
         self,
@@ -623,8 +625,8 @@ where
         );
 
         // The rule is invoked directly while its carrier is transposed, with the carrier's inputs (i.e., the
-        // non-differentiated inputs, the residuals, and the differentiated inputs' tangents) and one accumulator per
-        // carrier input, so it receives the known residuals and the accumulators of the call's inputs.
+        // non-differentiated inputs, the residuals, and the differentiated inputs' tangents) and one accumulator
+        // per carrier input, so it receives the known residuals and the accumulators of the call's inputs.
         let backward = {
             let (backward, name) = (configuration.backward.clone(), self.name.clone());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
@@ -665,6 +667,8 @@ where
         if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Batching configuration of a [`Composite`] without a custom batching rule. Batching a call structurally batches its
 /// primal region.
