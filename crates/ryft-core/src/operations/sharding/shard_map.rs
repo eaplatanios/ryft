@@ -13486,9 +13486,9 @@ mod tests {
         // `r` is removed before binding). Both match the same function outside `shard_map` on the reference backend.
         type BodyTracer = Tracer<TestContext>;
         let function = composite(custom_sine).with_non_differentiated_count(1).with_batching(
-            |_: BatchingLevelExtent<BodyTracer>,
-             (r, x): (BodyTracer, BodyTracer),
-             (_, axis): (BatchAxis, BatchAxis)| { Ok((custom_sine((r, x))?, axis)) },
+            |(r, x): (BodyTracer, BodyTracer),
+             (_, axis): (BatchAxis, BatchAxis),
+             _: BatchingLevelExtent<BodyTracer>| { Ok((custom_sine((r, x))?, axis)) },
         );
         let call = |r, x| function.call((r, x)).unwrap();
         let program = body_allocated_reference_program(f32_vector_type(4), Some(sharded_along_x()), call);

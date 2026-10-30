@@ -295,16 +295,16 @@ where
 }
 
 /// Retained custom batching rule, which batches a call of a [`CustomRuleDefinition`] instead of structurally batching
-/// its primal region. It receives the batching level, the level's boundary inputs (e.g., a first-class batch extent),
-/// the call's batched inputs, and their batch axes, and it returns the batched outputs together with their batch axes.
+/// its primal region. It receives the call's batched inputs, their batch axes, the batching level, and the level's
+/// boundary inputs (e.g., a first-class batch extent), and it returns the batched outputs together with their batch axes.
 pub(super) trait CustomBatchingRule<V: Typed, O>: Send + Sync {
     /// Applies this rule to the provided batched inputs.
     fn apply(
         &self,
-        level: &BatchingLevel<V::Type>,
-        boundary_inputs: &[CustomRuleTracer<V, O>],
         inputs: &[CustomRuleTracer<V, O>],
         input_axes: &[BatchAxis],
+        level: &BatchingLevel<V::Type>,
+        boundary_inputs: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -316,10 +316,10 @@ impl<V: Value, O: Operation<Type = V::Type>, F> CustomBatchingRule<V, O> for F
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
-            &BatchingLevel<V::Type>,
-            &[CustomRuleTracer<V, O>],
             &[CustomRuleTracer<V, O>],
             &[BatchAxis],
+            &BatchingLevel<V::Type>,
+            &[CustomRuleTracer<V, O>],
         ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
         + Send
         + Sync,
@@ -327,12 +327,12 @@ where
     #[inline]
     fn apply(
         &self,
-        level: &BatchingLevel<V::Type>,
-        boundary_inputs: &[CustomRuleTracer<V, O>],
         inputs: &[CustomRuleTracer<V, O>],
         input_axes: &[BatchAxis],
+        level: &BatchingLevel<V::Type>,
+        boundary_inputs: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError> {
-        self(level, boundary_inputs, inputs, input_axes)
+        self(inputs, input_axes, level, boundary_inputs)
     }
 }
 
@@ -804,7 +804,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         <V::Type as BatchableType>::Policy:
             RecursiveBatchingPolicy<TracingContext<V, O>> + CotangentBatchingPolicy<TracingContext<V, O>>,
     {
-        self.batcher = Some(Arc::new(|level, program, input_axes, output_axes, outputs| {
+        self.batcher = Some(Arc::new(|program, input_axes, output_axes, level, outputs| {
             type Policy<T> = <T as BatchableType>::Policy;
 
             // Align every required output first (a replicated alignment request keeps the natural axis), then adapt
@@ -855,8 +855,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
     /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which batches its calls instead of
     /// structurally batching their primal regions (i.e., the analogue of JAX's `custom_vmap`). The rule receives the
-    /// batching level, the level's boundary inputs (e.g., a first-class batch extent), the call's batched inputs, and
-    /// their batch axes, and it returns the batched outputs together with their batch axes. It is traced when a call is
+    /// call's batched inputs, their batch axes, the batching level, and the level's boundary inputs (e.g., a first-class
+    /// batch extent), and it returns the batched outputs together with their batch axes. It is traced when a call is
     /// batched, once per batching level and input signature, and its program becomes the batched call's primal region,
     /// so it also determines the batch axes of the call's outputs (instead of [`Self::with_batched_output_axes`]). Each
     /// output, unbatched along the batch axis that the rule declares for it, must have the type of the corresponding
@@ -887,10 +887,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + ResidualZeroProvider<V::Type, Operation = O>,
         R: 'static
             + Fn(
-                &BatchingLevel<V::Type>,
-                &[CustomRuleTracer<V, O>],
                 &[CustomRuleTracer<V, O>],
                 &[BatchAxis],
+                &BatchingLevel<V::Type>,
+                &[CustomRuleTracer<V, O>],
             ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
             + Send
             + Sync,
@@ -925,10 +925,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         R: 'static
             + Fn(
-                &BatchingLevel<V::Type>,
-                &[CustomRuleTracer<V, O>],
                 &[CustomRuleTracer<V, O>],
                 &[BatchAxis],
+                &BatchingLevel<V::Type>,
+                &[CustomRuleTracer<V, O>],
             ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
             + Send
             + Sync,
@@ -1236,7 +1236,7 @@ mod tests {
                 .with_named_axes(named_axes.clone())
                 .with_jvp_from_primal()
                 .with_batching_support()
-                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         assert_eq!(registration.reference().definition().named_axes(), named_axes.as_slice());
         let key = CustomRuleDerivationKey {
@@ -1622,7 +1622,7 @@ mod tests {
     fn test_custom_rule_definition_with_batching_rule() {
         // The rule's program is the batched primal of the call, with the batch axes that the rule declares.
         let registration = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(
-            |_, _, inputs, input_axes| Ok((vec![inputs[0].clone() * inputs[0].clone()], input_axes.to_vec())),
+            |inputs, input_axes, _, _| Ok((vec![inputs[0].clone() * inputs[0].clone()], input_axes.to_vec())),
         ));
         assert!(registration.reference().has_batching_rule());
         let key = batching_rule_key(
@@ -1644,7 +1644,7 @@ mod tests {
 
         // The rule must declare one batch axis per output.
         let registration = CustomRuleRegistration::new(
-            MemberDefinition::new("square").with_batching_rule(|_, _, inputs, _| Ok((inputs.to_vec(), Vec::new()))),
+            MemberDefinition::new("square").with_batching_rule(|inputs, _, _, _| Ok((inputs.to_vec(), Vec::new()))),
         );
         assert!(matches!(
             registration.reference().batching_rule_specialization(key),
@@ -1657,7 +1657,7 @@ mod tests {
     fn test_custom_rule_definition_with_axis_dependent_batching_rule() {
         // The rule batches calls exactly as a plain batching rule does, and it records the operations with which the
         // derived definitions recover exact per-item tangents (refer to the `CustomRuleDerivation` tests).
-        let rule = |_: &BatchingLevel<ArrayType>, _: &[MemberTracer], inputs: &[MemberTracer], axes: &[BatchAxis]| {
+        let rule = |inputs: &[MemberTracer], axes: &[BatchAxis], _: &BatchingLevel<ArrayType>, _: &[MemberTracer]| {
             Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[0].clone()], axes.to_vec()))
         };
         let plain = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(rule));

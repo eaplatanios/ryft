@@ -91,10 +91,10 @@ enum CustomRuleBatchedOutputs {
 /// operation family's batching bounds are known, because requiring them on the operations' own rules would form a cycle
 /// with the family's payload bounds.
 type CustomRuleBatcher<V, O> = dyn Fn(
-        &BatchingLevel<<V as Typed>::Type>,
         &Program<V, O, Vec<V>, Vec<V>>,
         &[BatchAxis],
         &[Option<BatchAxis>],
+        &BatchingLevel<<V as Typed>::Type>,
         CustomRuleBatchedOutputs,
     ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
     + Send

@@ -4136,7 +4136,7 @@ mod tests {
 
         type Tracer = DomainTracer<ArrayContext>;
         let function = composite(|x: Tracer| Ok((x.sin()?, x.cos()?))).with_batching(
-            |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok(((x.sin()?, x.cos()?), (axis, axis))),
+            |x: Tracer, axis: BatchAxis, _: BatchingLevelExtent<Tracer>| Ok(((x.sin()?, x.cos()?), (axis, axis))),
         );
         let (_, program) = ArrayContext::trace(|x| Ok(function.call(x)?.0), scalar_type.clone()).unwrap();
         let program = program.into_flat_program();
@@ -5186,7 +5186,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false).with_batching_rule({
             let invocations = invocations.clone();
-            move |_, _, inputs, input_axes| {
+            move |inputs, input_axes, _, _| {
                 invocations.fetch_add(1, Ordering::SeqCst);
                 let x = inputs[0].clone();
                 Ok((vec![x.clone() * (x.clone() * x)], input_axes.to_vec()))
@@ -5244,7 +5244,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(
             cube_definition(&counters, true, false)
-                .with_batching_rule(|_, _, inputs, _| Ok((vec![inputs[0].clone()], vec![BatchAxis::replicated()]))),
+                .with_batching_rule(|inputs, _, _, _| Ok((vec![inputs[0].clone()], vec![BatchAxis::replicated()]))),
         );
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let output_axes_policy = ProgramBatchingOutputAxesPolicy::Natural;
@@ -5281,7 +5281,7 @@ mod tests {
         let definition = CustomRuleRegistration::new(
             IrDefinition::new("stateful")
                 .with_batching_support()
-                .with_batching_rule(|_, _, inputs, input_axes| {
+                .with_batching_rule(|inputs, input_axes, _, _| {
                     let state = inputs[0].reference_new()?;
                     state.add_update(&inputs[0])?;
                     Ok((vec![state.read()?], input_axes.to_vec()))
@@ -7997,7 +7997,7 @@ mod tests {
         // linearization transposes its primal region with respect to them.
         type Tracer = DomainTracer<ArrayContext>;
         let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
-            |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+            |(x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis), _: BatchingLevelExtent<Tracer>| {
                 Ok((x * y, if x_axis.is_replicated() { y_axis } else { x_axis }))
             },
         );

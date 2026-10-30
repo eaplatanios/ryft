@@ -931,16 +931,14 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Batching configuration of a [`Composite`] without a custom batching rule. Batching a call structurally batches its
 /// primal region.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultBatching;
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
-/// `(extent, x, x_axes) ↦ (y, y_axes)`. `Tracer` is the tracer type of the closure's leaves, which is also the type of
-/// dynamic extents. Refer to [`Composite::with_batching`] for more information.
+/// `(x, x_axes, extent) ↦ (y, y_axes)`. `Tracer` is the tracer type of the closure's leaves, which is also
+/// the type of dynamic extents. Refer to [`Composite::with_batching`] for more information.
 ///
 /// The name follows the vocabulary of JAX's
 /// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html) for a
@@ -955,9 +953,9 @@ where
     #[allow(clippy::type_complexity)]
     pub(super) rule: Arc<
         dyn Fn(
-                BatchingLevelExtent<Tracer>,
                 Input,
                 Input::To<BatchAxis>,
+                BatchingLevelExtent<Tracer>,
             ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
             + Send
             + Sync,
@@ -969,14 +967,15 @@ where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
 {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("CustomBatching").finish_non_exhaustive()
     }
 }
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
-/// `(extent, x, x_axes) ↦ (y, y_axes)` whose result may depend on its input batch axes. `Tracer` is the tracer type of
-/// the closure's leaves, which is also the type of dynamic extents. Refer to
+/// `(x, x_axes, extent) ↦ (y, y_axes)` whose result may depend on its input batch axes. `Tracer` is the tracer
+/// type of the closure's leaves, which is also the type of dynamic extents. Refer to
 /// [`Composite::with_axis_dependent_batching`] for more information.
 pub struct AxisDependentBatching<Tracer: Parameter, Input, Output>
 where
@@ -987,9 +986,9 @@ where
     #[allow(clippy::type_complexity)]
     pub(super) rule: Arc<
         dyn Fn(
-                BatchingLevelExtent<Tracer>,
                 Input,
                 Input::To<BatchAxis>,
+                BatchingLevelExtent<Tracer>,
             ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
             + Send
             + Sync,
@@ -1001,6 +1000,7 @@ where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
 {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("AxisDependentBatching").finish_non_exhaustive()
     }
@@ -1011,9 +1011,10 @@ where
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SequentialBatching;
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Installs a batching configuration in a [`CustomRuleDefinition`], selecting a custom batching rule or sequential
-/// batching when configured. The supported configurations are [`DefaultBatching`], [`CustomBatching`],
-/// [`AxisDependentBatching`], and [`SequentialBatching`].
+/// batching when configured.
 pub trait CompositeBatching<Batching, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
     Sized
 {
@@ -1344,13 +1345,13 @@ where
 }
 
 /// Adapts the structured custom batching rule closure `rule` of a [`Composite`] to the flat interface of retained
-/// batching rules. Each invocation passes the closure the level's extent, the call's own batched inputs with the call's
-/// input structure, and their batch axes. It validates that the outputs and their batch axes have the call's output
+/// batching rules. Each invocation passes the closure the call's own batched inputs with the call's input structure,
+/// their batch axes, and the level's extent. It validates that the outputs and their batch axes have the call's output
 /// structure.
 ///
 /// # Parameters
 ///
-///   - `rule`: Closure implementing `(extent, x, x_axes) ↦ (y, y_axes)`.
+///   - `rule`: Closure implementing `(x, x_axes, extent) ↦ (y, y_axes)`.
 ///   - `name`: Name of the function, used in diagnostics.
 ///   - `input_structure`: Structure of the call's inputs.
 ///   - `output_structure`: Structure of the call's outputs.
@@ -1362,10 +1363,10 @@ fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
     output_structure: &Output::ParameterStructure,
 ) -> impl 'static
 + Fn(
-    &BatchingLevel<V::Type>,
-    &[CustomRuleTracer<V, O>],
     &[CustomRuleTracer<V, O>],
     &[BatchAxis],
+    &BatchingLevel<V::Type>,
+    &[CustomRuleTracer<V, O>],
 ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
 + Send
 + Sync
@@ -1380,18 +1381,18 @@ where
     Rule: ?Sized
         + 'static
         + Fn(
-            BatchingLevelExtent<CustomRuleTracer<V, O>>,
             Input,
             Input::To<BatchAxis>,
+            BatchingLevelExtent<CustomRuleTracer<V, O>>,
         ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
         + Send
         + Sync,
 {
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-    move |level: &BatchingLevel<V::Type>,
-          boundary_inputs: &[CustomRuleTracer<V, O>],
-          inputs: &[CustomRuleTracer<V, O>],
-          input_axes: &[BatchAxis]| {
+    move |inputs: &[CustomRuleTracer<V, O>],
+          input_axes: &[BatchAxis],
+          level: &BatchingLevel<V::Type>,
+          boundary_inputs: &[CustomRuleTracer<V, O>]| {
         // A dynamic extent reaches the rule as the level's leading boundary input, and the level's other boundary
         // inputs do not reach the rule. The inputs of a call that was batched at earlier levels start with those
         // levels' boundary inputs, which the rule does not receive either.
@@ -1420,12 +1421,12 @@ where
             .checked_sub(input_structure.parameter_count())
             .ok_or_else(|| ProgramError::MalformedProgram(format!("`{name}` batching rule received too few inputs")))?;
         let (outputs, output_axes) = rule(
-            extent,
             Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
             Input::To::<BatchAxis>::from_parameters(
                 input_structure.clone(),
                 input_axes[leading_input_count..].iter().copied(),
             )?,
+            extent,
         )?;
         for (value, structure) in
             [("output", outputs.parameter_structure()), ("output axis", output_axes.parameter_structure())]
@@ -1550,7 +1551,7 @@ mod tests {
     fn test_custom_rule_definition_configure_batching() {
         let registration = {
             let configuration = CustomBatching::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
-                rule: Arc::new(|_, input, axis| Ok((vec![input.clone(), input], vec![axis, axis]))),
+                rule: Arc::new(|input, axis, _| Ok((vec![input.clone(), input], vec![axis, axis]))),
             };
             CustomRuleRegistration::new(ArrayDefinition::new(String::from("batching_definition")).configure_batching(
                 &configuration,
@@ -1583,7 +1584,7 @@ mod tests {
         // A dynamic batch extent is the leading boundary input of its batching level, which may have further boundary
         // inputs that the rule does not receive.
         type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let rule = |extent: BatchingLevelExtent<IrTracer>, _input: IrTracer, _axis: BatchAxis| match extent {
+        let rule = |_input: IrTracer, _axis: BatchAxis, extent: BatchingLevelExtent<IrTracer>| match extent {
             BatchingLevelExtent::Dynamic(extent) => Ok((extent, BatchAxis::replicated())),
             BatchingLevelExtent::Static(_) => {
                 Err(ProgramError::InvalidArgument { message: "the test rule expects a dynamic extent".to_string() })
@@ -1601,7 +1602,7 @@ mod tests {
             BatchingLevel::new(BatchingLevelExtent::Dynamic(extent_type.clone()), None, ShardingDimension::Replicated);
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |values: Vec<IrTracer>| {
-                let (outputs, output_axes) = adapter(&level, &values[..2], &values[2..], &[BatchAxis::replicated()])?;
+                let (outputs, output_axes) = adapter(&values[2..], &[BatchAxis::replicated()], &level, &values[..2])?;
                 assert_eq!(output_axes, vec![BatchAxis::replicated()]);
                 Ok(outputs)
             },

@@ -480,10 +480,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             );
             let output_axes = level.output_axes.iter().chain(&level.output_axes).copied().map(Some).collect::<Vec<_>>();
             self.definition.batched_specialization(
-                &level,
                 &inner.program,
                 &input_axes,
                 &output_axes,
+                &level,
                 CustomRuleBatchedOutputs::Values,
                 Vec::new(),
             )
@@ -616,10 +616,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 .chain(std::iter::repeat_n(None, residual_count))
                 .collect::<Vec<_>>();
             self.definition.batched_specialization(
-                &level,
                 &inner.program,
                 &level.input_axes,
                 &output_axes,
+                &level,
                 CustomRuleBatchedOutputs::Values,
                 Vec::new(),
             )
@@ -725,10 +725,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 })
                 .collect::<Vec<_>>();
             self.definition.batched_specialization(
-                &level,
                 &inner.program,
                 &input_axes,
                 &output_axes,
+                &level,
                 CustomRuleBatchedOutputs::Cotangents,
                 inner.cotangents.clone(),
             )
@@ -775,7 +775,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
-                    let (outputs, axes) = rule.apply(&key.level, boundary_inputs, inputs, &key.input_axes)?;
+                    let (outputs, axes) = rule.apply(inputs, &key.input_axes, &key.level, boundary_inputs)?;
                     if axes.len() != outputs.len() {
                         return Err(TypeError::invalid(format!(
                             "{} batching rule returned {} outputs but {} output \
@@ -1508,10 +1508,10 @@ where
             let mut input_axes = vec![BatchAxis::replicated(); boundary_input_count];
             input_axes.extend_from_slice(&key.input_axes);
             let (batched, output_axes) = batcher(
-                &key.level,
                 &jvp,
                 &input_axes,
                 &vec![None; jvp.output_types().len()],
+                &key.level,
                 CustomRuleBatchedOutputs::Values,
             )
             .map_err(ProgramError::from)?;
@@ -1560,10 +1560,10 @@ where
                 let alignment = Self::alignment_program(
                     name,
                     batcher.as_ref(),
-                    &key.level,
                     &aligned_inputs.iter().map(|&index| key.unbatched_input_types[index].clone()).collect::<Vec<_>>(),
                     &aligned_inputs.iter().map(|&index| key.input_axes[index]).collect::<Vec<_>>(),
                     &aligned_inputs.iter().map(|&index| aligned_axes[index]).collect::<Vec<_>>(),
+                    &key.level,
                 )?;
                 for (&index, r#type) in aligned_inputs.iter().zip(alignment.output_types()) {
                     aligned_types[index] = r#type;
@@ -1709,7 +1709,6 @@ where
             false => Some(Self::alignment_program(
                 name,
                 batcher,
-                &key.level,
                 &misaligned_following
                     .iter()
                     .map(|&tangent| key.unbatched_input_types[primal_count + tangent].clone())
@@ -1719,6 +1718,7 @@ where
                     .iter()
                     .map(|&tangent| primal_axes[tangent_primal_indices[tangent]])
                     .collect::<Vec<_>>(),
+                &key.level,
             )?),
         };
 
@@ -1730,10 +1730,10 @@ where
         let mut outer_input_axes = vec![BatchAxis::replicated(); boundary_input_count + primal_count];
         outer_input_axes.extend(tangent_only.iter().map(|&tangent| tangent_axes[tangent]));
         let (outer_product, outer_axes) = batcher(
-            &outer_level,
             &tangent_only_jvp,
             &outer_input_axes,
             &vec![None; tangent_only_jvp.output_types().len()],
+            &outer_level,
             CustomRuleBatchedOutputs::Values,
         )
         .map_err(ProgramError::from)?;
@@ -1790,10 +1790,10 @@ where
                 Some(Self::alignment_program(
                     name,
                     batcher,
-                    &key.level,
                     &broadcast_following.iter().map(|(index, _)| following_types[*index].clone()).collect::<Vec<_>>(),
                     &vec![BatchAxis::replicated(); broadcast_following.len()],
                     &broadcast_following.iter().map(|(_, axis)| *axis).collect::<Vec<_>>(),
+                    &key.level,
                 )?)
             }
         };
@@ -1960,17 +1960,17 @@ where
     ///
     ///   - `name`: Name of the derived definition, used in diagnostics.
     ///   - `batcher`: Batcher of the source definition.
-    ///   - `level`: Batching level of the values.
     ///   - `types`: Per-item types of the values.
     ///   - `input_axes`: Batch axes of the values.
     ///   - `output_axes`: Batch axes of the aligned values.
+    ///   - `level`: Batching level of the values.
     fn alignment_program(
         name: &str,
         batcher: &CustomRuleBatcher<V, O>,
-        level: &BatchingLevel<V::Type>,
         types: &[V::Type],
         input_axes: &[BatchAxis],
         output_axes: &[BatchAxis],
+        level: &BatchingLevel<V::Type>,
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let mut builder = ProgramBuilder::<V, O>::new();
         let inputs = types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
@@ -1978,7 +1978,7 @@ where
             builder.build::<Vec<V>, Vec<V>>(inputs, vec![Placeholder; types.len()], vec![Placeholder; types.len()])?;
         let required_axes = output_axes.iter().copied().map(Some).collect::<Vec<_>>();
         let (alignment, aligned_axes) =
-            batcher(level, &identity, input_axes, &required_axes, CustomRuleBatchedOutputs::Values)
+            batcher(&identity, input_axes, &required_axes, level, CustomRuleBatchedOutputs::Values)
                 .map_err(ProgramError::from)?;
         if aligned_axes != output_axes {
             return Err(ProgramError::MalformedProgram(format!(
@@ -2005,10 +2005,10 @@ where
     /// specialization that `program` belongs to (i.e., empty unless it is a backward-rule specialization).
     fn batched_specialization(
         &self,
-        level: &CustomRuleBatchingLevel<V::Type>,
         program: &Program<V, O, Vec<V>, Vec<V>>,
         input_axes: &[BatchAxis],
         output_axes: &[Option<BatchAxis>],
+        level: &CustomRuleBatchingLevel<V::Type>,
         outputs: CustomRuleBatchedOutputs,
         cotangents: Vec<TransposedProgramCotangent>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
@@ -2030,7 +2030,7 @@ where
             .into());
         };
         let (program, output_axes) =
-            batcher(&level.level, program, input_axes, output_axes, outputs).map_err(ProgramError::from)?;
+            batcher(program, input_axes, output_axes, &level.level, outputs).map_err(ProgramError::from)?;
         Ok(Arc::new(CustomRuleSpecialization { program, output_axes, cotangents }))
     }
 }
@@ -2205,7 +2205,7 @@ mod tests {
         batching_support: bool,
         axis_dependent: bool,
     ) -> CustomRuleRegistration<Array, ArrayOperation<Array>> {
-        let rule = |_: &BatchingLevel<ArrayType>, _: &[MemberTracer], inputs: &[MemberTracer], axes: &[BatchAxis]| {
+        let rule = |inputs: &[MemberTracer], axes: &[BatchAxis], _: &BatchingLevel<ArrayType>, _: &[MemberTracer]| {
             let axis = if axes[0].is_replicated() { axes[1] } else { axes[0] };
             Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[1].clone()], vec![axis]))
         };
@@ -2408,7 +2408,7 @@ mod tests {
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
                 .with_batching_support()
-                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let key = |kind| CustomRuleDerivationKey {
             kind,
@@ -2461,7 +2461,7 @@ mod tests {
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
                 .with_batching_support()
-                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let key = |input_count| CustomRuleDerivationKey {
             kind: CustomRuleDerivationKind::Jvp,
@@ -2505,7 +2505,7 @@ mod tests {
         let registration = CustomRuleRegistration::new(
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
-                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let source = registration.reference();
         let unavailable = UnavailableCustomRules::from_source(&source);
@@ -2595,7 +2595,7 @@ mod tests {
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
                 .with_batching_support()
-                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let key = CustomRuleDerivationKey {
             kind: CustomRuleDerivationKind::Jvp,

@@ -2981,7 +2981,7 @@ mod tests {
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
         let function = composite(|x: Tracer<'_>| Ok(x.sin()?)).with_batching(
-            |_: BatchingLevelExtent<Tracer<'_>>, x: Tracer<'_>, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)),
+            |x: Tracer<'_>, axis: BatchAxis, _: BatchingLevelExtent<Tracer<'_>>| Ok((x.sin()? + x.sin()?, axis)),
         );
         let close = |actual: &XlaArray<'_>, expected: &[f32]| {
             let actual = read_f32s(actual);
@@ -3024,9 +3024,9 @@ mod tests {
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
         let function = composite(|(x, y): (Tracer<'_>, Tracer<'_>)| Ok(x * y)).with_axis_dependent_batching(
-            |_: BatchingLevelExtent<Tracer<'_>>,
-             (x, y): (Tracer<'_>, Tracer<'_>),
-             (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+            |(x, y): (Tracer<'_>, Tracer<'_>),
+             (x_axis, y_axis): (BatchAxis, BatchAxis),
+             _: BatchingLevelExtent<Tracer<'_>>| {
                 let product = x * y;
                 let scaled = match x_axis.is_replicated() || y_axis.is_replicated() {
                     true => product.clone() + product.clone() + product,
