@@ -22,13 +22,11 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
     CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward,
     boundary_input_count, validate_rule_output_types,
-};
-use crate::operations::composites::{
-    retained_carrier_batching, validate_composite_discharge_inputs, validate_deferred_forward_rule,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -641,14 +639,20 @@ where
             CompositeTransposeRules::Attached => COMPOSITE_OPERATION_NAME,
             CompositeTransposeRules::Retained { rules, .. } => rules.name(),
         };
-        validate_composite_discharge_inputs(
-            &if name == COMPOSITE_OPERATION_NAME {
+        if let Some(index) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
+            let description = if name == COMPOSITE_OPERATION_NAME {
                 format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
             } else {
                 format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
-            },
-            inputs,
-        )?;
+            };
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{description} cannot discharge the reference state of its input {index}, because its rules receive \
+                     non-differentiated reference inputs by identity and cannot thread their state explicitly; pass \
+                     reference-free inputs or discharge external references first",
+                ),
+            });
+        }
         match &self.rules {
             CompositeTransposeRules::Attached => discharge_local_reference_operation(self, context, driver, inputs),
             CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, deferred_forward, .. } => {
@@ -1093,7 +1097,22 @@ where
                 }
                 let rule_output_count = key.rule_output_count()?;
                 let forward = rules.forward_specialization(key.clone())?;
-                validate_deferred_forward_rule(rules.name(), forward.program.effects())?;
+                if !forward.program.effects().is_pure() {
+                    let name = rules.name();
+                    let description = if name == COMPOSITE_OPERATION_NAME {
+                        format!("`{COMPOSITE_OPERATION_NAME}`")
+                    } else {
+                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                    };
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "{description} defers its forward rule to the backward pass (refer to \
+                             `with_deferred_forward`), which requires a pure forward rule, but its forward rule has \
+                             effects, which would run out of order in the backward pass",
+                        ),
+                    }
+                    .into());
+                }
 
                 // Only the residuals are replayed, because the primal outputs of the forward rule were already computed
                 // by the primal and the pullback would otherwise keep their dead computation.
@@ -1115,7 +1134,7 @@ where
                             .collect::<Vec<_>>();
                         let extent_types =
                             key.output_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?;
-                        Some(retained_carrier_batching(
+                        Some(transpose_carrier_batching(
                             rules,
                             key,
                             rule_output_count,
@@ -1242,10 +1261,12 @@ mod tests {
     };
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::composites::operations::call::{CompositeJvpRule, CompositeOperation};
+    use crate::operations::composites::operations::tests::{
+        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, batched_program, ir_custom_rule_program,
+    };
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
-        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, RuleCounters, batched_program, cube_definition,
-        custom_rule_program, ir_custom_rule_program, member_cube_definition,
+        RuleCounters, cube_definition, custom_rule_program, member_cube_definition,
     };
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;

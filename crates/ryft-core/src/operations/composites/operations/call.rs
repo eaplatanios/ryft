@@ -23,25 +23,21 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
+use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey,
     CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey,
     CustomRuleSpecializer, CustomRuleTracer, derive_bijective_identity_renaming,
-};
-use crate::operations::composites::{
-    replay_custom_jvp_rule, retained_carrier_batching, validate_composite_discharge_inputs,
-    validate_composite_reference_boundary, validate_composite_replay, validate_deferred_forward_rule,
-    validate_non_differentiated_count,
 };
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    discharge_local_reference_operation,
+    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
+    TypeError, TypeIdentityRenaming, Typed, Value, discharge_local_reference_operation,
 };
 use crate::tracing::TracingContext;
 
@@ -393,8 +389,15 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     /// group, based on the value of [`Self::non_differentiated_count`].
     #[inline]
     fn split_inputs<'v, T>(&self, values: &'v [T]) -> Result<(&'v [T], &'v [T]), TypeError> {
-        validate_non_differentiated_count(self.name(), self.non_differentiated_count, values.len())?;
-        Ok(values.split_at(self.non_differentiated_count))
+        let non_differentiated_count = self.non_differentiated_count;
+        let input_count = values.len();
+        if non_differentiated_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {non_differentiated_count} exceeds \
+                 input count {input_count}",
+            )));
+        }
+        Ok(values.split_at(non_differentiated_count))
     }
 
     /// Validates the composite contract over the attached region interfaces (refer to the documentation of
@@ -731,11 +734,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             }
             CompositeRules::Retained { rules, batching, .. } => {
                 check_count!("region", region_interfaces, 1, TypeError);
-                validate_non_differentiated_count(
-                    COMPOSITE_OPERATION_NAME,
-                    self.non_differentiated_count,
-                    input_types.len(),
-                )?;
+                let input_count = input_types.len();
+                if self.non_differentiated_count > input_count {
+                    return Err(TypeError::invalid(format!(
+                        "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {} exceeds input count \
+                         {input_count}",
+                        self.non_differentiated_count,
+                    )));
+                }
 
                 // A batched call's inputs start with the boundary inputs of its batching levels, followed by the inputs
                 // of the unbatched call (and `with_non_differentiated_count` keeps those boundary inputs
@@ -981,14 +987,20 @@ where
             CompositeRules::Attached { .. } => COMPOSITE_OPERATION_NAME,
             CompositeRules::Retained { rules, .. } => rules.name(),
         };
-        validate_composite_discharge_inputs(
-            &if name == COMPOSITE_OPERATION_NAME {
+        if let Some(index) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
+            let description = if name == COMPOSITE_OPERATION_NAME {
                 format!("`{COMPOSITE_OPERATION_NAME}`")
             } else {
                 format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-            },
-            inputs,
-        )?;
+            };
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{description} cannot discharge the reference state of its input {index}, because its rules receive \
+                     non-differentiated reference inputs by identity and cannot thread their state explicitly; pass \
+                     reference-free inputs or discharge external references first",
+                ),
+            });
+        }
         match &self.rules {
             CompositeRules::Attached { .. } => discharge_local_reference_operation(self, context, driver, inputs),
             CompositeRules::Retained { rules, batching, kept_outputs, .. } => {
@@ -1365,7 +1377,14 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        validate_non_differentiated_count(COMPOSITE_OPERATION_NAME, self.non_differentiated_count, inputs.len())?;
+        let input_count = inputs.len();
+        if self.non_differentiated_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {} exceeds input count {input_count}",
+                self.non_differentiated_count,
+            ))
+            .into());
+        }
         match (self.jvp_rule(), &self.rules) {
             // Apply the explicit pushforward directly instead of differentiating the primal region.
             (CompositeJvpRule::Explicit, CompositeRules::Attached { .. }) => replay_custom_jvp_rule(
@@ -1562,7 +1581,22 @@ where
                 // The forward rule is traced here, on its first request, to reject an effectful forward rule before
                 // anything is staged, and the carrier's transposition replays the cached specialization.
                 let specialization = rules.forward_specialization(key.clone())?;
-                validate_deferred_forward_rule(rules.name(), specialization.program.effects())?;
+                if !specialization.program.effects().is_pure() {
+                    let name = rules.name();
+                    let description = if name == COMPOSITE_OPERATION_NAME {
+                        format!("`{COMPOSITE_OPERATION_NAME}`")
+                    } else {
+                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                    };
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "{description} defers its forward rule to the backward pass (refer to \
+                             `with_deferred_forward`), which requires a pure forward rule, but its forward rule has \
+                             effects, which would run out of order in the backward pass",
+                        ),
+                    }
+                    .into());
+                }
                 let outputs = primal_region.interpret_in_context(context.primal(), primal_inputs)?;
                 leading_values.extend(differentiated_inputs.iter().map(|input| input.primal().clone()));
                 let extent_types = match batching {
@@ -1632,7 +1666,7 @@ where
 
                 let carrier_batching = match batching {
                     None => None,
-                    Some(_) => Some(retained_carrier_batching(
+                    Some(_) => Some(transpose_carrier_batching(
                         rules,
                         &key,
                         rule_output_count,
@@ -1773,6 +1807,242 @@ where
         }
         Ok(())
     }
+}
+
+/// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose leading
+/// `non_differentiated_count` inputs `p` are not differentiated. This is the forward mode rule for both attached JVP
+/// regions and retained JVP specializations of [`CompositeOperation`]. A fused [`DifferentiationContext`] replays the
+/// rule directly, while a partitioned one replays its known and tangent parts in their own contexts. Structural zero
+/// output tangents are recovered from literal zeros and zero-producing instructions of the rule.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the operation applying the rule, used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the rule without being differentiated.
+///   - `context`: [`DifferentiationContext`] in which the rule is applied.
+///   - `driver`: Instruction-scoped [`DifferentiationDriver`] used to partition the rule.
+///   - `jvp_region`: Rule program over every primal input followed by the differentiated inputs' tangents, returning
+///     the primal outputs followed by their tangents.
+///   - `inputs`: Input [`DifferentiationDual`]s aligned with the operation's inputs.
+///   - `tangent_activity`: Whether `jvp_region` takes the tangent of each differentiated input, or [`None`] when it
+///     takes every one of them. A region that takes only the active tangents materializes the structural zeros
+///     itself.
+fn replay_custom_jvp_rule<
+    C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>
+        + Zero<C::Value>,
+    P: DifferentiationPolicy<C>,
+    D: DifferentiationDriver<C>,
+>(
+    operation_name: &str,
+    non_differentiated_count: usize,
+    context: &DifferentiationContext<C, P>,
+    driver: &D,
+    jvp_region: RegionRef<'_, C::Constant, C::Operation>,
+    inputs: &[DifferentiationDual<C::Value>],
+    tangent_activity: Option<&[bool]>,
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    // Apply the user-supplied pushforward directly. For `f(p, x) = y`, the rule implements:
+    //
+    //   j(p, x, ẋ) = (f(p, x), (∂f/∂x)(p, x) · ẋ) = (y, ẏ).
+    //
+    // Feed every primal value, followed only by the differentiated inputs' tangents; `p` has no tangent slot in the
+    // rule, so a non-zero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary primitive
+    // operations directly in the active context, so it introduces no symbolic capture. Consequently, reverse mode
+    // differentiation can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
+    // no nested differentiation request or special reverse rule is needed here.
+    let output_types = jvp_region.output_types();
+    let output_count = output_types.len() / 2;
+    let input_count = inputs.len();
+    if non_differentiated_count > input_count {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` non-differentiated input count {non_differentiated_count} exceeds input count \
+             {input_count}",
+        ))
+        .into());
+    }
+    let differentiated_inputs = &inputs[non_differentiated_count..];
+
+    // The rule region is replayed directly rather than differentiated, so the replayed inputs are validated as defense
+    // in depth (refer to the documentation of `validate_composite_replay`).
+    validate_composite_replay(
+        operation_name,
+        non_differentiated_count,
+        context.primal(),
+        inputs,
+        &output_types[..output_count],
+    )?;
+    let tangent_activity = match tangent_activity {
+        Some(tangent_activity) => {
+            if tangent_activity.len() != differentiated_inputs.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{operation_name}` has {} differentiated inputs but {} tangent activity flags",
+                    differentiated_inputs.len(),
+                    tangent_activity.len(),
+                ))
+                .into());
+            }
+            tangent_activity.to_vec()
+        }
+        None => vec![true; differentiated_inputs.len()],
+    };
+    let active_count = tangent_activity.iter().filter(|active| **active).count();
+    check_count!("input", jvp_region.input_types(), inputs.len() + active_count, ProgramError);
+
+    // The JVP region consumes `(primals..., active_differentiated_input_tangents...)`, so feed every dual primal
+    // followed by the active differentiated duals' tangents.
+    let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+
+    // The JVP region takes every active tangent as a real region input, so materialize structural zeros against their
+    // own primal, which names every runtime quantity a reference-bearing tangent type omits; static inputs keep the
+    // nullary zero.
+    for (input, _) in differentiated_inputs.iter().zip(&tangent_activity).filter(|(_, active)| **active) {
+        let source = context.primal_to_tangent(input.primal().clone())?;
+        jvp_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+            context.tangent(),
+            input.tangent().clone(),
+            std::iter::once(&source),
+        )?);
+    }
+
+    // A fused differentiation context stages primal and tangent work in the same context, so the rule replays
+    // there directly. Otherwise, partition the rule into its known part, which depends only on the primal inputs
+    // and computes the primal outputs, and its tangent part, and replay each part in its own context.
+    let shares_context = std::ptr::eq(context.primal(), context.tangent());
+    let mut outputs = if shares_context {
+        jvp_region.interpret_in_context(context.primal(), jvp_inputs)?
+    } else {
+        let mut known = vec![true; inputs.len()];
+        known.resize(jvp_inputs.len(), false);
+        let partition = driver.partition_jvp_program(jvp_region, &known, &(0..output_count).collect::<Vec<_>>())?;
+        partition.interpret_in_context(context, &jvp_inputs, output_count)?
+    };
+    check_count!("output", outputs, 2 * output_count, ProgramError);
+    let tangents = outputs.split_off(output_count);
+    outputs
+        .into_iter()
+        .zip(tangents)
+        .enumerate()
+        .map(|(index, (primal, tangent))| {
+            // Replaying a stored rule loses the structural-zero representation. Recover it from a literal zero
+            // or a zero-producing instruction, without treating every known tangent as zero: a non-zero constant
+            // tangent is affine and must still be rejected by linearization. Replay has already preserved effects.
+            let output = jvp_region.output_ids()[output_count + index];
+            let is_zero = jvp_region.atoms()[output.index()].as_constant().is_some_and(Value::is_zero)
+                || jvp_region.instructions().iter().any(|instruction| {
+                    instruction
+                        .outputs()
+                        .iter()
+                        .position(|candidate| *candidate == output)
+                        .is_some_and(|index| instruction.operation().is_zero(index))
+                })
+                // Only partitioning needs to recover zeros produced by constant folding. Inspecting arbitrary
+                // eager tangent results would otherwise add a full array scan to each ordinary JVP call.
+                || (!shares_context
+                    && context.tangent().resolve(&tangent).into_constant().is_some_and(|value| value.is_zero()));
+
+            // Keep a materialized dynamic zero when its reconstruction requires runtime dimension values.
+            if is_zero && C::Operation::zero_residual_types(tangent.r#type().as_ref()).is_empty() {
+                DifferentiationDual::new_with_zero_tangent(primal)
+            } else {
+                DifferentiationDual::new(primal, tangent)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Validates the reference contract that the composite operations share over one primal boundary. A reference-typed
+/// input is accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that
+/// every attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a
+/// reference, so an active reference input would have a derivative that no user-supplied rule can express). No output
+/// may be a reference, because a rule region would then have to produce that output's tangent reference or consume its
+/// cotangent reference, and a user-supplied rule can neither allocate nor receive one. The custom derivative operations
+/// apply this contract during type inference, so it holds for every constructed call, and their derivative rules apply
+/// it again to the replayed inputs as defense in depth.
+///
+/// # Parameters
+///
+///   - `name`: Operation name used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
+///   - `input_types`: Primal input types in input order.
+///   - `output_types`: Primal output types in output order.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming the first reference-typed input in the differentiated segment, or otherwise the
+/// first reference-typed output.
+fn validate_composite_reference_boundary<T: Type>(
+    name: &str,
+    non_differentiated_count: usize,
+    input_types: &[T],
+    output_types: &[T],
+) -> Result<(), TypeError> {
+    if let Some((index, r#type)) = input_types
+        .iter()
+        .enumerate()
+        .skip(non_differentiated_count)
+        .find(|(_, r#type)| r#type.is_reference())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{name}` accepts reference inputs only in its leading non-differentiated segment; move input {index} \
+             of type `{type}` before the differentiated inputs",
+        )));
+    }
+    if let Some((index, r#type)) = output_types.iter().enumerate().find(|(_, r#type)| r#type.is_reference()) {
+        return Err(TypeError::invalid(format!(
+            "`{name}` cannot return a reference, but output {index} has type `{type}`",
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the inputs before replaying a custom derivative rule. Rule regions bypass ordinary differentiation
+/// dispatch, so replay checks the reference contract of [`validate_composite_reference_boundary`] that type inference
+/// already enforces and uses [`ReferenceBoundary`] to reject aliased concrete or staged references. Non-differentiated
+/// numeric inputs must have zero tangents, while non-differentiated references carry state whose tangent the rule
+/// leaves untouched.
+///
+/// # Parameters
+///
+///   - `name`: Operation name used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
+///   - `context`: Context in which the rule is replayed, which resolves the inputs.
+///   - `inputs`: Dual inputs of the replayed call, in input order.
+///   - `output_types`: Primal output types in output order.
+///
+/// # Errors
+///
+/// Returns the [`ProgramError`] of the first violated contract: the [`TypeError`] of
+/// [`validate_composite_reference_boundary`], a reference boundary error, or an unsupported non-zero tangent.
+fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
+    name: &str,
+    non_differentiated_count: usize,
+    context: &C,
+    inputs: &[DifferentiationDual<C::Value>],
+    output_types: &[C::Type],
+) -> Result<(), ProgramError> {
+    let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
+    validate_composite_reference_boundary(name, non_differentiated_count, primal_types.as_slice(), output_types)?;
+    ReferenceBoundary::new_for_differentiation(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
+    if let Some(input) = inputs.iter().take(non_differentiated_count).find(|input| {
+        !input.primal().r#type().is_reference()
+            && !input.tangent().is_zero()
+            && !input.tangent().r#type().is_zero_space()
+    }) {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{}` cannot propagate the non-zero tangent of type `{}` supplied for one of its \
+                 {} leading non-differentiated inputs, because its rule has no tangent slot for them",
+                name,
+                input.tangent().r#type(),
+                non_differentiated_count,
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Batches the composite call `call`, whose retained rules `rules` batch it sequentially (refer to
@@ -2068,23 +2338,25 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::forward::JvpPartitionTransform;
     use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, EverythingSavable,
-        ForwardModeDifferentiate, ReverseModeDifferentiate, TransposedProgramCotangent, differentiate_at,
-        rematerialize,
+        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationContext, DifferentiationDriver,
+        DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule, EverythingSavable,
+        ForwardModeDifferentiate, Linearization, ReverseModeDifferentiate, TransposedProgramCotangent,
+        differentiate_at, rematerialize,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::builders::composite;
+    use crate::operations::composites::operations::tests::{
+        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, batched_program, ir_custom_rule_program,
+    };
     use crate::operations::composites::rules::{
         CustomRuleBackwardSpecializationKey, CustomRuleRegistration, LiftedCustomRules,
     };
     use crate::operations::composites::tests::{
-        ArrayContext, ConvertedProgram, EagerArrayIrContext, IrDefinition, IrTracer, MemberDefinition,
-        ReferenceRuleDifferentiationDriver, RuleCounters, TestContext, TestDefinition, TestRegistration,
-        batched_program, call_jvp, composite_call_program, cube_definition, cube_program, custom_rule_program,
-        ir_custom_rule_program, member_cube_definition,
+        MemberDefinition, RuleCounters, TestContext, TestDefinition, TestRegistration, call_jvp, cube_definition,
+        cube_program, custom_rule_program, member_cube_definition,
     };
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -2098,10 +2370,11 @@ mod tests {
     };
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::partial::{PartialEvaluationOutput, PartialValue, PartitionedProgram};
     use crate::programs::{
         AttachedRegions, EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero,
-        OutputRegionProvenance, ProgramBuilder, ReferenceType, RegionInterface, RegionRole, RegionSlot,
+        OutputRegionProvenance, Program, ProgramBuilder, ReferenceType, RegionDriver, RegionInterface, RegionRef,
+        RegionRole, RegionSlot,
     };
     use crate::tests::hash_of;
     use crate::tracing::{DomainTracer, Trace};
@@ -2113,6 +2386,84 @@ mod tests {
 
     /// Composite call in the array IR operation family.
     type ArrayIrComposite = CompositeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Eager array IR context whose values may be arrays or references.
+    type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Builds one flat program that binds the composite call `operation` with `regions` to inputs of `input_types` and
+    /// returns all of its outputs.
+    fn composite_call_program<V: Value, O: Operation<Type = V::Type>>(
+        operation: impl Into<O>,
+        regions: Vec<Program<V, O, Vec<V>, Vec<V>>>,
+        input_types: Vec<V::Type>,
+    ) -> Program<V, O, Vec<V>, Vec<V>> {
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let regions = regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>();
+        let input_count = input_types.len();
+        let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = builder.add_instruction(operation, regions, inputs, None).unwrap().to_vec();
+        let output_count = outputs.len();
+        builder
+            .build::<Vec<V>, Vec<V>>(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
+            .unwrap()
+    }
+
+    /// Supplies the regions of composite calls while making recursive differentiation an assertion failure: the custom
+    /// derivative rules replay their rule regions directly and must never differentiate them recursively.
+    struct ReferenceRuleDifferentiationDriver {
+        programs: Vec<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>,
+    }
+
+    impl RegionDriver<ArrayIrValue<Array>, ArrayIrOperation<Array>> for ReferenceRuleDifferentiationDriver {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, ArrayIrValue<Array>, ArrayIrOperation<Array>>>
+        where
+            ArrayIrValue<Array>: 'r,
+            ArrayIrOperation<Array>: 'r,
+        {
+            self.programs.iter().map(Program::entry_region_ref)
+        }
+    }
+
+    impl DifferentiationDriver<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>
+        for ReferenceRuleDifferentiationDriver
+    {
+        fn jvp_program(
+            &self,
+            _region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            _input_indices: &[usize],
+        ) -> Result<Arc<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>, DifferentiationError>
+        {
+            unreachable!("custom derivative rules replay their rule regions instead of differentiating them")
+        }
+
+        fn linearize_program(
+            &self,
+            _region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            _input_indices: &[usize],
+            _instantiated_outputs: Option<&[bool]>,
+        ) -> Result<Linearization<ArrayIrValue<Array>, ArrayIrOperation<Array>>, DifferentiationError> {
+            unreachable!("custom derivative rules replay their rule regions instead of linearizing them")
+        }
+
+        fn partition_jvp_program(
+            &self,
+            region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            input_known: &[bool],
+            required_known_outputs: &[usize],
+        ) -> Result<PartitionedProgram<ArrayIrValue<Array>, ArrayIrOperation<Array>>, DifferentiationError> {
+            Ok(region.partition_with_configuration(input_known, true, true, Some(required_known_outputs), None)?.0)
+        }
+
+        fn bind_jvp_operation<P: DifferentiationPolicy<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>(
+            &self,
+            _context: &DifferentiationContext<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, P>,
+            _operation: &ArrayIrOperation<Array>,
+            _programs: Vec<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>,
+            _inputs: &[DifferentiationDual<ArrayIrValue<Array>>],
+        ) -> Result<Vec<DifferentiationDual<ArrayIrValue<Array>>>, DifferentiationError> {
+            unreachable!("custom derivative rules replay their rule regions instead of differentiating them")
+        }
+    }
 
     /// Builds a reference-free program representing the identity function over `r#type`.
     fn array_ir_identity_program(r#type: &ArrayIrType) -> FlatProgram<EagerArrayIrContext> {
@@ -7774,5 +8125,109 @@ mod tests {
         assert!(retained_caches.upgrade().is_none());
         drop((member, converted, again, batched, linearization, reverse, pullback));
         assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_validate_composite_reference_boundary() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+
+        // References are accepted in the leading non-differentiated input segment.
+        assert_eq!(
+            validate_composite_reference_boundary(
+                "composite",
+                1,
+                &[reference_type.clone(), scalar_type.clone()],
+                std::slice::from_ref(&scalar_type),
+            ),
+            Ok(()),
+        );
+
+        // References are rejected among the differentiated inputs and among the outputs.
+        assert_eq!(
+            validate_composite_reference_boundary(
+                "composite",
+                1,
+                &[scalar_type.clone(), reference_type.clone()],
+                std::slice::from_ref(&scalar_type),
+            ),
+            Err(TypeError::invalid(
+                "`composite` accepts reference inputs only in its leading non-differentiated segment; move input \
+                 1 of type `ref<f32[]>` before the differentiated inputs"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(
+            validate_composite_reference_boundary(
+                "composite",
+                1,
+                &[reference_type.clone(), scalar_type.clone()],
+                &[scalar_type, reference_type],
+            ),
+            Err(TypeError::invalid(
+                "`composite` cannot return a reference, but output 1 has type `ref<f32[]>`".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_validate_composite_replay() {
+        // Structural zeros and zero-space values require no tangent slot for a non-differentiated input.
+        let input =
+            DifferentiationDual::new_with_zero_tangent(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())).unwrap();
+        assert_eq!(validate_composite_replay("composite", 1, &EagerArrayIrContext::new(), &[input], &[]), Ok(()),);
+        let input = DifferentiationDual::new(
+            ArrayIrValue::Array(Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap()),
+            ArrayIrValue::Array(Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(validate_composite_replay("composite", 1, &EagerArrayIrContext::new(), &[input], &[]), Ok(()),);
+
+        // A non-differentiated numeric input with a non-zero tangent has no tangent slot in the rule.
+        let input = DifferentiationDual::new(
+            ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_composite_replay("composite", 1, &EagerArrayIrContext::new(), &[input], &[]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`composite` cannot propagate the non-zero tangent of type `f32[]` supplied for \
+                    one of its 1 leading non-differentiated inputs, because its rule has no tangent slot for them",
+        ));
+    }
+
+    #[test]
+    fn test_validate_composite_replay_staged_references() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        EagerArrayIrContext::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let mut duals = inputs
+                    .iter()
+                    .cloned()
+                    .map(DifferentiationDual::new_with_zero_tangent)
+                    .collect::<Result<Vec<_>, _>>()?;
+                assert_eq!(validate_composite_replay("composite", 2, context, &duals, &[]), Ok(()));
+
+                // Replaying the same valid boundary is allowed, including a fresh root allocated inside the trace.
+                let local = context.bind(ReferenceNewOperation::new(), vec![], &inputs[2..])?.remove(0);
+                duals[1] = DifferentiationDual::new_with_zero_tangent(local)?;
+                assert_eq!(validate_composite_replay("composite", 2, context, &duals, &[]), Ok(()));
+                assert_eq!(validate_composite_replay("composite", 2, context, &duals, &[]), Ok(()));
+
+                // An ordinary staged input must not hide two reference inputs naming the same allocation.
+                duals[1] = duals[0].clone();
+                assert!(matches!(
+                    validate_composite_replay("composite", 2, context, &duals, &[]),
+                    Err(ProgramError::InvalidArgument { message })
+                        if message == "input 1 and input 0 bind the same reference allocation",
+                ));
+                Ok(vec![inputs[2].clone()])
+            },
+            vec![reference_type.clone(), reference_type, scalar_type],
+        )
+        .unwrap();
     }
 }

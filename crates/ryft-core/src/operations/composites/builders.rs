@@ -25,7 +25,6 @@ use crate::operations::composites::configurations::{
 };
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, CompositeOperation};
 use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration};
-use crate::operations::composites::validate_non_differentiated_count;
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed, Value};
@@ -1074,7 +1073,14 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
         let Some(first) = input_values.first() else {
             return Err(TypeError::invalid(format!("`{}` requires at least one input", self.name)).into());
         };
-        validate_non_differentiated_count(&self.name, self.non_differentiated_count, input_values.len())?;
+        let input_count = input_values.len();
+        if self.non_differentiated_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "`{}` non-differentiated input count {} exceeds input count {input_count}",
+                self.name, self.non_differentiated_count,
+            ))
+            .into());
+        }
 
         // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The
         // primal and the rules are traced in fresh traces, which are seeded with the named axes that are visible where

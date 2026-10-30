@@ -1,7 +1,3 @@
-//! The type-state markers of the [`Composite`] configurations (e.g., [`ExplicitJvp`] and [`ExplicitVjp`]), which store
-//! the structured rule closures type-erased, and the adapters that register those closures as the flat, family-level
-//! rules of [`CustomRuleDefinition`]s.
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -30,6 +26,8 @@ use crate::tracing::{DomainTracingContext, TracingContext};
 
 #[cfg(doc)]
 use crate::operations::composites::builders::{Composite, composite};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
