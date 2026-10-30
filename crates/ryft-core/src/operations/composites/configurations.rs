@@ -20,7 +20,7 @@ use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationProvider, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracingContext, TracingContext};
 
@@ -138,9 +138,18 @@ where
                     ("output tangent", tangent_types.parameter_structure()),
                 ] {
                     if &rule_structure != output_structure {
-                        return Err(
-                            rule_structure_mismatch(name, "JVP", value, output_structure, &rule_structure).into()
-                        );
+                        return Err(TypeError::invalid(format!(
+                            "{} JVP rule {} structure mismatch: expected {:?} but got {:?}",
+                            if name == COMPOSITE_OPERATION_NAME {
+                                format!("`{COMPOSITE_OPERATION_NAME}`")
+                            } else {
+                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                            },
+                            value,
+                            output_structure,
+                            rule_structure,
+                        ))
+                        .into());
                     }
                 }
                 let program = program.into_flat_program();
@@ -311,13 +320,16 @@ where
                         )?;
                         let output_tangent_structure = output_tangents.parameter_structure();
                         if &output_tangent_structure != output_structure {
-                            return Err(rule_structure_mismatch(
-                                name,
-                                "JVP",
-                                "output tangent",
+                            return Err(TypeError::invalid(format!(
+                                "{} JVP rule output tangent structure mismatch: expected {:?} but got {:?}",
+                                if name == COMPOSITE_OPERATION_NAME {
+                                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                                } else {
+                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                },
                                 output_structure,
-                                &output_tangent_structure,
-                            )
+                                output_tangent_structure,
+                            ))
                             .into());
                         }
 
@@ -362,13 +374,16 @@ where
                 )?;
                 let output_type_structure = output_types.parameter_structure();
                 if &output_type_structure != output_structure {
-                    return Err(rule_structure_mismatch(
-                        name,
-                        "JVP",
-                        "output",
+                    return Err(TypeError::invalid(format!(
+                        "{} JVP rule output structure mismatch: expected {:?} but got {:?}",
+                        if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        },
                         output_structure,
-                        &output_type_structure,
-                    )
+                        output_type_structure,
+                    ))
                     .into());
                 }
 
@@ -554,13 +569,16 @@ where
                             // same leaf type.
                             let cotangent_structure = cotangents.parameter_structure();
                             if &cotangent_structure != input_structure {
-                                return Err(rule_structure_mismatch(
-                                    name,
-                                    "backward",
-                                    "cotangent",
+                                return Err(TypeError::invalid(format!(
+                                    "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
+                                    if name == COMPOSITE_OPERATION_NAME {
+                                        format!("`{COMPOSITE_OPERATION_NAME}`")
+                                    } else {
+                                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                    },
                                     input_structure,
-                                    &cotangent_structure,
-                                )
+                                    cotangent_structure,
+                                ))
                                 .into());
                             }
                             Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
@@ -722,19 +740,22 @@ where
                             // materialized seeds.
                             let cotangent_structure = cotangents.parameter_structure();
                             if &cotangent_structure != input_structure {
-                                return Err(rule_structure_mismatch(
-                                    name,
-                                    "backward",
-                                    "cotangent",
+                                return Err(TypeError::invalid(format!(
+                                    "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
+                                    if name == COMPOSITE_OPERATION_NAME {
+                                        format!("`{COMPOSITE_OPERATION_NAME}`")
+                                    } else {
+                                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                                    },
                                     input_structure,
-                                    &cotangent_structure,
-                                )
+                                    cotangent_structure,
+                                ))
                                 .into());
                             }
 
                             // Only the live cotangents become program outputs, while the structural zeros are recorded
-                            // by type.
-                            // This preserves symbolic zeros as in a JAX backward rule returning `None` or `SymbolicZero`.
+                            // by type. This preserves symbolic zeros as in a JAX backward rule returning `None` or
+                            // `SymbolicZero`.
                             let mut zeros = Vec::new();
                             let mut live_cotangents = Vec::new();
                             for cotangent in cotangents.into_parameters().skip(non_differentiated_count) {
@@ -1212,7 +1233,21 @@ where
             [("output", outputs.parameter_structure()), ("output axis", output_axes.parameter_structure())]
         {
             if structure != output_structure {
-                return Err(rule_structure_mismatch(&name, "batching", value, &output_structure, &structure).into());
+                return Err(TypeError::invalid(format!(
+                    "{} batching rule {} structure mismatch: expected {:?} but got {:?}",
+                    {
+                        let name: &str = &name;
+                        if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        }
+                    },
+                    value,
+                    output_structure,
+                    structure,
+                ))
+                .into());
             }
         }
         Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
@@ -1248,9 +1283,16 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<
             .iter()
             .find(|(types, _)| derive_bijective_identity_renaming(types, &residual_types).is_some());
         match recorded {
-            Some((_, recorded)) if recorded != &structure => {
-                Err(rule_structure_mismatch(name, "forward", "residual", recorded, &structure))
-            }
+            Some((_, recorded)) if recorded != &structure => Err(TypeError::invalid(format!(
+                "{} forward rule residual structure mismatch: expected {:?} but got {:?}",
+                if name == COMPOSITE_OPERATION_NAME {
+                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                } else {
+                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                },
+                recorded,
+                structure,
+            ))),
             Some(_) => Ok(()),
             None => {
                 structures.push((residual_types, structure));
@@ -1361,13 +1403,16 @@ where
             // Matching flat types cannot establish the nested output structure.
             let forward_output_structure = forward_output_types.parameter_structure();
             if &forward_output_structure != output_structure {
-                return Err(rule_structure_mismatch(
-                    name,
-                    "forward",
-                    "output",
+                return Err(TypeError::invalid(format!(
+                    "{} forward rule output structure mismatch: expected {:?} but got {:?}",
+                    if name == COMPOSITE_OPERATION_NAME {
+                        format!("`{COMPOSITE_OPERATION_NAME}`")
+                    } else {
+                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                    },
                     output_structure,
-                    &forward_output_structure,
-                )
+                    forward_output_structure,
+                ))
                 .into());
             }
 
@@ -1383,15 +1428,15 @@ where
                 }
                 if !program.input_ids().contains(residual) {
                     return Err(TypeError::invalid(format!(
-                        "`{name}` forward rule returns residual {index} of reference type `{type}` that is not a leading \
-                         non-differentiated input forwarded by identity",
+                        "`{name}` forward rule returns residual {index} of reference type `{type}` \
+                         that is not a leading non-differentiated input forwarded by identity",
                     ))
                     .into());
                 }
                 if !forwarded_inputs.insert(*residual) {
                     return Err(TypeError::invalid(format!(
-                        "`{name}` forward rule returns residual {index} of reference type `{type}` from an input already \
-                         forwarded by an earlier residual",
+                        "`{name}` forward rule returns residual {index} of reference type `{type}` \
+                         from an input already forwarded by an earlier residual",
                     ))
                     .into());
                 }
@@ -1405,26 +1450,6 @@ where
         let residuals = outputs.split_off(output_structure.parameter_count());
         Ok((outputs, residuals))
     }
-}
-
-/// Returns the error reported when the `value` structure (e.g., `"output"`) of the `rule` rule (e.g., `"JVP"`) of the
-/// function named `name` differs from the `expected` one. It is reported like the type mismatches of rule outputs,
-/// because flattened signatures cannot distinguish differently nested collections with identical leaf types.
-fn rule_structure_mismatch<Structure: Debug>(
-    name: &str,
-    rule: &str,
-    value: &str,
-    expected: &Structure,
-    actual: &Structure,
-) -> TypeError {
-    TypeError::invalid(format!(
-        "{} {rule} rule {value} structure mismatch: expected {expected:?} but got {actual:?}",
-        if name == COMPOSITE_OPERATION_NAME {
-            format!("`{COMPOSITE_OPERATION_NAME}`")
-        } else {
-            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-        },
-    ))
 }
 
 #[cfg(test)]
