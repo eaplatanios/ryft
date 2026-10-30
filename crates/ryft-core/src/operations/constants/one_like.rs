@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_one_like_differentiation() {
-        // Dense forward-mode differentiation batches the constant rule while constructing the identity Jacobian.
+        // Dense forward mode differentiation batches the constant rule while constructing the identity Jacobian.
         let jacobian = differentiate_at(Array::scalar(2.0).unwrap())
             .jacobian_forward(|input| Ok(input.clone() + input.one_like()?))
             .unwrap();

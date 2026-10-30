@@ -195,7 +195,7 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Returns the outputs and tangents of the forward-mode differentiation of one call of `definition` at `x` with
+    /// Returns the outputs and tangents of the forward mode differentiation of one call of `definition` at `x` with
     /// tangent `tangent`.
     pub(super) fn call_jvp(
         definition: &TestRegistration,

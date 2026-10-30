@@ -1,6 +1,6 @@
 //! Contains the `shard_map` operation: [`ShardMapOperation`], which runs its attached local `body` [`Region`] once per
 //! device of a manual SPMD computation, together with its logical boundary metadata [`ShardMap`], its logical error
-//! type [`ShardMapError`], and its reference-discharge, interpretation, partial-evaluation, batching, forward-mode
+//! type [`ShardMapError`], and its reference-discharge, interpretation, partial-evaluation, batching, forward mode
 //! differentiation, and transposition rules. This is the analogue of
 //! [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html) (refer to the
 //! [JAX `shard_map` guide](https://docs.jax.dev/en/latest/notebooks/shard_map.html) for the programming model), and
@@ -94,7 +94,7 @@
 //! # References Under `shard_map`
 //!
 //! This section is the per-shard ownership contract for mutable references crossing a shard-map boundary. The
-//! discharge, forward-mode, partial-evaluation, and reverse-mode rules of [`ShardMapOperation`] implement it, and they
+//! discharge, forward mode, partial-evaluation, and reverse mode rules of [`ShardMapOperation`] implement it, and they
 //! check the body against it before doing any work. Construct reference-bearing operations through
 //! [`ShardMapOperation::from_program`], which derives output types and reference forwarding from the body, and then
 //! attach the checked local body when binding the operation through a tracing context or program builder. Global
@@ -374,7 +374,7 @@ pub enum ShardMapError {
     )]
     DynamicResidualNotSupported { residual_index: usize, dimension: usize },
 
-    /// Error returned when forward-mode differentiation would carry a reference residual between the primal and
+    /// Error returned when forward mode differentiation would carry a reference residual between the primal and
     /// tangent maps that neither denotes a reference input of the body nor is allocated inside it. A reference cannot
     /// be carried by a residual edge: a reference residual that denotes a reference input crosses the boundary as that
     /// input, by identity, and one allocated inside the body crosses as a snapshot of its final state, from which the
@@ -1533,7 +1533,7 @@ impl ShardMapOperation {
     }
 
     /// Returns a copy of this operation whose global output types are replaced by `global_output_types`, keeping the
-    /// manual SPMD metadata, global input types, and output forwarding unchanged. Forward-mode differentiation uses
+    /// manual SPMD metadata, global input types, and output forwarding unchanged. Forward mode differentiation uses
     /// this to align a tangent boundary's global output types with the tangent descriptors derived from the staged
     /// primal `shard_map`'s output types.
     pub(crate) fn with_global_output_types(
@@ -2514,7 +2514,7 @@ where
     }
 }
 
-// Capture-free forward-mode (JVP) rule for `ShardMapOperation`, binding either one fused `shard_map` or a primal
+// Capture-free forward mode (JVP) rule for `ShardMapOperation`, binding either one fused `shard_map` or a primal
 // `shard_map` and a tangent `shard_map` as ordinary operations of the active context's operation family: a staging
 // context stages them over its shared builder, while an eager context executes them immediately.
 //
@@ -4189,8 +4189,8 @@ where
     })
 }
 
-/// Binds the fused forward-mode `shard_map` of `operation` in the shared primal and tangent context of `context` (refer
-/// to the forward-mode rule of [`ShardMapOperation`]) and returns the output duals, or [`None`] when no output tangent
+/// Binds the fused forward mode `shard_map` of `operation` in the shared primal and tangent context of `context` (refer
+/// to the forward mode rule of [`ShardMapOperation`]) and returns the output duals, or [`None`] when no output tangent
 /// is live, in which case nothing is bound. The fused body is the fused JVP program of `body` with respect to the
 /// inputs that `activity` marks as active, which maps `[inputs..., active(input_tangents)...]` to
 /// `[outputs..., output_tangents...]`, projected onto the outputs followed by the live output tangents with its dead
@@ -4296,7 +4296,7 @@ where
 
 /// Returns `true` when a shard-map body has a reference input or output or accesses a reference anywhere in its region
 /// closure. The partial-evaluation rule of [`ShardMapOperation`] keeps the boundary of such a body whole, so its
-/// forward-mode rule never fuses it.
+/// forward mode rule never fuses it.
 fn body_has_references<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
     body: RegionRef<'_, V, O>,
 ) -> bool {
@@ -4308,7 +4308,7 @@ fn body_has_references<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIr
 /// Returns `true` when a value of a shard-map body, including the values of its nested regions, has a dynamically
 /// shaped array type. Such a value cannot cross the static boundary between the bodies of a split (refer to
 /// [`residual_boundary`]), so the partial-evaluation rule of [`ShardMapOperation`] cannot split the body across it, and
-/// its forward-mode rule never fuses such a body. The values of nested regions count as well, because splitting a
+/// its forward mode rule never fuses such a body. The values of nested regions count as well, because splitting a
 /// region operation (e.g., a `condition` whose branch computes `sin` of a dynamically shaped value) moves the residuals
 /// of its regions to the body itself, and when those residuals are dynamically shaped, the region operation (or the
 /// whole body) stays on the unknown side of the split, which would leave the primal outputs that it computes unknown.
@@ -5884,7 +5884,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Evaluates the forward-mode derivative of the single-input `program` at `input` along unit tangents on the
+    /// Evaluates the forward mode derivative of the single-input `program` at `input` along unit tangents on the
     /// reference backend and returns the elements of its outputs followed by those of its output tangents.
     fn evaluate_pushforward(program: &TestProgram, input: TestValue) -> Vec<Vec<f64>> {
         let TestValue::Array(array) = &input else {
@@ -6044,7 +6044,7 @@ mod tests {
         )
     }
 
-    /// Evaluates the reverse-mode linearization of the single-input `program` at `input` on the reference backend, and
+    /// Evaluates the reverse mode linearization of the single-input `program` at `input` on the reference backend, and
     /// returns the elements of its primal outputs followed by the elements of the input cotangent that each of
     /// `application_count` applications of its pullback to unit output seeds returns. All applications reuse the
     /// residuals of one evaluation of the primal program.
@@ -8114,7 +8114,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_boundary_pruning_of_fused_jvp_programs() {
-        // Pruning a forward-mode program that only uses the output tangents of a fused `shard_map` drops its primal
+        // Pruning a forward mode program that only uses the output tangents of a fused `shard_map` drops its primal
         // outputs (and the body computation that only they use, here `a + a`) but keeps the primal computation that
         // the tangents use. The body maps `(a, x)` to `(a + a, sin(a) * x)`.
         let replicated = Sharding::replicated(manual_mesh(), 0);
@@ -9298,7 +9298,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_partial_evaluation_of_jvp_programs_at_concrete_primals() {
-        // Partially evaluating a forward-mode program at a concrete primal splits its fused `shard_map`: the known
+        // Partially evaluating a forward mode program at a concrete primal splits its fused `shard_map`: the known
         // half, which computes the output and the residual `cos(x)`, executes, and the residual `shard_map`, which
         // computes the output tangent, is the only instruction of the residual program.
         let mesh = manual_mesh();
@@ -9343,7 +9343,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_partial_evaluation_splits_fused_jvp_maps() {
-        // Partially evaluating the fused forward-mode `shard_map` of `sin(x) * w` with known primals and unknown
+        // Partially evaluating the fused forward mode `shard_map` of `sin(x) * w` with known primals and unknown
         // tangents splits it into a known `shard_map`, which computes the output and the residuals `cos(x)` and
         // `sin(x)` (tiled along `x`), and a residual `shard_map`, which computes the output tangent. The residual `w`
         // is a known input, so the residual `shard_map` receives it from the known boundary input (JAX's `in_fwd`).
@@ -10109,7 +10109,7 @@ mod tests {
     #[test]
     fn test_shard_map_partial_evaluation_retains_deferred_work_of_bodies_with_only_forwarded_outputs() {
         // A body whose outputs all forward known inputs is kept exactly when its remaining work is retained when
-        // unused. Deferred work has no effect class but must survive: here, a reverse-mode carrier of a composite
+        // unused. Deferred work has no effect class but must survive: here, a reverse mode carrier of a composite
         // applied to the unknown input `x`, whose backward rule prints its cotangent, stays in a `shard_map` without
         // outputs.
         let replicated = Sharding::replicated(manual_mesh(), 0);
@@ -12392,7 +12392,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_differentiation() {
-        // Forward-mode differentiation binds one fused `shard_map` over the primal and the tangent of its input, whose
+        // Forward mode differentiation binds one fused `shard_map` over the primal and the tangent of its input, whose
         // body is the fused JVP program of the body and whose tangent boundary types are the tangent descriptors of
         // the primal ones, which may have other element types.
         let mesh = manual_mesh();
@@ -12446,7 +12446,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_differentiation_treats_structurally_zero_tangents_as_inactive() {
-        // Forward-mode differentiation treats a structurally zero input tangent as inactive, like JAX's `which_nz`: the
+        // Forward mode differentiation treats a structurally zero input tangent as inactive, like JAX's `which_nz`: the
         // fused `shard_map` receives no tangent slot for it, and an output that depends only on such inputs receives a
         // structurally zero tangent instead of a tangent computed from materialized zeros (JAX's `which_nz_out`).
 
@@ -12705,7 +12705,7 @@ mod tests {
         // between them tiled along `x`, so that their local shards are the residuals themselves. Neither body converts
         // them, so the partial evaluation of the tangent `shard_map` (whose residual inputs are known) finds no work
         // that depends on the residuals alone and keeps it whole, instead of splitting off a known `shard_map` that
-        // only converts the residual edges back and forth. The linearization of the fused forward-mode program binds
+        // only converts the residual edges back and forth. The linearization of the fused forward mode program binds
         // one map on each side as well.
         let program = sine_product_shard_map_program();
         let linearization = program.linearize().unwrap();
@@ -12835,7 +12835,7 @@ mod tests {
         // unpacking it. The tangent `shard_map` is partially evaluated with its residual edge known, but that unpacking
         // is the only work that depends on the residual alone, so the map is kept whole instead of splitting off a
         // known `shard_map` that only unpacks and repacks the edge. This holds for forward linearization, for reverse
-        // mode, and for the linearization of the fused forward-mode program.
+        // mode, and for the linearization of the fused forward mode program.
         let program = trace_test_program(
             |inputs| {
                 vec![
@@ -12993,7 +12993,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_linearization_of_while_loops_over_fused_maps() {
-        // The forward-mode rule of an unbounded `while` loop differentiates its body with the fused policy, so a
+        // The forward mode rule of an unbounded `while` loop differentiates its body with the fused policy, so a
         // `shard_map` in the body becomes one fused map, and linearization then partitions the fused loop, whose body
         // the partial-evaluation rule of `shard_map` splits. The result matches that of the same loop without the map.
         let program = sine_while_program(true);
@@ -13050,7 +13050,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_linearization_of_rematerialized_maps() {
-        // The partitioned forward-mode rule of `rematerialize` partitions the fused derivative of its body, whose
+        // The partitioned forward mode rule of `rematerialize` partitions the fused derivative of its body, whose
         // `shard_map` becomes one fused map that the partial-evaluation rule of `shard_map` splits. The result matches
         // that of the same function without the map.
         type BodyTracer = Tracer<TestContext>;
@@ -13606,7 +13606,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_reverse_mode_differentiation_snapshots_body_allocated_residuals_of_custom_vjp_rules() {
-        // A reverse-mode rule may forward the body-allocated plumbing reference `r` as one of its residuals, alone or
+        // A reverse mode rule may forward the body-allocated plumbing reference `r` as one of its residuals, alone or
         // next to a JVP rule (which reverse mode does not use). The primal map snapshots the final state of `r`, which
         // is replicated, into an untiled residual edge, and the tangent map allocates its own `r` from that edge before
         // the transposed backward rule receives it. Both match the same function outside `shard_map`.
@@ -13973,7 +13973,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_differentiation_rejects_dynamic_residuals() {
-        // Forward-mode differentiation splits a body into primal and tangent maps, so it rejects a body whose residuals
+        // Forward mode differentiation splits a body into primal and tangent maps, so it rejects a body whose residuals
         // include a dynamically shaped intermediate, which cannot cross the static boundary between them.
         let program = dynamic_residual_shard_map_program();
         let expected = ShardMapError::DynamicResidualNotSupported { residual_index: 1, dimension: 0 };
@@ -14393,7 +14393,7 @@ mod tests {
     fn test_shard_map_differentiation_of_bodies_with_casts() {
         // A checked cast staged directly keeps its checked mode in the body, whereas the public `cast` capability
         // normalizes a cast whose input types prove its relationship into an unchecked one, and differentiation
-        // normalizes the staged one when it binds the body. The fused forward-mode body converts the tangent with the
+        // normalizes the staged one when it binds the body. The fused forward mode body converts the tangent with the
         // primal conversion as its witness, so the tangent stays behind the primal conversion, and linearization keeps
         // the varying output of the cast as a residual that crosses the boundary tiled along `x`, while the tangent
         // program needs no conversion because the cast is an identity.
@@ -14956,7 +14956,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_differentiation_of_bodies_without_inputs() {
-        // A `shard_map` without inputs has no input tangents, so forward-mode differentiation keeps its primal
+        // A `shard_map` without inputs has no input tangents, so forward mode differentiation keeps its primal
         // boundary and gives its output a zero tangent without staging a tangent `shard_map`. The body lifts a constant
         // through its context, which is invariant and is therefore marked as varying along the tiled axis `x`.
         let context = TestContext::new();
@@ -16475,7 +16475,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_transposition_keeps_effects_of_bodies_without_output_cotangents() {
-        // A body whose backward work prints (here, a reverse-mode carrier of a composite applied to `x`, whose backward
+        // A body whose backward work prints (here, a reverse mode carrier of a composite applied to `x`, whose backward
         // rule prints its cotangent) must be transposed even when every value output cotangent is a structural zero, as
         // here, where the outer program uses no output of the map. The body is projected onto no outputs, which keeps
         // the carrier because it carries deferred work, so the transposed map still runs the print on a zero seed. The

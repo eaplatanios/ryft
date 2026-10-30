@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_zero_like_differentiation() {
-        // Dense reverse-mode differentiation batches the constant rule while constructing the identity Jacobian.
+        // Dense reverse mode differentiation batches the constant rule while constructing the identity Jacobian.
         let jacobian = differentiate_at(Array::scalar(2.0).unwrap())
             .jacobian_reverse(|input| Ok(input.clone() + input.zero_like()?))
             .unwrap();

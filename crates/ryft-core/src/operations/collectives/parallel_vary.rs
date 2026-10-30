@@ -278,7 +278,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 /// cotangent contributions back into one. Transposing a [`ParallelVaryOperation`] therefore stages a sum over the axis
 /// (a mesh-form [`ParallelReduceOperation`] of kind `sum`), and that sum is exactly the cross-device reduction that
 /// the gradient of a replicated parameter needs. Without the explicit transition, each device would report only its
-/// own contribution. The other transforms keep the transition intact: forward-mode differentiation repeats it on the
+/// own contribution. The other transforms keep the transition intact: forward mode differentiation repeats it on the
 /// tangent (a structural-zero tangent still receives the varying output type), partial evaluation retains it for the
 /// backend that owns the mesh, and batching over an unrelated named axis preserves the mapped axis.
 ///
@@ -1011,7 +1011,7 @@ mod tests {
         )
         .unwrap();
 
-        // Forward-mode differentiation repeats the transition on the tangent.
+        // Forward mode differentiation repeats the transition on the tangent.
         let differentiated = program.to_flat_program().jvp().unwrap();
         assert_eq!(differentiated.output_types(), vec![varying.clone(), varying.clone()]);
         assert_eq!(

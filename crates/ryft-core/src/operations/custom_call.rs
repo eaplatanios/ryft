@@ -564,7 +564,7 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 ///
 /// Because the kernel is opaque, Ryft cannot derive its transform rules automatically:
 ///
-///   - **Differentiation:** Forward-mode differentiation binds the call unchanged and returns structural zero tangents
+///   - **Differentiation:** Forward mode differentiation binds the call unchanged and returns structural zero tangents
 ///     when every input tangent is a structural zero (including when the call has no inputs). Any other derivative
 ///     reports an error directing users to call the kernel through a [`composite`](crate::composite) with derivative
 ///     rules (refer to [`Composite::from_custom_call`](crate::Composite::from_custom_call)). The call is not linear,

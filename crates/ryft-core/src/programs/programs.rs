@@ -469,7 +469,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// that its [`Operation`] reports as [zero-valued](Operation::is_zero). That output is zero-valued regardless
     /// of every input, and so it never depends on one, even in a program with references.
     ///
-    /// For example, forward-mode differentiation rules use this function on a derived program, whose tangent inputs
+    /// For example, forward mode differentiation rules use this function on a derived program, whose tangent inputs
     /// and outputs follow its primal ones, to find the tangent outputs that depend on no live tangent input and are
     /// therefore structural zeros.
     ///

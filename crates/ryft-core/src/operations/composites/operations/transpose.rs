@@ -1,4 +1,4 @@
-//! The [`CompositeTransposeOperation`] carrier that reverse mode stages for the reverse-mode rules of a
+//! The [`CompositeTransposeOperation`] carrier that reverse mode stages for the reverse mode rules of a
 //! [`CompositeOperation`]. The carrier holds its rules either as attached rule regions or as retained rule sets (refer
 //! to [`CustomRuleSource`]), and its transposition applies the backward rule.
 
@@ -80,16 +80,16 @@ pub(super) enum CompositeTransposeRules<T, S> {
     },
 }
 
-/// Selected reverse-mode carrier of a [`CompositeOperation`] with reverse-mode rules, which its
+/// Selected reverse mode carrier of a [`CompositeOperation`] with reverse mode rules, which its
 /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule stages in place of the call. It represents
 /// the linear map `ẋ ↦ ẏ` from the differentiated inputs' tangents to the output tangents, whose transpose `ȳ ↦ x̄` is
 /// the call's backward rule. This is the role of the `custom_lin` primitive of [JAX's automatic
 /// differentiation](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/ad.py), which has no rendered
-/// documentation page and is therefore linked at its source. The map has no forward program: reverse-mode rules supply
+/// documentation page and is therefore linked at its source. The map has no forward program: reverse mode rules supply
 /// only its transpose, and deriving the map itself would differentiate the primal, which the custom rules exist to
 /// avoid. The carrier therefore rejects execution, lowering, and forward mode, and it exists only to be transposed. A
-/// call without reverse-mode rules stages no carrier, because reverse mode transposes the linearization of its
-/// forward-mode rule instead.
+/// call without reverse mode rules stages no carrier, because reverse mode transposes the linearization of its
+/// forward mode rule instead.
 ///
 /// Its inputs are the known leading inputs (i.e., any batching boundary inputs, the non-differentiated inputs, the
 /// residuals, and the seed extents) followed by the differentiated inputs' tangents. The seed extents name the runtime
@@ -1286,10 +1286,10 @@ mod tests {
 
     use super::*;
 
-    /// Reverse-mode carrier of a composite call in the array operation family.
+    /// Reverse mode carrier of a composite call in the array operation family.
     type ArrayCompositeTranspose = CompositeTransposeOperation<Array, ArrayOperation<Array>>;
 
-    /// Reverse-mode carrier of a composite call in the array IR operation family.
+    /// Reverse mode carrier of a composite call in the array IR operation family.
     type ArrayIrCompositeTranspose = CompositeTransposeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Test-only transposition driver exposing one attached region, used to invoke the transposition rule of a carrier
@@ -1351,7 +1351,7 @@ mod tests {
     /// Program builder in the array IR family.
     type IrBuilder = ProgramBuilder<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Returns a reverse-mode carrier of `definition`, as reverse-mode linearization of a call would stage it, whose
+    /// Returns a reverse mode carrier of `definition`, as reverse mode linearization of a call would stage it, whose
     /// first `leading_input_count` inputs are known.
     fn retained_carrier(
         rules: CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
@@ -1710,7 +1710,7 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_interpretation() {
-        // A carrier has no forward program, so it supports only reverse-mode differentiation.
+        // A carrier has no forward program, so it supports only reverse mode differentiation.
         assert_eq!(
             attached_carrier_program().interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
             Err(ProgramError::UnsupportedOperation {

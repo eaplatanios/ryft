@@ -27,33 +27,35 @@ use crate::tracing::{DomainTracingContext, TracingContext};
 #[cfg(doc)]
 use crate::operations::composites::builders::{Composite, composite};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
-/// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
-/// with reverse-mode rules rejects forward mode (refer to [`composite`] for the rule selection).
+/// Forward mode configuration of a [`Composite`] without a configured forward mode differentiation rule. A function
+/// without reverse mode rules then derives its forward mode rule from its primal (as [`JvpFromPrimal`] does), while a
+/// function with reverse mode rules rejects forward mode differentiation. Refer to the documentation of [`composite`]
+/// for more information on rule selection.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultJvp;
 
-/// Forward-mode configuration of a [`Composite`] with an explicit, user-supplied Jacobian-Vector Product (JVP) rule
-/// closure implementing `(x, ẋ) ↦ (y, ẏ)` (refer to [`Composite::with_jvp`]).
+/// Forward mode differentiation configuration of a [`Composite`] with an explicit, user-supplied Jacobian-Vector
+/// Product (JVP) rule closure implementing `(x, ẋ) ↦ (y, ẏ)`. Refer to [`Composite::with_jvp`] for more information.
 pub struct ExplicitJvp<Input, Output> {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
     pub(super) jvp: Arc<dyn Fn(Input, Input) -> Result<(Output, Output), ProgramError> + Send + Sync>,
 }
 
 impl<Input, Output> Debug for ExplicitJvp<Input, Output> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ExplicitJvp").finish_non_exhaustive()
     }
 }
 
-/// Forward-mode configuration of a [`Composite`] whose forward-mode rule is derived from its primal (refer to
+// TODO(eaplatanios): Review from here onwards.
+
+/// Forward mode configuration of a [`Composite`] whose forward mode rule is derived from its primal (refer to
 /// [`Composite::with_jvp_from_primal`]).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct JvpFromPrimal;
 
-/// Forward-mode configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
+/// Forward mode configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
 /// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves, of which the
 /// structurally zero ones are [`MaybeZero::Zero`]s (refer to [`Composite::with_symbolic_zero_jvp`]). `Tracer` is the
 /// tracer type of the closure's leaves, which the leaves of its tangents wrap.
@@ -63,6 +65,7 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
+    #[allow(clippy::type_complexity)]
     pub(super) jvp: Arc<
         dyn Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output::To<MaybeZero<Tracer>>), ProgramError>
             + Send
@@ -80,12 +83,12 @@ where
     }
 }
 
-/// Reverse-mode configuration of a [`Composite`] without reverse-mode rules. Reverse mode then transposes the
-/// forward-mode rule, which is derived from the primal when none is configured.
+/// Reverse mode configuration of a [`Composite`] without reverse mode rules. Reverse mode then transposes the
+/// forward mode rule, which is derived from the primal when none is configured.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultVjp;
 
-/// Reverse-mode configuration of a [`Composite`] with explicit, user-supplied forward and backward (i.e.,
+/// Reverse mode configuration of a [`Composite`] with explicit, user-supplied forward and backward (i.e.,
 /// Vector-Jacobian Product or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, where `r` is a value of
 /// type `Residual` (refer to [`Composite::with_vjp`]).
 pub struct ExplicitVjp<Input, Output, Residual> {
@@ -109,7 +112,7 @@ impl<Input, Output, Residual> Debug for ExplicitVjp<Input, Output, Residual> {
     }
 }
 
-/// Reverse-mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
+/// Reverse mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
 /// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` and returns
 /// `x̄` with [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
 /// [`Composite::with_symbolic_zero_vjp`]). `Tracer` is the tracer type of the closures' leaves, which the leaves of the
@@ -147,7 +150,7 @@ where
     }
 }
 
-/// Reverse-mode configuration of a [`Composite`] with a user-supplied forward rule closure implementing `x ↦ (y, r)`
+/// Reverse mode configuration of a [`Composite`] with a user-supplied forward rule closure implementing `x ↦ (y, r)`
 /// and an accumulating backward rule closure, which submits the input cotangents to their accumulators (refer to
 /// [`Composite::with_accumulating_vjp`]). `Tracer` is the tracer type of the closures' leaves, which the leaves of the
 /// seeds wrap, and `Transposition` is the type of the transposition context that the backward rule closure receives.
@@ -191,8 +194,8 @@ where
     }
 }
 
-/// Forward-mode configuration of a [`Composite`] (i.e., [`DefaultJvp`], [`ExplicitJvp`], [`SymbolicZeroJvp`], or
-/// [`JvpFromPrimal`]), which installs its forward-mode rule in the retained definition that a call registers for the
+/// Forward mode configuration of a [`Composite`] (i.e., [`DefaultJvp`], [`ExplicitJvp`], [`SymbolicZeroJvp`], or
+/// [`JvpFromPrimal`]), which installs its forward mode rule in the retained definition that a call registers for the
 /// operation family `(V, O)`. Its user-supplied rule is adapted to the flat interface of retained rules by tracing it,
 /// with the complete structured interface of the call, at the types of each specialization and replaying the traced
 /// program.
@@ -202,7 +205,7 @@ where
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
-    /// Returns `definition` with this forward-mode rule.
+    /// Returns `definition` with this forward mode rule.
     ///
     /// # Parameters
     ///
@@ -363,8 +366,8 @@ where
     }
 }
 
-/// Reverse-mode configuration of a [`Composite`] (i.e., [`DefaultVjp`], [`ExplicitVjp`], [`SymbolicZeroVjp`], or
-/// [`AccumulatingVjp`]), which installs its reverse-mode rules in the retained definition that a call registers for the
+/// Reverse mode configuration of a [`Composite`] (i.e., [`DefaultVjp`], [`ExplicitVjp`], [`SymbolicZeroVjp`], or
+/// [`AccumulatingVjp`]), which installs its reverse mode rules in the retained definition that a call registers for the
 /// operation family `(V, O)`. Its user-supplied rules are adapted to the flat interface of retained rules as for
 /// [`CompositeJvp`]. The backward rule receives the residuals with the structure that the forward rule returned for the
 /// same specialization. Different specializations of one call structure may return differently structured residuals, as
@@ -376,7 +379,7 @@ where
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
-    /// Returns `definition` with these reverse-mode rules (refer to [`CompositeJvp::configure`] for the parameters).
+    /// Returns `definition` with these reverse mode rules (refer to [`CompositeJvp::configure`] for the parameters).
     fn configure(
         &self,
         definition: CustomRuleDefinition<V, O>,
@@ -1023,7 +1026,7 @@ impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
     }
 }
 
-/// Adapts the structured reverse-mode forward closure `forward` of a [`Composite`] to the flat interface of retained
+/// Adapts the structured reverse mode forward closure `forward` of a [`Composite`] to the flat interface of retained
 /// forward rules: each invocation traces the closure at the types of its primal inputs, records the structure of its
 /// residuals in `residual_structures`, and replays the traced program on the primal inputs.
 ///

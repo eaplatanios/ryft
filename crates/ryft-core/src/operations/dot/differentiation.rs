@@ -55,7 +55,7 @@ where
     DifferentiationDual::new(primal, tangent)
 }
 
-// Forward-mode differentiation applies the product rule. Each term holds the corresponding primal input fixed on its
+// Forward mode differentiation applies the product rule. Each term holds the corresponding primal input fixed on its
 // original contracting side and stages an ordinary dot with the primal operation's dimensions, accumulation type, and
 // requested output sharding.
 impl_differentiable_operation! {

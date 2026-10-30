@@ -1,5 +1,5 @@
 //! Retained custom rule sets, whose derivative rules are callbacks rather than programs. A [`CustomRuleDefinition`]
-//! holds a human-readable name, an optional forward-mode (JVP) rule, optional reverse-mode (VJP) forward and backward
+//! holds a human-readable name, an optional forward mode (JVP) rule, optional reverse mode (VJP) forward and backward
 //! rules, and optional batching support. A [`CompositeOperation`](crate::CompositeOperation) with retained
 //! rules calls a definition over a traced primal program: ordinary execution uses only the primal, forward mode traces
 //! and replays the JVP rule, and reverse mode traces the VJP forward rule and stages a [`CompositeTransposeOperation`]
@@ -100,7 +100,7 @@ type CustomRuleBatcher<V, O> = dyn Fn(
     + Send
     + Sync;
 
-/// Forward-mode differentiation of a traced rule program with respect to the provided inputs, which returns its fused
+/// Forward mode differentiation of a traced rule program with respect to the provided inputs, which returns its fused
 /// Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). The batching rules of derived
 /// definitions (refer to [`CustomRuleDerivation`]) differentiate the batched programs of their source's custom
 /// batching rule with it. [`CustomRuleDefinition::with_batching_rule`] captures it where the operation family's
@@ -239,7 +239,7 @@ impl<T: Display> Display for CustomRuleBatching<T> {
     }
 }
 
-/// Specialization key of the forward-mode and reverse-mode primal rules of a [`CustomRuleDefinition`].
+/// Specialization key of the forward mode and reverse mode primal rules of a [`CustomRuleDefinition`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleSpecializationKey<T> {
     /// Unbatched types of every input of the call, excluding boundary inputs.
@@ -253,16 +253,16 @@ pub struct CustomRuleSpecializationKey<T> {
     /// Whether each output of the rule is an output of the call, or [`None`] when the call returns every output of the
     /// rule (refer to [`CompositeOperation`](crate::CompositeOperation)'s boundary pruning). When present, it has one
     /// entry per output of the rule, and [`Self::output_types`] lists the types of the kept outputs only, against which
-    /// the specialization is validated. A forward-mode specialization then returns only the kept outputs and their
-    /// tangents, while a reverse-mode forward specialization keeps returning every output of the rule, because the
+    /// the specialization is validated. A forward mode specialization then returns only the kept outputs and their
+    /// tangents, while a reverse mode forward specialization keeps returning every output of the rule, because the
     /// backward rule receives a seed for each of them.
     pub(super) kept_outputs: Option<Vec<bool>>,
 
     /// Number of leading inputs that parameterize the rule without being differentiated, excluding boundary inputs.
     pub(super) non_differentiated_count: usize,
 
-    /// Whether each differentiated input's tangent is active (i.e., not a structural zero) in a forward-mode request,
-    /// which is empty for reverse-mode forward requests, whose rules receive no tangents. A forward-mode specialization
+    /// Whether each differentiated input's tangent is active (i.e., not a structural zero) in a forward mode request,
+    /// which is empty for reverse mode forward requests, whose rules receive no tangents. A forward mode specialization
     /// receives only the active tangents, and it materializes the structural zeros itself (or hands them to a rule that
     /// receives structural zeros), so that the zeros that the rule propagates remain recognizable as zeros.
     pub(super) tangent_activity: Vec<bool>,
@@ -421,8 +421,8 @@ pub struct CustomRuleBatchingRuleKey<T> {
     pub(super) discharged: bool,
 }
 
-/// Kind of call that a derived definition (refer to [`CustomRuleDerivation`]) stages for the forward-mode derivative
-/// of a call whose forward-mode rule is derived from its primal.
+/// Kind of call that a derived definition (refer to [`CustomRuleDerivation`]) stages for the forward mode derivative
+/// of a call whose forward mode rule is derived from its primal.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum CustomRuleDerivationKind {
     /// Call that maps the source call's inputs and the active tangents of its differentiated inputs to its outputs and
@@ -459,13 +459,13 @@ pub struct CustomRuleDerivationKey {
 /// that retains it and, when no cache is alive, the in-flight marker that rejects its recursive production.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CustomRuleSpecializationRequest<T> {
-    /// Specialization of the forward-mode rule.
+    /// Specialization of the forward mode rule.
     Jvp(CustomRuleSpecializationKey<T>),
 
-    /// Specialization of the reverse-mode forward rule.
+    /// Specialization of the reverse mode forward rule.
     Forward(CustomRuleSpecializationKey<T>),
 
-    /// Destination-specialized transpose of the reverse-mode backward rule.
+    /// Destination-specialized transpose of the reverse mode backward rule.
     Backward(CustomRuleBackwardSpecializationKey<T>),
 
     /// Batched primal program produced by the custom batching rule.

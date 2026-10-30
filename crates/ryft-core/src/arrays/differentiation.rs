@@ -843,7 +843,7 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
 /// # Parameters
 ///
 ///   - `context`: Projected array view of the active mixed [`Context`], whose parent stages the zero.
-///   - `input`: Forward-mode dual whose tangent is materialized and whose primal supplies its runtime extents.
+///   - `input`: Forward mode dual whose tangent is materialized and whose primal supplies its runtime extents.
 pub fn materialize_array_tangent<
     C: Context<
             Type = ArrayIrType,

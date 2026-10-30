@@ -6,7 +6,7 @@
 //!   - The [`Tag`] value capability, whose [`tag`](Tag::tag) returns its input unchanged while marking the producing
 //!     instruction with a key.
 //!   - The [`TagOperation`] that the capability stages, whose [`key`](TagOperation::key) is what consumers match on.
-//!     Forward-mode differentiation re-tags the primal value and passes the tangent through, so a tag placed in the
+//!     Forward mode differentiation re-tags the primal value and passes the tangent through, so a tag placed in the
 //!     body of a function is still present on the instructions that define the residuals of its linearization.
 //!
 //! The main consumer of tags is key-based rematerialization. Policies such as
@@ -192,7 +192,7 @@ impl<A: Value<Type = ArrayType>> From<TagOperation<ArrayIrType>> for ArrayIrOper
 }
 
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
-/// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
+/// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward mode
 /// differentiation rule (i.e., the [`DifferentiableOperation`](crate::DifferentiableOperation) implementation re-tags
 /// the primal value and passes the tangent value through), so that it marks the instructions that define linearization
 /// residuals, which rematerialization policies classify by key through the producing [`TagOperation`].

@@ -247,7 +247,7 @@ impl_differentiable_operation! {
         C::Value: Broadcast,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode differentiation rule for `BroadcastOperation`. Broadcasting is structural-linear, and so the
+            // Forward mode differentiation rule for `BroadcastOperation`. Broadcasting is structural-linear, and so the
             // tangent follows the same axis mapping as the primal. A structural-zero input tangent remains structural
             // and acquires the primal output's tangent type.
             check_count!("input", inputs, 1, ProgramError);

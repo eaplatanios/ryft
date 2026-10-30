@@ -32,7 +32,7 @@ pub const DOT_PRODUCT_ATTENTION_OPERATION_NAME: &str = "dot_product_attention";
 ///
 /// Eager execution and portable lowering both evaluate [`dot_product_attention_ir_composition`]. The primitive itself
 /// is a backend-recognizable inference boundary and is intentionally not directly differentiable; use
-/// [`differentiable_dot_product_attention`] for reverse-mode differentiation. Its batching rule folds a mapped leading
+/// [`differentiable_dot_product_attention`] for reverse mode differentiation. Its batching rule folds a mapped leading
 /// axis into the logical batch axis while retaining this boundary for fused lowering. Every batch item uses the same
 /// rectangular storage shape; explicit sequence-length inputs control visibility within that storage.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

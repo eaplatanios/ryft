@@ -588,7 +588,7 @@ where
                 difference.sub(&broadcast(target_probabilities.mul(&difference)?.reduce_sum(&[axis], None)?)?)?;
 
             // Only close rows need the cancellation-resistant formula. Sanitize its input before expm1, rather than
-            // selecting an overflowing result afterward: reverse-mode derivatives of an unused infinite branch can
+            // selecting an overflowing result afterward: reverse mode derivatives of an unused infinite branch can
             // otherwise be NaN. The all-finite test routes a class that only one distribution masks through the
             // direct probability difference, while a class that both mask is excluded from the test. Masking the
             // raw differences before reduce_max keeps the discarded branch's higher derivatives finite as well.

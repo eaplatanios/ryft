@@ -1675,7 +1675,7 @@ mod tests {
     #[test]
     fn test_rematerialized_function_call_saves_only_the_values_that_differentiation_needs() {
         // Saving everything for `x ↦ exp(x)` saves only `exp(x)`, as differentiating `exp` directly does, and
-        // linearization saves the same values as reverse-mode differentiation, according to the policy.
+        // linearization saves the same values as reverse mode differentiation, according to the policy.
         let x = Array::scalar(0.7f64).unwrap();
         let (_, direct) = differentiate_at(x.clone()).vjp(|x| Ok(x.exp()?)).unwrap();
         let function = rematerialize(|x: TestTracer| Ok(x.exp()?)).with_policy(EverythingSavable);
@@ -1733,7 +1733,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_call_with_an_unused_reference_input() {
-        // An unused reference input does not make reverse-mode differentiation save the values that the call
+        // An unused reference input does not make reverse mode differentiation save the values that the call
         // recomputes.
         let sine_of_square = |x: TestIrTracer| -> Result<TestIrTracer, ProgramError> {
             let context = x.context().clone();
@@ -2005,7 +2005,7 @@ mod tests {
             ]),
         );
 
-        // Reverse-mode rules decide what is saved: a composite with only a reverse-mode rule saves its residual.
+        // Reverse mode rules decide what is saved: a composite with only a reverse mode rule saves its residual.
         let sine = composite(|x: TestTracer| Ok(x.sin()?))
             .with_vjp(|x: TestTracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
         let function = rematerialize(move |x: TestTracer| sine.call(x)).with_policy(EverythingSavable);

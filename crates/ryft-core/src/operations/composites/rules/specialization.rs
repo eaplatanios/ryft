@@ -88,17 +88,17 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// Returns the human-readable label of the source's definition.
     fn name(&self) -> &str;
 
-    /// Returns whether the source has a retained forward-mode (i.e., JVP) rule.
+    /// Returns whether the source has a retained forward mode (i.e., JVP) rule.
     fn has_jvp(&self) -> bool;
 
-    /// Returns whether the source derives its forward-mode rule from the primal region of each call (refer to
+    /// Returns whether the source derives its forward mode rule from the primal region of each call (refer to
     /// [`CustomRuleDefinition::with_jvp_from_primal`]).
     fn derives_jvp_from_primal(&self) -> bool;
 
-    /// Returns whether the source has reverse-mode (i.e., VJP) forward and backward rules.
+    /// Returns whether the source has reverse mode (i.e., VJP) forward and backward rules.
     fn has_vjp(&self) -> bool;
 
-    /// Returns whether the source has reverse-mode rules whose forward rule reverse mode defers to the backward pass
+    /// Returns whether the source has reverse mode rules whose forward rule reverse mode defers to the backward pass
     /// (refer to [`CustomRuleDefinition::with_deferred_forward_rule`]).
     fn defers_forward(&self) -> bool;
 
@@ -138,7 +138,7 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
 /// the rule traits, which keeps the operations free of bounds on `O` that would form a cycle with the payload bounds of
 /// the families that contain them. It is sealed (refer to the documentation of [`CustomRuleSource`]).
 pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: CustomRuleSource<V, O> {
-    /// Returns the forward-mode rule specialization for `key`, whose program takes the call's inputs followed by the
+    /// Returns the forward mode rule specialization for `key`, whose program takes the call's inputs followed by the
     /// active tangents of its differentiated inputs (refer to the tangent activity of the key) and returns the call's
     /// outputs followed by their tangents.
     fn jvp_specialization(
@@ -150,7 +150,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>;
 
-    /// Returns the reverse-mode forward rule specialization for `key`, whose program takes the call's inputs and
+    /// Returns the reverse mode forward rule specialization for `key`, whose program takes the call's inputs and
     /// returns the call's outputs followed by the residuals.
     fn forward_specialization(
         &self,
@@ -197,13 +197,13 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         stacked_output_count: usize,
     ) -> Result<(O, V::Type), DifferentiationError>;
 
-    /// Returns the rules of the definition derived from this source for `key`, with which forward-mode differentiation
-    /// stages the derived call of a call whose forward-mode rule is derived from its primal and whose source has a
+    /// Returns the rules of the definition derived from this source for `key`, with which forward mode differentiation
+    /// stages the derived call of a call whose forward mode rule is derived from its primal and whose source has a
     /// custom batching rule or batches its calls sequentially. This keeps that rule, or the sequential batching, on the
-    /// path of forward-mode derivatives that are batched after they are taken (i.e., the analogue of JAX's
+    /// path of forward mode derivatives that are batched after they are taken (i.e., the analogue of JAX's
     /// `custom_vmap_jvp`): the derived call's primal region is the derivative of the call's primal region (i.e., its
     /// Jacobian-Vector Product (JVP), or the tangent half of it), and the derived definition holds no program. It
-    /// derives its forward-mode rule from each call's primal region, so that higher orders recurse through each call's
+    /// derives its forward mode rule from each call's primal region, so that higher orders recurse through each call's
     /// own region, and its batching rule applies the JVP of the source's batching rule, while the derived definition of
     /// a source that batches its calls sequentially batches its own calls sequentially (i.e., it loops over the
     /// derivative one batch item at a time). Calls whose primal regions differ therefore share one derived definition.
@@ -214,7 +214,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
     /// tangents are computed in one of two modes:
     ///
     ///   - **Structural:** when every primal input is replicated, and so is every output of the rule applied to them
-    ///     (e.g., the replicated primals and mapped tangents of a forward-mode Jacobian), the JVP of the rule's program
+    ///     (e.g., the replicated primals and mapped tangents of a forward mode Jacobian), the JVP of the rule's program
     ///     is batched structurally over the given batch axes.
     ///   - **Rule:** otherwise, each primal and tangent pair with a mapped side is aligned to one axis (i.e., its
     ///     replicated side is broadcast, and a tangent mapped along another axis than its primal is moved), and the JVP
@@ -499,7 +499,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>,
     {
-        // Returns the reverse-mode forward rule specialization for `key`, whose program takes the call's inputs and
+        // Returns the reverse mode forward rule specialization for `key`, whose program takes the call's inputs and
         // returns the call's outputs followed by the residuals. Specializations are traced and batched as for
         // [`Self::jvp_specialization`], except that residuals keep the batch axes that batching naturally produces,
         // which the specialization records.
@@ -913,16 +913,16 @@ pub struct UnavailableCustomRules {
     /// Human-readable label of the original definition.
     name: Cow<'static, str>,
 
-    /// Whether the original definition has a retained forward-mode (i.e., JVP) rule.
+    /// Whether the original definition has a retained forward mode (i.e., JVP) rule.
     has_jvp: bool,
 
-    /// Whether the original definition derives its forward-mode rule from the primal.
+    /// Whether the original definition derives its forward mode rule from the primal.
     derives_jvp_from_primal: bool,
 
-    /// Whether the original definition has reverse-mode (i.e., VJP) rules.
+    /// Whether the original definition has reverse mode (i.e., VJP) rules.
     has_vjp: bool,
 
-    /// Whether the original definition defers its reverse-mode forward rule to the backward pass.
+    /// Whether the original definition defers its reverse mode forward rule to the backward pass.
     defers_forward: bool,
 
     /// Declared batch axes of the outputs of batched calls of the original definition.
@@ -2198,7 +2198,7 @@ mod tests {
 
     use super::*;
 
-    /// Returns a registration of `(x, y) ↦ x · y` whose forward-mode rule is derived from its primal and whose custom
+    /// Returns a registration of `(x, y) ↦ x · y` whose forward mode rule is derived from its primal and whose custom
     /// batching rule maps the product along the first mapped input axis, which is axis-dependent when `axis_dependent`
     /// is set and has batching support when `batching_support` is set.
     fn product_registration(
@@ -2652,7 +2652,7 @@ mod tests {
     #[test]
     fn test_custom_rule_derivation_batching_rule_specialization() {
         // Structural mode: with replicated primals, the source rule applied to them is replicated as well, so the JVP
-        // of its program is batched structurally over the mapped tangents (e.g., in a forward-mode Jacobian), which
+        // of its program is batched structurally over the mapped tangents (e.g., in a forward mode Jacobian), which
         // gives `ẋy + xẏ` per item.
         let registration = product_registration(true, false);
         let scalar_type = ArrayType::scalar(DataType::F64);

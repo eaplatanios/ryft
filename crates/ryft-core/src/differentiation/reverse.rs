@@ -1286,7 +1286,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TransposedProgram<V, O> {
 }
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
-/// packaged as a reusable callable. This is the reverse-mode dual of [`Pushforward`], whose callable applies the
+/// packaged as a reusable callable. This is the reverse mode dual of [`Pushforward`], whose callable applies the
 /// un-transposed map `ẋ ↦ (∂f/∂x)(x) · ẋ` instead. It retains the linear pushforward [`Program`] `(ẋ, r) ↦ ẏ` together
 /// with the saved linearization values `r`, called residuals. With `r` fixed, that program is linear in `ẋ`.
 ///
@@ -2395,9 +2395,9 @@ where
 /// # Deriving Transposable Operation Enums
 ///
 /// `#[derive(Operation)]` generates a [`TransposableOperation`] dispatcher when the enum specifies
-/// `#[ryft(dispatch(transposition))]`. Selecting it enables *reverse-mode* differentiation for programs staged in the
-/// operation family. The independent `differentiation` selection adds forward-mode (JVP) support, and the transposition
-/// dispatcher is what [`Program::transpose`] and the reverse-mode entry points build on. The generated implementation
+/// `#[ryft(dispatch(transposition))]`. Selecting it enables *reverse mode* differentiation for programs staged in the
+/// operation family. The independent `differentiation` selection adds forward mode (JVP) support, and the transposition
+/// dispatcher is what [`Program::transpose`] and the reverse mode entry points build on. The generated implementation
 /// is intentionally only a dispatcher: it matches on the enum variant and forwards [`transpose`](Self::transpose) to
 /// the wrapped payload. Operation-specific transpose semantics still live on the concrete payload types. The derived
 /// implementation follows the same enum-shape rules as `#[derive(Operation)]`:
@@ -2583,7 +2583,7 @@ impl<
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse-mode _pullback_ with respect to
+    /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse mode _pullback_ with respect to
     /// `input_indices`, using `destination_kinds` to select how their cotangents cross the pullback boundary. Refer
     /// to [`Program::transpose_with_respect_to`] for the resulting program's boundary contract.
     ///
@@ -3733,14 +3733,14 @@ where
             .restructured(self.output_structure().clone(), self.input_structure().clone())?)
     }
 
-    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ with respect to selected
+    /// Transposes this linear _pushforward_ [`Program`] into its reverse mode _pullback_ with respect to selected
     /// inputs. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on _dual_ spaces
     /// `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix transpose. Here the
     /// linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents to output tangents,
     /// and transposition builds the dual program that maps output cotangents back to input cotangents. Operationally,
     /// transposition creates cotangent inputs for this program's outputs, walks the instructions in reverse order,
     /// and applies each primitive operation's [`TransposableOperation::transpose`] rule to accumulate cotangent
-    /// contributions for the original inputs. This is the same decomposition of reverse-mode automatic differentiation
+    /// contributions for the original inputs. This is the same decomposition of reverse mode automatic differentiation
     /// as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
     /// Over complex types, transposition is defined with respect to the **bilinear** (i.e., conjugation-free) pairing
@@ -3919,7 +3919,7 @@ where
     }
 }
 
-/// Extension trait carrying the primitive value-level reverse-mode transform on every [`Context`]. Reverse mode
+/// Extension trait carrying the primitive value-level reverse mode transform on every [`Context`]. Reverse mode
 /// is implemented as forward linearization followed by transposition. This trait is blanket-implemented for every
 /// [`ForwardModeDifferentiate`] context whose operation family supports the required partial-evaluation and
 /// transposition machinery. Value cotangents flow through the same context as the primals while reference-state
@@ -3927,7 +3927,7 @@ where
 ///
 /// User-facing scalar gradients, auxiliary outputs, and holomorphic validation are composed through
 /// [`DifferentiationBuilder`](crate::DifferentiationBuilder). Keeping those orthogonal choices in builder type state
-/// leaves this trait with the reusable reverse-mode engine [`vjp`](Self::vjp) and the low-level scalar cotangent-seed
+/// leaves this trait with the reusable reverse mode engine [`vjp`](Self::vjp) and the low-level scalar cotangent-seed
 /// primitive [`gradient_seed`](Self::gradient_seed), instead of a method for every option combination.
 pub trait ReverseModeDifferentiate:
     ForwardModeDifferentiate
@@ -3961,13 +3961,13 @@ where
     // so generic code bounded by this trait restates it.
     <PartialEvaluationContext<Self> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<Self>>,
 {
-    /// Reverse-mode-differentiates `function` at `primal`, returning the primal output and a reusable [`Pullback`],
+    /// Differentiates `function` at `primal` in reverse mode, returning the primal output and a reusable [`Pullback`],
     /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of
-    /// [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp) for the reverse-mode transform.
+    /// [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp) for the reverse mode transform.
     ///
     /// Reverse mode builds its linearization with [`DifferentiableOperation::jvp_for_transpose`] (which defaults to
     /// [`DifferentiableOperation::jvp`]), so overrides can choose different residuals and derivative programs without
-    /// affecting forward-mode linearization. The returned pullback retains the derivative program and transposes it
+    /// affecting forward mode linearization. The returned pullback retains the derivative program and transposes it
     /// on its first application for the [`CotangentDestination`]s chosen then (refer to the documentation of
     /// [`Pullback`]), so transposition errors surface on that first application rather than here. The pullback also
     /// retains, as zero sources, the leaves of `primal` whose cotangent zeros cannot be constructed from their types
@@ -4037,7 +4037,7 @@ where
 
     /// Validates the scalar `output` of a gradient entry point and constructs its cotangent seed. The output must be a
     /// single rank-0 scalar with a cotangent space, and complex outputs additionally require `holomorphic`. A single
-    /// reverse-mode seed recovers the derivative of a complex-output function only when the function is holomorphic,
+    /// reverse mode seed recovers the derivative of a complex-output function only when the function is holomorphic,
     /// so without that promise a complex output is rejected with an error instead of silently computing a value that
     /// is not a derivative (i.e., `holomorphic` changes nothing for real outputs). The seed is the multiplicative
     /// identity typed with the output's cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays)
@@ -10548,7 +10548,7 @@ pub(crate) mod tests {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let x: f64 = 0.7;
 
-        // Reverse-over-reverse through builder terminals: the outer value is `f'(x) = 2x cos(x²)` and the
+        // Reverse over reverse through builder terminals: the outer value is `f'(x) = 2x cos(x²)` and the
         // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
         let (value, second_derivative) = differentiate_at(Array::scalar(x).unwrap())
             .value_and_gradient(|x| differentiate_at(x).gradient(|y| (y.clone() * y).sin()).map_err(Into::into))
@@ -10582,7 +10582,7 @@ pub(crate) mod tests {
             epsilon = 1e-9,
         );
 
-        // Forward-over-reverse through builder terminals: pushing the tangent `v = 2` through the gradient computes the
+        // Forward over reverse through builder terminals: pushing the tangent `v = 2` through the gradient computes the
         // Hessian-vector product `f''(x) · v` without materializing a dense Hessian, because the `jvp` duals' stamped
         // `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests on.
         let (primal, tangent) = differentiate_at(Array::scalar(x).unwrap())

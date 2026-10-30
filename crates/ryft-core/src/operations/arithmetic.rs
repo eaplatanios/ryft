@@ -28,7 +28,7 @@
 //! Negation, addition, and subtraction are linear. Multiplication is linear in either input when the other one is
 //! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
 //! [`Sign`] is piecewise constant and has zero derivatives. Saturating subtraction has discrete integer outputs with
-//! structural-zero tangents. The remaining operations are nonlinear, so reverse-mode differentiation transposes their
+//! structural-zero tangents. The remaining operations are nonlinear, so reverse mode differentiation transposes their
 //! linearizations instead.
 //!
 //! # Example
@@ -2293,7 +2293,7 @@ mod tests {
     fn test_abs_differentiation_complex() {
         // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
         // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
-        // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
+        // the reverse mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let (value, gradient_value) =
             differentiate_at(Array::scalar(z).unwrap()).value_and_gradient(|z| z.abs().unwrap()).unwrap();
@@ -3886,7 +3886,7 @@ mod tests {
     #[test]
     fn test_mul_differentiation_complex() {
         // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
-        // `c128` payloads, and the reverse-mode pullback applies the bilinear (conjugation-free) transpose pairing.
+        // `c128` payloads, and the reverse mode pullback applies the bilinear (conjugation-free) transpose pairing.
         let left = ComplexNumber::new(1.0f64, 2.0);
         let right = ComplexNumber::new(0.5f64, -1.0);
         let left_tangent = ComplexNumber::new(-0.5f64, 0.25);

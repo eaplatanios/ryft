@@ -13,7 +13,7 @@
 //! All operations support real floating-point and complex inputs. Complex logarithms use principal branches.
 //! Unary operations preserve input metadata. [`LogAddExp`] promotes element types and broadcasts shapes. Its
 //! low-precision real inputs use `f32` intermediates before conversion back to the output type. Inputs that carry
-//! partial sums over unreduced mesh axes are rejected. These operations are nonlinear, so reverse-mode
+//! partial sums over unreduced mesh axes are rejected. These operations are nonlinear, so reverse mode
 //! differentiation transposes their linearizations.
 //!
 //! # Examples

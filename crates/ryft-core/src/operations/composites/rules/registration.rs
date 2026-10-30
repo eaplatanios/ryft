@@ -28,15 +28,15 @@ use crate::specialization::SpecializationCache;
 /// Bounded specialization caches of one registered [`CustomRuleDefinition`], keyed by static information only and
 /// owned by its [`CustomRuleRegistration`] handle (refer to the Ownership section of [`CustomRuleDefinition`]).
 pub(in crate::operations::composites) struct CustomRuleCaches<V: Typed + Parameter, O> {
-    /// Specializations of the forward-mode rule.
+    /// Specializations of the forward mode rule.
     pub(in crate::operations::composites) jvp_specializations:
         SpecializationCache<CustomRuleSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 
-    /// Specializations of the reverse-mode forward rule.
+    /// Specializations of the reverse mode forward rule.
     pub(in crate::operations::composites) forward_specializations:
         SpecializationCache<CustomRuleSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 
-    /// Destination-specialized transposes of the reverse-mode backward rule.
+    /// Destination-specialized transposes of the reverse mode backward rule.
     pub(in crate::operations::composites) backward_specializations:
         SpecializationCache<CustomRuleBackwardSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 

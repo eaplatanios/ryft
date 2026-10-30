@@ -493,7 +493,7 @@ impl Sharding {
         self.varying_manual_axes.clear();
     }
 
-    /// Returns the [`Sharding`] that reverse-mode cotangents of values sharded like this one carry. It swaps
+    /// Returns the [`Sharding`] that reverse mode cotangents of values sharded like this one carry. It swaps
     /// [`Self::unreduced_axes`] with [`Self::reduced_axes`] and keeps all other state unchanged. The cotangent of a
     /// value that still carries per-device partial results along an axis is the same value on every device along that
     /// axis (i.e., marked reduced), while the cotangent of an already-reduced value carries per-device partial results

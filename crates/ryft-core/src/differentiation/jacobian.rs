@@ -181,7 +181,7 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
     }
 }
 
-/// Implements the forward-mode differentiation transform used by
+/// Implements the forward mode differentiation transform used by
 /// [`jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward) in an explicitly
 /// provided [`Context`]. It linearizes once, replays a packed active-input basis, and returns
 /// auxiliary output unchanged.
@@ -407,7 +407,7 @@ where
     Ok((jacobian, auxiliary))
 }
 
-/// Implements the reverse-mode differentiation transform used by
+/// Implements the reverse mode differentiation transform used by
 /// [`jacobian_reverse`](crate::DifferentiationBuilder::jacobian_reverse) in an explicitly
 /// provided [`Context`]. It constructs one pullback, replays a packed differentiated-output basis,
 /// and returns auxiliary output unchanged.

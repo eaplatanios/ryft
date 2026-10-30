@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_one_differentiation_array_ir_gradient_seed() {
-        // Reverse-mode gradient terminals seed the output cotangent by binding a `one` of the array IR cotangent type
+        // Reverse mode gradient terminals seed the output cotangent by binding a `one` of the array IR cotangent type
         // through the fallible provider, which constructs the canonical array member encoding. The differentiated
         // function reaches ordinary array math through the array member projection, because homogeneous array
         // capabilities deliberately do not exist at the array IR level.

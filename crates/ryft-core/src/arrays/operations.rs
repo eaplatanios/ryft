@@ -453,7 +453,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// non-differentiated segment and reference outputs are rejected.
     Composite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Temporary reverse-mode carrier of [`Composite`](Self::Composite) calls with custom backward rules. It represents
+    /// Temporary reverse mode carrier of [`Composite`](Self::Composite) calls with custom backward rules. It represents
     /// the tangent map whose transpose is the backward rule, and has no executable forward program. Transposition
     /// replaces it with the backward computation. The corresponding carrier for retained array-only rules is
     /// [`LiftedCompositeTranspose`](Self::LiftedCompositeTranspose).
@@ -469,7 +469,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// convert with the primal, so they use [`Composite`](Self::Composite) even when promoted from [`ArrayOperation`].
     LiftedComposite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>),
 
-    /// Temporary reverse-mode carrier of [`LiftedComposite`](Self::LiftedComposite), with the same role as
+    /// Temporary reverse mode carrier of [`LiftedComposite`](Self::LiftedComposite), with the same role as
     /// [`CompositeTranspose`](Self::CompositeTranspose). It retains the original array-only rule definition through
     /// [`LiftedCustomRules`], which specializes and converts the backward program into array IR during transposition.
     /// Like the native carrier, it has no executable forward program and is replaced by the backward computation.
@@ -684,7 +684,7 @@ mod tests {
         ]
     }
 
-    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `composite` call with reverse-mode rules,
+    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `composite` call with reverse mode rules,
     /// implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately distinct rule
     /// `backward(r, ȳ) = 3 * ȳ`.
     fn array_ir_custom_vjp_regions() -> Vec<TestProgram> {
@@ -2081,7 +2081,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_operation_batching_composite() {
-        // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
+        // A call with both a JVP rule and reverse mode rules rebuilds all four regions around the threaded extent,
         // keeping every rule attached in region order.
         let mut regions = array_ir_custom_jvp_regions();
         regions.extend(array_ir_custom_vjp_regions().into_iter().skip(1));

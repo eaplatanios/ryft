@@ -1873,7 +1873,7 @@ mod tests {
     /// Exchanges the two-participant `operand` rows into the `output` seeds at a matching named `batch` level over the
     /// axis `x` and sums the exchanged result. The fixed metadata route row 0 of participant 0 into row 1 of
     /// participant 1 and row 0 of participant 1 into row 2 of participant 0. The metadata are lifted into the context
-    /// of `operand`, so the same expansion serves both concrete evaluation and reverse-mode differentiation. This is a
+    /// of `operand`, so the same expansion serves both concrete evaluation and reverse mode differentiation. This is a
     /// macro rather than a generic function because each call site binds a different traced value type, and naming the
     /// batching capability bounds of a generic value type overflows the trait solver.
     macro_rules! batched_parallel_ragged_all_to_all_sum {
@@ -4383,7 +4383,7 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_transposition_around_named_batch_axis() {
-        // Reverse-mode differentiation of a function that contains a matching `batch` level transposes the physical
+        // Reverse mode differentiation of a function that contains a matching `batch` level transposes the physical
         // exchange: each `operand` row receives the cotangent of every row that it was sent to, and each `output` row
         // receives its cotangent only when no segment overwrote it.
         let operand = Array::matrix(2, 3, vec![10.0f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap();
@@ -4488,7 +4488,7 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_transposition_inside_named_batch_axis() {
-        // Reverse-mode differentiation inside a matching `batch` level transposes the logical exchange, whose offset
+        // Reverse mode differentiation inside a matching `batch` level transposes the logical exchange, whose offset
         // metadata are transposed by dense exchanges over the same named axis. The gradients equal those of the
         // transposed physical exchange, which finite differences check in the outer differentiation test.
         let (values, gradients) = batch(

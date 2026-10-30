@@ -182,8 +182,8 @@ impl CompositeRegistrations {
 }
 
 /// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
-/// an optional forward-mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
-/// reverse-mode rules (refer to [`Self::with_vjp`]), and an optional batching rule (refer to [`Self::with_batching`]),
+/// an optional forward mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
+/// reverse mode rules (refer to [`Self::with_vjp`]), and an optional batching rule (refer to [`Self::with_batching`]),
 /// and each [`call`](Self::call) stages one [`CompositeOperation`] with retained rules over the traced primal. Without
 /// a batching rule, a batched call maps every output at axis 0, even an output that does not vary across the batch,
 /// unless [`Self::with_batched_output_axes`] declares the batch axes of its outputs.
@@ -205,8 +205,8 @@ impl CompositeRegistrations {
 /// reference state was discharged is rejected when its rule programs contain reference state (refer to
 /// [`CustomRuleDefinition::with_reference_discharge`]).
 ///
-/// The forward-mode configuration is part of the type (i.e., `Jvp` is [`DefaultJvp`], [`ExplicitJvp`],
-/// [`SymbolicZeroJvp`], or [`JvpFromPrimal`]), so an explicit forward-mode rule and a forward-mode rule derived from
+/// The forward mode configuration is part of the type (i.e., `Jvp` is [`DefaultJvp`], [`ExplicitJvp`],
+/// [`SymbolicZeroJvp`], or [`JvpFromPrimal`]), so an explicit forward mode rule and a forward mode rule derived from
 /// the primal cannot both be configured, whatever the order of the configuration calls. Refer to the documentation of
 /// the [`composite`] function for the rule selection of every configuration.
 pub struct Composite<Input, Output, Jvp = DefaultJvp, Vjp = DefaultVjp, Batching = DefaultBatching> {
@@ -215,10 +215,10 @@ pub struct Composite<Input, Output, Jvp = DefaultJvp, Vjp = DefaultVjp, Batching
     /// function stores neither a context value nor a context type witness.
     primal: Arc<dyn Fn(Input) -> Result<Output, ProgramError> + Send + Sync>,
 
-    /// Forward-mode configuration.
+    /// Forward mode configuration.
     jvp: Jvp,
 
-    /// Reverse-mode configuration.
+    /// Reverse mode configuration.
     vjp: Vjp,
 
     /// Batching configuration.
@@ -238,20 +238,20 @@ pub struct Composite<Input, Output, Jvp = DefaultJvp, Vjp = DefaultVjp, Batching
     registrations: CompositeRegistrations,
 }
 
-/// [`Composite`] with an explicit forward-mode rule (refer to [`Composite::with_jvp`]), which governs both forward- and
-/// reverse-mode differentiation, and with the default reverse-mode and batching configurations. It names the type of
+/// [`Composite`] with an explicit forward mode rule (refer to [`Composite::with_jvp`]), which governs both forward and
+/// reverse mode differentiation, and with the default reverse mode and batching configurations. It names the type of
 /// such a function by its input and output types alone (e.g., for storing it in a struct field).
 pub type JvpComposite<Input, Output> = Composite<Input, Output, ExplicitJvp<Input, Output>>;
 
-/// [`Composite`] with explicit reverse-mode forward and backward rules (refer to [`Composite::with_vjp`]) whose
-/// residuals have type `Residual`, and with the default forward-mode and batching configurations (i.e., forward mode
+/// [`Composite`] with explicit reverse mode forward and backward rules (refer to [`Composite::with_vjp`]) whose
+/// residuals have type `Residual`, and with the default forward mode and batching configurations (i.e., forward mode
 /// rejects its calls). It names the type of such a function by its input, output, and residual types alone (e.g., for
 /// storing it in a struct field).
 pub type VjpComposite<Input, Output, Residual> =
     Composite<Input, Output, DefaultJvp, ExplicitVjp<Input, Output, Residual>>;
 
 /// [`Composite`] with a custom batching rule (refer to [`Composite::with_batching`]) whose leaves are `Tracer`s, and
-/// with the default forward-mode and reverse-mode configurations (i.e., derivatives are derived from the primal). It
+/// with the default forward mode and reverse mode configurations (i.e., derivatives are derived from the primal). It
 /// names the type of such a function by its tracer, input, and output types alone (e.g., for storing it in a struct
 /// field).
 pub type BatchedComposite<Tracer, Input, Output> =
@@ -371,8 +371,8 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
 }
 
 impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Batching> {
-    /// Returns this function with the provided Jacobian-Vector Product (JVP) rule, which governs forward-mode
-    /// differentiation and, unless reverse-mode rules are configured as well, reverse-mode differentiation. This is the
+    /// Returns this function with the provided Jacobian-Vector Product (JVP) rule, which governs forward mode
+    /// differentiation and, unless reverse mode rules are configured as well, reverse mode differentiation. This is the
     /// analogue of JAX's [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
     /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
     ///
@@ -398,7 +398,7 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
     /// redundant work that the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse
     /// mode obtains its gradient by transposing the supplied tangent map, so the one rule composes with forward mode,
     /// reverse mode, and their higher-order combinations. Prefer it over [`Self::with_vjp`] whenever the function is
-    /// naturally forward-differentiable, and use reverse-mode rules only when just the reverse rule is natural (e.g.,
+    /// naturally forward-differentiable, and use reverse mode rules only when just the reverse rule is natural (e.g.,
     /// for implicit differentiation or adjoint solvers).
     ///
     /// # Transform Semantics
@@ -439,10 +439,10 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
         Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
     }
 
-    /// Returns this function with a forward-mode rule derived from its primal: forward mode differentiates the primal,
-    /// reusable linearization partitions that derivative once, and reverse mode transposes it unless reverse-mode rules
-    /// are configured as well. A function without derivative rules already derives its forward-mode rule from its
-    /// primal, so this configuration is needed only to pair reverse-mode rules with the derived forward-mode rule,
+    /// Returns this function with a forward mode rule derived from its primal: forward mode differentiates the primal,
+    /// reusable linearization partitions that derivative once, and reverse mode transposes it unless reverse mode rules
+    /// are configured as well. A function without derivative rules already derives its forward mode rule from its
+    /// primal, so this configuration is needed only to pair reverse mode rules with the derived forward mode rule,
     /// which would otherwise make forward mode reject the calls.
     #[inline]
     pub fn with_jvp_from_primal(self) -> Composite<Input, Output, JvpFromPrimal, Vjp, Batching> {
@@ -526,8 +526,8 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
 }
 
 impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Batching> {
-    /// Returns this function with the provided reverse-mode forward and backward (i.e., Vector-Jacobian Product or VJP)
-    /// rules, which govern reverse-mode differentiation and take precedence over any forward-mode rule for it. This is
+    /// Returns this function with the provided reverse mode forward and backward (i.e., Vector-Jacobian Product or VJP)
+    /// rules, which govern reverse mode differentiation and take precedence over any forward mode rule for it. This is
     /// the analogue of JAX's [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
     /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
     ///
@@ -554,7 +554,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     ///
     /// # When to Use
     ///
-    /// Reach for reverse-mode rules when only the _reverse_ rule is natural, or when the function is not (efficiently)
+    /// Reach for reverse mode rules when only the _reverse_ rule is natural, or when the function is not (efficiently)
     /// forward-differentiable. Common cases are:
     ///
     ///   - **Implicit Differentiation:** Differentiate through a solver, optimizer, or fixed point via the implicit
@@ -569,11 +569,11 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     ///   - **Numerical Stability:** Replace an unstable or wasteful automatically derived gradient with a handwritten
     ///     one.
     ///
-    /// Without a forward-mode rule, active forward-mode differentiation and reusable forward linearization reject a
+    /// Without a forward mode rule, active forward mode differentiation and reusable forward linearization reject a
     /// call before executing its forward rule, because no pushforward rule was supplied. This rejection also occurs
     /// when constructing staged forward derivatives, rather than waiting for their execution. Calls with no active
-    /// derivative inputs can still execute their primal directly. Add a forward-mode rule (e.g., with
-    /// [`Self::with_jvp`] or [`Self::with_jvp_from_primal`]) when callers need direct forward-mode differentiation as
+    /// derivative inputs can still execute their primal directly. Add a forward mode rule (e.g., with
+    /// [`Self::with_jvp`] or [`Self::with_jvp_from_primal`]) when callers need direct forward mode differentiation as
     /// well as reverse mode.
     ///
     /// # Non-Differentiated Inputs and References
@@ -586,7 +586,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     ///
     /// `forward` may return a non-differentiated reference inside `r`, in which case the reference itself (rather
     /// than a snapshot of its contents) is forwarded to `backward`. Every reference-typed residual must be a distinct
-    /// non-differentiated input forwarded by identity, which the first reverse-mode derivative request validates when
+    /// non-differentiated input forwarded by identity, which the first reverse mode derivative request validates when
     /// it traces `forward`. This interface supports externally owned mutable state, not privately allocated reference
     /// residuals; save immutable values when the backward rule needs a snapshot. This enables the _stash-gradients_
     /// pattern: a `stash` reference enters as a non-differentiated input, `forward` returns it as a residual, and
@@ -607,13 +607,13 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     /// Higher-order differentiation differentiates the backward program's ordinary operations, because the pullback
     /// replays that program inline. Both forward and reverse mode apply to a pullback, with respect to the primal
     /// inputs (through the saved residuals) and to the cotangent seeds, even when the backward program is nonlinear in
-    /// its seeds. This includes reverse-over-reverse and forward-over-reverse differentiation, but it does not supply a
+    /// its seeds. This includes reverse over reverse and forward over reverse differentiation, but it does not supply a
     /// forward rule for a nested reverse-only call encountered along either path. Transposing a pullback again requires
     /// the backward program to be linear in its seeds and is rejected otherwise.
     ///
     /// # Parameters
     ///
-    ///   - `forward`: Closure implementing `x ↦ (y, r)` for reverse-mode residual production.
+    ///   - `forward`: Closure implementing `x ↦ (y, r)` for reverse mode residual production.
     ///   - `backward`: Closure implementing `(r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ`.
     #[inline]
     pub fn with_vjp<Residual, Forward, Backward>(
@@ -630,7 +630,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
         Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
     }
 
-    /// Returns this function with the provided reverse-mode forward rule `x ↦ (y, r)` and backward rule `(r, ȳ) ↦ x̄`,
+    /// Returns this function with the provided reverse mode forward rule `x ↦ (y, r)` and backward rule `(r, ȳ) ↦ x̄`,
     /// which are used as the rules of [`Self::with_vjp`] except that the backward rule receives `ȳ` and returns `x̄`
     /// with [`MaybeZero`] leaves (i.e., as `Output::To<MaybeZero<Tracer>>` and `Input::To<MaybeZero<Tracer>>` values).
     /// The leaves of structural-zero cotangent seeds (e.g., those of unused outputs) are [`MaybeZero::Zero`]s, and the
@@ -696,8 +696,8 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
         Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
     }
 
-    /// Returns this function with the provided reverse-mode forward rule `x ↦ (y, r)` and accumulating backward rule,
-    /// which govern reverse-mode differentiation as the rules of [`Self::with_vjp`] do, except that the backward rule
+    /// Returns this function with the provided reverse mode forward rule `x ↦ (y, r)` and accumulating backward rule,
+    /// which govern reverse mode differentiation as the rules of [`Self::with_vjp`] do, except that the backward rule
     /// submits each input cotangent to its [`CotangentAccumulator`] instead of returning it. One rule therefore serves
     /// every destination kind of an input's cotangent: it can update only the affected entries of a caller-provided
     /// buffer (refer to [`CotangentAccumulator::reference`]) instead of returning a full-sized cotangent, and it can
@@ -750,7 +750,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
 impl<Input, Output, Jvp, Residual, Batching>
     Composite<Input, Output, Jvp, ExplicitVjp<Input, Output, Residual>, Batching>
 {
-    /// Returns this function with its reverse-mode forward rule deferred to the backward pass, which is the analogue of
+    /// Returns this function with its reverse mode forward rule deferred to the backward pass, which is the analogue of
     /// JAX's `custom_vjp(..., optimize_remat=True)`. Reverse mode then computes the outputs of each call with the
     /// primal, rather than with `forward`, and keeps only the call's inputs alive for the backward pass, where it runs
     /// `forward` on them to recover the residuals `r` right before `backward` consumes them. This trades recomputing
@@ -773,7 +773,7 @@ impl<Input, Output, Jvp, Residual, Batching>
     /// `forward` runs in the backward pass, where its effects would execute out of order with the rest of the program,
     /// so reverse mode rejects a call whose `forward` has effects (e.g., a `print` or a reference update) with a
     /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a call before differentiating it is
-    /// supported, but batching a reverse-mode derivative after it is taken and before it is transposed (e.g., batching
+    /// supported, but batching a reverse mode derivative after it is taken and before it is transposed (e.g., batching
     /// a linearization) is rejected with a [`BatchingError::UnsupportedOperation`] that names this function.
     ///
     /// # Examples
@@ -811,7 +811,7 @@ where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
-    /// Returns this function with its reverse-mode forward rule deferred to the backward pass, exactly as for the
+    /// Returns this function with its reverse mode forward rule deferred to the backward pass, exactly as for the
     /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
     #[inline]
     pub fn with_deferred_forward(mut self) -> Self {
@@ -828,7 +828,7 @@ where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
-    /// Returns this function with its reverse-mode forward rule deferred to the backward pass, exactly as for the
+    /// Returns this function with its reverse mode forward rule deferred to the backward pass, exactly as for the
     /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
     #[inline]
     pub fn with_deferred_forward(mut self) -> Self {
@@ -861,14 +861,14 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     ///
     /// # Derivatives
     ///
-    /// How derivatives interact with the rule depends on the forward-mode rule (refer to [`composite`] for the rule
+    /// How derivatives interact with the rule depends on the forward mode rule (refer to [`composite`] for the rule
     /// selection):
     ///
     ///   - **Derived from the primal** (i.e., without derivative rules, or with [`Self::with_jvp_from_primal`]): the
-    ///     rule stays on the path of forward-mode derivatives in either order of the two transforms, which is the
+    ///     rule stays on the path of forward mode derivatives in either order of the two transforms, which is the
     ///     analogue of JAX's `custom_vmap_jvp`. Differentiating a batched call differentiates the rule's program, and
     ///     differentiating an unbatched call stages a derived call whose batching applies the derivative of the rule,
-    ///     including when a forward-mode Jacobian batches it or when a linearized pushforward is batched. The derived
+    ///     including when a forward mode Jacobian batches it or when a linearized pushforward is batched. The derived
     ///     rule computes the primal outputs with the rule applied at the batch axes of the primal inputs, exactly as
     ///     batching the call does, and the tangents with the derivative of that application, after aligning each
     ///     tangent to its primal (broadcasting or moving it), so the batched derivative has the batch axes of the
@@ -880,7 +880,7 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     ///     should use [`Self::with_axis_dependent_batching`] instead, which recovers the exact per-item tangents of
     ///     such inputs from the outer product of their tangents' batch with the rule's batch (i.e., the diagonal of the
     ///     outer product that JAX returns for them when another input is mapped). When every primal is replicated
-    ///     (e.g., in a forward-mode Jacobian), it applies the rule with every input replicated and batches the rule's
+    ///     (e.g., in a forward mode Jacobian), it applies the rule with every input replicated and batches the rule's
     ///     derivative structurally, so the rule must also accept calls without mapped inputs. Linearization computes
     ///     the outputs with the call itself and recomputes the primal inside the staged pushforward, because the call
     ///     is opaque to partial evaluation, which is only valid for a primal without effects: a primal with effects
@@ -888,7 +888,7 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     ///     batching that linearization's pushforward batches it structurally. Transposing a linearization transposes
     ///     the primal of its staged pushforward, so the rule does not apply to the transpose. Reverse mode therefore
     ///     inlines the derivative of the primal instead of staging a derived call.
-    ///   - **Explicit** (i.e., [`Self::with_jvp`] or reverse-mode rules): differentiating a batched call traces the
+    ///   - **Explicit** (i.e., [`Self::with_jvp`] or reverse mode rules): differentiating a batched call traces the
     ///     derivative rules at the unbatched types and batches them structurally, aligned to the batch axes that the
     ///     rule declared, and batching a derivative batches the explicit rule structurally, which is JAX's
     ///     `custom_jvp(custom_vmap(f))` nesting order. The other order nests two functions: an outer function with the
@@ -1112,7 +1112,7 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
             );
 
             // Every transform without a configured rule treats the primal as it treats any other function, so a
-            // function without derivative rules differentiates its primal. A function with only reverse-mode rules
+            // function without derivative rules differentiates its primal. A function with only reverse mode rules
             // keeps rejecting forward mode instead, because a derived pushforward would contradict its pullback.
             let definition = match definition.has_derivative_rules() {
                 true => definition,
@@ -1160,8 +1160,8 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 ///
 ///   - [`Composite::with_jvp`] adds a Jacobian-Vector Product (JVP) rule `(x, ẋ) ↦ (y, ẏ)`, and
 ///     [`Composite::with_symbolic_zero_jvp`] adds one that receives structural-zero tangents,
-///   - [`Composite::with_jvp_from_primal`] derives the forward-mode rule from the primal instead,
-///   - [`Composite::with_vjp`] adds reverse-mode forward and backward rules `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`,
+///   - [`Composite::with_jvp_from_primal`] derives the forward mode rule from the primal instead,
+///   - [`Composite::with_vjp`] adds reverse mode forward and backward rules `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`,
 ///     [`Composite::with_symbolic_zero_vjp`] adds ones whose backward rule receives structural-zero seeds, and
 ///     [`Composite::with_accumulating_vjp`] adds ones whose backward rule submits its cotangents to their destinations
 ///     (e.g., caller-provided buffers) instead of returning them, and
@@ -1171,7 +1171,7 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 /// [`Composite::from_custom_call`] creates a function whose primal calls a foreign kernel. Every transform without a
 /// configured rule treats the primal as it treats any other function, so a function without derivative rules (e.g., one
 /// with only a batching rule, which is JAX's bare `custom_vmap`) differentiates its primal. The one exception is a
-/// function with only reverse-mode rules, which rejects forward mode (as JAX's `custom_vjp` does), because a derived
+/// function with only reverse mode rules, which rejects forward mode (as JAX's `custom_vjp` does), because a derived
 /// pushforward would contradict its custom pullback. Each derivative mode selects exactly one rule:
 ///
 /// | Configuration                          | Forward mode   | Reverse mode                          | Batching      |
@@ -1184,10 +1184,10 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 /// | `with_jvp` and `with_vjp`              | JVP rule       | forward and backward rules            | structural    |
 /// | `with_jvp_from_primal` and `with_vjp`  | derived JVP    | forward and backward rules            | structural    |
 ///
-/// Any of the forms of a forward-mode or reverse-mode rule listed above takes the place of `with_jvp` or `with_vjp` in
+/// Any of the forms of a forward mode or reverse mode rule listed above takes the place of `with_jvp` or `with_vjp` in
 /// this table, respectively, and `with_batching` combines with every configuration, replacing structural batching. The
 /// user is responsible for the numerical consistency of the rules (e.g., that a forward rule computes the same outputs
-/// as the primal, that a JVP rule and reverse-mode rules describe the same derivative, or that a batching rule computes
+/// as the primal, that a JVP rule and reverse mode rules describe the same derivative, or that a batching rule computes
 /// the batched primal). Higher-order differentiation differentiates the selected rule programs rather than switching
 /// back to the primal.
 ///
@@ -1201,7 +1201,7 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 /// # fn main() -> Result<(), ProgramError> {
 /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 ///
-/// // `sin` with a JVP rule for forward mode and reverse-mode rules that save `cos(x)` as their residual.
+/// // `sin` with a JVP rule for forward mode and reverse mode rules that save `cos(x)` as their residual.
 /// let sine = composite(|x: Tracer| Ok(x.sin()?))
 ///     .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
 ///     .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
@@ -1264,7 +1264,7 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 /// that it is called with, traces only the primal closure at their types, and stages one [`CompositeOperation`]
 /// that retains the rules into the context through which those values flow. The rules are traced lazily, at the types
 /// of each specialization (e.g., each distinct input signature): forward mode traces the JVP rule, reverse mode traces
-/// the forward rule when it stages its reverse-mode carrier and the backward rule when that carrier is transposed, and
+/// the forward rule when it stages its reverse mode carrier and the backward rule when that carrier is transposed, and
 /// batching traces the batching rule. Tracing a rule also validates its signature, so a malformed rule is reported by
 /// the request that first needs it rather than by the call. The traced programs are cached with the function, and a
 /// program that is never differentiated never traces its derivative rules (refer to [`Composite`] for the ownership of
@@ -1282,13 +1282,13 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 ///     batched primal program, and records the batching level, and a later derivative request batches the derivative
 ///     rule programs traced at the unbatched types, aligned to the batch axes of the batched call's outputs, so that
 ///     the custom derivative survives batching applied _before_ differentiation, while a batching rule survives
-///     batching applied _after_ forward-mode differentiation (refer to [`Composite::with_batching`]), and
+///     batching applied _after_ forward mode differentiation (refer to [`Composite::with_batching`]), and
 ///   - _differentiation_ replays the selected derivative rule programs instead of differentiating the primal (refer to
 ///     [`Composite::with_jvp`] and [`Composite::with_vjp`] for the semantics of each mode, including higher-order
 ///     differentiation), and
 ///   - _dead code elimination_ (i.e., [`Program::into_pruned`]) prunes the unused outputs of a call from its primal
 ///     while keeping every input, as JAX does for its custom derivative calls, and the call's rules are projected onto
-///     its remaining outputs, except that a call whose forward-mode rule is derived from its primal and that has a
+///     its remaining outputs, except that a call whose forward mode rule is derived from its primal and that has a
 ///     custom batching rule stays whole.
 ///
 /// # Differences from JAX
@@ -1301,7 +1301,7 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 ///     are specialized for the complete call.
 ///   - **Foreign Kernels:** A function created by [`Composite::from_custom_call`] needs at least one input, whose
 ///     context the kernel call dispatches through.
-///   - **Differentiation Flags:** The reverse-mode forward rule receives no per-input differentiation flags (i.e.,
+///   - **Differentiation Flags:** The reverse mode forward rule receives no per-input differentiation flags (i.e.,
 ///     JAX's `perturbed` flags), while the backward rule can still skip structural-zero seeds and return
 ///     structural-zero cotangents (refer to [`Composite::with_symbolic_zero_vjp`]).
 ///   - **Rematerialization:** [`Composite::with_deferred_forward`], the analogue of JAX's `optimize_remat` option,
@@ -1702,7 +1702,7 @@ mod tests {
     fn test_composite_with_name() {
         // Without a name, calls are labeled by the operation name. Renaming a function that was already called must not
         // reuse the definition registered by that call, which carries the previous name. A function with only
-        // reverse-mode rules rejects forward mode and names itself in the diagnostic.
+        // reverse mode rules rejects forward mode and names itself in the diagnostic.
         let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?));
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(
@@ -1738,7 +1738,7 @@ mod tests {
             .trim_end(),
         );
 
-        // The name also labels the diagnostics of the call (e.g., the forward-mode rejection of reverse-only rules).
+        // The name also labels the diagnostics of the call (e.g., the forward mode rejection of reverse-only rules).
         let function = function.with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
@@ -2259,7 +2259,7 @@ mod tests {
     #[test]
     fn test_composite_with_jvp_and_vjp() {
         // With both rule kinds, forward mode uses the JVP rule (which doubles the derivative) and reverse mode uses the
-        // reverse-mode rules (which triple it), whatever the order of the configuration calls.
+        // reverse mode rules (which triple it), whatever the order of the configuration calls.
         let doubled_jvp = |x: DomainTracer<ArrayContext>, tangent: DomainTracer<ArrayContext>| {
             let tangent = x.cos()? * tangent;
             Ok((x.sin()?, tangent.clone() + tangent))
@@ -2289,7 +2289,7 @@ mod tests {
 
     #[test]
     fn test_composite_with_jvp_from_primal() {
-        // Deriving the forward-mode rule from the primal yields the true derivative in both modes, unless reverse-mode
+        // Deriving the forward mode rule from the primal yields the true derivative in both modes, unless reverse mode
         // rules are configured as well, in which case they govern reverse mode (and triple the derivative here).
         let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp_from_primal();
         assert_eq!(
@@ -2429,7 +2429,7 @@ mod tests {
 
     #[test]
     fn test_composite_with_vjp() {
-        // Reverse-mode rules govern reverse mode, while forward mode rejects the call because no forward-mode rule was
+        // Reverse mode rules govern reverse mode, while forward mode rejects the call because no forward mode rule was
         // configured.
         let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
@@ -2680,7 +2680,7 @@ mod tests {
 
         // Each closure's original error must propagate rather than becoming a rule-interface diagnostic. The primal
         // closure is traced when the function is called, while the forward and backward closures are traced by the
-        // first reverse-mode derivative request.
+        // first reverse mode derivative request.
         let function = composite(|_: DomainTracer<ArrayContext>| -> Result<DomainTracer<ArrayContext>, ProgramError> {
             Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() })
         })
@@ -2720,7 +2720,7 @@ mod tests {
     #[test]
     fn test_composite_with_vjp_rule_signature_mismatch() {
         // The closure signatures fix the parameter families, but array shapes still require validation after tracing,
-        // which happens when the first reverse-mode derivative request specializes the rules.
+        // which happens when the first reverse mode derivative request specializes the rules.
         let function = composite(|input: DomainTracer<ArrayContext>| Ok(input))
             .with_vjp(|input| Ok((input.reduce(&[0], ReductionKind::Sum)?, ())), |(), cotangent| Ok(cotangent));
         assert_eq!(
@@ -2820,7 +2820,7 @@ mod tests {
         );
 
         // A forward rule may forward the plumbing reference as a residual but not return a reference it allocated.
-        // Residuals are only produced by the forward rule, which the first reverse-mode derivative request traces.
+        // Residuals are only produced by the forward rule, which the first reverse mode derivative request traces.
         let inputs = (
             ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0f32).unwrap())),
             ArrayIrValue::Array(Array::scalar(0.5f32).unwrap()),
@@ -2920,7 +2920,7 @@ mod tests {
         // The forward rule narrows `x: f64[n]` to `f64[2]` with a checked cast and saves `x` with the derivative, and
         // the backward rule widens the cotangent back to `f64[n]` with a checked cast that names `x` as its witness.
         // The staged pullback keeps both checks, the first one before the backward rule, in both orders of batching and
-        // reverse-mode differentiation.
+        // reverse mode differentiation.
         type Tracer = DomainTracer<ArrayContext>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
@@ -3516,7 +3516,7 @@ mod tests {
     #[test]
     fn test_composite_with_deferred_forward() {
         // `sin` whose forward rule saves `cos(x)`. Deferring the forward rule changes what the pullback keeps alive,
-        // from that residual to the input `x`, but not the value or the gradient, for every form of the reverse-mode
+        // from that residual to the input `x`, but not the value or the gradient, for every form of the reverse mode
         // rules.
         type Tracer = DomainTracer<ArrayContext>;
         type Transposition = TranspositionContext<Array, ArrayOperation<Array>>;
@@ -3771,7 +3771,7 @@ mod tests {
         // The primal narrows `x: f64[n]` to `f64[2]` with a checked cast before `sin`, while the batching rule applies
         // `sin` first and then narrows the batched value with a checked cast of its own, so that its program is
         // recognizable. The rule's check survives batching, differentiation of the batched call (which differentiates
-        // the rule's program), and batching of the derived forward-mode call (which applies the derivative of the
+        // the rule's program), and batching of the derived forward mode call (which applies the derivative of the
         // rule).
         type Tracer = DomainTracer<ArrayContext>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -3851,7 +3851,7 @@ mod tests {
         assert_eq!(jvp_of_batched.interpret(vec![x.clone(), tangent.clone()]), Ok(vec![sine.clone(), cosine.clone()]),);
         assert_eq!(jvp_of_batched.interpret(vec![wide.clone(), wide.clone()]), mismatch);
 
-        // Differentiating then batching: the derived forward-mode call keeps the batching rule, whose derivative its
+        // Differentiating then batching: the derived forward mode call keeps the batching rule, whose derivative its
         // batching applies.
         let jvp = program.jvp().unwrap();
         assert_eq!(
@@ -4055,7 +4055,7 @@ mod tests {
     #[test]
     fn test_composite_with_batching_differentiate_then_batch_jacobian_forward() {
         // Linearization computes the outputs with the call itself and stages a pushforward call on its tangent side, so
-        // the forward-mode Jacobian (which batches that pushforward over its tangents) applies the rule's derivative.
+        // the forward mode Jacobian (which batches that pushforward over its tangents) applies the rule's derivative.
         let function = doubled_sine_when_batched();
         let x = [0.5, 1.0, 1.5];
         let (_, doubled_cosine) = doubled_sine_and_cosine(&x);
@@ -4806,7 +4806,7 @@ mod tests {
     #[test]
     fn test_composite_with_batching_differentiate_then_batch_reverse_mode() {
         // Reverse mode inlines the derivative of the primal instead of staging a derived call, and a function with
-        // reverse-mode rules keeps using them.
+        // reverse mode rules keeps using them.
         let function = doubled_sine_when_batched();
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         let reverse = program
@@ -4954,7 +4954,7 @@ mod tests {
         assert_eq!(batched(&plain_program.jvp().unwrap(), &axes, inputs).1, expected);
 
         // Linearization stages a pushforward call, whose batching takes the same exact path when its residual primals
-        // have the axes above, and structural batching when they are replicated (e.g., in a forward-mode Jacobian).
+        // have the axes above, and structural batching when they are replicated (e.g., in a forward mode Jacobian).
         let linearization = program.linearize().unwrap();
         assert_eq!(
             linearization.tangent().to_string(),
@@ -4985,7 +4985,7 @@ mod tests {
         assert_eq!(outputs, vec![vector(vec![6.0, 8.0, 13.0]), vector(vec![34.0, 39.0, 44.0])]);
         assert_eq!(output_axes, vec![mapped; 2]);
 
-        // A forward-mode Jacobian at `(x, y, z) = (2, 4, 5)` batches the pushforward over the basis tangents with
+        // A forward mode Jacobian at `(x, y, z) = (2, 4, 5)` batches the pushforward over the basis tangents with
         // replicated primals, which applies the rule once and batches its derivative structurally.
         let mut inputs = vec![vector(vec![1.0, 0.0, 0.0]), vector(vec![0.0, 1.0, 0.0]), vector(vec![0.0, 0.0, 1.0])];
         inputs.extend([scalar(2.0), scalar(4.0), scalar(5.0)]);
@@ -5630,7 +5630,7 @@ mod tests {
     #[test]
     fn test_composite_checked_casts() {
         // A checked cast in the primal of a function without derivative rules keeps its runtime check in every
-        // transform. The derived forward-mode rule converts the tangent behind the primal check and retains the source
+        // transform. The derived forward mode rule converts the tangent behind the primal check and retains the source
         // `f64[n]` for the extent that the converted tangent no longer carries, so that reverse mode can transpose the
         // conversion back to `f64[n]` with the retained source as its witness.
         type Tracer = DomainTracer<ArrayContext>;

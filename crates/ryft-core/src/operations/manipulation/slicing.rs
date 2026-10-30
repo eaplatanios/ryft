@@ -2814,7 +2814,7 @@ where
 /// axis permits a start at its end, while the [`Clamp`](DynamicSliceBounds::Clamp) policy moves the start so that the
 /// requested window fits without shrinking it. Invalid runtime bounds remain observable even when the result is unused.
 /// The output preserves the input memory space and inferred sharding; an identity slice preserves the input layout and
-/// any other slice uses a fresh dense layout. Array tangents follow the same slice, and reverse-mode differentiation
+/// any other slice uses a fresh dense layout. Array tangents follow the same slice, and reverse mode differentiation
 /// retains the original input extents and adds cotangents at the selected coordinates, treating starts and sizes as
 /// discrete metadata.
 ///
@@ -7070,7 +7070,7 @@ mod tests {
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(block.value().to_f64s(), vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
 
-        // Finite differences of `sum(dynamic_slice(x)²)` agree with the reverse-mode rule at an in-bounds start and at
+        // Finite differences of `sum(dynamic_slice(x)²)` agree with the reverse mode rule at an in-bounds start and at
         // a start that clamps to the last valid origin. The integer start is a fixed constant, never a perturbed input.
         check_gradient!(
             |x| {
@@ -7160,7 +7160,7 @@ mod tests {
     #[test]
     fn test_dynamic_slice_differentiation_pullback_higher_order() {
         // Squaring before indexing leaves the primal value as a runtime coefficient of the pullback. Its derivative
-        // must survive expanding the indexed backward rule, in both forward-over-reverse and reverse-over-reverse.
+        // must survive expanding the indexed backward rule, in both forward over reverse and reverse over reverse.
         let (gradient, tangent) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap())
             .jvp(Array::vector(vec![1.0_f32; 3]).unwrap(), |value| {
                 let seed = value.context().constant(Array::vector(vec![1.0_f32]).unwrap())?;
@@ -9210,7 +9210,7 @@ mod tests {
         assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
 
-        // Finite differences of `sum(dynamic_update_slice(x, u)²)` agree with the reverse-mode rule for the input
+        // Finite differences of `sum(dynamic_update_slice(x, u)²)` agree with the reverse mode rule for the input
         // (with the update captured) and for the update (with the input captured), at an in-bounds start and at a
         // start that clamps to the last valid origin. The integer start is a fixed constant, never a perturbed input.
         check_gradient!(

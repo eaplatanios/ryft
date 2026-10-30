@@ -203,7 +203,7 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// dependent array shapes needing a runtime join. Dimension identities established by branch inputs remain supported.
 ///
 /// Each reference output must denote the same reference (i.e., the same instruction input or captured reference)
-/// in bot  branches. Forward-mode differentiation relies on this as well, because it gives both branches the same
+/// in bot  branches. Forward mode differentiation relies on this as well, because it gives both branches the same
 /// reference-output tangent slots: a reference tangent that only one branch carried could not be padded in its peer
 /// without inventing allocation state.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -10305,7 +10305,7 @@ mod tests {
 
     #[test]
     fn test_condition_batching_after_differentiation_with_a_mapped_predicate() {
-        // Batching the forward-mode program of a condition along a batch-varying predicate selects the primal and
+        // Batching the forward mode program of a condition along a batch-varying predicate selects the primal and
         // tangent outputs of each batch item's branch.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let true_region = builder.import_program(scalar_scale_branch(2.0));
@@ -11436,7 +11436,7 @@ mod tests {
                 if message == "`condition` branch output type signature mismatch: expected [f64[]] but got []",
         ));
 
-        // Forward-mode differentiation specializes attached regions before applying its rule, so it also rejects
+        // Forward mode differentiation specializes attached regions before applying its rule, so it also rejects
         // branches that declare different input types even when the actual input refines both to the same type.
         let branches = mismatched_input_branches();
         let expected_error = TypeError::invalid(
@@ -13608,7 +13608,7 @@ mod tests {
 
         // Away from the predicate boundary, the positive branch has derivatives (2x, 2), while the negative branch
         // has derivatives (3x², 6x). Both nesting orders must retain the branch choice and the derivative of its
-        // captured primal residuals; the forward-over-reverse tangent also checks a non-unit direction.
+        // captured primal residuals; the forward over reverse tangent also checks a non-unit direction.
         for (input, expected_gradient, expected_second_derivative) in [(2f64, 4f64, 2f64), (-2f64, 12f64, -12f64)] {
             let (gradient, second_derivative) = differentiate_at(Array::scalar(input).unwrap())
                 .value_and_gradient(|input| {

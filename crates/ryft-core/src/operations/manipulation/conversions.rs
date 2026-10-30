@@ -1053,7 +1053,7 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 ///     A tangent cast is witnessed only for the identities that one of its sides does not carry, by a value whose type
 ///     carries each such identity, read from the primal input or output with [`CastType::IdentityWitnessOperation`]
 ///     (e.g., a `dimension<n>` scalar in the [`ArrayIrType`] family), or by that whole primal value in families without
-///     such an operation. Forward-mode programs that interleave primal and tangent computations also make it depend on
+///     such an operation. Forward mode programs that interleave primal and tangent computations also make it depend on
 ///     the primal output, so that it stays behind the primal check.
 ///
 /// Batching lifts the declared types by the mapped axis and binds the cast over the packed values. A proven one-input
@@ -1237,7 +1237,7 @@ impl<T: Type> CastOperation<T> {
     ///     [`CastType::IdentityWitnessOperation`] bound in the primal context (e.g., a `dimension<n>` scalar in the
     ///     [`ArrayIrType`] family). Families without such an operation retain the whole value instead.
     ///   - When `needs_ordering` holds, a data dependency on `output` so that the tangent stays behind the primal check
-    ///     and its witness producers in a fused forward-mode program. A witness read from `output` already provides
+    ///     and its witness producers in a fused forward mode program. A witness read from `output` already provides
     ///     it. Otherwise, `output` itself is a witness, unless a whole `primal` is retained, which is then re-cast at
     ///     its own type with `output` as its witness so that one value carries both.
     ///
@@ -1339,7 +1339,7 @@ impl<T: Type> CastOperation<T> {
     /// Returns `value` at `output_type` through an unchecked [`CastOperation`] bound in `context` with the provided
     /// `witnesses` (at their current types), or `value` itself when it already has that type and there are no
     /// witnesses. Witness producers remain explicit dependencies even for identity conversions. Transformation rules
-    /// use this to bind into their target context (e.g., the tangent context of a forward-mode rule), and must have
+    /// use this to bind into their target context (e.g., the tangent context of a forward mode rule), and must have
     /// proven the relationship that the cast states.
     fn bind_unchecked<C: Context<Type = T, Operation: From<Self>>>(
         context: &C,

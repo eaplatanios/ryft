@@ -378,7 +378,7 @@ impl_differentiable_operation! {
     },
 }
 
-// Reverse-mode transposition requires an accumulation provider for reference cotangents even when instantiated
+// Reverse mode transposition requires an accumulation provider for reference cotangents even when instantiated
 // with a reference-free type universe. This implementation lets ordinary scalar/array gradients satisfy that
 // bound without adding reference support; direct accumulation requests are unsupported.
 impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAddUpdateOperation<NoReferent, DataType>>
@@ -399,7 +399,7 @@ impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAddUpda
     }
 }
 
-// Reverse-mode transposition requires an accumulation provider for reference cotangents even when instantiated
+// Reverse mode transposition requires an accumulation provider for reference cotangents even when instantiated
 // with a reference-free type universe. This implementation lets ordinary scalar/array gradients satisfy that
 // bound without adding reference support; direct accumulation requests are unsupported.
 impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<NoReferent, ArrayType>>
@@ -443,7 +443,7 @@ impl<
 /// through [`ReferenceMemberType::referent`] and use the context's operation family to select and bind the update
 /// operation through [`OperationProvider`]. The selected operation may use a downstream payload, and a family without
 /// reference operations may reject construction. This capability supports arbitrary reference-aware type universes so
-/// reverse-mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
+/// reverse mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that staged values
 /// implement this capability for every universe with reference members (e.g., [`ArrayIrType`]), concrete array IR

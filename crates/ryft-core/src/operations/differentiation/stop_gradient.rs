@@ -27,7 +27,7 @@ pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 /// preserves each mapped axis and rebinds the barrier through the parent transform. Its Jacobian-Vector Product (JVP)
 /// rule (i.e., its [`DifferentiableOperation`](crate::DifferentiableOperation) implementation) passes each primal
 /// through unchanged and replaces each tangent with a structural zero, so that no derivative flows through the marked
-/// values in either forward- or reverse-mode differentiation. Because the rule stages only those zero tangents,
+/// values in either forward or reverse mode differentiation. Because the rule stages only those zero tangents,
 /// [`StopGradientOperation`] can never appear in a valid tangent program, and its
 /// [`TransposableOperation`](crate::TransposableOperation) implementation reports an error.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

@@ -1,5 +1,5 @@
 //! The [`CustomRuleDefinition`] of a retained rule set, together with the object-safe rule traits behind which it
-//! stores its JVP, VJP, and batching callbacks, and the [`CustomVjpOperation`] requirements that its reverse-mode rules
+//! stores its JVP, VJP, and batching callbacks, and the [`CustomVjpOperation`] requirements that its reverse mode rules
 //! place on the operation family.
 
 use std::borrow::Cow;
@@ -172,7 +172,7 @@ where
 
 /// Retained custom Vector-Jacobian Product (VJP) backward rule `(p, r, ȳ) ↦ x̄`. It receives the known leading inputs
 /// (i.e., the non-differentiated inputs `p` followed by the residuals `r`) and one materialized cotangent seed per
-/// output, and it returns one cotangent per differentiated input. This is the primary reverse-mode form: it is a pure
+/// output, and it returns one cotangent per differentiated input. This is the primary reverse mode form: it is a pure
 /// function of its inputs, like any other traced program, and transposition adds its results to whatever destination
 /// each differentiated input's cotangent has.
 pub(in crate::operations::composites) trait CustomVjpBackwardRule<V, O>:
@@ -401,7 +401,7 @@ where
     }
 }
 
-/// Forward-mode rule of a [`CustomRuleDefinition`].
+/// Forward mode rule of a [`CustomRuleDefinition`].
 pub(super) enum CustomRuleJvp<V, O> {
     /// Retained custom JVP rule that receives materialized input tangents (refer to [`CustomJvpRule`]).
     Rule(Arc<dyn CustomJvpRule<V, O>>),
@@ -414,7 +414,7 @@ pub(super) enum CustomRuleJvp<V, O> {
     Primal,
 }
 
-/// Borrowed retained JVP rule of a [`CustomRuleDefinition`], as applied by its forward-mode specializations.
+/// Borrowed retained JVP rule of a [`CustomRuleDefinition`], as applied by its forward mode specializations.
 pub(super) enum CustomRuleJvpRule<'r, V, O> {
     /// Rule that receives materialized input tangents.
     Materialized(&'r Arc<dyn CustomJvpRule<V, O>>),
@@ -435,11 +435,11 @@ pub(in crate::operations::composites) enum CustomVjpBackward<V, O> {
     Accumulating(Arc<dyn CustomVjpAccumulatingBackwardRule<V, O>>),
 }
 
-/// Operation family `Self` over values `V` whose programs the reverse-mode rules of a [`CustomRuleDefinition`] (refer
+/// Operation family `Self` over values `V` whose programs the reverse mode rules of a [`CustomRuleDefinition`] (refer
 /// to [`CustomRuleDefinition::with_vjp`]) can serve: the family transposes the programs that apply the rules, and it
 /// provides the zeros, reference allocations, reference updates, and additions with which transposition delivers
 /// cotangents to their destinations (including caller-provided buffers). It names those requirements once for every
-/// reverse-mode rule builder, and it is implemented for every family that satisfies them.
+/// reverse mode rule builder, and it is implemented for every family that satisfies them.
 pub trait CustomVjpOperation<V: Value<Type: ReferenceMemberType>>:
     Operation<Type = V::Type>
     + TransposableOperation<V, Self>
@@ -516,13 +516,13 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Named axes with which every rule is traced (refer to [`Self::with_named_axes`]).
     pub(super) named_axes: Vec<(String, NamedAxis)>,
 
-    /// Optional forward-mode rule.
+    /// Optional forward mode rule.
     pub(super) jvp: Option<CustomRuleJvp<V, O>>,
 
-    /// Optional retained reverse-mode forward rule, present exactly when [`Self::backward`] is present.
+    /// Optional retained reverse mode forward rule, present exactly when [`Self::backward`] is present.
     pub(super) forward: Option<Arc<dyn CustomVjpForwardRule<V, O>>>,
 
-    /// Optional retained reverse-mode backward rule, present exactly when [`Self::forward`] is present.
+    /// Optional retained reverse mode backward rule, present exactly when [`Self::forward`] is present.
     pub(in crate::operations::composites) backward: Option<CustomVjpBackward<V, O>>,
 
     /// Transposer of backward-rule specialization source programs, present exactly when [`Self::backward`] is present.
@@ -607,8 +607,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided forward-mode rule, replacing any previously configured
-    /// forward-mode rule (including a JVP derived from the primal). The rule implements `(p, x, ẋ) ↦ (y, ẏ)`: it
+    /// Returns this [`CustomRuleDefinition`] with the provided forward mode rule, replacing any previously configured
+    /// forward mode rule (including a JVP derived from the primal). The rule implements `(p, x, ẋ) ↦ (y, ẏ)`: it
     /// receives every primal input (i.e., the non-differentiated inputs `p` followed by the differentiated inputs `x`)
     /// and one tangent per differentiated input, in which structural zeros are materialized, and it returns the primal
     /// outputs followed by one tangent per output.
@@ -629,14 +629,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided forward-mode rule, replacing any previously configured
-    /// forward-mode rule. The rule is used as the rule of [`Self::with_jvp`], except that it receives each structurally
+    /// Returns this [`CustomRuleDefinition`] with the provided forward mode rule, replacing any previously configured
+    /// forward mode rule. The rule is used as the rule of [`Self::with_jvp`], except that it receives each structurally
     /// zero input tangent as a [`MaybeZero::Zero`] rather than as a materialized zero, which lets it skip the work that
     /// the zero would otherwise require, and that it returns each output tangent as a [`MaybeZero`], so that it can
     /// declare an output tangent to be a structural zero (e.g., that of an output that does not depend on the
     /// differentiated inputs). Each pattern of structurally zero input tangents is a separate specialization of the
     /// rule. A structural-zero output tangent is materialized at the boundary of the specialization program, from the
-    /// primal outputs and inputs, as a zero-producing operation, which forward-mode differentiation recognizes as a
+    /// primal outputs and inputs, as a zero-producing operation, which forward mode differentiation recognizes as a
     /// structural zero again when it replays the program.
     pub fn with_symbolic_zero_jvp<R>(mut self, rule: R) -> Self
     where
@@ -656,17 +656,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with a forward-mode rule derived from the primal region of each call,
-    /// replacing any previously configured forward-mode rule. This is how a rule set that only customizes reverse mode
-    /// (or batching) keeps ordinary forward-mode differentiation, which a missing rule never provides implicitly:
+    /// Returns this [`CustomRuleDefinition`] with a forward mode rule derived from the primal region of each call,
+    /// replacing any previously configured forward mode rule. This is how a rule set that only customizes reverse mode
+    /// (or batching) keeps ordinary forward mode differentiation, which a missing rule never provides implicitly:
     /// forward mode then differentiates the primal region, reusable linearization partitions that derivative once, and
-    /// reverse mode transposes it unless reverse-mode rules take precedence.
+    /// reverse mode transposes it unless reverse mode rules take precedence.
     pub fn with_jvp_from_primal(mut self) -> Self {
         self.jvp = Some(CustomRuleJvp::Primal);
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided reverse-mode forward rule `(p, x) ↦ (y, r)` and pure
+    /// Returns this [`CustomRuleDefinition`] with the provided reverse mode forward rule `(p, x) ↦ (y, r)` and pure
     /// backward rule `(p, r, ȳ) ↦ x̄`. The forward rule receives every primal input and returns the primal outputs
     /// followed by the residuals `r`. The backward rule receives the known leading inputs (i.e., the non-differentiated
     /// inputs `p` followed by the residuals) and one cotangent seed per output, in which structural zeros are
@@ -697,7 +697,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided reverse-mode forward rule `(p, x) ↦ (y, r)` and pure
+    /// Returns this [`CustomRuleDefinition`] with the provided reverse mode forward rule `(p, x) ↦ (y, r)` and pure
     /// backward rule `(p, r, ȳ) ↦ x̄`. The rules are used as the rules of [`Self::with_vjp`], except that the backward
     /// rule receives each structural-zero seed as a [`MaybeZero::Zero`] rather than as a materialized zero, and that
     /// it returns each input cotangent as a [`MaybeZero`], so that it can declare an input cotangent to be a structural
@@ -729,7 +729,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided reverse-mode forward rule `(p, x) ↦ (y, r)` and
+    /// Returns this [`CustomRuleDefinition`] with the provided reverse mode forward rule `(p, x) ↦ (y, r)` and
     /// accumulating backward rule. The forward rule is used as the forward rule of [`Self::with_vjp`]. The backward
     /// rule is invoked while its carrier is transposed, with the [`TranspositionContext`], the carrier's inputs (i.e.,
     /// the known leading inputs followed by the differentiated inputs' tangents), the output cotangent seeds, and one
@@ -764,7 +764,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with its reverse-mode forward rule deferred to the backward pass (i.e.,
+    /// Returns this [`CustomRuleDefinition`] with its reverse mode forward rule deferred to the backward pass (i.e.,
     /// the analogue of JAX's `custom_vjp(..., optimize_remat=True)`). Reverse mode then computes the outputs of a call
     /// with its primal region, which is cheaper than the forward rule whenever the residuals cost extra work, and
     /// stages a [`CompositeTransposeOperation`] carrier whose leading inputs are the call's own inputs rather than the
@@ -775,7 +775,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// forward rule runs only once, in the backward pass.
     ///
     /// The swap applies whenever reverse mode partitions a call, and it has no effect on a definition without
-    /// reverse-mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
+    /// reverse mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
     /// [`Program::into_pruned`](crate::Program::into_pruned)) is differentiated without the swap, because only the
     /// forward rule computes the pruned outputs, whose cotangent seeds the backward rule receives.
     ///
@@ -865,10 +865,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Batching a call with this rule preserves the call and its derivative rules: derivative requests of a batched
     /// call still trace the derivative rules at the unbatched types and batch them structurally (refer to
     /// [`Self::with_batching_support`]), aligning their outputs to the batch axes that the rule declared, while a
-    /// forward-mode rule derived from the primal differentiates the rule's batched program. The rule is responsible for
+    /// forward mode rule derived from the primal differentiates the rule's batched program. The rule is responsible for
     /// computing the batched primal consistently with those derivative rules.
     ///
-    /// When the forward-mode rule is derived from the primal, differentiating an unbatched call stages a derived call
+    /// When the forward mode rule is derived from the primal, differentiating an unbatched call stages a derived call
     /// whose batching applies the derivative of this rule (refer to [`CustomRuleSpecializer::derived`]), which may
     /// apply the rule with every input replicated. This function therefore also captures the family's differentiation
     /// of traced programs, which is why it requires the family's differentiation bounds. Batching those derivatives
@@ -904,7 +904,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// [`Self::with_batching_rule`] except that its result may depend on its input batch axes beyond computing the
     /// batched primal for them (e.g., a rule that applies a different approximation when an input is replicated). A
     /// batching rule that only computes the batched primal gives the same values whether a replicated input is
-    /// broadcast or not, so the derived batching rules of a call whose forward-mode rule is derived from its primal
+    /// broadcast or not, so the derived batching rules of a call whose forward mode rule is derived from its primal
     /// apply it with a replicated primal broadcast when that primal's tangent is mapped. For an axis-dependent rule,
     /// they instead apply it once, at the primal inputs' own batch axes, and recover the per-item tangents of such
     /// inputs from the outer product of their mapped tangents with the rule's batch (i.e., by batching the rule's
@@ -944,7 +944,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// are moved to axis 0 and become the scan's stacked inputs, the replicated inputs become invariant carries, and
     /// every output is mapped at axis 0. Batching therefore replaces the call with the scan, rather than preserving the
     /// call around a batched primal region, and the derivatives of the batched call are those of the scan: its body
-    /// differentiates the unbatched call with its own rules, one batch item at a time. A forward-mode rule derived from
+    /// differentiates the unbatched call with its own rules, one batch item at a time. A forward mode rule derived from
     /// the primal stays sequential when its derivative is batched after it is taken, because differentiating an
     /// unbatched call stages a derived call that is itself batched sequentially (refer to
     /// [`CustomRuleSpecializer::derived`]). A custom batching rule (refer to [`Self::with_batching_rule`]) takes
@@ -996,7 +996,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         &self.named_axes
     }
 
-    /// Returns `true` if this [`CustomRuleDefinition`] has a forward-mode rule or reverse-mode rules.
+    /// Returns `true` if this [`CustomRuleDefinition`] has a forward mode rule or reverse mode rules.
     #[inline]
     pub(in crate::operations::composites) fn has_derivative_rules(&self) -> bool {
         self.jvp.is_some() || self.forward.is_some()
@@ -1290,7 +1290,7 @@ mod tests {
         );
         assert_eq!(counters.counts(), (2, 0, 0));
 
-        // The rule replaces any previously configured forward-mode rule, including a JVP derived from the primal.
+        // The rule replaces any previously configured forward mode rule, including a JVP derived from the primal.
         let replaced = CustomRuleRegistration::new(
             TestDefinition::new("identity")
                 .with_jvp_from_primal()
@@ -1360,7 +1360,7 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_with_jvp_from_primal() {
-        // A forward-mode rule derived from the primal is not traced by the definition: forward mode differentiates the
+        // A forward mode rule derived from the primal is not traced by the definition: forward mode differentiates the
         // primal region of each call instead, which computes the true derivative `3x²` of the cube.
         let counters = Arc::new(RuleCounters::default());
         let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false).with_jvp_from_primal());
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_with_deferred_forward_rule() {
-        // The deferral applies only to a definition with reverse-mode rules, configuring it traces no rule, and the
+        // The deferral applies only to a definition with reverse mode rules, configuring it traces no rule, and the
         // sources of converted calls report the deferral of their member definition, even when unavailable.
         fn defers_forward_in_ir<S: CustomRuleSource<ArrayIrValue<Array>, ArrayIrOperation<Array>>>(rules: &S) -> bool {
             rules.defers_forward()

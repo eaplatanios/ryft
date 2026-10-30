@@ -7,7 +7,7 @@
 //!
 //! Only real floating-point inputs are supported. The output keeps the element type and array metadata of the input,
 //! and inputs that carry partial sums over unreduced mesh axes are rejected. The derivative of the error function is
-//! `2/√π · e^{−x²}`. It is nonlinear, so reverse-mode differentiation transposes its linearization instead.
+//! `2/√π · e^{−x²}`. It is nonlinear, so reverse mode differentiation transposes its linearization instead.
 //!
 //! # Example
 //!

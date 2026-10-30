@@ -30,7 +30,7 @@
 //! form with a dedicated `one_minus_square` primitive whose factored `(1 + t) · (1 - t)` value is not uniformly more
 //! accurate once `tanh(x)` has rounded). The derivative of `atan2(y, x)` is `(x · dy - y · dx) / (x² + y²)`. For real
 //! inputs, it is evaluated after dividing both coordinates by `max(|x|, |y|)`, so that, unlike JAX's direct formula,
-//! its squared denominator neither overflows nor underflows. Every operation is nonlinear, so reverse-mode
+//! its squared denominator neither overflows nor underflows. Every operation is nonlinear, so reverse mode
 //! differentiation transposes its linearization instead.
 //!
 //! # Example

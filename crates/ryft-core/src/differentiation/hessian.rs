@@ -227,7 +227,7 @@ impl<'o, T: Type, V> Clone for HessianBlock<'o, T, V> {
     }
 }
 
-/// Implements the forward-over-reverse differentiation transform used by
+/// Implements the forward over reverse differentiation transform used by
 /// [`hessian`](crate::DifferentiationBuilder::hessian) in an explicitly provided [`Context`].
 /// Refer to the documentation of that function for information on the mathematical interpretation,
 /// block representation, cost model, complex-type contract, runtime-capture behavior, and auxiliary-output

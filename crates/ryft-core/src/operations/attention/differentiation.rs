@@ -134,10 +134,10 @@ where
 }
 
 /// Differentiable scaled dot-product attention training function, built by [`differentiable_dot_product_attention`].
-/// It is a [`Composite`](crate::Composite) with reverse-mode rules whose input variation transitions precede its
+/// It is a [`Composite`](crate::Composite) with reverse mode rules whose input variation transitions precede its
 /// composite boundary, which lets the transitions' transposes accumulate invariant-input contributions exactly once.
 /// Its forward and backward rules are retained: an ordinary call traces only the attention primal, and the rules are
-/// traced on the first reverse-mode request of each specialization and cached for as long as the function lives.
+/// traced on the first reverse mode request of each specialization and cached for as long as the function lives.
 pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
@@ -183,7 +183,7 @@ where
 
 /// Creates the differentiable scaled dot-product attention entry point for one canonical [`AttentionInputs`] tree.
 ///
-/// The primal path returns only the attended output. Reverse-mode differentiation runs a residual-producing forward
+/// The primal path returns only the attended output. Reverse mode differentiation runs a residual-producing forward
 /// with the same configuration and then applies the narrow backward boundary. [`AttentionImplementation::Automatic`]
 /// selects [`AttentionImplementation::Portable`] for this training entry point, preserving small dominant-logit
 /// gradients with its stabilized backward composition. Explicitly requesting [`AttentionImplementation::Fused`] opts

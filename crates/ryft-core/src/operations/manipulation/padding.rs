@@ -67,7 +67,7 @@ pub const PAD_OPERATION_NAME: &str = "pad";
 ///   - `PadOperation<ArrayIrType>` additionally accepts one first-class dimension input for each output axis. It is
 ///     used in mixed array/dimension programs that must carry those logical result extents explicitly.
 ///
-/// Live reverse-mode differentiation of symbolic input shapes uses the mixed form and linearization, which retains the
+/// Live reverse mode differentiation of symbolic input shapes uses the mixed form and linearization, which retains the
 /// runtime extents needed to restore cropped input positions and build the padding-position mask. Homogeneous direct
 /// transposition supports static shapes as symbolic-zero cotangents do not require runtime extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1708,11 +1708,11 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     /// encodings and supporting element types without a representable zero. Output placement follows the same
     /// sharding and reduction-state rules as [`Self::dynamic_pad`].
     ///
-    /// Reverse-mode differentiation uses scatter's dual gather. Currently, every non-padded axis must have a static
+    /// Reverse mode differentiation uses scatter's dual gather. Currently, every non-padded axis must have a static
     /// extent, and a dynamic target `extent` must have a positive lower bound. For example, padding `[2, size]` along
     /// axis `1` supports a pullback when the target is bounded below by `1`, whereas `[rows, size]` with dynamic `rows`
     /// or a target bounded below by `0` does not. Forward evaluation supports those shapes independently of these
-    /// reverse-mode restrictions.
+    /// reverse mode restrictions.
     ///
     /// # Parameters
     ///

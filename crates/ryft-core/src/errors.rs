@@ -92,7 +92,7 @@ dyn_hash::hash_trait_object!(CustomError);
 /// from the entry point instead of requiring an explicit annotation.
 ///
 /// This dual-mode contract is only sound where the expected closure output `T` has a concrete outer type
-/// constructor at the entry point (e.g., the reverse-mode gradient entry points, whose closures produce a
+/// constructor at the entry point (e.g., the reverse mode gradient entry points, whose closures produce a
 /// [`LinearizationTracer`](crate::LinearizationTracer) or a tracer/auxiliary tuple). A plain output can then never
 /// unify with [`Result`], which is what lets type inference select between the two implementations unambiguously.
 /// When `T` is itself a fully generic parameter inferred from the closure (e.g., the traced output structures of

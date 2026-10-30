@@ -10,7 +10,7 @@ use crate::programs::ProgramError;
 use crate::programs::types::Typed;
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`](crate::Type).
-/// [`MaybeZero`] is the symbolic zero representation shared by transforms like forward-mode and reverse-mode
+/// [`MaybeZero`] is the symbolic zero representation shared by transforms like forward mode and reverse mode
 /// differentiation, where it is the tangent type carried by [`DifferentiationTracer`](crate::DifferentiationTracer)s
 /// and the cotangent type that transposition rules consume and produce. A [`MaybeZero::Zero`] means that no value
 /// exists and nothing has been staged or computed for it. In the context of differentiation, it means that the

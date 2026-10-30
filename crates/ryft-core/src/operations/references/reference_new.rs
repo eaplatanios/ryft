@@ -242,7 +242,7 @@ impl_differentiable_operation! {
     },
 }
 
-// Reverse-mode differentiation requires an allocation provider for every operation family, even when its types
+// Reverse mode differentiation requires an allocation provider for every operation family, even when its types
 // cannot contain references. This lets scalar/array-only differentiation satisfy the generic bounds; it never
 // takes the reference-allocation path. Direct allocation requests are unsupported.
 impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<NoReferent, DataType>> for O {
@@ -259,7 +259,7 @@ impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOper
     }
 }
 
-// Reverse-mode differentiation requires an allocation provider for every operation family, even when its types
+// Reverse mode differentiation requires an allocation provider for every operation family, even when its types
 // cannot contain references. This lets scalar/array-only differentiation satisfy the generic bounds; it never
 // takes the reference-allocation path. Direct allocation requests are unsupported.
 impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<NoReferent, ArrayType>> for O {

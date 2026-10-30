@@ -1,6 +1,6 @@
 //! The [`CompositeOperation`] that calls a primal program with custom derivative rules. The operation holds its rules
 //! either as attached rule regions or as retained rule sets (refer to [`CustomRuleSource`]), and reverse mode replaces
-//! a call with reverse-mode rules with a [`CompositeTransposeOperation`] carrier.
+//! a call with reverse mode rules with a [`CompositeTransposeOperation`] carrier.
 
 // TODO(eaplatanios): Review this module.
 
@@ -44,18 +44,18 @@ use crate::tracing::TracingContext;
 /// Canonical operation name for [`CompositeOperation`].
 pub const COMPOSITE_OPERATION_NAME: &str = "composite";
 
-/// Forward-mode (i.e., Jacobian-Vector Product or JVP) rule of a [`CompositeOperation`].
+/// Forward mode (i.e., Jacobian-Vector Product or JVP) rule of a [`CompositeOperation`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CompositeJvpRule {
-    /// No forward-mode rule. Forward mode is rejected, and reverse mode requires a reverse-mode rule.
+    /// No forward mode rule. Forward mode is rejected, and reverse mode requires a reverse mode rule.
     #[default]
     Absent,
 
-    /// Explicit forward-mode rule `(p, x, ẋ) → (y, ẏ)`, which is a `"jvp"` rule region of a call with attached rules
+    /// Explicit forward mode rule `(p, x, ẋ) → (y, ẏ)`, which is a `"jvp"` rule region of a call with attached rules
     /// and a retained callback of a call with retained rules.
     Explicit,
 
-    /// Forward-mode rule derived by differentiating the primal region, which is an explicit registration choice
+    /// Forward mode rule derived by differentiating the primal region, which is an explicit registration choice
     /// rather than a fallback for a missing rule.
     Primal,
 }
@@ -65,10 +65,10 @@ pub enum CompositeJvpRule {
 enum CompositeRules<T, S> {
     /// Rule programs attached as rule regions that follow the primal region.
     Attached {
-        /// Forward-mode rule, whose explicit form is a `"jvp"` rule region.
+        /// Forward mode rule, whose explicit form is a `"jvp"` rule region.
         jvp_rule: CompositeJvpRule,
 
-        /// Whether the call has `"forward"` and `"backward"` reverse-mode rule regions.
+        /// Whether the call has `"forward"` and `"backward"` reverse mode rule regions.
         has_vjp_rule: bool,
     },
 
@@ -88,7 +88,7 @@ enum CompositeRules<T, S> {
         /// Whether each output of the rules is an output of the call, or [`None`] when the call returns every output
         /// of its rules. Pruning the unused outputs of a call (refer to [`Operation::prune_boundary`]) prunes them
         /// from its primal region and records them here, because its rules are traced for the complete output
-        /// structure: the rule specializations of the call project the kept outputs, and its reverse-mode carrier
+        /// structure: the rule specializations of the call project the kept outputs, and its reverse mode carrier
         /// keeps every output of the forward rule, whose pruned outputs then receive structural-zero seeds.
         kept_outputs: Option<Vec<bool>>,
     },
@@ -100,9 +100,9 @@ enum CompositeRules<T, S> {
 /// numerically stabilized derivative). The primal program is attached as the computation region `"primal"`, and
 /// ordinary execution, lowering, and partial evaluation use it exclusively. A call has any of the following rules:
 ///
-///   - a forward-mode rule (refer to [`CompositeJvpRule`]), which is either an explicit Jacobian-Vector Product (JVP)
+///   - a forward mode rule (refer to [`CompositeJvpRule`]), which is either an explicit Jacobian-Vector Product (JVP)
 ///     rule or the derivative of the primal region, and
-///   - reverse-mode forward and backward (i.e., Vector-Jacobian Product or VJP) rules.
+///   - reverse mode forward and backward (i.e., Vector-Jacobian Product or VJP) rules.
 ///
 /// # Representations
 ///
@@ -184,8 +184,8 @@ enum CompositeRules<T, S> {
 /// custom batching rule is the exception: batching replaces the call with a scan over the batch items whose body
 /// applies the unbatched call, so the batched call's derivatives are those of the scan.
 ///
-/// A custom batching rule also stays on the path of forward-mode derivatives that are batched after they are taken.
-/// Forward-mode differentiation of an unbatched call with retained rules whose forward-mode rule is derived from its
+/// A custom batching rule also stays on the path of forward mode derivatives that are batched after they are taken.
+/// Forward mode differentiation of an unbatched call with retained rules whose forward mode rule is derived from its
 /// primal stages a derived call (with rules that [`CustomRuleSpecializer::derived`] derives) instead of inlining the
 /// derivative of the primal region, and batching that call applies the derivative of the batching rule. The derived
 /// call's primal region is that derivative: in fused contexts, it computes the outputs and their tangents, while
@@ -201,10 +201,10 @@ enum CompositeRules<T, S> {
 /// from its primal region while keeping every input, because the rules may use inputs that the pruned primal does not,
 /// which is how JAX's dead code elimination treats its custom derivative calls. A call with retained rules records
 /// which outputs of its rules it keeps (rendered as `kept_outputs`), because its rules are traced for the complete
-/// output structure: its forward-mode and batching rules are projected onto the kept outputs, and its reverse-mode
+/// output structure: its forward mode and batching rules are projected onto the kept outputs, and its reverse mode
 /// carrier keeps every output of the forward rule, whose pruned outputs receive structural-zero seeds. A call with
 /// attached rule regions, whose boundaries mirror the complete primal boundary, stays whole, and so does a call whose
-/// forward-mode rule is derived from its primal while its rules have a custom batching rule, because the derived calls
+/// forward mode rule is derived from its primal while its rules have a custom batching rule, because the derived calls
 /// that its derivatives stage apply that rule to every output.
 ///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
@@ -234,9 +234,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Creates a new call with attached rule programs, whose inputs are all differentiated. An explicit forward-mode
+    /// Creates a new call with attached rule programs, whose inputs are all differentiated. An explicit forward mode
     /// rule (i.e., [`CompositeJvpRule::Explicit`]) is a `"jvp"` rule region that follows the primal region, and
-    /// reverse-mode rules are `"forward"` and `"backward"` rule regions that follow the primal region and the optional
+    /// reverse mode rules are `"forward"` and `"backward"` rule regions that follow the primal region and the optional
     /// `"jvp"` rule region.
     #[inline]
     pub fn from_rule_regions(jvp_rule: CompositeJvpRule, has_vjp_rule: bool) -> Self {
@@ -293,7 +293,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns the forward-mode rule of this call.
+    /// Returns the forward mode rule of this call.
     pub fn jvp_rule(&self) -> CompositeJvpRule {
         match &self.rules {
             CompositeRules::Attached { jvp_rule, .. } => *jvp_rule,
@@ -303,7 +303,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns whether this call has reverse-mode forward and backward rules.
+    /// Returns whether this call has reverse mode forward and backward rules.
     pub fn has_vjp_rule(&self) -> bool {
         match &self.rules {
             CompositeRules::Attached { has_vjp_rule, .. } => *has_vjp_rule,
@@ -819,7 +819,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         let rules = match &self.rules {
             // Attached rule regions mirror the complete output boundary of the primal region, which the region
             // provenance of the call cannot prune together with it, so only a call without rule regions is pruned (its
-            // forward-mode rule, if any, is derived from its pruned primal region).
+            // forward mode rule, if any, is derived from its pruned primal region).
             CompositeRules::Attached { jvp_rule, has_vjp_rule } => {
                 if *jvp_rule == CompositeJvpRule::Explicit || *has_vjp_rule {
                     return Ok(None);
@@ -827,7 +827,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 self.rules.clone()
             }
 
-            // The derived calls with which a forward-mode rule derived from the primal keeps a custom batching rule on
+            // The derived calls with which a forward mode rule derived from the primal keeps a custom batching rule on
             // the path of batched derivatives (refer to `CustomRuleSpecializer::derived`) apply that rule to every
             // output, so such calls stay whole.
             CompositeRules::Retained { rules, .. } if rules.derives_jvp_from_primal() && rules.has_batching_rule() => {
@@ -922,7 +922,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         // Attached rule regions render under their slot names, so their fields appear only for the non-differentiated
-        // split and for a forward-mode rule derived from the primal region, both exactly where they exist. Retained
+        // split and for a forward mode rule derived from the primal region, both exactly where they exist. Retained
         // rules render the name of their definition and the state of the call that their specializations depend on.
         let operation = OperationFormatter::new(formatter, indentation, COMPOSITE_OPERATION_NAME)?;
         match &self.rules {
@@ -1094,7 +1094,7 @@ where
                 // the forward and backward rules, so they keep the axes that the forward rule naturally produces. The
                 // backward rule is batched on those exact axes and each `x̄` is aligned with its corresponding
                 // differentiated input `x`: when a replicated `x` receives a mapped cotangent, the batching policy sums
-                // that mapped axis, which is the transpose of broadcasting `x` across the batch. A forward-mode rule
+                // that mapped axis, which is the transpose of broadcasting `x` across the batch. A forward mode rule
                 // derived from the primal region has no region of its own, so batching the primal region also batches
                 // it.
                 let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
@@ -1463,7 +1463,7 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Without reverse-mode rules, reverse mode transposes the linearized forward-mode rule. A forward-mode rule
+        // Without reverse mode rules, reverse mode transposes the linearized forward mode rule. A forward mode rule
         // derived from the primal is inlined, because transposing the derived calls that forward mode stages transposes
         // their primal regions inline, which would drop the batching rule that they exist to keep.
         if !self.has_vjp_rule() {
@@ -1480,7 +1480,7 @@ where
             return self.jvp(context, driver, inputs);
         }
 
-        // Reverse-mode rules specify the pullback `ȳ ↦ x̄`, not the pushforward `ẋ ↦ ẏ`. Replay:
+        // Reverse mode rules specify the pullback `ȳ ↦ x̄`, not the pushforward `ẋ ↦ ẏ`. Replay:
         //
         //   forward(p, x) = (y, r)
         //
@@ -1749,11 +1749,11 @@ where
         outputs: &[MaybeZero<CustomRuleTracer<V, O>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // Reverse mode linearizes a call before transposing it: a forward-mode rule replaces `f(p, x)` with the
-        // ordinary primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`, and reverse-mode rules replace
+        // Reverse mode linearizes a call before transposing it: a forward mode rule replaces `f(p, x)` with the
+        // ordinary primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`, and reverse mode rules replace
         // it with a `CompositeTransposeOperation` carrier, whose transpose evaluates `backward(p, r, ȳ) = x̄`. A call
         // that reaches transposition is therefore one that is linear in its unknown inputs, such as the pushforward
-        // call that a partitioned differentiation context stages for a call whose forward-mode rule is derived from its
+        // call that a partitioned differentiation context stages for a call whose forward mode rule is derived from its
         // primal (refer to `differentiate_primal_region`). Like JAX's transposition of a `custom_jvp_call` through its
         // call jaxpr, the primal region is transposed with respect to the unknown inputs and replayed inline, so a call
         // whose primal is not linear in them is rejected by the transpose rules of the primal's own operations.
@@ -2138,7 +2138,7 @@ where
     outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect()
 }
 
-/// Differentiates the primal region at slot 0 of a composite call in forward mode, which is the forward-mode rule of a
+/// Differentiates the primal region at slot 0 of a composite call in forward mode, which is the forward mode rule of a
 /// call whose JVP is derived from its primal (i.e., [`CompositeJvpRule::Primal`]). The derivative is taken with respect
 /// to the differentiated inputs with active tangents, while the leading `non_differentiated_count` inputs, which must
 /// have zero tangents, parameterize the derivative.
@@ -2300,8 +2300,8 @@ where
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Returns the error that forward-mode differentiation of a composite call without a forward-mode rule reports, where
-/// `call` describes the call (e.g., ``a `composite` call``). A call with reverse-mode rules supports only reverse-mode
+/// Returns the error that forward mode differentiation of a composite call without a forward mode rule reports, where
+/// `call` describes the call (e.g., ``a `composite` call``). A call with reverse mode rules supports only reverse mode
 /// differentiation, while a call without any rule is not differentiable. A missing rule never falls back to
 /// differentiating the primal.
 pub(super) fn missing_custom_jvp_rule_error(call: &str, has_vjp_rule: bool) -> DifferentiationError {
@@ -2690,7 +2690,7 @@ mod tests {
     }
 
     /// Checks coefficient hoisting and independent repeated pushforwards with a read or consuming freeze, optionally
-    /// for a call that also has reverse-mode rules, which forward-mode linearization must never consult.
+    /// for a call that also has reverse mode rules, which forward mode linearization must never consult.
     fn check_custom_jvp_linearization_fresh_tangent_state(consume: bool, with_vjp_rule: bool) {
         let endpoint = if consume { "reference_freeze" } else { "reference_read" };
         let operation = ArrayIrComposite::from_rule_regions(CompositeJvpRule::Explicit, with_vjp_rule);
@@ -2913,7 +2913,7 @@ mod tests {
     /// Tracer of the array IR universe used by the plumbing-reference tests.
     type ArrayIrTracer = DomainTracer<EagerArrayIrContext>;
 
-    /// Error message of the forward-mode rejection of calls that have only reverse-mode rules.
+    /// Error message of the forward mode rejection of calls that have only reverse mode rules.
     const FORWARD_MODE_REJECTION: &str = "cannot apply forward-mode differentiation to a `composite` call that \
                                           has only reverse-mode rules; it supports only reverse-mode differentiation \
                                           (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)";
@@ -2942,7 +2942,7 @@ mod tests {
 
     /// Returns the attached regions of a call of `operation` over `f(x) = sin(x)` on `f64[]` values, in its region
     /// order. The rule regions deliberately differ from the true derivative `cos(x)`: the JVP rule doubles it and the
-    /// reverse-mode rules triple it, so tests can prove which rule each transform selects.
+    /// reverse mode rules triple it, so tests can prove which rule each transform selects.
     fn sin_regions(operation: &ArrayComposite) -> Vec<FlatProgram<ArrayContext>> {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut regions = vec![sin_program(&scalar_type)];
@@ -2956,7 +2956,7 @@ mod tests {
         regions
     }
 
-    /// Builds the reverse-mode rules `forward(counter, x) = (x², 2x)` and `backward(counter, r, ȳ) = r · ȳ` over a
+    /// Builds the reverse mode rules `forward(counter, x) = (x², 2x)` and `backward(counter, r, ȳ) = r · ȳ` over a
     /// leading `ref<f32[]>` counter and an `f32[]` input, where the backward rule also adds one to the counter so that
     /// every execution of it is observable.
     fn counting_square_vjp_regions() -> Vec<FlatProgram<EagerArrayIrContext>> {
@@ -3101,7 +3101,7 @@ mod tests {
         assert_eq!(combined.input_region_provenance(3, 0), InputRegionProvenance::None);
         assert_eq!(format!("{combined}"), "composite");
 
-        // A forward-mode rule derived from the primal region adds no region, so its rendering records it.
+        // A forward mode rule derived from the primal region adds no region, so its rendering records it.
         let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, false);
         assert_eq!(derived.region_slots(), &[RegionSlot::computation("primal")]);
         assert_eq!(format!("{derived}"), "composite [jvp_from_primal=true]");
@@ -3335,7 +3335,7 @@ mod tests {
 
     #[test]
     fn test_composite_type_inference() {
-        // A call with both a JVP rule region and reverse-mode rule regions validates every rule interface against the
+        // A call with both a JVP rule region and reverse mode rule regions validates every rule interface against the
         // primal interface.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type.clone()], EffectClasses::NONE);
@@ -3371,7 +3371,7 @@ mod tests {
             Err(TypeError::invalid("expected 4 regions but got 3")),
         );
 
-        // A forward-mode rule derived from the primal region has no region to validate.
+        // A forward mode rule derived from the primal region has no region to validate.
         let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, false);
         assert_eq!(derived.infer_output_types(&[scalar_type.clone()], &[primal]), Ok(vec![scalar_type]));
     }
@@ -3977,7 +3977,7 @@ mod tests {
 
     #[test]
     fn test_composite_prune_boundary() {
-        // A call of `x ↦ (sin(x), cos(x))` with explicit forward- and reverse-mode rules whose second output is
+        // A call of `x ↦ (sin(x), cos(x))` with explicit forward and reverse mode rules whose second output is
         // unused drops that output from its primal region while keeping every input, and it records which outputs of
         // its rules it keeps, so its rules keep their complete output structure and its derivatives match those of the
         // unpruned call, whether it is batched before or after it is pruned.
@@ -4085,7 +4085,7 @@ mod tests {
     fn test_composite_prune_boundary_kept_calls() {
         // Attached rule regions mirror the complete output boundary of the primal region, so a call with a JVP rule
         // region stays whole, while a call without rule regions is pruned like any other call. Derived calls apply a
-        // custom batching rule to every output, so a call whose forward-mode rule is derived from its primal and that
+        // custom batching rule to every output, so a call whose forward mode rule is derived from its primal and that
         // has a custom batching rule stays whole as well.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let attached_program = |jvp_rule: CompositeJvpRule| -> FlatProgram<ArrayContext> {
@@ -4703,7 +4703,7 @@ mod tests {
     fn test_composite_batching() {
         // Batching a call that has every kind of rule batches all of its regions and preserves both rules, so forward
         // mode through the batched call still uses the doubled JVP rule and reverse mode still uses the tripled
-        // reverse-mode rules.
+        // reverse mode rules.
         let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true);
         let regions = sin_regions(&operation);
         let (value, tangent) = differentiate_at(Array::vector(vec![0.5, 1.0]).unwrap())
@@ -5661,7 +5661,7 @@ mod tests {
     fn test_composite_differentiation() {
         // The rule-selection contract: every layout of rules selects exactly the rule that each mode requires, and a
         // missing rule never falls back to differentiating the primal region. The rule regions of the sine fixture
-        // double (JVP rule) or triple (reverse-mode rules) the true derivative `cos(x)`, which a derived JVP computes.
+        // double (JVP rule) or triple (reverse mode rules) the true derivative `cos(x)`, which a derived JVP computes.
         let no_rule = "cannot differentiate a `composite` call that has no derivative rule";
         let (absent, explicit, primal) =
             (CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Primal);
@@ -5711,7 +5711,7 @@ mod tests {
         }
 
         // Higher-order derivatives compose with both a derived JVP, whose second derivative is `-sin(x)`, and with
-        // forward differentiation of reverse-mode rules, whose tripled backward rule makes it `-3 sin(x)`.
+        // forward differentiation of reverse mode rules, whose tripled backward rule makes it `-3 sin(x)`.
         for (jvp_rule, has_vjp_rule, expected) in [(primal, false, -x.sin()), (explicit, true, -3.0 * x.sin())] {
             let operation = ArrayComposite::from_rule_regions(jvp_rule, has_vjp_rule);
             let regions = sin_regions(&operation);
@@ -5830,7 +5830,7 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_jvp_rule() {
-        // The custom rule doubles the true derivative, which proves that it governs forward-mode differentiation.
+        // The custom rule doubles the true derivative, which proves that it governs forward mode differentiation.
         let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
             .jvp(Array::scalar(1.0).unwrap(), |x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
@@ -6425,7 +6425,7 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_combined_rules_fresh_tangent_state() {
-        // Adding reverse-mode rules does not change forward-mode linearization: the tangent program still allocates
+        // Adding reverse mode rules does not change forward mode linearization: the tangent program still allocates
         // fresh JVP rule state on every application, exactly as for a call that has only a JVP rule.
         check_custom_jvp_linearization_fresh_tangent_state(false, true);
         check_custom_jvp_linearization_fresh_tangent_state(true, true);
@@ -6499,7 +6499,7 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_vjp_rule() {
-        // The custom backward rule triples the true gradient, which proves that it governs reverse-mode
+        // The custom backward rule triples the true gradient, which proves that it governs reverse mode
         // differentiation.
         let (value, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| {
@@ -6937,7 +6937,7 @@ mod tests {
         assert_eq!(counter_tangent.read(), Ok(Array::scalar(0.0f32).unwrap()));
 
         // Building executable forward derivatives of an already staged call rejects immediately too: neither
-        // request returns an artifact that defers the error until its reverse-mode carrier is executed.
+        // request returns an artifact that defers the error until its reverse mode carrier is executed.
         let (_, program) = EagerArrayIrContext::trace(
             |inputs| function.call(inputs),
             (
@@ -7072,10 +7072,10 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_retained_rules_rule_selection() {
-        /// Forward-mode rule of one registration row.
+        /// Forward mode rule of one registration row.
         #[derive(Copy, Clone, Debug)]
         enum ForwardRule {
-            /// No forward-mode rule.
+            /// No forward mode rule.
             Absent,
 
             /// The deliberately wrong JVP rule `ẏ = x² ẋ`.
@@ -7087,7 +7087,7 @@ mod tests {
 
         // The registration acceptance contract over the production member family: every registration row selects
         // exactly the rule that each mode requires, and a missing rule never falls back to differentiating the
-        // primal. The reverse-mode rules compute the deliberately wrong gradient `x̄ = 2 x² ȳ`.
+        // primal. The reverse mode rules compute the deliberately wrong gradient `x̄ = 2 x² ȳ`.
         let registration = |forward: ForwardRule, reverse: bool| {
             let mut definition = MemberDefinition::new("cube");
             definition = match forward {
@@ -7179,7 +7179,7 @@ mod tests {
         }
 
         // Higher-order differentiation differentiates the selected rule programs rather than the primal: the derived
-        // JVP has the true second derivative `6 x`, while forward-over-reverse through the backward rule `2 x² ȳ` gives
+        // JVP has the true second derivative `6 x`, while forward over reverse through the backward rule `2 x² ȳ` gives
         // `4 x`.
         for (forward, reverse, expected) in
             [(ForwardRule::Derived, false, 6.0 * x), (ForwardRule::Explicit, true, 4.0 * x)]
@@ -7215,7 +7215,7 @@ mod tests {
         let one = Array::scalar(1f64).unwrap();
         let failure = || ProgramError::InvalidArgument { message: "rule failure".to_string() };
 
-        // A failing JVP rule surfaces at the first forward-mode request, never during ordinary execution or reverse
+        // A failing JVP rule surfaces at the first forward mode request, never during ordinary execution or reverse
         // mode.
         let counters = Arc::new(RuleCounters::default());
         let definition =
@@ -7239,7 +7239,7 @@ mod tests {
                                has 1 outputs",
         ));
 
-        // A failing forward rule surfaces at the first reverse-mode request, while a failing backward rule surfaces
+        // A failing forward rule surfaces at the first reverse mode request, while a failing backward rule surfaces
         // only when the first pullback application transposes the carrier.
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(
@@ -7311,7 +7311,7 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_retained_rules_structural_zero_tangents() {
-        // Forward-mode specializations receive only the active input tangents, and each activity pattern is a separate
+        // Forward mode specializations receive only the active input tangents, and each activity pattern is a separate
         // specialization. The pair rule forwards each input tangent to the corresponding output.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let pair_program = |definition: &TestRegistration| {
@@ -7432,7 +7432,7 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_retained_rules_linearization() {
-        // Forward-mode linearization replays the traced JVP rule, while reverse-mode linearization stages the carrier
+        // Forward mode linearization replays the traced JVP rule, while reverse mode linearization stages the carrier
         // over the forward rule's residual and the input tangent.
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
@@ -7972,7 +7972,7 @@ mod tests {
 
     #[test]
     fn test_composite_transposition_vjp_rule() {
-        // Differentiation replaces the call with its reverse-mode carrier before transposition, so a direct transpose
+        // Differentiation replaces the call with its reverse mode carrier before transposition, so a direct transpose
         // of an un-linearized call transposes its primal region, whose nonlinear `sin` rejects it.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
@@ -7992,7 +7992,7 @@ mod tests {
 
     #[test]
     fn test_composite_transposition_pushforward() {
-        // Linearizing a call whose forward-mode rule is derived from its primal and whose rules have a custom batching
+        // Linearizing a call whose forward mode rule is derived from its primal and whose rules have a custom batching
         // rule stages a pushforward call on the tangent side, which is linear in its tangent inputs, so transposing the
         // linearization transposes its primal region with respect to them.
         type Tracer = DomainTracer<ArrayContext>;
@@ -8072,7 +8072,7 @@ mod tests {
         );
         assert_eq!(counters.counts(), (1, 0, 0));
 
-        // Reverse mode uses the converted reverse-mode rules.
+        // Reverse mode uses the converted reverse mode rules.
         let reverse = converted
             .entry_region_ref()
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)

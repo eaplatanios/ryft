@@ -519,7 +519,7 @@ fn test_dot_accumulation_type() {
     );
     assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
 
-    // Forward-mode differentiation stages accumulation-typed tangent dots over the input-typed tangents, so the output
+    // Forward mode differentiation stages accumulation-typed tangent dots over the input-typed tangents, so the output
     // tangent lives at the accumulation type exactly like the primal output. Every value below is exactly representable
     // in `f8e4m3fn` and every product sum is exact in `f32`.
     let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();

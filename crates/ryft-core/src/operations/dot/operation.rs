@@ -20,13 +20,13 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// [`DotOperation`] is the unified primitive for matrix multiplication, batched matrix multiplication, vector inner
 /// products, and arbitrary tensor contractions. It lowers to StableHLO's `dot_general` op in the XLA backend.
 ///
-/// A dot is bilinear. Forward-mode differentiation applies
+/// A dot is bilinear. Forward mode differentiation applies
 /// `d(dot(lhs, rhs)) = dot(dlhs, rhs) + dot(lhs, drhs)`. Transposition therefore accepts exactly one linear input and
 /// contracts the output cotangent with the other, known input using the corresponding adjoint dimension numbers.
 /// Accumulation-typed dots perform those contractions at the widened cotangent type before converting the result back
 /// to the linear input's cotangent representation.
 ///
-/// Each forward-mode tangent term is staged as an ordinary dot that preserves the primal dimension numbers,
+/// Each forward mode tangent term is staged as an ordinary dot that preserves the primal dimension numbers,
 /// accumulation type, and requested output sharding without introducing captures. Transposition pins the adjoint
 /// contraction's output sharding to the cotangent dual of the linear input's sharding. A structural-zero output
 /// cotangent remains structural zero.
@@ -77,7 +77,7 @@ impl DotOperation {
     /// the inputs and accumulates the contraction at the wider type (XLA's `preferred_element_type` contract, which is
     /// what its low-precision matrix units implement natively — e.g., `f8 × f8 → f32` and `bf16 × bf16 → f32`).
     /// Accumulation-typed dots differentiate like ordinary dots, with tangents and cotangents carried at the
-    /// accumulation type (refer to the forward-mode and transpose rule documentation on this operation), and cannot yet
+    /// accumulation type (refer to the forward mode and transpose rule documentation on this operation), and cannot yet
     /// be combined with a requested output sharding.
     #[inline]
     pub fn with_accumulation_type(mut self, accumulation_type: impl Into<Option<DataType>>) -> Self {
@@ -338,7 +338,7 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
 ///
 /// The operation is linear in either data input separately, while `group_sizes` is nondifferentiable metadata.
-/// Forward-mode differentiation applies the two-term product rule with the same group metadata. Transposition is
+/// Forward mode differentiation applies the two-term product rule with the same group metadata. Transposition is
 /// defined only in non-contracting mode and applies another grouped dot followed by the inverse adjoint-axis
 /// permutation.
 ///

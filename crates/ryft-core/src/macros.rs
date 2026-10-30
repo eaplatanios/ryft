@@ -1620,10 +1620,10 @@ macro_rules! impl_reference_dischargeable_operation {
     };
 }
 
-/// Implements complete forward-mode differentiation (i.e., the Jacobian-Vector Product, or JVP, tranform) and primitive
+/// Implements complete forward mode differentiation (i.e., the Jacobian-Vector Product, or JVP, tranform) and primitive
 /// transposition rules for an [`Operation`](crate::Operation). The caller supplies the operation-specific algorithms
 /// while this macro generates the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
-/// [`TransposableOperation`](crate::TransposableOperation) implementation shells. Reverse-mode differentiation needs no
+/// [`TransposableOperation`](crate::TransposableOperation) implementation shells. Reverse mode differentiation needs no
 /// separate rule because it is derived by linearizing and then transposing the staged tangent program.
 ///
 /// Use this macro when a rule needs direct access to the complete input list, an operation's structural metadata, or a
@@ -1664,7 +1664,7 @@ macro_rules! impl_reference_dischargeable_operation {
 /// ```
 ///
 /// A nonlinear primitive can provide its JVP and request the standard rejecting primitive-transposition rule.
-/// Reverse-mode differentiation remains available when the JVP stages transposable linear primitives:
+/// Reverse mode differentiation remains available when the JVP stages transposable linear primitives:
 ///
 /// ```rust,ignore
 /// impl_differentiable_operation! {
@@ -2089,10 +2089,10 @@ macro_rules! impl_differentiable_operation {
     };
 }
 
-/// Implements the forward-mode differentiation (Jacobian-Vector Product; JVP) and primitive transposition rules for
+/// Implements the forward mode differentiation (Jacobian-Vector Product; JVP) and primitive transposition rules for
 /// an elementwise [`Operation`](crate::Operation). The macro keeps the operation-specific mathematical rule at the
 /// invocation site while generating the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
-/// [`TransposableOperation`](crate::TransposableOperation) implementation shells. Reverse-mode differentiation
+/// [`TransposableOperation`](crate::TransposableOperation) implementation shells. Reverse mode differentiation
 /// needs no separate rule because it is derived by linearizing and then transposing the staged tangent program.
 ///
 /// Unary and binary JVP forms replay the primal operation through the active [`Context`](crate::Context), preserve
@@ -2122,7 +2122,7 @@ macro_rules! impl_differentiable_operation {
 /// rules provide only the supported ordering. Unsupported patterns and missing cotangent spaces receive diagnostics
 /// derived from the operation and input names.
 ///
-/// `@nonlinear` implements the standard erroring primitive transpose rule. Reverse-mode differentiation remains
+/// `@nonlinear` implements the standard erroring primitive transpose rule. Reverse mode differentiation remains
 /// available by transposing the linear operations produced by the JVP. Operations whose rules cannot be expressed as
 /// elementwise tangent contributions should use [`impl_differentiable_operation!`] instead.
 ///
@@ -3500,7 +3500,7 @@ macro_rules! impl_non_differentiable_operation {
 
 /// Implements the erroring [`TransposableOperation`](crate::TransposableOperation) rule for an operation that is not a
 /// linear map on any input. A valid tangent program never contains such an operation on a linear input (its
-/// forward-mode rule pairs replayed primals with tangents computed by other operations), so the generated rule reports
+/// forward mode rule pairs replayed primals with tangents computed by other operations), so the generated rule reports
 /// an [`UnsupportedOperation`](crate::ProgramError::UnsupportedOperation) error. The reason non-transposable operations
 /// still implement [`TransposableOperation`](crate::TransposableOperation) at all is that transposition is driven
 /// through whole operation families. Ryft used to have a separate linear operation family type, but that resulted in
@@ -4619,7 +4619,7 @@ macro_rules! check_operation_batching {
     };
 }
 
-/// Checks how a concrete [`Operation`](crate::Operation) behaves under forward-mode differentiation. Each
+/// Checks how a concrete [`Operation`](crate::Operation) behaves under forward mode differentiation. Each
 /// case builds a single [`Instruction`](crate::Instruction) [`Program`](crate::Program), transforms it with
 /// [`Program::jvp`](crate::Program::jvp) and [`Program::linearize`](crate::Program::linearize), and checks the declared
 /// primal and tangent outputs under both fused and separate execution. The macro independently checks the tangent
@@ -4933,7 +4933,7 @@ macro_rules! check_operation_transposition {
     };
 }
 
-/// Asserts that the reverse-mode gradient of a function at an input matches a central finite-difference estimate of its
+/// Asserts that the reverse mode gradient of a function at an input matches a central finite-difference estimate of its
 /// derivative within an absolute tolerance. This is the standard oracle for testing operation gradient rules without
 /// hand-deriving the expected derivative and without trusting the machinery under test (i.e., the gradient side runs
 /// the function through [`DifferentiationBuilder::gradient`](crate::DifferentiationBuilder::gradient), while the
@@ -4967,7 +4967,7 @@ macro_rules! check_operation_transposition {
 ///     truncation error of the central difference.
 #[macro_export]
 macro_rules! check_gradient {
-    // This public branch evaluates an array function through reverse-mode differentiation and concrete finite
+    // This public branch evaluates an array function through reverse mode differentiation and concrete finite
     // differences. Rank-zero arrays represent scalar inputs and outputs.
     ($function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {{
         // Closure parameter types flow one way in Rust. A closure literal takes its signature from the expected type at
@@ -5002,7 +5002,7 @@ macro_rules! check_gradient {
         )
     }};
 
-    // This public branch evaluates an array function with nondifferentiated runtime captures through reverse-mode
+    // This public branch evaluates an array function with nondifferentiated runtime captures through reverse mode
     // differentiation and concrete finite differences.
     (
         $function:expr,
@@ -5824,7 +5824,7 @@ pub mod checks {
         move |input, captures| MaybeFallible::into_result(function(input, captures))
     }
 
-    /// Checks the reverse-mode `gradient` of the ℝⁿ → ℝ or ℂⁿ → ℝ function `evaluate` at `input` (an array of any
+    /// Checks the reverse mode `gradient` of the ℝⁿ → ℝ or ℂⁿ → ℝ function `evaluate` at `input` (an array of any
     /// shape whose function output is a rank-0 real `f64` array) against the central finite-difference estimates of its
     /// partials, perturbing one input element at a time with all others held fixed. This implements the assertion half
     /// of [`check_gradient!`], which computes `gradient` itself before calling this function. For a `c128` input, the

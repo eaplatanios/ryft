@@ -28,7 +28,7 @@
 //!
 //! [`CumulativeKind::Sum`] is the one _linear_ kind, so a cumulative sum differentiates and transposes as itself: its
 //! tangent is the same prefix sum of the input tangent, and its transpose is the prefix sum in the opposite direction.
-//! The non-linear kinds have no closed-form primitive derivative and none is invented for them: their forward-mode
+//! The non-linear kinds have no closed-form primitive derivative and none is invented for them: their forward mode
 //! rules differentiate through the parallel-prefix [`associative_scan`] decomposition, so each derivative is assembled
 //! from the rules of the primitives that construction stages. None of them is directly transposable, and reverse mode
 //! reaches them by transposing those staged primitives instead.
@@ -339,7 +339,7 @@ impl_differentiable_operation! {
             // A cumulative sum is linear in its input, so its tangent is the same prefix sum of the input tangent.
             // Every other kind is non-linear, so its rule differentiates through the associative-scan decomposition
             // with the kind's own combining operator, and every primitive that construction stages contributes its
-            // own forward-mode rule. The array IR universe reaches this rule through the default projected
+            // own forward mode rule. The array IR universe reaches this rule through the default projected
             // fall-through of `MemberDifferentiableOperation`, because the operation is shape-preserving and its
             // input never needs the replication that a broadcasting elementwise member does.
             check_count!("input", inputs, 1, ProgramError);

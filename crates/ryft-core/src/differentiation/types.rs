@@ -21,8 +21,8 @@ pub trait DifferentiableType: Type {
     /// type from a type that can carry live, potentially nonzero differential values.
     fn is_zero_space(&self) -> bool;
 
-    /// Returns the [`Type`] that forward-mode tangents of values of this [`Type`] carry. The returned type is used
-    /// for forward-mode inputs, outputs, structural zeros, and intermediate Jacobian-Vector Product (JVP) values. It
+    /// Returns the [`Type`] that forward mode tangents of values of this [`Type`] carry. The returned type is used
+    /// for forward mode inputs, outputs, structural zeros, and intermediate Jacobian-Vector Product (JVP) values. It
     /// preserves primal placement metadata because a tangent follows the same forward data flow as its primal. Most
     /// differentiable types use themselves, but specialized storage representations may use a wider differential
     /// representation. For example, [`DataType::F8E8M0FNU`] uses [`DataType::F32`] because its unsigned power-of-two
@@ -35,8 +35,8 @@ pub trait DifferentiableType: Type {
     /// forward differentiation return an error instead of fabricating a zero-space representation.
     fn tangent(&self) -> Result<Self, DifferentiationError>;
 
-    /// Returns the [`Type`] that reverse-mode cotangents of values of this [`Type`] carry. The returned type is the
-    /// representation used for reverse-mode seeds, accumulation, structural zeros, and outputs. In most cases it is the
+    /// Returns the [`Type`] that reverse mode cotangents of values of this [`Type`] carry. The returned type is the
+    /// representation used for reverse mode seeds, accumulation, structural zeros, and outputs. In most cases it is the
     /// type itself, but it may instead be a distinct representation that supports the required linear operations. For
     /// example, [`DataType::F8E8M0FNU`] uses [`DataType::F32`] cotangents because its unsigned power-of-two storage
     /// format cannot represent zero or negative values, while [`ArrayType`] also swaps the unreduced and reduced axes
@@ -252,7 +252,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// scalar_value      = [0, 0, 1]
     /// ```
     ///
-    /// Forward-mode Jacobians use these values as packed Jacobian-Vector Product (JVP) tangents, while reverse-mode
+    /// Forward mode Jacobians use these values as packed Jacobian-Vector Product (JVP) tangents, while reverse mode
     /// Jacobians use them as packed Vector-Jacobian Product (VJP) cotangents. Implementations construct the basis
     /// through ordinary context/value capabilities so a staging context records the constituent operations directly
     /// in the surrounding program.
@@ -301,7 +301,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
 
-    /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the values
+    /// Validates the physical type of one forward over reverse dense Hessian block. Hessian blocks arrive as the values
     /// of the outer forward Jacobian rather than through a Hessian-specific extractor, so this combined layout check
     /// is the one block validation that cannot live inside
     /// [`extract_forward_jacobian_block`](Self::extract_forward_jacobian_block) or
@@ -327,7 +327,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         second_input_type: &Self,
     ) -> Result<(), DifferentiationError>;
 
-    /// Extracts one output/input Jacobian block from a packed forward-mode pushforward result. The method selects the
+    /// Extracts one output/input Jacobian block from a packed forward mode pushforward result. The method selects the
     /// packed directions belonging to `input_type`, restores its coordinate axes, places those axes after the output
     /// tangent value axes, and validates the resulting block type.
     ///
@@ -351,7 +351,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         output_type: &Self,
     ) -> Result<C::Value, DifferentiationError>;
 
-    /// Extracts one output/input Jacobian block from a packed reverse-mode pullback result. The method selects the
+    /// Extracts one output/input Jacobian block from a packed reverse mode pullback result. The method selects the
     /// packed directions belonging to `output_type`, restores its coordinate axes before the input cotangent value
     /// axes, and validates the resulting block type.
     ///

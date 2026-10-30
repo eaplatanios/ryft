@@ -67,9 +67,11 @@ code comments. Preserve the documented contract, technical rationale, and links 
   write "The outputs must be unknown, because a known tangent would make the map affine." rather than "The outputs must
   be unknown: a known tangent would make the map affine."). The `# Parameters` bullet format, code, and labels inside
   tables and diagrams keep their colons.
-- Do not hyphenate word pairs unnecessarily (e.g., write "structural zero tangent", "forward mode", and "zero leaf
-  positions" rather than "structural-zero tangent", "forward-mode", and "zero-leaf positions"). Keep hyphens only where
-  the spelling requires them (e.g., "non-empty") or in established names (e.g., "Jacobian-Vector Product"). When an
+- Do not hyphenate word pairs unnecessarily (e.g., write "structural zero tangent" and "zero leaf positions" rather
+  than "structural-zero tangent" and "zero-leaf positions"). Always write "forward mode" and "reverse mode" without
+  hyphens in documentation and code comments, including when they modify another word. Write composed and coordinated
+  forms naturally (e.g., "forward over reverse mode" and "forward and reverse mode"). Keep hyphens only where the
+  spelling requires them (e.g., "non-empty") or in established names (e.g., "Jacobian-Vector Product"). When an
   unhyphenated pair would be ambiguous, rephrase the sentence instead (e.g., "a zero constructed from its type alone"
   rather than "a type-only zero").
 - When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally

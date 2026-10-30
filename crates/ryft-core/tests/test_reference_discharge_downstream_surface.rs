@@ -1666,7 +1666,7 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
 }
 
 /// `f(r, x) = { r.add_update(x); r.read() }` over the register universe, written against whatever context the input
-/// values dispatch to so that one closure serves the forward-mode, reverse-mode, and batching tracers alike.
+/// values dispatch to so that one closure serves the forward mode, reverse mode, and batching tracers alike.
 fn read_modify_write<V: Value<Type = RegisterIrType>>((reference, x): (V, V)) -> Result<V, ProgramError>
 where
     V::Domain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,

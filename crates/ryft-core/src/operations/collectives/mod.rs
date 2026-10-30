@@ -564,7 +564,7 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
 /// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Its output shape depends on the participant
 /// count and its [`CollectiveMode`], so in the array IR family it is staged with one explicit extent input per output
 /// axis. This trait captures the hooks that differ between these collectives (i.e., their options and their array IR
-/// type inference) and provides the array IR interpretation and forward-mode differentiation rules, together with the
+/// type inference) and provides the array IR interpretation and forward mode differentiation rules, together with the
 /// batching rules of both array families, on top of them and of their [`ShapeChangingCollectiveBatching`]
 /// implementations.
 trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {

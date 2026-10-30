@@ -36,7 +36,7 @@ use crate::tracing::{Tracer, TracerState, TracingContext};
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
 /// context of differentiating a function `f(x)`, the value `y = f(x)` is the primal value and its tangent `ẏ` is
 /// the directional derivative of `f` at `x` along an input tangent (i.e., perturbation direction) `ẋ` (i.e., the
-/// Jacobian-vector product `ẏ = (∂f/∂x)(x) · ẋ`). Forward-mode differentiation propagates a dual `(x, ẋ)` at the
+/// Jacobian-vector product `ẏ = (∂f/∂x)(x) · ẋ`). Forward mode differentiation propagates a dual `(x, ẋ)` at the
 /// input to the dual `(y, ẏ) = (f(x), (∂f/∂x)(x) · ẋ)` at the output. This is the data that the per-operation
 /// [`jvp`](DifferentiableOperation::jvp) rules consume and produce.
 ///
@@ -1684,7 +1684,7 @@ pub trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
     /// represents the derivative to transpose; this function does not consume output cotangents or compute input
     /// cotangents itself.
     ///
-    /// Reverse-mode differentiation uses this rule before computing primal outputs and saving residuals. Immediate
+    /// Reverse mode differentiation uses this rule before computing primal outputs and saving residuals. Immediate
     /// forward mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
     /// [`Self::jvp`], whose tangent computation must support execution as a pushforward. This rule's tangent
     /// computation need only support transposition (e.g., it may retain a custom backward program in a
@@ -3861,7 +3861,7 @@ where
 
 impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 
-/// Forward-mode activity of one application of a region that a region-carrying operation differentiates through its
+/// Forward mode activity of one application of a region that a region-carrying operation differentiates through its
 /// [`DifferentiationDriver`] (e.g., the body of a `scan` or `while` operation or a branch of a `condition` operation).
 /// [`Self::new`] selects the region inputs whose tangents are live and marks an output tangent live when it has a
 /// tangent slot (refer to [`RegionRef::tangent_output_mask`]) and depends on a selected input tangent in the region's

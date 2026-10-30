@@ -198,8 +198,8 @@ The transform stack was rebuilt around a single builder entry point:
 
 | Capability | Used by | State | Notes |
 |---|---|---|---|
-| Forward-mode JVP / linearize | per-op linearization | ✅ | `differentiate_at(..).jvp(..)` / `.linearize(..)` → `Pushforward` |
-| Reverse-mode VJP | training | ✅ | `.vjp(..)` → `Pullback`; `Program::transpose()` underneath |
+| Forward mode JVP / linearize | per-op linearization | ✅ | `differentiate_at(..).jvp(..)` / `.linearize(..)` → `Pushforward` |
+| Reverse mode VJP | training | ✅ | `.vjp(..)` → `Pullback`; `Program::transpose()` underneath |
 | `value_and_gradient`, `gradient` | optimizer step | ✅ | builder terminals; gradients come back as `Input::To<V>` parameter trees |
 | Jacobian / Hessian | curvature-aware optimizers (optional) | ✅ | `.jacobian_forward` / `.jacobian_reverse` / `.hessian` |
 | `vmap` | per-example losses | ✅ | `batch(function, input, in_axes, out_axes, axis)` in `batching.rs`; nests and composes with staging |
@@ -1026,7 +1026,7 @@ the model stays in `bf16`.
 | Capability | Used by | State | Notes |
 |---|---|---|---|
 | block quantization `(values, scales)` from bf16/fp32 | producing FP8/NVFP4 weights & activations | ✅ | `BlockQuantize::block_quantize(block_size, element_type, scale_type)` — a pure composition of existing primitives (as this table originally recommended for `reduce_max_abs`, and better than the dedicated op it proposed: the recipe inherits its transform rules from its ingredients). NVFP4 recipe (`f8e4m3fn` scales, `max_abs / element_max`) and OCP MX recipe (`f8e8m0fnu` power-of-two scales with spec-prescribed clamping) both implemented |
-| block-scaled dot | every quantized matmul | ✅ | `ScaledDotOperation` / `ScaledDot::scaled_dot(lhs_scales, rhs, rhs_scales, block_size, accumulation_type)` (+ `scaled_dot_with_global_scale`); rank-2 or batched rank-3 operands; forward-mode rule treats it as bilinear with the scales held fixed |
+| block-scaled dot | every quantized matmul | ✅ | `ScaledDotOperation` / `ScaledDot::scaled_dot(lhs_scales, rhs, rhs_scales, block_size, accumulation_type)` (+ `scaled_dot_with_global_scale`); rank-2 or batched rank-3 operands; forward mode rule treats it as bilinear with the scales held fixed |
 | dequantize | debugging, portable execution | ✅ | implemented inside the portable lowering fallback (broadcast-expand scales → multiply → convert → `dot_general`); no standalone op, none needed |
 | per-block `reduce_max_abs` | amax inside quantization | ✅ | composite (`Abs` + `Reshape` + `Reduce`), inside `block_quantize` |
 | FP4/FP8 ↔ bf16 casts | scaled-GEMM boundaries | ✅ | `ConvertElementTypeOperation` handles the narrow types |

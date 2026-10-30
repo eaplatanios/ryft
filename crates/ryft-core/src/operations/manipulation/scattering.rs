@@ -4363,7 +4363,7 @@ mod tests {
         );
         assert_eq!(outputs[0].tangent().as_value(), Some(&Array::vector(vec![22.0_f32]).unwrap()));
 
-        // The retained factors remain differentiable under forward-over-reverse. Scattering a value into itself
+        // The retained factors remain differentiable under forward over reverse. Scattering a value into itself
         // multiplicatively is x squared, so its gradient at 3 is 6 and the derivative of that gradient is 2.
         let (gradient, tangent) = differentiate_at(Array::vector(vec![3.0_f64]).unwrap())
             .jvp(Array::vector(vec![1.0_f64]).unwrap(), |input| {

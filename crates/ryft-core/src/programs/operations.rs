@@ -219,7 +219,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// naming a structural member, member types may not repeat, and an empty list is rejected. For example, the dynamic
 /// array family declares `#[ryft(members(ArrayType, structural(DimensionType)))]`. Declaring the members has three
 /// effects: (i) a `mixed` marker may omit its member type (see [Variant Classes](#variant-classes)), (ii) every member
-/// marker's type is checked against the declaration, and (iii) the generated structural mixed forward-mode arm knows
+/// marker's type is checked against the declaration, and (iii) the generated structural mixed forward mode arm knows
 /// every computational universe an output may belong to.
 ///
 /// ### Dispatchers
@@ -275,7 +275,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
 ///     generic over its array batching mode, while an explicitly declared family uses the canonical policy named
 ///     by [`BatchableType`](crate::BatchableType).
-///   - `differentiation` delegates native variants to the payload's own forward-mode rule and computational member
+///   - `differentiation` delegates native variants to the payload's own forward mode rule and computational member
 ///     variants to [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation), and generates the
 ///     structural arms described under [Variant Classes](#variant-classes) directly.
 ///   - `transposition` delegates native variants to the payload's own rule, mixed variants in either role to
@@ -321,8 +321,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - A **structural** role declares that the payload is bookkeeping. There is nothing to differentiate (i.e., the
 ///     type has a zero differential space) and nothing to batch per item, so batched inputs must be replicated. A
 ///     structural projected member reaches that behavior through its member family's rules and its projected batching
-///     policy, and its generated forward-mode and transposition arms stage a zero tangent and contribute no cotangents
-///     respectively. A structural mixed member instead has its forward-mode rule generated as the payload's primal plus
+///     policy, and its generated forward mode and transposition arms stage a zero tangent and contribute no cotangents
+///     respectively. A structural mixed member instead has its forward mode rule generated as the payload's primal plus
 ///     one zero tangent per declared parent output, staged over the same inputs so that the runtime extents those
 ///     inputs carry stays available to both. Each output's tangent is constructed in the computational member universe
 ///     that output belongs to, discovered by projecting the declared output type across the family's computational

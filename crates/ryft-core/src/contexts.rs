@@ -263,7 +263,7 @@ pub trait Context:
     /// concrete values immediately so that concretizing extractions such as
     /// [`Concretizable::concretize`](crate::Concretizable::concretize) on values it produces can succeed and, for
     /// example, the trip count of a data-dependent loop is decidable while differentiating. Transform contexts that
-    /// wrap other contexts (e.g., batching and forward-mode differentiation) delegate to the wrapped context, so that
+    /// wrap other contexts (e.g., batching and forward mode differentiation) delegate to the wrapped context, so that
     /// the answer reflects the innermost context that actually executes the bound operations.
     fn is_eager(&self) -> bool;
 

@@ -1332,7 +1332,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         // The body is requested at the instantiated input types when their type identities differ from the declared
         // ones or when they strictly refine the declared ones (e.g., with a sharding that the actual inputs carry but
         // the body leaves unspecified), so that staging and differentiation specialize it and the programs derived
-        // from it (e.g., its forward-mode derivative and its transposition) carry those refinements. Comparing type
+        // from it (e.g., its forward mode derivative and its transposition) carry those refinements. Comparing type
         // identities explicitly also detects identity substitutions that are not directional refinements.
         let same_identities = region_interfaces[0]
             .input_types()
@@ -1986,7 +1986,7 @@ impl<
                 .collect::<Vec<bool>>();
 
             // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging
-            // context. Unlike the body's derived forward-mode and transposed programs, a partition is not retained
+            // context. Unlike the body's derived forward mode and transposed programs, a partition is not retained
             // by the body region's transform cache: it depends on the configuration of the partial-evaluation context
             // (e.g., effect folding and residual placement), so the body and the known-ness mask alone do not
             // determine it.
@@ -3214,7 +3214,7 @@ impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>, P: Bat
     }
 }
 
-/// Represents a forward-mode application of a [`ScanOperation`] (i.e., one scan over the compact fused body that
+/// Represents a forward mode application of a [`ScanOperation`] (i.e., one scan over the compact fused body that
 /// carries a tangent exactly for the body inputs and outputs whose tangents are live). Plumbing references, zero-space
 /// inputs, and structural-zero tangents are not live, so inactive carries keep structural-zero tangents instead of
 /// threading materialized zeros through the loop, and stacked outputs whose tangents depend on no live tangent
@@ -16740,7 +16740,7 @@ mod tests {
     #[test]
     fn test_scan_differentiation_rejects_tangent_updates_of_known_reference_carries() {
         // The body maps `[r, x]` to `[r]` after `add_update(r, x)`, and only the stacked input is differentiated, so
-        // the reference carry is known while the update writes a live tangent. The body's forward-mode rule rejects
+        // the reference carry is known while the update writes a live tangent. The body's forward mode rule rejects
         // the write before linearization could split the scan, so a known reference never has to cross from the
         // primal scan into the tangent scan (the split's own rejection of such a crossing is unreachable from here).
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -17168,7 +17168,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_flows_through_reverse_scans() {
-        // Forward- and reverse-mode differentiation flow through a `reverse` scan: the visit order flips while slice
+        // Forward and reverse mode differentiation flow through a `reverse` scan: the visit order flips while slice
         // `i` of every stacked value stays paired with iteration `i`. With reverse visit order, the carry runs
         // `2 · 5 = 10 → 10 · 4 = 40 → 40 · 3 = 120`, with `y_i` still paired with `x_i`.
         let function = |(carry, values): (TestTracer, TestTracer)| {
@@ -19346,7 +19346,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_computes_dense_jacobians_and_hessians() {
-        // For `f(initial, values) = initial · Π values`, the forward- and reverse-mode Jacobians agree on
+        // For `f(initial, values) = initial · Π values`, the forward and reverse mode Jacobians agree on
         // `[Π values, initial · Π_{j ≠ i} values_j]`. Same-variable second derivatives vanish, mixed derivatives with
         // `initial` are the products excluding the corresponding value, and mixed derivatives between values are
         // `initial` times the remaining value.
@@ -19398,7 +19398,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_forward_over_forward() {
-        // Differentiating the fused forward-mode scan again fuses it once more: the doubled boundary pairs every primal
+        // Differentiating the fused forward mode scan again fuses it once more: the doubled boundary pairs every primal
         // carry and stack with its first-order tangent and both with their second-order tangents, in scan order.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let stacked_type = ArrayType::new_static(DataType::F64, [3]);
@@ -19466,7 +19466,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_reverse_over_forward() {
-        // Linearizing the fused forward-mode scan splits a scan whose primal carries vary over time, so the primal scan
+        // Linearizing the fused forward mode scan splits a scan whose primal carries vary over time, so the primal scan
         // stacks the per-iteration primal and tangent carries as residuals, and the pullback reverses the tangent scan
         // over them.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -19621,7 +19621,7 @@ mod tests {
     #[test]
     fn test_scan_differentiation_composes_with_batching_in_both_orders() {
         // The carry is replicated while the stacked input is mapped, so batching widens the carry, and only the
-        // stacked input is differentiated, so the forward-mode fixed point enlivens the carry tangent from a
+        // stacked input is differentiated, so the forward mode fixed point enlivens the carry tangent from a
         // structural zero. Both orders stage the same fused scan over a widened, materialized zero carry tangent.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let stacked_type = ArrayType::new_static(DataType::F64, [3]);
@@ -19715,7 +19715,7 @@ mod tests {
     #[test]
     fn test_scan_differentiation_composes_with_batching_with_an_unknown_iteration_count() {
         // A cumulative product with a dynamic iteration count whose stacked input alone is differentiated and mapped.
-        // Both orders of batching and forward-mode differentiation stage the same fused scan, which keeps the trailing
+        // Both orders of batching and forward mode differentiation stage the same fused scan, which keeps the trailing
         // iteration count and threads the batch extent as a leading carry, and both compute the same values.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -19901,7 +19901,7 @@ mod tests {
         );
 
         // The scan computes 3 * live² while ignoring every slice of `dead`. Differentiating its live gradient
-        // again must retain the zero in the dead slot through both reverse-mode boundaries.
+        // again must retain the zero in the dead slot through both reverse mode boundaries.
         let (first_derivative, (dead_cotangent, second_derivative)) =
             differentiate_at((Array::vector(vec![7f64; 3]).unwrap(), Array::scalar(2f64).unwrap()))
                 .value_and_gradient(|inputs| {

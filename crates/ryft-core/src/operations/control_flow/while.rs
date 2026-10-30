@@ -701,7 +701,7 @@ impl<T: WhileType> WhileOperation<T> {
     /// elements' final values. The residual loop is the _original loop unchanged_: its unknown outputs are the unknown
     /// state elements' finals, and any known per-iteration values the unknown side reads are _recomputed inside the
     /// loop_ rather than streamed as residual edges, because a loop with a data-dependent iteration count has no
-    /// statically shaped residual stream. For an eligible fused forward-mode loop, this duplication lets the known side
+    /// statically shaped residual stream. For an eligible fused forward mode loop, this duplication lets the known side
     /// recover the primal outputs while the tangent program keeps the complete loop. The residual loop's known-state
     /// outputs are left dead. This does not support arbitrary unbounded-loop linearization; the split requires pure
     /// regions and a predicate that depends only on the closed known state.
@@ -1647,7 +1647,7 @@ where
         let condition = driver.region(0)?.to_program();
         let body = driver.region(1)?.to_program();
         if context.primal().is_eager() {
-            // Run a `while` loop's forward-mode rule directly at concrete duals for an eager context and returns the
+            // Run a `while` loop's forward mode rule directly at concrete duals for an eager context and returns the
             // output duals, resuming with the staged rule (refer to `WhileJvp::bind`) from the current duals when the
             // loop's predicate stops concretizing to one scalar Boolean.
             //
@@ -1806,7 +1806,7 @@ where
         //       Stage the scheduler with fixed-size checkpoint buffers, dynamic slot indices, and forward re-sweeps
         //       interleaved with reverse steps. The transpose rule is a natural home for this interleaving, whose
         //       batching, higher derivatives, and partial evaluation need their own validation. Equinox uses online
-        //       schedules based on Stumm/Walther and Wang/Moin, but its checkpointed loop does not support forward-mode
+        //       schedules based on Stumm/Walther and Wang/Moin, but its checkpointed loop does not support forward mode
         //       differentiation.
         //    3. Checkpointing for bounded loops. Reuse the state source for replay-safe bounded loops to trade O(bound)
         //       residual storage for O(c) state-sized checkpoints and recomputation. Retain the existing residual-stack
@@ -1875,7 +1875,7 @@ impl WhileOptions {
 
     /// Sets the semantic iteration bound of the loop, replacing any earlier bound. [`None`] restores the default
     /// unbounded loop. A bounded loop runs at most `bound` iterations by definition, truncating even while its
-    /// condition still holds, and supports staged reverse-mode differentiation. Refer to
+    /// condition still holds, and supports staged reverse mode differentiation. Refer to
     /// [`WhileOperation::with_iteration_bound`] for more information.
     ///
     /// # Errors
@@ -2326,7 +2326,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>, P: B
     }
 }
 
-/// Represents a staged forward-mode application of a [`WhileOperation`] whose state enters as the instruction input
+/// Represents a staged forward mode application of a [`WhileOperation`] whose state enters as the instruction input
 /// duals. The state elements keep their positions across the body boundary, so every state element is a loop carry
 /// and the body's region input mask is the live state mask. A state element starts live when its tangent is live
 /// (structural zeros are not), and carry liveness is the monotone fixed point of [`TangentActivity::from_loop_body`],
@@ -2370,7 +2370,7 @@ where
     for<'t> &'t ArrayType: TryFrom<&'t C::Type>,
     for<'t> <&'t ArrayType as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
 {
-    /// Creates a new [`WhileJvp`] by analyzing the forward-mode activity of an application of `operation` to the input
+    /// Creates a new [`WhileJvp`] by analyzing the forward mode activity of an application of `operation` to the input
     /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body.
     ///
     /// # Errors
@@ -2401,7 +2401,7 @@ where
     ///   - A loop without a semantic [`iteration_bound`](WhileOperation::with_iteration_bound) has no statically shaped
     ///     residual stack, so it stages one fused loop over `[primal_state..., tangent_state...]` whose continuation
     ///     decision reads the primal half (refer to [`Self::bind_fused`]). This loop supports forward mode
-    ///     differentiation without an iteration bound, but it cannot be transposed for reverse-mode differentiation.
+    ///     differentiation without an iteration bound, but it cannot be transposed for reverse mode differentiation.
     ///     Reverse mode through a staged unbounded loop reports the transposition error, as JAX's `jax.lax.while_loop`
     ///     does.
     ///   - A bounded loop with a batched (per-item) predicate is first rewritten into its scalar-predicate masked form
@@ -2470,7 +2470,7 @@ where
             // lowering threads the predicate so that reaching the bound skips the condition, so a condition that
             // errors, diverges, or differs on the state after the last admitted body application behaves alike on every
             // path. Both regions are pure under a batched predicate (refer to `WhileOperation::validate_interfaces`),
-            // so the repeated evaluation is unobservable. The bounded while forward-mode rule uses this form for
+            // so the repeated evaluation is unobservable. The bounded while forward mode rule uses this form for
             // batched-predicate loops, whose counter- and stack-augmented differentiation state is not
             // predicate-prefixed and therefore needs the loop's masking made explicit as program data
             // hanging off a scalar predicate.
@@ -2536,7 +2536,7 @@ where
                         next_state.push(<Tracer<_> as ValueProjection<ArrayType>>::from_projected(selected));
                     }
                     // The predicate is recomputed from the whole state on every iteration, exactly as interpretation,
-                    // the lowering, and the fused forward-mode rule recompute it. An item whose predicate reads its own
+                    // the lowering, and the fused forward mode rule recompute it. An item whose predicate reads its own
                     // state alone stays finished, because its state is frozen, while an item whose predicate reads
                     // other items may rejoin on every path alike.
                     Ok(next_state)
@@ -3138,7 +3138,7 @@ where
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 
-    /// Stages one fused doubled-state forward-mode `while` for the condition program
+    /// Stages one fused doubled-state forward mode `while` for the condition program
     /// `condition` and the input duals `inputs`, and returns the output duals. Like [JAX's `jvp` of
     /// `jax.lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), the fused loop
     /// runs the pushforward alongside the primal loop instead of storing per-iteration residuals. The fused state is
@@ -4741,7 +4741,7 @@ mod tests {
     fn test_while_validate_region_interfaces_rejects_bodies_that_only_fit_after_refinement() {
         // An `f64[3]` input refines the body's declared `f64[extent] -> f64[3]` signature to a valid one, but the
         // declared body does not map its state to itself. Builder construction, eager binding (even though the loop
-        // never iterates), staging (which could otherwise specialize the body), partial evaluation, and forward-mode
+        // never iterates), staging (which could otherwise specialize the body), partial evaluation, and forward mode
         // differentiation all reject it.
         let regions = refinement_only_while_regions();
         let expected = ProgramError::Type(TypeError::invalid(format!(
@@ -10518,7 +10518,7 @@ mod tests {
         // Forward mode with respect to `x` alone leaves every state tangent of a loop over the reference `r` a
         // structural zero, and the carry fixed point keeps it that way, so the staged rule binds the original loop with
         // structural-zero tangents instead of staging residual stacks, a mask, or a fused doubled-state loop. The loop
-        // carries only a reference, so it reaches the rule instead of the all-zero fast path of the forward-mode
+        // carries only a reference, so it reaches the rule instead of the all-zero fast path of the forward mode
         // transform. The condition increments the referenced counter before comparing it against 3, so from 0 it
         // observes 1, 2, and 3 and the final value is 3.
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
@@ -10580,7 +10580,7 @@ mod tests {
 
     #[test]
     fn test_while_differentiation_keeps_tangents_of_inactive_state_structural() {
-        // `limit` passes through the loop without a tangent, so both forward-mode rules keep its tangent a structural
+        // `limit` passes through the loop without a tangent, so both forward mode rules keep its tangent a structural
         // zero instead of threading a materialized zero through the loop, and linearization succeeds. At `x = 2` with
         // limit `10`, the loop squares twice, so `f(x) = x⁴` with value `16` and derivative `4 x³ = 32`.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -10802,7 +10802,7 @@ mod tests {
     fn test_while_differentiation_enlivens_state_whose_tangents_become_live() {
         // Only `source` has a live tangent. It reaches `second` after one iteration and `first` after two, so the carry
         // fixed point takes two rounds to enliven them, while `counter` never depends on a live tangent and keeps a
-        // structural-zero tangent. Both forward-mode rules carry tangents for exactly `first`, `second`, and `source`,
+        // structural-zero tangent. Both forward mode rules carry tangents for exactly `first`, `second`, and `source`,
         // and the linearized body retains that entire dependent carry chain across repeated applications. From the
         // state `[3, 1, 1, 7]`, three iterations move `source` into every other carry, so each live output tangent
         // is the input tangent of `source`.
@@ -13862,7 +13862,7 @@ mod tests {
             Ok((Array::scalar(16.0).unwrap(), Array::scalar(32.0).unwrap())),
         );
 
-        // The fused forward-mode program contains exactly one while loop over the doubled state `[primal, tangent]`,
+        // The fused forward mode program contains exactly one while loop over the doubled state `[primal, tangent]`,
         // with no unrolling and no residual stacks, and its number of iterations stays data-dependent. Interpreting the
         // same fused program at `x = 16` never enters the loop, so the state passes through unchanged.
         let fused = while_program(while_operation, &while_regions, vec![ArrayType::scalar(DataType::F64)])
@@ -14135,7 +14135,7 @@ mod tests {
 
     #[test]
     fn test_while_differentiation_recovers_the_primal_loop_of_staged_linearizations() {
-        // Linearization of a staged unbounded loop composes the fused doubled-state forward-mode rule with the `while`
+        // Linearization of a staged unbounded loop composes the fused doubled-state forward mode rule with the `while`
         // closed-knownness split. The fused loop's primal half is closed under the body and the condition reads only
         // it, so the split rebinds the primal loop on the known (primal) side while the tangent program keeps the fused
         // loop whole, recomputing primal state internally. For `while (x < 16) { x = x * x }` at `x = 2`, the primal is
@@ -14753,7 +14753,7 @@ mod tests {
 
     #[test]
     fn test_while_differentiation_falls_back_to_declared_regions() {
-        // Forward-mode differentiation specializes attached regions before applying the `while` rule. A body that
+        // Forward mode differentiation specializes attached regions before applying the `while` rule. A body that
         // replaces its sharded carry with an unsharded constant cannot be specialized usefully, so differentiation uses
         // the declared regions, exactly like staging does.
         let state_type = ArrayType::scalar(DataType::F32);

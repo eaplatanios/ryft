@@ -25,7 +25,7 @@
 //! inside the interval, the lower-bound tangent where the input lies below a lower bound that is smaller than the upper
 //! bound, and the upper-bound tangent where the input lies above the upper bound. Other cases give zero, including
 //! equality to either bound when the bounds are ordered. With crossed bounds, equality to the lower bound still passes
-//! the upper-bound tangent. None of the operations is linear, so reverse-mode differentiation transposes their
+//! the upper-bound tangent. None of the operations is linear, so reverse mode differentiation transposes their
 //! linearizations instead.
 //!
 //! # Example

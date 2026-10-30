@@ -280,7 +280,7 @@ impl Type for NoReferent {
 ///
 /// The associated [`Referent`](Self::Referent) makes "exactly one referent family per universe" a rule. The
 /// per-operation conversion bounds of the reference operations never required this, so a universe could in principle
-/// embed several [`ReferenceType`] families, but reverse-mode differentiation and reference discharge already treat a
+/// embed several [`ReferenceType`] families, but reverse mode differentiation and reference discharge already treat a
 /// universe as having one referent, and a second family would need a second set of cotangent constructors with no
 /// consumer. A universe that embeds several [`ReferenceType`] families therefore cannot implement this trait.
 ///

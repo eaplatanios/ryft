@@ -560,7 +560,7 @@ where
         // `jvp_for_transpose` of this operation delegates here. When the primal and tangent contexts are shared, the
         // call is bound over the fused derivative program with its incoming flags, which interprets it in eager
         // contexts and keeps the rematerialization boundary in staged ones, for later transforms. Otherwise (e.g., for
-        // linearization and reverse-mode differentiation), the fused program is partitioned with this call's residual
+        // linearization and reverse mode differentiation), the fused program is partitioned with this call's residual
         // policy: its known program computes the primal outputs together with the values that the policy saves in the
         // primal context, and its residual program recomputes everything else in the tangent context as a
         // differentiated call.
@@ -2678,8 +2678,8 @@ mod tests {
     #[test]
     fn test_rematerialize_differentiation_higher_order() {
         // The staged gradient of `sin(x²)` keeps the differentiated call that recomputes `cos(x²)`, and so does
-        // differentiating that gradient in forward mode (i.e., forward-over-reverse Hessian-vector products) and in
-        // reverse mode (i.e., the gradient of the gradient), as well as the gradient of its forward-mode derivative.
+        // differentiating that gradient in forward mode (i.e., forward over reverse Hessian-vector products) and in
+        // reverse mode (i.e., the gradient of the gradient), as well as the gradient of its forward mode derivative.
         let function = rematerialize(|x: TestTracer| Ok((x.clone() * x).sin()?));
         let (_, gradient) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |x: TestTracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
@@ -3212,7 +3212,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_differentiation_unbounded_while_body() {
-        // The body `while (x < 16) { x = x * x }` has no reverse-mode derivative, but evaluating it and differentiating
+        // The body `while (x < 16) { x = x * x }` has no reverse mode derivative, but evaluating it and differentiating
         // it in forward mode derive nothing that only reverse mode needs. At `x = 2`, the loop computes `x⁴` locally.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let condition = {

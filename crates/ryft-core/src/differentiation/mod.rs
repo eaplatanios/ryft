@@ -16,7 +16,7 @@
 //! equivalent `context.differentiate_at(primal)` syntax. Its terminal methods provide the complete value-level API:
 //!
 //!   - [`DifferentiationBuilder::jvp`] computes a Jacobian-Vector Product (JVP) for one primal value and one tangent
-//!     value. It is the direct forward-mode transform and is usually best when there are few input directions or when
+//!     value. It is the direct forward mode transform and is usually best when there are few input directions or when
 //!     both primal and tangent outputs are needed immediately.
 //!   - [`DifferentiationBuilder::linearize`] runs the primal computation once and returns its value together with a
 //!     reusable [`Pushforward`] that can be applied to many tangent inputs without repeating nonlinear primal work.
@@ -322,11 +322,11 @@ pub enum DifferentiationError {
         r#type: String,
     },
 
-    /// Error returned when a type has no representation for forward-mode perturbations.
+    /// Error returned when a type has no representation for forward mode perturbations.
     #[error("type {primal_type} does not define a tangent representation")]
     UndefinedTangentType { primal_type: String },
 
-    /// Error returned when a type has no representation for reverse-mode adjoints.
+    /// Error returned when a type has no representation for reverse mode adjoints.
     #[error("type {primal_type} does not define a cotangent representation")]
     UndefinedCotangentType { primal_type: String },
 
@@ -395,7 +395,7 @@ impl From<DifferentiationError> for ProgramError {
 /// Selects which derivative rule a [`DifferentiationContext`] applies when constructing a derivative
 /// program. [`Self::Jvp`] selects [`DifferentiableOperation::jvp`] for executable forward derivatives, while
 /// [`Self::JvpForTranspose`] selects [`DifferentiableOperation::jvp_for_transpose`] for derivatives that will be
-/// transposed by reverse-mode differentiation. Both use the same dual propagation and partitioning machinery; this
+/// transposed by reverse mode differentiation. Both use the same dual propagation and partitioning machinery; this
 /// selection is independent of the policy that determines where primal and tangent operations execute or are staged.
 ///
 /// Context projection and recursive region drivers preserve the selected rule so that nested operations use the same
@@ -606,10 +606,10 @@ impl ReferenceBoundary<DifferentiationBoundaryPosition> {
 /// not the mathematical derivative object being materialized.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DerivativeTransform {
-    /// Forward-mode Jacobian materialization, including its holomorphic entry point.
+    /// Forward mode Jacobian materialization, including its holomorphic entry point.
     JacobianForward,
 
-    /// Reverse-mode Jacobian materialization, including its holomorphic entry point.
+    /// Reverse mode Jacobian materialization, including its holomorphic entry point.
     JacobianReverse,
 
     /// Hessian materialization.
@@ -893,7 +893,7 @@ impl<Input, ContextState>
 {
     /// Evaluates `function` at the builder's active primal and propagates `tangent` through its Jacobian function.
     /// For a function `y = f(x)`, this returns the dual `(y, ẏ) = (f(x), J_f(x) · ẋ)`, where `ẋ` is the supplied
-    /// tangent and `J_f(x) = ∂f/∂x`. This is direct forward-mode differentiation, analogous to
+    /// tangent and `J_f(x) = ∂f/∂x`. This is direct forward mode differentiation, analogous to
     /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html). The closure runs once on
     /// [`DifferentiationTracer`] duals, and every operation propagates its primal and tangent together through its
     /// [`DifferentiableOperation`] rule.
@@ -903,7 +903,7 @@ impl<Input, ContextState>
     /// trace, and data-dependent Rust control flow on a traced primal is unavailable. Structural-zero tangents remain
     /// symbolic between operations and are materialized at the output boundary through [`ResidualZeroProvider`],
     /// preserving runtime extents for dynamically shaped values. Nested transforms differentiate through these duals
-    /// and therefore compose forward, reverse-over-forward, and higher-order differentiation.
+    /// and therefore compose forward, reverse over forward, and higher-order differentiation.
     ///
     /// # Parameters
     ///
@@ -989,7 +989,7 @@ impl<Input, ContextState>
         .linearize(|input, ()| function(input))
     }
 
-    /// Differentiates `function` using reverse-mode differentiation, returning its value and a reusable [`Pullback`].
+    /// Differentiates `function` using reverse mode differentiation, returning its value and a reusable [`Pullback`].
     /// For `y = f(x)`, this returns `y` together with the transposed linear map `ȳ ↦ x̄ = J_f(x)ᵀ · ȳ`, analogous to
     /// [JAX's `vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.vjp.html). Applying the pullback maps an output
     /// cotangent tree to the corresponding input cotangent tree at the builder's fixed primal point.
@@ -1006,7 +1006,7 @@ impl<Input, ContextState>
     ///
     /// # Parameters
     ///
-    ///   - `function`: Function to evaluate and reverse-mode-differentiate at the builder's active primal.
+    ///   - `function`: Function to evaluate and differentiate in reverse mode at the builder's active primal.
     #[inline]
     pub fn vjp<C, V, Output, F>(
         self,
@@ -1037,7 +1037,7 @@ impl<Input, ContextState>
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, LinearityState, ContextState>
 {
-    /// Computes the scalar value of `function` and its gradient using reverse-mode differentiation. For a real scalar
+    /// Computes the scalar value of `function` and its gradient using reverse mode differentiation. For a real scalar
     /// `y = f(x)`, this returns `(f(x), ∇f(x))`, where `∇f(x) = J_f(x)ᵀ · 1` is the pullback of the multiplicative
     /// identity cotangent seed. In [`HolomorphicLinearity`] mode, a holomorphic complex scalar function `y = f(z)`
     /// instead returns `(f(z), ∂f/∂z)` (i.e., the complex derivative itself, rather than a conjugate steepest-ascent
@@ -1090,7 +1090,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .value_and_gradient(|input, ()| function(input))
     }
 
-    /// Computes the gradient of a scalar-valued `function` using reverse-mode differentiation. For a real scalar
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation. For a real scalar
     /// `y = f(x)`, this returns `∇f(x) = J_f(x)ᵀ · 1`, analogous to
     /// [JAX's `grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html). In [`HolomorphicLinearity`] mode,
     /// a holomorphic complex scalar function returns `∂f/∂z`. This is the gradient-only counterpart of
@@ -1127,7 +1127,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
 
-    /// Computes the [`Jacobian`] of `function` using forward-mode differentiation. For `y = f(x)`, the Jacobian is the
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation. For `y = f(x)`, the Jacobian is the
     /// linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This method linearizes `function` once, applies the
     /// resulting [`Pushforward`] to a packed basis of the finite input coordinate space, and assembles the resulting
     /// columns into a Jacobian. Each block corresponds to one output leaf and one input leaf in deterministic
@@ -1186,7 +1186,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .jacobian_forward(|input, ()| function(input))
     }
 
-    /// Computes the [`Jacobian`] of `function` using reverse-mode differentiation. For `y = f(x)`, the pullback maps
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation. For `y = f(x)`, the pullback maps
     /// `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This method constructs one [`Pullback`], applies it to a
     /// packed basis of the finite output coordinate space, and reorients the resulting rows into the same
     /// output-major/input-minor [`Jacobian`] representation returned by [`jacobian_forward`](Self::jacobian_forward).
@@ -1197,7 +1197,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// packed pullback, so its derivative work is approximately `O(T_vjp + m · T_pullback)`. If `R_reverse` is the
     /// shared residual storage and `M_pullback` the additional peak memory for one direction, its working memory
     /// excluding the result is approximately `O(R_reverse + m · M_pullback)`. The materialized Jacobian itself
-    /// necessarily occupies `Θ(mn)` storage. Reverse mode is generally preferable when `m < n`; use forward-mode when
+    /// necessarily occupies `Θ(mn)` storage. Reverse mode is generally preferable when `m < n`; use forward mode when
     /// `n <= m`. Packing lets the backend evaluate derivative directions concurrently, potentially reducing wall-clock
     /// time, but it does not reduce the total arithmetic work or asymptotic storage required.
     ///
@@ -1258,7 +1258,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .jacobian_reverse(|input, ()| function(input))
     }
 
-    /// Computes the [`Hessian`] of `function` using forward-over-reverse-mode differentiation. For `y = f(x)`, each
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation. For `y = f(x)`, each
     /// entry is `H_f(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. The inner reverse transform materializes `J_f(x)` by applying
     /// a [`Pullback`] to packed output-coordinate basis cotangents. The outer forward transform differentiates those
     /// Jacobian entries by applying a [`Pushforward`] to packed input-coordinate basis tangents. The result stores
@@ -1354,7 +1354,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithAuxiliaryOutput, LinearityState, ContextState>
 {
-    /// Computes the scalar value and auxiliary output of `function` and its gradient using reverse-mode
+    /// Computes the scalar value and auxiliary output of `function` and its gradient using reverse mode
     /// differentiation. For `(y, a) = f(x)` with a real scalar `y`, this returns `((y, a), J_y(x)ᵀ · 1)`. Only
     /// `y` receives the multiplicative-identity cotangent seed; every auxiliary leaf receives a zero seed and is
     /// reconstructed as a primal runtime value. In [`HolomorphicLinearity`] mode, complex `y` instead yields the
@@ -1411,7 +1411,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .value_and_gradient(|input, ()| function(input))
     }
 
-    /// Computes the gradient of a scalar-valued `function` using reverse-mode differentiation and returns its auxiliary
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation and returns its auxiliary
     /// output. For `(y, a) = f(x)` with real scalar `y`, this returns `(J_y(x)ᵀ · 1, a)`. In [`HolomorphicLinearity`]
     /// mode it returns `(∂y/∂z, a)` under the caller's holomorphy promise. This is the gradient-only counterpart of
     /// [`value_and_gradient`](Self::value_and_gradient): it discards `y`, while auxiliary leaves remain primal values
@@ -1458,7 +1458,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
 
-    /// Computes the [`Jacobian`] of `function` using forward-mode differentiation and returns its auxiliary output. For
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation and returns its auxiliary output. For
     /// `(y, a) = f(x)`, only `J_y(x) = ∂y/∂x` is materialized: the method linearizes once, applies its [`Pushforward`]
     /// to a packed input-coordinate basis, and assembles output-major/input-minor blocks. Auxiliary leaves are
     /// recovered from the primal trace and returned unchanged; they add no Jacobian coordinates. Forward mode is
@@ -1509,7 +1509,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .jacobian_forward(|input, ()| function(input))
     }
 
-    /// Computes the [`Jacobian`] of `function` using reverse-mode differentiation and returns its auxiliary output. For
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation and returns its auxiliary output. For
     /// `(y, a) = f(x)`, only `J_y(x) = ∂y/∂x` is materialized: the method constructs one [`Pullback`], applies it to
     /// a packed differentiated-output basis, and assembles the same output-major/input-minor blocks as forward mode.
     /// Auxiliary leaves are recovered from the primal trace and returned unchanged; they receive zero cotangent seeds
@@ -1575,7 +1575,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .jacobian_reverse(|input, ()| function(input))
     }
 
-    /// Computes the [`Hessian`] of `function` using forward-over-reverse-mode differentiation and returns its
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation and returns its
     /// auxiliary output. For `(y, a) = f(x)`, this returns the blocks `H_y(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])` in
     /// output-major/first-input-major/second-input-minor order. Only `y` participates in the inner reverse Jacobian
     /// and outer forward differentiation; auxiliary leaves are recovered as primal runtime values and introduce no
@@ -1668,7 +1668,7 @@ impl<Input, Capture, ContextState>
     /// Evaluates `function` and its Jacobian-vector product while holding runtime captures fixed. For `y = f(x; c)`,
     /// this returns `(y, ẏ) = (f(x; c), (∂f/∂x)(x; c) · ẋ)`. Only the active primal `x` pairs with the supplied tangent
     /// value; capture `c` affects the primal and tangent computations as runtime coefficients but receives no tangent
-    /// values and contributes no derivative coordinates. The closure otherwise follows the direct forward-mode
+    /// values and contributes no derivative coordinates. The closure otherwise follows the direct forward mode
     /// execution, structural-zero, nesting, and eager-versus-staged semantics of the capture-free [`jvp`](Self::jvp).
     ///
     /// # Parameters
@@ -1746,7 +1746,7 @@ impl<Input, Capture, ContextState>
         context.linearize(function, self.primal, self.capture.0)
     }
 
-    /// Reverse-mode-differentiates `function` with respect to the active primal while holding runtime captures fixed.
+    /// Differentiates `function` in reverse mode with respect to the active primal, holding runtime captures fixed.
     ///
     /// For `y = f(x; c)`, this returns `f(x; c)` and the reusable map `ȳ ↦ x̄ = (∂f/∂x)(x; c)ᵀ · ȳ`. Reverse mode
     /// selects [`DifferentiableOperation::jvp_for_transpose`] and transposes the active derivative carrier. Captures
@@ -1788,7 +1788,7 @@ impl<Input, Capture, ContextState>
 impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithCapture<Capture>, WithoutAuxiliaryOutput, LinearityState, ContextState>
 {
-    /// Computes the scalar value of `function` and its gradient using reverse-mode differentiation with respect to
+    /// Computes the scalar value of `function` and its gradient using reverse mode differentiation with respect to
     /// the active primal only. For `y = f(x; c)` with real scalar `y`, this returns `(f(x; c), (∂f/∂x)(x; c)ᵀ · 1)`.
     /// Captures are fixed runtime coefficients: they may change the value and gradient but receive no gradient result.
     /// In [`HolomorphicLinearity`] mode, complex `y` yields `(f(x; c), ∂f/∂x)` under the caller's holomorphy promise.
@@ -1832,7 +1832,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         )
     }
 
-    /// Computes the gradient of a scalar-valued `function` using reverse-mode differentiation with respect
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation with respect
     /// to the active primal only. For real scalar `y = f(x; c)`, this returns `(∂f/∂x)(x; c)ᵀ · 1`. In
     /// [`HolomorphicLinearity`] mode it returns the complex derivative with respect to `x`. This discards the primal
     /// scalar from [`value_and_gradient`](Self::value_and_gradient). Captures remain fixed runtime coefficients and
@@ -1869,7 +1869,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
 
-    /// Computes the [`Jacobian`] of `function` using forward-mode differentiation with respect to the active primal
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation with respect to the active primal
     /// only. For `y = f(x; c)`, this materializes `J_x f(x; c) = ∂f/∂x` by applying one [`Pushforward`] to a packed
     /// basis of active-input coordinates. Captures affect every evaluated column as fixed runtime coefficients but
     /// contribute no basis directions or Jacobian blocks. Blocks use deterministic output-major/active-input-minor
@@ -1924,7 +1924,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         Ok(jacobian)
     }
 
-    /// Computes the [`Jacobian`] of `function` using reverse-mode differentiation with respect to the active primal
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation with respect to the active primal
     /// only. For `y = f(x; c)`, this constructs a [`Pullback`] for `J_x f(x; c)ᵀ`, applies it to a packed basis of
     /// differentiated-output coordinates, and assembles the same output-major/active-input-minor blocks as forward
     /// mode. Captures affect the pullback as fixed runtime coefficients but receive no cotangents and contribute no
@@ -1993,7 +1993,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         Ok(jacobian)
     }
 
-    /// Computes the [`Hessian`] of `function` using forward-over-reverse-mode differentiation with respect to the
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation with respect to the
     /// active primal only. For `y = f(x; c)`, this materializes `H_x f(x; c)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. Captures
     /// remain fixed through both the inner reverse Jacobian and the outer forward transform. They may affect every
     /// derivative value, but introduce neither first- nor second-order coordinates. Blocks use
@@ -2090,7 +2090,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
 impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithCapture<Capture>, WithAuxiliaryOutput, LinearityState, ContextState>
 {
-    /// Computes the scalar value and auxiliary output of `function` and its gradient using reverse-mode differentiation
+    /// Computes the scalar value and auxiliary output of `function` and its gradient using reverse mode differentiation
     /// with respect to the active primal while holding captures fixed. For `(y, a) = f(x; c)` with real scalar `y`,
     /// this returns `((y, a), (∂y/∂x)(x; c)ᵀ · 1)`. Captures affect the computation as fixed runtime coefficients,
     /// auxiliary leaves receive zero cotangent seeds, and neither receives a gradient result. In
@@ -2146,7 +2146,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         )
     }
 
-    /// Computes the gradient of a scalar-valued `function` using reverse-mode differentiation with respect to the
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation with respect to the
     /// active primal and returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)` with real
     /// scalar `y`, this returns `((∂y/∂x)(x; c)ᵀ · 1, a)`. In [`HolomorphicLinearity`] mode, complex `y` yields the
     /// complex derivative with respect to `x`. This discards the primal scalar from
@@ -2195,7 +2195,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
 
-    /// Computes the [`Jacobian`] of `function` using forward-mode differentiation with respect to the active primal and
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation with respect to the active primal and
     /// returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)`, this materializes `∂y/∂x`
     /// from a packed active-input basis. Capture `c` remains a runtime coefficient, and auxiliary leaves `a` are
     /// reconstructed as primal values. Neither introduces Jacobian coordinates. Blocks use
@@ -2251,7 +2251,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         )
     }
 
-    /// Computes the [`Jacobian`] of `function` using reverse-mode differentiation with respect to the active primal
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation with respect to the active primal
     /// and returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)`, this materializes `∂y/∂x`
     /// from a packed differentiated-output cotangent basis. Capture `c` remains a runtime coefficient, while auxiliary
     /// leaves `a` receive zero cotangent seeds and are reconstructed as primal values. Neither contributes derivative
@@ -2321,7 +2321,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         )
     }
 
-    /// Computes the [`Hessian`] of `function` using forward-over-reverse-mode differentiation with respect to the
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation with respect to the
     /// active primal and returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)`, this
     /// materializes `H_x y[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. Captures remain fixed through both derivative levels,
     /// while auxiliary leaves are reconstructed from primal values; neither contributes first- or second-order
