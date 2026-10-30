@@ -1145,115 +1145,6 @@ where
     }
 }
 
-/// Adapts the structured custom batching rule closure `rule` of a [`Composite`] to the flat interface of retained
-/// batching rules. Each invocation passes the closure the level's extent, the call's own batched inputs with the call's
-/// input structure, and their batch axes. It validates that the outputs and their batch axes have the call's output
-/// structure.
-///
-/// # Parameters
-///
-///   - `rule`: Closure implementing `(extent, x, x_axes) ↦ (y, y_axes)`.
-///   - `name`: Name of the function, used in diagnostics.
-///   - `input_structure`: Structure of the call's inputs.
-///   - `output_structure`: Structure of the call's outputs.
-#[allow(clippy::type_complexity)]
-fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
-    rule: Arc<Rule>,
-    name: Cow<'static, str>,
-    input_structure: &Input::ParameterStructure,
-    output_structure: &Output::ParameterStructure,
-) -> impl 'static
-+ Fn(
-    &BatchingLevel<V::Type>,
-    &[CustomRuleTracer<V, O>],
-    &[CustomRuleTracer<V, O>],
-    &[BatchAxis],
-) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
-+ Send
-+ Sync
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value,
-    O: 'static + Operation<Type = V::Type>,
-    Input: 'static
-        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
-    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Rule: ?Sized
-        + 'static
-        + Fn(
-            BatchingLevelExtent<CustomRuleTracer<V, O>>,
-            Input,
-            Input::To<BatchAxis>,
-        ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
-        + Send
-        + Sync,
-{
-    let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-    move |level: &BatchingLevel<V::Type>,
-          boundary_inputs: &[CustomRuleTracer<V, O>],
-          inputs: &[CustomRuleTracer<V, O>],
-          input_axes: &[BatchAxis]| {
-        // A dynamic extent reaches the rule as the level's leading boundary input, and the level's other boundary
-        // inputs do not reach the rule. The inputs of a call that was batched at earlier levels start with those
-        // levels' boundary inputs, which the rule does not receive either.
-        let extent = match (level.extent(), boundary_inputs) {
-            (BatchingLevelExtent::Static(extent), _) => BatchingLevelExtent::Static(*extent),
-            (BatchingLevelExtent::Dynamic(_), [extent, ..]) => BatchingLevelExtent::Dynamic(extent.clone()),
-            (BatchingLevelExtent::Dynamic(_), []) => {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "{} batching rule requires a dynamic batch extent to be the leading boundary input of its \
-                         batching level, but the level has no boundary inputs",
-                        {
-                            let name: &str = &name;
-                            if name == COMPOSITE_OPERATION_NAME {
-                                format!("`{COMPOSITE_OPERATION_NAME}`")
-                            } else {
-                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                            }
-                        },
-                    ),
-                });
-            }
-        };
-        let leading_input_count = inputs
-            .len()
-            .checked_sub(input_structure.parameter_count())
-            .ok_or_else(|| ProgramError::MalformedProgram(format!("`{name}` batching rule received too few inputs")))?;
-        let (outputs, output_axes) = rule(
-            extent,
-            Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
-            Input::To::<BatchAxis>::from_parameters(
-                input_structure.clone(),
-                input_axes[leading_input_count..].iter().copied(),
-            )?,
-        )?;
-        for (value, structure) in
-            [("output", outputs.parameter_structure()), ("output axis", output_axes.parameter_structure())]
-        {
-            if structure != output_structure {
-                return Err(TypeError::invalid(format!(
-                    "{} batching rule {} structure mismatch: expected {:?} but got {:?}",
-                    {
-                        let name: &str = &name;
-                        if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        }
-                    },
-                    value,
-                    output_structure,
-                    structure,
-                ))
-                .into());
-            }
-        }
-        Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
-    }
-}
-
 /// Residual structures that the forward rule of one [`Composite`] registration returned, from which its backward rule
 /// learns the structure of the residuals that it receives as flat leading inputs. The backward rule of each
 /// specialization is traced after the forward rule of that specialization, but specializations of one call structure
@@ -1449,6 +1340,115 @@ where
         let mut outputs = program.interpret_in_context(primals[0].context(), primals.to_vec())?;
         let residuals = outputs.split_off(output_structure.parameter_count());
         Ok((outputs, residuals))
+    }
+}
+
+/// Adapts the structured custom batching rule closure `rule` of a [`Composite`] to the flat interface of retained
+/// batching rules. Each invocation passes the closure the level's extent, the call's own batched inputs with the call's
+/// input structure, and their batch axes. It validates that the outputs and their batch axes have the call's output
+/// structure.
+///
+/// # Parameters
+///
+///   - `rule`: Closure implementing `(extent, x, x_axes) ↦ (y, y_axes)`.
+///   - `name`: Name of the function, used in diagnostics.
+///   - `input_structure`: Structure of the call's inputs.
+///   - `output_structure`: Structure of the call's outputs.
+#[allow(clippy::type_complexity)]
+fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
+    rule: Arc<Rule>,
+    name: Cow<'static, str>,
+    input_structure: &Input::ParameterStructure,
+    output_structure: &Output::ParameterStructure,
+) -> impl 'static
++ Fn(
+    &BatchingLevel<V::Type>,
+    &[CustomRuleTracer<V, O>],
+    &[CustomRuleTracer<V, O>],
+    &[BatchAxis],
+) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
++ Send
++ Sync
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    V: 'static + Value,
+    O: 'static + Operation<Type = V::Type>,
+    Input: 'static
+        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Rule: ?Sized
+        + 'static
+        + Fn(
+            BatchingLevelExtent<CustomRuleTracer<V, O>>,
+            Input,
+            Input::To<BatchAxis>,
+        ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
+        + Send
+        + Sync,
+{
+    let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+    move |level: &BatchingLevel<V::Type>,
+          boundary_inputs: &[CustomRuleTracer<V, O>],
+          inputs: &[CustomRuleTracer<V, O>],
+          input_axes: &[BatchAxis]| {
+        // A dynamic extent reaches the rule as the level's leading boundary input, and the level's other boundary
+        // inputs do not reach the rule. The inputs of a call that was batched at earlier levels start with those
+        // levels' boundary inputs, which the rule does not receive either.
+        let extent = match (level.extent(), boundary_inputs) {
+            (BatchingLevelExtent::Static(extent), _) => BatchingLevelExtent::Static(*extent),
+            (BatchingLevelExtent::Dynamic(_), [extent, ..]) => BatchingLevelExtent::Dynamic(extent.clone()),
+            (BatchingLevelExtent::Dynamic(_), []) => {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "{} batching rule requires a dynamic batch extent to be the leading boundary input of its \
+                         batching level, but the level has no boundary inputs",
+                        {
+                            let name: &str = &name;
+                            if name == COMPOSITE_OPERATION_NAME {
+                                format!("`{COMPOSITE_OPERATION_NAME}`")
+                            } else {
+                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                            }
+                        },
+                    ),
+                });
+            }
+        };
+        let leading_input_count = inputs
+            .len()
+            .checked_sub(input_structure.parameter_count())
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("`{name}` batching rule received too few inputs")))?;
+        let (outputs, output_axes) = rule(
+            extent,
+            Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
+            Input::To::<BatchAxis>::from_parameters(
+                input_structure.clone(),
+                input_axes[leading_input_count..].iter().copied(),
+            )?,
+        )?;
+        for (value, structure) in
+            [("output", outputs.parameter_structure()), ("output axis", output_axes.parameter_structure())]
+        {
+            if structure != output_structure {
+                return Err(TypeError::invalid(format!(
+                    "{} batching rule {} structure mismatch: expected {:?} but got {:?}",
+                    {
+                        let name: &str = &name;
+                        if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        }
+                    },
+                    value,
+                    output_structure,
+                    structure,
+                ))
+                .into());
+            }
+        }
+        Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
     }
 }
 

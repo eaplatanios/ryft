@@ -12,6 +12,7 @@ use crate::operations::attention::{
     DotProductAttentionOperation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
+use crate::operations::composites::rules::CustomRuleDefinition;
 use crate::operations::composites::{
     Composite, CompositeCallContext, CompositeVjp, DefaultJvp, SymbolicZeroVjp, composite,
 };
@@ -167,12 +168,17 @@ where
     where
         C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
-        SymbolicZeroVjp<
-            DomainTracer<D>,
-            AttentionInputs<DomainTracer<D>>,
-            DomainTracer<D>,
-            AttentionResiduals<DomainTracer<D>>,
-        >: CompositeVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
+        CustomRuleDefinition<C::Constant, C::Operation>: CompositeVjp<
+                SymbolicZeroVjp<
+                    DomainTracer<D>,
+                    AttentionInputs<DomainTracer<D>>,
+                    DomainTracer<D>,
+                    AttentionResiduals<DomainTracer<D>>,
+                >,
+                DomainTracer<D>,
+                AttentionInputs<DomainTracer<D>>,
+                DomainTracer<D>,
+            >,
     {
         let signature = inputs.signature();
         let inputs = inputs.into_values();

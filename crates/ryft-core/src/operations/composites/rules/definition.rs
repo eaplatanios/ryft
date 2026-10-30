@@ -511,7 +511,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     pub(super) id: u64,
 
     /// Human-readable label used for rendering and diagnostics.
-    pub(super) name: Cow<'static, str>,
+    pub(in crate::operations::composites) name: Cow<'static, str>,
 
     /// Named axes with which every rule is traced (refer to [`Self::with_named_axes`]).
     pub(super) named_axes: Vec<(String, NamedAxis)>,

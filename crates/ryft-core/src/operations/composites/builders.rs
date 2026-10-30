@@ -73,8 +73,9 @@ pub enum BatchingRuleConsistencyError {
 ///
 /// The bound covers only requirements on the context and its associated types, which Rust propagates from a trait
 /// bound. The requirements that [`Composite::call`] places on its configurations (e.g.,
-/// `Vjp: CompositeVjp<C::Constant, C::Operation, Input, Output>`) and on its input and output structures concern other
-/// types, so a generic wrapper whose configuration is not one of the defaults still states them separately.
+/// `CustomRuleDefinition<C::Constant, C::Operation>: CompositeVjp<Vjp, DomainTracer<C>, Input, Output>`), and on its
+/// input and output structures concern other types, so a generic wrapper whose configuration is not one of the
+/// defaults still states them separately.
 pub trait CompositeCallContext:
     NamedAxes
     + Context<
@@ -1050,9 +1051,9 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        Jvp: CompositeJvp<C::Constant, C::Operation, Input, Output>,
-        Vjp: CompositeVjp<C::Constant, C::Operation, Input, Output>,
-        Batching: CompositeBatching<C::Constant, C::Operation, Input, Output>,
+        CustomRuleDefinition<C::Constant, C::Operation>: CompositeJvp<Jvp, DomainTracer<C>, Input, Output>
+            + CompositeVjp<Vjp, DomainTracer<C>, Input, Output>
+            + CompositeBatching<Batching, DomainTracer<C>, Input, Output>,
         Input: Parameterized<DomainTracer<C>>,
         Input::ParameterStructure: 'static + PartialEq + Send,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
@@ -1096,20 +1097,10 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
             let definition = CustomRuleDefinition::new(self.name.clone())
                 .with_named_axes(named_axes.clone())
                 .with_batching_support();
-            let definition = self.jvp.configure(
-                definition,
-                &self.name,
-                &input_structure,
-                &output_structure,
-                self.non_differentiated_count,
-            );
-            let definition = self.vjp.configure(
-                definition,
-                &self.name,
-                &input_structure,
-                &output_structure,
-                self.non_differentiated_count,
-            );
+            let definition =
+                definition.configure_jvp(&self.jvp, &input_structure, &output_structure, self.non_differentiated_count);
+            let definition =
+                definition.configure_vjp(&self.vjp, &input_structure, &output_structure, self.non_differentiated_count);
 
             // Every transform without a configured rule treats the primal as it treats any other function, so a
             // function without derivative rules differentiates its primal. A function with only reverse mode rules
@@ -1122,7 +1113,7 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
                 Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
                 None => definition,
             };
-            self.batching.configure(definition, &self.name, &input_structure, &output_structure)
+            definition.configure_batching(&self.batching, &input_structure, &output_structure)
         });
 
         // The call binds through whatever context the input values flow through (e.g., a staging trace, a batching
