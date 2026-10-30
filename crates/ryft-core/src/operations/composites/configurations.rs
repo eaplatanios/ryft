@@ -27,12 +27,55 @@ use crate::tracing::{DomainTracingContext, TracingContext};
 #[cfg(doc)]
 use crate::operations::composites::builders::{Composite, composite};
 
+/// Installs a forward mode differentiation configuration in a [`CustomRuleDefinition`]. A user-supplied rule is adapted
+/// to the flat interface of retained rules by tracing it with the complete structured interface of the call at the
+/// types of each specialization and replaying the traced program.
+pub trait CompositeJvp<Jvp, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
+    Sized
+{
+    /// Returns this definition with the provided forward mode differentiation configuration applied. [`DefaultJvp`]
+    /// leaves the definition unchanged. Retained rules use the definition's name and named axes.
+    ///
+    /// # Parameters
+    ///
+    ///   - `configuration`: Forward mode differentiation configuration to apply.
+    ///   - `input_structure`: Structure of the call's inputs.
+    ///   - `output_structure`: Structure of the call's outputs.
+    ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
+    fn configure_jvp(
+        self,
+        configuration: &Jvp,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> Self;
+}
+
 /// Forward mode configuration of a [`Composite`] without a configured forward mode differentiation rule. A function
 /// without reverse mode rules then derives its forward mode rule from its primal (as [`JvpFromPrimal`] does), while a
 /// function with reverse mode rules rejects forward mode differentiation. Refer to the documentation of [`composite`]
 /// for more information on rule selection.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultJvp;
+
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
+    CompositeJvp<DefaultJvp, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
+where
+    Input: Parameterized<CustomRuleTracer<V, O>>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    #[inline]
+    fn configure_jvp(
+        self,
+        _configuration: &DefaultJvp,
+        _input_structure: &Input::ParameterStructure,
+        _output_structure: &Output::ParameterStructure,
+        _non_differentiated_count: usize,
+    ) -> Self {
+        self
+    }
+}
 
 /// Forward mode differentiation configuration of a [`Composite`] with an explicit, user-supplied Jacobian-Vector
 /// Product (JVP) rule closure implementing `(x, ẋ) ↦ (y, ẏ)`. Refer to [`Composite::with_jvp`] for more information.
@@ -48,10 +91,73 @@ impl<Input, Output> Debug for ExplicitJvp<Input, Output> {
     }
 }
 
+impl<V, O, Input, Output> CompositeJvp<ExplicitJvp<Input, Output>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
+where
+    V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
+    O: 'static + Operation<Type = V::Type>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
+    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn configure_jvp(
+        self,
+        configuration: &ExplicitJvp<Input, Output>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> Self {
+        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name.clone(), self.named_axes().to_vec());
+        let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+        self.with_jvp(move |primals, tangents| {
+            let input_types = Input::To::<V::Type>::from_parameters(
+                input_structure.clone(),
+                primals.iter().map(|primal| primal.r#type().into_owned()),
+            )?;
+            let program = trace_custom_jvp_rule::<V, O, Input, Output, _>(
+                &name,
+                jvp.as_ref(),
+                input_types,
+                &output_structure,
+                non_differentiated_count,
+                named_axes.clone(),
+            )?;
+            let mut values = primals.to_vec();
+            values.extend_from_slice(tangents);
+            let mut outputs = program.interpret_in_context(primals[0].context(), values)?;
+            let output_tangents = outputs.split_off(output_structure.parameter_count());
+            Ok((outputs, output_tangents))
+        })
+    }
+}
+
 /// Forward mode differentiation configuration of a [`Composite`] whose forward mode differentiation rule is derived
 /// from its primal. Refer to [`Composite::with_jvp_from_primal`] for more information.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct JvpFromPrimal;
+
+impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>, Input, Output>
+    CompositeJvp<JvpFromPrimal, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
+where
+    Input: Parameterized<CustomRuleTracer<V, O>>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    #[inline]
+    fn configure_jvp(
+        self,
+        _configuration: &JvpFromPrimal,
+        _input_structure: &Input::ParameterStructure,
+        _output_structure: &Output::ParameterStructure,
+        _non_differentiated_count: usize,
+    ) -> Self {
+        self.with_jvp_from_primal()
+    }
+}
 
 /// Forward mode differentiation configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP)
 /// rule closure implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves, of which
@@ -79,6 +185,66 @@ where
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("SymbolicZeroJvp").finish_non_exhaustive()
+    }
+}
+
+impl<V, O, Input, Output>
+    CompositeJvp<SymbolicZeroJvp<CustomRuleTracer<V, O>, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
+where
+    V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
+    O: 'static + Operation<Type = V::Type>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
+    Input::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    Output::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn configure_jvp(
+        self,
+        configuration: &SymbolicZeroJvp<CustomRuleTracer<V, O>, Input, Output>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> Self {
+        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name.clone(), self.named_axes().to_vec());
+        let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+        self.with_symbolic_zero_jvp(move |primals, tangents| {
+            let input_types = Input::To::<V::Type>::from_parameters(
+                input_structure.clone(),
+                primals.iter().map(|primal| primal.r#type().into_owned()),
+            )?;
+            let tangent_activity = tangents.iter().map(|tangent| !tangent.is_zero()).collect::<Vec<_>>();
+            let (program, output_tangent_zeros) = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, _>(
+                &name,
+                jvp.as_ref(),
+                input_types,
+                &tangent_activity,
+                &output_structure,
+                non_differentiated_count,
+                named_axes.clone(),
+            )?;
+            let mut values = primals.to_vec();
+            values.extend(tangents.iter().filter_map(MaybeZero::as_value).cloned());
+            let mut outputs = program.interpret_in_context(primals[0].context(), values)?;
+            let mut live_output_tangents = outputs.split_off(output_structure.parameter_count()).into_iter();
+
+            // The traced program returns only the live output tangents, so the structural zeros are reinserted
+            // at their positions, typed by the tangent types of the replayed outputs.
+            let output_tangents = outputs
+                .iter()
+                .zip(output_tangent_zeros)
+                .map(|(output, is_zero)| match is_zero {
+                    true => Ok(MaybeZero::Zero(output.r#type().tangent()?)),
+                    false => Ok(MaybeZero::Value(live_output_tangents.next().unwrap())),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            Ok((outputs, output_tangents))
+        })
     }
 }
 
@@ -201,226 +367,57 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Forward mode differentiation configuration of a [`Composite`] that installs its rule in the retained definition
-/// that a call registers for the operation family `(V, O)`. Implemented by [`DefaultJvp`], [`ExplicitJvp`],
-/// [`SymbolicZeroJvp`], and [`JvpFromPrimal`].
-///
-/// A user-supplied rule is adapted to the flat interface of retained rules by tracing it with the complete structured
-/// interface of the call at the types of each specialization and replaying the traced program.
-pub trait CompositeJvp<V: Value, O: Operation<Type = V::Type>, Input, Output>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
-{
-    /// Returns `definition` with this forward mode differentiation rule.
-    ///
-    /// # Parameters
-    ///
-    ///   - `definition`: Definition that the call registers.
-    ///   - `name`: Name of the user-facing function, used in diagnostics.
-    ///   - `input_structure`: Structure of the call's inputs.
-    ///   - `output_structure`: Structure of the call's outputs.
-    ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O>;
-}
-
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CompositeJvp<V, O, Input, Output> for DefaultJvp
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
-{
-    #[inline]
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        _name: &Cow<'static, str>,
-        _input_structure: &Input::ParameterStructure,
-        _output_structure: &Output::ParameterStructure,
-        _non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
-        definition
-    }
-}
-
-impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>, Input, Output> CompositeJvp<V, O, Input, Output>
-    for JvpFromPrimal
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
-{
-    #[inline]
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        _name: &Cow<'static, str>,
-        _input_structure: &Input::ParameterStructure,
-        _output_structure: &Output::ParameterStructure,
-        _non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
-        definition.with_jvp_from_primal()
-    }
-}
-
-impl<V, O, Input, Output> CompositeJvp<V, O, Input, Output> for ExplicitJvp<Input, Output>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
-    O: 'static + Operation<Type = V::Type>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
-    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-{
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
-        let (jvp, name, named_axes) = (self.jvp.clone(), name.clone(), definition.named_axes().to_vec());
-        let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-        definition.with_jvp(move |primals, tangents| {
-            let input_types = Input::To::<V::Type>::from_parameters(
-                input_structure.clone(),
-                primals.iter().map(|primal| primal.r#type().into_owned()),
-            )?;
-            let program = trace_custom_jvp_rule::<V, O, Input, Output, _>(
-                &name,
-                jvp.as_ref(),
-                input_types,
-                &output_structure,
-                non_differentiated_count,
-                named_axes.clone(),
-            )?;
-            let mut values = primals.to_vec();
-            values.extend_from_slice(tangents);
-            let mut outputs = program.interpret_in_context(primals[0].context(), values)?;
-            let output_tangents = outputs.split_off(output_structure.parameter_count());
-            Ok((outputs, output_tangents))
-        })
-    }
-}
-
-impl<V, O, Input, Output> CompositeJvp<V, O, Input, Output> for SymbolicZeroJvp<CustomRuleTracer<V, O>, Input, Output>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
-    O: 'static + Operation<Type = V::Type>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
-    Input::Family:
-        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
-    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>>,
-    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Output::Family:
-        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
-{
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
-        let (jvp, name, named_axes) = (self.jvp.clone(), name.clone(), definition.named_axes().to_vec());
-        let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-        definition.with_symbolic_zero_jvp(move |primals, tangents| {
-            let input_types = Input::To::<V::Type>::from_parameters(
-                input_structure.clone(),
-                primals.iter().map(|primal| primal.r#type().into_owned()),
-            )?;
-            let tangent_activity = tangents.iter().map(|tangent| !tangent.is_zero()).collect::<Vec<_>>();
-            let (program, output_tangent_zeros) = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, _>(
-                &name,
-                jvp.as_ref(),
-                input_types,
-                &tangent_activity,
-                &output_structure,
-                non_differentiated_count,
-                named_axes.clone(),
-            )?;
-            let mut values = primals.to_vec();
-            values.extend(tangents.iter().filter_map(MaybeZero::as_value).cloned());
-            let mut outputs = program.interpret_in_context(primals[0].context(), values)?;
-            let mut live_output_tangents = outputs.split_off(output_structure.parameter_count()).into_iter();
-
-            // The traced program returns only the live output tangents, so the structural zeros are reinserted at
-            // their positions, typed by the tangent types of the replayed outputs.
-            let output_tangents = outputs
-                .iter()
-                .zip(output_tangent_zeros)
-                .map(|(output, is_zero)| match is_zero {
-                    true => Ok(MaybeZero::Zero(output.r#type().tangent()?)),
-                    false => Ok(MaybeZero::Value(live_output_tangents.next().unwrap())),
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            Ok((outputs, output_tangents))
-        })
-    }
-}
-
-/// Reverse mode differentiation configuration of a [`Composite`] that installs its rules in the retained definition
-/// that a call registers for the operation family `(V, O)`. Implemented by [`DefaultVjp`], [`ExplicitVjp`],
-/// [`SymbolicZeroVjp`], and [`AccumulatingVjp`].
+/// Installs a reverse mode differentiation configuration in a [`CustomRuleDefinition`]. The supported configurations
+/// are [`DefaultVjp`], [`ExplicitVjp`], [`SymbolicZeroVjp`], and [`AccumulatingVjp`].
 ///
 /// User-supplied rules are adapted to the flat interface of retained rules as described for [`CompositeJvp`]. The
 /// backward rule receives the residuals with the structure that the forward rule returned for the same specialization.
 /// Different specializations of one call structure may return differently structured residuals. Residuals whose flat
 /// types are equal up to a renaming of their type identities (e.g., their dimension variables) must always have the
 /// same structure. The forward rule is rejected otherwise.
-pub trait CompositeVjp<V: Value, O: Operation<Type = V::Type>, Input, Output>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
+pub trait CompositeVjp<Vjp, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
+    Sized
 {
-    /// Returns `definition` with these reverse mode differentiation rules. Refer to [`CompositeJvp::configure`] for the
-    /// parameters.
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    /// Returns this definition with the provided reverse mode differentiation configuration applied. [`DefaultVjp`]
+    /// leaves the definition unchanged. Retained rules use the definition's name and named axes.
+    ///
+    /// # Parameters
+    ///
+    ///   - `configuration`: Reverse mode differentiation configuration to apply.
+    ///   - `input_structure`: Structure of the call's inputs.
+    ///   - `output_structure`: Structure of the call's outputs.
+    ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
+    fn configure_vjp(
+        self,
+        configuration: &Vjp,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O>;
+    ) -> Self;
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CompositeVjp<V, O, Input, Output> for DefaultVjp
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
+    CompositeVjp<DefaultVjp, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
     #[inline]
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        _name: &Cow<'static, str>,
+    fn configure_vjp(
+        self,
+        _configuration: &DefaultVjp,
         _input_structure: &Input::ParameterStructure,
         _output_structure: &Output::ParameterStructure,
         _non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
-        definition
+    ) -> Self {
+        self
     }
 }
 
-impl<V, O, Input, Output, Residual> CompositeVjp<V, O, Input, Output> for ExplicitVjp<Input, Output, Residual>
+impl<V, O, Input, Output, Residual>
+    CompositeVjp<ExplicitVjp<Input, Output, Residual>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
@@ -438,25 +435,25 @@ where
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
 {
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    fn configure_vjp(
+        self,
+        configuration: &ExplicitVjp<Input, Output, Residual>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
+    ) -> Self {
         let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
-            self.forward.clone(),
-            name,
+            configuration.forward.clone(),
+            self.name.clone(),
             input_structure,
             output_structure,
             &residual_structures,
-            definition.named_axes(),
+            self.named_axes(),
         );
         let backward = {
-            let (backward, name, named_axes) = (self.backward.clone(), name.clone(), definition.named_axes().to_vec());
+            let (backward, name, named_axes) =
+                (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[CustomRuleTracer<V, O>]| {
                 let types = |values: &[CustomRuleTracer<V, O>]| {
@@ -486,13 +483,18 @@ where
                 program.interpret_in_context(&context, values)
             }
         };
-        let definition = definition.with_vjp(forward, backward);
-        if self.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
+        let definition = self.with_vjp(forward, backward);
+        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
-impl<V, O, Input, Output, Residual> CompositeVjp<V, O, Input, Output>
-    for SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>
+impl<V, O, Input, Output, Residual>
+    CompositeVjp<
+        SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
+        CustomRuleTracer<V, O>,
+        Input,
+        Output,
+    > for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
@@ -512,25 +514,25 @@ where
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
 {
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    fn configure_vjp(
+        self,
+        configuration: &SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
+    ) -> Self {
         let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
-            self.forward.clone(),
-            name,
+            configuration.forward.clone(),
+            self.name.clone(),
             input_structure,
             output_structure,
             &residual_structures,
-            definition.named_axes(),
+            self.named_axes(),
         );
         let backward = {
-            let (backward, name, named_axes) = (self.backward.clone(), name.clone(), definition.named_axes().to_vec());
+            let (backward, name, named_axes) =
+                (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
                 let types = |values: &[CustomRuleTracer<V, O>]| {
@@ -573,13 +575,18 @@ where
                     .collect::<Vec<_>>())
             }
         };
-        let definition = definition.with_symbolic_zero_vjp(forward, backward);
-        if self.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
+        let definition = self.with_symbolic_zero_vjp(forward, backward);
+        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
-impl<V, O, Input, Output, Residual> CompositeVjp<V, O, Input, Output>
-    for AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>
+impl<V, O, Input, Output, Residual>
+    CompositeVjp<
+        AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>,
+        CustomRuleTracer<V, O>,
+        Input,
+        Output,
+    > for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
@@ -598,29 +605,28 @@ where
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
 {
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    fn configure_vjp(
+        self,
+        configuration: &AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
+    ) -> Self {
         let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
-            self.forward.clone(),
-            name,
+            configuration.forward.clone(),
+            self.name.clone(),
             input_structure,
             output_structure,
             &residual_structures,
-            definition.named_axes(),
+            self.named_axes(),
         );
 
         // The rule is invoked directly while its carrier is transposed, with the carrier's inputs (i.e., the
         // non-differentiated inputs, the residuals, and the differentiated inputs' tangents) and one accumulator per
         // carrier input, so it receives the known residuals and the accumulators of the call's inputs.
         let backward = {
-            let (backward, name) = (self.backward.clone(), name.clone());
+            let (backward, name) = (configuration.backward.clone(), self.name.clone());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |context: &mut TranspositionContext<V, O>,
                   inputs: &[PartialValue<CustomRuleTracer<V, O>>],
@@ -655,8 +661,8 @@ where
                 backward(context, residuals, seeds, accumulators)
             }
         };
-        let definition = definition.with_accumulating_vjp(forward, backward);
-        if self.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
+        let definition = self.with_accumulating_vjp(forward, backward);
+        if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
@@ -736,52 +742,49 @@ where
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SequentialBatching;
 
-/// Batching configuration of a [`Composite`] that installs its custom batching rule or sequential batching, if any, in
-/// the retained definition that a call registers for the operation family `(V, O)`. Implemented by [`DefaultBatching`],
-/// [`CustomBatching`], [`AxisDependentBatching`], and [`SequentialBatching`].
-pub trait CompositeBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
+/// Installs a batching configuration in a [`CustomRuleDefinition`], selecting a custom batching rule or sequential
+/// batching when configured. The supported configurations are [`DefaultBatching`], [`CustomBatching`],
+/// [`AxisDependentBatching`], and [`SequentialBatching`].
+pub trait CompositeBatching<Batching, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
+    Sized
 {
-    /// Returns `definition` with this batching rule.
+    /// Returns this definition with the provided batching configuration applied. [`DefaultBatching`] leaves the
+    /// definition unchanged. Retained rules use the definition's name.
     ///
     /// # Parameters
     ///
-    ///   - `definition`: Definition that the call registers.
-    ///   - `name`: Name of the user-facing function, used in diagnostics.
+    ///   - `configuration`: Batching configuration to apply.
     ///   - `input_structure`: Structure of the call's inputs.
     ///   - `output_structure`: Structure of the call's outputs.
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    fn configure_batching(
+        self,
+        configuration: &Batching,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
-    ) -> CustomRuleDefinition<V, O>;
+    ) -> Self;
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CompositeBatching<V, O, Input, Output> for DefaultBatching
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
+    CompositeBatching<DefaultBatching, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
     #[inline]
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        _name: &Cow<'static, str>,
+    fn configure_batching(
+        self,
+        _configuration: &DefaultBatching,
         _input_structure: &Input::ParameterStructure,
         _output_structure: &Output::ParameterStructure,
-    ) -> CustomRuleDefinition<V, O> {
-        definition
+    ) -> Self {
+        self
     }
 }
 
-impl<V, O, Input, Output> CompositeBatching<V, O, Input, Output>
-    for CustomBatching<CustomRuleTracer<V, O>, Input, Output>
+impl<V, O, Input, Output>
+    CompositeBatching<CustomBatching<CustomRuleTracer<V, O>, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -796,24 +799,29 @@ where
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
     Output::ParameterStructure: Debug + PartialEq + Send + Sync,
 {
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    fn configure_batching(
+        self,
+        configuration: &CustomBatching<CustomRuleTracer<V, O>, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
-    ) -> CustomRuleDefinition<V, O> {
-        definition.with_batching_rule(retained_custom_batching_rule::<V, O, Input, Output, _>(
-            self.rule.clone(),
-            name,
+    ) -> Self {
+        let rule = retained_custom_batching_rule::<V, O, Input, Output, _>(
+            configuration.rule.clone(),
+            self.name.clone(),
             input_structure,
             output_structure,
-        ))
+        );
+        self.with_batching_rule(rule)
     }
 }
 
-impl<V, O, Input, Output> CompositeBatching<V, O, Input, Output>
-    for AxisDependentBatching<CustomRuleTracer<V, O>, Input, Output>
+impl<V, O, Input, Output>
+    CompositeBatching<
+        AxisDependentBatching<CustomRuleTracer<V, O>, Input, Output>,
+        CustomRuleTracer<V, O>,
+        Input,
+        Output,
+    > for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static
@@ -832,23 +840,24 @@ where
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
     Output::ParameterStructure: Debug + PartialEq + Send + Sync,
 {
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
+    fn configure_batching(
+        self,
+        configuration: &AxisDependentBatching<CustomRuleTracer<V, O>, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
-    ) -> CustomRuleDefinition<V, O> {
-        definition.with_axis_dependent_batching_rule(retained_custom_batching_rule::<V, O, Input, Output, _>(
-            self.rule.clone(),
-            name,
+    ) -> Self {
+        let rule = retained_custom_batching_rule::<V, O, Input, Output, _>(
+            configuration.rule.clone(),
+            self.name.clone(),
             input_structure,
             output_structure,
-        ))
+        );
+        self.with_axis_dependent_batching_rule(rule)
     }
 }
 
-impl<V, O, Input, Output> CompositeBatching<V, O, Input, Output> for SequentialBatching
+impl<V, O, Input, Output> CompositeBatching<SequentialBatching, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + ScanType>,
@@ -857,14 +866,13 @@ where
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
     #[inline]
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        _name: &Cow<'static, str>,
+    fn configure_batching(
+        self,
+        _configuration: &SequentialBatching,
         _input_structure: &Input::ParameterStructure,
         _output_structure: &Output::ParameterStructure,
-    ) -> CustomRuleDefinition<V, O> {
-        definition.with_sequential_batching()
+    ) -> Self {
+        self.with_sequential_batching()
     }
 }
 
@@ -881,7 +889,7 @@ where
 ///   - `output_structure`: Structure of the call's outputs.
 fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
     rule: Arc<Rule>,
-    name: &Cow<'static, str>,
+    name: Cow<'static, str>,
     input_structure: &Input::ParameterStructure,
     output_structure: &Output::ParameterStructure,
 ) -> impl 'static
@@ -911,7 +919,6 @@ where
         + Send
         + Sync,
 {
-    let name = name.clone();
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
     move |level: &BatchingLevel<V::Type>,
           boundary_inputs: &[CustomRuleTracer<V, O>],
@@ -1052,7 +1059,7 @@ impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
 ///     for more information.
 fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     forward: Arc<Forward>,
-    name: &Cow<'static, str>,
+    name: Cow<'static, str>,
     input_structure: &Input::ParameterStructure,
     output_structure: &Output::ParameterStructure,
     residual_structures: &CompositeResidualStructures<V::Type, Residual::ParameterStructure>,
@@ -1078,7 +1085,7 @@ where
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
     Forward: ?Sized + 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
 {
-    let (name, residual_structures, named_axes) = (name.clone(), residual_structures.clone(), named_axes.to_vec());
+    let (name, residual_structures, named_axes) = (name, residual_structures.clone(), named_axes.to_vec());
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
     move |primals: &[CustomRuleTracer<V, O>]| {
         let input_types = Input::To::<V::Type>::from_parameters(
@@ -1615,13 +1622,123 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionType,
-        ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
+        DimensionType, ShardingDimension,
     };
     use crate::batching::BatchAxis;
+    use crate::differentiation::DifferentiationError;
+    use crate::operations::composites::rules::{
+        CustomRuleBatchingRuleKey, CustomRuleRegistration, CustomRuleSpecializationKey, CustomRuleSpecializer,
+    };
     use crate::parameters::Placeholder;
 
     use super::*;
+
+    type ArrayTracer = CustomRuleTracer<Array, ArrayOperation<Array>>;
+    type ArrayDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp() {
+        // The configured callback outlives its configuration and reports the definition's owned name.
+        let registration = {
+            let configuration = ExplicitJvp::<ArrayTracer, Vec<ArrayTracer>> {
+                jvp: Arc::new(|input, tangent| Ok((vec![input.clone(), input], vec![tangent.clone(), tangent]))),
+            };
+            CustomRuleRegistration::new(ArrayDefinition::new(String::from("jvp_definition")).configure_jvp(
+                &configuration,
+                &Placeholder,
+                &vec![Placeholder],
+                0,
+            ))
+        };
+        let key = CustomRuleSpecializationKey {
+            input_types: vec![ArrayType::scalar(DataType::F64)],
+            output_types: vec![ArrayType::scalar(DataType::F64)],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels: Vec::new(),
+            discharged: false,
+        };
+        assert!(matches!(
+            registration.reference().jvp_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{COMPOSITE_OPERATION_NAME}` `jvp_definition` JVP rule output structure mismatch: expected \
+                     {:?} but got {:?}",
+                    [Placeholder],
+                    [Placeholder, Placeholder],
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_vjp() {
+        let registration = {
+            let configuration = ExplicitVjp::<ArrayTracer, Vec<ArrayTracer>, ArrayTracer> {
+                forward: Arc::new(|input| Ok((vec![input.clone(), input.clone()], input))),
+                backward: Arc::new(|residual, _| Ok(residual)),
+                deferred_forward: false,
+            };
+            CustomRuleRegistration::new(ArrayDefinition::new(String::from("vjp_definition")).configure_vjp(
+                &configuration,
+                &Placeholder,
+                &vec![Placeholder],
+                0,
+            ))
+        };
+        let key = CustomRuleSpecializationKey {
+            input_types: vec![ArrayType::scalar(DataType::F64)],
+            output_types: vec![ArrayType::scalar(DataType::F64)],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity: Vec::new(),
+            levels: Vec::new(),
+            discharged: false,
+        };
+        assert!(matches!(
+            registration.reference().forward_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{COMPOSITE_OPERATION_NAME}` `vjp_definition` forward rule output structure mismatch: expected \
+                     {:?} but got {:?}",
+                    [Placeholder],
+                    [Placeholder, Placeholder],
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_batching() {
+        let registration = {
+            let configuration = CustomBatching::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+                rule: Arc::new(|_, input, axis| Ok((vec![input.clone(), input], vec![axis, axis]))),
+            };
+            CustomRuleRegistration::new(ArrayDefinition::new(String::from("batching_definition")).configure_batching(
+                &configuration,
+                &Placeholder,
+                &vec![Placeholder],
+            ))
+        };
+        let key = CustomRuleBatchingRuleKey {
+            level: BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated),
+            boundary_input_types: Vec::new(),
+            input_types: vec![ArrayType::scalar(DataType::F64)],
+            unbatched_input_types: vec![ArrayType::scalar(DataType::F64)],
+            input_axes: vec![BatchAxis::replicated()],
+            discharged: false,
+        };
+        assert!(matches!(
+            registration.reference().batching_rule_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{COMPOSITE_OPERATION_NAME}` `batching_definition` batching rule output structure mismatch: \
+                     expected {:?} but got {:?}",
+                    [Placeholder],
+                    [Placeholder, Placeholder],
+                ),
+        ));
+    }
 
     #[test]
     fn test_retained_custom_batching_rule_leading_boundary_extent() {
@@ -1636,7 +1753,7 @@ mod tests {
         };
         let adapter = retained_custom_batching_rule::<_, _, IrTracer, IrTracer, _>(
             Arc::new(rule),
-            &Cow::Borrowed("rule"),
+            Cow::Borrowed("rule"),
             &Placeholder,
             &Placeholder,
         );
