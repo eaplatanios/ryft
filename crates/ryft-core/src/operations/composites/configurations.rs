@@ -4,7 +4,6 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use crate::Composite;
 use crate::axes::NamedAxis;
 use crate::batching::{BatchAxis, BatchableType, BatchingLevel, BatchingLevelExtent, DiagonalBatchingPolicy};
 use crate::contexts::{EagerContext, StagingContext};
@@ -83,16 +82,15 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Reverse mode configuration of a [`Composite`] without reverse mode rules. Reverse mode then transposes the
-/// forward mode rule, which is derived from the primal when none is configured.
+/// Reverse mode differentiation configuration of a [`Composite`] without configured reverse mode differentiation
+/// rules. Reverse mode differentiation then transposes the forward mode rule, which is derived from the primal when
+/// none is configured. Refer to the documentation of [`composite`] for more information on rule selection.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultVjp;
 
-/// Reverse mode configuration of a [`Composite`] with explicit, user-supplied forward and backward (i.e.,
-/// Vector-Jacobian Product or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, where `r` is a value of
-/// type `Residual` (refer to [`Composite::with_vjp`]).
+/// Reverse mode differentiation configuration of a [`Composite`] with explicit, user-supplied forward and backward
+/// rule closures implementing `x ↦ (y, r)` and the Vector-Jacobian Product (VJP) `(r, ȳ) ↦ x̄`, where `r` is a value
+/// of type `Residual`. Refer to [`Composite::with_vjp`] for more information.
 pub struct ExplicitVjp<Input, Output, Residual> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
@@ -100,7 +98,8 @@ pub struct ExplicitVjp<Input, Output, Residual> {
     /// Closure computing the input cotangent value from `(residuals, output_cotangents)`.
     pub(super) backward: Arc<dyn Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync>,
 
-    /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
+    /// Whether reverse mode differentiation defers `forward` to the backward pass. Refer to
+    /// [`Composite::with_deferred_forward`] for more information.
     pub(super) deferred_forward: bool,
 }
 
@@ -114,11 +113,11 @@ impl<Input, Output, Residual> Debug for ExplicitVjp<Input, Output, Residual> {
     }
 }
 
-/// Reverse mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
-/// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` and returns
-/// `x̄` with [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
-/// [`Composite::with_symbolic_zero_vjp`]). `Tracer` is the tracer type of the closures' leaves, which the leaves of the
-/// seeds and cotangents wrap.
+/// Reverse mode differentiation configuration of a [`Composite`] with user-supplied forward and backward rule closures
+/// implementing `x ↦ (y, r)` and the Vector-Jacobian Product (VJP) `(r, ȳ) ↦ x̄`. The backward rule receives `ȳ` and
+/// returns `x̄` with [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s. `Tracer` is the
+/// tracer type of the closures' leaves, which the leaves of the seeds and cotangents wrap. Refer to
+/// [`Composite::with_symbolic_zero_vjp`] for more information.
 pub struct SymbolicZeroVjp<Tracer: Typed + Parameter, Input, Output, Residual>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -134,7 +133,8 @@ where
             + Sync,
     >,
 
-    /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
+    /// Whether reverse mode differentiation defers `forward` to the backward pass. Refer to
+    /// [`Composite::with_deferred_forward`] for more information.
     pub(super) deferred_forward: bool,
 }
 
@@ -152,10 +152,11 @@ where
     }
 }
 
-/// Reverse mode configuration of a [`Composite`] with a user-supplied forward rule closure implementing `x ↦ (y, r)`
-/// and an accumulating backward rule closure, which submits the input cotangents to their accumulators (refer to
-/// [`Composite::with_accumulating_vjp`]). `Tracer` is the tracer type of the closures' leaves, which the leaves of the
-/// seeds wrap, and `Transposition` is the type of the transposition context that the backward rule closure receives.
+/// Reverse mode differentiation configuration of a [`Composite`] with a user-supplied forward rule closure implementing
+/// `x ↦ (y, r)` and an accumulating backward rule closure, which submits the input cotangents to their accumulators.
+/// `Tracer` is the tracer type of the closures' leaves, which the leaves of the seeds wrap, and `Transposition` is the
+/// type of the transposition context that the backward rule closure receives. Refer to
+/// [`Composite::with_accumulating_vjp`] for more information.
 pub struct AccumulatingVjp<Tracer: Typed + Parameter, Transposition, Input, Output, Residual>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
@@ -166,6 +167,7 @@ where
 
     /// Closure submitting the input cotangents, computed from `(residuals, output_cotangent_seeds)`, to their
     /// accumulators.
+    #[allow(clippy::type_complexity)]
     pub(super) backward: Arc<
         dyn Fn(
                 &mut Transposition,
@@ -177,7 +179,8 @@ where
             + Sync,
     >,
 
-    /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
+    /// Whether reverse mode differentiation defers `forward` to the backward pass. Refer to
+    /// [`Composite::with_deferred_forward`] for more information.
     pub(super) deferred_forward: bool,
 }
 
@@ -196,18 +199,21 @@ where
     }
 }
 
-/// Forward mode configuration of a [`Composite`] (i.e., [`DefaultJvp`], [`ExplicitJvp`], [`SymbolicZeroJvp`], or
-/// [`JvpFromPrimal`]), which installs its forward mode rule in the retained definition that a call registers for the
-/// operation family `(V, O)`. Its user-supplied rule is adapted to the flat interface of retained rules by tracing it,
-/// with the complete structured interface of the call, at the types of each specialization and replaying the traced
-/// program.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Forward mode differentiation configuration of a [`Composite`] that installs its rule in the retained definition
+/// that a call registers for the operation family `(V, O)`. Implemented by [`DefaultJvp`], [`ExplicitJvp`],
+/// [`SymbolicZeroJvp`], and [`JvpFromPrimal`].
+///
+/// A user-supplied rule is adapted to the flat interface of retained rules by tracing it with the complete structured
+/// interface of the call at the types of each specialization and replaying the traced program.
 pub trait CompositeJvp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
-    /// Returns `definition` with this forward mode rule.
+    /// Returns `definition` with this forward mode differentiation rule.
     ///
     /// # Parameters
     ///
@@ -368,20 +374,23 @@ where
     }
 }
 
-/// Reverse mode configuration of a [`Composite`] (i.e., [`DefaultVjp`], [`ExplicitVjp`], [`SymbolicZeroVjp`], or
-/// [`AccumulatingVjp`]), which installs its reverse mode rules in the retained definition that a call registers for the
-/// operation family `(V, O)`. Its user-supplied rules are adapted to the flat interface of retained rules as for
-/// [`CompositeJvp`]. The backward rule receives the residuals with the structure that the forward rule returned for the
-/// same specialization. Different specializations of one call structure may return differently structured residuals, as
-/// long as residuals whose flat types are equal up to a renaming of their type identities (e.g., their dimension
-/// variables) always have the same structure; the forward rule is rejected otherwise.
+/// Reverse mode differentiation configuration of a [`Composite`] that installs its rules in the retained definition
+/// that a call registers for the operation family `(V, O)`. Implemented by [`DefaultVjp`], [`ExplicitVjp`],
+/// [`SymbolicZeroVjp`], and [`AccumulatingVjp`].
+///
+/// User-supplied rules are adapted to the flat interface of retained rules as described for [`CompositeJvp`]. The
+/// backward rule receives the residuals with the structure that the forward rule returned for the same specialization.
+/// Different specializations of one call structure may return differently structured residuals. Residuals whose flat
+/// types are equal up to a renaming of their type identities (e.g., their dimension variables) must always have the
+/// same structure. The forward rule is rejected otherwise.
 pub trait CompositeVjp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
-    /// Returns `definition` with these reverse mode rules (refer to [`CompositeJvp::configure`] for the parameters).
+    /// Returns `definition` with these reverse mode differentiation rules. Refer to [`CompositeJvp::configure`] for the
+    /// parameters.
     fn configure(
         &self,
         definition: CustomRuleDefinition<V, O>,
@@ -657,8 +666,8 @@ where
 pub struct DefaultBatching;
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
-/// `(extent, x, x_axes) ↦ (y, y_axes)` (refer to [`Composite::with_batching`]). `Tracer` is the tracer type of the
-/// closure's leaves, which is also the type of dynamic extents.
+/// `(extent, x, x_axes) ↦ (y, y_axes)`. `Tracer` is the tracer type of the closure's leaves, which is also the type of
+/// dynamic extents. Refer to [`Composite::with_batching`] for more information.
 ///
 /// The name follows the vocabulary of JAX's
 /// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html) for a
@@ -692,9 +701,9 @@ where
 }
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
-/// `(extent, x, x_axes) ↦ (y, y_axes)` whose result may depend on its input batch axes (refer to
-/// [`Composite::with_axis_dependent_batching`]). `Tracer` is the tracer type of the closure's leaves, which is also the
-/// type of dynamic extents.
+/// `(extent, x, x_axes) ↦ (y, y_axes)` whose result may depend on its input batch axes. `Tracer` is the tracer type of
+/// the closure's leaves, which is also the type of dynamic extents. Refer to
+/// [`Composite::with_axis_dependent_batching`] for more information.
 pub struct AxisDependentBatching<Tracer: Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -723,13 +732,13 @@ where
 }
 
 /// Batching configuration of a [`Composite`] that batches its calls sequentially, by looping over the batch items with
-/// a scan (refer to [`Composite::with_sequential_batching`]).
+/// a scan. Refer to [`Composite::with_sequential_batching`] for more information.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SequentialBatching;
 
-/// Batching configuration of a [`Composite`] (i.e., [`DefaultBatching`], [`CustomBatching`], [`AxisDependentBatching`],
-/// or [`SequentialBatching`]), which installs its custom batching rule or sequential batching, if any, in the retained
-/// definition that a call registers for the operation family `(V, O)`.
+/// Batching configuration of a [`Composite`] that installs its custom batching rule or sequential batching, if any, in
+/// the retained definition that a call registers for the operation family `(V, O)`. Implemented by [`DefaultBatching`],
+/// [`CustomBatching`], [`AxisDependentBatching`], and [`SequentialBatching`].
 pub trait CompositeBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -860,8 +869,8 @@ where
 }
 
 /// Adapts the structured custom batching rule closure `rule` of a [`Composite`] to the flat interface of retained
-/// batching rules: each invocation passes the closure the level's extent, the call's own batched inputs with the call's
-/// input structure, and their batch axes, and validates that its outputs and their batch axes have the call's output
+/// batching rules. Each invocation passes the closure the level's extent, the call's own batched inputs with the call's
+/// input structure, and their batch axes. It validates that the outputs and their batch axes have the call's output
 /// structure.
 ///
 /// # Parameters
@@ -958,8 +967,8 @@ where
 /// learns the structure of the residuals that it receives as flat leading inputs. The backward rule of each
 /// specialization is traced after the forward rule of that specialization, but specializations of one call structure
 /// may return differently structured residuals (e.g., collections whose lengths depend on the input shapes), so the
-/// structures are recorded by the flat residual types that the forward rule returned, and only two structures with
-/// equivalent flat residual types are ambiguous.
+/// structures are recorded by the flat residual types that the forward rule returned. Different structures are
+/// ambiguous only when their flat residual types are equivalent.
 ///
 /// Flat residual types are compared up to a bijective renaming of their type identities, because the backward rule
 /// observes the residuals of a replay of the traced forward rule. Replaying a program that computes type identities
@@ -1028,9 +1037,9 @@ impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
     }
 }
 
-/// Adapts the structured reverse mode forward closure `forward` of a [`Composite`] to the flat interface of retained
-/// forward rules: each invocation traces the closure at the types of its primal inputs, records the structure of its
-/// residuals in `residual_structures`, and replays the traced program on the primal inputs.
+/// Adapts the structured forward rule closure `forward` for reverse mode differentiation of a [`Composite`] to the
+/// flat interface of retained forward rules. Each invocation traces the closure at the types of its primal inputs,
+/// records the residual structure in `residual_structures`, and replays the traced program on the primal inputs.
 ///
 /// # Parameters
 ///
@@ -1039,8 +1048,8 @@ impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
 ///   - `input_structure`: Structure of the call's inputs.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `residual_structures`: Residual structures shared with the backward rule of the same registration.
-///   - `named_axes`: Named axes with which the closure is traced (refer to
-///     [`CustomRuleDefinition::with_named_axes`]).
+///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
+///     for more information.
 fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     forward: Arc<Forward>,
     name: &Cow<'static, str>,
@@ -1094,10 +1103,9 @@ where
 /// Traces the structured custom Vector-Jacobian Product (VJP) forward closure `forward` at `input_types` in the
 /// `(V, O)` family and returns the structure and flat types of its residuals together with its flat rule program over
 /// the call's inputs, which returns `[outputs..., residuals...]`. The closure's outputs must have the primal output
-/// structure `output_structure`, because matching flattened types do not establish matching nested collection lengths,
-/// and every reference-typed residual must be an input forwarded by identity, because reference residuals preserve
-/// handles rather than snapshots (the reference boundary separately requires reference inputs to be
-/// non-differentiated).
+/// structure `output_structure`, because matching flattened types do not establish matching nested collection lengths.
+/// Every residual with a reference type must be an input forwarded by identity, because reference residuals preserve
+/// handles rather than snapshots. The reference boundary separately requires reference inputs to be non-differentiated.
 ///
 /// # Parameters
 ///
@@ -1105,8 +1113,8 @@ where
 ///   - `forward`: Closure implementing `x ↦ (y, r)`.
 ///   - `input_types`: Types of the call's inputs, with the call's input structure.
 ///   - `output_structure`: Structure of the call's primal outputs.
-///   - `named_axes`: Named axes with which the closure is traced (refer to
-///     [`CustomRuleDefinition::with_named_axes`]).
+///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
+///     for more information.
 fn trace_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     name: &str,
     forward: &Forward,
@@ -1179,8 +1187,8 @@ where
 /// Traces the structured custom Vector-Jacobian Product (VJP) backward closure `backward` in the `(V, O)` family and
 /// returns its flat rule program over `[non_differentiated_inputs..., residuals..., output_cotangents...]`, which
 /// returns one cotangent per differentiated input. The closure sees only the residuals and the output cotangents, so
-/// the leading non-differentiated inputs are declared as unused program inputs (a plumbing value that the backward rule
-/// needs is forwarded to it as a residual), and the input-shaped cotangent value that the closure returns must have the
+/// the leading non-differentiated inputs are declared as unused program inputs. Any of those inputs needed by the
+/// backward rule must be forwarded to it as residuals. The cotangent value that the closure returns must have the
 /// call's input structure `input_structure` before its leading non-differentiated leaves are dropped.
 ///
 /// # Parameters
@@ -1193,8 +1201,8 @@ where
 ///   - `residual_types`: Flat types of those residuals.
 ///   - `output_structure`: Structure of the call's outputs.
 ///   - `output_cotangent_types`: Flat cotangent types of the call's outputs.
-///   - `named_axes`: Named axes with which the closure is traced (refer to
-///     [`CustomRuleDefinition::with_named_axes`]).
+///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
+///     for more information.
 fn trace_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
     name: &str,
     backward: &Backward,
@@ -1252,10 +1260,11 @@ where
 /// structural zeros, in the `(V, O)` family and returns its flat rule program over
 /// `[non_differentiated_inputs..., residuals..., non_zero_output_cotangents...]`, which returns the cotangent of each
 /// differentiated input that is not a structural zero, together with the type of each differentiated input's
-/// structural-zero cotangent (or [`None`] for a cotangent that the program returns). The closure receives a seed value
-/// whose leaves are the non-zero seeds and [`MaybeZero::Zero`]s at the positions of the structural-zero seeds, it
+/// structural zero cotangent (or [`None`] for a cotangent that the program returns). The closure receives a seed value
+/// whose leaves are the live seeds and [`MaybeZero::Zero`]s at the positions of the structural zero seeds. It
 /// returns a cotangent value whose leaves are [`MaybeZero`]s (i.e., the analogue of a JAX backward rule returning
-/// `None` or a `SymbolicZero` for an input), and it is otherwise validated as by [`trace_custom_vjp_backward_rule`].
+/// `None` or a `SymbolicZero` for an input). Refer to [`trace_custom_vjp_backward_rule`] for the remaining validation
+/// requirements.
 ///
 /// # Parameters
 ///
@@ -1267,8 +1276,8 @@ where
 ///   - `residual_types`: Flat types of those residuals.
 ///   - `output_structure`: Structure of the call's outputs.
 ///   - `seeds`: Output cotangent seeds, of which only the types and the structural zeros are used.
-///   - `named_axes`: Named axes with which the closure is traced (refer to
-///     [`CustomRuleDefinition::with_named_axes`]).
+///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
+///     for more information.
 fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
     name: &str,
     backward: &Backward,
@@ -1355,9 +1364,9 @@ where
 /// returns its flat rule program over `[inputs..., differentiated_input_tangents...]`, which returns
 /// `[outputs..., output_tangents...]`. Both halves of the closure's result must have the primal output structure
 /// `output_structure`, because flattened signatures cannot distinguish differently nested collections with identical
-/// leaf types, and the tangent placeholders of the leading `non_differentiated_count` inputs must be unused (refer to
-/// [`without_non_differentiated_tangent_inputs`]). The retained JVP rules of [`Composite`]s are traced with this
-/// function on their first derivative request.
+/// leaf types. The tangent placeholders of the leading `non_differentiated_count` inputs must be unused. Refer to
+/// [`without_non_differentiated_tangent_inputs`] for more information. The retained JVP rules of [`Composite`]s are
+/// traced with this function on their first derivative request.
 ///
 /// # Parameters
 ///
@@ -1366,8 +1375,8 @@ where
 ///   - `input_types`: Types of the call's inputs, with the call's input structure.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
-///   - `named_axes`: Named axes with which the closure is traced (refer to
-///     [`CustomRuleDefinition::with_named_axes`]).
+///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
+///     for more information.
 fn trace_custom_jvp_rule<V, O, Input, Output, Jvp>(
     name: &str,
     jvp: &Jvp,
@@ -1422,8 +1431,8 @@ where
 ///   - `tangent_activity`: Whether the tangent of each differentiated input is active.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
-///   - `named_axes`: Named axes with which the closure is traced (refer to
-///     [`CustomRuleDefinition::with_named_axes`]).
+///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
+///     for more information.
 fn trace_symbolic_zero_custom_jvp_rule<V, O, Input, Output, Jvp>(
     name: &str,
     jvp: &Jvp,
@@ -1548,10 +1557,11 @@ fn rule_structure_mismatch<Structure: Debug>(
     ))
 }
 
-/// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
-/// rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
-/// non-differentiated input has no tangent slot in the [`CompositeOperation`] contract, so its tangent input is a
-/// placeholder that the rule must ignore. The traced program has inputs `[inputs..., input_tangents...]`, and the
+/// Removes the tangent inputs that a traced Jacobian-Vector Product (JVP) rule declares for the leading
+/// `non_differentiated_count` inputs. The rule closure receives one tangent per input so that its signature mirrors
+/// the primal signature, but a non-differentiated input has no tangent slot in the
+/// [`CompositeOperation`](crate::operations::composites::operations::CompositeOperation) contract, so its tangent input
+/// is a placeholder that the rule must ignore. The traced program has inputs `[inputs..., input_tangents...]`, and the
 /// placeholders are the tangents at positions `input_count..input_count + non_differentiated_count`, which are
 /// projected away so that the remaining boundary is exactly `[inputs..., differentiated_input_tangents...]`.
 ///
