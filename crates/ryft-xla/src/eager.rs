@@ -3008,11 +3008,11 @@ mod tests {
     }
 
     /// A composite whose batching rule depends on its input batch axes (`2xy` when both inputs are mapped and `3xy`
-    /// otherwise) and is configured as axis-dependent batches its derivative in eager XLA with the exact per-item
+    /// otherwise) and is configured as broadcast sensitive batches its derivative in eager XLA with the exact per-item
     /// tangents `3(ẋy + xẏ)` when `y` is replicated but its tangent is mapped, which requires taking a diagonal on
     /// device.
     #[test]
-    fn test_eager_composite_with_axis_dependent_batching_rule() {
+    fn test_eager_composite_with_broadcast_sensitive_batching_rule() {
         use ryft_core::{BatchingLevelExtent, DomainTracer, composite};
 
         let plugin = load_cpu_plugin().unwrap();
@@ -3023,7 +3023,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
-        let function = composite(|(x, y): (Tracer<'_>, Tracer<'_>)| Ok(x * y)).with_axis_dependent_batching(
+        let function = composite(|(x, y): (Tracer<'_>, Tracer<'_>)| Ok(x * y)).with_broadcast_sensitive_batching(
             |(x, y): (Tracer<'_>, Tracer<'_>),
              (x_axis, y_axis): (BatchAxis, BatchAxis),
              _: BatchingLevelExtent<Tracer<'_>>| {

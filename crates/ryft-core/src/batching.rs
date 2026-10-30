@@ -935,7 +935,8 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
 /// itself already batched), the per-item result of item `i` is the element at index `i` along both batch axes, and the
 /// remaining elements form the outer product of the two batches. Composites whose batching rules depend on their input
 /// batch axes use this capability to recover exact per-item tangents from such an outer product. Refer to
-/// [`Composite::with_axis_dependent_batching`](crate::Composite::with_axis_dependent_batching) for more information.
+/// [`Composite::with_broadcast_sensitive_batching`](crate::Composite::with_broadcast_sensitive_batching)
+/// for more information.
 pub trait DiagonalBatchingPolicy<C: Context>: BatchingPolicy<C> {
     /// Returns the elements of `value` whose indices along `kept_axis` and `removed_axis` agree. The result has
     /// the shape of `value` without `removed_axis`, so `kept_axis` moves one position earlier when it follows

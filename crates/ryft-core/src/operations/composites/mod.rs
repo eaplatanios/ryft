@@ -57,8 +57,8 @@ pub use builders::{
     check_batching_rule_consistency, composite,
 };
 pub use configurations::{
-    AccumulatingVjp, AxisDependentBatching, CompositeBatching, CompositeJvp, CompositeVjp, CustomBatching,
-    DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
+    AccumulatingVjp, BroadcastInvariantBatching, BroadcastSensitiveBatching, CompositeBatching, CompositeJvp,
+    CompositeVjp, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
 pub use operations::{

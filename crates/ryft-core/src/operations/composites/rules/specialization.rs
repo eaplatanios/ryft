@@ -22,7 +22,7 @@ use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
 use crate::operations::composites::rules::definition::{
-    CustomRuleAxisDependence, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomVjpOperation,
+    CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomVjpOperation,
 };
 use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
@@ -223,7 +223,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
     ///     mapped, because the rule cannot apply per-item perturbations of a shared input otherwise; only then is the
     ///     rule applied twice (i.e., once at the primal axes for the primal outputs and once at the aligned axes for
     ///     the tangents). When the source's rule depends on its input batch axes (refer to
-    ///     [`CustomRuleDefinition::with_axis_dependent_batching_rule`]), the rule is instead applied once, at the
+    ///     [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]), the rule is instead applied once, at the
     ///     primal axes, and the tangents of such primals are recovered exactly from an outer product (refer to
     ///     [`DiagonalBatchingPolicy`]).
     ///
@@ -861,7 +861,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 jvp: Some(CustomRuleJvp::Primal),
                 batcher: self.definition.batcher.clone(),
                 differentiator: self.definition.differentiator.clone(),
-                axis_dependence: self.definition.axis_dependence.clone(),
+                broadcast_sensitivity: self.definition.broadcast_sensitivity.clone(),
                 derivation,
                 sequential_scan: self.definition.sequential_scan.clone(),
                 discharger: self.definition.discharger.clone(),
@@ -1540,13 +1540,13 @@ where
             aligned_axes[primal_count + tangent] = axis;
         }
         let broadcasts_primals = aligned_axes[..primal_count] != *primal_axes;
-        if broadcasts_primals && let Some(axis_dependence) = &source.axis_dependence {
-            return self.axis_dependent_batching_rule_specialization(
+        if broadcasts_primals && let Some(broadcast_sensitivity) = &source.broadcast_sensitivity {
+            return self.broadcast_sensitive_batching_rule_specialization(
                 name,
                 key,
                 &primal_rule,
                 &tangent_primal_indices,
-                axis_dependence.as_ref(),
+                broadcast_sensitivity.as_ref(),
                 differentiator.as_ref(),
                 batcher.as_ref(),
             );
@@ -1626,7 +1626,7 @@ where
 
     /// Returns the batched program of a derived call for `key` when its source batching rule depends on its input batch
     /// axes and some replicated primal input has a mapped tangent (refer to
-    /// [`CustomRuleDefinition::with_axis_dependent_batching_rule`]). The rule is applied once, at the primal inputs'
+    /// [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]). It is applied once, at the primal inputs'
     /// own batch axes, as `P`, which computes the primal outputs. The tangents are the sum of two contributions:
     ///
     ///   - **Following:** the JVP of `P` with respect to the tangents that can follow their primal's batch axis, after
@@ -1643,16 +1643,16 @@ where
     ///   - `primal_rule`: Source rule applied at the primal inputs' batch axes (i.e., `P`).
     ///   - `tangent_primal_indices`: Index of the primal input of each active tangent, among the derived call's primal
     ///     inputs.
-    ///   - `axis_dependence`: Operations of the source definition that take diagonals and add contributions.
+    ///   - `broadcast_sensitivity`: Operations of the source definition that take diagonals and add contributions.
     ///   - `differentiator`: Differentiator of the source definition.
     ///   - `batcher`: Batcher of the source definition.
-    fn axis_dependent_batching_rule_specialization(
+    fn broadcast_sensitive_batching_rule_specialization(
         &self,
         name: &str,
         key: &CustomRuleBatchingRuleKey<V::Type>,
         primal_rule: &CustomRuleProgram<V, O>,
         tangent_primal_indices: &[usize],
-        axis_dependence: &dyn CustomRuleAxisDependence<V, O>,
+        broadcast_sensitivity: &dyn CustomRuleBroadcastSensitivity<V, O>,
         differentiator: &CustomRuleDifferentiator<V, O>,
         batcher: &CustomRuleBatcher<V, O>,
     ) -> Result<CustomRuleSpecialization<V, O>, DifferentiationError> {
@@ -1864,13 +1864,15 @@ where
                             // position does not exceed that axis's position in `P`'s output.
                             let axis = position(axis)?;
                             let kept_axis = if outer_axis <= axis { axis + 1 } else { axis };
-                            Some(axis_dependence.diagonal(&outer_outputs[*index], kept_axis, outer_axis)?)
+                            Some(broadcast_sensitivity.diagonal(&outer_outputs[*index], kept_axis, outer_axis)?)
                         }
                     };
                     let following = following.map(|index| following_outputs[index].clone());
                     // Every recorded output has at least one contribution.
                     outputs.push(match (following, tangent_only) {
-                        (Some(following), Some(tangent_only)) => axis_dependence.add(&following, &tangent_only)?,
+                        (Some(following), Some(tangent_only)) => {
+                            broadcast_sensitivity.add(&following, &tangent_only)?
+                        }
                         (Some(tangent), None) => tangent,
                         (None, tangent) => tangent.unwrap(),
                     });
@@ -1886,7 +1888,7 @@ where
     /// Returns the Jacobian-Vector Product (JVP) program of the source rule's batched `program` with respect to
     /// `input_indices`, restricted to its tangent outputs when `tangents_only` is set, after validating that its live
     /// tangent outputs are those of the derived calls. The derivatives with respect to subsets of the active inputs
-    /// (refer to [`Self::axis_dependent_batching_rule_specialization`]) use [`Self::partial_jvp_program`] instead.
+    /// (refer to [`Self::broadcast_sensitive_batching_rule_specialization`]) use [`Self::partial_jvp_program`] instead.
     ///
     /// # Parameters
     ///
@@ -2199,11 +2201,11 @@ mod tests {
     use super::*;
 
     /// Returns a registration of `(x, y) ↦ x · y` whose forward mode rule is derived from its primal and whose custom
-    /// batching rule maps the product along the first mapped input axis, which is axis-dependent when `axis_dependent`
-    /// is set and has batching support when `batching_support` is set.
+    /// batching rule maps the product along the first mapped input axis. The registration uses broadcast sensitive
+    /// batching when `broadcast_sensitive` is set and has batching support when `batching_support` is set.
     fn product_registration(
         batching_support: bool,
-        axis_dependent: bool,
+        broadcast_sensitive: bool,
     ) -> CustomRuleRegistration<Array, ArrayOperation<Array>> {
         let rule = |inputs: &[MemberTracer], axes: &[BatchAxis], _: &BatchingLevel<ArrayType>, _: &[MemberTracer]| {
             let axis = if axes[0].is_replicated() { axes[1] } else { axes[0] };
@@ -2213,8 +2215,8 @@ mod tests {
         if batching_support {
             definition = definition.with_batching_support();
         }
-        CustomRuleRegistration::new(match axis_dependent {
-            true => definition.with_axis_dependent_batching_rule(rule),
+        CustomRuleRegistration::new(match broadcast_sensitive {
+            true => definition.with_broadcast_sensitive_batching_rule(rule),
             false => definition.with_batching_rule(rule),
         })
     }
@@ -2891,9 +2893,9 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_derivation_axis_dependent_batching_rule_specialization() {
-        // An axis-dependent source rule is applied once, at the primal axes, and the tangent `xẏ` of the replicated `y`
-        // is the diagonal of the outer product of its mapped tangent with the rule's batch.
+    fn test_custom_rule_derivation_broadcast_sensitive_batching_rule_specialization() {
+        // A broadcast sensitive source rule is applied once, at the primal axes, and the tangent `xẏ` of the replicated
+        // `y` is the diagonal of the outer product of its mapped tangent with the rule's batch.
         let registration = product_registration(true, true);
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F64, [3]);

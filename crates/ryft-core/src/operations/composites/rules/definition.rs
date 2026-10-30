@@ -336,9 +336,9 @@ where
     }
 }
 
-/// Operations with which the derived batching rules of an axis-dependent custom batching rule recover exact per-item
-/// tangents (refer to [`CustomRuleDefinition::with_axis_dependent_batching_rule`]).
-pub(super) trait CustomRuleAxisDependence<V, O>: Send + Sync {
+/// Operations with which the derived batching rules of a broadcast sensitive custom batching rule recover exact
+/// per-item tangents (refer to [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]).
+pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
     /// Returns the elements of `value` whose indices along two of its batch axes of equal extent agree (refer to
     /// [`DiagonalBatchingPolicy::diagonal`]).
     fn diagonal(
@@ -364,11 +364,11 @@ pub(super) trait CustomRuleAxisDependence<V, O>: Send + Sync {
         O: Operation<Type = V::Type>;
 }
 
-/// [`CustomRuleAxisDependence`] that takes diagonals with the canonical batching policy of the family's type universe
-/// and adds values with [`AddOperation`].
-struct PolicyAxisDependence<V, O>(PhantomData<fn() -> (V, O)>);
+/// [`CustomRuleBroadcastSensitivity`] that takes diagonals with the canonical batching policy of the family's type
+/// universe and adds values with [`AddOperation`].
+struct PolicyBroadcastSensitivity<V, O>(PhantomData<fn() -> (V, O)>);
 
-impl<V, O> CustomRuleAxisDependence<V, O> for PolicyAxisDependence<V, O>
+impl<V, O> CustomRuleBroadcastSensitivity<V, O> for PolicyBroadcastSensitivity<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
@@ -547,8 +547,8 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
 
     /// Operations with which the batching rules of the definitions derived from this definition recover exact per-item
     /// tangents, present when [`Self::batching_rule`] depends on its input batch axes (refer to
-    /// [`Self::with_axis_dependent_batching_rule`]).
-    pub(super) axis_dependence: Option<Arc<dyn CustomRuleAxisDependence<V, O>>>,
+    /// [`Self::with_broadcast_sensitive_batching_rule`]).
+    pub(super) broadcast_sensitivity: Option<Arc<dyn CustomRuleBroadcastSensitivity<V, O>>>,
 
     /// Derivation of this definition from a source definition, whose batching rule this definition's calls apply
     /// instead of [`Self::batching_rule`] (refer to [`CustomRuleDerivation`]).
@@ -589,7 +589,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             batched_output_axes: None,
             batching_rule: None,
             differentiator: None,
-            axis_dependence: None,
+            broadcast_sensitivity: None,
             derivation: None,
             sequential_scan: None,
             discharger: None,
@@ -901,17 +901,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     }
 
     /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which is used as the rule of
-    /// [`Self::with_batching_rule`] except that its result may depend on its input batch axes beyond computing the
-    /// batched primal for them (e.g., a rule that applies a different approximation when an input is replicated). A
-    /// batching rule that only computes the batched primal gives the same values whether a replicated input is
-    /// broadcast or not, so the derived batching rules of a call whose forward mode rule is derived from its primal
-    /// apply it with a replicated primal broadcast when that primal's tangent is mapped. For an axis-dependent rule,
-    /// they instead apply it once, at the primal inputs' own batch axes, and recover the per-item tangents of such
-    /// inputs from the outer product of their mapped tangents with the rule's batch (i.e., by batching the rule's
-    /// derivative with respect to them over a second level of the same extent and taking the diagonal of the two batch
-    /// axes; refer to [`DiagonalBatchingPolicy`]). This costs as many applications of that derivative as the batch has
-    /// items, which is why it is not the default (refer to [`CustomRuleSpecializer::derived`]).
-    pub fn with_axis_dependent_batching_rule<R>(self, rule: R) -> Self
+    /// [`Self::with_batching_rule`] except that its per-item numerical behavior may change when a replicated input is
+    /// broadcast (e.g., a rule that applies a different approximation when an input is replicated). A batching rule
+    /// that only computes the batched primal gives the same values whether a replicated input is broadcast or not, so
+    /// the derived batching rules of a call whose forward mode rule is derived from its primal apply it with a
+    /// replicated primal broadcast when that primal's tangent is mapped. For a broadcast sensitive rule, they instead
+    /// apply it once, at the primal inputs' own batch axes, and recover the per-item tangents of such inputs from the
+    /// outer product of their mapped tangents with the rule's batch (i.e., by batching the rule's derivative with
+    /// respect to them over a second level of the same extent and taking the diagonal of the two batch axes; refer to
+    /// [`DiagonalBatchingPolicy`]). This costs as many applications of that derivative as the batch has items, which
+    /// is why it is not the default (refer to [`CustomRuleSpecializer::derived`]).
+    pub fn with_broadcast_sensitive_batching_rule<R>(self, rule: R) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static
@@ -934,7 +934,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
     {
         let mut definition = self.with_batching_rule(rule);
-        definition.axis_dependence = Some(Arc::new(PolicyAxisDependence(PhantomData)));
+        definition.broadcast_sensitivity = Some(Arc::new(PolicyBroadcastSensitivity(PhantomData)));
         definition
     }
 
@@ -1654,24 +1654,24 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_definition_with_axis_dependent_batching_rule() {
+    fn test_custom_rule_definition_with_broadcast_sensitive_batching_rule() {
         // The rule batches calls exactly as a plain batching rule does, and it records the operations with which the
         // derived definitions recover exact per-item tangents (refer to the `CustomRuleDerivation` tests).
         let rule = |inputs: &[MemberTracer], axes: &[BatchAxis], _: &BatchingLevel<ArrayType>, _: &[MemberTracer]| {
             Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[0].clone()], axes.to_vec()))
         };
         let plain = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(rule));
-        let axis_dependent =
-            CustomRuleRegistration::new(MemberDefinition::new("square").with_axis_dependent_batching_rule(rule));
-        assert!(axis_dependent.reference().has_batching_rule());
-        assert!(axis_dependent.definition().axis_dependence.is_some());
-        assert!(plain.definition().axis_dependence.is_none());
+        let broadcast_sensitive =
+            CustomRuleRegistration::new(MemberDefinition::new("square").with_broadcast_sensitive_batching_rule(rule));
+        assert!(broadcast_sensitive.reference().has_batching_rule());
+        assert!(broadcast_sensitive.definition().broadcast_sensitivity.is_some());
+        assert!(plain.definition().broadcast_sensitivity.is_none());
         let key = batching_rule_key(
             vec![ArrayType::new_static(DataType::F64, [3])],
             vec![ArrayType::scalar(DataType::F64)],
             vec![BatchAxis::new(0)],
         );
-        let specialization = axis_dependent.reference().batching_rule_specialization(key.clone()).unwrap();
+        let specialization = broadcast_sensitive.reference().batching_rule_specialization(key.clone()).unwrap();
         let plain_specialization = plain.reference().batching_rule_specialization(key).unwrap();
         assert_eq!(specialization.output_axes, plain_specialization.output_axes);
         assert_eq!(specialization.program.to_string(), plain_specialization.program.to_string());

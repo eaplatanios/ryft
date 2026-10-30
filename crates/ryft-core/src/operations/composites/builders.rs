@@ -19,8 +19,8 @@ use crate::batching::{
 use crate::contexts::Context;
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType};
 use crate::operations::composites::configurations::{
-    AccumulatingVjp, AxisDependentBatching, CompositeBatching, CompositeJvp, CompositeVjp, CustomBatching,
-    DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
+    AccumulatingVjp, BroadcastInvariantBatching, BroadcastSensitiveBatching, CompositeBatching, CompositeJvp,
+    CompositeVjp, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, CompositeOperation};
@@ -47,7 +47,7 @@ use crate::programs::Program;
 pub enum BatchingRuleConsistencyError {
     /// Broadcasting a replicated input changes a batched output, so the batching rule behind the function depends on
     /// its input batch axes beyond computing the batched function (refer to
-    /// [`Composite::with_axis_dependent_batching`]).
+    /// [`Composite::with_broadcast_sensitive_batching`]).
     #[error("broadcasting the replicated input leaf {input} changes the batched output leaf {output}")]
     Inconsistent {
         /// Index of the replicated input leaf whose broadcast changes the batched outputs.
@@ -256,7 +256,7 @@ pub type VjpComposite<Input, Output, Residual> =
 /// names the type of such a function by its tracer, input, and output types alone (e.g., for storing it in a struct
 /// field).
 pub type BatchedComposite<Tracer, Input, Output> =
-    Composite<Input, Output, DefaultJvp, DefaultVjp, CustomBatching<Tracer, Input, Output>>;
+    Composite<Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<Tracer, Input, Output>>;
 
 impl<V: CustomCall> Composite<Vec<V>, Vec<V>> {
     /// Creates a [`Composite`], without any custom rule, whose primal calls the foreign kernel described by `operation`
@@ -847,7 +847,8 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     /// (i.e., an `Input::To<BatchAxis>` value), and the extent of the batch axis (i.e., [`BatchingLevelExtent::Static`]
     /// for a host extent, or [`BatchingLevelExtent::Dynamic`] with a first-class extent value). It returns the batched
     /// outputs together with their batch axes (i.e., an `Output::To<BatchAxis>` value). A replicated input axis means
-    /// that the input is the same for every batch item.
+    /// that the input is the same for every batch item. Broadcasting a replicated input must preserve the rule's
+    /// per-item numerical behavior.
     ///
     /// `Tracer` must usually be annotated, because it cannot be inferred from `Input` or `Output` (a [`Parameterized`]
     /// structure is generic over its leaf type): annotate the extent parameter of the closure (e.g., as
@@ -878,9 +879,9 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     ///     primal broadcast. That gives the per-item derivatives of the batched primal for every rule that only
     ///     computes the batched primal for the batch axes that it receives, because such a rule computes the same
     ///     values whether the primal is broadcast or not. A rule whose result depends on its input axes beyond that
-    ///     should use [`Self::with_axis_dependent_batching`] instead, which recovers the exact per-item tangents of
-    ///     such inputs from the outer product of their tangents' batch with the rule's batch (i.e., the diagonal of the
-    ///     outer product that JAX returns for them when another input is mapped). When every primal is replicated
+    ///     should use [`Self::with_broadcast_sensitive_batching`] instead, which recovers the exact per-item tangents
+    ///     of such inputs from the outer product of their tangents' batch with the rule's batch (i.e., the diagonal of
+    ///     the outer product that JAX returns for them when another input is mapped). When every primal is replicated
     ///     (e.g., in a forward mode Jacobian), it applies the rule with every input replicated and batches the rule's
     ///     derivative structurally, so the rule must also accept calls without mapped inputs. Linearization computes
     ///     the outputs with the call itself and recomputes the primal inside the staged pushforward, because the call
@@ -898,7 +899,7 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     pub fn with_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> Composite<Input, Output, Jvp, Vjp, CustomBatching<Tracer, Input, Output>>
+    ) -> Composite<Input, Output, Jvp, Vjp, BroadcastInvariantBatching<Tracer, Input, Output>>
     where
         Tracer: Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -913,14 +914,13 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
             + Sync,
     {
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
-        let batching = CustomBatching { rule: Arc::new(rule) };
+        let batching = BroadcastInvariantBatching { rule: Arc::new(rule) };
         Self::with_configuration(primal, jvp, vjp, batching, None, non_differentiated_count, name)
     }
 
     /// Returns this function with the provided custom batching rule `(x, x_axes, extent) ↦ (y, y_axes)`, which is used
-    /// as the rule of [`Self::with_batching`] except that its result may depend on its input batch axes beyond
-    /// computing the batched primal for them (e.g., a rule that applies a different approximation when an input is
-    /// replicated, so that it does not compute the same values when that input is broadcast instead). This only
+    /// as the rule of [`Self::with_batching`] except that its per-item numerical behavior may change when a replicated
+    /// input is broadcast (e.g., a rule that applies a different approximation when an input is replicated). This only
     /// changes how derivatives derived from the primal are batched (refer to the derivatives section of
     /// [`Self::with_batching`]): when a replicated primal has a mapped tangent while another input is mapped, the
     /// rule is still applied once, at the primal inputs' own batch axes, and the per-item tangents of such inputs are
@@ -935,10 +935,10 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     /// diagonals (refer to [`DiagonalBatchingPolicy`]). `Tracer` must usually be annotated, as for
     /// [`Self::with_batching`].
     #[inline]
-    pub fn with_axis_dependent_batching<Tracer, Rule>(
+    pub fn with_broadcast_sensitive_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> Composite<Input, Output, Jvp, Vjp, AxisDependentBatching<Tracer, Input, Output>>
+    ) -> Composite<Input, Output, Jvp, Vjp, BroadcastSensitiveBatching<Tracer, Input, Output>>
     where
         Tracer: Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -953,7 +953,7 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
             + Sync,
     {
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
-        let batching = AxisDependentBatching { rule: Arc::new(rule) };
+        let batching = BroadcastSensitiveBatching { rule: Arc::new(rule) };
         Self::with_configuration(primal, jvp, vjp, batching, None, non_differentiated_count, name)
     }
 
@@ -1324,7 +1324,7 @@ pub fn composite<Input, Output, Primal: 'static + Fn(Input) -> Result<Output, Pr
 
 /// Checks on sample values whether the batching rule behind `function` depends on its input batch axes beyond computing
 /// the batched function, which is what decides between [`Composite::with_batching`] and
-/// [`Composite::with_axis_dependent_batching`] (the former is exact only for rules that do not). The function is
+/// [`Composite::with_broadcast_sensitive_batching`] (the former is exact only for rules that do not). The function is
 /// batched once at `input_batch_axes`, and then once for each replicated input leaf with that leaf broadcast along the
 /// batch instead. Every batched output is mapped at axis `0`, and the outputs of each broadcast batch are compared with
 /// those of the first batch by `equivalent` (e.g., exact equality, or equality within a numerical tolerance for a rule
@@ -1333,7 +1333,7 @@ pub fn composite<Input, Output, Primal: 'static + Fn(Input) -> Result<Output, Pr
 ///
 /// Passing the check on samples does not prove that the rule is independent of its axes, but failing it proves that it
 /// is not, in which case the function's derivatives batched with a replicated primal whose tangent is mapped require
-/// [`Composite::with_axis_dependent_batching`] to be the per-item derivatives of its batched primal.
+/// [`Composite::with_broadcast_sensitive_batching`] to be the per-item derivatives of its batched primal.
 ///
 /// # Parameters
 ///
@@ -4251,10 +4251,10 @@ mod tests {
             (vec![primal, Array::vector(vec![12.0f64, 18.0, 24.0]).unwrap()], vec![mapped; 2]),
         );
 
-        // An axis-dependent configuration of the same rule applies it once, at the primal axes, in the first case too,
-        // and recovers the per-item tangents of the replicated `y` from the outer product of its batch of tangents with
-        // the rule's batch, so they are exactly the per-item derivatives `3(ẋy + xẏ)` of the batched primal `3xy`.
-        let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_axis_dependent_batching(
+        // A broadcast sensitive configuration of the same rule applies it once, at the primal axes, in the first case
+        // too, and recovers the per-item tangents of the replicated `y` from the outer product of its batch of tangents
+        // with the rule's batch, so they are exactly the per-item derivatives `3(ẋy + xẏ)` of the batched primal `3xy`.
+        let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_broadcast_sensitive_batching(
             |(x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis), _: BatchingLevelExtent<Tracer>| {
                 let product = x * y;
                 let scale = if x_axis.is_replicated() || y_axis.is_replicated() { 3.0 } else { 2.0 };
@@ -4846,11 +4846,11 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_with_axis_dependent_batching() {
+    fn test_composite_with_broadcast_sensitive_batching() {
         // The rule of `(x, y, z) ↦ (xy, yz)` computes the batched products for every batch axis pattern, so it does not
-        // depend on its axes, and the axis-dependent configuration must give exactly the per-item derivatives that the
-        // plain configuration gives. With `x` mapped and `y` and `z` replicated, the mapped tangent `ẏ` (and, in the
-        // second case, `ż`) of a replicated primal is recovered from an outer product, and the tangent of the
+        // depend on its axes, and the broadcast sensitive configuration must give exactly the per-item derivatives
+        // that the plain configuration gives. With `x` mapped and `y` and `z` replicated, the mapped tangent `ẏ` (and,
+        // in the second case, `ż`) of a replicated primal is recovered from an outer product, and the tangent of the
         // replicated output `yz` sums the broadcast tangent `yż` with the per-item tangents `ẏᵢz`.
         type Tracer = DomainTracer<ArrayContext>;
         let primal = |(x, y, z): (Tracer, Tracer, Tracer)| Ok((x * y.clone(), y * z));
@@ -4862,8 +4862,8 @@ mod tests {
         };
         let scalar_type = ArrayType::scalar(DataType::F64);
         let input_types = (scalar_type.clone(), scalar_type.clone(), scalar_type);
-        let axis_dependent = composite(primal).with_axis_dependent_batching(rule);
-        let (_, program) = ArrayContext::trace(|inputs| axis_dependent.call(inputs), input_types.clone()).unwrap();
+        let broadcast_sensitive = composite(primal).with_broadcast_sensitive_batching(rule);
+        let (_, program) = ArrayContext::trace(|inputs| broadcast_sensitive.call(inputs), input_types.clone()).unwrap();
         let program = program.into_flat_program();
         let plain = composite(primal).with_batching(rule);
         let (_, plain_program) = ArrayContext::trace(|inputs| plain.call(inputs), input_types).unwrap();
@@ -4987,12 +4987,12 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_with_axis_dependent_batching_dynamic_extent() {
+    fn test_composite_with_broadcast_sensitive_batching_dynamic_extent() {
         // The rule of `y ↦ 3y` maps its output itself: it computes `3y` broadcast along the batch when `y` is replicated
         // and `2y` otherwise. With a replicated `y` whose tangent is mapped along a first-class extent, the plain
-        // configuration applies the rule with `y` broadcast, which gives `2ẏ`, while the axis-dependent configuration
-        // takes the diagonal of the outer product over that extent, which gives the per-item derivatives `3ẏ` of the
-        // batched primal.
+        // configuration applies the rule with `y` broadcast, which gives `2ẏ`, while the broadcast sensitive
+        // configuration takes the diagonal of the outer product over that extent, which gives the per-item
+        // derivatives `3ẏ` of the batched primal.
         type Tracer = DomainTracer<EagerArrayIrContext>;
         let add = |left: &Tracer, right: &Tracer| -> Result<Tracer, ProgramError> {
             let left = ValueProjection::<ArrayType>::into_projected(left.clone())?;
@@ -5043,7 +5043,7 @@ mod tests {
         assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
         assert_eq!(batched.interpret(inputs.clone()), outputs(vec![2.0, 4.0, 6.0]));
 
-        let function = composite(primal).with_axis_dependent_batching(rule);
+        let function = composite(primal).with_broadcast_sensitive_batching(rule);
         let (_, program) = EagerArrayIrContext::trace(|y| function.call(y), scalar_type).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
         assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
@@ -5080,7 +5080,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_with_axis_dependent_batching_nested_levels() {
+    fn test_composite_with_broadcast_sensitive_batching_nested_levels() {
         // A derived call batched at an earlier level reaches the exact path with that level's batch axes on its inputs.
         // The rule of `(x, y) ↦ xy` does not depend on its axes, so the per-item derivative `ẋy + xẏ` (with `y` mapped
         // only at the inner level) is also what the plain configuration computes.
@@ -5126,7 +5126,7 @@ mod tests {
         assert_eq!(output_axes, vec![mapped; 2]);
         assert_eq!(batched.interpret(inputs.clone()), Ok(expected.clone()));
 
-        let function = composite(primal).with_axis_dependent_batching(rule);
+        let function = composite(primal).with_broadcast_sensitive_batching(rule);
         let (_, program) =
             ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
@@ -5135,7 +5135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_with_axis_dependent_batching_independent_outputs() {
+    fn test_composite_with_broadcast_sensitive_batching_independent_outputs() {
         // In `(x, y) ↦ (x · x, x · y)` with only `ẏ` active, `ẏ` belongs to the replicated `y`, so it reaches the
         // tangent-only contribution. The output `x · x` does not depend on `y`, so that contribution is a zero that is
         // replicated along the second level, which keeps the batch axis of the mapped output without a diagonal.
@@ -5147,7 +5147,7 @@ mod tests {
                 Ok(((x.clone() * x.clone(), x * y), (x_axis, product_axis)))
             };
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let function = composite(primal).with_axis_dependent_batching(rule);
+        let function = composite(primal).with_broadcast_sensitive_batching(rule);
         let (_, program) =
             ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
         let (batched, output_axes) = program
@@ -5584,7 +5584,7 @@ mod tests {
         assert_eq!(
             format!("{function:?}"),
             "Composite { name: \"sine\", jvp: ExplicitJvp { .. }, vjp: ExplicitVjp { .. }, \
-             batching: CustomBatching { .. }, batched_output_axes: None, non_differentiated_count: 0, .. }",
+             batching: BroadcastInvariantBatching { .. }, batched_output_axes: None, non_differentiated_count: 0, .. }",
         );
     }
 
