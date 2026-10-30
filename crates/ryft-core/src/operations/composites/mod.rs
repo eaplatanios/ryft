@@ -1,37 +1,30 @@
-//! Composites: functions with custom transform rules. The name follows the StableHLO
-//! [`composite`](https://openxla.org/stablehlo/spec#composite) operation, which stays one unit while carrying its
-//! decomposition; here, the decomposition is the primal function. A composite pairs that primal with handwritten rules
-//! for the transforms whose automatic treatment of it is inadequate (e.g., a fused or foreign kernel, a numerically
-//! stabilized derivative, or a batching strategy that structural batching cannot discover). Every transform without a
-//! configured rule treats the primal as it treats any other function, except that a composite with only reverse-mode
-//! rules rejects forward mode. This module has three layers:
+//! Contains functionality for building _composite_ operations. Composites in Ryft are functions with custom transform
+//! rules. Ryft composites follow the StableHLO [`composite`](https://openxla.org/stablehlo/spec#composite) design, with
+//! the operation carrying its decomposition, where here the decomposition is the primal function. A composite pairs
+//! that primal with handwritten rules for the transforms whose automatic treatment of it is inadequate (e.g., a fused
+//! or foreign kernel, a numerically stabilized derivative, or a batching strategy that structural batching cannot
+//! discover). Every transform without a configured rule treats the primal as it treats any other function, except that
+//! a composite with only reverse mode rules rejects forward mode. This module has three layers:
 //!
 //!   - **Functions:** [`composite`] creates a [`Composite`] from its primal, and configuration functions attach its
-//!     rules: a Jacobian-Vector Product (JVP) rule that governs both forward- and reverse-mode differentiation
-//!     ([`Composite::with_jvp`], the analogue of JAX's
-//!     [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html)), forward and backward
-//!     rules that govern reverse-mode differentiation ([`Composite::with_vjp`], the analogue of JAX's
-//!     [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html)), or both, as well as a
-//!     batching rule ([`Composite::with_batching`], the analogue of JAX's [`jax.custom_batching.custom_vmap`][vmap]) or
-//!     sequential batching ([`Composite::with_sequential_batching`], the analogue of JAX's
-//!     [`jax.custom_batching.sequential_vmap`][sequential_vmap]). [`Composite::from_custom_call`] creates a composite
-//!     whose primal calls a foreign kernel.
-//!   - **Operations:** each call of a composite stages a [`CompositeOperation`], which carries the primal program
+//!     rules, including support for a Jacobian-Vector Product (JVP) rule that governs both forward and reverse mode
+//!     differentiation (via [`Composite::with_jvp`]), forward and backward rules that govern reverse mode
+//!     differentiation (via [`Composite::with_vjp`]), or both, and a batching rule (via [`Composite::with_batching`])
+//!     or sequential batching (via [`Composite::with_sequential_batching`]). [`Composite::from_custom_call`] creates
+//!     a composite whose primal calls a foreign kernel.
+//!   - **Operations:** Each call of a composite stages a [`CompositeOperation`], which carries the primal program
 //!     as an attached region and retains the rules as callbacks that are traced on the first request of each
 //!     specialization. Callers whose rules are already programs (e.g., kernel staging with explicit rule programs)
-//!     stage the same operation with the rule programs attached as regions instead. Reverse mode replaces a call with
-//!     reverse-mode rules, in either representation, with a [`CompositeTransposeOperation`] carrier whose
-//!     transposition applies the backward rule, while it transposes the linearized forward-mode rule of a call
-//!     without reverse-mode rules.
+//!     stage the same operation with the rule programs attached as regions instead. Reverse mode replaces a call
+//!     with reverse mode rules, in either representation, with a [`CompositeTransposeOperation`] carrier whose
+//!     transposition applies the backward rule, while it transposes the linearized forward mode rule of a call
+//!     without reverse mode rules.
 //!   - **Rules:** [`CustomRuleDefinition`] and its [`CustomRuleRegistration`] are the flat, family-level rule sets
 //!     behind the retained rules, which trace and cache the rule programs of each specialization.
 //!
-//! [vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html
-//! [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
-//!
-//! Outside of the transforms that their rules govern, composites are transparent: interpretation and backend lowering
-//! replay the primal program. Refer to the documentation of [`composite`] for the calling convention and for how the
-//! rules interact with references, batching, and partial evaluation.
+//! Outside of the transforms that their rules govern, composites are _transparent_ meaning that interpretation and
+//! backend lowering simply replay the primal program. Refer to the documentation of [`composite`] for the calling
+//! convention and for how the rules interact with references, batching, and partial evaluation.
 //!
 //! # Examples
 //!
@@ -42,7 +35,7 @@
 //! # fn main() -> Result<(), ProgramError> {
 //! type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 //!
-//! // A custom JVP rule for `sin` that doubles the true derivative, so that its effect is visible.
+//! // A custom JVP rule for `sin` that computes the wrong derivative, so that its effect is visible.
 //! let sine = composite(|x: Tracer| Ok(x.sin()?)).with_jvp(|x, tangent| {
 //!     let tangent = x.cos()? * tangent;
 //!     Ok((x.sin()?, tangent.clone() + tangent))
