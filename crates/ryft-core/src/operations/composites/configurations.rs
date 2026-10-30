@@ -1162,8 +1162,6 @@ struct CompositeResidualStructures<T, Structure> {
     structures: Arc<Mutex<Vec<(Vec<T>, Structure)>>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<T, Structure> {
     /// Records that the forward rule of the function named `name` returned residuals of the provided flat types with
     /// the provided structure.
@@ -1195,8 +1193,8 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<
         }
     }
 
-    /// Returns the structure of residuals of the provided flat types for the backward rule of the function named
-    /// `name`.
+    /// Returns the structure of residuals of the provided flat types for the backward rule of the function
+    /// named `name`.
     ///
     /// # Errors
     ///
@@ -1217,15 +1215,17 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<
     }
 }
 
-impl<T, Structure> Clone for CompositeResidualStructures<T, Structure> {
-    fn clone(&self) -> Self {
-        Self { structures: self.structures.clone() }
+impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
+    #[inline]
+    fn default() -> Self {
+        Self { structures: Arc::new(Mutex::new(Vec::new())) }
     }
 }
 
-impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
-    fn default() -> Self {
-        Self { structures: Arc::new(Mutex::new(Vec::new())) }
+impl<T, Structure> Clone for CompositeResidualStructures<T, Structure> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { structures: self.structures.clone() }
     }
 }
 
@@ -1255,7 +1255,6 @@ fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
 + Send
 + Sync
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + Operation<Type = V::Type>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>>,
@@ -1269,7 +1268,8 @@ where
     Residual::ParameterStructure: Debug + PartialEq + Send,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
-    Forward: ?Sized + 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
+    Forward: 'static + ?Sized + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     let (name, residual_structures, named_axes) = (name, residual_structures.clone(), named_axes.to_vec());
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
@@ -1278,6 +1278,7 @@ where
             input_structure.clone(),
             primals.iter().map(|primal| primal.r#type().into_owned()),
         )?;
+
         let (structure, residual_types, program) = {
             let name: &str = &name;
             let forward = forward.as_ref();
@@ -1294,6 +1295,7 @@ where
                     input_types,
                     named_axes,
                 )?;
+
             // Matching flat types cannot establish the nested output structure.
             let forward_output_structure = forward_output_types.parameter_structure();
             if &forward_output_structure != output_structure {
@@ -1311,8 +1313,8 @@ where
             }
 
             // Reference residuals preserve handles, not snapshots. Validate their input identities while the traced
-            // atoms are available; matching types alone cannot distinguish two inputs of the same reference type. The
-            // operation subsequently checks that reference inputs belong to the non-differentiated prefix.
+            // atoms are available; matching types alone cannot distinguish two inputs of the same reference type.
+            // The operation subsequently checks that reference inputs belong to the non-differentiated prefix.
             let output_count = forward_output_types.parameter_count();
             let mut forwarded_inputs = HashSet::new();
             for (index, residual) in program.output_ids().iter().skip(output_count).enumerate() {
@@ -1320,6 +1322,7 @@ where
                 if !r#type.is_reference() {
                     continue;
                 }
+
                 if !program.input_ids().contains(residual) {
                     return Err(TypeError::invalid(format!(
                         "`{name}` forward rule returns residual {index} of reference type `{type}` \
@@ -1327,6 +1330,7 @@ where
                     ))
                     .into());
                 }
+
                 if !forwarded_inputs.insert(*residual) {
                     return Err(TypeError::invalid(format!(
                         "`{name}` forward rule returns residual {index} of reference type `{type}` \
@@ -1339,6 +1343,7 @@ where
             // The closure ran exactly once, so the structure of its residuals is always recorded.
             (residual_structure.unwrap(), residual_types.parameters().cloned().collect(), program.into_flat_program())
         };
+
         residual_structures.record(&name, residual_types, structure)?;
         let mut outputs = program.interpret_in_context(primals[0].context(), primals.to_vec())?;
         let residuals = outputs.split_off(output_structure.parameter_count());
@@ -1373,15 +1378,14 @@ fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
 + Send
 + Sync
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value,
     O: 'static + Operation<Type = V::Type>,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
     Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-    Rule: ?Sized
-        + 'static
+    Rule: 'static
+        + ?Sized
         + Fn(
             Input,
             Input::To<BatchAxis>,
@@ -1389,6 +1393,7 @@ where
         ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
     move |inputs: &[CustomRuleTracer<V, O>],
@@ -1418,10 +1423,12 @@ where
                 });
             }
         };
+
         let leading_input_count = inputs
             .len()
             .checked_sub(input_structure.parameter_count())
             .ok_or_else(|| ProgramError::MalformedProgram(format!("`{name}` batching rule received too few inputs")))?;
+
         let (outputs, output_axes) = rule(
             Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
             Input::To::<BatchAxis>::from_parameters(
@@ -1430,6 +1437,7 @@ where
             )?,
             extent,
         )?;
+
         for (value, structure) in
             [("output", outputs.parameter_structure()), ("output axis", output_axes.parameter_structure())]
         {
@@ -1451,9 +1459,12 @@ where
                 .into());
             }
         }
+
         Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
