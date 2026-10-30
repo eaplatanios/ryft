@@ -16,7 +16,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{
     CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation, derive_bijective_identity_renaming,
 };
@@ -29,7 +29,7 @@ use crate::programs::{
 use crate::tracing::{DomainTracingContext, TracingContext};
 
 #[cfg(doc)]
-use crate::operations::composites::builder::{Composite, composite};
+use crate::operations::composites::builders::{Composite, composite};
 
 /// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function

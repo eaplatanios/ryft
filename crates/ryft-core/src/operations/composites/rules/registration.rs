@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, Weak};
 use lru::LruCache;
 
 use crate::differentiation::DifferentiationError;
-use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::definition::CustomRuleDefinition;
 use crate::operations::composites::rules::specialization::specialization_error;
 use crate::operations::composites::rules::{
@@ -298,7 +298,7 @@ mod tests {
 
     use crate::arrays::{ArrayType, DataType};
     use crate::contexts::Context;
-    use crate::operations::composites::call::CompositeOperation;
+    use crate::operations::composites::operations::CompositeOperation;
     use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
     use crate::operations::composites::tests::{
         RuleCounters, TestDefinition, cube_definition, cube_program, custom_rule_program,

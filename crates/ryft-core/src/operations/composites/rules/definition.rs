@@ -24,7 +24,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::specialization::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
 };
@@ -55,7 +55,7 @@ use crate::operations::composites::rules::registration::{CustomRuleReference, Cu
 use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
 
 #[cfg(doc)]
-use crate::operations::composites::transpose::CompositeTransposeOperation;
+use crate::operations::composites::operations::CompositeTransposeOperation;
 
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
 static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);

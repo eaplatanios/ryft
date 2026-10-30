@@ -30,7 +30,7 @@ use crate::programs::{Program, ProgramError, Type, TypeError, TypeIdentityRenami
 use crate::tracing::{Tracer, TracingContext};
 
 #[cfg(doc)]
-use crate::operations::composites::transpose::CompositeTransposeOperation;
+use crate::operations::composites::operations::CompositeTransposeOperation;
 
 mod definition;
 mod registration;

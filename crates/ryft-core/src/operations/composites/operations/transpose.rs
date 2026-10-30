@@ -21,7 +21,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
     CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward,
@@ -41,7 +41,7 @@ use crate::programs::{
 use crate::tracing::TracingContext;
 
 #[cfg(doc)]
-use crate::operations::composites::call::CompositeOperation;
+use crate::operations::composites::operations::call::CompositeOperation;
 
 /// Canonical operation name for [`CompositeTransposeOperation`].
 pub const COMPOSITE_TRANSPOSE_OPERATION_NAME: &str = "composite_transpose";
@@ -226,7 +226,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Creates the source carrier from which the backward specializations of `rules` are derived, whose
     /// transposition invokes the retained backward rule directly.
-    pub(super) fn direct(
+    pub(in crate::operations::composites) fn direct(
         rules: S,
         leading_input_count: usize,
         seed_extent_count: usize,
@@ -1241,7 +1241,7 @@ mod tests {
         TranspositionDriver,
     };
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::composites::call::{CompositeJvpRule, CompositeOperation};
+    use crate::operations::composites::operations::call::{CompositeJvpRule, CompositeOperation};
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
         ArrayContext, ConvertedProgram, IrDefinition, IrTracer, RuleCounters, batched_program, cube_definition,

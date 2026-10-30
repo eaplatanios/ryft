@@ -18,7 +18,9 @@ use crate::differentiation::{
     TransposedProgramCotangent,
 };
 use crate::macros::{check_count, check_types};
-use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::{
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
+};
 use crate::operations::composites::rules::definition::{
     CustomRuleAxisDependence, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomVjpOperation,
 };
@@ -29,7 +31,6 @@ use crate::operations::composites::rules::{
     CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationKey, CustomRuleSpecializationRequest,
     CustomRuleTracer,
 };
-use crate::operations::composites::transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
     MaybeZero, Operation, Program, ProgramBuilder, ProgramError, ReferenceMemberType, Type, TypeError,

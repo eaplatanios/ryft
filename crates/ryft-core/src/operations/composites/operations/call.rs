@@ -22,12 +22,12 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::composites::operations::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey,
     CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey,
     CustomRuleSpecializer, CustomRuleTracer, derive_bijective_identity_renaming,
 };
-use crate::operations::composites::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 use crate::operations::composites::{
     replay_custom_jvp_rule, retained_carrier_batching, validate_composite_discharge_inputs,
     validate_composite_reference_boundary, validate_composite_replay, validate_deferred_forward_rule,
@@ -2076,7 +2076,7 @@ mod tests {
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::builder::composite;
+    use crate::operations::composites::builders::composite;
     use crate::operations::composites::rules::{
         CustomRuleBackwardSpecializationKey, CustomRuleRegistration, LiftedCustomRules,
     };

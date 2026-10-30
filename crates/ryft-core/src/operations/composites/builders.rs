@@ -18,12 +18,12 @@ use crate::batching::{
 };
 use crate::contexts::Context;
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType};
-use crate::operations::composites::call::{COMPOSITE_OPERATION_NAME, CompositeOperation};
 use crate::operations::composites::configurations::{
     AccumulatingVjp, AxisDependentBatching, CompositeBatching, CompositeJvp, CompositeVjp, CustomBatching,
     DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
+use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, CompositeOperation};
 use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::validate_non_differentiated_count;
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};

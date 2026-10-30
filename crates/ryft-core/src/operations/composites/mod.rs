@@ -47,8 +47,6 @@
 //! # }
 //! ```
 
-// TODO(eaplatanios): Review this module.
-
 use std::hash::Hash;
 
 use crate::batching::BatchAxis;
@@ -68,27 +66,30 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
-mod builder;
-mod call;
-mod configurations;
+pub mod builders;
+pub mod configurations;
+pub mod operations;
 pub mod rules;
-mod transpose;
 
-pub use builder::{
+pub use builders::{
     BatchedComposite, BatchingRuleConsistencyError, Composite, CompositeCallContext, JvpComposite, VjpComposite,
     check_batching_rule_consistency, composite,
 };
-pub use call::{COMPOSITE_OPERATION_NAME, CompositeJvpRule, CompositeOperation};
 pub use configurations::{
     AccumulatingVjp, AxisDependentBatching, CompositeBatching, CompositeJvp, CompositeVjp, CustomBatching,
     DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
+pub use operations::{
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeJvpRule, CompositeOperation,
+    CompositeTransposeOperation,
+};
 pub use rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
     CustomRuleTracer, CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
 };
-pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates that the leading `non_differentiated_count` input positions of a composite call named `name` fit within
 /// its `input_count` inputs.
