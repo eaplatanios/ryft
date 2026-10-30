@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
+use crate::Composite;
 use crate::axes::NamedAxis;
 use crate::batching::{BatchAxis, BatchableType, BatchingLevel, BatchingLevelExtent, DiagonalBatchingPolicy};
 use crate::contexts::{EagerContext, StagingContext};
@@ -48,17 +49,15 @@ impl<Input, Output> Debug for ExplicitJvp<Input, Output> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Forward mode configuration of a [`Composite`] whose forward mode rule is derived from its primal (refer to
-/// [`Composite::with_jvp_from_primal`]).
+/// Forward mode differentiation configuration of a [`Composite`] whose forward mode differentiation rule is derived
+/// from its primal. Refer to [`Composite::with_jvp_from_primal`] for more information.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct JvpFromPrimal;
 
-/// Forward mode configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
-/// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves, of which the
-/// structurally zero ones are [`MaybeZero::Zero`]s (refer to [`Composite::with_symbolic_zero_jvp`]). `Tracer` is the
-/// tracer type of the closure's leaves, which the leaves of its tangents wrap.
+/// Forward mode differentiation configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP)
+/// rule closure implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves, of which
+/// the structurally zero ones are [`MaybeZero::Zero`]s. `Tracer` is the tracer type of the closure's leaves, which the
+/// leaves of its tangents wrap. Refer to [`Composite::with_symbolic_zero_jvp`] for more information.
 pub struct SymbolicZeroJvp<Tracer: Typed + Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -78,10 +77,13 @@ where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("SymbolicZeroJvp").finish_non_exhaustive()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reverse mode configuration of a [`Composite`] without reverse mode rules. Reverse mode then transposes the
 /// forward mode rule, which is derived from the primal when none is configured.
