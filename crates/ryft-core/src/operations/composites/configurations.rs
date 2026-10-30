@@ -1464,8 +1464,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1475,22 +1473,98 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, ShardingDimension,
+        DimensionType, DimensionVariable, Shape, ShardingDimension,
     };
-    use crate::batching::BatchAxis;
-    use crate::differentiation::DifferentiationError;
+    use crate::differentiation::{CotangentDestinationKind, DifferentiationError, TransposedProgramCotangent};
     use crate::operations::composites::rules::{
-        CustomRuleBatchingRuleKey, CustomRuleRegistration, CustomRuleSpecializationKey, CustomRuleSpecializer,
+        CustomRuleBackwardSpecializationKey, CustomRuleBatchingRuleKey, CustomRuleRegistration, CustomRuleSource,
+        CustomRuleSpecializationKey, CustomRuleSpecializer,
     };
     use crate::parameters::Placeholder;
 
     use super::*;
 
+    /// Tracer used by the structured configuration closures.
     type ArrayTracer = CustomRuleTracer<Array, ArrayOperation<Array>>;
+
+    /// Definition configured by the structured configuration closures.
     type ArrayDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
+
+    /// Tracer whose type universe includes first-class dimensions.
+    type ArrayIrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Returns the key of an unbatched scalar `f64` call with one input and one output.
+    fn scalar_specialization_key(tangent_activity: Vec<bool>) -> CustomRuleSpecializationKey<ArrayType> {
+        CustomRuleSpecializationKey {
+            input_types: vec![ArrayType::scalar(DataType::F64)],
+            output_types: vec![ArrayType::scalar(DataType::F64)],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity,
+            levels: Vec::new(),
+            discharged: false,
+        }
+    }
+
+    /// Returns the backward key of a scalar call with one residual and one returned input cotangent.
+    fn scalar_backward_key(seed_type: Option<ArrayType>) -> CustomRuleBackwardSpecializationKey<ArrayType> {
+        CustomRuleBackwardSpecializationKey {
+            leading_input_types: vec![ArrayType::scalar(DataType::F64)],
+            seed_extent_count: 0,
+            input_tangent_types: vec![ArrayType::scalar(DataType::F64)],
+            output_tangent_types: vec![ArrayType::scalar(DataType::F64)],
+            seed_types: vec![seed_type],
+            destination_kinds: vec![CotangentDestinationKind::Return],
+            levels: Vec::new(),
+            discharged: false,
+        }
+    }
+
+    /// Returns the key of a scalar call replicated over a static level of two items.
+    fn scalar_batching_key() -> CustomRuleBatchingRuleKey<ArrayType> {
+        CustomRuleBatchingRuleKey {
+            level: BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated),
+            boundary_input_types: Vec::new(),
+            input_types: vec![ArrayType::scalar(DataType::F64)],
+            unbatched_input_types: vec![ArrayType::scalar(DataType::F64)],
+            input_axes: vec![BatchAxis::replicated()],
+            discharged: false,
+        }
+    }
 
     #[test]
     fn test_custom_rule_definition_configure_jvp() {
+        // The retained closure and its structured interface outlive the configuration that installed them.
+        let registration = {
+            let configuration = ExplicitJvp::<ArrayTracer, ArrayTracer> {
+                jvp: Arc::new(|input, tangent| Ok((input, tangent.clone() + tangent))),
+            };
+            CustomRuleRegistration::new(ArrayDefinition::new("jvp").configure_jvp(
+                &configuration,
+                &Placeholder,
+                &Placeholder,
+                0,
+            ))
+        };
+        let specialization =
+            registration.reference().jvp_specialization(scalar_specialization_key(vec![true])).unwrap();
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %1 %1
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            specialization.program.interpret(vec![Array::scalar(3f64).unwrap(), Array::scalar(4f64).unwrap()]),
+            Ok(vec![Array::scalar(3f64).unwrap(), Array::scalar(8f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp_output_structure_mismatch() {
         // The configured callback outlives its configuration and reports the definition's owned name.
         let registration = {
             let configuration = ExplicitJvp::<ArrayTracer, Vec<ArrayTracer>> {
@@ -1503,21 +1577,13 @@ mod tests {
                 0,
             ))
         };
-        let key = CustomRuleSpecializationKey {
-            input_types: vec![ArrayType::scalar(DataType::F64)],
-            output_types: vec![ArrayType::scalar(DataType::F64)],
-            kept_outputs: None,
-            non_differentiated_count: 0,
-            tangent_activity: vec![true],
-            levels: Vec::new(),
-            discharged: false,
-        };
+        let key = scalar_specialization_key(vec![true]);
         assert!(matches!(
             registration.reference().jvp_specialization(key),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `jvp_definition` JVP rule output structure mismatch: expected \
-                     {:?} but got {:?}",
+                    "`{}` `jvp_definition` JVP rule output structure mismatch: expected {:?} but got {:?}",
+                    COMPOSITE_OPERATION_NAME,
                     [Placeholder],
                     [Placeholder, Placeholder],
                 ),
@@ -1525,7 +1591,216 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_definition_configure_jvp_default() {
+        let definition =
+            ArrayDefinition::new("default").with_jvp(|inputs, tangents| Ok((inputs.to_vec(), tangents.to_vec())));
+        let definition = CompositeJvp::<DefaultJvp, ArrayTracer, ArrayTracer, ArrayTracer>::configure_jvp(
+            definition,
+            &DefaultJvp,
+            &Placeholder,
+            &Placeholder,
+            0,
+        );
+        let registration = CustomRuleRegistration::new(definition);
+        assert!(registration.reference().has_jvp());
+        assert!(!registration.reference().derives_jvp_from_primal());
+        assert_eq!(registration.reference().name(), "default");
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp_from_primal() {
+        let definition =
+            ArrayDefinition::new("primal").with_jvp(|inputs, tangents| Ok((inputs.to_vec(), tangents.to_vec())));
+        let definition = CompositeJvp::<JvpFromPrimal, ArrayTracer, ArrayTracer, ArrayTracer>::configure_jvp(
+            definition,
+            &JvpFromPrimal,
+            &Placeholder,
+            &Placeholder,
+            0,
+        );
+        let registration = CustomRuleRegistration::new(definition);
+        assert!(registration.reference().derives_jvp_from_primal());
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp_symbolic_zeros() {
+        let configuration = SymbolicZeroJvp::<ArrayTracer, (ArrayTracer, ArrayTracer, ArrayTracer), Vec<ArrayTracer>> {
+            jvp: Arc::new(|(_, active, inactive), (parameter_tangent, active_tangent, inactive_tangent)| {
+                // Parameters and inactive inputs have no live tangent slot in the retained signature.
+                assert!(
+                    matches!(parameter_tangent, MaybeZero::Zero(r#type) if r#type == ArrayType::scalar(DataType::F64))
+                );
+                assert!(matches!(&active_tangent, MaybeZero::Value(_)));
+                assert!(
+                    matches!(&inactive_tangent, MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64))
+                );
+                Ok((vec![active, inactive], vec![active_tangent, inactive_tangent]))
+            }),
+        };
+        let registration = CustomRuleRegistration::new(ArrayDefinition::new("activity").configure_jvp(
+            &configuration,
+            &(Placeholder, Placeholder, Placeholder),
+            &vec![Placeholder; 2],
+            1,
+        ));
+        let specialization = registration
+            .reference()
+            .jvp_specialization(CustomRuleSpecializationKey {
+                input_types: vec![ArrayType::scalar(DataType::F64); 3],
+                output_types: vec![ArrayType::scalar(DataType::F64); 2],
+                non_differentiated_count: 1,
+                tangent_activity: vec![true, false],
+                ..scalar_specialization_key(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[] = zero [type=f64[]]
+                in (%1, %2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            specialization.program.interpret(vec![
+                Array::scalar(7f64).unwrap(),
+                Array::scalar(2f64).unwrap(),
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(5f64).unwrap(),
+            ]),
+            Ok(vec![
+                Array::scalar(2f64).unwrap(),
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(5f64).unwrap(),
+                Array::scalar(0f64).unwrap()
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp_symbolic_zero_output_structure_mismatch() {
+        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+            jvp: Arc::new(|input, tangent| Ok((vec![input.clone(), input], vec![tangent]))),
+        };
+        let registration = CustomRuleRegistration::new(ArrayDefinition::new("output").configure_jvp(
+            &configuration,
+            &Placeholder,
+            &vec![Placeholder],
+            0,
+        ));
+        assert!(matches!(
+            registration.reference().jvp_specialization(scalar_specialization_key(vec![true])),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{}` `output` JVP rule output structure mismatch: expected {:?} but got {:?}",
+                    COMPOSITE_OPERATION_NAME,
+                    [Placeholder],
+                    [Placeholder, Placeholder],
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp_symbolic_zero_tangent_structure_mismatch() {
+        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+            jvp: Arc::new(|input, tangent| Ok((vec![input], vec![tangent.clone(), tangent]))),
+        };
+        let registration = CustomRuleRegistration::new(ArrayDefinition::new("tangent").configure_jvp(
+            &configuration,
+            &Placeholder,
+            &vec![Placeholder],
+            0,
+        ));
+        assert!(matches!(
+            registration.reference().jvp_specialization(scalar_specialization_key(vec![true])),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{}` `tangent` JVP rule output tangent structure mismatch: expected {:?} but got {:?}",
+                    COMPOSITE_OPERATION_NAME,
+                    [Placeholder],
+                    [Placeholder, Placeholder],
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_jvp_symbolic_zero_tangent_type_mismatch() {
+        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, ArrayTracer> {
+            jvp: Arc::new(|input, _| Ok((input, MaybeZero::Zero(ArrayType::scalar(DataType::F32))))),
+        };
+        let registration = CustomRuleRegistration::new(ArrayDefinition::new(COMPOSITE_OPERATION_NAME).configure_jvp(
+            &configuration,
+            &Placeholder,
+            &Placeholder,
+            0,
+        ));
+        assert!(matches!(
+            registration.reference().jvp_specialization(scalar_specialization_key(vec![false])),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{COMPOSITE_OPERATION_NAME}` JVP rule returned a structural-zero tangent of type `f32[]` \
+                     for output 0, whose tangent type is `f64[]`",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_symbolic_zero_jvp_debug() {
+        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, ArrayTracer> {
+            jvp: Arc::new(|input, tangent| Ok((input, tangent))),
+        };
+        assert_eq!(format!("{configuration:?}"), "SymbolicZeroJvp { .. }");
+    }
+
+    #[test]
     fn test_custom_rule_definition_configure_vjp() {
+        let registration = {
+            let configuration = ExplicitVjp::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+                forward: Arc::new(|input| Ok((input.clone(), vec![input]))),
+                backward: Arc::new(|residuals, seed| Ok(residuals[0].clone() * seed)),
+                deferred_forward: false,
+            };
+            CustomRuleRegistration::new(ArrayDefinition::new("vjp").configure_vjp(
+                &configuration,
+                &Placeholder,
+                &Placeholder,
+                0,
+            ))
+        };
+        assert!(registration.reference().has_vjp());
+        assert!(!registration.reference().defers_forward());
+        let forward = registration.reference().forward_specialization(scalar_specialization_key(Vec::new())).unwrap();
+        assert_eq!(
+            forward.program.to_string(),
+            indoc! {"
+            lambda %0:f64[] .
+            in (%0, %0)
+        "}
+            .trim_end(),
+        );
+        let backward = registration
+            .reference()
+            .backward_specialization(scalar_backward_key(Some(ArrayType::scalar(DataType::F64))))
+            .unwrap();
+        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Output]);
+        assert_eq!(
+            backward.program.to_string(),
+            indoc! {"
+            lambda %0:f64[], %1:f64[] .
+            let %2:f64[] = mul %1 %0
+            in (%2)
+        "}
+            .trim_end(),
+        );
+        assert_eq!(
+            backward.program.interpret(vec![Array::scalar(3f64).unwrap(), Array::scalar(4f64).unwrap()]),
+            Ok(vec![Array::scalar(12f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_vjp_output_structure_mismatch() {
         let registration = {
             let configuration = ExplicitVjp::<ArrayTracer, Vec<ArrayTracer>, ArrayTracer> {
                 forward: Arc::new(|input| Ok((vec![input.clone(), input.clone()], input))),
@@ -1539,21 +1814,13 @@ mod tests {
                 0,
             ))
         };
-        let key = CustomRuleSpecializationKey {
-            input_types: vec![ArrayType::scalar(DataType::F64)],
-            output_types: vec![ArrayType::scalar(DataType::F64)],
-            kept_outputs: None,
-            non_differentiated_count: 0,
-            tangent_activity: Vec::new(),
-            levels: Vec::new(),
-            discharged: false,
-        };
+        let key = scalar_specialization_key(Vec::new());
         assert!(matches!(
             registration.reference().forward_specialization(key),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `vjp_definition` forward rule output structure mismatch: expected \
-                     {:?} but got {:?}",
+                    "`{}` `vjp_definition` forward rule output structure mismatch: expected {:?} but got {:?}",
+                    COMPOSITE_OPERATION_NAME,
                     [Placeholder],
                     [Placeholder, Placeholder],
                 ),
@@ -1561,7 +1828,132 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_definition_configure_vjp_default() {
+        let definition = ArrayDefinition::new("default")
+            .with_vjp(|inputs| Ok((inputs.to_vec(), inputs.to_vec())), |_, seeds| Ok(seeds.to_vec()))
+            .with_deferred_forward_rule();
+        let definition = CompositeVjp::<DefaultVjp, ArrayTracer, ArrayTracer, ArrayTracer>::configure_vjp(
+            definition,
+            &DefaultVjp,
+            &Placeholder,
+            &Placeholder,
+            0,
+        );
+        let registration = CustomRuleRegistration::new(definition);
+        assert!(registration.reference().has_vjp());
+        assert!(registration.reference().defers_forward());
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_vjp_symbolic_zero_cotangent_structure_mismatch() {
+        let configuration = SymbolicZeroVjp::<ArrayTracer, Vec<ArrayTracer>, ArrayTracer, ArrayTracer> {
+            forward: Arc::new(|inputs| Ok((inputs[1].clone(), inputs[0].clone()))),
+            backward: Arc::new(|_, seed| Ok(vec![seed])),
+            deferred_forward: false,
+        };
+        let registration = CustomRuleRegistration::new(ArrayDefinition::new("cotangent").configure_vjp(
+            &configuration,
+            &vec![Placeholder; 2],
+            &Placeholder,
+            1,
+        ));
+        let forward = registration
+            .reference()
+            .forward_specialization(CustomRuleSpecializationKey {
+                input_types: vec![ArrayType::scalar(DataType::F64); 2],
+                non_differentiated_count: 1,
+                ..scalar_specialization_key(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(
+            forward.program.to_string(),
+            indoc! {"
+            lambda %0:f64[], %1:f64[] .
+            in (%1, %0)
+        "}
+            .trim_end(),
+        );
+        // Returning only the differentiated suffix must fail before the adapter drops the leading cotangent.
+        let key = CustomRuleBackwardSpecializationKey {
+            leading_input_types: vec![ArrayType::scalar(DataType::F64); 2],
+            ..scalar_backward_key(Some(ArrayType::scalar(DataType::F64)))
+        };
+        assert!(matches!(
+            registration.reference().backward_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "`{}` `cotangent` backward rule cotangent structure mismatch: expected {:?} but got {:?}",
+                    COMPOSITE_OPERATION_NAME,
+                    [Placeholder, Placeholder],
+                    [Placeholder],
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_symbolic_zero_vjp_debug() {
+        let mut configuration = SymbolicZeroVjp::<ArrayTracer, ArrayTracer, ArrayTracer, ArrayTracer> {
+            forward: Arc::new(|input| Ok((input.clone(), input))),
+            backward: Arc::new(|_, seed| Ok(seed)),
+            deferred_forward: false,
+        };
+        assert_eq!(format!("{configuration:?}"), "SymbolicZeroVjp { .. }");
+        configuration.deferred_forward = true;
+        assert_eq!(format!("{configuration:?}"), "SymbolicZeroVjp { deferred_forward: true, .. }");
+    }
+
+    #[test]
+    fn test_accumulating_vjp_debug() {
+        let mut configuration = AccumulatingVjp::<
+            ArrayTracer,
+            TranspositionContext<Array, ArrayOperation<Array>>,
+            ArrayTracer,
+            ArrayTracer,
+            ArrayTracer,
+        > {
+            forward: Arc::new(|input| Ok((input.clone(), input))),
+            backward: Arc::new(|_, _, _, _| Ok(())),
+            deferred_forward: false,
+        };
+        assert_eq!(format!("{configuration:?}"), "AccumulatingVjp { .. }");
+        configuration.deferred_forward = true;
+        assert_eq!(format!("{configuration:?}"), "AccumulatingVjp { deferred_forward: true, .. }");
+    }
+
+    #[test]
     fn test_custom_rule_definition_configure_batching() {
+        let registration = {
+            let configuration = BroadcastInvariantBatching::<ArrayTracer, ArrayTracer, ArrayTracer> {
+                rule: Arc::new(|input, axis, extent| {
+                    assert!(matches!(extent, BatchingLevelExtent::Static(2)));
+                    Ok((input.clone() + input, axis))
+                }),
+            };
+            CustomRuleRegistration::new(ArrayDefinition::new("batching").configure_batching(
+                &configuration,
+                &Placeholder,
+                &Placeholder,
+            ))
+        };
+        let specialization = registration.reference().batching_rule_specialization(scalar_batching_key()).unwrap();
+        assert_eq!(specialization.output_axes, vec![BatchAxis::replicated()]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+            lambda %0:f64[] .
+            let %1:f64[] = add %0 %0
+            in (%1)
+        "}
+            .trim_end(),
+        );
+        assert_eq!(
+            specialization.program.interpret(vec![Array::scalar(3f64).unwrap()]),
+            Ok(vec![Array::scalar(6f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_batching_output_structure_mismatch() {
         let registration = {
             let configuration = BroadcastInvariantBatching::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
                 rule: Arc::new(|input, axis, _| Ok((vec![input.clone(), input], vec![axis, axis]))),
@@ -1572,20 +1964,13 @@ mod tests {
                 &vec![Placeholder],
             ))
         };
-        let key = CustomRuleBatchingRuleKey {
-            level: BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated),
-            boundary_input_types: Vec::new(),
-            input_types: vec![ArrayType::scalar(DataType::F64)],
-            unbatched_input_types: vec![ArrayType::scalar(DataType::F64)],
-            input_axes: vec![BatchAxis::replicated()],
-            discharged: false,
-        };
+        let key = scalar_batching_key();
         assert!(matches!(
             registration.reference().batching_rule_specialization(key),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `batching_definition` batching rule output structure mismatch: \
-                     expected {:?} but got {:?}",
+                    "`{}` `batching_definition` batching rule output structure mismatch: expected {:?} but got {:?}",
+                    COMPOSITE_OPERATION_NAME,
                     [Placeholder],
                     [Placeholder, Placeholder],
                 ),
@@ -1593,17 +1978,153 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_definition_configure_batching_default() {
+        let definition = ArrayDefinition::new("default").with_sequential_batching();
+        let definition =
+            CompositeBatching::<DefaultBatching, ArrayTracer, ArrayTracer, ArrayTracer>::configure_batching(
+                definition,
+                &DefaultBatching,
+                &Placeholder,
+                &Placeholder,
+            );
+        let registration = CustomRuleRegistration::new(definition);
+        assert!(registration.reference().has_sequential_batching());
+        assert!(!registration.reference().has_batching_rule());
+    }
+
+    #[test]
+    fn test_broadcast_sensitive_batching_debug() {
+        let configuration = BroadcastSensitiveBatching::<ArrayTracer, ArrayTracer, ArrayTracer> {
+            rule: Arc::new(|input, axis, _| Ok((input, axis))),
+        };
+        assert_eq!(format!("{configuration:?}"), "BroadcastSensitiveBatching { .. }");
+    }
+
+    #[test]
+    fn test_composite_residual_structures_record() {
+        let structures = CompositeResidualStructures::<ArrayType, Vec<Vec<Placeholder>>>::default();
+        let first = vec![vec![Placeholder]];
+        let second = vec![vec![], vec![Placeholder]];
+        assert_eq!(structures.record("residuals", vec![ArrayType::scalar(DataType::F64)], first.clone()), Ok(()));
+        assert_eq!(structures.record("residuals", vec![ArrayType::scalar(DataType::F64)], first.clone()), Ok(()));
+        assert_eq!(structures.structures.lock().unwrap().len(), 1);
+        assert_eq!(structures.record("residuals", vec![ArrayType::scalar(DataType::F32)], second.clone()), Ok(()));
+        assert_eq!(structures.get("residuals", &[ArrayType::scalar(DataType::F64)]), Ok(first));
+        assert_eq!(structures.get("residuals", &[ArrayType::scalar(DataType::F32)]), Ok(second));
+    }
+
+    #[test]
+    fn test_composite_residual_structures_record_ambiguous() {
+        let structures = CompositeResidualStructures::<ArrayType, Vec<Vec<Placeholder>>>::default();
+        let expected = vec![vec![Placeholder]];
+        let actual = vec![vec![], vec![Placeholder]];
+        assert_eq!(
+            structures.record(COMPOSITE_OPERATION_NAME, vec![ArrayType::scalar(DataType::F64)], expected.clone()),
+            Ok(())
+        );
+        assert_eq!(
+            structures.record(COMPOSITE_OPERATION_NAME, vec![ArrayType::scalar(DataType::F64)], actual.clone()),
+            Err(TypeError::invalid(format!(
+                "`{COMPOSITE_OPERATION_NAME}` forward rule residual structure mismatch: expected {expected:?} \
+                 but got {actual:?}",
+            ))),
+        );
+        assert_eq!(structures.get(COMPOSITE_OPERATION_NAME, &[ArrayType::scalar(DataType::F64)]), Ok(expected));
+    }
+
+    #[test]
+    fn test_composite_residual_structures_get() {
+        let structures = CompositeResidualStructures::<ArrayType, Vec<Placeholder>>::default();
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![DimensionVariable::new("source", bounds).into()]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![DimensionVariable::new("target", bounds).into()]));
+        assert_eq!(structures.record("residuals", vec![source], vec![Placeholder]), Ok(()));
+        // Replay creates fresh dimension identities without changing the residual container.
+        assert_eq!(structures.get("residuals", std::slice::from_ref(&target)), Ok(vec![Placeholder]));
+        assert_eq!(structures.record("residuals", vec![target], vec![Placeholder]), Ok(()));
+        assert_eq!(structures.structures.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_composite_residual_structures_get_missing() {
+        let structures = CompositeResidualStructures::<ArrayType, Vec<Placeholder>>::default();
+        assert!(matches!(
+            structures.get("residuals", &[ArrayType::scalar(DataType::F64)]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "`residuals` backward rule was traced before the forward rule that produces its \
+                               residuals",
+        ));
+        assert_eq!(structures.record("residuals", vec![ArrayType::scalar(DataType::F32)], vec![Placeholder]), Ok(()));
+        assert!(matches!(
+            structures.get("residuals", &[ArrayType::scalar(DataType::F64)]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "`residuals` backward rule was traced before the forward rule that produces its \
+                               residuals",
+        ));
+    }
+
+    #[test]
+    fn test_composite_residual_structures_clone() {
+        let structures = CompositeResidualStructures::<ArrayType, Vec<Placeholder>>::default();
+        let cloned = structures.clone();
+        assert_eq!(structures.record("residuals", vec![ArrayType::scalar(DataType::F64)], vec![Placeholder]), Ok(()));
+        assert_eq!(cloned.get("residuals", &[ArrayType::scalar(DataType::F64)]), Ok(vec![Placeholder]));
+        assert_eq!(cloned.record("residuals", vec![ArrayType::scalar(DataType::F32)], vec![Placeholder]), Ok(()));
+        assert_eq!(structures.get("residuals", &[ArrayType::scalar(DataType::F32)]), Ok(vec![Placeholder]));
+        drop(structures);
+        assert_eq!(cloned.get("residuals", &[ArrayType::scalar(DataType::F64)]), Ok(vec![Placeholder]));
+    }
+
+    #[test]
+    fn test_retained_custom_batching_rule() {
+        let adapter = retained_custom_batching_rule::<_, _, ArrayTracer, ArrayTracer, _>(
+            Arc::new(|input: ArrayTracer, axis, extent| {
+                assert_eq!(axis, BatchAxis::replicated());
+                assert!(matches!(extent, BatchingLevelExtent::Static(2)));
+                Ok((input.clone() + input, axis))
+            }),
+            Cow::Borrowed("rule"),
+            &Placeholder,
+            &Placeholder,
+        );
+        let level = BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<ArrayTracer>| {
+                // The first value belongs to an earlier level and must not reach the structured rule.
+                let (outputs, axes) = adapter(&inputs, &[BatchAxis::new(0), BatchAxis::replicated()], &level, &[])?;
+                assert_eq!(axes, vec![BatchAxis::replicated()]);
+                Ok(outputs)
+            },
+            vec![ArrayType::new_static(DataType::F64, [2]), ArrayType::scalar(DataType::F64)],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f64[2], %1:f64[] .
+            let %2:f64[] = add %1 %1
+            in (%2)
+        "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![99f64, 100f64]).unwrap(), Array::scalar(3f64).unwrap()]),
+            Ok(vec![Array::scalar(6f64).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_retained_custom_batching_rule_leading_boundary_extent() {
         // A dynamic batch extent is the leading boundary input of its batching level, which may have further boundary
         // inputs that the rule does not receive.
-        type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let rule = |_input: IrTracer, _axis: BatchAxis, extent: BatchingLevelExtent<IrTracer>| match extent {
+        let rule = |_input: ArrayIrTracer, _axis: BatchAxis, extent: BatchingLevelExtent<ArrayIrTracer>| match extent {
             BatchingLevelExtent::Dynamic(extent) => Ok((extent, BatchAxis::replicated())),
             BatchingLevelExtent::Static(_) => {
                 Err(ProgramError::InvalidArgument { message: "the test rule expects a dynamic extent".to_string() })
             }
         };
-        let adapter = retained_custom_batching_rule::<_, _, IrTracer, IrTracer, _>(
+        let adapter = retained_custom_batching_rule::<_, _, ArrayIrTracer, ArrayIrTracer, _>(
             Arc::new(rule),
             Cow::Borrowed("rule"),
             &Placeholder,
@@ -1614,7 +2135,7 @@ mod tests {
         let level =
             BatchingLevel::new(BatchingLevelExtent::Dynamic(extent_type.clone()), None, ShardingDimension::Replicated);
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-            |values: Vec<IrTracer>| {
+            |values: Vec<ArrayIrTracer>| {
                 let (outputs, output_axes) = adapter(&values[2..], &[BatchAxis::replicated()], &level, &values[..2])?;
                 assert_eq!(output_axes, vec![BatchAxis::replicated()]);
                 Ok(outputs)
@@ -1631,5 +2152,78 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_retained_custom_batching_rule_missing_dynamic_boundary() {
+        let adapter = retained_custom_batching_rule::<_, _, ArrayIrTracer, ArrayIrTracer, _>(
+            Arc::new(|input: ArrayIrTracer, axis, _| Ok((input, axis))),
+            Cow::Borrowed(COMPOSITE_OPERATION_NAME),
+            &Placeholder,
+            &Placeholder,
+        );
+        let extent_type = ArrayIrType::from(DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let level = BatchingLevel::new(BatchingLevelExtent::Dynamic(extent_type), None, ShardingDimension::Replicated);
+        let result = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<ArrayIrTracer>| {
+                adapter(&inputs, &[BatchAxis::replicated()], &level, &[]).map(|(outputs, _)| outputs)
+            },
+            vec![ArrayIrType::from(ArrayType::scalar(DataType::F64))],
+            Vec::new(),
+        );
+        assert!(matches!(result,
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == format!(
+                    "`{COMPOSITE_OPERATION_NAME}` batching rule requires a dynamic batch extent to be the leading \
+                     boundary input of its batching level, but the level has no boundary inputs",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_retained_custom_batching_rule_too_few_inputs() {
+        let adapter = retained_custom_batching_rule::<_, _, (ArrayTracer, ArrayTracer), ArrayTracer, _>(
+            Arc::new(|(input, _): (ArrayTracer, ArrayTracer), (axis, _), _| Ok((input, axis))),
+            Cow::Borrowed("rule"),
+            &(Placeholder, Placeholder),
+            &Placeholder,
+        );
+        let level = BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated);
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<ArrayTracer>| {
+                adapter(&inputs, &[BatchAxis::replicated()], &level, &[]).map(|(outputs, _)| outputs)
+            },
+            vec![ArrayType::scalar(DataType::F64)],
+            Vec::new(),
+        );
+        assert!(matches!(result,
+            Err(ProgramError::MalformedProgram(message)) if message == "`rule` batching rule received too few inputs",
+        ));
+    }
+
+    #[test]
+    fn test_retained_custom_batching_rule_output_axis_structure_mismatch() {
+        let adapter = retained_custom_batching_rule::<_, _, ArrayTracer, Vec<ArrayTracer>, _>(
+            Arc::new(|input: ArrayTracer, _, _| Ok((vec![input], Vec::new()))),
+            Cow::Borrowed("rule"),
+            &Placeholder,
+            &vec![Placeholder],
+        );
+        let level = BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated);
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<ArrayTracer>| {
+                adapter(&inputs, &[BatchAxis::replicated()], &level, &[]).map(|(outputs, _)| outputs)
+            },
+            vec![ArrayType::scalar(DataType::F64)],
+            Vec::new(),
+        );
+        assert!(matches!(result,
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "`{COMPOSITE_OPERATION_NAME}` `rule` batching rule output axis structure mismatch: expected {:?} \
+                     but got {:?}",
+                    [Placeholder], Vec::<Placeholder>::new(),
+                ),
+        ));
     }
 }
