@@ -931,10 +931,49 @@ where
     }
 }
 
+/// Installs a batching configuration in a [`CustomRuleDefinition`], selecting a custom batching rule or sequential
+/// batching when configured.
+pub trait CompositeBatching<Batching, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
+    Sized
+{
+    /// Returns this definition with the provided batching configuration applied. [`DefaultBatching`] leaves the
+    /// definition unchanged. Retained rules use the definition's name.
+    ///
+    /// # Parameters
+    ///
+    ///   - `configuration`: Batching configuration to apply.
+    ///   - `input_structure`: Structure of the call's inputs.
+    ///   - `output_structure`: Structure of the call's outputs.
+    fn configure_batching(
+        self,
+        configuration: &Batching,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+    ) -> Self;
+}
+
 /// Batching configuration of a [`Composite`] without a custom batching rule. Batching a call structurally batches its
 /// primal region.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultBatching;
+
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
+    CompositeBatching<DefaultBatching, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
+where
+    Input: Parameterized<CustomRuleTracer<V, O>>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    #[inline]
+    fn configure_batching(
+        self,
+        _configuration: &DefaultBatching,
+        _input_structure: &Input::ParameterStructure,
+        _output_structure: &Output::ParameterStructure,
+    ) -> Self {
+        self
+    }
+}
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
 /// `(x, x_axes, extent) ↦ (y, y_axes)` whose per-item numerical behavior is preserved when a replicated input is
@@ -967,6 +1006,44 @@ where
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("BroadcastInvariantBatching").finish_non_exhaustive()
+    }
+}
+
+impl<V, O, Input, Output>
+    CompositeBatching<
+        BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
+        CustomRuleTracer<V, O>,
+        Input,
+        Output,
+    > for CustomRuleDefinition<V, O>
+where
+    V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
+    O: 'static
+        + Operation<Type = V::Type>
+        + PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
+        + ResidualZeroProvider<V::Type, Operation = O>,
+    Input: 'static
+        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    #[inline]
+    fn configure_batching(
+        self,
+        configuration: &BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+    ) -> Self {
+        let rule = retained_custom_batching_rule::<V, O, Input, Output, _>(
+            configuration.rule.clone(),
+            self.name.clone(),
+            input_structure,
+            output_structure,
+        );
+        self.with_batching_rule(rule)
     }
 }
 
@@ -1003,89 +1080,6 @@ where
     }
 }
 
-/// Batching configuration of a [`Composite`] that batches its calls sequentially, by looping over the batch items with
-/// a scan. Refer to [`Composite::with_sequential_batching`] for more information.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct SequentialBatching;
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Installs a batching configuration in a [`CustomRuleDefinition`], selecting a custom batching rule or sequential
-/// batching when configured.
-pub trait CompositeBatching<Batching, Tracer: Parameter, Input: Parameterized<Tracer>, Output: Parameterized<Tracer>>:
-    Sized
-{
-    /// Returns this definition with the provided batching configuration applied. [`DefaultBatching`] leaves the
-    /// definition unchanged. Retained rules use the definition's name.
-    ///
-    /// # Parameters
-    ///
-    ///   - `configuration`: Batching configuration to apply.
-    ///   - `input_structure`: Structure of the call's inputs.
-    ///   - `output_structure`: Structure of the call's outputs.
-    fn configure_batching(
-        self,
-        configuration: &Batching,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-    ) -> Self;
-}
-
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output>
-    CompositeBatching<DefaultBatching, CustomRuleTracer<V, O>, Input, Output> for CustomRuleDefinition<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    Input: Parameterized<CustomRuleTracer<V, O>>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
-{
-    #[inline]
-    fn configure_batching(
-        self,
-        _configuration: &DefaultBatching,
-        _input_structure: &Input::ParameterStructure,
-        _output_structure: &Output::ParameterStructure,
-    ) -> Self {
-        self
-    }
-}
-
-impl<V, O, Input, Output>
-    CompositeBatching<
-        BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
-        CustomRuleTracer<V, O>,
-        Input,
-        Output,
-    > for CustomRuleDefinition<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
-    O: 'static
-        + Operation<Type = V::Type>
-        + PartiallyEvaluatableOperation<TracingContext<V, O>>
-        + DifferentiableOperation<TracingContext<V, O>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + ResidualZeroProvider<V::Type, Operation = O>,
-    Input: 'static
-        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
-    Output::ParameterStructure: Debug + PartialEq + Send + Sync,
-{
-    fn configure_batching(
-        self,
-        configuration: &BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-    ) -> Self {
-        let rule = retained_custom_batching_rule::<V, O, Input, Output, _>(
-            configuration.rule.clone(),
-            self.name.clone(),
-            input_structure,
-            output_structure,
-        );
-        self.with_batching_rule(rule)
-    }
-}
-
 impl<V, O, Input, Output>
     CompositeBatching<
         BroadcastSensitiveBatching<CustomRuleTracer<V, O>, Input, Output>,
@@ -1094,7 +1088,6 @@ impl<V, O, Input, Output>
         Output,
     > for CustomRuleDefinition<V, O>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static
         + Value<
             Type: DifferentiableType + BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>> + Eq + Hash,
@@ -1110,7 +1103,9 @@ where
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
     Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
+    #[inline]
     fn configure_batching(
         self,
         configuration: &BroadcastSensitiveBatching<CustomRuleTracer<V, O>, Input, Output>,
@@ -1127,14 +1122,19 @@ where
     }
 }
 
+/// Batching configuration of a [`Composite`] that batches its calls sequentially, by looping over the batch items with
+/// a scan. Refer to [`Composite::with_sequential_batching`] for more information.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SequentialBatching;
+
 impl<V, O, Input, Output> CompositeBatching<SequentialBatching, CustomRuleTracer<V, O>, Input, Output>
     for CustomRuleDefinition<V, O>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: Eq + Hash + ScanType>,
     O: 'static + Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn configure_batching(
@@ -1146,6 +1146,8 @@ where
         self.with_sequential_batching()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Residual structures that the forward rule of one [`Composite`] registration returned, from which its backward rule
 /// learns the structure of the residuals that it receives as flat leading inputs. The backward rule of each
