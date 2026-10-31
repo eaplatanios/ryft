@@ -76,9 +76,7 @@ impl<C> CompositeCallContext for C where
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Retained definitions registered by one [`Composite`] in its selected operation family, one per input and output
+/// Retained definitions registered by a [`Composite`] in its selected operation family, one per input and output
 /// parameter structure and visible named axes. Their handles live as long as the composite, so calls with the same
 /// structure and named axes share specialization caches. The mutex synchronizes access to the registration handles,
 /// which are not themselves [`Sync`].
@@ -87,35 +85,12 @@ struct CompositeRegistrations<V: Typed + Parameter, O, InputStructure, OutputStr
     entries: Mutex<Vec<CompositeRegistration<V, O, InputStructure, OutputStructure>>>,
 }
 
-/// Retained definition that a [`Composite`] registered for one operation family and call structure.
-struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStructure> {
-    /// Structure of the calls' inputs.
-    input_structure: InputStructure,
-
-    /// Structure of the calls' outputs.
-    output_structure: OutputStructure,
-
-    /// Named axes visible where the calls are made, with which the definition traces its rules.
-    named_axes: Vec<(String, NamedAxis)>,
-
-    /// Registration handle, which owns the definition's specialization caches.
-    registration: CustomRuleRegistration<V, O>,
-}
-
-impl<V: Typed + Parameter, O, InputStructure, OutputStructure> Default
-    for CompositeRegistrations<V, O, InputStructure, OutputStructure>
-{
-    fn default() -> Self {
-        Self { entries: Mutex::new(Vec::new()) }
-    }
-}
-
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
     CompositeRegistrations<V, O, InputStructure, OutputStructure>
 {
-    /// Returns a reference to the definition registered for the provided call structure and named axes, registering
-    /// the definition returned by `register_fn` if there is none yet.
-    fn get_or_register<F>(
+    /// Returns a reference to the [`CustomRuleDefinition`] registered for the provided call structure and named axes,
+    /// registering the definition returned by `register_fn` if there is none yet.
+    fn get_or_register<F: FnOnce() -> CustomRuleDefinition<V, O>>(
         &self,
         input_structure: &InputStructure,
         output_structure: &OutputStructure,
@@ -125,7 +100,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
     where
         InputStructure: Clone + PartialEq,
         OutputStructure: Clone + PartialEq,
-        F: FnOnce() -> CustomRuleDefinition<V, O>,
     {
         let mut entries = self.entries.lock().expect("composite registration mutex is poisoned");
         let existing = entries
@@ -149,6 +123,32 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
         })
     }
 }
+
+impl<V: Typed + Parameter, O, InputStructure, OutputStructure> Default
+    for CompositeRegistrations<V, O, InputStructure, OutputStructure>
+{
+    #[inline]
+    fn default() -> Self {
+        Self { entries: Mutex::new(Vec::new()) }
+    }
+}
+
+/// Retained definition that a [`Composite`] registered for one operation family and call structure.
+struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStructure> {
+    /// Structure of the calls' inputs.
+    input_structure: InputStructure,
+
+    /// Structure of the calls' outputs.
+    output_structure: OutputStructure,
+
+    /// Named axes visible where the calls are made, with which the definition traces its rules.
+    named_axes: Vec<(String, NamedAxis)>,
+
+    /// Registration handle, which owns the definition's specialization caches.
+    registration: CustomRuleRegistration<V, O>,
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
 /// an optional forward mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
