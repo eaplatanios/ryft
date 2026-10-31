@@ -1121,8 +1121,8 @@ pub struct SequentialBatching;
 impl<V, O, Input, Output> CompositeBatching<SequentialBatching, CustomRuleTracer<V, O>, Input, Output>
     for CustomRuleDefinition<V, O>
 where
-    V: 'static + Value<Type: Eq + Hash + ScanType>,
-    O: 'static + Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
+    V: Value<Type: Eq + Hash + ScanType>,
+    O: Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,

@@ -86,7 +86,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleCaches<V, O> {
 /// A rule that calls a definition must capture a [`CustomRuleReference`] (or, for its own definition, the
 /// [`WeakCustomRuleRegistration`] passed to [`Self::new_cyclic`]), never a handle, because a rule that owned the caches
 /// of a definition whose programs reach the rule would form a reference cycle. Handles are deliberately not [`Sync`],
-/// so the compiler rejects a rule, which must be [`Send`] and [`Sync`], that captures one. References to other
+/// so the compiler rejects a rule, which must be [`Send`] and [`Sync`], that captures a handle directly. This guard is
+/// not complete, because a handle wrapped in a [`Mutex`] is [`Sync`] whenever the handle is [`Send`], and so a rule
+/// that captures a handle in any form is a misuse that the compiler does not always reject. References to other
 /// definitions cannot form a cycle either, because a definition can only capture definitions that were registered
 /// before it, except for itself through [`Self::new_cyclic`]. For example, two mutually recursive definitions are
 /// registered by building the second one inside the [`Self::new_cyclic`] closure of the first one, capturing the weak

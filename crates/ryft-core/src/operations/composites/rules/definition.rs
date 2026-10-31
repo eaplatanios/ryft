@@ -622,7 +622,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: 'static + Operation<Type = V::Type>,
+        O: Operation<Type = V::Type>,
         R: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -648,7 +648,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: 'static + Operation<Type = V::Type>,
+        O: Operation<Type = V::Type>,
         R: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -859,8 +859,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     pub fn with_batching_support(mut self) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: 'static + Value<Type: DifferentiableType + BatchableType>,
-        O: 'static + Operation<Type = V::Type>,
+        V: Value<Type: DifferentiableType + BatchableType>,
+        O: Operation<Type = V::Type>,
         <V::Type as BatchableType>::Policy:
             RecursiveBatchingPolicy<TracingContext<V, O>> + CotangentBatchingPolicy<TracingContext<V, O>>,
     {
@@ -938,9 +938,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     pub fn with_batching_rule<R>(mut self, rule: R) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: 'static + Value<Type: DifferentiableType>,
-        O: 'static
-            + Operation<Type = V::Type>
+        V: Value<Type: DifferentiableType>,
+        O: Operation<Type = V::Type>
             + PartiallyEvaluatableOperation<TracingContext<V, O>>
             + DifferentiableOperation<TracingContext<V, O>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
@@ -1015,8 +1014,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
     pub fn with_sequential_batching(mut self) -> Self
     where
-        V: 'static + Value<Type: ScanType>,
-        O: 'static + Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
+        V: Value<Type: ScanType>,
+        O: Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
     {
         self.sequential_scan = Some(Arc::new(|length, carry_count, axis_sharding, stacked_output_count| {
             let scan = ScanOperation::<V::Type>::new(carry_count, length)
@@ -1034,9 +1033,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     pub fn with_reference_discharge<P>(mut self) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: 'static + Value<Type: ReferenceDischargeableType<Policy = P> + From<P::Referent>>,
+        V: Value<Type: ReferenceDischargeableType<Policy = P> + From<P::Referent>>,
         V::Type: From<ReferenceType<P::Referent>>,
-        O: 'static + Operation<Type = V::Type> + ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        O: Operation<Type = V::Type> + ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {

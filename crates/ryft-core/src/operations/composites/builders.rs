@@ -51,8 +51,8 @@ pub trait CompositeCallContext:
             Policy: RecursiveBatchingPolicy<TracingContext<Self::Constant, Self::Operation>>
                         + CotangentBatchingPolicy<TracingContext<Self::Constant, Self::Operation>>,
         >,
-        Constant: 'static + Send + Sync,
-        Operation: 'static + Send + Sync + From<CompositeOperation<Self::Constant, Self::Operation>>,
+        Constant: Send + Sync,
+        Operation: Send + Sync + From<CompositeOperation<Self::Constant, Self::Operation>>,
     >
 {
 }
@@ -70,8 +70,8 @@ impl<C> CompositeCallContext for C where
                 Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
                             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
             >,
-            Constant: 'static + Send + Sync,
-            Operation: 'static + Send + Sync + From<CompositeOperation<C::Constant, C::Operation>>,
+            Constant: Send + Sync,
+            Operation: Send + Sync + From<CompositeOperation<C::Constant, C::Operation>>,
         >
 {
 }
@@ -528,8 +528,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     V: Value,
     O: Operation<Type = V::Type>,
@@ -543,24 +541,24 @@ where
 {
     /// Returns this function with the provided reverse mode forward and backward (i.e., Vector-Jacobian Product or VJP)
     /// rules, which govern reverse mode differentiation and take precedence over any forward mode rule for it. This is
-    /// the analogue of JAX's [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
-    /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
+    /// the Ryft analogue of JAX's [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html)
+    /// and [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
     ///
     /// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The VJP, or pullback, maps an output
     /// cotangent `ȳ` to the input cotangent `x̄ = J_f(x)ᵀ · ȳ`. The two rules factor that computation through a
     /// residual value `r`:
     ///
     /// ```text
-    /// Forward:      x      ↦ (y, r) = (f(x), r)
-    /// Backward:     (r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ
+    /// Forward:   x      ↦ (y, r) = (f(x), r)
+    /// Backward:  (r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ
     /// ```
     ///
     /// Thus, `forward` recomputes `y` and saves exactly the residual value `r` needed by the reverse rule, and
     /// `backward` receives `r` and the output-cotangent value `ȳ`, then returns the input-cotangent value `x̄`. When
     /// tracing, Ryft validates matching parameter structures and the corresponding primal, residual, and cotangent
     /// types. The caller must ensure that the primal and `forward` compute the same value of `y`; tracing cannot
-    /// establish their numerical equivalence. A dynamic value that `backward` needs must be preserved as a residual in
-    /// `r`, and `backward` returns a zero cotangent for an input that it treats as a parameter.
+    /// establish their numerical equivalence. A dynamic value that `backward` needs must be preserved as a
+    /// residual in `r`, and `backward` returns a zero cotangent for an input that it treats as a parameter.
     ///
     /// The primal is kept separate from `forward` for efficiency rather than necessity: an un-differentiated call
     /// should not pay for residual computation. Callers that do not care about the distinction can pass the same body
@@ -569,8 +567,8 @@ where
     ///
     /// # When to Use
     ///
-    /// Reach for reverse mode rules when only the _reverse_ rule is natural, or when the function is not (efficiently)
-    /// forward-differentiable. Common cases are:
+    /// Reach for reverse mode differentiation rules when only the _reverse_ rule is natural, or when the function
+    /// is not (efficiently) forward-differentiable. Common cases are:
     ///
     ///   - **Implicit Differentiation:** Differentiate through a solver, optimizer, or fixed point via the implicit
     ///     function theorem rather than unrolling its iterations.
@@ -584,20 +582,20 @@ where
     ///   - **Numerical Stability:** Replace an unstable or wasteful automatically derived gradient with a handwritten
     ///     one.
     ///
-    /// Without a forward mode rule, active forward mode differentiation and reusable forward linearization reject a
-    /// call before executing its forward rule, because no pushforward rule was supplied. This rejection also occurs
-    /// when constructing staged forward derivatives, rather than waiting for their execution. Calls with no active
-    /// derivative inputs can still execute their primal directly. Add a forward mode rule (e.g., with
-    /// [`Self::with_jvp`] or [`Self::with_jvp_from_primal`]) when callers need direct forward mode differentiation as
-    /// well as reverse mode.
+    /// Without a forward mode differentiation rule, active forward mode differentiation and reusable forward
+    /// linearization reject a call before executing its forward rule, because no pushforward rule was supplied. This
+    /// rejection also occurs when constructing staged forward derivatives, rather than waiting for their execution.
+    /// Calls with no active derivative inputs can still execute their primal directly. Add a forward mode
+    /// differentiation rule (e.g., with [`Self::with_jvp`] or [`Self::with_jvp_from_primal`]) when callers
+    /// need direct forward mode differentiation as well as reverse mode.
     ///
     /// # Non-Differentiated Inputs and References
     ///
     /// Non-differentiated inputs reach the primal and `forward` at their usual positions and receive no cotangent:
     /// `backward` keeps returning a full `x̄` value so that its signature mirrors the primal signature, but the leaves
-    /// that it returns at non-differentiated positions are ignored, because the staged [`CompositeOperation`]
-    /// produces no cotangents for them. A non-differentiated value that `backward` needs must be forwarded to it as a
-    /// residual in `r`.
+    /// that it returns at non-differentiated positions are ignored, because the staged [`CompositeOperation`] produces
+    /// no cotangents for them. A non-differentiated value that `backward` needs must be forwarded to it as a residual
+    /// in `r`.
     ///
     /// `forward` may return a non-differentiated reference inside `r`, in which case the reference itself (rather
     /// than a snapshot of its contents) is forwarded to `backward`. Every reference-typed residual must be a distinct
@@ -609,15 +607,15 @@ where
     ///
     /// # Transform Semantics
     ///
-    /// Reverse mode traces `forward` when it linearizes a call and `backward` when it transposes the resulting carrier.
-    /// It replays the forward program for the primal outputs and residuals and stages a
+    /// Reverse mode differentiation traces `forward` when it linearizes a call and `backward` when it transposes
+    /// the resulting carrier. It replays the forward program for the primal outputs and residuals and stages a
     /// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) carrier whose transpose replays the backward
     /// program, so reverse mode uses exactly the user-supplied gradient, and the original call is never transposed. A
     /// call batched before it is differentiated batches both rule programs traced at the unbatched types and sums the
     /// cotangents that the batched backward program produces for replicated inputs over the batch axis. By default,
     /// the forward pass runs `forward` and keeps its residuals alive for the backward pass, while
-    /// [`Composite::with_deferred_forward`] (i.e., the analogue of JAX's `optimize_remat` option) runs the primal in
-    /// the forward pass instead and defers `forward` to the backward pass that needs its residuals.
+    /// [`Composite::with_deferred_forward`] (i.e., the Ryft analogue of JAX's `optimize_remat` option) runs the
+    /// primal in the forward pass instead and defers `forward` to the backward pass that needs its residuals.
     ///
     /// Higher-order differentiation differentiates the backward program's ordinary operations, because the pullback
     /// replays that program inline. Both forward and reverse mode apply to a pullback, with respect to the primal
@@ -661,12 +659,12 @@ where
     /// The leaves of structural-zero cotangent seeds (e.g., those of unused outputs) are [`MaybeZero::Zero`]s, and the
     /// rule returns a [`MaybeZero::Zero`] of an input's cotangent type for an input whose cotangent it knows to be zero
     /// (e.g., an input that it treats as a parameter), which then contributes nothing to that input's cotangent and
-    /// stays a structural zero instead of being materialized and accumulated. This is the analogue of JAX's
-    /// `defvjp(..., symbolic_zeros=True)` together with a backward rule that returns `None` or a `SymbolicZero` for an
-    /// input, except that the forward rule receives no per-input differentiation flags (JAX's `perturbed` flags).
+    /// stays a structural zero instead of being materialized and accumulated. This is the Ryft analogue of JAX's
+    /// `defvjp(..., symbolic_zeros=True)` together with a backward rule that returns `None` or a `SymbolicZero` for
+    /// an input, except that the forward rule receives no per-input differentiation flags (JAX's `perturbed` flags).
     ///
-    /// The operation family is inferred from the primal closure, so the seed needs no separate type annotation. The
-    /// residual structure may still need an annotation when the backward closure uses overloaded operations.
+    /// The operation family is inferred from the primal closure, so the seed needs no separate type annotation.
+    /// The residual structure may still need an annotation when the backward closure uses overloaded operations.
     ///
     /// # Examples
     ///
@@ -749,8 +747,8 @@ where
     /// analogue of a JAX backward rule returning `None` for an input, as [`Self::with_symbolic_zero_vjp`] expresses
     /// with [`MaybeZero::Zero`]).
     ///
-    /// The primal closure selects both the tracer of the seeds and the family of the transposition context, so the
-    /// backward closure needs no separate type annotations for them.
+    /// The primal closure selects both the tracer of the seeds and the family of the transposition context,
+    /// so the backward closure needs no separate type annotations for them.
     #[inline]
     pub fn with_accumulating_vjp<Residual, Forward, Backward>(
         self,
@@ -785,6 +783,8 @@ where
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value,
