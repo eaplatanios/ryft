@@ -27,8 +27,9 @@ use crate::operations::composites::operations::transpose::{CompositeTransposeOpe
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
-    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey,
-    CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey, CustomRuleTracer,
+    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey, CustomRuleDerivationKey,
+    CustomRuleDerivationKind, CustomRuleForwardSpecializationKey, CustomRuleReference, CustomRuleSource,
+    CustomRuleTracer,
 };
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameter, Placeholder};
@@ -503,9 +504,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         kept_outputs: &Option<Vec<bool>>,
         input_types: Vec<V::Type>,
         output_types: Vec<V::Type>,
-    ) -> Result<CustomRuleSpecializationKey<V::Type>, ProgramError> {
+    ) -> Result<CustomRuleForwardSpecializationKey<V::Type>, ProgramError> {
         Ok(match batching {
-            None => CustomRuleSpecializationKey {
+            None => CustomRuleForwardSpecializationKey {
                 input_types,
                 output_types,
                 kept_outputs: kept_outputs.clone(),
@@ -514,7 +515,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 levels: Vec::new(),
                 discharged,
             },
-            Some(batching) => CustomRuleSpecializationKey {
+            Some(batching) => CustomRuleForwardSpecializationKey {
                 input_types: batching.input_types.clone(),
                 output_types: batching.output_types.clone(),
                 kept_outputs: kept_outputs.clone(),
@@ -1211,7 +1212,7 @@ where
                 let rule_output_count = kept_outputs.as_ref().map_or(output_count, Vec::len);
                 let is_kept = |index: usize| kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index]);
                 let (primal, output_axes) = if rules.has_batching_rule() {
-                    let key = CustomRuleBatchingRuleKey {
+                    let key = CustomRuleBatchingSpecializationKey {
                         level: level.clone(),
                         boundary_input_types: boundary_inputs.iter().map(|value| value.r#type().into_owned()).collect(),
                         input_types: inputs.iter().map(|input| P::value(input).r#type().into_owned()).collect(),
@@ -1372,7 +1373,7 @@ where
                     .iter()
                     .map(|input| !input.tangent().is_zero())
                     .collect::<Vec<_>>();
-                let key = CustomRuleSpecializationKey {
+                let key = CustomRuleForwardSpecializationKey {
                     tangent_activity: tangent_activity.clone(),
                     ..self.specialization_key(
                         rules,
@@ -1607,14 +1608,13 @@ where
                 leading_values.extend(outputs.split_off(rule_output_count));
 
                 // A batched call stages a batched carrier, whose types are those of the unbatched forward rule.
-                let unbatched =
-                    match batching {
-                        None => None,
-                        Some(_) => Some(rules.forward_specialization(CustomRuleSpecializationKey {
-                            levels: Vec::new(),
-                            ..key.clone()
-                        })?),
-                    };
+                let unbatched = match batching {
+                    None => None,
+                    Some(_) => Some(rules.forward_specialization(CustomRuleForwardSpecializationKey {
+                        levels: Vec::new(),
+                        ..key.clone()
+                    })?),
+                };
 
                 // The seed extents of a batched call are those of its unbatched output tangent types, read by identity
                 // from its outputs. The outputs that a batched call does not keep have no recorded unbatched types, so
@@ -7854,7 +7854,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let specialization = definition
             .reference()
-            .jvp_specialization(CustomRuleSpecializationKey {
+            .jvp_specialization(CustomRuleForwardSpecializationKey {
                 input_types: vec![scalar_type.clone()],
                 output_types: vec![scalar_type],
                 kept_outputs: None,
@@ -8204,7 +8204,7 @@ mod tests {
         assert_eq!(
             definition.caches().jvp_specializations.keys(),
             vec![
-                CustomRuleSpecializationKey {
+                CustomRuleForwardSpecializationKey {
                     input_types: vec![static_type.clone()],
                     output_types: vec![static_type],
                     kept_outputs: None,
@@ -8213,7 +8213,7 @@ mod tests {
                     levels: Vec::new(),
                     discharged: false,
                 },
-                CustomRuleSpecializationKey {
+                CustomRuleForwardSpecializationKey {
                     input_types: vec![relocated_type.clone()],
                     output_types: vec![relocated_type.clone()],
                     kept_outputs: None,

@@ -27,8 +27,8 @@ use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
-    CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
-    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleTracer,
+    CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel,
+    CustomRuleForwardSpecializationKey, CustomRuleReference, CustomRuleSource, CustomRuleTracer,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -281,7 +281,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     batching: batching.map(CustomRuleBatching::map_types),
                     invokes_rule_directly,
                     discharged,
-                    deferred_forward: deferred_forward.map(CustomRuleSpecializationKey::map_types),
+                    deferred_forward: deferred_forward.map(CustomRuleForwardSpecializationKey::map_types),
                 },
             },
             marker: PhantomData,
@@ -634,7 +634,7 @@ where
                         discharged: true,
                         deferred_forward: deferred_forward
                             .as_ref()
-                            .map(|key| CustomRuleSpecializationKey { discharged: true, ..key.clone() }),
+                            .map(|key| CustomRuleForwardSpecializationKey { discharged: true, ..key.clone() }),
                     },
                     ..self.clone()
                 };
@@ -1205,7 +1205,7 @@ pub(super) enum CompositeTransposeRules<T, S> {
         /// carrier's leading inputs already contain the residuals. A deferred carrier's leading
         /// inputs are the call's inputs (including the boundary inputs of its batching levels, which the key records),
         /// followed by the seed extents, and it records no batching of its own.
-        deferred_forward: Option<CustomRuleSpecializationKey<T>>,
+        deferred_forward: Option<CustomRuleForwardSpecializationKey<T>>,
     },
 }
 

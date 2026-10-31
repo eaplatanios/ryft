@@ -7,7 +7,9 @@ use crate::batching::BatchAxis;
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationError};
 use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
-use crate::operations::composites::rules::{CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleSpecializationKey};
+use crate::operations::composites::rules::{
+    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleForwardSpecializationKey,
+};
 use crate::programs::{Operation, Value};
 use crate::tracing::TracingContext;
 
@@ -29,7 +31,7 @@ pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperat
 /// unbatched forward rule.
 fn transpose_carrier_batching<V, O, S>(
     rules: &S,
-    key: &CustomRuleSpecializationKey<V::Type>,
+    key: &CustomRuleForwardSpecializationKey<V::Type>,
     rule_output_count: usize,
     seed_extent_types: &[V::Type],
     extent_types: Vec<V::Type>,
@@ -40,7 +42,8 @@ where
     O: Operation<Type = V::Type>,
     S: CustomRuleSpecializer<V, O>,
 {
-    let unbatched = rules.forward_specialization(CustomRuleSpecializationKey { levels: Vec::new(), ..key.clone() })?;
+    let unbatched =
+        rules.forward_specialization(CustomRuleForwardSpecializationKey { levels: Vec::new(), ..key.clone() })?;
     let non_differentiated_count = key.non_differentiated_count;
     let mut input_types = key.input_types[..non_differentiated_count].to_vec();
     input_types.extend_from_slice(&unbatched.program.output_types()[rule_output_count..]);
@@ -50,7 +53,7 @@ where
     }
     let mut levels = Vec::with_capacity(key.levels.len());
     for (index, level) in key.levels.iter().enumerate() {
-        let level_key = CustomRuleSpecializationKey { levels: key.levels[..=index].to_vec(), ..key.clone() };
+        let level_key = CustomRuleForwardSpecializationKey { levels: key.levels[..=index].to_vec(), ..key.clone() };
         let level_specialization = rules.forward_specialization(level_key)?;
         let leading_input_count = non_differentiated_count
             + key.levels[..index].iter().map(|level| level.boundary_input_count).sum::<usize>();

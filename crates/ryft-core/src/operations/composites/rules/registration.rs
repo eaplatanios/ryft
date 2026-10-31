@@ -19,8 +19,8 @@ use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::definition::CustomRuleDefinition;
 use crate::operations::composites::rules::specialization::specialization_error;
 use crate::operations::composites::rules::{
-    CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingRuleKey,
-    CustomRuleDerivationKey, CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationKey,
+    CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey,
+    CustomRuleDerivationKey, CustomRuleForwardSpecializationKey, CustomRuleProgram, CustomRuleSpecialization,
     CustomRuleSpecializationRequest,
 };
 use crate::parameters::Parameter;
@@ -32,11 +32,11 @@ use crate::specialization::SpecializationCache;
 pub(in crate::operations::composites) struct CustomRuleCaches<V: Typed + Parameter, O> {
     /// Specializations of the forward mode rule.
     pub(in crate::operations::composites) jvp_specializations:
-        SpecializationCache<CustomRuleSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 
     /// Specializations of the reverse mode forward rule.
     pub(in crate::operations::composites) forward_specializations:
-        SpecializationCache<CustomRuleSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 
     /// Destination-specialized transposes of the reverse mode backward rule.
     pub(in crate::operations::composites) backward_specializations:
@@ -44,7 +44,7 @@ pub(in crate::operations::composites) struct CustomRuleCaches<V: Typed + Paramet
 
     /// Batched primal programs produced by the custom batching rule.
     pub(super) batching_rule_specializations:
-        SpecializationCache<CustomRuleBatchingRuleKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleBatchingSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 
     /// Registrations of the definitions derived from this definition (refer to [`CustomRuleDerivation`]), which these
     /// caches own so that they live at most as long as the specializations of this definition. Like the
@@ -385,7 +385,7 @@ mod tests {
             let this = this.clone();
             TestDefinition::new("reentrant").with_jvp(move |primals, tangents| {
                 let r#type = primals[0].r#type().into_owned();
-                let key = CustomRuleSpecializationKey {
+                let key = CustomRuleForwardSpecializationKey {
                     input_types: vec![r#type.clone()],
                     output_types: vec![r#type],
                     kept_outputs: None,

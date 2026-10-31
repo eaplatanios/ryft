@@ -1470,8 +1470,8 @@ mod tests {
     use crate::differentiation::{CotangentDestinationKind, DifferentiationError, TransposedProgramCotangent};
     use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
     use crate::operations::composites::rules::{
-        CustomRuleBackwardSpecializationKey, CustomRuleBatchingRuleKey, CustomRuleRegistration, CustomRuleSource,
-        CustomRuleSpecializationKey,
+        CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey, CustomRuleForwardSpecializationKey,
+        CustomRuleRegistration, CustomRuleSource,
     };
     use crate::parameters::Placeholder;
 
@@ -1487,8 +1487,8 @@ mod tests {
     type ArrayIrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Returns the key of an unbatched scalar `f64` call with one input and one output.
-    fn scalar_specialization_key(tangent_activity: Vec<bool>) -> CustomRuleSpecializationKey<ArrayType> {
-        CustomRuleSpecializationKey {
+    fn scalar_specialization_key(tangent_activity: Vec<bool>) -> CustomRuleForwardSpecializationKey<ArrayType> {
+        CustomRuleForwardSpecializationKey {
             input_types: vec![ArrayType::scalar(DataType::F64)],
             output_types: vec![ArrayType::scalar(DataType::F64)],
             kept_outputs: None,
@@ -1514,8 +1514,8 @@ mod tests {
     }
 
     /// Returns the key of a scalar call replicated over a static level of two items.
-    fn scalar_batching_key() -> CustomRuleBatchingRuleKey<ArrayType> {
-        CustomRuleBatchingRuleKey {
+    fn scalar_batching_key() -> CustomRuleBatchingSpecializationKey<ArrayType> {
+        CustomRuleBatchingSpecializationKey {
             level: BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated),
             boundary_input_types: Vec::new(),
             input_types: vec![ArrayType::scalar(DataType::F64)],
@@ -1643,7 +1643,7 @@ mod tests {
         ));
         let specialization = registration
             .reference()
-            .jvp_specialization(CustomRuleSpecializationKey {
+            .jvp_specialization(CustomRuleForwardSpecializationKey {
                 input_types: vec![ArrayType::scalar(DataType::F64); 3],
                 output_types: vec![ArrayType::scalar(DataType::F64); 2],
                 non_differentiated_count: 1,
@@ -1814,7 +1814,7 @@ mod tests {
         ));
         let forward = registration
             .reference()
-            .forward_specialization(CustomRuleSpecializationKey {
+            .forward_specialization(CustomRuleForwardSpecializationKey {
                 output_types: Vec::new(),
                 ..scalar_specialization_key(Vec::new())
             })
@@ -1900,7 +1900,7 @@ mod tests {
         ));
         let forward = registration
             .reference()
-            .forward_specialization(CustomRuleSpecializationKey {
+            .forward_specialization(CustomRuleForwardSpecializationKey {
                 input_types: vec![ArrayType::scalar(DataType::F64); 2],
                 non_differentiated_count: 1,
                 ..scalar_specialization_key(Vec::new())

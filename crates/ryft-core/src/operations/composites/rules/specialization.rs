@@ -30,9 +30,10 @@ use crate::operations::composites::rules::definition::{
 };
 use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
-    CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey,
-    CustomRuleDerivationKey, CustomRuleDerivationKind, CustomRuleProgram, CustomRuleSpecialization,
-    CustomRuleSpecializationKey, CustomRuleSpecializationRequest, CustomRuleTracer,
+    CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatchingLevel,
+    CustomRuleBatchingSpecializationKey, CustomRuleDerivationKey, CustomRuleDerivationKind,
+    CustomRuleForwardSpecializationKey, CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationRequest,
+    CustomRuleTracer,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -146,7 +147,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     /// outputs followed by their tangents.
     fn jvp_specialization(
         &self,
-        key: CustomRuleSpecializationKey<V::Type>,
+        key: CustomRuleForwardSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -157,7 +158,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     /// returns the call's outputs followed by the residuals.
     fn forward_specialization(
         &self,
-        key: CustomRuleSpecializationKey<V::Type>,
+        key: CustomRuleForwardSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -181,7 +182,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     /// batch axes of those outputs.
     fn batching_rule_specialization(
         &self,
-        key: CustomRuleBatchingRuleKey<V::Type>,
+        key: CustomRuleBatchingSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -299,7 +300,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for CustomRuleReference<V, O> {
     fn jvp_specialization(
         &self,
-        key: CustomRuleSpecializationKey<V::Type>,
+        key: CustomRuleForwardSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -332,8 +333,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         };
         // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Jvp(key.clone()), || {
-            let inner = match key.split_outermost_level() {
-                Some((inner_key, level)) => Some((self.jvp_specialization(inner_key)?, level.clone())),
+            let inner = match key.levels.split_last() {
+                Some((level, inner_levels)) => Some((
+                    self.jvp_specialization(CustomRuleForwardSpecializationKey {
+                        levels: inner_levels.to_vec(),
+                        ..key.clone()
+                    })?,
+                    level.clone(),
+                )),
                 None => None,
             };
             let Some((inner, level)) = inner else {
@@ -495,7 +502,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
 
     fn forward_specialization(
         &self,
-        key: CustomRuleSpecializationKey<V::Type>,
+        key: CustomRuleForwardSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -527,8 +534,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // The inner specialization is requested only when the outer one is not cached.
         let output_count = key.rule_output_count()?;
         self.specialize(CustomRuleSpecializationRequest::Forward(key.clone()), || {
-            let inner = match key.split_outermost_level() {
-                Some((inner_key, level)) => Some((self.forward_specialization(inner_key)?, level.clone())),
+            let inner = match key.levels.split_last() {
+                Some((level, inner_levels)) => Some((
+                    self.forward_specialization(CustomRuleForwardSpecializationKey {
+                        levels: inner_levels.to_vec(),
+                        ..key.clone()
+                    })?,
+                    level.clone(),
+                )),
                 None => None,
             };
             let Some((inner, level)) = inner else {
@@ -615,7 +628,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let residual_count = inner.program.output_types().len() - output_count;
             let mut kept_output_axes = level.output_axes.iter().copied();
             let output_axes = (0..output_count)
-                .map(|index| key.is_output_kept(index).then(|| kept_output_axes.next()).flatten())
+                .map(|index| {
+                    if key.kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index]) {
+                        kept_output_axes.next()
+                    } else {
+                        None
+                    }
+                })
                 .chain(std::iter::repeat_n(None, residual_count))
                 .collect::<Vec<_>>();
             self.definition.batched_specialization(
@@ -647,8 +666,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         };
         // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Backward(key.clone()), || {
-            let inner = match key.split_outermost_level() {
-                Some((inner_key, level)) => Some((self.backward_specialization(inner_key)?, level.clone())),
+            let inner = match key.levels.split_last() {
+                Some((level, inner_levels)) => Some((
+                    self.backward_specialization(CustomRuleBackwardSpecializationKey {
+                        levels: inner_levels.to_vec(),
+                        ..key.clone()
+                    })?,
+                    level.clone(),
+                )),
                 None => None,
             };
             let leading_input_count = key.leading_input_types.len();
@@ -730,7 +755,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
 
     fn batching_rule_specialization(
         &self,
-        key: CustomRuleBatchingRuleKey<V::Type>,
+        key: CustomRuleBatchingSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1213,14 +1238,14 @@ where
 {
     fn jvp_specialization(
         &self,
-        key: CustomRuleSpecializationKey<Vc::Type>,
+        key: CustomRuleForwardSpecializationKey<Vc::Type>,
     ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type> + ResidualZeroProvider<Vc::Type, Operation = Oc>,
     {
         let member = self.member()?;
-        let member_key = CustomRuleSpecializationKey {
+        let member_key = CustomRuleForwardSpecializationKey {
             input_types: self.project_types(&key.input_types)?,
             output_types: self.project_types(&key.output_types)?,
             kept_outputs: key.kept_outputs.clone(),
@@ -1241,14 +1266,14 @@ where
 
     fn forward_specialization(
         &self,
-        key: CustomRuleSpecializationKey<Vc::Type>,
+        key: CustomRuleForwardSpecializationKey<Vc::Type>,
     ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type>,
     {
         let member = self.member()?;
-        let member_key = CustomRuleSpecializationKey {
+        let member_key = CustomRuleForwardSpecializationKey {
             input_types: self.project_types(&key.input_types)?,
             output_types: self.project_types(&key.output_types)?,
             kept_outputs: key.kept_outputs.clone(),
@@ -1325,7 +1350,7 @@ where
 
     fn batching_rule_specialization(
         &self,
-        key: CustomRuleBatchingRuleKey<Vc::Type>,
+        key: CustomRuleBatchingSpecializationKey<Vc::Type>,
     ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
@@ -1355,7 +1380,7 @@ where
             BatchingLevelExtent::Static(extent) => BatchingLevelExtent::Static(*extent),
             BatchingLevelExtent::Dynamic(r#type) => BatchingLevelExtent::Dynamic(project(r#type)?),
         };
-        let member_key = CustomRuleBatchingRuleKey {
+        let member_key = CustomRuleBatchingSpecializationKey {
             level: BatchingLevel::new(
                 extent,
                 key.level.axis_name().map(str::to_owned),
@@ -1419,7 +1444,7 @@ where
     fn batching_rule_specialization(
         &self,
         name: &str,
-        key: &CustomRuleBatchingRuleKey<V::Type>,
+        key: &CustomRuleBatchingSpecializationKey<V::Type>,
     ) -> Result<CustomRuleSpecialization<V, O>, DifferentiationError> {
         let source = &self.source.definition;
         let (Some(differentiator), Some(batcher)) = (&source.differentiator, &source.batcher) else {
@@ -1472,7 +1497,7 @@ where
         let boundary_input_count = key.boundary_input_types.len();
         let jvp_input_indices =
             tangent_primal_indices.iter().map(|index| boundary_input_count + index).collect::<Vec<_>>();
-        let rule_key = |input_types: Vec<V::Type>, input_axes: Vec<BatchAxis>| CustomRuleBatchingRuleKey {
+        let rule_key = |input_types: Vec<V::Type>, input_axes: Vec<BatchAxis>| CustomRuleBatchingSpecializationKey {
             level: key.level.clone(),
             boundary_input_types: key.boundary_input_types.clone(),
             input_types,
@@ -1642,7 +1667,7 @@ where
     fn broadcast_sensitive_batching_rule_specialization(
         &self,
         name: &str,
-        key: &CustomRuleBatchingRuleKey<V::Type>,
+        key: &CustomRuleBatchingSpecializationKey<V::Type>,
         primal_rule: &CustomRuleProgram<V, O>,
         tangent_primal_indices: &[usize],
         broadcast_sensitivity: &dyn CustomRuleBroadcastSensitivity<V, O>,
@@ -2227,7 +2252,7 @@ mod tests {
     fn derived_batching_rule_specialization(
         registration: &CustomRuleRegistration<Array, ArrayOperation<Array>>,
         derivation_key: CustomRuleDerivationKey,
-        key: &CustomRuleBatchingRuleKey<ArrayType>,
+        key: &CustomRuleBatchingSpecializationKey<ArrayType>,
     ) -> Result<CustomRuleSpecialization<Array, ArrayOperation<Array>>, DifferentiationError> {
         let derived = registration.reference().derived(derivation_key)?;
         derived.definition.derivation.as_ref().unwrap().batching_rule_specialization(derived.name(), key)
@@ -2250,7 +2275,7 @@ mod tests {
         };
         let specialization = |extent: usize| {
             let r#type = ArrayType::new_static(DataType::F64, [extent]);
-            let key = CustomRuleSpecializationKey {
+            let key = CustomRuleForwardSpecializationKey {
                 input_types: vec![r#type.clone()],
                 output_types: vec![r#type],
                 kept_outputs: None,
@@ -2289,7 +2314,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let key = CustomRuleSpecializationKey {
+        let key = CustomRuleForwardSpecializationKey {
             input_types: vec![scalar_type.clone()],
             output_types: vec![scalar_type],
             kept_outputs: None,
@@ -2524,7 +2549,7 @@ mod tests {
                 .to_owned()
         };
         assert_eq!(source(&lifted), "cube");
-        let key = |input_type: ArrayIrType, levels| CustomRuleSpecializationKey {
+        let key = |input_type: ArrayIrType, levels| CustomRuleForwardSpecializationKey {
             input_types: vec![input_type.clone()],
             output_types: vec![input_type],
             kept_outputs: None,
@@ -2621,7 +2646,7 @@ mod tests {
         let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
         let lifted = LiftedCustomRules::Member(definition.reference());
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
-        let key = CustomRuleSpecializationKey {
+        let key = CustomRuleForwardSpecializationKey {
             input_types: vec![scalar_type.clone()],
             output_types: vec![scalar_type],
             kept_outputs: None,
@@ -3003,7 +3028,7 @@ mod tests {
             input_axes: vec![BatchAxis::new(0)],
             output_axes: vec![BatchAxis::new(0)],
         };
-        let key = CustomRuleSpecializationKey {
+        let key = CustomRuleForwardSpecializationKey {
             input_types: vec![item_type.clone()],
             output_types: vec![item_type],
             kept_outputs: None,

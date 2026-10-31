@@ -171,9 +171,11 @@ impl<T: Display> Display for CustomRuleBatching<T> {
     }
 }
 
-/// Specialization key for the rules of a [`CustomRuleDefinition`].
+/// Specialization key for the forward mode differentiation and reverse mode forward rules of a
+/// [`CustomRuleDefinition`], based on the call's primal signature and tangent activity. Backward rules use
+/// [`CustomRuleBackwardSpecializationKey`] to describe their residuals, cotangent seeds, and destinations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CustomRuleSpecializationKey<T> {
+pub(super) struct CustomRuleForwardSpecializationKey<T> {
     /// Unbatched types of every input of the call, excluding boundary inputs.
     pub(super) input_types: Vec<T>,
 
@@ -207,18 +209,9 @@ pub(super) struct CustomRuleSpecializationKey<T> {
     pub(super) discharged: bool,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
-    /// Returns the key of the specialization from which this key's specialization is batched (i.e., without its
-    /// outermost level), together with that level, or [`None`] when this key is unbatched.
-    fn split_outermost_level(&self) -> Option<(Self, &CustomRuleBatchingLevel<T>)> {
-        let (outermost, inner) = self.levels.split_last()?;
-        Some((Self { levels: inner.to_vec(), ..self.clone() }, outermost))
-    }
-
+impl<T: Type + Eq + Hash> CustomRuleForwardSpecializationKey<T> {
     /// Returns the number of outputs of the rule, which exceeds the number of outputs of the call when the call keeps
-    /// only some of them (refer to [`Self::kept_outputs`]).
+    /// only some of them (refer to [`Self::kept_output_indices`]).
     ///
     /// # Errors
     ///
@@ -230,7 +223,8 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
         let kept_output_count = kept_outputs.iter().filter(|kept| **kept).count();
         if kept_output_count != self.output_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "custom rule specialization key keeps {kept_output_count} rule outputs but has {} output types",
+                "custom rule specialization key keeps {} rule outputs but has {} output types",
+                kept_output_count,
                 self.output_types.len(),
             )));
         }
@@ -239,17 +233,14 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
 
     /// Returns the positions of the outputs of the call among the `rule_output_count` outputs of the rule.
     pub(super) fn kept_output_indices(&self, rule_output_count: usize) -> Vec<usize> {
-        (0..rule_output_count).filter(|&index| self.is_output_kept(index)).collect()
-    }
-
-    /// Returns whether the output of the rule at `index` is an output of the call.
-    fn is_output_kept(&self, index: usize) -> bool {
-        self.kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index])
+        (0..rule_output_count)
+            .filter(|&index| self.kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index]))
+            .collect()
     }
 
     /// Returns this key with its types converted into the type family `U` (refer to [`CustomRuleBatching::map_types`]),
     /// as when the carrier that stores it is converted into a family that contains the carrier's family.
-    pub(super) fn map_types<U: Type + From<T>>(self) -> CustomRuleSpecializationKey<U> {
+    pub(super) fn map_types<U: Type + From<T>>(self) -> CustomRuleForwardSpecializationKey<U> {
         let Self {
             input_types,
             output_types,
@@ -261,7 +252,7 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
         } = self;
         let CustomRuleBatching { input_types, output_types, levels } =
             CustomRuleBatching { input_types, output_types, levels }.map_types();
-        CustomRuleSpecializationKey {
+        CustomRuleForwardSpecializationKey {
             input_types,
             output_types,
             kept_outputs,
@@ -290,8 +281,8 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
     }
 }
 
-/// Specialization key of the backward rule of a [`CustomRuleDefinition`]. It contains only static information, and
-/// never a runtime reference identity or the contents of a value.
+/// Specialization key of the backward differentiation rule of a [`CustomRuleDefinition`]. It contains only static
+/// information, and never a runtime reference identity or the contents of a value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CustomRuleBackwardSpecializationKey<T> {
     /// Unbatched types of the known leading inputs (i.e., the non-differentiated inputs, the residuals, and the seed
@@ -320,20 +311,11 @@ pub(super) struct CustomRuleBackwardSpecializationKey<T> {
     pub(super) discharged: bool,
 }
 
-impl<T: Type + Eq + Hash> CustomRuleBackwardSpecializationKey<T> {
-    /// Returns the key of the specialization from which this key's specialization is batched (i.e., without its
-    /// outermost level), together with that level, or [`None`] when this key is unbatched.
-    fn split_outermost_level(&self) -> Option<(Self, &CustomRuleBatchingLevel<T>)> {
-        let (outermost, inner) = self.levels.split_last()?;
-        Some((Self { levels: inner.to_vec(), ..self.clone() }, outermost))
-    }
-}
-
 /// Specialization key of the custom batching rule of a [`CustomRuleDefinition`] (refer to
-/// [`CustomRuleDefinition::with_batching_rule`]). It contains only static information: the level, the types and batch
-/// axes of the batched call's inputs, and whether the call was discharged.
+/// [`CustomRuleDefinition::with_batching_rule`]). It contains only static information: the level,
+/// the types and batch axes of the batched call's inputs, and whether the call was discharged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CustomRuleBatchingRuleKey<T> {
+pub(super) struct CustomRuleBatchingSpecializationKey<T> {
     /// Batching level at which the call is batched.
     pub(super) level: BatchingLevel<T>,
 
@@ -356,19 +338,21 @@ pub(super) struct CustomRuleBatchingRuleKey<T> {
     pub(super) discharged: bool,
 }
 
-/// Kind of call that a derived definition (refer to [`CustomRuleDerivation`]) stages for the forward mode derivative
-/// of a call whose forward mode rule is derived from its primal.
+/// Kind of call that a derived definition stages for the forward mode derivative of a call whose forward mode
+/// differentiation rule is derived from its primal.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum CustomRuleDerivationKind {
-    /// Call that maps the source call's inputs and the active tangents of its differentiated inputs to its outputs and
-    /// their live tangents, which fused differentiation contexts stage.
+    /// Call that maps the source call's inputs and the active tangents of its differentiated inputs to its outputs
+    /// and their live tangents, which fused differentiation contexts stage.
     Jvp,
 
     /// Call that maps the source call's inputs and the active tangents of its differentiated inputs to the live
-    /// tangents of its outputs only, which partitioned differentiation contexts (e.g., linearization) stage on their
-    /// tangent side.
+    /// tangents of its outputs only, which partitioned differentiation contexts (e.g., linearization) stage on
+    /// their tangent side.
     Pushforward,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Key of a definition derived from a source [`CustomRuleDefinition`] (refer to
 /// [`CustomRuleSpecializer::derived`](specialization::CustomRuleSpecializer::derived)). It contains only static
@@ -395,16 +379,16 @@ pub(super) struct CustomRuleDerivationKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CustomRuleSpecializationRequest<T> {
     /// Specialization of the forward mode rule.
-    Jvp(CustomRuleSpecializationKey<T>),
+    Jvp(CustomRuleForwardSpecializationKey<T>),
 
     /// Specialization of the reverse mode forward rule.
-    Forward(CustomRuleSpecializationKey<T>),
+    Forward(CustomRuleForwardSpecializationKey<T>),
 
     /// Destination-specialized transpose of the reverse mode backward rule.
     Backward(CustomRuleBackwardSpecializationKey<T>),
 
     /// Batched primal program produced by the custom batching rule.
-    BatchingRule(CustomRuleBatchingRuleKey<T>),
+    BatchingRule(CustomRuleBatchingSpecializationKey<T>),
 }
 
 /// Program produced by specializing a retained custom rule, together with the batch axes of its outputs at the
@@ -448,8 +432,8 @@ mod tests {
         input_types: Vec<ArrayType>,
         unbatched_input_types: Vec<ArrayType>,
         input_axes: Vec<BatchAxis>,
-    ) -> CustomRuleBatchingRuleKey<ArrayType> {
-        CustomRuleBatchingRuleKey {
+    ) -> CustomRuleBatchingSpecializationKey<ArrayType> {
+        CustomRuleBatchingSpecializationKey {
             level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
             boundary_input_types: Vec::new(),
             input_types,

@@ -1349,7 +1349,7 @@ mod tests {
     use crate::operations::composites::rules::tests::{MemberTracer, batching_rule_key};
     use crate::operations::composites::rules::{
         CustomRuleBackwardSpecializationKey, CustomRuleBatchingLevel, CustomRuleDerivationKind,
-        CustomRuleSpecializationKey,
+        CustomRuleForwardSpecializationKey,
     };
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition,
@@ -1365,8 +1365,8 @@ mod tests {
         input_types: Vec<T>,
         output_types: Vec<T>,
         tangent_activity: Vec<bool>,
-    ) -> CustomRuleSpecializationKey<T> {
-        CustomRuleSpecializationKey {
+    ) -> CustomRuleForwardSpecializationKey<T> {
+        CustomRuleForwardSpecializationKey {
             input_types,
             output_types,
             kept_outputs: None,
@@ -1792,7 +1792,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let key = CustomRuleSpecializationKey {
+        let key = CustomRuleForwardSpecializationKey {
             levels: vec![CustomRuleBatchingLevel {
                 level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
                 boundary_input_count: 0,
@@ -1935,7 +1935,7 @@ mod tests {
             )
         };
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let key = |discharged| CustomRuleSpecializationKey {
+        let key = |discharged| CustomRuleForwardSpecializationKey {
             discharged,
             ..unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], vec![true])
         };
