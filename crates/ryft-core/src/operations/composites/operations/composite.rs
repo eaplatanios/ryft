@@ -194,9 +194,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Creates a new call with attached rule programs, whose inputs are all differentiated. An explicit forward mode
-    /// rule (i.e., [`CompositeJvpRule::Explicit`]) is a `"jvp"` rule region that follows the primal region, and
-    /// reverse mode rules are `"forward"` and `"backward"` rule regions that follow the primal region and the optional
-    /// `"jvp"` rule region.
+    /// differentiation rule (i.e., an [`CompositeJvpRule::Explicit`] rule) is a `"jvp"` rule region that follows the
+    /// primal region, and reverse mode differentiation rules are `"forward"` and `"backward"` rule regions that follow
+    /// the primal region and the optional `"jvp"` rule region.
     #[inline]
     pub fn from_rule_regions(jvp_rule: CompositeJvpRule, has_vjp_rule: bool) -> Self {
         Self {
@@ -207,22 +207,23 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
-    /// [`CompositeOperation`] for the impact of this property on the rule interfaces. For a batched call with
-    /// retained rules, this count includes the boundary inputs that its batching levels prepended to its inputs.
+    /// [`CompositeOperation`] for the impact of this property on the rule interfaces. For a batched call with retained
+    /// rules, this count includes the boundary inputs that its batching levels prepended to its inputs.
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count` is
-    /// smaller than the number of those boundary inputs, which are always non-differentiated.
+    /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count`
+    /// is smaller than the number of those boundary inputs, which are always non-differentiated.
     pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Result<Self, TypeError> {
         if let CompositeRules::Retained { rules, batching: Some(batching), .. } = &self.rules {
             let boundary_input_count = batching.boundary_input_count();
             if non_differentiated_count < boundary_input_count {
                 return Err(TypeError::invalid(format!(
-                    "batched {} must have at least {boundary_input_count} \
-                     non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
-                     its inputs, but got {non_differentiated_count}",
+                    "batched {} must have at least {} non-differentiated inputs, which are the boundary inputs \
+                     that its batching levels prepended to its inputs, but got {}",
                     describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
+                    boundary_input_count,
+                    non_differentiated_count,
                 )));
             }
         }
@@ -245,7 +246,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns the forward mode rule of this call.
+    /// Returns the forward mode differentiation rule of this [`CompositeOperation`].
+    #[inline]
     pub fn jvp_rule(&self) -> CompositeJvpRule {
         match &self.rules {
             CompositeRules::Attached { jvp_rule, .. } => *jvp_rule,
@@ -255,7 +257,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns whether this call has reverse mode forward and backward rules.
+    /// Returns whether this [`CompositeOperation`] has reverse mode differentiation forward and backward rules.
+    #[inline]
     pub fn has_vjp_rule(&self) -> bool {
         match &self.rules {
             CompositeRules::Attached { has_vjp_rule, .. } => *has_vjp_rule,
