@@ -176,13 +176,15 @@ where
 /// (i.e., the non-differentiated inputs `p` followed by the residuals `r`) and one materialized cotangent seed per
 /// output, and it returns one cotangent per differentiated input. This is the primary reverse mode form: it is a pure
 /// function of its inputs, like any other traced program, and transposition adds its results to whatever destination
-/// each differentiated input's cotangent has.
+/// each differentiated input's cotangent has. The explicit tracing context lets structured adapters replay a rule
+/// even when its boundary has no leading inputs or seeds.
 pub(in crate::operations::composites) trait CustomVjpBackwardRule<V, O>:
     Send + Sync
 {
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
+        context: &TracingContext<V, O>,
         leading_inputs: &[CustomRuleTracer<V, O>],
         seeds: &[CustomRuleTracer<V, O>],
     ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
@@ -195,17 +197,22 @@ pub(in crate::operations::composites) trait CustomVjpBackwardRule<V, O>:
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpBackwardRule<V, O> for F
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    F: Fn(&[CustomRuleTracer<V, O>], &[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
+    F: Fn(
+            &TracingContext<V, O>,
+            &[CustomRuleTracer<V, O>],
+            &[CustomRuleTracer<V, O>],
+        ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
         + Send
         + Sync,
 {
     #[inline]
     fn apply(
         &self,
+        context: &TracingContext<V, O>,
         leading_inputs: &[CustomRuleTracer<V, O>],
         seeds: &[CustomRuleTracer<V, O>],
     ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> {
-        self(leading_inputs, seeds)
+        self(context, leading_inputs, seeds)
     }
 }
 
@@ -220,6 +227,7 @@ pub(in crate::operations::composites) trait CustomSymbolicZeroVjpBackwardRule<V,
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
+        context: &TracingContext<V, O>,
         leading_inputs: &[CustomRuleTracer<V, O>],
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
     ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
@@ -233,6 +241,7 @@ impl<V: Value, O: Operation<Type = V::Type>, F> CustomSymbolicZeroVjpBackwardRul
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
+            &TracingContext<V, O>,
             &[CustomRuleTracer<V, O>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
         ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
@@ -242,10 +251,11 @@ where
     #[inline]
     fn apply(
         &self,
+        context: &TracingContext<V, O>,
         leading_inputs: &[CustomRuleTracer<V, O>],
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
     ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError> {
-        self(leading_inputs, seeds)
+        self(context, leading_inputs, seeds)
     }
 }
 
@@ -674,7 +684,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// inputs `p` followed by the residuals) and one cotangent seed per output, in which structural zeros are
     /// materialized, and it returns one cotangent per differentiated input, which transposition adds to whatever
     /// destination that input's cotangent has.
-    pub fn with_vjp<F, B>(mut self, forward: F, backward: B) -> Self
+    pub fn with_vjp<F, B>(self, forward: F, backward: B) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -687,6 +697,31 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
         B: 'static
             + Fn(
+                &[CustomRuleTracer<V, O>],
+                &[CustomRuleTracer<V, O>],
+            ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
+            + Send
+            + Sync,
+    {
+        self.with_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
+    }
+
+    /// Installs materialized-seed reverse mode rules whose backward adapter receives the trace in which it must
+    /// replay. Structured adapters need that trace when neither leading inputs nor seeds can supply it.
+    pub(in crate::operations::composites) fn with_vjp_in_context<F, B>(mut self, forward: F, backward: B) -> Self
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+        V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
+        O: 'static + CustomVjpOperation<V>,
+        F: 'static
+            + Fn(
+                &[CustomRuleTracer<V, O>],
+            ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
+            + Send
+            + Sync,
+        B: 'static
+            + Fn(
+                &TracingContext<V, O>,
                 &[CustomRuleTracer<V, O>],
                 &[CustomRuleTracer<V, O>],
             ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
@@ -706,7 +741,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// zero (e.g., that of an input that it treats as a parameter). Transposition contributes nothing to the
     /// destination of a structural-zero cotangent, so the cotangent stays a structural zero through the transposed
     /// program (refer to [`TransposedProgramCotangent::Zero`]) unless its consumer materializes it.
-    pub fn with_symbolic_zero_vjp<F, B>(mut self, forward: F, backward: B) -> Self
+    pub fn with_symbolic_zero_vjp<F, B>(self, forward: F, backward: B) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -719,6 +754,35 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
         B: 'static
             + Fn(
+                &[CustomRuleTracer<V, O>],
+                &[MaybeZero<CustomRuleTracer<V, O>>],
+            ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
+            + Send
+            + Sync,
+    {
+        self.with_symbolic_zero_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
+    }
+
+    /// Installs symbolic-seed reverse mode rules whose backward adapter receives the trace in which it must replay,
+    /// including when every seed is structural zero and there are no leading inputs.
+    pub(in crate::operations::composites) fn with_symbolic_zero_vjp_in_context<F, B>(
+        mut self,
+        forward: F,
+        backward: B,
+    ) -> Self
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+        V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
+        O: 'static + CustomVjpOperation<V>,
+        F: 'static
+            + Fn(
+                &[CustomRuleTracer<V, O>],
+            ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
+            + Send
+            + Sync,
+        B: 'static
+            + Fn(
+                &TracingContext<V, O>,
                 &[CustomRuleTracer<V, O>],
                 &[MaybeZero<CustomRuleTracer<V, O>>],
             ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
@@ -950,7 +1014,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// the primal stays sequential when its derivative is batched after it is taken, because differentiating an
     /// unbatched call stages a derived call that is itself batched sequentially (refer to
     /// [`CustomRuleSpecializer::derived`]). A custom batching rule (refer to [`Self::with_batching_rule`]) takes
-    /// precedence over sequential batching, and the batch extent must be static.
+    /// precedence over sequential batching. The batch extent must be statically known, including for a first-class
+    /// dimension, and the batch axis must be unnamed because the scan does not bind named collectives across its items
+    /// for the primal or derivative rules.
     ///
     /// [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
     pub fn with_sequential_batching(mut self) -> Self

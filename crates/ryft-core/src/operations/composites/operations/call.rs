@@ -90,7 +90,7 @@ enum CompositeRules<T, S> {
         /// of its rules. Pruning the unused outputs of a call (refer to [`Operation::prune_boundary`]) prunes them
         /// from its primal region and records them here, because its rules are traced for the complete output
         /// structure: the rule specializations of the call project the kept outputs, and its reverse mode carrier
-        /// keeps every output of the forward rule, whose pruned outputs then receive structural-zero seeds.
+        /// keeps every output of the forward rule, whose pruned outputs then receive structural zero seeds.
         kept_outputs: Option<Vec<bool>>,
     },
 }
@@ -203,7 +203,7 @@ enum CompositeRules<T, S> {
 /// which is how JAX's dead code elimination treats its custom derivative calls. A call with retained rules records
 /// which outputs of its rules it keeps (rendered as `kept_outputs`), because its rules are traced for the complete
 /// output structure: its forward mode and batching rules are projected onto the kept outputs, and its reverse mode
-/// carrier keeps every output of the forward rule, whose pruned outputs receive structural-zero seeds. A call with
+/// carrier keeps every output of the forward rule, whose pruned outputs receive structural zero seeds. A call with
 /// attached rule regions, whose boundaries mirror the complete primal boundary, stays whole, and so does a call whose
 /// forward mode rule is derived from its primal while its rules have a custom batching rule, because the derived calls
 /// that its derivatives stage apply that rule to every output.
@@ -1928,7 +1928,7 @@ where
         .zip(tangents)
         .enumerate()
         .map(|(index, (primal, tangent))| {
-            // Replaying a stored rule loses the structural-zero representation. Recover it from a literal zero
+            // Replaying a stored rule loses the structural zero representation. Recover it from a literal zero
             // or a zero-producing instruction, without treating every known tangent as zero: a non-zero constant
             // tangent is affine and must still be rejected by linearization. Replay has already preserved effects.
             let output = jvp_region.output_ids()[output_count + index];
@@ -2052,8 +2052,8 @@ fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
 /// aligned to axis 0 and become the scan's stacked inputs, the replicated inputs become invariant carries, and every
 /// output is mapped at axis 0. The body applies the call with its own primal region, so the call's rules keep governing
 /// the derivatives of each item, and batching the scan again (e.g., at an enclosing batching level) batches the calls
-/// in its body sequentially in turn. A call whose inputs are all replicated is the same for every item, so it is
-/// applied once instead.
+/// in its body sequentially in turn. A call whose inputs are all replicated is applied once instead. Named levels are
+/// rejected because a sequential scan does not bind the named axis that the primal and derivative rules may observe.
 ///
 /// # Parameters
 ///
@@ -2065,8 +2065,8 @@ fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
 ///
 /// # Errors
 ///
-/// Returns a [`BatchingError`] when the batch extent is not static, and propagates the errors of the scan construction,
-/// of the axis alignment, and of staging the scan.
+/// Returns a [`BatchingError`] when the level is named or its extent is not statically known, and propagates the errors
+/// of the scan construction, of the axis alignment, and of staging the scan.
 fn batch_composite_sequentially<C, P, D, S>(
     call: &CompositeOperation<C::Constant, C::Operation, S>,
     rules: &S,
@@ -2082,7 +2082,20 @@ where
 {
     let primal_region = driver.region(0)?;
     let level = driver.batching_level(context)?;
-    let BatchingLevelExtent::Static(length) = level.extent() else {
+    if let Some(axis_name) = context.axis_name() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "{} cannot batch sequentially over the named axis `{axis_name}`, because its scan does not bind \
+                 that axis for its primal and derivative rules; use an unnamed batch axis or a custom batching rule",
+                call.description(),
+            ),
+        });
+    }
+    let length = match level.extent() {
+        BatchingLevelExtent::Static(length) => Some(*length),
+        BatchingLevelExtent::Dynamic(_) => driver.static_batch_axis_extent(context),
+    };
+    let Some(length) = length else {
         return Err(BatchingError::UnsupportedOperation {
             message: {
                 let name = rules.name();
@@ -2108,7 +2121,7 @@ where
         (0..inputs.len()).partition(|&index| P::batch_axis(&inputs[index]).is_replicated());
     let output_count = primal_region.output_types().len();
     let (scan, index_type) = rules
-        .sequential_batching_scan(*length, carry_indices.len(), context.axis_sharding(), output_count)
+        .sequential_batching_scan(length, carry_indices.len(), context.axis_sharding(), output_count)
         .map_err(ProgramError::from)?;
     let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
     let primal = builder.import_program(primal_region.to_program());
@@ -2321,6 +2334,7 @@ pub(super) fn missing_custom_jvp_rule_error(call: &str, has_vjp_rule: bool) -> D
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2328,9 +2342,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType,
+        ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        ShardingDimension,
     };
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingLevelExtent, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
@@ -3253,6 +3268,9 @@ mod tests {
         let twin =
             CompositeOperation::new(CustomRuleRegistration::new(cube_definition(&counters, true, true)).reference());
         assert_ne!(operation, twin);
+        let map = HashMap::from([(operation.clone(), "original")]);
+        assert_eq!(map.get(&operation.clone()), Some(&"original"));
+        assert_eq!(map.get(&twin), None);
         assert_eq!(operation.to_string(), twin.to_string());
         assert_eq!(operation.to_string(), "composite [name=\"cube\"]");
         assert_eq!(
@@ -5625,6 +5643,137 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_batching_retained_rules_sequential_first_class_extent() {
+        let definition = CustomRuleRegistration::new(
+            IrDefinition::new("identity").with_jvp_from_primal().with_sequential_batching(),
+        );
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(scalar_type);
+        let primal = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let regions = AttachedRegions::from(vec![primal.clone()]);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerArrayIrContext::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let values = Array::vector(vec![1.0f64, 2.0]).unwrap();
+        let outputs = CompositeOperation::new(definition.reference())
+            .batch(&context, &driver, &[ArrayIrBatch::new(values.clone().into(), BatchAxis::new(0)).unwrap()])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &ArrayIrValue::Array(values));
+
+        let program = ir_custom_rule_program(&definition, 0, primal);
+        let batched = |extent: DimensionType| {
+            program.batched_with_threaded_extent(
+                extent,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+        };
+        let constant = batched(Dimension::Static(2).into()).unwrap().into_parts().0;
+        assert_eq!(
+            constant.to_string(),
+            indoc! {"
+                lambda %0:dimension<2>, %1:f64[2] .
+                let %2:f64[2] = scan [carry_count=0, iteration_count=2, reverse=false] %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[] .
+                        let %2:f64[] = composite [name=\"identity\"] %1 [
+                            primal={
+                                lambda %0:f64[] .
+                                in (%0)
+                            },
+                        ]
+                        in (%2)
+                    },
+                ]
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(2, Some(3)).unwrap());
+        let exact = batched(exact.into()).unwrap().into_parts().0;
+        assert_eq!(
+            exact.to_string(),
+            indoc! {"
+                lambda %0:dimension<exact ∈ [2, 3)>, %1:f64[2] .
+                let %2:f64[2] = scan [carry_count=0, iteration_count=2, reverse=false] %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[] .
+                        let %2:f64[] = composite [name=\"identity\"] %1 [
+                            primal={
+                                lambda %0:f64[] .
+                                in (%0)
+                            },
+                        ]
+                        in (%2)
+                    },
+                ]
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+        let inputs = vec![
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            Array::vector(vec![1.0f64, 2.0]).unwrap().into(),
+        ];
+        assert_eq!(constant.interpret(inputs.clone()), Ok(inputs.clone()));
+        assert_eq!(exact.interpret(inputs.clone()), Ok(inputs));
+
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::new(1, Some(4)).unwrap());
+        assert!(matches!(
+            batched(dynamic.into()),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == format!("`{COMPOSITE_OPERATION_NAME}` `identity` batches its calls sequentially, \
+                                       which requires a static batch extent"),
+        ));
+    }
+
+    #[test]
+    fn test_composite_batching_retained_rules_sequential_named_axis() {
+        let definition = CustomRuleRegistration::new(MemberDefinition::new("indices").with_sequential_batching());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let index = builder
+            .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
+        let primal =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![index], vec![Placeholder], vec![Placeholder]).unwrap();
+        let regions = AttachedRegions::from(vec![primal]);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(ArrayContext::new(), 2).with_axis_name("items".to_string());
+        let call = CompositeOperation::new(definition.reference());
+        let expected = format!(
+            "a `{COMPOSITE_OPERATION_NAME}` call of `indices` cannot batch sequentially over the named axis \
+             `items`, because its scan does not bind that axis for its primal and derivative rules; use an unnamed \
+             batch axis or a custom batching rule",
+        );
+        assert_eq!(
+            call.batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(1.0f64).unwrap())]),
+            Err(BatchingError::UnsupportedOperation { message: expected.clone() }),
+        );
+        assert_eq!(
+            call.batch(
+                &context,
+                &driver,
+                &[ArrayBatch::new(Array::vector(vec![1.0f64, 2.0]).unwrap(), Some(0)).unwrap()],
+            ),
+            Err(BatchingError::UnsupportedOperation { message: expected }),
+        );
+    }
+
+    #[test]
     fn test_composite_batching_retained_rules_renaming() {
         // Renaming a batched call renames its recorded unbatched types, so specializations use the renamed boundary.
         let counters = Arc::new(RuleCounters::default());
@@ -5733,7 +5882,7 @@ mod tests {
     #[test]
     fn test_composite_differentiation_keeps_tangents_of_inactive_outputs_structural() {
         // The primal maps `(x, y)` to `(sin(x), sin(y))` and only `x` has a live tangent, so the second output depends
-        // on no live tangent and keeps a structural-zero tangent, which lets linearization succeed.
+        // on no live tangent and keeps a structural zero tangent, which lets linearization succeed.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();

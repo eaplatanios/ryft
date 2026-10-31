@@ -929,8 +929,10 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     /// and a convenience over [`Self::with_batching`] for primals that have no batched form (e.g., a foreign kernel
     /// called by [`Self::from_custom_call`] that processes one item at a time): the mapped inputs are moved to axis 0
     /// and sliced by the scan, the replicated inputs are passed to every iteration unchanged, and every output is
-    /// mapped at axis 0. The batch extent must be static, and the context's family must support scans (i.e., its types
-    /// implement [`ScanType`] and its operations contain [`ScanOperation`]).
+    /// mapped at axis 0. The batch extent must be statically known, including when represented by a first-class
+    /// dimension, and the context's family must support scans (i.e., its types implement [`ScanType`] and its
+    /// operations contain [`ScanOperation`]). The batch axis must be unnamed because the scan does not bind named
+    /// collectives across its items for the primal or derivative rules.
     ///
     /// Unlike a custom batching rule, which replaces the call's primal while preserving the call, batching replaces
     /// the call with the scan, whose body calls the unbatched function. The function's derivative rules therefore keep
@@ -3316,8 +3318,8 @@ mod tests {
     #[test]
     fn test_composite_with_symbolic_zero_vjp_dead_output() {
         // Without residuals or non-differentiated inputs, the backward rule of a call whose output is dead would
-        // receive neither leading inputs nor a non-zero seed. The cotangent of its input is then a structural zero, so
-        // the rule is never invoked.
+        // receive neither leading inputs nor a non-zero seed. The adapter still invokes it in the existing trace, so
+        // it can return a structural zero without recovering a context from a live input.
         type Tracer = DomainTracer<ArrayContext>;
         let invocations = Arc::new(AtomicUsize::new(0));
         let function = composite(|x: Tracer| Ok(x.sin()?)).with_symbolic_zero_vjp(|x: Tracer| Ok((x.sin()?, ())), {
@@ -3326,9 +3328,7 @@ mod tests {
                 invocations.fetch_add(1, Ordering::SeqCst);
                 match seed {
                     MaybeZero::Value(seed) => Ok(MaybeZero::Value(seed)),
-                    MaybeZero::Zero(_) => {
-                        Err(ProgramError::InvalidArgument { message: "unexpected zero seed".to_string() })
-                    }
+                    MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(r#type)),
                 }
             }
         });
@@ -3339,7 +3339,7 @@ mod tests {
             }),
             Ok(Array::scalar(1.0).unwrap()),
         );
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[test]

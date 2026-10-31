@@ -95,7 +95,7 @@ pub(super) enum CompositeTransposeRules<T, S> {
 ///
 /// Its inputs are the known leading inputs (i.e., any batching boundary inputs, the non-differentiated inputs, the
 /// residuals, and the seed extents) followed by the differentiated inputs' tangents. The seed extents name the runtime
-/// quantities of the output tangent types (e.g., the extents of dynamically shaped outputs) that structural-zero seeds
+/// quantities of the output tangent types (e.g., the extents of dynamically shaped outputs) that structural zero seeds
 /// need when no other leading input names them, and the backward rule never receives them. The carrier of a call whose
 /// retained rules defer their forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`],
 /// rendered as `deferred_forward=true`) receives every input of the call in place of the non-differentiated inputs and
@@ -140,7 +140,7 @@ pub struct CompositeTransposeOperation<V: Typed + Parameter, O, S = CustomRuleRe
     pub(super) leading_input_count: usize,
 
     /// Number of trailing leading inputs that carry the runtime extents of the output tangent types (e.g., the extents
-    /// of dynamically shaped outputs), from which structural-zero seeds are materialized when no other leading input
+    /// of dynamically shaped outputs), from which structural zero seeds are materialized when no other leading input
     /// carries them. The backward rule never receives them.
     pub(super) seed_extent_count: usize,
 
@@ -259,7 +259,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Returns the number of trailing leading inputs of this carrier that carry the runtime extents of its output
-    /// tangent types, from which structural-zero seeds are materialized and which the backward rule never receives.
+    /// tangent types, from which structural zero seeds are materialized and which the backward rule never receives.
     #[inline]
     pub fn seed_extent_count(&self) -> usize {
         self.seed_extent_count
@@ -941,7 +941,7 @@ where
                     })
                     .collect::<Vec<_>>();
 
-                // A dead output's structural-zero seed still becomes a real input of the backward region. Its type
+                // A dead output's structural zero seed still becomes a real input of the backward region. Its type
                 // alone cannot construct it when it references runtime identities, but the live seeds and the leading
                 // inputs, whose seed extents name every runtime quantity of the output tangent types, do, so the zero
                 // is assembled from them one identity at a time before falling back to the nullary zero that every
@@ -987,12 +987,8 @@ where
             } => (rules, batching, *invokes_rule_directly, *discharged, deferred_forward),
         };
 
-        // Without leading inputs, the backward rule is a linear function of the seeds alone, so all-zero seeds give
-        // structurally zero cotangents without tracing the rule, which could not even recover its context from its
-        // inputs (as for an unused output of a call without residuals or non-differentiated inputs).
-        if self.leading_input_count == 0 && outputs.iter().all(MaybeZero::is_zero) {
-            return Ok(());
-        }
+        // Even without leading inputs or live seeds, a retained rule can carry effects or deferred work. Its selected
+        // specialization must be traced before unused numerical work can be removed.
         if invokes_rule_directly {
             let Some(backward) = rules.native_definition().and_then(|definition| definition.backward.as_ref()) else {
                 return Err(ProgramError::UnsupportedOperation {
@@ -1042,12 +1038,17 @@ where
                             O::materialize_zero_from_residual_sources(&**context, seed.clone(), &leading_values)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    rule.apply(rule_leading_values, &seeds)?.into_iter().map(MaybeZero::Value).collect::<Vec<_>>()
+                    rule.apply(&**context, rule_leading_values, &seeds)?
+                        .into_iter()
+                        .map(MaybeZero::Value)
+                        .collect::<Vec<_>>()
                 }
 
-                // A rule that receives structural-zero seeds may also return structural-zero cotangents, which
+                // A rule that receives structural zero seeds may also return structural zero cotangents, which
                 // contribute nothing to their destinations, so they stay structural zeros for the transposition.
-                CustomVjpBackward::PureWithSymbolicZeros(rule) => rule.apply(rule_leading_values, outputs)?,
+                CustomVjpBackward::PureWithSymbolicZeros(rule) => {
+                    rule.apply(&**context, rule_leading_values, outputs)?
+                }
             };
 
             // Each cotangent has the cotangent type of its differentiated input, which may differ from the input's
@@ -1219,7 +1220,7 @@ where
 
         // The specialized program consumes the boundary inputs, then the live seeds, then the caller buffers, then the
         // remaining known leading inputs, and returns the cotangents of the differentiated inputs with returned
-        // destinations, except for the structural-zero cotangents, which contribute nothing to their destinations.
+        // destinations, except for the structural zero cotangents, which contribute nothing to their destinations.
         let mut leading_values = leading_values.into_iter();
         let mut arguments = leading_values.by_ref().take(boundary_input_count).collect::<Vec<_>>();
         arguments.extend(outputs.iter().filter_map(MaybeZero::as_value).cloned());
@@ -1244,6 +1245,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1458,6 +1460,7 @@ mod tests {
     #[test]
     fn test_composite_transpose() {
         let scalar_type = ArrayType::scalar(DataType::F64);
+        let tangent_types = format!("{:?}", vec![scalar_type.clone()]);
 
         // A carrier with an attached backward rule attaches that rule as its only, deferred rule region, whose own
         // effects decide whether transposition must run it (and whether the carrier's application carries deferred
@@ -1472,17 +1475,56 @@ mod tests {
         assert_eq!(carrier.region_slots(), &[RegionSlot::deferred_rule("backward")]);
         assert!(!carrier.effects().summary().has_deferred_work());
         assert_eq!(carrier.to_string(), "composite_transpose [leading_input_count=1]");
+        assert_eq!(
+            format!("{carrier:?}"),
+            format!(
+                "CompositeTransposeOperation {{ leading_input_count: 1, seed_extent_count: 0, \
+                 input_tangent_types: {tangent_types}, output_tangent_types: {tangent_types} }}",
+            ),
+        );
+        let attached = carrier;
 
         // A carrier with a retained backward rule attaches no region and carries deferred work until transposition
         // replaces it with the specialized backward program.
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
-        let carrier =
-            CompositeTransposeOperation::new(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
+        let carrier = CompositeTransposeOperation::new(
+            definition.reference(),
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
         assert_eq!(carrier.rules(), Some(&definition.reference()));
         assert!(carrier.region_slots().is_empty());
         assert!(carrier.effects().summary().has_deferred_work());
         assert_eq!(carrier.to_string(), "composite_transpose [name=\"cube\", leading_input_count=1]");
+        assert_eq!(
+            format!("{carrier:?}"),
+            format!(
+                "CompositeTransposeOperation {{ name: \"cube\", leading_input_count: 1, seed_extent_count: 0, \
+                 input_tangent_types: {tangent_types}, output_tangent_types: {tangent_types}, batching: None, \
+                 invokes_rule_directly: false, discharged: false }}",
+            ),
+        );
+
+        assert_eq!(attached, attached.clone());
+        assert_eq!(carrier, carrier.clone());
+        assert_ne!(attached, carrier);
+        let twin = CompositeTransposeOperation::new(
+            CustomRuleRegistration::new(cube_definition(&counters, false, true)).reference(),
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
+        assert_ne!(carrier, twin);
+        let other_boundary =
+            CompositeTransposeOperation::new(definition.reference(), 2, vec![scalar_type.clone()], vec![scalar_type]);
+        assert_ne!(carrier, other_boundary);
+        let map = HashMap::from([(attached.clone(), "attached"), (carrier.clone(), "retained")]);
+        assert_eq!(map.get(&attached.clone()), Some(&"attached"));
+        assert_eq!(map.get(&carrier.clone()), Some(&"retained"));
+        assert_eq!(map.get(&twin), None);
+        assert_eq!(map.get(&other_boundary), None);
     }
 
     #[test]
@@ -2396,8 +2438,8 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
         // One backward rule specializes to a returned cotangent and a caller buffer. An ignored sole destination leaves
-        // the seed unused, so transposition passes the carrier, which has no leading inputs, only a structural-zero
-        // seed, whose cotangent is a structural zero without specializing the rule.
+        // the seed unused, so transposition specializes the rule for a structural zero seed as well, before removing
+        // its unused numerical work.
         let returned = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
         let buffered = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let ignored = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
@@ -2443,10 +2485,10 @@ mod tests {
         assert_eq!(buffered.interpret(vec![seed.clone(), second.clone().into()]), Ok(vec![]));
         assert_eq!(second.read(), Ok(Array::vector(vec![40.0f64, 53.0, 60.0]).unwrap()));
         assert_eq!(ignored.interpret(vec![seed.clone()]), Ok(vec![]));
-        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 3);
         let repeated = program.clone().transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert_eq!(repeated.to_string(), buffered.to_string());
-        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 3);
 
         // A wider input is a different carrier signature, so its returned cotangent is rebuilt from its own extent
         // even though its seed type and destination kind are unchanged.
@@ -2456,7 +2498,7 @@ mod tests {
             wider_pullback.interpret(vec![seed]),
             Ok(vec![Array::vector(vec![0.0f64, 3.0, 0.0, 0.0]).unwrap().into()]),
         );
-        assert_eq!(invocations.load(Ordering::SeqCst), 3);
+        assert_eq!(invocations.load(Ordering::SeqCst), 4);
 
         // The rule receives the current renamed boundary, but existing reference slicing requires a static referent
         // type. Both failures report their current identity and do not retain failed specializations.
@@ -2479,7 +2521,7 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "reference slicing requires a static referent type but got `f64[relocated]`",
         ));
-        assert_eq!(invocations.load(Ordering::SeqCst), 5);
+        assert_eq!(invocations.load(Ordering::SeqCst), 6);
         let seed_type: ArrayIrType = ArrayType::new_static(DataType::F64, [1]).into();
         let key = |input_extent: usize, seed_type: Option<ArrayIrType>, destination_kind| {
             CustomRuleBackwardSpecializationKey {
@@ -2498,6 +2540,7 @@ mod tests {
             vec![
                 key(4, Some(seed_type.clone()), CotangentDestinationKind::Return),
                 key(3, Some(seed_type.clone()), CotangentDestinationKind::Reference),
+                key(3, None, CotangentDestinationKind::Ignore),
                 key(3, Some(seed_type), CotangentDestinationKind::Return),
             ],
         );
@@ -2759,7 +2802,7 @@ mod tests {
     #[test]
     fn test_composite_transpose_transposition_retained_rules_effectful_buffered_zero_seed() {
         // The backward rule records a reference effect whenever its differentiated input's cotangent goes to a caller
-        // buffer, including for a structural-zero seed that contributes nothing to that buffer.
+        // buffer, including for a structural zero seed that contributes nothing to that buffer.
         let definition = CustomRuleRegistration::new(IrDefinition::new("buffered_zero_effect").with_accumulating_vjp(
             |_| unreachable!("the tests construct the carrier directly"),
             |context, inputs, seeds, accumulators| {
@@ -2894,7 +2937,7 @@ mod tests {
             ),
         );
 
-        // A rule that receives structural-zero seeds sees the unused output's seed as a `MaybeZero::Zero` leaf.
+        // A rule that receives structural zero seeds sees the unused output's seed as a `MaybeZero::Zero` leaf.
         let observed = Arc::new(Mutex::new(Vec::new()));
         let definition = CustomRuleRegistration::new(IrDefinition::new("duplicate").with_symbolic_zero_vjp(
             |primals| Ok((vec![primals[0].clone(), primals[0].clone()], Vec::new())),
@@ -2919,6 +2962,71 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(*observed.lock().unwrap(), vec![vec![false, true]]);
+    }
+
+    #[test]
+    fn test_composite_transpose_transposition_retained_rules_zero_seeds_without_leading_inputs() {
+        // The selected backward rule asserts a bound even though it receives no residuals or live seeds and no input
+        // cotangent is requested. The existing transposition context is sufficient to stage its effect.
+        let definition = CustomRuleRegistration::new(IrDefinition::new("zero_seed_assertion").with_accumulating_vjp(
+            |_| unreachable!("the test constructs the carrier directly"),
+            |context, _, seeds, accumulators| {
+                assert!(seeds[0].is_zero());
+                assert!(!accumulators[0].is_needed());
+                let invalid = context.lift(ArrayIrValue::Array(Array::scalar(-1i32)?))?;
+                let extent = DimensionVariable::new("extent", DimensionBounds::new(0, None)?);
+                context.bind(DimensionFromScalarOperation::new(extent.into()), Vec::new(), &[invalid])?;
+                Ok(())
+            },
+        ));
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut builder = IrBuilder::new();
+        let tangent = builder.add_input(scalar_type.clone());
+        builder
+            .add_instruction(
+                retained_carrier(definition.reference(), 0, vec![scalar_type.clone()], vec![scalar_type]),
+                Vec::new(),
+                vec![tangent],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = composite_transpose [name=\"zero_seed_assertion\", leading_input_count=0] %0
+                in ()
+            "}
+            .trim_end(),
+        );
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda .
+                let %0:i32[] = const -1
+                    %1:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %0
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            transposed.interpret(Vec::new()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range",
+        ));
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.to_string(), program.to_string());
+        let repeated = simplified.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(repeated.to_string(), transposed.to_string());
+        assert!(matches!(
+            repeated.interpret(Vec::new()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range",
+        ));
     }
 
     #[test]

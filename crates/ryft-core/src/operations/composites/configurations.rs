@@ -527,18 +527,14 @@ where
             let (backward, name, named_axes) =
                 (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[CustomRuleTracer<V, O>]| {
+            move |context: &TracingContext<V, O>,
+                  leading_inputs: &[CustomRuleTracer<V, O>],
+                  seeds: &[CustomRuleTracer<V, O>]| {
                 let residual_types = leading_inputs[non_differentiated_count..]
                     .iter()
                     .map(|value| value.r#type().into_owned())
                     .collect::<Vec<_>>();
                 let structure = residual_structures.get(&name, &residual_types)?;
-                let Some(context) = leading_inputs.iter().chain(seeds).next().map(|value| value.context().clone())
-                else {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "`{name}` backward rule has neither leading inputs nor seeds",
-                    )));
-                };
                 let program = {
                     let name: &str = &name;
                     let backward = backward.as_ref();
@@ -589,10 +585,10 @@ where
                 };
                 let mut values = leading_inputs.to_vec();
                 values.extend_from_slice(seeds);
-                program.interpret_in_context(&context, values)
+                program.interpret_in_context(context, values)
             }
         };
-        let definition = self.with_vjp(forward, backward);
+        let definition = self.with_vjp_in_context(forward, backward);
         if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
@@ -682,20 +678,15 @@ where
             let (backward, name, named_axes) =
                 (configuration.backward.clone(), self.name.clone(), self.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
+            move |context: &TracingContext<V, O>,
+                  leading_inputs: &[CustomRuleTracer<V, O>],
+                  seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
                 let residual_types = leading_inputs[non_differentiated_count..]
                     .iter()
                     .map(|value| value.r#type().into_owned())
                     .collect::<Vec<_>>();
                 let structure = residual_structures.get(&name, &residual_types)?;
                 let live_seeds = seeds.iter().filter_map(MaybeZero::as_value).cloned().collect::<Vec<_>>();
-                let Some(context) =
-                    leading_inputs.iter().chain(&live_seeds).next().map(|value| value.context().clone())
-                else {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "`{name}` backward rule has neither leading inputs nor non-zero seeds",
-                    )));
-                };
                 let (program, cotangent_zeros) = {
                     let name: &str = &name;
                     let backward = backward.as_ref();
@@ -779,7 +770,7 @@ where
 
                 let mut values = leading_inputs.to_vec();
                 values.extend(live_seeds);
-                let mut live_cotangents = program.interpret_in_context(&context, values)?.into_iter();
+                let mut live_cotangents = program.interpret_in_context(context, values)?.into_iter();
 
                 // The traced program returns only the live cotangents, so the structural zeros are reinserted at their
                 // positions. Their types were traced at the actual types of the leading inputs and seeds.
@@ -792,7 +783,7 @@ where
                     .collect::<Vec<_>>())
             }
         };
-        let definition = self.with_symbolic_zero_vjp(forward, backward);
+        let definition = self.with_symbolic_zero_vjp_in_context(forward, backward);
         if configuration.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
@@ -1797,6 +1788,48 @@ mod tests {
             backward.program.interpret(vec![Array::scalar(3f64).unwrap(), Array::scalar(4f64).unwrap()]),
             Ok(vec![Array::scalar(12f64).unwrap()]),
         );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_configure_vjp_empty_backward_boundary() {
+        // An empty output and residual structure gives the adapter no tracer from which to recover its context. The
+        // supplied trace still runs the user's callback and reports its error instead of silently omitting the rule.
+        let configuration = ExplicitVjp::<ArrayTracer, (), ()> {
+            forward: Arc::new(|_| Ok(((), ()))),
+            backward: Arc::new(|(), ()| Err(ProgramError::InvalidArgument { message: "backward invoked".to_string() })),
+            deferred_forward: false,
+        };
+        let registration = CustomRuleRegistration::new(ArrayDefinition::new("empty").configure_vjp(
+            &configuration,
+            &Placeholder,
+            &(),
+            0,
+        ));
+        let forward = registration
+            .reference()
+            .forward_specialization(CustomRuleSpecializationKey {
+                output_types: Vec::new(),
+                ..scalar_specialization_key(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(
+            forward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            registration.reference().backward_specialization(CustomRuleBackwardSpecializationKey {
+                leading_input_types: Vec::new(),
+                output_tangent_types: Vec::new(),
+                seed_types: Vec::new(),
+                ..scalar_backward_key(None)
+            }),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "backward invoked",
+        ));
     }
 
     #[test]
