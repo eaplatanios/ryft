@@ -1476,13 +1476,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, Shape,
-        ShardingDimension,
+        ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::AxisError;
     use crate::batching::{
@@ -5245,6 +5245,95 @@ mod tests {
                 ],
                 vec![mapped; 2],
             ),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_broadcast_sensitive_batching_manual_variation() {
+        // Inside a manual region, the batching rule derived for the JVP of `(x, y) ↦ x + y` stages every value that it
+        // creates with the manual variation of the values that it combines. With `x` mapped and varying over the
+        // manual axis `m`, and `y` replicated and invariant with a mapped tangent `ẏ`, the derivative of the rule
+        // carries the transition of `y` into `ẏ` and the diagonal makes its indices vary before gathering, so the
+        // contribution of `ẋ` and the contribution of `ẏ` that the rule adds have the same variation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let placed = |data_type: DataType, dimensions: &[usize], varying: bool| {
+            let sharding = Sharding::replicated(mesh.clone(), dimensions.len());
+            let sharding = if varying { sharding.with_varying_manual_axes(["m"]).unwrap() } else { sharding };
+            ArrayType::new_static(data_type, dimensions.to_vec()).with_sharding(sharding).unwrap()
+        };
+        let varying_scalar = placed(DataType::F64, &[], true);
+        let invariant_scalar = placed(DataType::F64, &[], false);
+        let varying_vector = placed(DataType::F64, &[3], true);
+        let invariant_vector = placed(DataType::F64, &[3], false);
+        let varying_matrix = placed(DataType::F64, &[3, 3], true);
+        let invariant_indices = placed(DataType::I64, &[3, 1], false);
+        let varying_indices = placed(DataType::I64, &[3, 1], true);
+        let varying_matrix_sharding = varying_matrix.sharding().unwrap();
+        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })];
+        let function = composite(|(x, y): (ArrayTracer, ArrayTracer)| Ok(x + y)).with_broadcast_sensitive_batching(
+            |(x, y): (ArrayTracer, ArrayTracer),
+             (x_axis, y_axis): (BatchAxis, BatchAxis),
+             _: BatchingLevelExtent<ArrayTracer>| {
+                Ok((x + y, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            },
+        );
+        let (_, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+            |inputs| function.call(inputs),
+            (varying_scalar.clone(), invariant_scalar.clone()),
+            named_axes,
+        )
+        .unwrap();
+        let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
+        let (batched, output_axes) = program
+            .into_flat_program()
+            .jvp()
+            .unwrap()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[mapped, replicated, mapped, mapped],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![mapped; 2]);
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:{varying_vector}, %1:{invariant_scalar}, %2:{varying_vector}, %3:{invariant_vector} .
+                let %4:{varying_vector}, %5:{varying_vector} = composite [
+                    name=\"jvp(composite)\",
+                    batching=[(extent=3, input_axes=[axis 0, replicated, axis 0, axis 0], \
+                        output_axes=[axis 0, axis 0])],
+                ] %0 %1 %2 %3 [
+                    primal={{
+                        lambda %0:{varying_vector}, %1:{invariant_scalar}, %2:{varying_vector}, \
+                            %3:{invariant_vector} .
+                        let %4:{varying_scalar} = parallel_vary [axis_name=\"m\"] %1
+                            %5:{varying_vector} = add %0 %4
+                            %6:{varying_vector} = parallel_vary [axis_name=\"m\"] %3
+                            %7:{varying_matrix} = broadcast [
+                                output_type={varying_matrix},
+                                output_axes=[0],
+                            ] %6
+                            %8:{varying_matrix} = reshard [sharding={varying_matrix_sharding}] %7
+                            %9:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                            %10:{invariant_indices} = broadcast [
+                                output_type={invariant_indices},
+                                output_axes=[0, 1],
+                            ] %9
+                            %11:{varying_indices} = parallel_vary [axis_name=\"m\"] %10
+                            %12:{varying_vector} = gather [
+                                dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                                slice_sizes=[1, 1],
+                            ] %8 %11
+                            %13:{varying_vector} = add %2 %12
+                        in (%5, %13)
+                    }},
+                ]
+                in (%4, %5)
+            "}
+            .trim_end(),
         );
     }
 
