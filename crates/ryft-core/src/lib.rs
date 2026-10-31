@@ -46,7 +46,7 @@ pub use batching::{
     BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
     RecursiveBatchingDriver, RecursiveBatchingPolicy, ReplicatedBatchingPolicyProjection, batch,
-    batch_projected_operation, batch_replicated_projected_operation,
+    batch_projected_operation, batch_replicated_projected_operation, check_batching_rule_consistency,
 };
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::{
@@ -178,9 +178,8 @@ pub use operations::{
     UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, While,
     WhileOperation, WhileOptions, WhilePredicate, WhileType, XOR_OPERATION_NAME, Xor, XorOperation,
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    check_batching_rule_consistency, composite, scan, shard_map, shard_map_in_context, shard_map_with_options,
-    softmax_cross_entropy_with_target_logits, trace_shard_map, trace_shard_map_with_named_axes,
-    trace_shard_map_with_options, r#while,
+    composite, scan, shard_map, shard_map_in_context, shard_map_with_options, softmax_cross_entropy_with_target_logits,
+    trace_shard_map, trace_shard_map_with_named_axes, trace_shard_map_with_options, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

@@ -4,10 +4,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use crate::axes::{NamedAxes, NamedAxis};
-use crate::batching::{
-    Batch, BatchAxis, BatchAxisSpecification, BatchableType, BatchingError, BatchingLevelExtent, BatchingPolicy,
-    BatchingTracer, RecursiveBatchingPolicy, batch,
-};
+use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType, TranspositionContext};
 use crate::operations::composites::configurations::{
@@ -28,7 +25,7 @@ use crate::tracing::{DomainTracingContext, TracingContext};
 use crate::tracing::DomainTracer;
 
 #[cfg(doc)]
-use crate::batching::DiagonalBatchingPolicy;
+use crate::batching::{BatchingError, DiagonalBatchingPolicy};
 
 #[cfg(doc)]
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
@@ -1472,97 +1469,6 @@ where
         name: Cow::Borrowed(COMPOSITE_OPERATION_NAME),
         registrations: CompositeRegistrations::default(),
     }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Checks on sample values whether the batching rule behind `function` depends on its input batch axes beyond computing
-/// the batched function, which is what decides between [`Composite::with_batching`] and
-/// [`Composite::with_broadcast_sensitive_batching`] (the former is exact only for rules that do not). The function is
-/// batched once at `input_batch_axes`, and then once for each replicated input leaf with that leaf broadcast along the
-/// batch instead. Every batched output is mapped at axis `0`, and the outputs of each broadcast batch are compared with
-/// those of the first batch by `equivalent` (e.g., exact equality, or equality within a numerical tolerance for a rule
-/// that uses a different but equivalent algorithm). This is the batching counterpart of
-/// [`check_gradient!`](crate::check_gradient): it observes the rule only through the public [`batch`] transform.
-///
-/// Passing the check on samples does not prove that the rule is independent of its axes, but failing it proves that it
-/// is not, in which case the function's derivatives batched with a replicated primal whose tangent is mapped require
-/// [`Composite::with_broadcast_sensitive_batching`] to be the per-item derivatives of its batched primal.
-///
-/// # Parameters
-///
-///   - `function`: Function to batch, which typically calls a [`Composite`] with a custom batching rule.
-///   - `input`: Sample input of `function`, with every mapped leaf packed along its batch axis.
-///   - `input_batch_axes`: Batch axis of each input leaf, with the structure of `input`.
-///   - `batch_axis`: Batch axis specification passed to every [`batch`] call. It must supply the batch extent when
-///     every input leaf is replicated.
-///   - `equivalent`: Comparison deciding whether two batched output leaves agree.
-///
-/// # Errors
-///
-/// Returns [`BatchingError::BroadcastInvarianceViolation`] for the first replicated input leaf whose broadcast changes
-/// a batched output leaf. Failures during batching propagate as their existing [`BatchingError`] variants.
-pub fn check_batching_rule_consistency<V, F, Input, Output, Specification, Equivalent>(
-    function: F,
-    input: Input,
-    input_batch_axes: Input::To<BatchAxis>,
-    batch_axis: Specification,
-    equivalent: Equivalent,
-) -> Result<(), BatchingError>
-where
-    V: Value<Domain: Batch>,
-    F: Fn(Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<Output, ProgramError>,
-    Input: Parameterized<
-            V,
-            Family: ParameterizedFamily<BatchAxis>
-                        + ParameterizedFamily<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>,
-        >,
-    Output: Parameterized<
-            BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
-            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
-        >,
-    Specification: Into<BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>>,
-    Equivalent: Fn(&V, &V) -> bool,
-{
-    let batch_axis = batch_axis.into();
-    let structure = input.parameter_structure();
-    let inputs = input.into_parameters().collect::<Vec<_>>();
-    let input_axes = input_batch_axes.into_parameters().collect::<Vec<_>>();
-    let batched = |inputs: Vec<V>, input_axes: Vec<BatchAxis>| -> Result<Vec<V>, BatchingError> {
-        let input = Input::from_parameters(structure.clone(), inputs)?;
-        let input_axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes)?;
-        let outputs = batch(|input| function(input), input, input_axes, BatchAxis::new(0), batch_axis.clone())?;
-        Ok(outputs.into_parameters().collect())
-    };
-    let expected = batched(inputs.clone(), input_axes.clone())?;
-    for (input, axis) in input_axes.iter().enumerate() {
-        if !axis.is_replicated() {
-            continue;
-        }
-        // The leaf is broadcast by a batch of the complete input that returns only that leaf, so that its extent is
-        // inferred exactly as in the batches that it is compared with.
-        let input_value = Input::from_parameters(structure.clone(), inputs.clone())?;
-        let axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone())?;
-        let broadcast: V = batch(
-            |tracers: Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>| {
-                Ok(tracers.into_parameters().nth(input).unwrap())
-            },
-            input_value,
-            axes,
-            BatchAxis::new(0),
-            batch_axis.clone(),
-        )?;
-        let mut broadcast_inputs = inputs.clone();
-        broadcast_inputs[input] = broadcast;
-        let mut broadcast_axes = input_axes.clone();
-        broadcast_axes[input] = BatchAxis::new(0);
-        let actual = batched(broadcast_inputs, broadcast_axes)?;
-        if let Some(output) = expected.iter().zip(&actual).position(|(expected, actual)| !equivalent(expected, actual))
-        {
-            return Err(BatchingError::BroadcastInvarianceViolation { input, output });
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -5978,68 +5884,5 @@ mod tests {
         );
         assert_eq!(batched_jvp.interpret(vec![x, tangent]), Ok(vec![sine, cosine]));
         assert_eq!(batched_jvp.interpret(vec![wide_x, wide_tangent]), mismatch);
-    }
-
-    #[test]
-    fn test_check_batching_rule_consistency() {
-        // A rule that computes `2xy` when both inputs are mapped and `xy` otherwise changes its batched output when the
-        // replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
-        type Tracer = DomainTracer<ArrayContext>;
-        let scaled_product = |inconsistent: bool| {
-            composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
-                move |(x, y): (Tracer, Tracer),
-                      (x_axis, y_axis): (BatchAxis, BatchAxis),
-                      _: BatchingLevelExtent<Tracer>| {
-                    let product = x * y;
-                    let scale = match inconsistent && !x_axis.is_replicated() && !y_axis.is_replicated() {
-                        true => 2.0,
-                        false => 1.0,
-                    };
-                    let scale = product.context().lift(Array::scalar(scale)?)?;
-                    Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
-                },
-            )
-        };
-        let input = (Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(), Array::scalar(4.0f64).unwrap());
-        let input_axes = (BatchAxis::new(0), BatchAxis::replicated());
-        let check = |inconsistent: bool| {
-            let function = scaled_product(inconsistent);
-            check_batching_rule_consistency(
-                |inputs| function.call(inputs),
-                input.clone(),
-                input_axes,
-                None,
-                |expected: &Array, actual: &Array| expected == actual,
-            )
-        };
-        assert_eq!(check(false), Ok(()));
-        assert_eq!(check(true), Err(BatchingError::BroadcastInvarianceViolation { input: 1, output: 0 }));
-
-        // Every input of a fully replicated batch is broadcast in turn, which requires an explicit extent.
-        let function = scaled_product(true);
-        assert_eq!(
-            check_batching_rule_consistency(
-                |inputs| function.call(inputs),
-                (Array::scalar(1.0f64).unwrap(), Array::scalar(4.0f64).unwrap()),
-                (BatchAxis::replicated(), BatchAxis::replicated()),
-                3,
-                |expected: &Array, actual: &Array| expected == actual,
-            ),
-            Ok(()),
-        );
-    }
-
-    #[test]
-    fn test_check_batching_rule_consistency_batching_error() {
-        assert_eq!(
-            check_batching_rule_consistency(
-                |input| Ok(input),
-                Array::scalar(1f64).unwrap(),
-                BatchAxis::replicated(),
-                None,
-                |expected: &Array, actual: &Array| expected == actual,
-            ),
-            Err(BatchingError::EmptyBatch),
-        );
     }
 }
