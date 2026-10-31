@@ -20,6 +20,7 @@ use crate::differentiation::{
     TranspositionContext,
 };
 use crate::operations::arithmetic::{Add, AddOperation};
+use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::specializations::CustomRuleDerivation;
 use crate::operations::composites::rules::{
@@ -1370,14 +1371,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 message: format!(
                     "{} cannot differentiate a call whose reference state was discharged, because its rule programs \
                      contain reference state and its definition has no reference discharge support",
-                    {
-                        let name = self.name.as_ref();
-                        if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        }
-                    },
+                    describe_composite(COMPOSITE_OPERATION_NAME, self.name.as_ref()),
                 ),
             }
             .into());

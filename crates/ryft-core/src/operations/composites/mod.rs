@@ -69,6 +69,16 @@ pub use rules::{
     CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleReference,
 };
 
+/// Renders `operation_name` for diagnostics, followed by the definition name `name` unless it is the default name of
+/// composites (i.e., [`COMPOSITE_OPERATION_NAME`]), so that diagnostics never print the default name twice.
+fn describe_composite(operation_name: &str, name: &str) -> String {
+    if name == COMPOSITE_OPERATION_NAME {
+        format!("`{operation_name}`")
+    } else {
+        format!("`{operation_name}` `{name}`")
+    }
+}
+
 /// Returns the renaming of the type identities of `source` onto those of `target` when the two type signatures are
 /// equal up to a bijective renaming of their identities, which holds exactly when each renames into the other.
 fn derive_bijective_identity_renaming<T: Type>(

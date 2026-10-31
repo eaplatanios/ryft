@@ -23,6 +23,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::derive_bijective_identity_renaming;
+use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
@@ -231,14 +232,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     "batched {} must have at least {boundary_input_count} \
                      non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
                      its inputs, but got {non_differentiated_count}",
-                    {
-                        let name = rules.name();
-                        if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        }
-                    },
+                    describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                 )));
             }
         }
@@ -526,14 +520,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                         ProgramError::MalformedProgram(format!(
                             "batched {} has fewer non-differentiated inputs \
                              than boundary inputs",
-                            {
-                                let name = rules.name();
-                                if name == COMPOSITE_OPERATION_NAME {
-                                    format!("`{COMPOSITE_OPERATION_NAME}`")
-                                } else {
-                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                }
-                            },
+                            describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                         ))
                     })?,
                 tangent_activity: Vec::new(),
@@ -720,14 +707,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                         return Err(TypeError::invalid(format!(
                             "batched {} has {} inputs but its batching levels \
                              record {} boundary inputs and {} unbatched inputs",
-                            {
-                                let name = rules.name();
-                                if name == COMPOSITE_OPERATION_NAME {
-                                    format!("`{COMPOSITE_OPERATION_NAME}`")
-                                } else {
-                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                }
-                            },
+                            describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                             input_types.len(),
                             boundary_input_count,
                             batching.input_types.len(),
@@ -815,14 +795,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                             true => used.next().ok_or_else(|| {
                                 ProgramError::MalformedProgram(format!(
                                     "{} keeps more rule outputs than it has outputs",
-                                    {
-                                        let name = rules.name();
-                                        if name == COMPOSITE_OPERATION_NAME {
-                                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                                        } else {
-                                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                        }
-                                    },
+                                    describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                                 ))
                             }),
                             false => Ok(false),
@@ -956,11 +929,7 @@ where
             CompositeRules::Retained { rules, .. } => rules.name(),
         };
         if let Some(index) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
-            let description = if name == COMPOSITE_OPERATION_NAME {
-                format!("`{COMPOSITE_OPERATION_NAME}`")
-            } else {
-                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-            };
+            let description = describe_composite(COMPOSITE_OPERATION_NAME, name);
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "{description} cannot discharge the reference state of its input {index}, because its rules receive \
@@ -1317,14 +1286,7 @@ where
                 return Err(TypeError::invalid(format!(
                     "{} batching rule output type signature mismatch: expected per-item output types [{expected}] \
                      but got [{actual}]{reason}",
-                    {
-                        let name = rules.name();
-                        if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        }
-                    },
+                    describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                 ))
                 .into());
             }
@@ -1556,12 +1518,7 @@ where
                 // anything is staged, and the carrier's transposition replays the cached specialization.
                 let specialization = rules.forward_specialization(key.clone())?;
                 if !specialization.program.effects().is_pure() {
-                    let name = rules.name();
-                    let description = if name == COMPOSITE_OPERATION_NAME {
-                        format!("`{COMPOSITE_OPERATION_NAME}`")
-                    } else {
-                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                    };
+                    let description = describe_composite(COMPOSITE_OPERATION_NAME, rules.name());
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "{description} defers its forward rule to the backward pass (refer to \
@@ -2103,15 +2060,10 @@ where
     };
     let Some(length) = length else {
         return Err(BatchingError::UnsupportedOperation {
-            message: {
-                let name = rules.name();
-                let description = if name == COMPOSITE_OPERATION_NAME {
-                    format!("`{COMPOSITE_OPERATION_NAME}`")
-                } else {
-                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                };
-                format!("{description} batches its calls sequentially, which requires a static batch extent")
-            },
+            message: format!(
+                "{} batches its calls sequentially, which requires a static batch extent",
+                describe_composite(COMPOSITE_OPERATION_NAME, rules.name())
+            ),
         });
     };
     if inputs.iter().all(|input| P::batch_axis(input).is_replicated()) {

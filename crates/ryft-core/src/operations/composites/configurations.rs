@@ -13,6 +13,7 @@ use crate::differentiation::{
 use crate::macros::check_count;
 use crate::operations::arithmetic::Add;
 use crate::operations::composites::derive_bijective_identity_renaming;
+use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation};
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
@@ -137,11 +138,7 @@ where
                     if &rule_structure != output_structure {
                         return Err(TypeError::invalid(format!(
                             "{} JVP rule {} structure mismatch: expected {:?} but got {:?}",
-                            if name == COMPOSITE_OPERATION_NAME {
-                                format!("`{COMPOSITE_OPERATION_NAME}`")
-                            } else {
-                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                            },
+                            describe_composite(COMPOSITE_OPERATION_NAME, name),
                             value,
                             output_structure,
                             rule_structure,
@@ -324,11 +321,7 @@ where
                         if &output_tangent_structure != output_structure {
                             return Err(TypeError::invalid(format!(
                                 "{} JVP rule output tangent structure mismatch: expected {:?} but got {:?}",
-                                if name == COMPOSITE_OPERATION_NAME {
-                                    format!("`{COMPOSITE_OPERATION_NAME}`")
-                                } else {
-                                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                },
+                                describe_composite(COMPOSITE_OPERATION_NAME, name),
                                 output_structure,
                                 output_tangent_structure,
                             ))
@@ -353,11 +346,7 @@ where
                                         return Err(TypeError::invalid(format!(
                                             "{} JVP rule returned a structural-zero tangent of type `{}` \
                                              for output {}, whose tangent type is `{}`",
-                                            if name == COMPOSITE_OPERATION_NAME {
-                                                format!("`{COMPOSITE_OPERATION_NAME}`")
-                                            } else {
-                                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                            },
+                                            describe_composite(COMPOSITE_OPERATION_NAME, name),
                                             r#type,
                                             index,
                                             expected,
@@ -378,11 +367,7 @@ where
                 if &output_type_structure != output_structure {
                     return Err(TypeError::invalid(format!(
                         "{} JVP rule output structure mismatch: expected {:?} but got {:?}",
-                        if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        },
+                        describe_composite(COMPOSITE_OPERATION_NAME, name),
                         output_structure,
                         output_type_structure,
                     ))
@@ -569,11 +554,7 @@ where
                             if &cotangent_structure != input_structure {
                                 return Err(TypeError::invalid(format!(
                                     "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
-                                    if name == COMPOSITE_OPERATION_NAME {
-                                        format!("`{COMPOSITE_OPERATION_NAME}`")
-                                    } else {
-                                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                    },
+                                    describe_composite(COMPOSITE_OPERATION_NAME, name),
                                     input_structure,
                                     cotangent_structure,
                                 ))
@@ -738,11 +719,7 @@ where
                             if &cotangent_structure != input_structure {
                                 return Err(TypeError::invalid(format!(
                                     "{} backward rule cotangent structure mismatch: expected {:?} but got {:?}",
-                                    if name == COMPOSITE_OPERATION_NAME {
-                                        format!("`{COMPOSITE_OPERATION_NAME}`")
-                                    } else {
-                                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                                    },
+                                    describe_composite(COMPOSITE_OPERATION_NAME, name),
                                     input_structure,
                                     cotangent_structure,
                                 ))
@@ -1168,11 +1145,7 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<
         match recorded {
             Some((_, recorded)) if recorded != &structure => Err(TypeError::invalid(format!(
                 "{} forward rule residual structure mismatch: expected {:?} but got {:?}",
-                if name == COMPOSITE_OPERATION_NAME {
-                    format!("`{COMPOSITE_OPERATION_NAME}`")
-                } else {
-                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                },
+                describe_composite(COMPOSITE_OPERATION_NAME, name),
                 recorded,
                 structure,
             ))),
@@ -1292,11 +1265,7 @@ where
             if &forward_output_structure != output_structure {
                 return Err(TypeError::invalid(format!(
                     "{} forward rule output structure mismatch: expected {:?} but got {:?}",
-                    if name == COMPOSITE_OPERATION_NAME {
-                        format!("`{COMPOSITE_OPERATION_NAME}`")
-                    } else {
-                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                    },
+                    describe_composite(COMPOSITE_OPERATION_NAME, name),
                     output_structure,
                     forward_output_structure,
                 ))
@@ -1402,14 +1371,7 @@ where
                     message: format!(
                         "{} batching rule requires a dynamic batch extent to be the leading boundary input of its \
                          batching level, but the level has no boundary inputs",
-                        {
-                            let name: &str = &name;
-                            if name == COMPOSITE_OPERATION_NAME {
-                                format!("`{COMPOSITE_OPERATION_NAME}`")
-                            } else {
-                                format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                            }
-                        },
+                        describe_composite(COMPOSITE_OPERATION_NAME, &name),
                     ),
                 });
             }
@@ -1435,14 +1397,7 @@ where
             if structure != output_structure {
                 return Err(TypeError::invalid(format!(
                     "{} batching rule {} structure mismatch: expected {:?} but got {:?}",
-                    {
-                        let name: &str = &name;
-                        if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        }
-                    },
+                    describe_composite(COMPOSITE_OPERATION_NAME, &name),
                     value,
                     output_structure,
                     structure,

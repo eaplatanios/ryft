@@ -11,6 +11,7 @@ use std::thread::ThreadId;
 use lru::LruCache;
 
 use crate::differentiation::DifferentiationError;
+use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::definitions::CustomRuleDefinition;
 use crate::operations::composites::rules::specializations::CustomRuleSource;
@@ -247,15 +248,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             {
                 let error = SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError);
                 return Err(ProgramError::UnsupportedOperation {
-                    message: {
-                        let name = self.name();
-                        let description = if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        };
-                        format!("{description} makes a {error}")
-                    },
+                    message: format!("{} makes a {error}", describe_composite(COMPOSITE_OPERATION_NAME, self.name())),
                 }
                 .into());
             }
@@ -280,15 +273,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
         .map_err(|error| match error {
             SpecializationCacheError::Production(error) => error,
             error @ SpecializationCacheError::Reentrant(_) => ProgramError::UnsupportedOperation {
-                message: {
-                    let name = self.name();
-                    let description = if name == COMPOSITE_OPERATION_NAME {
-                        format!("`{COMPOSITE_OPERATION_NAME}`")
-                    } else {
-                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                    };
-                    format!("{description} makes a {error}")
-                },
+                message: format!("{} makes a {error}", describe_composite(COMPOSITE_OPERATION_NAME, self.name())),
             }
             .into(),
         })
@@ -320,15 +305,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             .map_err(|error| match error {
                 SpecializationCacheError::Production(error) => error,
                 error @ SpecializationCacheError::Reentrant(_) => ProgramError::UnsupportedOperation {
-                    message: {
-                        let name = self.name();
-                        let description = if name == COMPOSITE_OPERATION_NAME {
-                            format!("`{COMPOSITE_OPERATION_NAME}`")
-                        } else {
-                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                        };
-                        format!("{description} makes a {error}")
-                    },
+                    message: format!("{} makes a {error}", describe_composite(COMPOSITE_OPERATION_NAME, self.name())),
                 }
                 .into(),
             })?;
