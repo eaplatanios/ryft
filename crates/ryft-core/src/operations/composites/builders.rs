@@ -172,6 +172,10 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
 /// differentiating a call whose reference state was discharged is rejected when its rule programs contain reference
 /// state. Refer to [`CustomRuleDefinition::with_reference_discharge`] for more information.
 ///
+/// Reconfiguring this function discards its registered definitions because they retain the previous configuration.
+/// Calls staged earlier keep their definitions, but lose the caches owned by this function and retrace their rules on
+/// later derivative requests.
+///
 /// Each configuration (i.e., `Jvp`, `Vjp`, and `Batching`) is part of the type, and its configuration functions exist
 /// only while it still holds its default (i.e., [`DefaultJvp`], [`DefaultVjp`], or [`DefaultBatching`]). Each mode is
 /// therefore configured at most once, and conflicting rules for one mode (e.g., an explicit forward mode rule and a
@@ -244,8 +248,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     V: Value,
     O: Operation<Type = V::Type>,
@@ -311,31 +313,6 @@ where
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
         let Self { primal, jvp, vjp, batching, batched_output_axes, name, .. } = self;
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
-    }
-
-    /// Returns this function with the provided name, which labels its staged calls in rendering and diagnostics.
-    /// Calls staged before this reconfiguration keep their original name.
-    #[inline]
-    pub fn with_name<N: Into<Cow<'static, str>>>(self, name: N) -> Self {
-        let Self { primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, .. } = self;
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name.into())
-    }
-
-    /// Returns this function with the provided configurations and without registered definitions, because the
-    /// definitions registered by earlier calls were configured with the previous configurations. The calls staged
-    /// earlier keep their definitions, but since this drops the registrations that own their specialization caches,
-    /// their derivative requests trace their rules again on every request. Refer to the documentation of [`Composite`]
-    /// for more information.
-    fn with_configuration<NewJvp, NewVjp, NewBatching>(
-        primal: Arc<dyn Fn(Input) -> Result<Output, ProgramError> + Send + Sync>,
-        jvp: NewJvp,
-        vjp: NewVjp,
-        batching: NewBatching,
-        batched_output_axes: Option<Vec<BatchAxis>>,
-        non_differentiated_count: usize,
-        name: Cow<'static, str>,
-    ) -> Composite<V, O, Input, Output, NewJvp, NewVjp, NewBatching> {
         Composite {
             primal,
             jvp,
@@ -344,6 +321,23 @@ where
             batched_output_axes,
             non_differentiated_count,
             name,
+            registrations: CompositeRegistrations::default(),
+        }
+    }
+
+    /// Returns this function with the provided name, which labels its staged calls in rendering and diagnostics.
+    /// Calls staged before this reconfiguration keep their original name.
+    #[inline]
+    pub fn with_name<N: Into<Cow<'static, str>>>(self, name: N) -> Self {
+        let Self { primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, .. } = self;
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name: name.into(),
             registrations: CompositeRegistrations::default(),
         }
     }
@@ -361,14 +355,14 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Returns this function with the provided Jacobian-Vector Product (JVP) rule, which governs forward mode
-    /// differentiation and, unless reverse mode rules are configured as well, reverse mode differentiation. This is the
-    /// analogue of JAX's [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
-    /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
+    /// differentiation and, unless reverse mode rules are configured as well, reverse mode differentiation. This is
+    /// the Ryft analogue of JAX's [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html)
+    /// and [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
     ///
     /// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The rule implements:
     ///
     /// ```text
-    /// JVP:        (x, ẋ) ↦ (y, ẏ) = (f(x), J_f(x) · ẋ)
+    /// JVP: (x, ẋ) ↦ (y, ẏ) = (f(x), J_f(x) · ẋ)
     /// ```
     ///
     /// Thus, `jvp` receives the input value `x` and an input-tangent value `ẋ`, then returns the primal output `y`
@@ -384,7 +378,7 @@ where
     /// Reach for a custom JVP when the function _is_ forward-differentiable but its automatically derived tangent is
     /// numerically unstable or wasteful and you want to supply a stable, efficient one by hand. Classic cases are a
     /// `log`-`sum`-`exp`, a softmax, or a normalization, where a handwritten tangent avoids the cancellation or
-    /// redundant work that the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse
+    /// redundant work that the generic rule incurs. A single custom JVP serves _both_ differentiation modes: reverse
     /// mode obtains its gradient by transposing the supplied tangent map, so the one rule composes with forward mode,
     /// reverse mode, and their higher-order combinations. Prefer it over [`Self::with_vjp`] whenever the function is
     /// naturally forward-differentiable, and use reverse mode rules only when just the reverse rule is natural (e.g.,
@@ -402,18 +396,18 @@ where
     /// carries the extents of the resulting cotangent. Higher-order differentiation differentiates those replayed
     /// operations, so every combination of forward and reverse mode applies to the resulting derivatives, including
     /// differentiation of a pullback with respect to its cotangent seeds and transposing a pullback again (which
-    /// restores the tangent map). The primal is kept separate from the rule for efficiency rather than necessity: the
-    /// rule computes both the outputs and their tangents, so deriving the primal from it would make every
+    /// restores the tangent map). The primal is kept separate from the rule for efficiency rather than necessity:
+    /// the rule computes both the outputs and their tangents, so deriving the primal from it would make every
     /// un-differentiated call pay for tangent computation.
     ///
-    /// There is no analogue of JAX's [`defjvps`][defjvps], which takes one closure per argument and sums their
-    /// contributions. Inputs here are arbitrary [`Parameterized`] structures rather than positional arguments, so a
-    /// closure per input leaf would have to be indexed by flattened leaf position, which discards the structure that
-    /// the rule otherwise receives, and one rule over the structured tangent `ẋ` already expresses the same derivative
-    /// by summing the per-leaf contributions itself. A rule that should skip the contributions of inactive leaves, as
-    /// `defjvps` does for the arguments that are not differentiated, can use [`Self::with_symbolic_zero_jvp`] instead.
-    ///
-    /// [defjvps]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvps.html
+    /// Note that there is no Ryft analogue of JAX's
+    /// [`defjvps`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvps.html), which takes one closure
+    /// per argument and sums their contributions. Inputs here are arbitrary [`Parameterized`] structures rather than
+    /// positional arguments, so a closure per input leaf would have to be indexed by flattened leaf position, which
+    /// discards the structure that the rule otherwise receives, and one rule over the structured tangent `ẋ` already
+    /// expresses the same derivative by summing the per-leaf contributions itself. A rule that should skip the
+    /// contributions of inactive leaves, as in JAX's `defjvps` does for the arguments that are not differentiated,
+    /// can use [`Self::with_symbolic_zero_jvp`] instead.
     ///
     /// # Parameters
     ///
@@ -425,40 +419,50 @@ where
     ) -> Composite<V, O, Input, Output, ExplicitJvp<Input, Output>, Vjp, Batching> {
         let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let jvp = ExplicitJvp { jvp: Arc::new(jvp) };
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
-    }
-
-    /// Returns this function with a forward mode rule derived from its primal: forward mode differentiates the primal,
-    /// reusable linearization partitions that derivative once, and reverse mode transposes it unless reverse mode rules
-    /// are configured as well. A function without derivative rules already derives its forward mode rule from its
-    /// primal, so this configuration is needed only to pair reverse mode rules with the derived forward mode rule,
-    /// which would otherwise make forward mode reject the calls.
-    #[inline]
-    pub fn with_jvp_from_primal(self) -> Composite<V, O, Input, Output, JvpFromPrimal, Vjp, Batching> {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
-        Self::with_configuration(
+        Composite {
             primal,
-            JvpFromPrimal,
+            jvp,
             vjp,
             batching,
             batched_output_axes,
             non_differentiated_count,
             name,
-        )
+            registrations: CompositeRegistrations::default(),
+        }
+    }
+
+    /// Returns this function with a forward mode differentiation rule derived from its primal (i.e., forward mode
+    /// differentiates the primal, reusable linearization partitions that derivative once, and reverse mode transposes
+    /// it unless reverse mode rules are configured as well). A function without derivative rules already derives its
+    /// forward mode differentiation rule from its primal, so this configuration is needed only to pair reverse mode
+    /// rules with the derived forward mode rule, which would otherwise make forward mode reject the calls.
+    #[inline]
+    pub fn with_jvp_from_primal(self) -> Composite<V, O, Input, Output, JvpFromPrimal, Vjp, Batching> {
+        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        Composite {
+            primal,
+            jvp: JvpFromPrimal,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 
     /// Returns this function with the provided Jacobian-Vector Product (JVP) rule `(x, ẋ) ↦ (y, ẏ)`, which is used as
     /// the rule of [`Self::with_jvp`] except that it receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves (i.e., as
     /// `Input::To<MaybeZero<CustomRuleTracer<V, O>>>` and `Output::To<MaybeZero<CustomRuleTracer<V, O>>>` values,
-    /// such as `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an input
-    /// `(DomainTracer<C>, DomainTracer<C>)`).
-    /// The leaves of structurally zero input tangents (e.g., those of inputs that are not being differentiated, and
-    /// those of every non-differentiated input) are [`MaybeZero::Zero`]s, which lets the rule skip the work that they
-    /// would otherwise require, and the rule returns a [`MaybeZero::Zero`] of the output's tangent type for an output
-    /// whose tangent it knows to be zero (e.g., an output that does not depend on the active inputs), which then stays
-    /// a structural zero for the transforms that consume the tangent (e.g., reverse mode transposes no work for it).
-    /// Each pattern of structurally zero input tangents is a separate specialization of the rule. This is the analogue
-    /// of JAX's `defjvp(..., symbolic_zeros=True)`, including its symbolic-zero output tangents.
+    /// such as `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an `(DomainTracer<C>, DomainTracer<C>)`
+    /// input). The leaves of structurally zero input tangents (e.g., those of inputs that are not being differentiated,
+    /// and those of every non-differentiated input) are [`MaybeZero::Zero`]s, which lets the rule skip the work that
+    /// they would otherwise require, and the rule returns a [`MaybeZero::Zero`] of the output's tangent type for an
+    /// output whose tangent it knows to be zero (e.g., an output that does not depend on the active inputs), which
+    /// then stays a structural zero for the transforms that consume the tangent (e.g., reverse mode differentiation
+    /// transposes no work for it). Each pattern of structurally zero input tangents is a separate specialization
+    /// of the rule. This is the Ryft analogue of JAX's `defjvp(..., symbolic_zeros=True)`, including its symbolic-zero
+    /// output tangents.
     ///
     /// The operation family is inferred from the primal closure, so the rule's tracer arguments need no separate type
     /// annotations.
@@ -473,8 +477,8 @@ where
     /// # fn main() -> Result<(), ProgramError> {
     /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
     ///
-    /// // `x ↦ (sin(x), x)` whose rule declares the tangent of its second output to be a structural zero (e.g., because
-    /// // that output only reports the point at which the first one was evaluated).
+    /// // `x ↦ (sin(x), x)` whose rule declares the tangent of its second output to be a structural zero
+    /// // (e.g., because that output only reports the point at which the first one was evaluated).
     /// let function = composite(|x: Tracer| Ok((x.sin()?, x))).with_symbolic_zero_jvp(
     ///     |x, tangent| {
     ///         let sine_tangent = match tangent {
@@ -511,9 +515,20 @@ where
     {
         let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let jvp = SymbolicZeroJvp { jvp: Arc::new(jvp) };
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value,
@@ -627,7 +642,16 @@ where
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let vjp = ExplicitVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 
     /// Returns this function with the provided reverse mode forward rule `x ↦ (y, r)` and backward rule `(r, ȳ) ↦ x̄`,
@@ -694,7 +718,16 @@ where
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let vjp = SymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 
     /// Returns this function with the provided reverse mode forward rule `x ↦ (y, r)` and accumulating backward rule,
@@ -740,7 +773,16 @@ where
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let vjp = AccumulatingVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
-        Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 }
 
@@ -940,7 +982,16 @@ where
     {
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         let batching = BroadcastInvariantBatching { rule: Arc::new(rule) };
-        Self::with_configuration(primal, jvp, vjp, batching, None, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes: None,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 
     /// Returns this function with the provided custom batching rule `(x, x_axes, extent) ↦ (y, y_axes)`, which is used
@@ -977,7 +1028,16 @@ where
     {
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         let batching = BroadcastSensitiveBatching { rule: Arc::new(rule) };
-        Self::with_configuration(primal, jvp, vjp, batching, None, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes: None,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 
     /// Returns this function with sequential batching, which batches its calls by looping over the batch items with a
@@ -1026,7 +1086,16 @@ where
     #[inline]
     pub fn with_sequential_batching(self) -> Composite<V, O, Input, Output, Jvp, Vjp, SequentialBatching> {
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
-        Self::with_configuration(primal, jvp, vjp, SequentialBatching, None, non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching: SequentialBatching,
+            batched_output_axes: None,
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 
     /// Returns this function with the provided batch axes for the outputs of its batched calls, one per flattened
@@ -1042,7 +1111,16 @@ where
     #[inline]
     pub fn with_batched_output_axes(self, output_axes: Vec<BatchAxis>) -> Self {
         let Self { primal, jvp, vjp, batching, non_differentiated_count, name, .. } = self;
-        Self::with_configuration(primal, jvp, vjp, batching, Some(output_axes), non_differentiated_count, name)
+        Composite {
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes: Some(output_axes),
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
     }
 }
 
