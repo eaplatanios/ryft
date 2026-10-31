@@ -13,14 +13,14 @@ use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingPolicy, DiagonalBatchingPolicy,
     ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
 };
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::StagingContext;
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
     DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
     TranspositionContext,
 };
-use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
+use crate::macros::check_types;
+use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME};
 use crate::operations::composites::rules::specializations::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
@@ -334,8 +334,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Operations with which the derived batching rules of a broadcast sensitive custom batching rule recover exact
 /// per-item tangents (refer to [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]).
 pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
@@ -352,7 +350,8 @@ pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
         O: Operation<Type = V::Type>,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 
-    /// Returns the sum of two values of the same type.
+    /// Returns the sum of two values of the same type, after aligning their manual variation (refer to
+    /// [`ManualVariationAlignment`](crate::ManualVariationAlignment)).
     fn add(
         &self,
         left: &CustomRuleTracer<V, O>,
@@ -365,23 +364,25 @@ pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
 }
 
 /// [`CustomRuleBroadcastSensitivity`] that takes diagonals with the canonical batching policy of the family's type
-/// universe and adds values with [`AddOperation`].
+/// universe and adds values with the [`Add`] capability. The two contributions that it adds are tangents produced by
+/// different rule programs, so the capability aligns their manual variation before binding the addition.
 struct PolicyBroadcastSensitivity<V, O>(PhantomData<fn() -> (V, O)>);
 
 impl<V, O> CustomRuleBroadcastSensitivity<V, O> for PolicyBroadcastSensitivity<V, O>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
-    O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    O: Operation<Type = V::Type>,
+    CustomRuleTracer<V, O>: Add<V::Type>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
+    #[inline]
     fn diagonal(
         &self,
         value: &CustomRuleTracer<V, O>,
         kept_axis: usize,
         removed_axis: usize,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError> {
-        type Policy<T> = <T as BatchableType>::Policy;
-        Ok(<Policy<V::Type> as DiagonalBatchingPolicy<TracingContext<V, O>>>::diagonal(
+        Ok(<<V::Type as BatchableType>::Policy as DiagonalBatchingPolicy<TracingContext<V, O>>>::diagonal(
             value.context(),
             value,
             kept_axis,
@@ -389,17 +390,17 @@ where
         )?)
     }
 
+    #[inline]
     fn add(
         &self,
         left: &CustomRuleTracer<V, O>,
         right: &CustomRuleTracer<V, O>,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError> {
-        let operation = O::provide(AddOperation::<V::Type>::new(), &[left.r#type().as_ref(), right.r#type().as_ref()])?;
-        let mut outputs = left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
+        <CustomRuleTracer<V, O> as Add<V::Type>>::add(left, right)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Forward mode rule of a [`CustomRuleDefinition`].
 pub(super) enum CustomRuleJvp<V, O> {
@@ -532,6 +533,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// [`Self::backward`] is present. [`Self::with_vjp`] captures it where the operation family's transposition bounds
     /// are known, because requiring them on the carrier's own transposition rule would form a cycle with the family's
     /// payload bounds.
+    #[allow(clippy::type_complexity)]
     pub(super) transposer: Option<
         Arc<
             dyn Fn(
@@ -555,6 +557,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// program's inputs, together with its output batch axes. Without it, batched calls can be executed but not
     /// differentiated. [`Self::with_batching_support`] captures it where the operation family's batching bounds are
     /// known, because requiring them on the operations' own rules would form a cycle with the family's payload bounds.
+    #[allow(clippy::type_complexity)]
     pub(super) batcher: Option<
         Arc<
             dyn Fn(
@@ -581,6 +584,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// differentiate the batched programs of their source's custom batching rule with it. [`Self::with_batching_rule`]
     /// captures it where the operation family's differentiation bounds are known, because requiring them on the
     /// operations' own rules would form a cycle with the family's payload bounds.
+    #[allow(clippy::type_complexity)]
     pub(super) differentiator: Option<
         Arc<
             dyn Fn(
@@ -609,6 +613,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// and returns the scan operation and the type of the slice index that the scan body receives first.
     /// [`Self::with_sequential_batching`] captures it where the family's scan bounds are known, because requiring them
     /// on the operations' own rules would restrict every family that contains the operations to scannable types.
+    #[allow(clippy::type_complexity)]
     pub(super) sequential_scan: Option<
         Arc<
             dyn Fn(usize, usize, &ShardingDimension, usize) -> Result<(O, <V as Typed>::Type), ProgramError>
@@ -622,6 +627,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// programs contain no reference state. [`Self::with_reference_discharge`] captures it where the operation family's
     /// discharge bounds are known, because requiring them on the operations' own rules would form a cycle with the
     /// family's payload bounds and would exclude families without references.
+    #[allow(clippy::type_complexity)]
     pub(super) discharger: Option<
         Arc<dyn Fn(Program<V, O, Vec<V>, Vec<V>>) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> + Send + Sync>,
     >,
@@ -678,7 +684,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// outputs followed by one tangent per output.
     pub fn with_jvp<R>(mut self, rule: R) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>,
         R: 'static
@@ -688,6 +693,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.jvp = Some(CustomRuleJvp::Rule(Arc::new(rule)));
         self
@@ -704,7 +710,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// structural zero again when it replays the program.
     pub fn with_symbolic_zero_jvp<R>(mut self, rule: R) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>,
         R: 'static
@@ -715,6 +720,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.jvp = Some(CustomRuleJvp::SymbolicZeroRule(Arc::new(rule)));
         self
@@ -738,7 +744,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// destination that input's cotangent has.
     pub fn with_vjp<F, B>(self, forward: F, backward: B) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static + CustomVjpOperation<V>,
         F: 'static
@@ -754,6 +759,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.with_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
     }
@@ -762,7 +768,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// replay. Structured adapters need that trace when neither leading inputs nor seeds can supply it.
     pub(in crate::operations::composites) fn with_vjp_in_context<F, B>(mut self, forward: F, backward: B) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static + CustomVjpOperation<V>,
         F: 'static
@@ -779,6 +784,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::Pure(Arc::new(backward)));
@@ -795,7 +801,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// program (refer to [`TransposedProgramCotangent::Zero`]) unless its consumer materializes it.
     pub fn with_symbolic_zero_vjp<F, B>(self, forward: F, backward: B) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static + CustomVjpOperation<V>,
         F: 'static
@@ -811,6 +816,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.with_symbolic_zero_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
     }
@@ -823,7 +829,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         backward: B,
     ) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static + CustomVjpOperation<V>,
         F: 'static
@@ -840,6 +845,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::PureWithSymbolicZeros(Arc::new(backward)));
@@ -857,7 +863,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// cotangent.
     pub fn with_accumulating_vjp<F, B>(mut self, forward: F, backward: B) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static + CustomVjpOperation<V>,
         F: 'static
@@ -875,6 +880,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<(), ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::Accumulating(Arc::new(backward)));
@@ -916,11 +922,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// derivatives of a custom batching rule cannot be batched (refer to [`Self::with_batching_rule`]).
     pub fn with_batching_support(mut self) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType + BatchableType>,
-        O: Operation<Type = V::Type>,
         <V::Type as BatchableType>::Policy:
             RecursiveBatchingPolicy<TracingContext<V, O>> + CotangentBatchingPolicy<TracingContext<V, O>>,
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.batcher = Some(Arc::new(|program, input_axes, output_axes, level, outputs| {
             type Policy<T> = <T as BatchableType>::Policy;
@@ -994,7 +1000,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// batches such a derivative is rejected with a diagnostic that names it.
     pub fn with_batching_rule<R>(mut self, rule: R) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>
             + PartiallyEvaluatableOperation<TracingContext<V, O>>
@@ -1010,6 +1015,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
             + Send
             + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.batching_rule = Some(Arc::new(rule));
         self.differentiator = Some(Arc::new(|program, input_indices| program.jvp_with_respect_to(input_indices)));
@@ -1029,7 +1035,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// is why it is not the default (refer to [`Self::with_batching_rule`]).
     pub fn with_broadcast_sensitive_batching_rule<R>(self, rule: R) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static
             + Value<Type: DifferentiableType + BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
         O: 'static
@@ -1037,8 +1042,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + PartiallyEvaluatableOperation<TracingContext<V, O>>
             + DifferentiableOperation<TracingContext<V, O>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-            + ResidualZeroProvider<V::Type, Operation = O>
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+            + ResidualZeroProvider<V::Type, Operation = O>,
         R: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1048,6 +1052,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
             + Send
             + Sync,
+        CustomRuleTracer<V, O>: Add<V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         let mut definition = self.with_batching_rule(rule);
         definition.broadcast_sensitivity = Some(Arc::new(PolicyBroadcastSensitivity(PhantomData)));

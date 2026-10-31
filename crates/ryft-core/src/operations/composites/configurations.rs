@@ -11,16 +11,14 @@ use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, ResidualZeroProvider, TranspositionContext,
 };
 use crate::macros::check_count;
-use crate::operations::arithmetic::AddOperation;
+use crate::operations::arithmetic::Add;
 use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation};
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{
-    MaybeZero, Operation, OperationProvider, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
-};
+use crate::programs::{MaybeZero, Operation, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracingContext, TracingContext};
 
 #[cfg(doc)]
@@ -1088,12 +1086,12 @@ where
         + PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + ResidualZeroProvider<V::Type, Operation = O>
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        + ResidualZeroProvider<V::Type, Operation = O>,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
     Output::ParameterStructure: Debug + PartialEq + Send + Sync,
+    CustomRuleTracer<V, O>: Add<V::Type>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
