@@ -11,7 +11,7 @@ use lru::LruCache;
 use crate::differentiation::DifferentiationError;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::definitions::CustomRuleDefinition;
-use crate::operations::composites::rules::specializations::specialization_error;
+use crate::operations::composites::rules::specializations::{CustomRuleSource, specialization_error};
 use crate::operations::composites::rules::{
     CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey,
     CustomRuleDerivedDefinitionKey, CustomRuleForwardSpecializationKey, CustomRuleSpecialization,
@@ -224,7 +224,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
                 caches.batching_rule_specializations.get_or_try_insert_with(key, produce_fn)
             }
         }
-        .map_err(|error| specialization_error(self.definition.name(), error))
+        .map_err(|error| specialization_error(self.name(), error))
     }
 
     /// Returns the specialization for `request` converted into the family `(Vc, Oc)`, which contains this reference's
@@ -249,7 +249,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             .get_or_try_insert_with((TypeId::of::<(Vc, Oc)>(), request), || {
                 Ok::<_, DifferentiationError>(produce_fn()? as Arc<dyn Any + Send + Sync>)
             })
-            .map_err(|error| specialization_error(self.definition.name(), error))?;
+            .map_err(|error| specialization_error(self.name(), error))?;
 
         // The key names the family, so the retained specialization always belongs to it.
         Ok(specialization.downcast::<CustomRuleSpecialization<Vc, Oc>>().unwrap())

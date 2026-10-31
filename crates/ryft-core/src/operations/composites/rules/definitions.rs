@@ -435,8 +435,6 @@ pub(super) enum CustomVjpBackward<V, O> {
     Accumulating(Arc<dyn CustomVjpAccumulatingBackwardRule<V, O>>),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Operation family `Self` over values `V` whose programs the reverse mode rules of a [`CustomRuleDefinition`] (refer
 /// to [`CustomRuleDefinition::with_vjp`]) can serve: the family transposes the programs that apply the rules, and it
 /// provides the zeros, reference allocations, reference updates, and additions with which transposition delivers
@@ -467,7 +465,6 @@ where
 
 impl<V: Value<Type: ReferenceMemberType>, O> CustomVjpOperation<V> for O
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     O: Operation<Type = V::Type>
         + TransposableOperation<V, O>
         + ResidualZeroProvider<V::Type, Operation = O>
@@ -485,52 +482,55 @@ where
             >,
             Operation = O,
         > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
 }
 
-/// Immutable definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on
-/// the first request of each specialization. A definition is registered once (refer to [`CustomRuleRegistration`]) and
-/// shared by every call that uses it, and two definitions are the same rule set exactly when they are the same
-/// definition (i.e., identity is a process-unique identifier assigned at construction rather than structural).
-/// [`Self::name`] is a human-readable label for rendering and diagnostics only; distinct definitions may share it.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on the first
+/// request of each specialization. A definition is registered once (refer to [`CustomRuleRegistration`]) and shared by
+/// every call that uses it, and two definitions are the same rule set exactly when they are the same definition (i.e.,
+/// identity is a process-unique identifier assigned at construction rather than structural). [`Self::name`] is a
+/// human-readable label for rendering and diagnostics only; distinct definitions may share it.
 ///
 /// Specialization is deterministic and repeatable but not exactly-once: eviction, retries after a failed
-/// specialization, concurrent cold requests, and requests made after the registration handle was dropped may invoke a
-/// rule again, so rules must not depend on mutable state outside their key. Host-side side effects of a rule (e.g.,
+/// specialization, concurrent cold requests, and requests made after the registration handle was dropped may invoke
+/// a rule again, so rules must not depend on mutable state outside their key. Host-side side effects of a rule (e.g.,
 /// counting its invocations) are not program effects.
 ///
 /// # Ownership
 ///
 /// The specialized programs are not stored in the definition, because a program that calls the definition (e.g., a
 /// rule that calls its own definition, directly or through other definitions) would then keep the definition alive
-/// forever. They are stored in caches owned by the [`CustomRuleRegistration`] handle, while calls and
-/// rules refer to the definition through a [`CustomRuleReference`], which holds the definition strongly and the caches
-/// only weakly. The strong references therefore always point from programs to definitions and from the handle to the
-/// caches, and never back from a definition to a program. Refer to [`CustomRuleRegistration`] for how rules must refer
-/// to definitions.
+/// forever. They are stored in caches owned by the [`CustomRuleRegistration`] handle, while calls and rules refer to
+/// the definition through a [`CustomRuleReference`], which holds the definition strongly and the caches only weakly.
+/// The strong references therefore always point from programs to definitions and from the handle to the caches, and
+/// never back from a definition to a program. Refer to [`CustomRuleRegistration`] for how rules must refer to
+/// definitions.
 pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Process-unique identity of this definition.
     pub(super) id: u64,
 
     /// Human-readable label used for rendering and diagnostics.
-    pub(in crate::operations::composites) name: Cow<'static, str>,
+    pub(super) name: Cow<'static, str>,
 
-    /// Named axes with which every rule is traced (refer to [`Self::with_named_axes`]).
+    /// Named axes with which every rule is traced.
     pub(super) named_axes: Vec<(String, NamedAxis)>,
 
-    /// Optional forward mode rule.
+    /// Optional forward mode differentiation rule.
     pub(super) jvp: Option<CustomRuleJvp<V, O>>,
 
-    /// Optional retained reverse mode forward rule, present exactly when [`Self::backward`] is present.
+    /// Optional retained reverse mode differentiation forward rule, present exactly when [`Self::backward`] is present.
     pub(super) forward: Option<Arc<dyn CustomVjpForwardRule<V, O>>>,
 
-    /// Optional retained reverse mode backward rule, present exactly when [`Self::forward`] is present.
+    /// Optional retained reverse mode differentiation backward rule, present exactly when [`Self::forward`] is present.
     pub(super) backward: Option<CustomVjpBackward<V, O>>,
 
     /// Transposition of a backward-rule specialization source program with respect to the provided inputs and
     /// destination kinds, returning the transposed program and the representation of each selected input's cotangent
-    /// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule declares
-    /// to be structural zeros stay structural zeros instead of being materialized. Present exactly when
+    /// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule
+    /// declares to be structural zeros stay structural zeros instead of being materialized. Present exactly when
     /// [`Self::backward`] is present. [`Self::with_vjp`] captures it where the operation family's transposition bounds
     /// are known, because requiring them on the carrier's own transposition rule would form a cycle with the family's
     /// payload bounds.
@@ -548,8 +548,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
         >,
     >,
 
-    /// Whether reverse mode defers the forward rule to the backward pass (refer to
-    /// [`Self::with_deferred_forward_rule`]).
+    /// Whether reverse mode differentiation defers the forward rule to the backward pass.
     pub(super) deferred_forward: bool,
 
     /// Optional structural batching of a traced rule program at one recorded level with the provided input batch
@@ -573,14 +572,29 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
         >,
     >,
 
+    /// Optional construction of the scan with which calls are batched sequentially when there is no custom batching
+    /// rule. It receives the batch extent (i.e., the scan's trip count), the number of carries (i.e., replicated
+    /// inputs), the batch axis placement, and the number of stacked outputs, and returns the scan operation and the
+    /// type of the slice index that the scan body receives first. [`Self::with_sequential_batching`] captures it where
+    /// the family's scan bounds are known, because requiring them on the operations' own rules would restrict every
+    /// family that contains the operations to scannable types.
+    #[allow(clippy::type_complexity)]
+    pub(super) sequential_batching_scan: Option<
+        Arc<
+            dyn Fn(usize, usize, &ShardingDimension, usize) -> Result<(O, <V as Typed>::Type), ProgramError>
+                + Send
+                + Sync,
+        >,
+    >,
+
     /// Optional batch axes of the outputs of batched calls, which default to mapping every output at axis 0.
     pub(super) batched_output_axes: Option<Vec<BatchAxis>>,
 
     /// Optional custom batching rule, which batches calls instead of structurally batching their primal regions.
     pub(super) batching_rule: Option<Arc<dyn CustomBatchingRule<V, O>>>,
 
-    /// Forward mode differentiation of a traced rule program with respect to the provided inputs, returning its fused
-    /// Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). Present when
+    /// Forward mode differentiation of a traced rule program with respect to the provided inputs, returning
+    /// its fused Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). Present when
     /// [`Self::batching_rule`] is present. Batching rules of derived definitions (refer to [`CustomRuleDerivation`])
     /// differentiate the batched programs of their source's custom batching rule with it. [`Self::with_batching_rule`]
     /// captures it where the operation family's differentiation bounds are known, because requiring them on the
@@ -600,28 +614,12 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     >,
 
     /// Operations with which the batching rules of the definitions derived from this definition recover exact per-item
-    /// tangents, present when [`Self::batching_rule`] depends on its input batch axes (refer to
-    /// [`Self::with_broadcast_sensitive_batching_rule`]).
+    /// tangents, present when [`Self::batching_rule`] depends on its input batch axes.
     pub(super) broadcast_sensitivity: Option<Arc<dyn CustomRuleBroadcastSensitivity<V, O>>>,
 
     /// Derivation of this definition from a source definition, whose batching rule this definition's calls apply
-    /// instead of [`Self::batching_rule`] (refer to [`CustomRuleDerivation`]).
+    /// instead of [`Self::batching_rule`].
     pub(super) derivation: Option<CustomRuleDerivation<V, O>>,
-
-    /// Optional construction of the scan with which calls are batched sequentially when there is no custom batching
-    /// rule (refer to [`Self::with_sequential_batching`]). It receives the batch extent (i.e., the scan's trip count),
-    /// the number of carries (i.e., replicated inputs), the batch axis placement, and the number of stacked outputs,
-    /// and returns the scan operation and the type of the slice index that the scan body receives first.
-    /// [`Self::with_sequential_batching`] captures it where the family's scan bounds are known, because requiring them
-    /// on the operations' own rules would restrict every family that contains the operations to scannable types.
-    #[allow(clippy::type_complexity)]
-    pub(super) sequential_scan: Option<
-        Arc<
-            dyn Fn(usize, usize, &ShardingDimension, usize) -> Result<(O, <V as Typed>::Type), ProgramError>
-                + Send
-                + Sync,
-        >,
-    >,
 
     /// Optional reference discharge of a traced rule program whose call was discharged, replacing its local reference
     /// state with explicitly threaded values. Without it, discharged calls can be differentiated only when their rule
@@ -657,12 +655,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             transposer: None,
             deferred_forward: false,
             batcher: None,
+            sequential_batching_scan: None,
             batched_output_axes: None,
             batching_rule: None,
             differentiator: None,
             broadcast_sensitivity: None,
             derivation: None,
-            sequential_scan: None,
             discharger: None,
             uncached_in_flight: Mutex::new(HashSet::new()),
             derived_definitions: Mutex::new(HashMap::new()),
@@ -1080,7 +1078,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         V: Value<Type: ScanType>,
         O: Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
     {
-        self.sequential_scan = Some(Arc::new(|length, carry_count, axis_sharding, stacked_output_count| {
+        self.sequential_batching_scan = Some(Arc::new(|length, carry_count, axis_sharding, stacked_output_count| {
             let scan = ScanOperation::<V::Type>::new(carry_count, length)
                 .with_stacked_axis_shardings(vec![axis_sharding.clone(); stacked_output_count]);
             Ok((O::from(scan), ArrayType::scalar(DataType::I64).into()))
@@ -1108,10 +1106,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns the human-readable label of this [`CustomRuleDefinition`].
+    /// Returns the human-readable label of this [`CustomRuleDefinition`], preserving borrowed static names. The
+    /// returned label can be retained independently of this definition.
     #[inline]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn name(&self) -> Cow<'static, str> {
+        self.name.clone()
     }
 
     /// Returns the named axes with which the rules of this [`CustomRuleDefinition`] are traced.
@@ -1151,7 +1150,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                      discharged, because its rule programs contain reference state and its definition has no \
                      reference discharge support",
                     {
-                        let name = self.name();
+                        let name = self.name.as_ref();
                         if name == COMPOSITE_OPERATION_NAME {
                             format!("`{COMPOSITE_OPERATION_NAME}`")
                         } else {
@@ -1199,7 +1198,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             .insert(marker.clone())
         {
             return Err(specialization_error(
-                self.name(),
+                self.name.as_ref(),
                 SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
             ));
         }
@@ -1253,7 +1252,7 @@ where
         input_tangent_types: &[V::Type],
     ) -> Result<(), DifferentiationError> {
         let Some(backward) = &self.backward else {
-            return Err(missing_backward_rule_error(self.name()).into());
+            return Err(missing_backward_rule_error(self.name.as_ref()).into());
         };
         let cotangents = match backward {
             CustomVjpBackward::Accumulating(rule) => return Ok(rule.apply(context, inputs, seeds, accumulators)?),
@@ -1282,7 +1281,7 @@ where
         let cotangent_types = cotangents.iter().map(|cotangent| cotangent.r#type().into_owned()).collect::<Vec<_>>();
         let expected_cotangent_types =
             input_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
-        validate_rule_output_types(self.name(), "backward", &expected_cotangent_types, &cotangent_types)?;
+        validate_rule_output_types(self.name.as_ref(), "backward", &expected_cotangent_types, &cotangent_types)?;
         for (accumulator, cotangent) in accumulators[leading_values.len()..].iter().zip(cotangents) {
             accumulator.accumulate(context, cotangent)?;
         }

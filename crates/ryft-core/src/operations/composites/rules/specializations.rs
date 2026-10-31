@@ -247,7 +247,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
 
     #[inline]
     fn name(&self) -> &str {
-        self.definition.name()
+        self.definition.name.as_ref()
     }
 
     #[inline]
@@ -282,7 +282,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
 
     #[inline]
     fn has_sequential_batching(&self) -> bool {
-        self.definition.sequential_scan.is_some()
+        self.definition.sequential_batching_scan.is_some()
     }
 
     #[inline]
@@ -318,7 +318,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             _ => {
                 return Err(ProgramError::UnsupportedOperation {
                     message: {
-                        let name = self.definition.name();
+                        let name = self.name();
                         let description = if name == COMPOSITE_OPERATION_NAME {
                             format!("`{COMPOSITE_OPERATION_NAME}`")
                         } else {
@@ -354,7 +354,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         "{} JVP specialization key has {} tangent activity \
                          flags for {} differentiated inputs",
                         {
-                            let name = self.definition.name();
+                            let name = self.name();
                             if name == COMPOSITE_OPERATION_NAME {
                                 format!("`{COMPOSITE_OPERATION_NAME}`")
                             } else {
@@ -410,7 +410,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                 "{} JVP rule returned {} outputs and {} output \
                                      tangents but the primal has {output_count} outputs",
                                 {
-                                    let name = self.definition.name();
+                                    let name = self.name();
                                     if name == COMPOSITE_OPERATION_NAME {
                                         format!("`{COMPOSITE_OPERATION_NAME}`")
                                     } else {
@@ -462,8 +462,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 for r#type in &key.output_types {
                     expected_output_types.push(r#type.tangent()?);
                 }
-                let program =
-                    conform_rule_output_types(self.definition.name(), "JVP", program, &expected_output_types, None)?;
+                let program = conform_rule_output_types(self.name(), "JVP", program, &expected_output_types, None)?;
                 let program = self.definition.discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization::new(program, Vec::new())));
             };
@@ -472,7 +471,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let differentiated_input_start = key.non_differentiated_count
                 + key.levels[..key.levels.len() - 1].iter().map(|level| level.boundary_input_count).sum::<usize>();
             let differentiated_input_axes = level.input_axes.get(differentiated_input_start..).ok_or_else(|| {
-                let name = self.definition.name();
+                let name = self.name();
                 let description = if name == COMPOSITE_OPERATION_NAME {
                     format!("`{COMPOSITE_OPERATION_NAME}`")
                 } else {
@@ -519,7 +518,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         let Some(forward) = &self.definition.forward else {
             return Err(ProgramError::UnsupportedOperation {
                 message: {
-                    let name = self.definition.name();
+                    let name = self.name();
                     let description = if name == COMPOSITE_OPERATION_NAME {
                         format!("`{COMPOSITE_OPERATION_NAME}`")
                     } else {
@@ -554,7 +553,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                 "{} forward rule returned {} outputs but the \
                                      primal has {output_count}",
                                 {
-                                    let name = self.definition.name();
+                                    let name = self.name();
                                     if name == COMPOSITE_OPERATION_NAME {
                                         format!("`{COMPOSITE_OPERATION_NAME}`")
                                     } else {
@@ -573,7 +572,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 )?;
                 let kept_output_indices = key.kept_output_indices(output_count);
                 let program = conform_rule_output_types(
-                    self.definition.name(),
+                    self.name(),
                     "forward",
                     program,
                     &key.output_types,
@@ -594,7 +593,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                              reference type `{type}` that is not a leading non-differentiated input forwarded by \
                              identity",
                             {
-                                let name = self.definition.name();
+                                let name = self.name();
                                 if name == COMPOSITE_OPERATION_NAME {
                                     format!("`{COMPOSITE_OPERATION_NAME}`")
                                 } else {
@@ -609,7 +608,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                             "{} forward rule returns residual {index} of \
                              reference type `{type}` from an input already forwarded by an earlier residual",
                             {
-                                let name = self.definition.name();
+                                let name = self.name();
                                 if name == COMPOSITE_OPERATION_NAME {
                                     format!("`{COMPOSITE_OPERATION_NAME}`")
                                 } else {
@@ -661,7 +660,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // hands the rule a structural zero for every dropped output. A batched key batches the specialization of its
         // inner key at its outermost level.
         let Some(transposer) = &self.definition.transposer else {
-            return Err(missing_backward_rule_error(self.definition.name()).into());
+            return Err(missing_backward_rule_error(self.name()).into());
         };
         // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Backward(key.clone()), || {
@@ -768,7 +767,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let Some(derivation) = &self.definition.derivation else {
                 return Err(ProgramError::UnsupportedOperation {
                     message: {
-                        let name = self.definition.name();
+                        let name = self.name();
                         let description = if name == COMPOSITE_OPERATION_NAME {
                             format!("`{COMPOSITE_OPERATION_NAME}`")
                         } else {
@@ -781,7 +780,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             };
             return self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
                 let CustomRuleSpecialization { program, output_axes, .. } =
-                    derivation.batching_rule_specialization(self.definition.name(), &key)?;
+                    derivation.batching_rule_specialization(self.name(), &key)?;
                 let program = self.definition.discharge_if(key.discharged, program)?;
                 Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
             });
@@ -798,7 +797,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                             "{} batching rule returned {} outputs but {} output \
                              batch axes",
                             {
-                                let name = self.definition.name();
+                                let name = self.name();
                                 if name == COMPOSITE_OPERATION_NAME {
                                     format!("`{COMPOSITE_OPERATION_NAME}`")
                                 } else {
@@ -828,10 +827,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         axis_sharding: &ShardingDimension,
         stacked_output_count: usize,
     ) -> Result<(O, V::Type), DifferentiationError> {
-        let Some(sequential_scan) = &self.definition.sequential_scan else {
+        let Some(sequential_batching_scan) = &self.definition.sequential_batching_scan else {
             return Err(ProgramError::UnsupportedOperation {
                 message: {
-                    let name = self.definition.name();
+                    let name = self.name();
                     let description = if name == COMPOSITE_OPERATION_NAME {
                         format!("`{COMPOSITE_OPERATION_NAME}`")
                     } else {
@@ -842,7 +841,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             }
             .into());
         };
-        Ok(sequential_scan(length, carry_count, axis_sharding, stacked_output_count)?)
+        Ok(sequential_batching_scan(length, carry_count, axis_sharding, stacked_output_count)?)
     }
 
     fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
@@ -855,7 +854,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 message: format!(
                     "{} has neither a custom batching rule nor sequential batching from which to derive rules",
                     {
-                        let name = self.definition.name();
+                        let name = self.name();
                         if name == COMPOSITE_OPERATION_NAME {
                             format!("`{COMPOSITE_OPERATION_NAME}`")
                         } else {
@@ -873,14 +872,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             };
             let derivation = self.has_batching_rule().then(|| CustomRuleDerivation { source: self.clone(), key });
             CustomRuleDefinition {
-                name: Cow::Owned(format!("{prefix}({})", self.definition.name())),
+                name: Cow::Owned(format!("{prefix}({})", self.name())),
                 named_axes: self.definition.named_axes.clone(),
                 jvp: Some(CustomRuleJvp::Primal),
                 batcher: self.definition.batcher.clone(),
+                sequential_batching_scan: self.definition.sequential_batching_scan.clone(),
                 differentiator: self.definition.differentiator.clone(),
                 broadcast_sensitivity: self.definition.broadcast_sensitivity.clone(),
                 derivation,
-                sequential_scan: self.definition.sequential_scan.clone(),
                 discharger: self.definition.discharger.clone(),
                 ..CustomRuleDefinition::new("")
             }
@@ -1101,7 +1100,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
     /// Returns the name of the member definition or of the unavailable definition.
     fn name_or_unavailable(&self) -> &str {
         match self {
-            Self::Member(rules) => rules.definition.name(),
+            Self::Member(rules) => rules.name(),
             Self::Unavailable(rules) => &rules.name,
         }
     }
@@ -2083,7 +2082,7 @@ where
                     "{} cannot differentiate a batched call because its definition has no batching support \
                      (refer to `CustomRuleDefinition::with_batching_support`)",
                     {
-                        let name = self.name();
+                        let name = self.name.as_ref();
                         if name == COMPOSITE_OPERATION_NAME {
                             format!("`{COMPOSITE_OPERATION_NAME}`")
                         } else {
