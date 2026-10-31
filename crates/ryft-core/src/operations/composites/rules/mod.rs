@@ -21,9 +21,8 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::arrays::ShardingDimension;
-use crate::batching::{BatchAxis, BatchingError, BatchingLevel, BatchingLevelExtent};
-use crate::differentiation::{CotangentDestinationKind, DifferentiationError, TransposedProgramCotangent};
+use crate::batching::{BatchAxis, BatchingLevel, BatchingLevelExtent};
+use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
 use crate::parameters::Parameter;
 use crate::programs::{Program, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed};
 use crate::tracing::{Tracer, TracingContext};
@@ -35,8 +34,6 @@ pub mod definition;
 pub mod registration;
 pub mod specialization;
 
-// TODO(eaplatanios): Review from here onwards.
-
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
 pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleRegistration};
 pub use specialization::{CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules};
@@ -47,27 +44,6 @@ pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
 /// Tracer over which retained custom rules are written. It is typed by the registration family's staged constant and
 /// operation types only, so a rule can be traced lazily under whichever transform later requests it.
 pub type CustomRuleTracer<V, O> = Tracer<TracingContext<V, O>>;
-
-/// Transposition of a backward-rule specialization source program with respect to the provided inputs and destination
-/// kinds, which returns the transposed program together with the representation of each selected input's cotangent
-/// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule declares to
-/// be structural zeros stay structural zeros instead of being materialized. [`CustomRuleDefinition::with_vjp`] captures
-/// it where the operation family's transposition bounds are known, because requiring them on the carrier's own
-/// transposition rule would form a cycle with the family's payload bounds.
-type CustomRuleTransposer<V, O> = dyn Fn(
-        &Program<V, O, Vec<V>, Vec<V>>,
-        &[usize],
-        &[CotangentDestinationKind],
-    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
-    + Send
-    + Sync;
-
-/// Reference discharge of a traced rule program whose call was discharged, which replaces the program's local reference
-/// state with explicitly threaded values. [`CustomRuleDefinition::with_reference_discharge`] captures it where the
-/// operation family's discharge bounds are known, because requiring them on the operations' own rules would form a
-/// cycle with the family's payload bounds (and would exclude families without references).
-type CustomRuleDischarger<V, O> =
-    dyn Fn(Program<V, O, Vec<V>, Vec<V>>) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> + Send + Sync;
 
 /// Kind of values that a batched rule program returns, which determines how an output that is mapped while its
 /// required batch axis is replicated is reconciled.
@@ -81,54 +57,13 @@ enum CustomRuleBatchedOutputs {
     Cotangents,
 }
 
-/// Structural batching of a traced rule program at one recorded [`BatchingLevel`] with the provided input batch axes.
-/// Each output is aligned to its required batch axis, or keeps its natural batch axis when the requirement is [`None`].
-/// The result is the batched program, which consumes the level's boundary inputs before the source program's inputs,
-/// together with its output batch axes. [`CustomRuleDefinition::with_batching_support`] captures it where the
-/// operation family's batching bounds are known, because requiring them on the operations' own rules would form a cycle
-/// with the family's payload bounds.
-type CustomRuleBatcher<V, O> = dyn Fn(
-        &Program<V, O, Vec<V>, Vec<V>>,
-        &[BatchAxis],
-        &[Option<BatchAxis>],
-        &BatchingLevel<<V as Typed>::Type>,
-        CustomRuleBatchedOutputs,
-    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
-    + Send
-    + Sync;
-
-/// Forward mode differentiation of a traced rule program with respect to the provided inputs, which returns its fused
-/// Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). The batching rules of derived
-/// definitions (refer to [`CustomRuleDerivation`]) differentiate the batched programs of their source's custom
-/// batching rule with it. [`CustomRuleDefinition::with_batching_rule`] captures it where the operation family's
-/// differentiation bounds are known, because requiring them on the operations' own rules would form a cycle with the
-/// family's payload bounds.
-type CustomRuleDifferentiator<V, O> = dyn Fn(
-        // Program to differentiate.
-        &Program<V, O, Vec<V>, Vec<V>>,
-        // Indices of the inputs with respect to which the program is differentiated.
-        &[usize],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
-    + Send
-    + Sync;
-
-/// Construction of the scan with which a call batched sequentially loops over its batch items (refer to
-/// [`CustomRuleDefinition::with_sequential_batching`]). It receives the extent of the batch axis (i.e., the scan's trip
-/// count), the number of carries (i.e., of the call's replicated inputs), the placement of the batch axis, and the
-/// number of stacked outputs (i.e., of the call's outputs), and it returns the scan operation together with the type
-/// of the slice index that the scan body receives first. [`CustomRuleDefinition::with_sequential_batching`] captures
-/// it where the family's scan bounds are known, because requiring them on the operations' own rules would restrict
-/// every family that contains the operations to scannable types.
-type CustomRuleSequentialScan<V, O> =
-    dyn Fn(usize, usize, &ShardingDimension, usize) -> Result<(O, <V as Typed>::Type), ProgramError> + Send + Sync;
-
 /// One batching level applied to a [`CompositeOperation`](crate::CompositeOperation) or
 /// [`CompositeTransposeOperation`] after it was staged. Batching such an operation batches no derivative rule. Instead,
 /// it records this level so that a later derivative request can batch the rule program that it traces at the unbatched
 /// types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleBatchingLevel<T> {
-    /// Context-neutral description of the level.
+    /// Context-neutral description of the batching level.
     pub(super) level: BatchingLevel<T>,
 
     /// Number of policy boundary inputs (e.g., a first-class batch extent) that batching at this level prepended to the
@@ -140,11 +75,6 @@ pub struct CustomRuleBatchingLevel<T> {
 
     /// Batch axes of the operation's outputs at this level.
     pub(super) output_axes: Vec<BatchAxis>,
-}
-
-/// Returns the number of boundary inputs that the provided batching levels together prepended to an operation's inputs.
-pub(in crate::operations::composites) fn boundary_input_count<T>(levels: &[CustomRuleBatchingLevel<T>]) -> usize {
-    levels.iter().map(|level| level.boundary_input_count).sum()
 }
 
 /// Batching applied to a [`CompositeOperation`](crate::CompositeOperation) or [`CompositeTransposeOperation`]
@@ -161,10 +91,12 @@ pub(super) struct CustomRuleBatching<T> {
     pub(super) levels: Vec<CustomRuleBatchingLevel<T>>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<T: Type> CustomRuleBatching<T> {
     /// Returns the number of boundary inputs that all levels together prepended to the operation's inputs.
     pub(super) fn boundary_input_count(&self) -> usize {
-        boundary_input_count(&self.levels)
+        self.levels.iter().map(|level| level.boundary_input_count).sum()
     }
 
     /// Returns this [`CustomRuleBatching`] with its types converted into the type family `U`, as when its operation is

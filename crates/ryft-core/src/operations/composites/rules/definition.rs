@@ -21,8 +21,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
+    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
+    TranspositionContext,
 };
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
@@ -31,9 +32,8 @@ use crate::operations::composites::rules::specialization::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
 };
 use crate::operations::composites::rules::{
-    CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleDerivationKey, CustomRuleDifferentiator,
-    CustomRuleDischarger, CustomRuleProgram, CustomRuleSequentialScan, CustomRuleSpecializationRequest,
-    CustomRuleTracer, CustomRuleTransposer,
+    CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleDerivationKey, CustomRuleDifferentiator, CustomRuleProgram,
+    CustomRuleSequentialScan, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
@@ -46,9 +46,6 @@ use crate::programs::{
 };
 use crate::specialization::{ReentrantSpecializationError, SpecializationCacheError};
 use crate::tracing::TracingContext;
-
-#[cfg(doc)]
-use crate::differentiation::TransposedProgramCotangent;
 
 #[cfg(doc)]
 use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
@@ -531,8 +528,25 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Optional retained reverse mode backward rule, present exactly when [`Self::forward`] is present.
     pub(super) backward: Option<CustomVjpBackward<V, O>>,
 
-    /// Transposer of backward-rule specialization source programs, present exactly when [`Self::backward`] is present.
-    pub(super) transposer: Option<Arc<CustomRuleTransposer<V, O>>>,
+    /// Transposition of a backward-rule specialization source program with respect to the provided inputs and
+    /// destination kinds, returning the transposed program and the representation of each selected input's cotangent
+    /// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule declares
+    /// to be structural zeros stay structural zeros instead of being materialized. Present exactly when
+    /// [`Self::backward`] is present. [`Self::with_vjp`] captures it where the operation family's transposition bounds
+    /// are known, because requiring them on the carrier's own transposition rule would form a cycle with the family's
+    /// payload bounds.
+    pub(super) transposer: Option<
+        Arc<
+            dyn Fn(
+                    &Program<V, O, Vec<V>, Vec<V>>,
+                    &[usize],
+                    &[CotangentDestinationKind],
+                )
+                    -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
+                + Send
+                + Sync,
+        >,
+    >,
 
     /// Whether reverse mode defers the forward rule to the backward pass (refer to
     /// [`Self::with_deferred_forward_rule`]).
@@ -564,9 +578,14 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// rule (refer to [`Self::with_sequential_batching`]).
     pub(super) sequential_scan: Option<Arc<CustomRuleSequentialScan<V, O>>>,
 
-    /// Optional reference discharge of traced rule programs, without which discharged calls can be differentiated
-    /// only when their rule programs contain no reference state.
-    pub(super) discharger: Option<Arc<CustomRuleDischarger<V, O>>>,
+    /// Optional reference discharge of a traced rule program whose call was discharged, replacing its local reference
+    /// state with explicitly threaded values. Without it, discharged calls can be differentiated only when their rule
+    /// programs contain no reference state. [`Self::with_reference_discharge`] captures it where the operation family's
+    /// discharge bounds are known, because requiring them on the operations' own rules would form a cycle with the
+    /// family's payload bounds and would exclude families without references.
+    pub(super) discharger: Option<
+        Arc<dyn Fn(Program<V, O, Vec<V>, Vec<V>>) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> + Send + Sync>,
+    >,
 
     /// Specializations that each thread is producing without a cache (i.e., after the registration handle was
     /// dropped), which reject recursive production exactly as a [`SpecializationCache`] does. The markers contain
