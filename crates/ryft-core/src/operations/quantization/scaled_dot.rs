@@ -268,13 +268,13 @@ where
         if inputs.len() != self.input_count() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_count(), actual: inputs.len() }.into());
         }
-        self.dimensions.validate_for_ranks(
+        self.dimensions.validate(
             DOT_OPERATION_NAME,
             inputs[0].unbatched_type().rank(),
             inputs[1].unbatched_type().rank(),
         )?;
         if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         }
         let mapped_dimensions = inputs
             .iter()

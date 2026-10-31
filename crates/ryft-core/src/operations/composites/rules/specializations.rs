@@ -26,7 +26,6 @@ use crate::operations::composites::operations::{
 };
 use crate::operations::composites::rules::definitions::{
     CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
-    CustomVjpOperation,
 };
 use crate::operations::composites::rules::registrations::CustomRuleReference;
 use crate::operations::composites::rules::{
@@ -36,8 +35,7 @@ use crate::operations::composites::rules::{
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    MaybeZero, Operation, Program, ProgramBuilder, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
-    ValueProjection,
+    MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::specialization::SpecializationCacheError;
 use crate::tracing::TracingContext;
@@ -2091,26 +2089,6 @@ where
     }
 }
 
-/// Transposes the source program of an unbatched backward-rule specialization with respect to the inputs at
-/// `input_indices`, whose cotangents have the provided destination kinds, and returns the transposed program together
-/// with the representation of each selected input's cotangent. Structural-zero cotangents (e.g., those that a backward
-/// rule declares with [`MaybeZero::Zero`]) are not materialized, so they consume no output of the transposed program
-/// and reach the carrier as [`TransposedProgramCotangent::Zero`]s, which contribute nothing to their destinations.
-pub(super) fn transpose_backward_source_program<V, O>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
-    input_indices: &[usize],
-    destination_kinds: &[CotangentDestinationKind],
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: Value<Type: DifferentiableType + ReferenceMemberType>,
-    O: CustomVjpOperation<V>,
-{
-    let transposed = program.entry_region_ref().transpose(input_indices, &[], destination_kinds)?;
-    let cotangents = transposed.cotangents().to_vec();
-    Ok((Arc::unwrap_or_clone(transposed.into_program()), cotangents))
-}
-
 /// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the
 /// `expected` types as its leading outputs (or as its outputs at the `selected` positions, when provided), and returns
 /// it with its type identities renamed onto those of `expected`.
@@ -2247,6 +2225,61 @@ mod tests {
             panic!("the derived definition has no derivation");
         };
         derivation.batching_rule_specialization(derived.name(), key)
+    }
+
+    #[test]
+    fn test_custom_rule_reference_derived() {
+        // Derivations of one key share a definition that the source registration owns, together with its caches, and
+        // the definition keeps only its source definition alive (i.e., there is no strong cycle back to the caches).
+        let registration = CustomRuleRegistration::new(
+            MemberDefinition::new("sine")
+                .with_jvp_from_primal()
+                .with_batching_support()
+                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
+        );
+        let key = |kind| CustomRuleDerivedDefinitionKey {
+            kind,
+            input_count: 1,
+            active_input_indices: vec![0],
+            output_tangent_mask: vec![true],
+        };
+        let derived = registration.reference().derived(key(CustomRuleDerivationKind::Jvp)).unwrap();
+        assert_eq!(derived.name(), "jvp(sine)");
+        assert!(derived.derives_jvp_from_primal());
+        assert!(derived.has_batching_rule());
+        assert!(!derived.has_jvp());
+        assert!(!derived.has_vjp());
+        assert_eq!(registration.reference().derived(key(CustomRuleDerivationKind::Jvp)).unwrap(), derived);
+        let pushforward = registration.reference().derived(key(CustomRuleDerivationKind::Pushforward)).unwrap();
+        assert_eq!(pushforward.name(), "pushforward(sine)");
+        assert_ne!(pushforward, derived);
+        assert!(derived.is_cached());
+        assert!(pushforward.is_cached());
+
+        // Dropping the source registration frees the derived registrations and their caches, and later derivations
+        // reuse the derived definitions that are still alive, without caches, exactly like specializations.
+        let source = registration.reference();
+        drop(registration);
+        assert!(!derived.is_cached());
+        let fresh = source.derived(key(CustomRuleDerivationKind::Jvp)).unwrap();
+        assert_eq!(fresh, derived);
+        assert!(!fresh.is_cached());
+
+        // Nothing but the derived references keeps a derived definition alive, so once they are dropped, a later
+        // derivation creates a new definition with a new identity.
+        let derived_id = derived.definition().id();
+        drop((derived, pushforward, fresh));
+        assert_ne!(source.derived(key(CustomRuleDerivationKind::Jvp)).unwrap().definition().id(), derived_id);
+
+        // A source without a custom batching rule has nothing to derive from.
+        assert!(matches!(
+            CustomRuleRegistration::new(MemberDefinition::new("sine").with_jvp_from_primal())
+                .reference()
+                .derived(key(CustomRuleDerivationKind::Jvp)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `sine` has neither a custom batching rule nor sequential batching from \
+                               which to derive rules",
+        ));
     }
 
     #[test]

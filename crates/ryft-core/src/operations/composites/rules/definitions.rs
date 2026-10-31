@@ -21,7 +21,7 @@ use crate::differentiation::{
 };
 use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
-use crate::operations::composites::rules::specializations::{CustomRuleDerivation, transpose_backward_source_program};
+use crate::operations::composites::rules::specializations::CustomRuleDerivation;
 use crate::operations::composites::rules::{
     CustomRuleBatchedOutputs, CustomRuleDerivedDefinitionKey, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
@@ -1396,6 +1396,26 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
             .field("has_vjp", &self.vjp.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// Transposes the source program of an unbatched backward-rule specialization with respect to the inputs at
+/// `input_indices`, whose cotangents have the provided destination kinds, and returns the transposed program together
+/// with the representation of each selected input's cotangent. Structural-zero cotangents (e.g., those that a backward
+/// rule declares with [`MaybeZero::Zero`]) are not materialized, so they consume no output of the transposed program
+/// and reach the carrier as [`TransposedProgramCotangent::Zero`]s, which contribute nothing to their destinations.
+fn transpose_backward_source_program<V, O>(
+    program: &Program<V, O, Vec<V>, Vec<V>>,
+    input_indices: &[usize],
+    destination_kinds: &[CotangentDestinationKind],
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
+where
+    V: Value<Type: DifferentiableType + ReferenceMemberType>,
+    O: CustomVjpOperation<V>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    let transposed = program.entry_region_ref().transpose(input_indices, &[], destination_kinds)?;
+    let cotangents = transposed.cotangents().to_vec();
+    Ok((Arc::unwrap_or_clone(transposed.into_program()), cotangents))
 }
 
 #[cfg(test)]

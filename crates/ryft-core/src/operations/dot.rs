@@ -252,8 +252,6 @@ impl DotDimensionNumbers {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Display for DotDimensionNumbers {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -270,6 +268,8 @@ impl Display for DotDimensionNumbers {
 
 /// Canonical operation name for [`DotOperation`].
 pub const DOT_OPERATION_NAME: &str = "dot";
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Primitive representing a generalized dot (tensor contraction) of two identically typed numeric inputs. Boolean,
 /// token, and structural zero element types are rejected.
@@ -1084,8 +1084,15 @@ impl Display for RaggedDotDimensionNumbers {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "(dot={}, lhs_ragged={:?}, rhs_group={:?})",
-            self.dot_dimensions, self.lhs_ragged_dimensions, self.rhs_group_dimensions,
+            "(lhs_contracting={:?}, rhs_contracting={:?}, \
+             lhs_batching={:?}, rhs_batching={:?}, \
+             lhs_ragged={:?}, rhs_group={:?})",
+            self.dot_dimensions.lhs_contracting_dimensions,
+            self.dot_dimensions.rhs_contracting_dimensions,
+            self.dot_dimensions.lhs_batching_dimensions,
+            self.dot_dimensions.rhs_batching_dimensions,
+            self.lhs_ragged_dimensions,
+            self.rhs_group_dimensions,
         )
     }
 }
@@ -4264,7 +4271,7 @@ mod tests {
         let dimensions = RaggedDotDimensionNumbers::matmul();
         assert_eq!(
             dimensions.to_string(),
-            "(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]), lhs_ragged=[0], \
+            "(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], lhs_ragged=[0], \
              rhs_group=[0])",
         );
         assert_eq!(
@@ -4388,7 +4395,7 @@ mod tests {
             operation.to_string(),
             indoc! {"
                 ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]), \
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], \
                         lhs_ragged=[0], rhs_group=[0]),
                 ]
             "}
@@ -4412,7 +4419,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2, 2, 1], %2:i32[2] .
                 let %3:f32[3, 1] = ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]), \
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], \
                         lhs_ragged=[0], rhs_group=[0]),
                 ] %0 %1 %2
                 in (%3)
@@ -5151,7 +5158,8 @@ mod tests {
                     %12:dimension<2> = constant [value=2]
                     %13:i32[batch, 2, 2] = broadcast [output_axes=[0, 2]] %2 %3 %11 %12
                     %14:f32[batch, 2, 3, 1] = ragged_dot_general [
-                        dimensions=(dot=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 1], rhs_batching=[0, 2]), lhs_ragged=[2], rhs_group=[1]),
+                        dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 1], \
+                            rhs_batching=[0, 2], lhs_ragged=[2], rhs_group=[1]),
                     ] %0 %10 %13
                 in (%14)
             "}
@@ -5268,16 +5276,16 @@ mod tests {
                 lambda %0:f32[3, 2], %1:f32[2, 2, 1], %2:f32[3, 2], %3:f32[2, 2, 1] .
                 let %4:i32[2] = const [1, 2]
                     %5:f32[3, 1] = ragged_dot_general [
-                        dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
-                            rhs_batching=[]), lhs_ragged=[0], rhs_group=[0]),
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
+                            rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
                     ] %0 %1 %4
                     %6:f32[3, 1] = ragged_dot_general [
-                        dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
-                            rhs_batching=[]), lhs_ragged=[0], rhs_group=[0]),
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
+                            rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
                     ] %2 %1 %4
                     %7:f32[3, 1] = ragged_dot_general [
-                        dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
-                            rhs_batching=[]), lhs_ragged=[0], rhs_group=[0]),
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
+                            rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
                     ] %0 %3 %4
                     %8:f32[3, 1] = add %6 %7
                 in (%5, %8)
@@ -5325,8 +5333,8 @@ mod tests {
             lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[3, 2, 1] .
             let %2:i32[2] = const [1, 2]
                 %3:f8e8m0fnu[3, 1] = ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0]), lhs_ragged=[0], rhs_group=[]),
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
                 ] %0 %1 %2
             in (%3)
             "}
@@ -5338,18 +5346,18 @@ mod tests {
             lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[3, 2, 1], %2:f32[3, 2], %3:f32[3, 2, 1] .
             let %4:i32[2] = const [1, 2]
                 %5:f8e8m0fnu[3, 1] = ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0]), lhs_ragged=[0], rhs_group=[]),
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
                 ] %0 %1 %4
                 %6:f32[3, 2, 1] = convert_element_type [data_type=f32] %1
                 %7:f32[3, 1] = ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0]), lhs_ragged=[0], rhs_group=[]),
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
                 ] %2 %6 %4
                 %8:f32[3, 2] = convert_element_type [data_type=f32] %0
                 %9:f32[3, 1] = ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0]), lhs_ragged=[0], rhs_group=[]),
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
                 ] %8 %3 %4
                 %10:f32[3, 1] = add %7 %9
             in (%5, %10)
@@ -5414,8 +5422,8 @@ mod tests {
                 lambda %0:f32[3, 1], %1:f32[2, 2, 1] .
                 let %2:i32[2] = const [1, 2]
                     %3:f32[3, 2] = ragged_dot_general [
-                        dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[2], lhs_batching=[], \
-                        rhs_batching=[]), lhs_ragged=[0], rhs_group=[0]),
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[2], lhs_batching=[], \
+                        rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
                     ] %0 %1 %2
                 in (%3)
             "}
@@ -5659,7 +5667,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2, 2, 1], %2:i32[2] .
                 let %3:f32[3, 1] = ragged_dot_general [
-                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]), \
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], \
                         lhs_ragged=[0], rhs_group=[0]),
                 ] %0 %1 %2
                 in (%3)
