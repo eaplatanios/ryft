@@ -111,7 +111,8 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     fn native_definition(&self) -> Option<&CustomRuleDefinition<V, O>>;
 
     /// Returns whether backward specializations of the source can write cotangents to caller-provided buffers. A
-    /// source that cannot returns those cotangents instead, and the carrier's accumulators add them to the buffers.
+    /// source that cannot do that returns those cotangents instead, and the carrier's accumulators add them to the
+    /// buffers.
     fn supports_reference_destinations(&self) -> bool;
 }
 
@@ -1145,6 +1146,8 @@ where
     for<'t> &'t V::Type: TryFrom<&'t VC::Type, Error = TypeError>,
     CustomRuleSpecialization<VC, OC>: Send + Sync,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    // State the source contract explicitly to aid RustRover's trait resolution.
+    Self: CustomRuleSource<VC, OC>,
 {
     fn jvp_specialization(
         &self,
@@ -1434,7 +1437,7 @@ where
                     let context = values[0].context().clone();
                     let mut inputs = values[..boundary_input_count].to_vec();
                     inputs.extend(values);
-                    Ok(batched.interpret_in_context(&context, inputs)?)
+                    batched.interpret_in_context(&context, inputs)
                 },
                 program_types,
                 self.source.definition().named_axes().to_vec(),
@@ -2042,8 +2045,6 @@ where
     }
     program.rename_type_identities(&renaming)
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
