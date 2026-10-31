@@ -660,6 +660,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Creates a new [`CustomRuleDefinition`] with the provided label and no derivative rules.
+    #[inline]
     pub fn new<N: Into<Cow<'static, str>>>(name: N) -> Self {
         Self {
             id: NEXT_CUSTOM_RULE_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
@@ -682,16 +683,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// the rules resolve the names bound where the calls that apply them are made (e.g., an `axis_index` over the axis
     /// of an enclosing batching level). The rules are traced lazily and in fresh traces, which see no enclosing
     /// bindings otherwise. The definitions that are derived from this definition trace their rules with the same axes.
+    #[inline]
     pub fn with_named_axes(mut self, named_axes: Vec<(String, NamedAxis)>) -> Self {
         self.named_axes = named_axes;
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided forward mode rule, replacing any previously configured
-    /// forward mode rule (including a JVP derived from the primal). The rule implements `(p, x, ẋ) ↦ (y, ẏ)`: it
-    /// receives every primal input (i.e., the non-differentiated inputs `p` followed by the differentiated inputs `x`)
-    /// and one tangent per differentiated input, in which structural zeros are materialized, and it returns the primal
-    /// outputs followed by one tangent per output.
+    /// Returns this [`CustomRuleDefinition`] with the provided forward mode differentiation rule, replacing any
+    /// previously configured forward mode rule (including a JVP derived from the primal). The rule implements
+    /// `(p, x, ẋ) ↦ (y, ẏ)`: it receives every primal input (i.e., the non-differentiated inputs `p` followed by the
+    /// differentiated inputs `x`) and one tangent per differentiated input, in which structural zeros are materialized,
+    /// and it returns the primal outputs followed by one tangent per output.
+    #[inline]
     pub fn with_jvp<R>(mut self, rule: R) -> Self
     where
         V: Value,
@@ -718,6 +721,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// rule. A structural-zero output tangent is materialized at the boundary of the specialization program, from the
     /// primal outputs and inputs, as a zero-producing operation, which forward mode differentiation recognizes as a
     /// structural zero again when it replays the program.
+    #[inline]
     pub fn with_symbolic_zero_jvp<R>(mut self, rule: R) -> Self
     where
         V: Value,
@@ -737,10 +741,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     }
 
     /// Returns this [`CustomRuleDefinition`] with a forward mode rule derived from the primal region of each call,
-    /// replacing any previously configured forward mode rule. This is how a rule set that only customizes reverse mode
-    /// (or batching) keeps ordinary forward mode differentiation, which a missing rule never provides implicitly:
+    /// replacing any previously configured forward mode rule. This is how a rule set that only customizes reverse
+    /// mode (or batching) keeps ordinary forward mode differentiation, which a missing rule never provides implicitly:
     /// forward mode then differentiates the primal region, reusable linearization partitions that derivative once, and
     /// reverse mode transposes it unless reverse mode rules take precedence.
+    #[inline]
     pub fn with_jvp_from_primal(mut self) -> Self {
         self.jvp = Some(CustomRuleJvp::Primal);
         self
@@ -752,6 +757,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// inputs `p` followed by the residuals) and one cotangent seed per output, in which structural zeros are
     /// materialized, and it returns one cotangent per differentiated input, which transposition adds to whatever
     /// destination that input's cotangent has.
+    #[inline]
     pub fn with_vjp<F, B>(self, forward: F, backward: B) -> Self
     where
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -774,8 +780,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.with_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
     }
 
-    /// Installs reverse mode rules whose backward adapter receives materialized seeds and the trace in which it must
-    /// replay. Structured adapters need that trace when neither leading inputs nor seeds can supply it.
+    /// Installs reverse mode differentiation rules whose backward adapter receives materialized seeds and the trace in
+    /// which it must replay. Structured adapters need that trace when neither leading inputs nor seeds can supply it.
+    #[inline]
     pub(in crate::operations::composites) fn with_vjp_in_context<F, B>(mut self, forward: F, backward: B) -> Self
     where
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -811,6 +818,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// zero (e.g., that of an input that it treats as a parameter). Transposition contributes nothing to the
     /// destination of a structural-zero cotangent, so the cotangent stays a structural zero through the transposed
     /// program (refer to [`TransposedProgramCotangent::Zero`]) unless its consumer materializes it.
+    #[inline]
     pub fn with_symbolic_zero_vjp<F, B>(self, forward: F, backward: B) -> Self
     where
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -833,8 +841,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.with_symbolic_zero_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
     }
 
-    /// Installs reverse mode rules whose backward adapter receives symbolic seeds and the trace in which it must
-    /// replay, including when every seed is structural zero and there are no leading inputs.
+    /// Installs reverse mode differentiation rules whose backward adapter receives symbolic seeds and the trace
+    /// in which it must replay, including when every seed is structural zero and there are no leading inputs.
+    #[inline]
     pub(in crate::operations::composites) fn with_symbolic_zero_vjp_in_context<F, B>(
         mut self,
         forward: F,
@@ -873,8 +882,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// the known leading inputs followed by the differentiated inputs' tangents), the output cotangent seeds, and one
     /// [`CotangentAccumulator`] per carrier input, and it submits the contributions of the differentiated inputs to
     /// their accumulators. A single rule therefore serves returned, caller-buffer, and ignored destinations, and it
-    /// can, for example, update only the affected entries of a caller-provided buffer instead of returning a full-sized
-    /// cotangent.
+    /// can, for example, update only the affected entries of a caller-provided buffer instead of returning a
+    /// full-sized cotangent.
+    #[inline]
     pub fn with_accumulating_vjp<F, B>(mut self, forward: F, backward: B) -> Self
     where
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -904,28 +914,29 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with its reverse mode forward rule deferred to the backward pass (i.e.,
-    /// the analogue of JAX's `custom_vjp(..., optimize_remat=True)`). Reverse mode then computes the outputs of a call
-    /// with its primal region, which is cheaper than the forward rule whenever the residuals cost extra work, and
-    /// stages a [`CompositeTransposeOperation`] carrier whose leading inputs are the call's own inputs rather than the
-    /// residuals. Transposing that carrier replays the forward rule on those inputs to recover the residuals and then
-    /// applies the backward rule. The call's inputs are therefore the only values that its derivative keeps alive
-    /// between the two passes, which residual policies (e.g., that of a
-    /// [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any other value, and the
-    /// forward rule runs only once, in the backward pass.
+    /// Returns this [`CustomRuleDefinition`] with its reverse mode differentiation forward rule deferred to the
+    /// backward pass (i.e., the analogue of JAX's `custom_vjp(..., optimize_remat=True)`). Reverse mode then computes
+    /// the outputs of a call with its primal region, which is cheaper than the forward rule whenever the residuals cost
+    /// extra work, and stages a [`CompositeTransposeOperation`] carrier whose leading inputs are the call's own inputs
+    /// rather than the residuals. Transposing that carrier replays the forward rule on those inputs to recover the
+    /// residuals and then applies the backward rule. The call's inputs are therefore the only values that its
+    /// derivative keeps alive between the two passes, which residual policies (e.g., that of a
+    /// [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any
+    /// other value, and the forward rule runs only once, in the backward pass.
     ///
-    /// The swap applies whenever reverse mode partitions a call, and it has no effect on a definition without
-    /// reverse mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
-    /// [`Program::into_pruned`](crate::Program::into_pruned)) is differentiated without the swap, because only the
-    /// forward rule computes the pruned outputs, whose cotangent seeds the backward rule receives.
+    /// The swap applies whenever reverse mode partitions a call, and it has no effect on a definition without reverse
+    /// mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
+    /// [`Program::into_pruned`]) is differentiated without the swap, because only the forward rule computes the pruned
+    /// outputs, whose cotangent seeds the backward rule receives.
     ///
     /// # Errors
     ///
     /// The forward rule runs in the backward pass, where its effects would execute out of order, so reverse mode
     /// rejects a call whose traced forward rule has effects (e.g., a `print` or a reference update) with a
-    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a carrier with a deferred forward rule
-    /// (i.e., batching a derivative after it is taken but before it is transposed) is rejected with a
-    /// [`BatchingError::UnsupportedOperation`], while batching a call before it is differentiated is supported.
+    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a carrier with a deferred
+    /// forward rule (i.e., batching a derivative after it is taken but before it is transposed) is rejected with
+    /// a [`BatchingError::UnsupportedOperation`], while batching a call before it is differentiated is supported.
+    #[inline]
     pub fn with_deferred_forward_rule(mut self) -> Self {
         self.deferred_forward = true;
         self
@@ -945,11 +956,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         self.structural_batcher = Some(Arc::new(|program, input_axes, output_axes, level, outputs| {
-            type Policy<T> = <T as BatchableType>::Policy;
-
             // Align every required output first (a replicated alignment request keeps the natural axis), then adapt
             // the policy boundary, collapsing any output that is still mapped while its requirement is replicated.
-            let batched = <Policy<V::Type> as RecursiveBatchingPolicy<TracingContext<V, O>>>::batch_program_at_level(
+            let batched = <<V::Type as BatchableType>::Policy as RecursiveBatchingPolicy<TracingContext<V, O>>>::batch_program_at_level(
                 level,
                 program.entry_region_ref(),
                 input_axes,
@@ -962,23 +971,26 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 .zip(batched.output_axes())
                 .map(|(required, natural)| required.unwrap_or(*natural))
                 .collect::<Vec<_>>();
-            let adapted = <Policy<V::Type> as BatchingPolicy<TracingContext<V, O>>>::adapt_batched_program(
-                batched,
-                Some(required_output_axes.as_slice()),
-                |context, output, axis| match outputs {
-                    CustomRuleBatchedOutputs::Values => Err(BatchingError::InvalidBatchMetadata {
-                        message: format!(
-                            "a custom rule output is mapped along axis {axis} but its batched layout requires it to \
-                             be replicated",
-                        ),
-                    }),
-                    CustomRuleBatchedOutputs::Cotangents => {
-                        <Policy<V::Type> as CotangentBatchingPolicy<TracingContext<V, O>>>::sum_mapped_cotangents(
-                            context, output, axis,
-                        )
-                    }
-                },
-            )?;
+            let adapted =
+                <<V::Type as BatchableType>::Policy as BatchingPolicy<TracingContext<V, O>>>::adapt_batched_program(
+                    batched,
+                    Some(required_output_axes.as_slice()),
+                    |context, output, axis| {
+                        match outputs {
+                            CustomRuleBatchedOutputs::Values => Err(BatchingError::InvalidBatchMetadata {
+                                message: format!(
+                                    "a custom rule output is mapped along axis {axis} but its batched layout requires \
+                                     it to be replicated",
+                                ),
+                            }),
+                            CustomRuleBatchedOutputs::Cotangents => {
+                                <<V::Type as BatchableType>::Policy as CotangentBatchingPolicy<TracingContext<V, O>>>::sum_mapped_cotangents(
+                                    context, output, axis,
+                                )
+                            }
+                        }
+                    },
+                )?;
             Ok(adapted.into_parts())
         }));
         self
@@ -988,13 +1000,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// output. They default to mapping every output at axis 0, which is always valid but may broadcast outputs that are
     /// replicated across the batch. Declared axes apply at every batching level: the primal is aligned to them when a
     /// call is batched, and each derivative rule is validated against them when it is first traced at that level.
+    #[inline]
     pub fn with_batched_output_axes(mut self, output_axes: Vec<BatchAxis>) -> Self {
         self.batched_output_axes = Some(output_axes);
         self
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which batches its calls instead of
-    /// structurally batching their primal regions (i.e., the analogue of JAX's `custom_vmap`). The rule receives the
+    /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which batches its calls instead
+    /// of structurally batching their primal regions (i.e., the analogue of JAX's `custom_vmap`). The rule receives the
     /// call's batched inputs, their batch axes, the batching level, and the level's boundary inputs (e.g., a first-class
     /// batch extent), and it returns the batched outputs together with their batch axes. It is traced when a call is
     /// batched, once per batching level and input signature, and its program becomes the batched call's primal region,
@@ -1002,18 +1015,19 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// output, unbatched along the batch axis that the rule declares for it, must have the type of the corresponding
     /// output of the call's primal region, which is validated when the call is batched.
     ///
-    /// Batching a call with this rule preserves the call and its derivative rules: derivative requests of a batched
-    /// call still trace the derivative rules at the unbatched types and batch them structurally (refer to
+    /// Batching a call with this rule preserves the call and its derivative rules: derivative requests of a
+    /// batched call still trace the derivative rules at the unbatched types and batch them structurally (refer to
     /// [`Self::with_batching_support`]), aligning their outputs to the batch axes that the rule declared, while a
-    /// forward mode rule derived from the primal differentiates the rule's batched program. The rule is responsible for
-    /// computing the batched primal consistently with those derivative rules.
+    /// forward mode rule derived from the primal differentiates the rule's batched program. The rule is responsible
+    /// for computing the batched primal consistently with those derivative rules.
     ///
     /// When the forward mode rule is derived from the primal, differentiating an unbatched call stages a derived call
     /// whose batching applies the derivative of this rule, which may apply the rule with every input replicated. This
     /// function therefore also captures the family's differentiation of traced programs, which is why it requires the
     /// family's differentiation bounds. Batching those derivatives also requires [`Self::with_batching_support`],
-    /// which this function cannot configure without the family's batching bounds. Without it, the first request that
-    /// batches such a derivative is rejected with a diagnostic that names it.
+    /// which this function cannot configure without the family's batching bounds. Without it, the first request
+    /// that batches such a derivative is rejected with a diagnostic that names it.
+    #[inline]
     pub fn with_batching_rule<R>(mut self, rule: R) -> Self
     where
         V: Value<Type: DifferentiableType>,
@@ -1044,14 +1058,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which is used as the rule of
     /// [`Self::with_batching_rule`] except that its per-item numerical behavior may change when a replicated input is
     /// broadcast (e.g., a rule that applies a different approximation when an input is replicated). A batching rule
-    /// that only computes the batched primal gives the same values whether a replicated input is broadcast or not, so
-    /// the derived batching rules of a call whose forward mode rule is derived from its primal apply it with a
+    /// that only computes the batched primal gives the same values whether a replicated input is broadcast or not,
+    /// so the derived batching rules of a call whose forward mode rule is derived from its primal apply it with a
     /// replicated primal broadcast when that primal's tangent is mapped. For a broadcast sensitive rule, they instead
     /// apply it once, at the primal inputs' own batch axes, and recover the per-item tangents of such inputs from the
     /// outer product of their mapped tangents with the rule's batch (i.e., by batching the rule's derivative with
     /// respect to them over a second level of the same extent and taking the diagonal of the two batch axes; refer to
     /// [`DiagonalBatchingPolicy`]). This costs as many applications of that derivative as the batch has items, which
     /// is why it is not the default (refer to [`Self::with_batching_rule`]).
+    #[inline]
     pub fn with_broadcast_sensitive_batching_rule<R>(self, rule: R) -> Self
     where
         V: 'static
@@ -1083,18 +1098,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
     /// Returns this [`CustomRuleDefinition`] with sequential batching, which batches each call by looping over its
     /// batch items with a [`ScanOperation`] whose body applies the unbatched call to one item, instead of structurally
-    /// batching its primal region (i.e., the analogue of JAX's [`sequential_vmap`][sequential_vmap]). The mapped inputs
-    /// are moved to axis 0 and become the scan's stacked inputs, the replicated inputs become invariant carries, and
-    /// every output is mapped at axis 0. Batching therefore replaces the call with the scan, rather than preserving the
-    /// call around a batched primal region, and the derivatives of the batched call are those of the scan: its body
-    /// differentiates the unbatched call with its own rules, one batch item at a time. A forward mode rule derived from
-    /// the primal stays sequential when its derivative is batched after it is taken, because differentiating an
-    /// unbatched call stages a derived call that is itself batched sequentially. A custom batching rule (refer to
-    /// [`Self::with_batching_rule`]) takes precedence over sequential batching. The batch extent must be statically
-    /// known, including for a first-class dimension, and the batch axis must be unnamed because the scan does not bind
-    /// named collectives across its items for the primal or derivative rules.
-    ///
-    /// [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
+    /// batching its primal region (i.e., the Ryft analogue of JAX's
+    /// [`sequential_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html)).
+    /// The mapped inputs are moved to axis `0` and become the scan's stacked inputs, the replicated inputs become
+    /// invariant carries, and every output is mapped at axis `0`. Batching therefore replaces the call with the scan,
+    /// rather than preserving the call around a batched primal region, and the derivatives of the batched call are
+    /// those of the scan: its body differentiates the unbatched call with its own rules, one batch item at a time.
+    /// A forward mode rule derived from the primal stays sequential when its derivative is batched after it is taken,
+    /// because differentiating an unbatched call stages a derived call that is itself batched sequentially. A custom
+    /// batching rule (refer to [`Self::with_batching_rule`]) takes precedence over sequential batching. The batch
+    /// extent must be statically known, including for a first-class dimension, and the batch axis must be unnamed
+    /// because the scan does not bind named collectives across its items for the primal or derivative rules.
+    #[inline]
     pub fn with_sequential_batching(mut self) -> Self
     where
         V: Value<Type: ScanType>,
@@ -1113,13 +1128,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// of its primal region immediately, and each rule program traced for that call later is discharged before it is
     /// cached or replayed, so that the call's derivatives contain no reference state either. Without this support, a
     /// discharged call whose traced rule programs contain reference state rejects differentiation.
+    #[inline]
     pub fn with_reference_discharge<P>(mut self) -> Self
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: ReferenceDischargeableType<Policy = P> + From<P::Referent>>,
         V::Type: From<ReferenceType<P::Referent>>,
         O: Operation<Type = V::Type> + ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         self.discharger = Some(Arc::new(|program: Program<V, O, Vec<V>, Vec<V>>| {
@@ -1143,22 +1159,22 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
     /// Returns `true` if this [`CustomRuleDefinition`] has a forward mode rule or reverse mode rules.
     #[inline]
-    pub(in crate::operations::composites) fn has_derivative_rules(&self) -> bool {
+    pub fn has_derivative_rules(&self) -> bool {
         self.jvp.is_some() || self.vjp.is_some()
     }
 
-    /// Returns `program` discharged when `discharged` is set (refer to [`Self::with_reference_discharge`]). A program
-    /// without reference state needs no discharge, which also makes definitions without discharge support usable for
-    /// discharged calls whose rules keep no reference state.
+    /// Returns `program` discharged when `discharged` is set. A program without reference state needs no discharge,
+    /// which also makes definitions without discharge support usable for discharged calls whose rules keep no reference
+    /// state.
     pub(super) fn discharge_if(
         &self,
         discharged: bool,
         program: Program<V, O, Vec<V>, Vec<V>>,
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         let has_reference_state =
             program.regions().iter().flat_map(|region| region.atoms()).any(|atom| atom.r#type().is_reference());
@@ -1168,9 +1184,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         let Some(discharger) = &self.discharger else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{} cannot differentiate a call whose reference state was \
-                     discharged, because its rule programs contain reference state and its definition has no \
-                     reference discharge support",
+                    "{} cannot differentiate a call whose reference state was discharged, because its rule programs \
+                     contain reference state and its definition has no reference discharge support",
                     {
                         let name = self.name.as_ref();
                         if name == COMPOSITE_OPERATION_NAME {
