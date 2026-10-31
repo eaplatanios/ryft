@@ -18,7 +18,9 @@ use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::describe_composite;
-use crate::operations::composites::operations::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
+use crate::operations::composites::operations::composite_transpose::{
+    CompositeTransposeOperation, CompositeTransposeRules,
+};
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
@@ -181,7 +183,7 @@ pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
     CompositeOperation<V, O, S>
 {
-    /// Creates a new call of the retained rules of `rules`, whose inputs are all differentiated.
+    /// Creates a new [`CompositeOperation`] of the retained rules of `rules`, whose inputs are all differentiated.
     #[inline]
     pub fn new(rules: S) -> Self {
         Self {

@@ -24,7 +24,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::describe_composite;
-use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::composite::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::definitions::CustomRuleVjpBackward;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
@@ -43,7 +43,7 @@ use crate::programs::{
 use crate::tracing::TracingContext;
 
 #[cfg(doc)]
-use crate::operations::composites::operations::call::CompositeOperation;
+use crate::operations::composites::operations::composite::CompositeOperation;
 
 /// Canonical operation name for [`CompositeTransposeOperation`].
 pub const COMPOSITE_TRANSPOSE_OPERATION_NAME: &str = "composite_transpose";
@@ -1229,7 +1229,7 @@ mod tests {
         TranspositionDriver,
     };
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::composites::operations::call::{CompositeJvpRule, CompositeOperation};
+    use crate::operations::composites::operations::composite::{CompositeJvpRule, CompositeOperation};
     use crate::operations::composites::operations::tests::{
         ArrayContext, ConvertedProgram, IrDefinition, IrTracer, ir_custom_rule_program,
     };

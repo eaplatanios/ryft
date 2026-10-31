@@ -10,11 +10,11 @@ use crate::operations::composites::rules::{
 use crate::programs::{Operation, Value};
 use crate::tracing::TracingContext;
 
-pub mod call;
-pub mod transpose;
+pub mod composite;
+pub mod composite_transpose;
 
-pub use call::{COMPOSITE_OPERATION_NAME, CompositeJvpRule, CompositeOperation};
-pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
+pub use composite::{COMPOSITE_OPERATION_NAME, CompositeJvpRule, CompositeOperation};
+pub use composite_transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 
 /// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode differentiation stages for
 /// a batched call with retained rules whose forward rule specialization key is `key` (whose levels are those of the
