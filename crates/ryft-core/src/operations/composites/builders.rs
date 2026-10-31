@@ -1282,14 +1282,12 @@ pub type VjpComposite<V, O, Input, Output, Residual> =
 pub type BatchedComposite<V, O, Input, Output> =
     Composite<V, O, Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<V, O, Input, Output>>;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any custom
-/// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them, where
-/// each configuration is the analogue of one JAX entry point: [`Composite::with_jvp`] of
-/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`] of
-/// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html), and
-/// [`Composite::with_batching`] of
+/// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them,
+/// where each configuration is the Ryft analogue of one JAX entry point: [`Composite::with_jvp`] of
+/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`]
+/// of [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html),
+/// and [`Composite::with_batching`] of
 /// [`jax.custom_batching.custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html),
 /// and they combine in one registration:
 ///
@@ -1304,20 +1302,20 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///     their primal, and [`Composite::with_sequential_batching`] batches calls by looping over their batch items.
 ///
 /// [`Composite::from_custom_call`] creates a function whose primal calls a foreign kernel. Every transform without a
-/// configured rule treats the primal as it treats any other function, so a function without derivative rules (e.g., one
-/// with only a batching rule, which is JAX's bare `custom_vmap`) differentiates its primal. The one exception is a
+/// configured rule treats the primal as it treats any other function, so a function without derivative rules (e.g.,
+/// one with only a batching rule, which is JAX's bare `custom_vmap`) differentiates its primal. The one exception is a
 /// function with only reverse mode rules, which rejects forward mode (as JAX's `custom_vjp` does), because a derived
 /// pushforward would contradict its custom pullback. Each derivative mode selects exactly one rule:
 ///
-/// | Configuration                          | Forward mode   | Reverse mode                          | Batching      |
-/// |----------------------------------------|----------------|---------------------------------------|---------------|
-/// | primal only                            | derived JVP    | transposed derived linearization      | structural    |
-/// | `with_batching`                        | derived JVP    | transposed derived linearization      | batching rule |
-/// | `with_jvp_from_primal`                 | derived JVP    | transposed derived linearization      | structural    |
-/// | `with_jvp`                             | JVP rule       | transposed JVP rule linearization     | structural    |
-/// | `with_vjp`                             | rejected       | forward and backward rules            | structural    |
-/// | `with_jvp` and `with_vjp`              | JVP rule       | forward and backward rules            | structural    |
-/// | `with_jvp_from_primal` and `with_vjp`  | derived JVP    | forward and backward rules            | structural    |
+/// | Configuration                          | Forward Mode   | Reverse Mode                      | Batching      |
+/// |----------------------------------------|----------------|-----------------------------------|---------------|
+/// | Primal Only                            | Derived JVP    | Transposed Derived Linearization  | Structural    |
+/// | `with_batching`                        | Derived JVP    | Transposed Derived Linearization  | Batching Rule |
+/// | `with_jvp_from_primal`                 | Derived JVP    | Transposed Derived Linearization  | Structural    |
+/// | `with_jvp`                             | JVP Rule       | Transposed JVP Rule Linearization | Structural    |
+/// | `with_vjp`                             | Rejected       | Forward and Backward Rules        | Structural    |
+/// | `with_jvp` and `with_vjp`              | JVP Rule       | Forward and Backward Rules        | Structural    |
+/// | `with_jvp_from_primal` and `with_vjp`  | Derived JVP    | Forward and Backward Rules        | Structural    |
 ///
 /// Any of the forms of a forward mode or reverse mode rule listed above takes the place of `with_jvp` or `with_vjp` in
 /// this table, respectively, and `with_batching` combines with every configuration, replacing structural batching. The
@@ -1374,8 +1372,8 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///
 /// # Non-Differentiated Inputs
 ///
-/// [`Composite::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
-/// parameterizes the call without being differentiated. These leaves remain dynamic inputs. Unlike JAX's
+/// [`Composite::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_
+/// that parameterizes the call without being differentiated. These leaves remain dynamic inputs. Unlike JAX's
 /// `nondiff_argnums`, this is a prefix of flattened leaves, not a set of static argument positions. Plumbing leaves
 /// reach every closure at their usual positions, and the rules keep signatures that mirror the primal signature: the
 /// tangent leaves that a JVP rule receives for them are placeholders that it must not use, and the cotangent leaves
@@ -1389,22 +1387,22 @@ pub type BatchedComposite<V, O, Input, Output> =
 /// An active reference input is rejected, because the rule interfaces define no tangent or cotangent reference for it
 /// and so user-supplied rules could not express its derivative. A live tangent reference supplied for a plumbing input
 /// by an enclosing transform is left untouched by the call, since the rules declare no derivative through the state it
-/// denotes. No output may be a reference, because the rules would then have to produce that output's tangent
-/// reference or consume its cotangent reference. The closures may also allocate and use local reference state, which
-/// executes like any other primitive operation whenever the corresponding program is replayed. When the call is
-/// differentiated, no two reference inputs may bind the same allocation.
+/// denotes. No output may be a reference, because the rules would then have to produce that output's tangent reference
+/// or consume its cotangent reference. The closures may also allocate and use local reference state, which executes
+/// like any other primitive operation whenever the corresponding program is replayed. When the call is differentiated,
+/// no two reference inputs may bind the same allocation.
 ///
 /// # Tracing Semantics
 ///
 /// Nothing is traced at construction time. Each [`Composite::call`] recovers the tracing [`Context`] from the values
-/// that it is called with, traces only the primal closure at their types, and stages one [`CompositeOperation`]
-/// that retains the rules into the context through which those values flow. The rules are traced lazily, at the types
-/// of each specialization (e.g., each distinct input signature): forward mode traces the JVP rule, reverse mode traces
+/// that it is called with, traces only the primal closure at their types, and stages one [`CompositeOperation`] that
+/// retains the rules into the context through which those values flow. The rules are traced lazily, at the types of
+/// each specialization (e.g., each distinct input signature): forward mode traces the JVP rule, reverse mode traces
 /// the forward rule when it stages its reverse mode carrier and the backward rule when that carrier is transposed, and
 /// batching traces the batching rule. Tracing a rule also validates its signature, so a malformed rule is reported by
 /// the request that first needs it rather than by the call. The traced programs are cached with the function, and a
-/// program that is never differentiated never traces its derivative rules (refer to [`Composite`] for the ownership of
-/// that cache).
+/// program that is never differentiated never traces its derivative rules (refer to [`Composite`] for the ownership
+/// of that cache).
 ///
 /// # Transform Semantics
 ///
@@ -1443,7 +1441,7 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///   - **Rematerialization:** [`Composite::with_deferred_forward`], the analogue of JAX's `optimize_remat` option,
 ///     swaps the primal into the forward pass wherever reverse mode partitions a call, rather than only where dead code
 ///     elimination finds the forward rule's residuals unused (e.g., inside a rematerialized body), and it also supports
-///     structural-zero and accumulating backward rules and higher-order differentiation, which JAX's option rejects.
+///     structural zero and accumulating backward rules and higher-order differentiation, which JAX's option rejects.
 ///   - **Non-Differentiated Inputs:** Non-differentiated inputs are a prefix of flattened leaves, which must receive
 ///     stopped gradients, rather than static argument positions whose gradients are stopped implicitly (refer to
 ///     [`Composite::with_non_differentiated_count`]).
@@ -1475,6 +1473,8 @@ where
         registrations: CompositeRegistrations::default(),
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Checks on sample values whether the batching rule behind `function` depends on its input batch axes beyond computing
 /// the batched function, which is what decides between [`Composite::with_batching`] and
