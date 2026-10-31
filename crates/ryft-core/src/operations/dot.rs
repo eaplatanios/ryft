@@ -327,7 +327,8 @@ impl DotOperation {
     /// `preferred_element_type` contract of XLA, which its low precision matrix units implement natively (e.g.,
     /// `f8 × f8 → f32` and `bf16 × bf16 → f32`). Dots with an accumulation type differentiate like ordinary dots,
     /// with tangents and cotangents carried at the accumulation type (refer to the forward mode and transposition
-    /// documentation of this operation), and cannot yet be combined with a requested output sharding.
+    /// documentation of this operation), and they can also request an output sharding (refer to
+    /// [`Self::with_output_sharding`]).
     #[inline]
     pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
         self.accumulation_type = accumulation_type.into();
@@ -364,15 +365,10 @@ impl DotOperation {
         self.output_sharding.as_ref()
     }
 
-    /// Applies this operation to `lhs` and `rhs` through the [`Dot`] capability, forwarding the accumulation type or
+    /// Applies this operation to `lhs` and `rhs` through the [`Dot`] capability, forwarding the accumulation type and
     /// the requested output sharding, so that interpretation and differentiation over staging values preserve them.
     fn apply<V: Dot>(&self, lhs: &V, rhs: &V) -> Result<V, ProgramError> {
-        validate_dot_options(self.accumulation_type, self.output_sharding.as_ref())?;
-        match (self.accumulation_type, &self.output_sharding) {
-            (Some(accumulation_type), _) => lhs.dot_with_accumulation_type(rhs, &self.dimensions, accumulation_type),
-            (None, Some(output_sharding)) => lhs.dot_with_output_sharding(rhs, &self.dimensions, output_sharding),
-            (None, None) => lhs.dot(rhs, &self.dimensions),
-        }
+        lhs.dot_with_configuration(rhs, &self.dimensions, self.accumulation_type, self.output_sharding.as_ref())
     }
 }
 
@@ -661,8 +657,6 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Value-level generalized dot product capability. [`Dot`] is the receiver-style entry point for staging or executing
 /// [`DotOperation`]s. It performs the contraction described by `dimensions`, supporting standard matrix multiplication,
 /// batched matrix multiplication, vector inner products, and arbitrary tensor contractions.
@@ -673,52 +667,77 @@ impl_differentiable_operation! {
 pub trait Dot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, and returns a [`ProgramError`] if
     /// the inputs are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
-    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError>;
-
-    // TODO(eaplatanios): Should we also introduce a `dot_with_configuration` that takes all of `dimensions`,
-    //  `output_sharding`, and `accumulation_type`. Also, should `accumulation_type` come first in both these arguments
-    //  and also the functions of this trait (i.e., `dot_with_accumulation_type` before `dot_with_output_sharding`)?
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding` for
-    /// the result. The requested sharding overrides the inferred output sharding and is validated by the operation's
-    /// type inference (this is implemented using [`DotOperation::with_output_sharding`]). Staging values attach it to
-    /// the staged operation, array IR values project it onto their array members, and concrete [`Array`]s record it on
-    /// their result.
-    fn dot_with_output_sharding(
-        &self,
-        rhs: &Self,
-        dimensions: &DotDimensionNumbers,
-        output_sharding: &Sharding,
-    ) -> Result<Self, ProgramError>;
+    #[inline]
+    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
+        self.dot_with_configuration(rhs, dimensions, None, None)
+    }
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the inputs to
     /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type.
     /// Refer to the documentation of [`DotOperation::with_accumulation_type`] for the exact contract.
+    #[inline]
     fn dot_with_accumulation_type(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
         accumulation_type: DataType,
-    ) -> Result<Self, ProgramError>;
-}
-
-impl Dot for Array {
-    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
-        let data_type = self.r#type().data_type();
-        validate_dot_data_type(DOT_OPERATION_NAME, data_type)?;
-        dispatch_on_array_element_type!(
-            @numeric data_type,
-            |Element| self.dot_elements::<Element>(rhs, dimensions, None),
-        )
+    ) -> Result<Self, ProgramError> {
+        self.dot_with_configuration(rhs, dimensions, Some(accumulation_type), None)
     }
 
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding` for
+    /// the result. The requested sharding overrides the inferred output sharding and is validated by the operation's
+    /// type inference (this is implemented using [`DotOperation::with_output_sharding`]). Staging values attach it to
+    /// the staged operation, array IR values project it onto their array members, and concrete [`Array`]s record it on
+    /// their result.
+    #[inline]
     fn dot_with_output_sharding(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Result<Self, ProgramError> {
+        self.dot_with_configuration(rhs, dimensions, None, Some(output_sharding))
+    }
+
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, accumulating the contraction at
+    /// `accumulation_type` when one is provided (refer to [`Self::dot_with_accumulation_type`]) and requesting
+    /// `output_sharding` for the result when one is provided (refer to [`Self::dot_with_output_sharding`]). The two
+    /// options are independent, because the accumulation type determines the element type of the result while the
+    /// requested sharding determines its placement. This is the most general function of this capability, and the
+    /// other functions are implemented using it.
+    fn dot_with_configuration(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: Option<DataType>,
+        output_sharding: Option<&Sharding>,
+    ) -> Result<Self, ProgramError>;
+}
+
+impl Dot for Array {
+    fn dot_with_configuration(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: Option<DataType>,
+        output_sharding: Option<&Sharding>,
+    ) -> Result<Self, ProgramError> {
+        // The kernel accumulates at the input element type, so an accumulation type upcasts the inputs first, after the
+        // `DotOperation` type inference rule validated it against the original input types, which the upcast inputs no
+        // longer carry.
+        if let Some(accumulation_type) = accumulation_type {
+            DotOperation::new(dimensions.clone())
+                .with_accumulation_type(accumulation_type)
+                .with_output_sharding(output_sharding.cloned())
+                .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
+            let lhs = self.convert_element_type(accumulation_type)?;
+            let rhs = rhs.convert_element_type(accumulation_type)?;
+            return lhs.dot_with_configuration(&rhs, dimensions, None, output_sharding);
+        }
+
         // An `Array` is a concrete value on a single device whose payload is always its logical (i.e., fully reduced)
-        // value, so the requested sharding only describes the placement of its result, exactly as for `Reshard`. That
+        // value, so a requested sharding only describes the placement of its result, exactly as for `Reshard`. That
         // holds for unreduced axes as well, which describe partial sums whose total is that payload. The `DotOperation`
         // type inference rule validates the request exactly as it does for staged programs and determines the result
         // type.
@@ -726,75 +745,38 @@ impl Dot for Array {
         validate_dot_data_type(DOT_OPERATION_NAME, data_type)?;
         dispatch_on_array_element_type!(
             @numeric data_type,
-            |Element| self.dot_elements::<Element>(rhs, dimensions, Some(output_sharding)),
+            |Element| self.dot_elements::<Element>(rhs, dimensions, output_sharding),
         )
-    }
-
-    fn dot_with_accumulation_type(
-        &self,
-        rhs: &Self,
-        dimensions: &DotDimensionNumbers,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError> {
-        DotOperation::new(dimensions.clone())
-            .with_accumulation_type(accumulation_type)
-            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
-        let lhs = self.convert_element_type(accumulation_type)?;
-        let rhs = rhs.convert_element_type(accumulation_type)?;
-        lhs.dot(&rhs, dimensions)
     }
 }
 
-// Values that carry a context stage a dot through that context. The `ValueDomainDispatch` marker keeps this
-// implementation disjoint from eager values, which implement the capability directly.
 impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Dot<ArrayType>
     for V
 where
     V::Domain: Context<Type = ArrayType>,
     <V::Domain as Domain>::Operation: From<DotOperation>,
 {
-    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
-        let inputs = [self.clone(), rhs.clone()];
-        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.domain().bind(DotOperation::new(dimensions.clone()), Vec::new(), &inputs)?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
-    fn dot_with_output_sharding(
+    fn dot_with_configuration(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
-        output_sharding: &Sharding,
+        accumulation_type: Option<DataType>,
+        output_sharding: Option<&Sharding>,
     ) -> Result<Self, ProgramError> {
+        // Values that carry a context stage a dot through that context. The `ValueDomainDispatch` marker keeps this
+        // implementation disjoint from eager values, which implement the capability directly.
         let inputs = [self.clone(), rhs.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.domain().bind(
-            DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
-            Vec::new(),
-            &inputs,
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
-    fn dot_with_accumulation_type(
-        &self,
-        rhs: &Self,
-        dimensions: &DotDimensionNumbers,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError> {
-        let inputs = [self.clone(), rhs.clone()];
-        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.domain().bind(
-            DotOperation::new(dimensions.clone()).with_accumulation_type(accumulation_type),
-            Vec::new(),
-            &inputs,
-        )?;
+        let operation = DotOperation::new(dimensions.clone())
+            .with_accumulation_type(accumulation_type)
+            .with_output_sharding(output_sharding.cloned());
+        let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Role of the single ragged left-hand side dimension in a [`RaggedDotDimensionNumbers`] specification.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1594,20 +1576,6 @@ fn validate_dot_axes(
     Ok(())
 }
 
-/// Rejects dot option combinations that have no shared interpretation and transformation contract.
-fn validate_dot_options(
-    accumulation_type: Option<DataType>,
-    output_sharding: Option<&Sharding>,
-) -> Result<(), TypeError> {
-    if accumulation_type.is_some() && output_sharding.is_some() {
-        return Err(TypeError::invalid(format!(
-            "`{DOT_OPERATION_NAME}` does not support combining an accumulation type with a requested output sharding \
-             yet",
-        )));
-    }
-    Ok(())
-}
-
 /// Rejects element types for which the dot kernels of `operation_name` have no arithmetic implementation.
 fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(), TypeError> {
     if data_type.is_numeric() {
@@ -1660,7 +1628,6 @@ pub(crate) fn infer_dot_output_type(
         return Err(TypeError::invalid(format!("`{operation_name}` input element types are incompatible")));
     }
     validate_dot_data_type(operation_name, lhs.data_type())?;
-    validate_dot_options(accumulation_type, output_sharding)?;
     if let Some(accumulation_type) = accumulation_type {
         // An identical type is valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
         // accumulate at an integer type with the same signedness that is at least as wide.
@@ -3025,8 +2992,8 @@ mod tests {
 
     #[test]
     fn test_dot_type_inference_accumulation_type() {
-        // Type inference widens the output to the accumulation type for promotable input types and rejects
-        // non-promotable ones and combining with a requested output sharding.
+        // Type inference widens the output to the accumulation type for promotable input types, rejects non-promotable
+        // ones, and places the widened output according to a requested output sharding.
         let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
         assert_eq!(operation.accumulation_type(), Some(DataType::F32));
         let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
@@ -3055,19 +3022,15 @@ mod tests {
                 error = format!("`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `f16`"),
             }],
         );
-        let mesh = test_mesh();
-        let sharded = DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(
-            Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]).unwrap(),
-        );
-
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
+        let sharded =
+            DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding.clone());
         check_operation_type_inference!(
             operation = sharded,
             cases = [{
-                input_types = [lhs.clone(), rhs.clone()],
-                error = format!(
-                    "`{DOT_OPERATION_NAME}` does not support combining an accumulation type with a \
-                    requested output sharding yet",
-                ),
+                input_types = [lhs, rhs],
+                output_types = [ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap()],
             }],
         );
     }
@@ -3203,6 +3166,44 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_interpretation_with_accumulation_type() {
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
+        // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
+        // element data type.
+        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]).unwrap();
+        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
+        let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F32).unwrap();
+        assert_eq!(product.r#type().data_type(), DataType::F32);
+        assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
+    }
+
+    #[test]
+    fn test_dot_interpretation_with_accumulation_type_low_precision() {
+        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let rhs = lhs.clone();
+        // The eager reference backend upcasts the inputs and accumulates at the accumulation type. Every value below is
+        // exactly representable in `f8e4m3fn`, so the `f32` results are exact.
+        let lhs_values = Array::from_elements::<f8e4m3fn>(
+            lhs.clone(),
+            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let rhs_values = Array::from_elements::<f8e4m3fn>(
+            rhs.clone(),
+            &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let product = lhs_values
+            .dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32)
+            .unwrap();
+        assert_eq!(
+            product.r#type().as_ref(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+        );
+        assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
+    }
+
+    #[test]
     fn test_dot_interpretation_with_output_sharding() {
         // The requested sharding is validated by the operation's type inference and recorded on the computed result.
         let mesh = test_mesh();
@@ -3246,39 +3247,47 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_interpretation_with_accumulation_type() {
-        let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
-        // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
-        // element data type.
-        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]).unwrap();
-        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
-        let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F32).unwrap();
-        assert_eq!(product.r#type().data_type(), DataType::F32);
-        assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
-    }
-
-    #[test]
-    fn test_dot_interpretation_with_accumulation_type_low_precision() {
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
-        let rhs = lhs.clone();
-        // The eager reference backend upcasts the inputs and accumulates at the accumulation type. Every value below is
-        // exactly representable in `f8e4m3fn`, so the `f32` results are exact.
-        let lhs_values = Array::from_elements::<f8e4m3fn>(
-            lhs.clone(),
+    fn test_dot_interpretation_with_configuration() {
+        // The accumulation type determines the element type of the result and the requested sharding its placement,
+        // including an unreduced placement, which a concrete array records on its fully reduced value. Every value
+        // below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
+        let mesh = test_mesh();
+        let lhs = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2, 2])
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])],
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
             &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        let rhs_values = Array::from_elements::<f8e4m3fn>(
-            rhs.clone(),
+        let rhs = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2, 2])
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
             &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        let product = lhs_values
-            .dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32)
+        let unreduced = Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["k"])
+            .unwrap();
+        let product = lhs
+            .dot_with_configuration(&rhs, &DotDimensionNumbers::matmul(), Some(DataType::F32), Some(&unreduced))
             .unwrap();
         assert_eq!(
-            product.r#type().as_ref(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+            product.r#type().into_owned(),
+            ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(unreduced).unwrap(),
         );
         assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
     }
@@ -3398,6 +3407,59 @@ mod tests {
         assert_eq!(outputs[0].r#type().data_type(), DataType::F32);
         // Both batch items repeat the unbatched case, whose exact product is [[1, 1.25], [2.5, 2.75]].
         assert_eq!(outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75, 1.0, 1.25, 2.5, 2.75]);
+    }
+
+    #[test]
+    fn test_dot_batching_accumulation_type_and_output_sharding() {
+        // Batching lifts the dimension numbers while carrying both the accumulation type and the requested output
+        // sharding, which gains the placement of the inserted batch axis.
+        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let mesh = test_mesh();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated])
+                .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(lhs.clone());
+        let rhs_input = builder.add_input(lhs);
+        let output = builder
+            .add_instruction(
+                DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding),
+                Vec::new(),
+                vec![lhs_input, rhs_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lifted_sharding = Sharding::new(
+            mesh,
+            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["m"]), ShardingDimension::Replicated],
+        )
+        .unwrap();
+        let lifted = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(
+            lifted.to_string(),
+            formatdoc! {"
+                lambda %0:f8e4m3fn[2, 2, 2], %1:f8e4m3fn[2, 2, 2] .
+                let %2:f32[2, 2, 2][sharding={lifted_sharding}] = dot [
+                    dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    accumulation_type=f32,
+                    output_sharding={lifted_sharding},
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -3882,6 +3944,53 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_differentiation_accumulation_type_and_output_sharding() {
+        // Forward mode differentiation stages tangent dots with both the accumulation type and the requested output
+        // sharding, so the output tangent has exactly the type of the primal output.
+        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(lhs.clone());
+        let rhs_input = builder.add_input(lhs);
+        let output = builder
+            .add_instruction(
+                DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding.clone()),
+                Vec::new(),
+                vec![lhs_input, rhs_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            formatdoc! {"
+                lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2], %2:f8e4m3fn[2, 2], %3:f8e4m3fn[2, 2] .
+                let %4:f32[2, 2][sharding={sharding}] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    accumulation_type=f32,
+                    output_sharding={sharding},
+                ] %0 %1
+                    %5:f32[2, 2][sharding={sharding}] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                        output_sharding={sharding},
+                    ] %2 %1
+                    %6:f32[2, 2][sharding={sharding}] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                        output_sharding={sharding},
+                    ] %0 %3
+                    %7:f32[2, 2][sharding={sharding}] = add %5 %6
+                in (%4, %7)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_dot_transposition() {
         let matmul = DotDimensionNumbers::matmul();
         let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
@@ -3936,6 +4045,45 @@ mod tests {
                 ],
                 output_cotangents = [Array::from_elements::<f32>(
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+                    &[1.0, 0.0, 0.0, 1.0],
+                ).unwrap()],
+                input_cotangents = [Array::from_elements::<f8e4m3fn>(
+                    rhs,
+                    &[0.5, 1.5, 1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                ).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_dot_transposition_accumulation_type_and_output_sharding() {
+        // The transpose rule contracts the adjoint at the accumulation type, requests the placement of the linear
+        // input's cotangent, and converts the result back to its `f8e4m3fn` element type. With an identity output
+        // cotangent, the adjoint of the linear right-hand side is exactly `lhsᵀ`.
+        let mesh = test_mesh();
+        let columns = vec![ShardingDimension::Replicated, ShardingDimension::sharded(["n"])];
+        let rhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2])
+            .with_sharding(Sharding::new(mesh.clone(), columns.clone()).unwrap())
+            .unwrap();
+        let lhs_values = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2, 2]),
+            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = DotOperation::matmul()
+                .with_accumulation_type(DataType::F32)
+                .with_output_sharding(Sharding::new(mesh.clone(), columns.clone()).unwrap()),
+            cases = [{
+                inputs = [
+                    (@known, lhs_values),
+                    (@linear(type = rhs.clone())),
+                ],
+                output_cotangents = [Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [2, 2])
+                        .with_sharding(Sharding::new(mesh, columns).unwrap())
+                        .unwrap(),
                     &[1.0, 0.0, 0.0, 1.0],
                 ).unwrap()],
                 input_cotangents = [Array::from_elements::<f8e4m3fn>(
