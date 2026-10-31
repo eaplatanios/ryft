@@ -2296,20 +2296,21 @@ mod tests {
             };
             Arc::downgrade(&definition.reference().jvp_specialization(key).unwrap())
         };
-        let baseline = Arc::strong_count(&definition.definition());
+        let retained_definition = Arc::downgrade(&definition.reference().definition);
+        let baseline = retained_definition.strong_count();
         let mut probes = Vec::new();
         for extent in 1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1 {
             jvp(extent);
             probes.push(specialization(extent));
         }
-        assert_eq!(definition.caches().jvp_specializations.len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
+        assert_eq!(definition.caches().jvp_specializations().len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
         assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1, 0, 0));
 
         // Bounded caches bound the retained memory: the evicted specialization is freed, and no cached program retains
         // the definition.
         assert!(probes[0].upgrade().is_none());
         assert!(probes[1..].iter().all(|probe| probe.upgrade().is_some()));
-        assert_eq!(Arc::strong_count(&definition.definition()), baseline);
+        assert_eq!(retained_definition.strong_count(), baseline);
 
         // The evicted oldest specialization is traced again, while a resident one is reused.
         jvp(1);
@@ -2339,11 +2340,11 @@ mod tests {
             discharged: false,
         };
         let first = definition.reference().jvp_specialization(key.clone()).unwrap();
-        assert_eq!(definition.caches().jvp_specializations.len(), 2);
-        assert_eq!(definition.caches().jvp_specializations.invalidate_entries_if(|key| key.levels.is_empty()), 1);
+        assert_eq!(definition.caches().jvp_specializations().len(), 2);
+        assert_eq!(definition.caches().jvp_specializations().invalidate_entries_if(|key| key.levels.is_empty()), 1);
         let second = definition.reference().jvp_specialization(key).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(definition.caches().jvp_specializations.len(), 1);
+        assert_eq!(definition.caches().jvp_specializations().len(), 1);
         assert_eq!(counters.counts(), (1, 0, 0));
     }
 
@@ -2368,7 +2369,7 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transient failure",
         ));
-        assert!(definition.caches().jvp_specializations.is_empty());
+        assert!(definition.caches().jvp_specializations().is_empty());
         for _ in 0..2 {
             assert_eq!(
                 call_jvp(&definition, x.clone(), one.clone()),
@@ -2410,7 +2411,7 @@ mod tests {
             }
         });
         assert_eq!(invocations.load(Ordering::SeqCst), 2);
-        assert_eq!(definition.caches().jvp_specializations.len(), 1);
+        assert_eq!(definition.caches().jvp_specializations().len(), 1);
         assert_eq!(call_jvp(&definition, x, one), Ok(expected));
         assert_eq!(invocations.load(Ordering::SeqCst), 2);
     }
@@ -2517,6 +2518,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let registration = CustomRuleRegistration::new(
             member_cube_definition(&counters)
+                .with_deferred_forward_rule()
                 .with_batched_output_axes(vec![BatchAxis::replicated()])
                 .with_sequential_batching(),
         );
@@ -2527,6 +2529,7 @@ mod tests {
         assert!(unavailable.has_jvp);
         assert!(!unavailable.derives_jvp_from_primal);
         assert!(unavailable.has_vjp);
+        assert!(unavailable.defers_forward);
         assert_eq!(unavailable.batched_output_axes, Some(vec![BatchAxis::replicated()]));
         assert!(!unavailable.has_batching_rule);
         assert!(unavailable.has_sequential_batching);
@@ -2543,6 +2546,7 @@ mod tests {
         assert!(!unavailable.has_jvp);
         assert!(unavailable.derives_jvp_from_primal);
         assert!(!unavailable.has_vjp);
+        assert!(!unavailable.defers_forward);
         assert_eq!(unavailable.batched_output_axes, None);
         assert!(unavailable.has_batching_rule);
         assert!(!unavailable.has_sequential_batching);
@@ -2614,6 +2618,19 @@ mod tests {
                 if message == "`composite` `cube` was converted from a family whose values its current family \
                                cannot represent, so its derivative rules are unavailable",
         ));
+
+        // Lifted rules report whether their definition defers its forward rule, even when they are unavailable.
+        let defers_forward = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>| {
+            <LiftedCustomRules<_, _> as CustomRuleSource<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::defers_forward(
+                rules,
+            )
+        };
+        let deferred = CustomRuleRegistration::new(member_cube_definition(&counters).with_deferred_forward_rule());
+        assert!(!defers_forward(&lifted));
+        assert!(defers_forward(&LiftedCustomRules::Member(deferred.reference())));
+        assert!(defers_forward(&LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(
+            &deferred.reference(),
+        ))));
         assert_eq!(counters.counts(), (0, 0, 0));
     }
 

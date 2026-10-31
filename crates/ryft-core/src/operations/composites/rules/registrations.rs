@@ -25,33 +25,33 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Bounded specialization caches of one registered [`CustomRuleDefinition`], keyed by static information only and
-/// owned by its [`CustomRuleRegistration`] handle (refer to the Ownership section of [`CustomRuleDefinition`]).
+/// [`SpecializationCache`]es of one registered [`CustomRuleDefinition`], keyed by static information only and
+/// owned by its [`CustomRuleRegistration`] handle.
 pub(super) struct CustomRuleCaches<V: Typed + Parameter, O> {
-    /// Specializations of the forward mode rule.
-    pub(super) jvp_specializations:
+    /// Specializations of the forward mode differentiation rule.
+    jvp_specializations:
         SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
-    /// Specializations of the reverse mode forward rule.
-    pub(super) forward_specializations:
+    /// Specializations of the reverse mode differentiation forward rule.
+    forward_specializations:
         SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
-    /// Destination-specialized transposes of the reverse mode backward rule.
-    pub(super) backward_specializations:
+    /// Destination-specialized transposes of the reverse mode differentiation backward rule.
+    backward_specializations:
         SpecializationCache<CustomRuleBackwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Batched primal programs produced by the custom batching rule.
-    pub(super) batching_rule_specializations:
+    batching_rule_specializations:
         SpecializationCache<CustomRuleBatchingSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
-    /// Registrations of the definitions derived from this definition (refer to [`CustomRuleDerivation`]), which these
-    /// caches own so that they live at most as long as the specializations of this definition. Like the
-    /// specializations, they are bounded, and an evicted registration frees the specializations of its definition.
+    /// Registrations of the definitions derived from this definition, which these caches own so that they live at most
+    /// as long as the specializations of this definition. Like the specializations, they are bounded, and an evicted
+    /// registration frees the specializations of its definition.
     pub(super) derived_registrations: Mutex<LruCache<CustomRuleDerivedDefinitionKey, CustomRuleRegistration<V, O>>>,
 
-    /// Specializations of this definition converted into the families that contain its family (refer to
-    /// [`LiftedCustomRules`]), keyed by the [`TypeId`] of the containing family and by the request of the
-    /// specialization from which each one was converted. Each is a shared [`CustomRuleSpecialization`] of that family.
+    /// Specializations of this definition converted into the families that contain its family, keyed by the [`TypeId`]
+    /// of the containing family and by the request of the specialization from which each one was converted. Each is a
+    /// shared [`CustomRuleSpecialization`] of that family.
     converted_specializations:
         SpecializationCache<(TypeId, CustomRuleSpecializationRequest<V::Type>), Arc<dyn Any + Send + Sync>>,
 }
@@ -70,6 +70,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleCaches<V, O> {
             )),
             converted_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
         }
+    }
+
+    /// Returns the JVP specialization cache for tests that observe lazy tracing, eviction, and invalidation.
+    #[cfg(test)]
+    pub(super) fn jvp_specializations(
+        &self,
+    ) -> &SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>> {
+        &self.jvp_specializations
     }
 }
 
@@ -108,12 +116,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
         Self::from_definition(Arc::new(definition))
     }
 
-    /// Registers the provided shared definition with empty specialization caches, which is how a derived definition
-    /// that outlived its previous registration is registered again without changing its identity.
-    pub(super) fn from_definition(definition: Arc<CustomRuleDefinition<V, O>>) -> Self {
-        Self { definition, caches: Arc::new(CustomRuleCaches::new()), marker: PhantomData }
-    }
-
     /// Registers the definition returned by `build_fn`, which receives a weak reference to that same definition so that
     /// its rules can call it (i.e., recursively) without keeping it alive.
     pub fn new_cyclic<F: FnOnce(&WeakCustomRuleReference<V, O>) -> CustomRuleDefinition<V, O>>(build_fn: F) -> Self {
@@ -122,6 +124,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
             build_fn(&WeakCustomRuleReference { definition: definition.clone(), caches: Arc::downgrade(&caches) })
         });
         Self { definition, caches, marker: PhantomData }
+    }
+
+    /// Registers the provided shared definition with empty specialization caches, which is how a derived definition
+    /// that outlived its previous registration is registered again without changing its identity.
+    pub(super) fn from_definition(definition: Arc<CustomRuleDefinition<V, O>>) -> Self {
+        Self { definition, caches: Arc::new(CustomRuleCaches::new()), marker: PhantomData }
+    }
+
+    /// Returns the [`CustomRuleDefinition`] owned by this registration.
+    #[inline]
+    pub fn definition(&self) -> &CustomRuleDefinition<V, O> {
+        &self.definition
     }
 
     /// Returns a [`CustomRuleReference`] to this registration, with which calls are staged and rules refer to it.
@@ -133,11 +147,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
 
 #[cfg(test)]
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
-    /// Returns the registered definition, which tests use to observe its ownership.
-    pub(super) fn definition(&self) -> &Arc<CustomRuleDefinition<V, O>> {
-        &self.definition
-    }
-
     /// Returns the specialization caches, which tests use to observe lazy tracing and cache ownership.
     pub(super) fn caches(&self) -> &Arc<CustomRuleCaches<V, O>> {
         &self.caches
@@ -382,7 +391,7 @@ mod tests {
         assert_eq!(registration.caches().derived_registrations.lock().unwrap().len(), 0);
         assert_eq!(registration.reference(), registration.reference());
         let clone = registration.clone();
-        assert!(Arc::ptr_eq(clone.definition(), registration.definition()));
+        assert!(std::ptr::eq(clone.definition(), registration.definition()));
         assert!(Arc::ptr_eq(clone.caches(), registration.caches()));
         assert_eq!(
             format!("{registration:?}"),
@@ -398,7 +407,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let inner = CustomRuleRegistration::new(cube_definition(&counters, true, true));
         let (retained_inner, retained_inner_caches) =
-            (Arc::downgrade(&inner.definition()), Arc::downgrade(&inner.caches()));
+            (Arc::downgrade(&inner.definition), Arc::downgrade(&inner.caches()));
         let inner_reference = inner.reference();
         let outer = CustomRuleRegistration::new(TestDefinition::new("outer").with_jvp(move |primals, tangents| {
             let r#type = primals[0].r#type().into_owned();
@@ -407,7 +416,7 @@ mod tests {
             Ok((outputs, vec![tangents[0].clone()]))
         }));
         let (retained_outer, retained_outer_caches) =
-            (Arc::downgrade(&outer.definition()), Arc::downgrade(&outer.caches()));
+            (Arc::downgrade(&outer.definition), Arc::downgrade(&outer.caches()));
         let program = custom_rule_program(&outer, ArrayType::scalar(DataType::F64));
         let linearization = program.linearize().unwrap();
         assert_eq!(counters.counts(), (0, 0, 0));
@@ -466,7 +475,7 @@ mod tests {
             program.jvp(),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message })) if message == reentrant,
         ));
-        let retained = Arc::downgrade(&definition.definition());
+        let retained = Arc::downgrade(&definition.definition);
         drop(definition);
         for _ in 0..2 {
             assert!(matches!(
@@ -491,7 +500,7 @@ mod tests {
         assert_eq!(reference, registration.reference());
         assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), registration.caches()));
         drop(reference);
-        let (definition, caches) = (Arc::downgrade(registration.definition()), Arc::downgrade(registration.caches()));
+        let (definition, caches) = (Arc::downgrade(&registration.definition), Arc::downgrade(registration.caches()));
         drop(registration);
         assert!(definition.upgrade().is_none());
         assert!(caches.upgrade().is_none());
@@ -515,7 +524,7 @@ mod tests {
             })
         });
         let (retained_definition, retained_caches) =
-            (Arc::downgrade(&definition.definition()), Arc::downgrade(&definition.caches()));
+            (Arc::downgrade(&definition.definition), Arc::downgrade(&definition.caches()));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let linearization = program.linearize().unwrap();
         assert_eq!(counters.counts(), (1, 0, 0));
@@ -573,8 +582,8 @@ mod tests {
         });
         let b = b.unwrap();
         let probes = [
-            (Arc::downgrade(&a.definition()), Arc::downgrade(&a.caches())),
-            (Arc::downgrade(&b.definition()), Arc::downgrade(&b.caches())),
+            (Arc::downgrade(&a.definition), Arc::downgrade(&a.caches())),
+            (Arc::downgrade(&b.definition), Arc::downgrade(&b.caches())),
         ];
         let program = custom_rule_program(&a, ArrayType::scalar(DataType::F64));
         let first = program.linearize().unwrap();
