@@ -25,17 +25,17 @@ use crate::specialization::SpecializationCache;
 
 /// Bounded specialization caches of one registered [`CustomRuleDefinition`], keyed by static information only and
 /// owned by its [`CustomRuleRegistration`] handle (refer to the Ownership section of [`CustomRuleDefinition`]).
-pub(in crate::operations::composites) struct CustomRuleCaches<V: Typed + Parameter, O> {
+pub(super) struct CustomRuleCaches<V: Typed + Parameter, O> {
     /// Specializations of the forward mode rule.
-    pub(in crate::operations::composites) jvp_specializations:
+    pub(super) jvp_specializations:
         SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Specializations of the reverse mode forward rule.
-    pub(in crate::operations::composites) forward_specializations:
+    pub(super) forward_specializations:
         SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Destination-specialized transposes of the reverse mode backward rule.
-    pub(in crate::operations::composites) backward_specializations:
+    pub(super) backward_specializations:
         SpecializationCache<CustomRuleBackwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Batched primal programs produced by the custom batching rule.
@@ -132,13 +132,37 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
 #[cfg(test)]
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
     /// Returns the registered definition, which tests use to observe its ownership.
-    pub(in crate::operations::composites) fn definition(&self) -> &Arc<CustomRuleDefinition<V, O>> {
+    pub(super) fn definition(&self) -> &Arc<CustomRuleDefinition<V, O>> {
         &self.definition
     }
 
     /// Returns the specialization caches, which tests use to observe lazy tracing and cache ownership.
-    pub(in crate::operations::composites) fn caches(&self) -> &Arc<CustomRuleCaches<V, O>> {
+    pub(super) fn caches(&self) -> &Arc<CustomRuleCaches<V, O>> {
         &self.caches
+    }
+
+    /// Returns the keys of the cached forward mode, reverse mode forward, and reverse mode backward rule
+    /// specializations, in that order, which tests of the operations use to observe lazy tracing.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::operations::composites) fn cached_specialization_keys(
+        &self,
+    ) -> (
+        Vec<CustomRuleForwardSpecializationKey<V::Type>>,
+        Vec<CustomRuleForwardSpecializationKey<V::Type>>,
+        Vec<CustomRuleBackwardSpecializationKey<V::Type>>,
+    ) {
+        (
+            self.caches.jvp_specializations.keys(),
+            self.caches.forward_specializations.keys(),
+            self.caches.backward_specializations.keys(),
+        )
+    }
+
+    /// Returns a probe that reports whether the registered definition and its specialization caches are still alive,
+    /// in that order, which tests of the operations use to observe ownership after this handle is dropped.
+    pub(in crate::operations::composites) fn ownership_probe(&self) -> impl Fn() -> (bool, bool) + use<V, O> {
+        let (definition, caches) = (Arc::downgrade(&self.definition), Arc::downgrade(&self.caches));
+        move || (definition.strong_count() > 0, caches.strong_count() > 0)
     }
 }
 

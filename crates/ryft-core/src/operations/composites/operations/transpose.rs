@@ -2083,7 +2083,7 @@ mod tests {
             )
             .trim_end(),
         );
-        let keys = definition.caches().backward_specializations.keys();
+        let (_, _, keys) = definition.cached_specialization_keys();
         let unbatched_keys = keys.iter().filter(|key| key.levels.is_empty()).collect::<Vec<_>>();
         assert_eq!(unbatched_keys.len(), 1);
         assert_eq!(unbatched_keys[0].seed_types, vec![Some(cotangent_type)]);
@@ -2576,7 +2576,7 @@ mod tests {
     fn test_composite_transpose_transposition_retained_rules() {
         let invocations = Arc::new(AtomicUsize::new(0));
         let definition = slice_at_one_definition(&invocations);
-        let retained = Arc::downgrade(&definition.definition());
+        let ownership = definition.ownership_probe();
         let program = slice_at_one_program(&definition, ArrayType::new_static(DataType::F64, [3]));
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
@@ -2678,8 +2678,9 @@ mod tests {
                 discharged: false,
             }
         };
+        let (_, _, backward_keys) = definition.cached_specialization_keys();
         assert_eq!(
-            definition.caches().backward_specializations.keys(),
+            backward_keys,
             vec![
                 key(4, Some(seed_type.clone()), CotangentDestinationKind::Return),
                 key(3, Some(seed_type.clone()), CotangentDestinationKind::Reference),
@@ -2690,7 +2691,7 @@ mod tests {
 
         // The specializations contain only ordinary operations, so dropping the programs releases the definition.
         drop((definition, program, wider, symbolic, renamed));
-        assert!(retained.upgrade().is_none());
+        assert_eq!(ownership(), (false, false));
     }
 
     #[test]
@@ -3213,7 +3214,7 @@ mod tests {
 
         let invocations = Arc::new(AtomicUsize::new(0));
         let definition = slice_at_one_definition(&invocations);
-        let retained = Arc::downgrade(&definition.definition());
+        let ownership = definition.ownership_probe();
         let input_type = ArrayType::new_static(DataType::F64, [4]);
         let mut builder = ProgramBuilder::<Array, MemberCarrier>::new();
         let input = builder.add_input(input_type.clone());
@@ -3252,6 +3253,6 @@ mod tests {
         assert_eq!(repeated.to_string(), buffered.to_string());
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         drop((definition, converted));
-        assert!(retained.upgrade().is_none());
+        assert_eq!(ownership(), (false, false));
     }
 }

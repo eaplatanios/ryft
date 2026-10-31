@@ -5400,7 +5400,8 @@ mod tests {
         // specializations share one rule invocation.
         let jvp = batched.jvp().unwrap();
         assert_eq!(counters.counts(), (1, 0, 0));
-        assert_eq!(definition.caches().jvp_specializations.len(), 2);
+        let (jvp_keys, _, _) = definition.cached_specialization_keys();
+        assert_eq!(jvp_keys.len(), 2);
         assert_eq!(
             jvp.to_string(),
             indoc! {"
@@ -5682,16 +5683,8 @@ mod tests {
             ]),
         );
         assert_eq!(counters.counts(), (1, 0, 0));
-        assert_eq!(
-            definition
-                .caches()
-                .jvp_specializations
-                .keys()
-                .iter()
-                .map(|key| key.levels.len())
-                .collect::<Vec<_>>(),
-            vec![2, 1, 0],
-        );
+        let (jvp_keys, _, _) = definition.cached_specialization_keys();
+        assert_eq!(jvp_keys.iter().map(|key| key.levels.len()).collect::<Vec<_>>(), vec![2, 1, 0],);
     }
 
     #[test]
@@ -5874,14 +5867,8 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert!(
-            definition
-                .caches()
-                .jvp_specializations
-                .keys()
-                .iter()
-                .all(|key| key.input_types == vec![relocated_type.clone()]),
-        );
+        let (jvp_keys, _, _) = definition.cached_specialization_keys();
+        assert!(jvp_keys.iter().all(|key| key.input_types == vec![relocated_type.clone()]));
     }
 
     #[test]
@@ -7795,7 +7782,8 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(definition.caches().jvp_specializations.len(), 2);
+        let (jvp_keys, _, _) = definition.cached_specialization_keys();
+        assert_eq!(jvp_keys.len(), 2);
 
         // A rule that receives structural zeros sees them as `MaybeZero::Zero` leaves and may return them as the
         // tangents of its outputs, which the specialization materializes at its boundary.
@@ -8201,8 +8189,9 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(counters.counts(), (2, 1, 1));
+        let (jvp_keys, _, backward_keys) = definition.cached_specialization_keys();
         assert_eq!(
-            definition.caches().jvp_specializations.keys(),
+            jvp_keys,
             vec![
                 CustomRuleForwardSpecializationKey {
                     input_types: vec![static_type.clone()],
@@ -8225,7 +8214,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            definition.caches().backward_specializations.keys(),
+            backward_keys,
             vec![CustomRuleBackwardSpecializationKey {
                 leading_input_types: vec![relocated_type.clone()],
                 seed_extent_count: 0,
@@ -8299,8 +8288,9 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "`composite` `forward_input` forward rule returned 1 outputs but the primal has 2",
         ));
-        assert_eq!(definition.caches().jvp_specializations.keys().len(), 1);
-        assert_eq!(definition.caches().forward_specializations.keys().len(), 1);
+        let (jvp_keys, forward_keys, _) = definition.cached_specialization_keys();
+        assert_eq!(jvp_keys.len(), 1);
+        assert_eq!(forward_keys.len(), 1);
     }
 
     #[test]
@@ -8559,12 +8549,11 @@ mod tests {
 
         // Converted calls follow the ownership of their member definition: the handle owns the caches, and the programs
         // keep the definition alive.
-        let (retained, retained_caches) =
-            (Arc::downgrade(&definition.definition()), Arc::downgrade(&definition.caches()));
+        let ownership = definition.ownership_probe();
         drop(definition);
-        assert!(retained_caches.upgrade().is_none());
+        assert_eq!(ownership(), (true, false));
         drop((member, converted, again, batched, linearization, reverse, pullback));
-        assert!(retained.upgrade().is_none());
+        assert_eq!(ownership(), (false, false));
     }
 
     #[test]
