@@ -776,8 +776,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Role of the single ragged left-hand side dimension in a [`RaggedDotDimensionNumbers`] specification.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RaggedDotMode {
@@ -792,6 +790,7 @@ pub enum RaggedDotMode {
 }
 
 impl Display for RaggedDotMode {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::NonContracting => "non-contracting",
@@ -801,11 +800,12 @@ impl Display for RaggedDotMode {
     }
 }
 
-/// Dimension number specification for a grouped generalized dot product.
-///
-/// The ordinary [`DotDimensionNumbers`] describe the contraction and batching axes. Exactly one left-hand side axis is
-/// marked ragged, and right-hand side group dimensions identify the explicit group axis used by non-contracting ragged
-/// dots. Refer to [`RaggedDotOperation`] for the semantics of each [`RaggedDotMode`].
+// TODO(eaplatanios): Review from here onwards.
+
+/// Dimension number specification for a grouped generalized dot product operation. The ordinary [`DotDimensionNumbers`]
+/// describe the contraction and batching axes. Exactly one left-hand side axis is marked ragged, and right-hand side
+/// group dimensions identify the explicit group axis used by non-contracting ragged dots. Refer to
+/// [`RaggedDotOperation`] for the semantics of each [`RaggedDotMode`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotDimensionNumbers {
     /// Underlying generalized dot dimension numbers.

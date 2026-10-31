@@ -406,7 +406,7 @@ pub enum CustomRuleJvp<V, O> {
 
     /// Jacobian-Vector Product (JVP) derived from the primal region of each call, which is an explicit registration
     /// choice (i.e., never a fallback for a missing rule).
-    Primal,
+    Derived,
 }
 
 /// Borrowed retained Jacobian-Vector Product (JVP) rule of a [`CustomRuleDefinition`],
@@ -733,7 +733,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     pub(super) fn new_derived(&self, name: String, batching_rule: Option<CustomRuleBatching<V, O>>) -> Self {
         Self {
             named_axes: self.named_axes.clone(),
-            jvp: Some(CustomRuleJvp::Primal),
+            jvp: Some(CustomRuleJvp::Derived),
             structural_batcher: self.structural_batcher.clone(),
             sequential_batching_scan: self.sequential_batching_scan.clone(),
             batching_rule,
@@ -810,7 +810,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// reverse mode transposes it unless reverse mode rules take precedence.
     #[inline]
     pub fn with_jvp_from_primal(mut self) -> Self {
-        self.jvp = Some(CustomRuleJvp::Primal);
+        self.jvp = Some(CustomRuleJvp::Derived);
         self
     }
 
@@ -1227,7 +1227,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     }
 
     /// Returns the configured forward mode rule, or [`None`] when no forward mode rule is configured. An explicit
-    /// choice to derive the rule from the primal is represented by [`CustomRuleJvp::Primal`].
+    /// choice to derive the rule from the primal is represented by [`CustomRuleJvp::Derived`].
     #[inline]
     pub fn jvp(&self) -> Option<&CustomRuleJvp<V, O>> {
         self.jvp.as_ref()
@@ -1386,7 +1386,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
             .debug_struct("CustomRuleDefinition")
             .field("name", &self.name)
             .field("has_jvp", &matches!(self.jvp, Some(CustomRuleJvp::Rule(_) | CustomRuleJvp::SymbolicZeroRule(_))))
-            .field("derives_jvp_from_primal", &matches!(self.jvp, Some(CustomRuleJvp::Primal)))
+            .field("derives_jvp_from_primal", &matches!(self.jvp, Some(CustomRuleJvp::Derived)))
             .field("has_vjp", &self.vjp.is_some())
             .finish_non_exhaustive()
     }
@@ -2165,7 +2165,7 @@ mod tests {
                 .jvp(),
             Some(CustomRuleJvp::SymbolicZeroRule(_)),
         ));
-        assert!(matches!(TestDefinition::new("cube").with_jvp_from_primal().jvp(), Some(CustomRuleJvp::Primal)));
+        assert!(matches!(TestDefinition::new("cube").with_jvp_from_primal().jvp(), Some(CustomRuleJvp::Derived)));
         assert_eq!(counters.counts(), (0, 0, 0));
     }
 

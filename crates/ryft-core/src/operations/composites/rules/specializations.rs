@@ -134,7 +134,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
 
     #[inline]
     fn derives_jvp_from_primal(&self) -> bool {
-        matches!(self.definition().jvp(), Some(CustomRuleJvp::Primal))
+        matches!(self.definition().jvp(), Some(CustomRuleJvp::Derived))
     }
 
     #[inline]

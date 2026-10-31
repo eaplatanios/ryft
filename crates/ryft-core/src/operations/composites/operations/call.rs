@@ -1,9 +1,3 @@
-//! The [`CompositeOperation`] that calls a primal program with custom derivative rules. The operation holds its rules
-//! either as attached rule regions or as retained rule sets (refer to [`CustomRuleSource`]), and reverse mode replaces
-//! a call with reverse mode rules with a [`CompositeTransposeOperation`] carrier.
-
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -44,55 +38,55 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
-/// Canonical operation name for [`CompositeOperation`].
-pub const COMPOSITE_OPERATION_NAME: &str = "composite";
-
-/// Forward mode (i.e., Jacobian-Vector Product or JVP) rule of a [`CompositeOperation`].
+/// Forward mode differentiation (i.e., Jacobian-Vector Product or JVP) rule of a [`CompositeOperation`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CompositeJvpRule {
-    /// No forward mode rule. Forward mode is rejected, and reverse mode requires a reverse mode rule.
+    /// No forward mode rule. Forward mode differentiation is rejected, and reverse mode requires a reverse mode rule.
     #[default]
     Absent,
 
-    /// Explicit forward mode rule `(p, x, ẋ) → (y, ẏ)`, which is a `"jvp"` rule region of a call with attached rules
-    /// and a retained callback of a call with retained rules.
+    /// Explicit forward mode differentiation rule `(p, x, ẋ) → (y, ẏ)`, which is a `"jvp"` rule region of a call with
+    /// attached rules and a retained callback of a call with retained rules.
     Explicit,
 
-    /// Forward mode rule derived by differentiating the primal region, which is an explicit registration choice
-    /// rather than a fallback for a missing rule.
-    Primal,
+    /// Forward mode differentiation rule derived by differentiating the primal region, which is an explicit
+    /// registration choice rather than a fallback for a missing rule.
+    Derived,
 }
 
+/// Canonical operation name for [`CompositeOperation`].
+pub const COMPOSITE_OPERATION_NAME: &str = "composite";
+
 /// Higher-order [`Operation`] that calls a primal program with custom derivative rules. It is the operation that
-/// [`Composite`](crate::Composite) functions stage, and it is the one boundary through which every transform treats a
-/// function whose derivative is not the derivative of its implementation (e.g., a fused or foreign kernel, or a
+/// [`Composite`](crate::Composite) functions stage, and it is the one boundary through which every transform treats
+/// a function whose derivative is not the derivative of its implementation (e.g., a fused or foreign kernel, or a
 /// numerically stabilized derivative). The primal program is attached as the computation region `"primal"`, and
 /// ordinary execution, lowering, and partial evaluation use it exclusively. A call has any of the following rules:
 ///
-///   - a forward mode rule (refer to [`CompositeJvpRule`]), which is either an explicit Jacobian-Vector Product (JVP)
-///     rule or the derivative of the primal region, and
-///   - reverse mode forward and backward (i.e., Vector-Jacobian Product or VJP) rules.
+///   - a forward mode differentiation rule, which is either an explicit Jacobian-Vector Product (JVP) rule or the
+///     derivative of the primal region (refer to [`CompositeJvpRule`] for more information), and
+///   - reverse mode differentiation forward and backward (i.e., Vector-Jacobian Product or VJP) rules.
 ///
 /// # Representations
 ///
 /// The rules have one of two representations, which differ only in where the rule programs come from and in how those
 /// programs follow batching and reference discharge:
 ///
-///   - **Attached rules** ([`Self::from_rule_regions`]) are programs supplied as the operation's attached rule regions
-///     (i.e., via the [`RegionDriver`](crate::RegionDriver) passed to [`Context::bind`]), in the region order
-///     `["primal", "jvp", "forward", "backward"]`, where the rule regions that a call does not have are omitted. They
-///     are used for pre-traced rule programs (e.g., by kernel staging), and they follow their call through every
-///     program transform and family conversion like any other region.
-///   - **Retained rules** ([`Self::new`]) are callbacks of a [`CustomRuleSource`] (e.g., a registered
-///     [`CustomRuleDefinition`](crate::CustomRuleDefinition)), so an ordinary call traces only its primal and never
-///     declares the effects of its rules. Each rule is traced on the first request of each static specialization and
-///     cached by the definition's [`CustomRuleRegistration`](crate::CustomRuleRegistration).
+///   - **Attached Rules:** Constructed using [`Self::from_rule_regions`], these are programs supplied as the
+///     operation's attached rule regions (i.e., via the [`RegionDriver`](crate::RegionDriver) passed to
+///     [`Context::bind`]), in the region order `["primal", "jvp", "forward", "backward"]`, where the rule regions that
+///     a call does not have are omitted. They are used for pre-traced rule programs (e.g., by kernel staging), and they
+///     follow their call through every program transform and family conversion like any other region.
+///   - **Retained Rules:** Constructed using [`Self::new`], these are callbacks of a [`CustomRuleSource`] (e.g., a
+///     registered [`CustomRuleDefinition`](crate::CustomRuleDefinition)), so an ordinary call traces only its primal
+///     and never declares the effects of its rules. Each rule is traced on the first request of each static
+///     specialization and cached by the definition's [`CustomRuleRegistration`](crate::CustomRuleRegistration).
 ///
 /// # Interfaces
 ///
 /// Writing the leading [`non_differentiated_count`](Self::non_differentiated_count) inputs as `p`, the remaining
-/// _differentiated_ inputs as `x`, the primal outputs as `y`, the forward residuals as `r`, and tangents and cotangents
-/// using a dot and an overbar, respectively, the rule interfaces are:
+/// _differentiated_ inputs as `x`, the primal outputs as `y`, the forward residuals as `r`, and tangents and
+/// cotangents using a dot and an overbar, respectively, the rule interfaces are:
 ///
 ///   - **Primal:**   `(p, x) → y`,
 ///   - **JVP:**      `(p, x, ẋ) → (y, ẏ)`, with one tangent per differentiated input and one tangent per primal output,
@@ -115,7 +109,7 @@ pub enum CompositeJvpRule {
 ///
 /// The rules that a call has determine how each transform differentiates it:
 ///
-/// | Rules                           | Forward mode (`jvp`)           | Reverse mode (`jvp_for_transpose`)   |
+/// | Rules                           | Forward Mode (`jvp`)           | Reverse Mode (`jvp_for_transpose`)   |
 /// | ------------------------------- | ------------------------------ | ------------------------------------ |
 /// | None                            | Rejected                       | Rejected                             |
 /// | JVP rule (explicit or primal)   | Replays or derives the JVP     | Transposes the linearized JVP        |
@@ -124,34 +118,27 @@ pub enum CompositeJvpRule {
 ///
 /// A missing rule never silently falls back to differentiating the primal region, because that would replace a
 /// deliberately custom derivative with the derivative of the primal implementation. Differentiating the primal region
-/// is instead an explicit registration choice (i.e., [`CompositeJvpRule::Primal`]). Reverse mode replays the forward
+/// is instead an explicit registration choice (i.e., [`CompositeJvpRule::Derived`]). Reverse mode replays the forward
 /// rule and stages a [`CompositeTransposeOperation`] carrier for the backward rule, in the same representation as the
-/// call. Retained rules may instead defer their forward rule to the backward pass (refer to
-/// [`CustomRuleSource::defers_forward`], rendered as `deferred_forward=true`), in which case reverse mode replays the
-/// primal region and stages a carrier over the call's inputs, whose transposition replays the forward rule to recover
-/// the residuals before it applies the backward rule.
+/// call. Retained rules may instead defer their forward rule to the backward pass, in which case reverse mode replays
+/// the primal region and stages a carrier over the call's inputs, whose transposition replays the forward rule to
+/// recover the residuals before it applies the backward rule.
 ///
 /// # Batching
 ///
 /// Batching a call with attached rules batches every attached region contract while retaining the call and its rules,
 /// reconciling the batch axes of the logical outputs across the primal and rule regions. Batching a call with retained
 /// rules batches its primal region and records the batching level, but traces no derivative rule. Its batched outputs
-/// use the definition's declared layout (refer to
-/// [`CustomRuleDefinition::with_batched_output_axes`](crate::CustomRuleDefinition::with_batched_output_axes)), which
-/// maps every output at axis 0 by default. A definition's custom batching rule (refer to
-/// [`CustomRuleDefinition::with_batching_rule`](crate::CustomRuleDefinition::with_batching_rule)) takes precedence over
-/// structurally batching the primal region: its traced program becomes the batched call's primal region, and it
-/// declares the batch axes of the outputs. Differentiating a batched call with retained rules traces the rule at the
-/// unbatched types, sharing that specialization with unbatched calls, and batches the traced program once per recorded
-/// level (refer to
-/// [`CustomRuleDefinition::with_batching_support`](crate::CustomRuleDefinition::with_batching_support)). A
-/// derivative whose natural layout is incompatible with the declared layout is therefore rejected when it is first
-/// requested, not when the call is batched. In both representations, any boundary inputs of the batching policy (e.g.,
-/// a first-class batch extent) become leading non-differentiated inputs. A definition that batches its calls
-/// sequentially (refer to
-/// [`CustomRuleDefinition::with_sequential_batching`](crate::CustomRuleDefinition::with_sequential_batching)) without a
-/// custom batching rule is the exception: batching replaces the call with a scan over the batch items whose body
-/// applies the unbatched call, so the batched call's derivatives are those of the scan.
+/// use the definition's declared layout, which maps every output at axis `0` by default. A definition's custom batching
+/// rule takes precedence over structurally batching the primal region: its traced program becomes the batched call's
+/// primal region, and it declares the batch axes of the outputs. Differentiating a batched call with retained rules
+/// traces the rule at the unbatched types, sharing that specialization with unbatched calls, and batches the traced
+/// program once per recorded level. A derivative whose natural layout is incompatible with the declared layout is
+/// therefore rejected when it is first requested, not when the call is batched. In both representations, any boundary
+/// inputs of the batching policy (e.g., a first-class batch extent) become leading non-differentiated inputs. A
+/// definition that batches its calls sequentially without a custom batching rule is the exception: batching replaces
+/// the call with a scan over the batch items whose body applies the unbatched call, so the batched call's derivatives
+/// are those of the scan.
 ///
 /// A custom batching rule also stays on the path of forward mode derivatives that are batched after they are taken.
 /// Forward mode differentiation of an unbatched call with retained rules whose forward mode rule is derived from its
@@ -166,15 +153,14 @@ pub enum CompositeJvpRule {
 ///
 /// # Dead Code Elimination
 ///
-/// Pruning the unused outputs of a call (refer to [`Program::into_pruned`](crate::Program::into_pruned)) removes them
-/// from its primal region while keeping every input, because the rules may use inputs that the pruned primal does not,
-/// which is how JAX's dead code elimination treats its custom derivative calls. A call with retained rules records
-/// which outputs of its rules it keeps (rendered as `kept_outputs`), because its rules are traced for the complete
-/// output structure: its forward mode and batching rules are projected onto the kept outputs, and its reverse mode
-/// carrier keeps every output of the forward rule, whose pruned outputs receive structural zero seeds. A call with
-/// attached rule regions, whose boundaries mirror the complete primal boundary, stays whole, and so does a call whose
-/// forward mode rule is derived from its primal while its rules have a custom batching rule, because the derived calls
-/// that its derivatives stage apply that rule to every output.
+/// Pruning the unused outputs of a call removes them from its primal region while keeping every input, because the
+/// rules may use inputs that the pruned primal does not, which is how JAX's dead code elimination treats its custom
+/// derivative calls. A call with retained rules records which outputs of its rules it keeps, because its rules are
+/// traced for the complete output structure: its forward mode differentiation and batching rules are projected onto
+/// the kept outputs, and its reverse mode differentiation carrier keeps every output of the forward rule, whose pruned
+/// outputs receive structural zero seeds. A call with attached rule regions, whose boundaries mirror the complete
+/// primal boundary, stays whole, and so does a call whose forward mode rule is derived from its primal while its rules
+/// have a custom batching rule, because the derived calls that its derivatives stage apply that rule to every output.
 ///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
 /// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
@@ -183,12 +169,14 @@ pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V
     /// that the batching levels of a call with retained rules prepended to its inputs.
     non_differentiated_count: usize,
 
-    /// Derivative rules of the call.
+    /// [`CompositeRules`]s attached to this [`CompositeOperation`].
     rules: CompositeRules<V::Type, S>,
 
-    /// Marker for the operation family, which only the rule source and the rule regions name.
+    /// [`PhantomData`] marker tying this [`Operation`] to the operation family `O` in which it is valid.
     marker: PhantomData<fn() -> O>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
     CompositeOperation<V, O, S>
@@ -260,7 +248,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         match &self.rules {
             CompositeRules::Attached { jvp_rule, .. } => *jvp_rule,
             CompositeRules::Retained { rules, .. } if rules.has_jvp() => CompositeJvpRule::Explicit,
-            CompositeRules::Retained { rules, .. } if rules.derives_jvp_from_primal() => CompositeJvpRule::Primal,
+            CompositeRules::Retained { rules, .. } if rules.derives_jvp_from_primal() => CompositeJvpRule::Derived,
             CompositeRules::Retained { .. } => CompositeJvpRule::Absent,
         }
     }
@@ -868,14 +856,14 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         let operation = OperationFormatter::new(formatter, indentation, COMPOSITE_OPERATION_NAME)?;
         match &self.rules {
             CompositeRules::Attached { jvp_rule, .. } => {
-                if self.non_differentiated_count == 0 && *jvp_rule != CompositeJvpRule::Primal {
+                if self.non_differentiated_count == 0 && *jvp_rule != CompositeJvpRule::Derived {
                     return Ok(());
                 }
                 operation.bracketed(|operation| {
                     if self.non_differentiated_count > 0 {
                         operation.field("non_differentiated_count", self.non_differentiated_count)?;
                     }
-                    if *jvp_rule == CompositeJvpRule::Primal {
+                    if *jvp_rule == CompositeJvpRule::Derived {
                         operation.field("jvp_from_primal", true)?;
                     }
                     Ok(())
@@ -1435,7 +1423,7 @@ where
             // which keeps that rule, or the sequential batching, on the path of derivatives that are batched after they
             // are taken (refer to `CustomRuleSpecializer::derived`). A batched call already computes its primal with
             // its batching rule, whose derivative is inlined.
-            (CompositeJvpRule::Primal, CompositeRules::Retained { rules, batching: None, .. })
+            (CompositeJvpRule::Derived, CompositeRules::Retained { rules, batching: None, .. })
                 if rules.has_batching_rule() || rules.has_sequential_batching() =>
             {
                 differentiate_primal_region(
@@ -1447,7 +1435,7 @@ where
                     Some(self),
                 )
             }
-            (CompositeJvpRule::Primal, _) => differentiate_primal_region(
+            (CompositeJvpRule::Derived, _) => differentiate_primal_region(
                 COMPOSITE_OPERATION_NAME,
                 self.non_differentiated_count,
                 context,
@@ -1483,7 +1471,7 @@ where
         // derived from the primal is inlined, because transposing the derived calls that forward mode stages transposes
         // their primal regions inline, which would drop the batching rule that they exist to keep.
         if !self.has_vjp_rule() {
-            if self.jvp_rule() == CompositeJvpRule::Primal {
+            if self.jvp_rule() == CompositeJvpRule::Derived {
                 return differentiate_primal_region(
                     COMPOSITE_OPERATION_NAME,
                     self.non_differentiated_count,
@@ -2090,9 +2078,9 @@ where
 }
 
 /// Differentiates the primal region at slot 0 of a composite call in forward mode, which is the forward mode rule of a
-/// call whose JVP is derived from its primal (i.e., [`CompositeJvpRule::Primal`]). The derivative is taken with respect
-/// to the differentiated inputs with active tangents, while the leading `non_differentiated_count` inputs, which must
-/// have zero tangents, parameterize the derivative.
+/// call whose JVP is derived from its primal (i.e., [`CompositeJvpRule::Derived`]). The derivative is taken with
+/// respect to the differentiated inputs with active tangents, while the leading `non_differentiated_count` inputs,
+/// which must have zero tangents, parameterize the derivative.
 ///
 /// The derivative is inlined unless `call` is provided, in which case it is staged as a derived call of the rules
 /// that [`CustomRuleSpecializer::derived`] derives from the call's rules (refer to the documentation of the derivation
@@ -3034,10 +3022,10 @@ mod tests {
         assert_eq!(format!("{combined}"), "composite");
 
         // A forward mode rule derived from the primal region adds no region, so its rendering records it.
-        let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, false);
+        let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Derived, false);
         assert_eq!(derived.region_slots(), &[RegionSlot::computation("primal")]);
         assert_eq!(format!("{derived}"), "composite [jvp_from_primal=true]");
-        let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, true);
+        let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Derived, true);
         assert_eq!(
             format!("{}", derived.clone().with_non_differentiated_count(1).unwrap()),
             "composite [non_differentiated_count=1, jvp_from_primal=true]",
@@ -3244,14 +3232,14 @@ mod tests {
     fn test_composite_into_attached_family() {
         // A call with attached rules converts into any family with any source type, while a call with retained rules is
         // returned unchanged.
-        let attached = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, true);
+        let attached = ArrayComposite::from_rule_regions(CompositeJvpRule::Derived, true);
         assert_eq!(
             attached.with_non_differentiated_count(1).unwrap().into_attached_family::<
                 ArrayIrValue<Array>,
                 ArrayIrOperation<Array>,
                 CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
             >(),
-            Ok(ArrayIrComposite::from_rule_regions(CompositeJvpRule::Primal, true)
+            Ok(ArrayIrComposite::from_rule_regions(CompositeJvpRule::Derived, true)
                 .with_non_differentiated_count(1)
                 .unwrap()),
         );
@@ -3307,7 +3295,7 @@ mod tests {
         );
 
         // A forward mode rule derived from the primal region has no region to validate.
-        let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, false);
+        let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Derived, false);
         assert_eq!(derived.infer_output_types(&[scalar_type.clone()], &[primal]), Ok(vec![scalar_type]));
     }
 
@@ -4072,7 +4060,7 @@ mod tests {
         let program = attached_program(CompositeJvpRule::Explicit);
         assert_eq!(program.clone().into_pruned().unwrap().to_string(), program.to_string());
         assert_eq!(
-            attached_program(CompositeJvpRule::Primal).into_pruned().unwrap().to_string(),
+            attached_program(CompositeJvpRule::Derived).into_pruned().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = composite [jvp_from_primal=true] %0 [
@@ -5866,7 +5854,7 @@ mod tests {
         // double (JVP rule) or triple (reverse mode rules) the true derivative `cos(x)`, which a derived JVP computes.
         let no_rule = "cannot differentiate a `composite` call that has no derivative rule";
         let (absent, explicit, primal) =
-            (CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Primal);
+            (CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Derived);
         let x = 0.5f64;
         for (jvp_rule, has_vjp_rule, tangent, gradient) in [
             (absent, false, Err(no_rule), Err(no_rule)),
@@ -5947,7 +5935,7 @@ mod tests {
                 .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false);
+        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Derived, false);
         let program = composite_call_program(
             ArrayOperation::Composite(operation),
             vec![primal],
@@ -5993,7 +5981,7 @@ mod tests {
     fn test_composite_differentiation_jvp_from_primal_linearization() {
         // Reusable linearization partitions a derived JVP like the primal region's own derivative: the primal program
         // saves `cos(x)` and the tangent program applies it.
-        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false);
+        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Derived, false);
         let program = composite_call_program(
             ArrayOperation::Composite(operation.clone()),
             sin_regions(&operation),
@@ -6045,7 +6033,7 @@ mod tests {
                 .unwrap()
         };
         let operation = ArrayOperation::Composite(
-            CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false)
+            CompositeOperation::from_rule_regions(CompositeJvpRule::Derived, false)
                 .with_non_differentiated_count(1)
                 .unwrap(),
         );
