@@ -1,9 +1,3 @@
-//! The [`CustomRuleRegistration`] handle that owns the specialization caches of a [`CustomRuleDefinition`], together
-//! with the [`CustomRuleReference`] and [`WeakCustomRuleRegistration`] handles through which calls and rules refer to a
-//! registered definition without forming reference cycles.
-
-// TODO(eaplatanios): Review from here onwards.
-
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::fmt::Debug;
@@ -26,6 +20,8 @@ use crate::operations::composites::rules::{
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Typed};
 use crate::specialization::SpecializationCache;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Bounded specialization caches of one registered [`CustomRuleDefinition`], keyed by static information only and
 /// owned by its [`CustomRuleRegistration`] handle (refer to the Ownership section of [`CustomRuleDefinition`]).
@@ -84,7 +80,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleCaches<V, O> {
 /// # Referring to Definitions from Rules
 ///
 /// A rule that calls a definition must capture a [`CustomRuleReference`] (or, for its own definition, the
-/// [`WeakCustomRuleRegistration`] passed to [`Self::new_cyclic`]), never a handle, because a rule that owned the caches
+/// [`WeakCustomRuleReference`] passed to [`Self::new_cyclic`]), never a handle, because a rule that owned the caches
 /// of a definition whose programs reach the rule would form a reference cycle. Handles are deliberately not [`Sync`],
 /// so the compiler rejects a rule, which must be [`Send`] and [`Sync`], that captures a handle directly. This guard is
 /// not complete, because a handle wrapped in a [`Mutex`] is [`Sync`] whenever the handle is [`Send`], and so a rule
@@ -116,12 +112,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
         Self { definition, caches: Arc::new(CustomRuleCaches::new()), marker: PhantomData }
     }
 
-    /// Registers the definition returned by `build_fn`, which receives a weak handle to that same registration so that
-    /// the definition's rules can call it (i.e., recursively) without keeping it alive.
-    pub fn new_cyclic<F: FnOnce(&WeakCustomRuleRegistration<V, O>) -> CustomRuleDefinition<V, O>>(build_fn: F) -> Self {
+    /// Registers the definition returned by `build_fn`, which receives a weak reference to that same definition so that
+    /// its rules can call it (i.e., recursively) without keeping it alive.
+    pub fn new_cyclic<F: FnOnce(&WeakCustomRuleReference<V, O>) -> CustomRuleDefinition<V, O>>(build_fn: F) -> Self {
         let caches = Arc::new(CustomRuleCaches::new());
         let definition = Arc::new_cyclic(|definition| {
-            build_fn(&WeakCustomRuleRegistration { definition: definition.clone(), caches: Arc::downgrade(&caches) })
+            build_fn(&WeakCustomRuleReference { definition: definition.clone(), caches: Arc::downgrade(&caches) })
         });
         Self { definition, caches, marker: PhantomData }
     }
@@ -262,9 +258,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Hash for CustomRuleReference<V, O
     }
 }
 
-/// Weak handle to a registered [`CustomRuleDefinition`], which keeps neither the definition nor its caches alive. It is
+/// Weak reference to a [`CustomRuleDefinition`], which keeps neither the definition nor its caches alive. It is
 /// how a definition's rules refer to that same definition (refer to [`CustomRuleRegistration::new_cyclic`]).
-pub struct WeakCustomRuleRegistration<V: Typed + Parameter, O> {
+pub struct WeakCustomRuleReference<V: Typed + Parameter, O> {
     /// Registered definition.
     definition: Weak<CustomRuleDefinition<V, O>>,
 
@@ -272,11 +268,14 @@ pub struct WeakCustomRuleRegistration<V: Typed + Parameter, O> {
     caches: Weak<CustomRuleCaches<V, O>>,
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O> WeakCustomRuleRegistration<V, O> {
-    /// Returns a [`CustomRuleReference`] to the registration, with which the rules of that same definition stage its
-    /// calls. A rule is only invoked while its definition is alive, so this fails only when the reference is used
-    /// outside a rule after the definition was dropped.
-    pub fn reference(&self) -> Result<CustomRuleReference<V, O>, ProgramError> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> WeakCustomRuleReference<V, O> {
+    /// Upgrades this weak reference to a [`CustomRuleReference`] with which rules stage calls of their own definition.
+    /// It succeeds while the definition is alive, even if the registration's specialization caches were dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the definition is unavailable.
+    pub fn upgrade(&self) -> Result<CustomRuleReference<V, O>, ProgramError> {
         let definition = self.definition.upgrade().ok_or_else(|| ProgramError::InvalidArgument {
             message: format!("the `{COMPOSITE_OPERATION_NAME}` definition was dropped"),
         })?;
@@ -284,15 +283,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> WeakCustomRuleRegistration<V, O> 
     }
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O> Clone for WeakCustomRuleRegistration<V, O> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> Clone for WeakCustomRuleReference<V, O> {
     fn clone(&self) -> Self {
         Self { definition: self.definition.clone(), caches: self.caches.clone() }
     }
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for WeakCustomRuleRegistration<V, O> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for WeakCustomRuleReference<V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("WeakCustomRuleRegistration").finish_non_exhaustive()
+        formatter.debug_struct("WeakCustomRuleReference").finish_non_exhaustive()
     }
 }
 
@@ -397,7 +396,7 @@ mod tests {
                     levels: Vec::new(),
                     discharged: false,
                 };
-                this.reference()?
+                this.upgrade()?
                     .jvp_specialization(key)
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 Ok((primals.to_vec(), tangents.to_vec()))
@@ -423,15 +422,15 @@ mod tests {
 
     #[test]
     fn test_custom_rule_registration_new_cyclic() {
-        // The build function receives a weak handle to the registration that it builds, which refers to that same
-        // registration and its caches once it is built, but keeps neither of them alive.
+        // The build function receives a weak reference to the definition that it builds, which refers to that same
+        // definition and its caches once it is built, but keeps neither of them alive.
         let mut weak = None;
         let registration = CustomRuleRegistration::new_cyclic(|this| {
             weak = Some(this.clone());
             TestDefinition::new("cyclic")
         });
         let weak = weak.unwrap();
-        let reference = weak.reference().unwrap();
+        let reference = weak.upgrade().unwrap();
         assert_eq!(reference, registration.reference());
         assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), registration.caches()));
         drop(reference);
@@ -452,7 +451,7 @@ mod tests {
             TestDefinition::new("recursive").with_jvp(move |primals, tangents| {
                 counters.jvp.fetch_add(1, Ordering::SeqCst);
                 let r#type = primals[0].r#type().into_owned();
-                let operation = CompositeOperation::new(this.reference()?);
+                let operation = CompositeOperation::new(this.upgrade()?);
                 let outputs =
                     primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
                 Ok((outputs, vec![primals[0].clone() * primals[0].clone() * tangents[0].clone()]))
@@ -500,7 +499,7 @@ mod tests {
             let registration =
                 CustomRuleRegistration::new(TestDefinition::new("b").with_jvp(move |primals, tangents| {
                     let r#type = primals[0].r#type().into_owned();
-                    let operation = CompositeOperation::new(a.reference()?);
+                    let operation = CompositeOperation::new(a.upgrade()?);
                     let outputs =
                         primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
                     Ok((outputs, vec![tangents[0].clone()]))
@@ -553,25 +552,25 @@ mod tests {
     }
 
     #[test]
-    fn test_weak_custom_rule_registration_reference() {
-        // A weak handle yields a reference while the definition is alive (e.g., while a reference keeps it alive after
-        // the registration is dropped), and fails once the definition was dropped.
+    fn test_weak_custom_rule_reference_upgrade() {
+        // A weak reference upgrades while the definition is alive (e.g., while a reference keeps it alive after the
+        // registration is dropped), and fails once the definition was dropped.
         let mut weak = None;
         let registration = CustomRuleRegistration::new_cyclic(|this| {
             weak = Some(this.clone());
             TestDefinition::new("cyclic")
         });
         let weak = weak.unwrap();
-        assert_eq!(format!("{weak:?}"), "WeakCustomRuleRegistration { .. }");
-        assert_eq!(weak.reference().unwrap(), registration.reference());
+        assert_eq!(format!("{weak:?}"), "WeakCustomRuleReference { .. }");
+        assert_eq!(weak.upgrade().unwrap(), registration.reference());
         let reference = registration.reference();
         drop(registration);
-        let upgraded = weak.reference().unwrap();
+        let upgraded = weak.upgrade().unwrap();
         assert_eq!(upgraded, reference);
         assert!(upgraded.caches.upgrade().is_none());
         drop((reference, upgraded));
         assert!(matches!(
-            weak.reference(),
+            weak.upgrade(),
             Err(ProgramError::InvalidArgument { message }) if message == "the `composite` definition was dropped",
         ));
     }

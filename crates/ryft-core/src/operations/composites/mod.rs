@@ -66,7 +66,7 @@ pub use operations::{
 };
 pub use rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
-    CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
+    CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleReference,
 };
 
 /// Returns the renaming of the type identities of `source` onto those of `target` when the two type signatures are

@@ -175,7 +175,7 @@ pub use operations::{
     TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan,
     TanOperation, Tanh, TanhOperation, Tolerance, TopK, TracedShardMap, TransferToMemory, TransferToMemoryOperation,
     Transpose, TransposeOperation, TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
-    UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, While,
+    UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While,
     WhileOperation, WhileOptions, WhilePredicate, WhileType, XOR_OPERATION_NAME, Xor, XorOperation,
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
     composite, scan, shard_map, shard_map_in_context, shard_map_with_options, softmax_cross_entropy_with_target_logits,

@@ -34,7 +34,7 @@ pub mod registration;
 pub mod specialization;
 
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
-pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleRegistration};
+pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleReference};
 pub use specialization::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
