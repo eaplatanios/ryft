@@ -1,6 +1,3 @@
-//! The [`CompositeOperation`] that calls a primal program with custom transform rules and the
-//! [`CompositeTransposeOperation`] carrier that applies a retained or attached backward rule during transposition.
-
 use std::hash::Hash;
 
 use crate::batching::BatchAxis;
@@ -13,22 +10,20 @@ use crate::operations::composites::rules::{
 use crate::programs::{Operation, Value};
 use crate::tracing::TracingContext;
 
-mod call;
-mod transpose;
+pub mod call;
+pub mod transpose;
 
 pub use call::{COMPOSITE_OPERATION_NAME, CompositeJvpRule, CompositeOperation};
 pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode stages for a batched call with
-/// retained rules whose forward rule specialization key is `key` (whose levels are those of the call), whose rules have
-/// `rule_output_count` outputs, whose carrier receives seed extents of types `seed_extent_types`, and whose output
-/// tangents have the unbatched types `extent_types`. At each level, the carrier's inputs have the batch axes of the
-/// corresponding call inputs, except for the residuals, which have the axes of that level's forward specialization, and
-/// for the seed extents, which are replicated, while its outputs have the call's batch axes, or those of the forward
-/// specialization for the outputs that the call does not keep. The carrier's unbatched input types are those of the
-/// unbatched forward rule.
+/// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode differentiation stages for
+/// a batched call with retained rules whose forward rule specialization key is `key` (whose levels are those of the
+/// call), whose rules have `rule_output_count` outputs, whose carrier receives seed extents of types
+/// `seed_extent_types`, and whose output tangents have the unbatched types `extent_types`. At each level, the carrier's
+/// inputs have the batch axes of the corresponding call inputs, except for the residuals, which have the axes of that
+/// level's forward specialization, and for the seed extents, which are replicated, while its outputs have the call's
+/// batch axes, or those of the forward specialization for the outputs that the call does not keep. The carrier's
+/// unbatched input types are those of the unbatched forward rule.
 fn transpose_carrier_batching<V, O, S>(
     rules: &S,
     key: &CustomRuleForwardSpecializationKey<V::Type>,
@@ -37,10 +32,10 @@ fn transpose_carrier_batching<V, O, S>(
     extent_types: Vec<V::Type>,
 ) -> Result<CustomRuleBatching<V::Type>, DifferentiationError>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType + Eq + Hash>,
     O: Operation<Type = V::Type>,
     S: CustomRuleSpecializer<V, O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     let unbatched =
         rules.forward_specialization(CustomRuleForwardSpecializationKey { levels: Vec::new(), ..key.clone() })?;
@@ -69,6 +64,8 @@ where
     }
     Ok(CustomRuleBatching { input_types, output_types: extent_types, levels })
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
