@@ -1231,7 +1231,7 @@ mod tests {
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::composites::operations::call::{CompositeJvpRule, CompositeOperation};
     use crate::operations::composites::operations::tests::{
-        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, batched_program, ir_custom_rule_program,
+        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, ir_custom_rule_program,
     };
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
@@ -1954,7 +1954,17 @@ mod tests {
             .unwrap();
         let squares = Array::vector(vec![1f64, 4f64, 9f64]).unwrap();
         let seeds = Array::vector(vec![1f64, 2f64, 3f64]).unwrap();
-        let batched = batched_program(reverse.tangent(), 3, &[BatchAxis::new(0), BatchAxis::new(0)]);
+        let batched = reverse
+            .tangent()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -1987,7 +1997,17 @@ mod tests {
         );
 
         // A replicated tangent input receives the sum of its per-item cotangents.
-        let batched = batched_program(reverse.tangent(), 3, &[BatchAxis::replicated(), BatchAxis::new(0)]);
+        let batched = reverse
+            .tangent()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -2069,7 +2089,11 @@ mod tests {
             )
             .trim_end(),
         );
-        let batched = batched_program(&program, 2, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         let packed_tangent_type = tangent_type.batched(0, Dimension::Static(2), ShardingDimension::Replicated).unwrap();
         assert_eq!(
             batched.to_string(),
@@ -2273,7 +2297,16 @@ mod tests {
             "}
             .trim_end(),
         );
-        let batched = batched_program(&pullback, 3, &[BatchAxis::new(0), BatchAxis::new(0)]);
+        let batched = pullback
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"

@@ -2322,7 +2322,7 @@ mod tests {
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::builders::composite;
     use crate::operations::composites::operations::tests::{
-        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, batched_program, ir_custom_rule_program,
+        ArrayContext, ConvertedProgram, IrDefinition, IrTracer, ir_custom_rule_program,
     };
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
@@ -5169,7 +5169,11 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5208,7 +5212,11 @@ mod tests {
             }
         }));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5228,7 +5236,11 @@ mod tests {
         );
         let x = Array::vector(vec![1f64, 2f64, 3f64]).unwrap();
         assert_eq!(batched.interpret(vec![x.clone()]), Ok(vec![Array::vector(vec![1f64, 8f64, 27f64]).unwrap()]));
-        batched_program(&program, 3, &[BatchAxis::new(0)]);
+        program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
 
         // Differentiating the batched call traces the JVP rule at the unbatched types and batches it structurally,
@@ -5347,7 +5359,11 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         let x = Array::vector(vec![1f64, 2f64, 3f64]).unwrap();
         let ones = Array::vector(vec![1f64; 3]).unwrap();
 
@@ -5417,7 +5433,11 @@ mod tests {
         let definition =
             CustomRuleRegistration::new(cube_definition(&counters, false, true).with_deferred_forward_rule());
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         let x = Array::vector(vec![1f64, 2f64, 3f64]).unwrap();
         let ones = Array::vector(vec![1f64; 3]).unwrap();
         let reverse = batched
@@ -5500,7 +5520,16 @@ mod tests {
         let parameter_tangent = Array::scalar(2f64).unwrap();
 
         // By default, the output is mapped (broadcasting the replicated primal), so the mapped derivative fits.
-        let batched = batched_program(&program(definition), 3, &[BatchAxis::new(0), BatchAxis::replicated()]);
+        let batched = program(definition)
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
         let arguments = vec![coefficient.clone(), parameter.clone(), parameter_tangent.clone()];
         assert_eq!(
             batched.entry_region_ref().jvp(&[1]).unwrap().interpret(arguments.clone()),
@@ -5515,7 +5544,16 @@ mod tests {
             })
             .with_batching_support()
             .with_batched_output_axes(vec![BatchAxis::replicated()]);
-        let batched = batched_program(&program(definition), 3, &[BatchAxis::new(0), BatchAxis::replicated()]);
+        let batched = program(definition)
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(batched.interpret(vec![coefficient.clone(), parameter.clone()]), Ok(vec![parameter.clone()]));
         assert!(matches!(
             batched.entry_region_ref().jvp(&[1]),
@@ -5560,7 +5598,16 @@ mod tests {
                 .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let batched = batched_program(&pair_program, 3, &[BatchAxis::new(0), BatchAxis::replicated()]);
+        let batched = pair_program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.entry_region_ref().jvp(&[1]).unwrap().interpret(arguments.clone()),
             Ok(vec![
@@ -5608,7 +5655,15 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let batched = batched_program(&batched_program(&program, 3, &[BatchAxis::new(0)]), 2, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5662,7 +5717,11 @@ mod tests {
         });
         let definition = CustomRuleRegistration::new(definition);
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
+        let batched = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5817,7 +5876,11 @@ mod tests {
         let original = DimensionVariable::new("original", DimensionBounds::new(2, Some(6)).unwrap());
         let relocated = DimensionVariable::new("relocated", DimensionBounds::new(2, Some(6)).unwrap());
         let original_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(original.clone())]));
-        let batched = batched_program(&custom_rule_program(&definition, original_type), 3, &[BatchAxis::new(0)]);
+        let batched = custom_rule_program(&definition, original_type)
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(original, relocated).unwrap();
         let renamed = batched.rename_type_identities(&renaming).unwrap();

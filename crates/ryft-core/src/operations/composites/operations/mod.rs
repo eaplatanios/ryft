@@ -65,15 +65,11 @@ where
     Ok(CustomRuleBatching { input_types, output_types: extent_types, levels })
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ShardingDimension};
-    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy};
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleRegistration, CustomRuleTracer};
-    use crate::operations::composites::tests::TestContext;
     use crate::parameters::Placeholder;
     use crate::programs::{FlatProgram, ProgramBuilder};
 
@@ -115,18 +111,5 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap()
-    }
-
-    /// Batches `program` over a batch axis of size `extent` with the provided input batch axes.
-    pub(super) fn batched_program(
-        program: &FlatProgram<TestContext>,
-        extent: usize,
-        input_axes: &[BatchAxis],
-    ) -> FlatProgram<TestContext> {
-        program
-            .batched(extent, ShardingDimension::Replicated, input_axes, ProgramBatchingOutputAxesPolicy::Natural)
-            .unwrap()
-            .into_parts()
-            .0
     }
 }
