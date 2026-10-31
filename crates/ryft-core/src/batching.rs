@@ -1002,6 +1002,14 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
         })
     }
 
+    /// Returns the statically known batch extent, or [`None`] when this driver cannot establish it. Recursive drivers
+    /// delegate to [`RecursiveBatchingPolicy::static_batch_axis_extent`], including for first-class extents whose
+    /// values or exact types establish a static size. This avoids requiring recursive policy bounds on operation rules.
+    #[inline]
+    fn static_batch_axis_extent(&self, _context: &BatchingContext<C, P>) -> Option<usize> {
+        None
+    }
+
     /// Batches `region` structurally at the provided input batch axes and output-axes policy, returning the rewritten
     /// standalone program and its inferred output batch axes.
     fn batch_program(
@@ -1130,6 +1138,11 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>> BatchingDriver<C, P>
     #[inline]
     fn batching_level(&self, context: &BatchingContext<C, P>) -> Result<BatchingLevel<C::Type>, BatchingError> {
         Ok(P::batching_level(context))
+    }
+
+    #[inline]
+    fn static_batch_axis_extent(&self, context: &BatchingContext<C, P>) -> Option<usize> {
+        P::static_batch_axis_extent(context)
     }
 
     #[inline]
@@ -2139,7 +2152,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-        ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+        ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, Shape, ShardingDimension,
     };
     use crate::contexts::EagerContext;
@@ -2256,6 +2269,35 @@ mod tests {
                 0,
                 collapse_fn,
             )
+        }
+    }
+
+    impl RecursiveBatchingPolicy<ProjectedProgramContext> for ProjectedProgramBatching {
+        fn batching_level(
+            context: &BatchingContext<ProjectedProgramContext, Self>,
+        ) -> BatchingLevel<ProjectedProgramType> {
+            BatchingLevel::new(BatchingLevelExtent::Static(*context.axis_extent()), None, ShardingDimension::Replicated)
+        }
+
+        fn batch_program_at_level(
+            _level: &BatchingLevel<ProjectedProgramType>,
+            _region: RegionRef<'_, ProjectedProgramValue, ProjectedProgramOperation>,
+            _input_axes: &[BatchAxis],
+            _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+        ) -> Result<Self::BatchedProgram, BatchingError> {
+            Err(BatchingError::UnsupportedOperation { message: "fixture does not batch nested programs".to_string() })
+        }
+
+        fn batch_region(
+            _context: &BatchingContext<ProjectedProgramContext, Self>,
+            _region: RegionRef<'_, ProjectedProgramValue, ProjectedProgramOperation>,
+            _inputs: Vec<Self::Batch>,
+        ) -> Result<Vec<Self::Batch>, BatchingError> {
+            Err(BatchingError::UnsupportedOperation { message: "fixture does not batch nested regions".to_string() })
+        }
+
+        fn static_batch_axis_extent(context: &BatchingContext<ProjectedProgramContext, Self>) -> Option<usize> {
+            Some(*context.axis_extent())
         }
     }
 
@@ -2600,6 +2642,42 @@ mod tests {
             Err(BatchingError::UnsupportedOperation { message })
                 if message == "member_2 values must remain replicated under batching",
         ));
+    }
+
+    #[test]
+    fn test_batching_driver_static_batch_axis_extent() -> Result<(), ProgramError> {
+        let arrays = BatchingContext::<TestArrayContext, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
+        assert_eq!(EmptyRegionDriver.static_batch_axis_extent(&arrays), None);
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        assert_eq!(driver.static_batch_axis_extent(&arrays), Some(2));
+
+        let eager = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(3)?),
+        );
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        assert_eq!(driver.static_batch_axis_extent(&eager), Some(3));
+
+        // Exact types prove the size without executing a staged extent. Wider types remain unknown.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(4, Some(5))?);
+        let staged = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.input(DimensionType::from(exact).into()),
+        );
+        assert_eq!(driver.static_batch_axis_extent(&staged), Some(4));
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::new(1, Some(5))?);
+        let staged = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.input(DimensionType::from(dynamic).into()),
+        );
+        assert_eq!(driver.static_batch_axis_extent(&staged), None);
+
+        // The driver delegates the query for an independent policy and value universe as well.
+        let custom = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        assert_eq!(driver.static_batch_axis_extent(&custom), Some(5));
+        Ok(())
     }
 
     #[test]

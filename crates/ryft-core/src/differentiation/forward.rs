@@ -4379,6 +4379,7 @@ pub(crate) mod tests {
 
     /// Composite with an explicit JVP rule and reverse mode rules that save residuals of type `Residual`.
     type CompositeWithRules<Input, Residual> = Composite<
+        CompositeTracer,
         Input,
         CompositeTracer,
         ExplicitJvp<Input, CompositeTracer>,

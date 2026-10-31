@@ -145,6 +145,7 @@ where
 {
     /// Composite that stages the attention training call.
     function: Composite<
+        DomainTracer<D>,
         AttentionInputs<DomainTracer<D>>,
         DomainTracer<D>,
         DefaultJvp,

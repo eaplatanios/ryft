@@ -706,7 +706,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.with_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
     }
 
-    /// Installs materialized-seed reverse mode rules whose backward adapter receives the trace in which it must
+    /// Installs reverse mode rules whose backward adapter receives materialized seeds and the trace in which it must
     /// replay. Structured adapters need that trace when neither leading inputs nor seeds can supply it.
     pub(in crate::operations::composites) fn with_vjp_in_context<F, B>(mut self, forward: F, backward: B) -> Self
     where
@@ -763,8 +763,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.with_symbolic_zero_vjp_in_context(forward, move |_, leading_inputs, seeds| backward(leading_inputs, seeds))
     }
 
-    /// Installs symbolic-seed reverse mode rules whose backward adapter receives the trace in which it must replay,
-    /// including when every seed is structural zero and there are no leading inputs.
+    /// Installs reverse mode rules whose backward adapter receives symbolic seeds and the trace in which it must
+    /// replay, including when every seed is structural zero and there are no leading inputs.
     pub(in crate::operations::composites) fn with_symbolic_zero_vjp_in_context<F, B>(
         mut self,
         forward: F,

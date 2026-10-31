@@ -5,7 +5,8 @@ code comments. Preserve the documented contract, technical rationale, and links 
 
 - Every struct, enum, trait, module, and function should have a documentation string. Enum variants should have
   documentation unless their name is self-explanatory. If an enum variant requires a documentation string, then you must
-  add documentation for all variants in that enum.
+  add documentation for all variants in that enum. Test functions are an exception. Give them descriptive names and use
+  ordinary code comments for non-obvious intent rather than adding documentation strings.
 - When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
   unit variants or small enums.
 - Keep an empty line between adjacent documented struct fields, including fields of private implementation structs.
