@@ -24,11 +24,11 @@ use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
-use crate::operations::composites::rules::definition::{
+use crate::operations::composites::rules::definitions::{
     CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomVjpOperation,
     missing_backward_rule_error,
 };
-use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
+use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatchingLevel,
     CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind, CustomRuleDerivedDefinitionKey,

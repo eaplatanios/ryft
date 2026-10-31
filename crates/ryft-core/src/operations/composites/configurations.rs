@@ -1468,7 +1468,7 @@ mod tests {
         DimensionType, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::differentiation::{CotangentDestinationKind, DifferentiationError, TransposedProgramCotangent};
-    use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
+    use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
     use crate::operations::composites::rules::{
         CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey, CustomRuleForwardSpecializationKey,
         CustomRuleRegistration, CustomRuleSource,

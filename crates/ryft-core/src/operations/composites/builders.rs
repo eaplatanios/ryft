@@ -1497,7 +1497,7 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
-    use crate::operations::composites::rules::specialization::CustomRuleSource;
+    use crate::operations::composites::rules::specializations::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
     use crate::operations::differentiation::stop_gradient::StopGradient;

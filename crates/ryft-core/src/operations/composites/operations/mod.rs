@@ -6,7 +6,7 @@ use std::hash::Hash;
 use crate::batching::BatchAxis;
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationError};
-use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
+use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleForwardSpecializationKey,
 };

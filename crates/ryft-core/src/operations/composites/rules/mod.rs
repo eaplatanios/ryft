@@ -29,13 +29,13 @@ use crate::tracing::{Tracer, TracingContext};
 #[cfg(doc)]
 use crate::operations::composites::operations::CompositeTransposeOperation;
 
-pub mod definition;
-pub mod registration;
-pub mod specialization;
+pub mod definitions;
+pub mod registrations;
+pub mod specializations;
 
-pub use definition::{CustomRuleDefinition, CustomVjpOperation};
-pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleReference};
-pub use specialization::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};
+pub use definitions::{CustomRuleDefinition, CustomVjpOperation};
+pub use registrations::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleReference};
+pub use specializations::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
 pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
@@ -352,7 +352,7 @@ pub(super) enum CustomRuleDerivationKind {
 }
 
 /// Key of a reusable derivative definition created from a source [`CustomRuleDefinition`] (refer to
-/// [`CustomRuleSpecializer::derived`](specialization::CustomRuleSpecializer::derived)). It records only the derivative
+/// [`CustomRuleSpecializer::derived`](specializations::CustomRuleSpecializer::derived)). It records only the derivative
 /// form, input count, and tangent activity, so calls with different types or primal regions can share one derived
 /// definition and its identity. Concrete types and batching levels belong to the keys of that definition's program
 /// specializations.

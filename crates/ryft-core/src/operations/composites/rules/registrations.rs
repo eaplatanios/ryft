@@ -10,8 +10,8 @@ use lru::LruCache;
 
 use crate::differentiation::DifferentiationError;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
-use crate::operations::composites::rules::definition::CustomRuleDefinition;
-use crate::operations::composites::rules::specialization::specialization_error;
+use crate::operations::composites::rules::definitions::CustomRuleDefinition;
+use crate::operations::composites::rules::specializations::specialization_error;
 use crate::operations::composites::rules::{
     CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey,
     CustomRuleDerivedDefinitionKey, CustomRuleForwardSpecializationKey, CustomRuleSpecialization,
@@ -329,7 +329,7 @@ mod tests {
     use crate::arrays::{ArrayType, DataType};
     use crate::contexts::Context;
     use crate::operations::composites::operations::CompositeOperation;
-    use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
+    use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
     use crate::operations::composites::tests::{
         RuleCounters, TestDefinition, cube_definition, cube_program, custom_rule_program,
     };

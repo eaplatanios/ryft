@@ -22,7 +22,7 @@ use crate::differentiation::{
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME};
-use crate::operations::composites::rules::specialization::{
+use crate::operations::composites::rules::specializations::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
 };
 use crate::operations::composites::rules::{
@@ -42,10 +42,10 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCacheErr
 use crate::tracing::TracingContext;
 
 #[cfg(doc)]
-use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
+use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
 
 #[cfg(doc)]
-use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
+use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 
 #[cfg(doc)]
 use crate::operations::composites::operations::CompositeTransposeOperation;
@@ -1342,8 +1342,8 @@ mod tests {
     };
     use crate::batching::BatchingLevelExtent;
     use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
-    use crate::operations::composites::rules::registration::CustomRuleRegistration;
-    use crate::operations::composites::rules::specialization::{
+    use crate::operations::composites::rules::registrations::CustomRuleRegistration;
+    use crate::operations::composites::rules::specializations::{
         CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules,
     };
     use crate::operations::composites::rules::{
