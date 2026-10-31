@@ -25,8 +25,8 @@ use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
 use crate::operations::composites::rules::definitions::{
-    CustomRuleBatching, CustomRuleBatchingRule, CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp,
-    CustomRuleJvpRule, CustomRuleVjp, CustomVjpOperation,
+    CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
+    CustomVjpOperation,
 };
 use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
@@ -46,7 +46,7 @@ use crate::tracing::TracingContext;
 use crate::batching::DiagonalBatchingPolicy;
 
 /// Derivation of a definition from a source definition, which is stored in the derived definition as its batching rule
-/// (refer to [`CustomRuleBatchingRule::Derived`] and [`CustomRuleSpecializer::derived`]).
+/// (refer to [`CustomRuleDefinition::batching_rule`] and [`CustomRuleSpecializer::derived`]).
 pub(super) struct CustomRuleDerivation<V: Typed + Parameter, O> {
     /// Rules of the source definition.
     source: CustomRuleReference<V, O>,
@@ -788,16 +788,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             }
             .into());
         };
-        let rule = match &batching_rule.rule {
-            CustomRuleBatchingRule::Custom(rule) => rule,
-            CustomRuleBatchingRule::Derived(derivation) => {
-                return self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
-                    let CustomRuleSpecialization { program, output_axes, .. } =
-                        derivation.batching_rule_specialization(self.name(), &key)?;
-                    let program = self.definition.discharge_if(key.discharged, program)?;
-                    Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
-                });
-            }
+        let Some(rule) = batching_rule.rule() else {
+            let derivation = batching_rule.derivation().unwrap();
+            return self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
+                let CustomRuleSpecialization { program, output_axes, .. } =
+                    derivation.batching_rule_specialization(self.name(), &key)?;
+                let program = self.definition.discharge_if(key.discharged, program)?;
+                Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
+            });
         };
         self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
             let boundary_input_count = key.boundary_input_types.len();
@@ -884,11 +882,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 CustomRuleDerivationKind::Jvp => "jvp",
                 CustomRuleDerivationKind::Pushforward => "pushforward",
             };
-            let batching_rule = self.definition.batching_rule().map(|batching_rule| CustomRuleBatching {
-                rule: CustomRuleBatchingRule::Derived(CustomRuleDerivation { source: self.clone(), key }),
-                differentiator: batching_rule.differentiator.clone(),
-                broadcast_sensitivity: batching_rule.broadcast_sensitivity.clone(),
-            });
+            let batching_rule = self
+                .definition
+                .batching_rule()
+                .map(|batching_rule| batching_rule.new_derived(CustomRuleDerivation { source: self.clone(), key }));
             self.definition.new_derived(format!("{prefix}({})", self.name()), batching_rule)
         };
         // A derived definition that is still alive is reused, so that its calls keep one identity (and with it the
@@ -2265,9 +2262,7 @@ mod tests {
         key: &CustomRuleBatchingSpecializationKey<ArrayType>,
     ) -> Result<CustomRuleSpecialization<Array, ArrayOperation<Array>>, DifferentiationError> {
         let derived = registration.reference().derived(derivation_key)?;
-        let Some(CustomRuleBatching { rule: CustomRuleBatchingRule::Derived(derivation), .. }) =
-            derived.definition.batching_rule()
-        else {
+        let Some(derivation) = derived.definition.batching_rule().and_then(|rule| rule.derivation()) else {
             panic!("the derived definition has no derivation");
         };
         derivation.batching_rule_specialization(derived.name(), key)

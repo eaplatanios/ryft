@@ -473,7 +473,7 @@ pub enum CustomRuleVjpBackward<V, O> {
 }
 
 /// Batching rule of a [`CustomRuleBatching`].
-pub(super) enum CustomRuleBatchingRule<V: Typed + Parameter, O> {
+enum CustomRuleBatchingRule<V: Typed + Parameter, O> {
     /// Retained custom batching rule.
     Custom(Arc<dyn CustomBatchingRule<V, O>>),
 
@@ -486,7 +486,7 @@ pub(super) enum CustomRuleBatchingRule<V: Typed + Parameter, O> {
 /// derived from it need.
 pub struct CustomRuleBatching<V: Typed + Parameter, O> {
     /// Rule that batches calls instead of structurally batching their primal regions.
-    pub(super) rule: CustomRuleBatchingRule<V, O>,
+    rule: CustomRuleBatchingRule<V, O>,
 
     /// Forward mode differentiation of a traced rule program with respect to the provided inputs, returning its fused
     /// Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). The batching rules of derived
@@ -513,10 +513,20 @@ pub struct CustomRuleBatching<V: Typed + Parameter, O> {
 }
 
 impl<V: Typed + Parameter, O> CustomRuleBatching<V, O> {
+    /// Creates the batching rule of a derived definition, inheriting the differentiation and broadcast sensitivity
+    /// support of this rule while applying the provided derivation.
+    pub(super) fn new_derived(&self, derivation: CustomRuleDerivation<V, O>) -> Self {
+        Self {
+            rule: CustomRuleBatchingRule::Derived(derivation),
+            differentiator: self.differentiator.clone(),
+            broadcast_sensitivity: self.broadcast_sensitivity.clone(),
+        }
+    }
+
     /// Returns the retained custom batching callback when this is a source definition's rule. A derived definition
     /// instead applies a derivative of its source's rule and returns [`None`] here (refer to [`Self::is_derived`]).
     #[inline]
-    pub fn custom_rule(&self) -> Option<&(dyn 'static + CustomBatchingRule<V, O>)> {
+    pub fn rule(&self) -> Option<&(dyn 'static + CustomBatchingRule<V, O>)> {
         match &self.rule {
             CustomRuleBatchingRule::Custom(rule) => Some(rule.as_ref()),
             CustomRuleBatchingRule::Derived(_) => None,
@@ -528,6 +538,16 @@ impl<V: Typed + Parameter, O> CustomRuleBatching<V, O> {
     #[inline]
     pub fn is_derived(&self) -> bool {
         matches!(self.rule, CustomRuleBatchingRule::Derived(_))
+    }
+
+    /// Returns the derivation that a derived definition's batching rule applies, or [`None`] for a retained custom
+    /// callback. The derivation remains internal because its specialization keys are internal.
+    #[inline]
+    pub(super) fn derivation(&self) -> Option<&CustomRuleDerivation<V, O>> {
+        match &self.rule {
+            CustomRuleBatchingRule::Custom(_) => None,
+            CustomRuleBatchingRule::Derived(derivation) => Some(derivation),
+        }
     }
 }
 
@@ -1377,8 +1397,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
             .finish_non_exhaustive()
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
