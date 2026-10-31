@@ -31,9 +31,8 @@ use crate::operations::composites::rules::definition::{
 use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatchingLevel,
-    CustomRuleBatchingSpecializationKey, CustomRuleDerivationKey, CustomRuleDerivationKind,
-    CustomRuleForwardSpecializationKey, CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationRequest,
-    CustomRuleTracer,
+    CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind, CustomRuleDerivedDefinitionKey,
+    CustomRuleForwardSpecializationKey, CustomRuleSpecialization, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -53,7 +52,7 @@ pub(super) struct CustomRuleDerivation<V: Typed + Parameter, O> {
     source: CustomRuleReference<V, O>,
 
     /// Key of this derivation.
-    key: CustomRuleDerivationKey,
+    key: CustomRuleDerivedDefinitionKey,
 }
 
 /// Seals [`CustomRuleSource`] and [`CustomRuleSpecializer`] (refer to the documentation of [`CustomRuleSource`]).
@@ -148,7 +147,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     fn jvp_specialization(
         &self,
         key: CustomRuleForwardSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -159,7 +158,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     fn forward_specialization(
         &self,
         key: CustomRuleForwardSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -171,7 +170,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     fn backward_specialization(
         &self,
         key: CustomRuleBackwardSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -183,7 +182,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     fn batching_rule_specialization(
         &self,
         key: CustomRuleBatchingSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -235,7 +234,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     /// registrations like its specializations. Every request for the same key returns the same derived definition while
     /// that definition is alive (i.e., while its registration or a call holds it), whether or not the source's
     /// registration is alive, and a fresh one otherwise.
-    fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError>
+    fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError>
     where
         Self: Sized;
 }
@@ -301,7 +300,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
     fn jvp_specialization(
         &self,
         key: CustomRuleForwardSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -503,7 +502,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
     fn forward_specialization(
         &self,
         key: CustomRuleForwardSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -651,7 +650,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
     fn backward_specialization(
         &self,
         key: CustomRuleBackwardSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -756,7 +755,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
     fn batching_rule_specialization(
         &self,
         key: CustomRuleBatchingSpecializationKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
@@ -846,7 +845,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         Ok(sequential_scan(length, carry_count, axis_sharding, stacked_output_count)?)
     }
 
-    fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError> {
+    fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
         // A derived definition copies the capabilities that its calls need from the source definition and holds no
         // program, so calls whose primal regions differ share it (refer to `CustomRuleSpecializer::derived`). A source
         // that batches its calls sequentially, without a custom batching rule, derives a definition that batches its
@@ -867,7 +866,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             }
             .into());
         }
-        let derive = |key: CustomRuleDerivationKey| {
+        let derive = |key: CustomRuleDerivedDefinitionKey| {
             let prefix = match key.kind {
                 CustomRuleDerivationKind::Jvp => "jvp",
                 CustomRuleDerivationKind::Pushforward => "pushforward",
@@ -1239,7 +1238,7 @@ where
     fn jvp_specialization(
         &self,
         key: CustomRuleForwardSpecializationKey<Vc::Type>,
-    ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type> + ResidualZeroProvider<Vc::Type, Operation = Oc>,
@@ -1267,7 +1266,7 @@ where
     fn forward_specialization(
         &self,
         key: CustomRuleForwardSpecializationKey<Vc::Type>,
-    ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type>,
@@ -1295,7 +1294,7 @@ where
     fn backward_specialization(
         &self,
         key: CustomRuleBackwardSpecializationKey<Vc::Type>,
-    ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type> + From<CompositeTransposeOperation<Vc, Oc>>,
@@ -1351,7 +1350,7 @@ where
     fn batching_rule_specialization(
         &self,
         key: CustomRuleBatchingSpecializationKey<Vc::Type>,
-    ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
     where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type>,
@@ -1416,7 +1415,7 @@ where
         Ok((Oc::from(scan), index_type.into()))
     }
 
-    fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError> {
+    fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
         // The member definition derives in its own family, and the derived rules follow the call like the member's
         // rules do. Unavailable rules stay unavailable, so the derived call reports the same error on its first
         // request.
@@ -1668,7 +1667,7 @@ where
         &self,
         name: &str,
         key: &CustomRuleBatchingSpecializationKey<V::Type>,
-        primal_rule: &CustomRuleProgram<V, O>,
+        primal_rule: &Arc<CustomRuleSpecialization<V, O>>,
         tangent_primal_indices: &[usize],
         broadcast_sensitivity: &dyn CustomRuleBroadcastSensitivity<V, O>,
         differentiator: &(
@@ -2077,7 +2076,7 @@ where
         level: &CustomRuleBatchingLevel<V::Type>,
         outputs: CustomRuleBatchedOutputs,
         cotangents: Vec<TransposedProgramCotangent>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError> {
         let Some(batcher) = &self.batcher else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -2208,7 +2207,6 @@ mod tests {
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::composites::rules::CUSTOM_RULE_SPECIALIZATION_CAPACITY;
-    use crate::operations::composites::rules::tests::{MemberTracer, batching_rule_key};
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, custom_rule_program,
         member_cube_definition,
@@ -2224,7 +2222,10 @@ mod tests {
         batching_support: bool,
         broadcast_sensitive: bool,
     ) -> CustomRuleRegistration<Array, ArrayOperation<Array>> {
-        let rule = |inputs: &[MemberTracer], axes: &[BatchAxis], _: &BatchingLevel<ArrayType>, _: &[MemberTracer]| {
+        let rule = |inputs: &[CustomRuleTracer<Array, ArrayOperation<Array>>],
+                    axes: &[BatchAxis],
+                    _: &BatchingLevel<ArrayType>,
+                    _: &[CustomRuleTracer<Array, ArrayOperation<Array>>]| {
             let axis = if axes[0].is_replicated() { axes[1] } else { axes[0] };
             Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[1].clone()], vec![axis]))
         };
@@ -2243,15 +2244,15 @@ mod tests {
     fn product_derivation_key(
         kind: CustomRuleDerivationKind,
         active_input_indices: Vec<usize>,
-    ) -> CustomRuleDerivationKey {
-        CustomRuleDerivationKey { kind, input_count: 2, active_input_indices, output_tangent_mask: vec![true] }
+    ) -> CustomRuleDerivedDefinitionKey {
+        CustomRuleDerivedDefinitionKey { kind, input_count: 2, active_input_indices, output_tangent_mask: vec![true] }
     }
 
     /// Applies the batching rule of the definition derived from `registration` for `derivation_key` directly (i.e.,
     /// without the caches and the discharge of the derived definition) to the call batched as `key` describes.
     fn derived_batching_rule_specialization(
         registration: &CustomRuleRegistration<Array, ArrayOperation<Array>>,
-        derivation_key: CustomRuleDerivationKey,
+        derivation_key: CustomRuleDerivedDefinitionKey,
         key: &CustomRuleBatchingSpecializationKey<ArrayType>,
     ) -> Result<CustomRuleSpecialization<Array, ArrayOperation<Array>>, DifferentiationError> {
         let derived = registration.reference().derived(derivation_key)?;
@@ -2429,7 +2430,7 @@ mod tests {
                 .with_batching_support()
                 .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
-        let key = |kind| CustomRuleDerivationKey {
+        let key = |kind| CustomRuleDerivedDefinitionKey {
             kind,
             input_count: 1,
             active_input_indices: vec![0],
@@ -2482,7 +2483,7 @@ mod tests {
                 .with_batching_support()
                 .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
-        let key = |input_count| CustomRuleDerivationKey {
+        let key = |input_count| CustomRuleDerivedDefinitionKey {
             kind: CustomRuleDerivationKind::Jvp,
             input_count,
             active_input_indices: vec![0],
@@ -2616,7 +2617,7 @@ mod tests {
                 .with_batching_support()
                 .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
-        let key = CustomRuleDerivationKey {
+        let key = CustomRuleDerivedDefinitionKey {
             kind: CustomRuleDerivationKind::Jvp,
             input_count: 1,
             active_input_indices: vec![0],
@@ -2682,11 +2683,14 @@ mod tests {
         let specialization = derived_batching_rule_specialization(
             &registration,
             product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0, 1]),
-            &batching_rule_key(
-                vec![scalar_type.clone(), scalar_type.clone(), vector_type.clone(), vector_type],
-                vec![scalar_type; 4],
-                vec![replicated, replicated, mapped, mapped],
-            ),
+            &CustomRuleBatchingSpecializationKey {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_types: Vec::new(),
+                input_types: vec![scalar_type.clone(), scalar_type.clone(), vector_type.clone(), vector_type],
+                unbatched_input_types: vec![scalar_type; 4],
+                input_axes: vec![replicated, replicated, mapped, mapped],
+                discharged: false,
+            },
         )
         .unwrap();
         assert_eq!(specialization.output_axes, vec![replicated, mapped]);
@@ -2726,11 +2730,14 @@ mod tests {
         let specialization = derived_batching_rule_specialization(
             &registration,
             product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0]),
-            &batching_rule_key(
-                vec![vector_type.clone(), scalar_type.clone(), vector_type],
-                vec![scalar_type; 3],
-                vec![mapped, replicated, mapped],
-            ),
+            &CustomRuleBatchingSpecializationKey {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_types: Vec::new(),
+                input_types: vec![vector_type.clone(), scalar_type.clone(), vector_type],
+                unbatched_input_types: vec![scalar_type; 3],
+                input_axes: vec![mapped, replicated, mapped],
+                discharged: false,
+            },
         )
         .unwrap();
         assert_eq!(specialization.output_axes, vec![mapped, mapped]);
@@ -2766,15 +2773,18 @@ mod tests {
         let specialization = derived_batching_rule_specialization(
             &registration,
             product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0]),
-            &batching_rule_key(
-                vec![
+            &CustomRuleBatchingSpecializationKey {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_types: Vec::new(),
+                input_types: vec![
                     ArrayType::new_static(DataType::F64, [3, 2]),
                     scalar_type.clone(),
                     ArrayType::new_static(DataType::F64, [2, 3]),
                 ],
-                vec![item_type.clone(), scalar_type, item_type],
-                vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(1)],
-            ),
+                unbatched_input_types: vec![item_type.clone(), scalar_type, item_type],
+                input_axes: vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(1)],
+                discharged: false,
+            },
         )
         .unwrap();
         assert_eq!(specialization.output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
@@ -2812,11 +2822,14 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F64, [3]);
         let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
-        let key = batching_rule_key(
-            vec![vector_type.clone(), scalar_type.clone(), vector_type],
-            vec![scalar_type; 3],
-            vec![mapped, replicated, mapped],
-        );
+        let key = CustomRuleBatchingSpecializationKey {
+            level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+            boundary_input_types: Vec::new(),
+            input_types: vec![vector_type.clone(), scalar_type.clone(), vector_type],
+            unbatched_input_types: vec![scalar_type; 3],
+            input_axes: vec![mapped, replicated, mapped],
+            discharged: false,
+        };
         let vector = |values: Vec<f64>| Array::vector(values).unwrap();
         let inputs = vec![vector(vec![1.0, 2.0, 3.0]), Array::scalar(3.0).unwrap(), vector(vec![1.0, 0.0, 2.0])];
         let jvp = derived_batching_rule_specialization(
@@ -2871,11 +2884,14 @@ mod tests {
             derived_batching_rule_specialization(
                 &registration,
                 product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0]),
-                &batching_rule_key(
-                    vec![vector_type.clone(), scalar_type.clone(), vector_type],
-                    vec![scalar_type; 3],
-                    vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
-                ),
+                &CustomRuleBatchingSpecializationKey {
+                    level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                    boundary_input_types: Vec::new(),
+                    input_types: vec![vector_type.clone(), scalar_type.clone(), vector_type],
+                    unbatched_input_types: vec![scalar_type; 3],
+                    input_axes: vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
+                    discharged: false,
+                },
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`composite` `jvp(product)` cannot batch a derivative because its source definition has \
@@ -2893,15 +2909,18 @@ mod tests {
         assert!(matches!(
             derived_batching_rule_specialization(
                 &registration,
-                CustomRuleDerivationKey {
+                CustomRuleDerivedDefinitionKey {
                     output_tangent_mask: vec![false],
                     ..product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0])
                 },
-                &batching_rule_key(
-                    vec![vector_type.clone(), scalar_type.clone(), vector_type],
-                    vec![scalar_type; 3],
-                    vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
-                ),
+                &CustomRuleBatchingSpecializationKey {
+                    level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                    boundary_input_types: Vec::new(),
+                    input_types: vec![vector_type.clone(), scalar_type.clone(), vector_type],
+                    unbatched_input_types: vec![scalar_type; 3],
+                    input_axes: vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
+                    discharged: false,
+                },
             ),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "`composite` `jvp(product)` batching rule program has live tangents for the outputs \
@@ -2922,11 +2941,14 @@ mod tests {
         let specialization = derived_batching_rule_specialization(
             &registration,
             product_derivation_key(CustomRuleDerivationKind::Jvp, vec![1]),
-            &batching_rule_key(
-                vec![vector_type.clone(), scalar_type.clone(), vector_type.clone()],
-                vec![scalar_type.clone(); 3],
-                vec![mapped, replicated, mapped],
-            ),
+            &CustomRuleBatchingSpecializationKey {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_types: Vec::new(),
+                input_types: vec![vector_type.clone(), scalar_type.clone(), vector_type.clone()],
+                unbatched_input_types: vec![scalar_type.clone(); 3],
+                input_axes: vec![mapped, replicated, mapped],
+                discharged: false,
+            },
         )
         .unwrap();
         assert_eq!(specialization.output_axes, vec![mapped, mapped]);
@@ -2959,11 +2981,14 @@ mod tests {
         let specialization = derived_batching_rule_specialization(
             &registration,
             product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0, 1]),
-            &batching_rule_key(
-                vec![vector_type.clone(), scalar_type.clone(), vector_type.clone(), vector_type],
-                vec![scalar_type; 4],
-                vec![mapped, replicated, mapped, mapped],
-            ),
+            &CustomRuleBatchingSpecializationKey {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_types: Vec::new(),
+                input_types: vec![vector_type.clone(), scalar_type.clone(), vector_type.clone(), vector_type],
+                unbatched_input_types: vec![scalar_type; 4],
+                input_axes: vec![mapped, replicated, mapped, mapped],
+                discharged: false,
+            },
         )
         .unwrap();
         assert_eq!(specialization.output_axes, vec![mapped, mapped]);

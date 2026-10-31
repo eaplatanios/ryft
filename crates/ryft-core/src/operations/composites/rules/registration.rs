@@ -20,7 +20,7 @@ use crate::operations::composites::rules::definition::CustomRuleDefinition;
 use crate::operations::composites::rules::specialization::specialization_error;
 use crate::operations::composites::rules::{
     CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey,
-    CustomRuleDerivationKey, CustomRuleForwardSpecializationKey, CustomRuleProgram, CustomRuleSpecialization,
+    CustomRuleDerivedDefinitionKey, CustomRuleForwardSpecializationKey, CustomRuleSpecialization,
     CustomRuleSpecializationRequest,
 };
 use crate::parameters::Parameter;
@@ -32,28 +32,28 @@ use crate::specialization::SpecializationCache;
 pub(in crate::operations::composites) struct CustomRuleCaches<V: Typed + Parameter, O> {
     /// Specializations of the forward mode rule.
     pub(in crate::operations::composites) jvp_specializations:
-        SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Specializations of the reverse mode forward rule.
     pub(in crate::operations::composites) forward_specializations:
-        SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Destination-specialized transposes of the reverse mode backward rule.
     pub(in crate::operations::composites) backward_specializations:
-        SpecializationCache<CustomRuleBackwardSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleBackwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Batched primal programs produced by the custom batching rule.
     pub(super) batching_rule_specializations:
-        SpecializationCache<CustomRuleBatchingSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+        SpecializationCache<CustomRuleBatchingSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
 
     /// Registrations of the definitions derived from this definition (refer to [`CustomRuleDerivation`]), which these
     /// caches own so that they live at most as long as the specializations of this definition. Like the
     /// specializations, they are bounded, and an evicted registration frees the specializations of its definition.
-    pub(super) derived_registrations: Mutex<LruCache<CustomRuleDerivationKey, CustomRuleRegistration<V, O>>>,
+    pub(super) derived_registrations: Mutex<LruCache<CustomRuleDerivedDefinitionKey, CustomRuleRegistration<V, O>>>,
 
     /// Specializations of this definition converted into the families that contain its family (refer to
     /// [`LiftedCustomRules`]), keyed by the [`TypeId`] of the containing family and by the request of the
-    /// specialization from which each one was converted. Each one is a [`CustomRuleProgram`] of that family.
+    /// specialization from which each one was converted. Each is a shared [`CustomRuleSpecialization`] of that family.
     converted_specializations:
         SpecializationCache<(TypeId, CustomRuleSpecializationRequest<V::Type>), Arc<dyn Any + Send + Sync>>,
 }
@@ -179,11 +179,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
 
     /// Returns the specialization for `request`, produced by `produce_fn` on a miss. The specialization is retained in
     /// the registration's caches while they are alive, and produced without caching otherwise.
-    pub(super) fn specialize<F: FnOnce() -> Result<CustomRuleProgram<V, O>, DifferentiationError>>(
+    pub(super) fn specialize<F>(
         &self,
         request: CustomRuleSpecializationRequest<V::Type>,
         produce_fn: F,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
+    where
+        F: FnOnce() -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>,
+    {
         let Some(caches) = self.caches.upgrade() else {
             return self.definition.produce_uncached(request, produce_fn);
         };
@@ -211,12 +214,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
         &self,
         request: CustomRuleSpecializationRequest<V::Type>,
         produce_fn: F,
-    ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
+    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
     where
         Vc: 'static + Typed + Parameter,
         Oc: 'static,
         CustomRuleSpecialization<Vc, Oc>: Send + Sync,
-        F: FnOnce() -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>,
+        F: FnOnce() -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>,
     {
         let Some(caches) = self.caches.upgrade() else {
             return produce_fn();

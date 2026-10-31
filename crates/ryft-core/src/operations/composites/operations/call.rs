@@ -27,8 +27,8 @@ use crate::operations::composites::operations::transpose::{CompositeTransposeOpe
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
-    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey, CustomRuleDerivationKey,
-    CustomRuleDerivationKind, CustomRuleForwardSpecializationKey, CustomRuleReference, CustomRuleSource,
+    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind,
+    CustomRuleDerivedDefinitionKey, CustomRuleForwardSpecializationKey, CustomRuleReference, CustomRuleSource,
     CustomRuleTracer,
 };
 use crate::operations::constants::zero::Zero;
@@ -2234,7 +2234,7 @@ where
     let call = call.filter(|_| !input_indices.is_empty());
     let derived_call = |kind: CustomRuleDerivationKind| match call {
         Some(CompositeOperation { rules: CompositeRules::Retained { rules, discharged, .. }, .. }) => {
-            let rules = rules.derived(CustomRuleDerivationKey {
+            let rules = rules.derived(CustomRuleDerivedDefinitionKey {
                 kind,
                 input_count: inputs.len(),
                 active_input_indices: input_indices.clone(),

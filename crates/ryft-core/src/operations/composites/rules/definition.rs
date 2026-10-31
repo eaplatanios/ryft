@@ -32,8 +32,8 @@ use crate::operations::composites::rules::specialization::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
 };
 use crate::operations::composites::rules::{
-    CustomRuleBatchedOutputs, CustomRuleDerivationKey, CustomRuleProgram, CustomRuleSpecializationRequest,
-    CustomRuleTracer,
+    CustomRuleBatchedOutputs, CustomRuleDerivedDefinitionKey, CustomRuleSpecialization,
+    CustomRuleSpecializationRequest, CustomRuleTracer,
 };
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
@@ -637,7 +637,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Definitions derived from this definition (refer to [`CustomRuleSpecializer::derived`]), held weakly so that a
     /// derived definition that some call still holds keeps its identity whether or not its registration is alive,
     /// while a derived definition, which holds this definition strongly, never forms a cycle with it.
-    pub(super) derived_definitions: Mutex<HashMap<CustomRuleDerivationKey, Weak<CustomRuleDefinition<V, O>>>>,
+    pub(super) derived_definitions: Mutex<HashMap<CustomRuleDerivedDefinitionKey, Weak<CustomRuleDefinition<V, O>>>>,
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
@@ -1164,11 +1164,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Produces the specialization for `request` with `produce_fn` without caching it, which is how specializations are
     /// produced once the registration handle, and with it the caches, was dropped. A recursive request for the same
     /// specialization on the same thread is rejected with the [`ReentrantSpecializationError`] that a cache reports.
-    pub(super) fn produce_uncached<F: FnOnce() -> Result<CustomRuleProgram<V, O>, DifferentiationError>>(
+    pub(super) fn produce_uncached<F>(
         &self,
         request: CustomRuleSpecializationRequest<V::Type>,
         produce_fn: F,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
+    where
+        F: FnOnce() -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>,
+    {
         /// Removes an in-flight marker when production finishes, fails, or unwinds.
         struct InFlightMarker<'d, T: Type + Eq + Hash> {
             /// Set from which the marker is removed.
@@ -1346,10 +1349,9 @@ mod tests {
     use crate::operations::composites::rules::specialization::{
         CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules,
     };
-    use crate::operations::composites::rules::tests::{MemberTracer, batching_rule_key};
     use crate::operations::composites::rules::{
-        CustomRuleBackwardSpecializationKey, CustomRuleBatchingLevel, CustomRuleDerivationKind,
-        CustomRuleForwardSpecializationKey,
+        CustomRuleBackwardSpecializationKey, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey,
+        CustomRuleDerivationKind, CustomRuleForwardSpecializationKey,
     };
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition,
@@ -1440,11 +1442,14 @@ mod tests {
                 if message == "`composite_transpose` `cube` has no backward rule",
         ));
         assert!(matches!(
-            reference.batching_rule_specialization(batching_rule_key(
-                vec![ArrayType::new_static(DataType::F64, [3])],
-                vec![scalar_type],
-                vec![BatchAxis::new(0)],
-            )),
+            reference.batching_rule_specialization(CustomRuleBatchingSpecializationKey {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_types: Vec::new(),
+                input_types: vec![ArrayType::new_static(DataType::F64, [3])],
+                unbatched_input_types: vec![scalar_type],
+                input_axes: vec![BatchAxis::new(0)],
+                discharged: false,
+            }),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`composite` `cube` has no custom batching rule",
         ));
@@ -1467,7 +1472,7 @@ mod tests {
                 .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         assert_eq!(registration.reference().definition().named_axes(), named_axes.as_slice());
-        let key = CustomRuleDerivationKey {
+        let key = CustomRuleDerivedDefinitionKey {
             kind: CustomRuleDerivationKind::Jvp,
             input_count: 1,
             active_input_indices: vec![0],
@@ -1853,11 +1858,14 @@ mod tests {
             |inputs, input_axes, _, _| Ok((vec![inputs[0].clone() * inputs[0].clone()], input_axes.to_vec())),
         ));
         assert!(registration.reference().has_batching_rule());
-        let key = batching_rule_key(
-            vec![ArrayType::new_static(DataType::F64, [3])],
-            vec![ArrayType::scalar(DataType::F64)],
-            vec![BatchAxis::new(0)],
-        );
+        let key = CustomRuleBatchingSpecializationKey {
+            level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+            boundary_input_types: Vec::new(),
+            input_types: vec![ArrayType::new_static(DataType::F64, [3])],
+            unbatched_input_types: vec![ArrayType::scalar(DataType::F64)],
+            input_axes: vec![BatchAxis::new(0)],
+            discharged: false,
+        };
         let specialization = registration.reference().batching_rule_specialization(key.clone()).unwrap();
         assert_eq!(specialization.output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
@@ -1885,7 +1893,10 @@ mod tests {
     fn test_custom_rule_definition_with_broadcast_sensitive_batching_rule() {
         // The rule batches calls exactly as a plain batching rule does, and it records the operations with which the
         // derived definitions recover exact per-item tangents (refer to the `CustomRuleDerivation` tests).
-        let rule = |inputs: &[MemberTracer], axes: &[BatchAxis], _: &BatchingLevel<ArrayType>, _: &[MemberTracer]| {
+        let rule = |inputs: &[CustomRuleTracer<Array, ArrayOperation<Array>>],
+                    axes: &[BatchAxis],
+                    _: &BatchingLevel<ArrayType>,
+                    _: &[CustomRuleTracer<Array, ArrayOperation<Array>>]| {
             Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[0].clone()], axes.to_vec()))
         };
         let plain = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(rule));
@@ -1894,11 +1905,14 @@ mod tests {
         assert!(broadcast_sensitive.reference().has_batching_rule());
         assert!(broadcast_sensitive.definition().broadcast_sensitivity.is_some());
         assert!(plain.definition().broadcast_sensitivity.is_none());
-        let key = batching_rule_key(
-            vec![ArrayType::new_static(DataType::F64, [3])],
-            vec![ArrayType::scalar(DataType::F64)],
-            vec![BatchAxis::new(0)],
-        );
+        let key = CustomRuleBatchingSpecializationKey {
+            level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+            boundary_input_types: Vec::new(),
+            input_types: vec![ArrayType::new_static(DataType::F64, [3])],
+            unbatched_input_types: vec![ArrayType::scalar(DataType::F64)],
+            input_axes: vec![BatchAxis::new(0)],
+            discharged: false,
+        };
         let specialization = broadcast_sensitive.reference().batching_rule_specialization(key.clone()).unwrap();
         let plain_specialization = plain.reference().batching_rule_specialization(key).unwrap();
         assert_eq!(specialization.output_axes, plain_specialization.output_axes);
@@ -1939,10 +1953,11 @@ mod tests {
             discharged,
             ..unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], vec![true])
         };
-        let has_reference_state = |specialization: &CustomRuleProgram<ArrayIrValue<Array>, ArrayIrOperation<Array>>| {
-            let regions = specialization.program.regions();
-            regions.iter().flat_map(|region| region.atoms()).any(|atom| atom.r#type().is_reference())
-        };
+        let has_reference_state =
+            |specialization: &Arc<CustomRuleSpecialization<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
+                let regions = specialization.program.regions();
+                regions.iter().flat_map(|region| region.atoms()).any(|atom| atom.r#type().is_reference())
+            };
         let supported = CustomRuleRegistration::new(definition().with_reference_discharge());
         let discharged = supported.reference().jvp_specialization(key(true)).unwrap();
         assert!(!has_reference_state(&discharged));

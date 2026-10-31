@@ -19,7 +19,6 @@
 
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::sync::Arc;
 
 use crate::batching::{BatchAxis, BatchingLevel, BatchingLevelExtent};
 use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
@@ -352,13 +351,13 @@ pub(super) enum CustomRuleDerivationKind {
     Pushforward,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Key of a definition derived from a source [`CustomRuleDefinition`] (refer to
-/// [`CustomRuleSpecializer::derived`](specialization::CustomRuleSpecializer::derived)). It contains only static
-/// information about the derived calls, so that calls whose primal regions differ share one derived definition.
+/// Key of a reusable derivative definition created from a source [`CustomRuleDefinition`] (refer to
+/// [`CustomRuleSpecializer::derived`](specialization::CustomRuleSpecializer::derived)). It records only the derivative
+/// form, input count, and tangent activity, so calls with different types or primal regions can share one derived
+/// definition and its identity. Concrete types and batching levels belong to the keys of that definition's program
+/// specializations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CustomRuleDerivationKey {
+pub(super) struct CustomRuleDerivedDefinitionKey {
     /// Kind of the derived calls.
     pub(super) kind: CustomRuleDerivationKind,
 
@@ -378,13 +377,13 @@ pub(super) struct CustomRuleDerivationKey {
 /// that retains it and, when no cache is alive, the in-flight marker that rejects its recursive production.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CustomRuleSpecializationRequest<T> {
-    /// Specialization of the forward mode rule.
+    /// Specialization of the forward mode differentiation rule.
     Jvp(CustomRuleForwardSpecializationKey<T>),
 
-    /// Specialization of the reverse mode forward rule.
+    /// Specialization of the reverse mode differentiation forward rule.
     Forward(CustomRuleForwardSpecializationKey<T>),
 
-    /// Destination-specialized transpose of the reverse mode backward rule.
+    /// Destination-specialized transpose of the reverse mode differentiation backward rule.
     Backward(CustomRuleBackwardSpecializationKey<T>),
 
     /// Batched primal program produced by the custom batching rule.
@@ -392,7 +391,8 @@ enum CustomRuleSpecializationRequest<T> {
 }
 
 /// Program produced by specializing a retained custom rule, together with the batch axes of its outputs at the
-/// outermost batching level of its key (which are empty for an unbatched specialization).
+/// outermost batching level of its key (which are empty for an unbatched specialization). The specialization caches
+/// of a [`CustomRuleDefinition`] retain shared instances in an [`Arc`](std::sync::Arc).
 pub(super) struct CustomRuleSpecialization<V: Typed + Parameter, O> {
     /// Specialized program.
     pub(super) program: Program<V, O, Vec<V>, Vec<V>>,
@@ -408,38 +408,10 @@ pub(super) struct CustomRuleSpecialization<V: Typed + Parameter, O> {
 }
 
 impl<V: Typed + Parameter, O> CustomRuleSpecialization<V, O> {
-    /// Creates a new [`CustomRuleSpecialization`] of a rule other than a backward rule, which has no cotangents.
+    /// Creates a new [`CustomRuleSpecialization`] of a rule other than a backward differentiation rule,
+    /// which has no cotangents.
+    #[inline]
     pub(super) fn new(program: Program<V, O, Vec<V>, Vec<V>>, output_axes: Vec<BatchAxis>) -> Self {
         Self { program, output_axes, cotangents: Vec::new() }
-    }
-}
-
-/// Shared [`CustomRuleSpecialization`], as retained by the specialization caches of a [`CustomRuleDefinition`].
-pub(super) type CustomRuleProgram<V, O> = Arc<CustomRuleSpecialization<V, O>>;
-
-#[cfg(test)]
-mod tests {
-    use crate::arrays::{Array, ArrayOperation, ArrayType, ShardingDimension};
-
-    use super::*;
-
-    /// Tracer over which the rules of a [`MemberDefinition`] are written.
-    pub(super) type MemberTracer = CustomRuleTracer<Array, ArrayOperation<Array>>;
-
-    /// Returns the key of the custom batching rule of an undischarged call batched at a static level of three items,
-    /// whose batched inputs have the provided types and batch axes.
-    pub(super) fn batching_rule_key(
-        input_types: Vec<ArrayType>,
-        unbatched_input_types: Vec<ArrayType>,
-        input_axes: Vec<BatchAxis>,
-    ) -> CustomRuleBatchingSpecializationKey<ArrayType> {
-        CustomRuleBatchingSpecializationKey {
-            level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
-            boundary_input_types: Vec::new(),
-            input_types,
-            unbatched_input_types,
-            input_axes,
-            discharged: false,
-        }
     }
 }
