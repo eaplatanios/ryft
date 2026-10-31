@@ -3,8 +3,6 @@
 //! interface, together with the internal specialization machinery that traces, batches, and transposes retained rules
 //! into cached programs.
 
-// TODO(eaplatanios): Review from here onwards.
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
@@ -42,6 +40,8 @@ use crate::tracing::TracingContext;
 
 #[cfg(doc)]
 use crate::batching::DiagonalBatchingPolicy;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Derivation of a definition from a source definition, which is stored in the derived definition as its batching rule
 /// (refer to [`CustomRuleDefinition::batching_rule`] and [`CustomRuleSpecializer::derived`]).
@@ -300,9 +300,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleForwardSpecializationKey<V::Type>,
     ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         // Returns the JVP rule specialization for `key`, whose program takes the call's inputs followed by the active
         // tangents of its differentiated inputs and returns the call's outputs followed by their tangents. An unbatched
@@ -501,9 +501,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleForwardSpecializationKey<V::Type>,
     ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         // Returns the reverse mode forward rule specialization for `key`, whose program takes the call's inputs and
         // returns the call's outputs followed by the residuals. Specializations are traced and batched as for
@@ -649,9 +649,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleBackwardSpecializationKey<V::Type>,
     ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + From<CompositeTransposeOperation<V, O>>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         // Returns the backward rule specialization for `key`. An unbatched key transposes a source program that applies
         // a directly invoking [`CompositeTransposeOperation`] and returns only its live-seed outputs, so transposition
@@ -1652,6 +1652,7 @@ where
     ///   - `broadcast_sensitivity`: Operations of the source definition that take diagonals and add contributions.
     ///   - `differentiator`: Differentiator of the source definition.
     ///   - `batcher`: Structural batcher of the source definition.
+    #[allow(clippy::type_complexity)]
     fn broadcast_sensitive_batching_rule_specialization(
         &self,
         name: &str,
@@ -1923,6 +1924,7 @@ where
     ///   - `input_indices`: Indices of the program inputs whose tangents are active.
     ///   - `tangents_only`: Whether the returned program returns only the tangent outputs (e.g., for pushforward
     ///     derivations, or when another program computes the primal outputs).
+    #[allow(clippy::type_complexity)]
     fn jvp_program(
         &self,
         name: &str,
@@ -1949,6 +1951,7 @@ where
     /// `input_indices`, restricted to its tangent outputs when `tangents_only` is set, together with whether each
     /// output has a live tangent with respect to those inputs (i.e., which outputs the JVP program's tangent outputs
     /// belong to).
+    #[allow(clippy::type_complexity)]
     fn partial_jvp_program(
         differentiator: &(
              dyn Fn(
@@ -2007,6 +2010,7 @@ where
     ///   - `input_axes`: Batch axes of the values.
     ///   - `output_axes`: Batch axes of the aligned values.
     ///   - `level`: Batching level of the values.
+    #[allow(clippy::type_complexity)]
     fn alignment_program(
         name: &str,
         batcher: &(
