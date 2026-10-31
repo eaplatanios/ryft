@@ -1,7 +1,7 @@
-//! The sealed [`CustomRuleSource`] and [`CustomRuleSpecializer`] interfaces through which composite calls and carriers
-//! request rule programs, their implementations for registered ([`CustomRuleReference`]), unavailable
-//! ([`UnavailableCustomRules`]), and lifted ([`LiftedCustomRules`]) rule sets, and the derivations that trace, batch,
-//! and transpose the retained rules into cached specializations.
+//! Rule sources for registered ([`CustomRuleReference`]), unavailable ([`UnavailableCustomRules`]), and lifted
+//! ([`LiftedCustomRules`]) rule sets, which composite calls and carriers inspect through the sealed [`CustomRuleSource`]
+//! interface, together with the internal specialization machinery that traces, batches, and transposes retained rules
+//! into cached programs.
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -13,7 +13,7 @@ use std::sync::{Arc, Weak};
 
 use crate::arrays::ShardingDimension;
 use crate::axes::Axis;
-use crate::batching::{BatchAxis, BatchingLevel, BatchingLevelExtent};
+use crate::batching::{BatchAxis, BatchingError, BatchingLevel, BatchingLevelExtent};
 use crate::contexts::StagingContext;
 use crate::differentiation::{
     CotangentDestinationKind, DifferentiableType, DifferentiationError, ResidualZeroProvider,
@@ -30,10 +30,9 @@ use crate::operations::composites::rules::definition::{
 };
 use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
-    CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleBatchingLevel,
-    CustomRuleBatchingRuleKey, CustomRuleDerivationKey, CustomRuleDerivationKind, CustomRuleDifferentiator,
-    CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationKey, CustomRuleSpecializationRequest,
-    CustomRuleTracer, boundary_input_count,
+    CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey,
+    CustomRuleDerivationKey, CustomRuleDerivationKind, CustomRuleProgram, CustomRuleSpecialization,
+    CustomRuleSpecializationKey, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -73,16 +72,14 @@ impl<Vm: Typed + Parameter, Om> sealed::Sealed for LiftedCustomRules<Vm, Om> {}
 /// array programs into array IR programs), whose specializations the member definition produces and caches before they
 /// are converted. Equality and hashing use the identity of the source's definition.
 ///
-/// This trait describes the rules only, which is all that every transform except differentiation needs, and
-/// [`CustomRuleSpecializer`] adds the production of their specializations. Keeping the two apart keeps the heavier
-/// bounds of converted sources (e.g., on the member family's operations) out of the [`Operation`] implementation of the
-/// operations, where they would form a cycle with the payload bounds of the families that contain them.
+/// This trait describes the rules only, which is all that every transform except differentiation needs. Internal
+/// specialization functions produce their programs and carry the heavier bounds of converted sources (e.g., on the
+/// member family's operations). Keeping those bounds separate from this trait keeps them out of the [`Operation`]
+/// implementation of the operations, where they would form a cycle with the payload bounds of the families that
+/// contain them.
 ///
-/// This trait and [`CustomRuleSpecializer`] are sealed: their only implementations are [`CustomRuleReference`] and
-/// [`LiftedCustomRules`]. Their specialization requests and results are internal to the
-/// [`rules`](crate::operations::composites::rules) module (their keys have no public constructors or accessors), so a
-/// source outside of it could only delegate to one of these two. New kinds of rules are registered through
-/// [`CustomRuleDefinition`] instead.
+/// This trait is sealed and implemented only by [`CustomRuleReference`] and [`LiftedCustomRules`]. New kinds of rules
+/// are registered through [`CustomRuleDefinition`].
 pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     sealed::Sealed + Clone + Debug + Eq + Hash
 {
@@ -141,7 +138,9 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
 /// `(V, O)`. The functions that produce specializations carry their bounds themselves rather than on the trait, like
 /// the rule traits, which keeps the operations free of bounds on `O` that would form a cycle with the payload bounds of
 /// the families that contain them. It is sealed (refer to the documentation of [`CustomRuleSource`]).
-pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: CustomRuleSource<V, O> {
+pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>:
+    CustomRuleSource<V, O>
+{
     /// Returns the forward mode rule specialization for `key`, whose program takes the call's inputs followed by the
     /// active tangents of its differentiated inputs (refer to the tangent activity of the key) and returns the call's
     /// outputs followed by their tangents.
@@ -464,8 +463,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             };
 
             // Each active tangent follows the batch axis of its primal, and each output tangent follows its output.
-            let differentiated_input_start =
-                key.non_differentiated_count + boundary_input_count(&key.levels[..key.levels.len() - 1]);
+            let differentiated_input_start = key.non_differentiated_count
+                + key.levels[..key.levels.len() - 1].iter().map(|level| level.boundary_input_count).sum::<usize>();
             let differentiated_input_axes = level.input_axes.get(differentiated_input_start..).ok_or_else(|| {
                 let name = self.definition.name();
                 let description = if name == COMPOSITE_OPERATION_NAME {
@@ -692,7 +691,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             // the remaining leading inputs. Each seed follows its output, each caller buffer follows its input, and
             // each leading input keeps its recorded axis. Each returned cotangent is aligned to its input, while
             // structural-zero cotangents have no output and stay structural zeros at every level.
-            let inner_boundary_input_count = boundary_input_count(&key.levels[..key.levels.len() - 1]);
+            let inner_boundary_input_count =
+                key.levels[..key.levels.len() - 1].iter().map(|level| level.boundary_input_count).sum::<usize>();
             let (leading_axes, tangent_axes) =
                 level.input_axes.split_at(inner_boundary_input_count + leading_input_count);
             let mut input_axes = leading_axes[..inner_boundary_input_count].to_vec();
@@ -1646,8 +1646,27 @@ where
         primal_rule: &CustomRuleProgram<V, O>,
         tangent_primal_indices: &[usize],
         broadcast_sensitivity: &dyn CustomRuleBroadcastSensitivity<V, O>,
-        differentiator: &CustomRuleDifferentiator<V, O>,
-        batcher: &CustomRuleBatcher<V, O>,
+        differentiator: &(
+             dyn Fn(
+            &Program<V, O, Vec<V>, Vec<V>>,
+            &[usize],
+        ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+                 + 'static
+                 + Send
+                 + Sync
+         ),
+        batcher: &(
+             dyn Fn(
+            &Program<V, O, Vec<V>, Vec<V>>,
+            &[BatchAxis],
+            &[Option<BatchAxis>],
+            &BatchingLevel<<V as Typed>::Type>,
+            CustomRuleBatchedOutputs,
+        ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
+                 + 'static
+                 + Send
+                 + Sync
+         ),
     ) -> Result<CustomRuleSpecialization<V, O>, DifferentiationError> {
         let tangents_only = self.key.kind == CustomRuleDerivationKind::Pushforward;
         let boundary_input_count = key.boundary_input_types.len();
@@ -1894,7 +1913,15 @@ where
     fn jvp_program(
         &self,
         name: &str,
-        differentiator: &CustomRuleDifferentiator<V, O>,
+        differentiator: &(
+             dyn Fn(
+            &Program<V, O, Vec<V>, Vec<V>>,
+            &[usize],
+        ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+                 + 'static
+                 + Send
+                 + Sync
+         ),
         program: &Program<V, O, Vec<V>, Vec<V>>,
         input_indices: &[usize],
         tangents_only: bool,
@@ -1910,7 +1937,15 @@ where
     /// output has a live tangent with respect to those inputs (i.e., which outputs the JVP program's tangent outputs
     /// belong to).
     fn partial_jvp_program(
-        differentiator: &CustomRuleDifferentiator<V, O>,
+        differentiator: &(
+             dyn Fn(
+            &Program<V, O, Vec<V>, Vec<V>>,
+            &[usize],
+        ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+                 + 'static
+                 + Send
+                 + Sync
+         ),
         program: &Program<V, O, Vec<V>, Vec<V>>,
         input_indices: &[usize],
         tangents_only: bool,
@@ -1961,7 +1996,18 @@ where
     ///   - `level`: Batching level of the values.
     fn alignment_program(
         name: &str,
-        batcher: &CustomRuleBatcher<V, O>,
+        batcher: &(
+             dyn Fn(
+            &Program<V, O, Vec<V>, Vec<V>>,
+            &[BatchAxis],
+            &[Option<BatchAxis>],
+            &BatchingLevel<<V as Typed>::Type>,
+            CustomRuleBatchedOutputs,
+        ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
+                 + 'static
+                 + Send
+                 + Sync
+         ),
         types: &[V::Type],
         input_axes: &[BatchAxis],
         output_axes: &[BatchAxis],

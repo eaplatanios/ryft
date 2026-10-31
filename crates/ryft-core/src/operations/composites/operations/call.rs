@@ -153,14 +153,14 @@ pub enum CompositeJvpRule {
 ///
 /// A custom batching rule also stays on the path of forward mode derivatives that are batched after they are taken.
 /// Forward mode differentiation of an unbatched call with retained rules whose forward mode rule is derived from its
-/// primal stages a derived call (with rules that [`CustomRuleSpecializer::derived`] derives) instead of inlining the
-/// derivative of the primal region, and batching that call applies the derivative of the batching rule. The derived
-/// call's primal region is that derivative: in fused contexts, it computes the outputs and their tangents, while
-/// partitioned contexts compute the outputs with the call itself and stage a pushforward that computes only the
-/// tangents (for a pure primal region, since the pushforward recomputes the primal; other primals are linearized
-/// inline, so that their effects run once). A pushforward is linear in its tangent inputs, so it transposes by
-/// transposing its primal region inline (e.g., when a linearization is transposed). Reverse mode inlines the derivative
-/// instead of staging a derived call, because that transposition would drop the batching rule anyway.
+/// primal stages a derived call instead of inlining the derivative of the primal region, and batching that call applies
+/// the derivative of the batching rule. The derived call's primal region is that derivative. In fused contexts, it
+/// computes the outputs and their tangents, while partitioned contexts compute the outputs with the call itself and
+/// stage a pushforward that computes only the tangents (for a pure primal region, since the pushforward recomputes the
+/// primal; other primals are linearized inline, so that their effects run once). A pushforward is linear in its tangent
+/// inputs, so it transposes by transposing its primal region inline (e.g., when a linearization is transposed). Reverse
+/// mode inlines the derivative instead of staging a derived call, because that transposition would drop the batching
+/// rule anyway.
 ///
 /// # Dead Code Elimination
 ///

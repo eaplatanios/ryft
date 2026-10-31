@@ -8,7 +8,6 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationError};
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleSpecializationKey, CustomRuleSpecializer,
-    boundary_input_count,
 };
 use crate::programs::{Operation, Value};
 use crate::tracing::TracingContext;
@@ -54,7 +53,8 @@ where
     for (index, level) in key.levels.iter().enumerate() {
         let level_key = CustomRuleSpecializationKey { levels: key.levels[..=index].to_vec(), ..key.clone() };
         let level_specialization = rules.forward_specialization(level_key)?;
-        let leading_input_count = non_differentiated_count + boundary_input_count(&key.levels[..index]);
+        let leading_input_count = non_differentiated_count
+            + key.levels[..index].iter().map(|level| level.boundary_input_count).sum::<usize>();
         let mut input_axes = level.input_axes[..leading_input_count].to_vec();
         input_axes.extend_from_slice(&level_specialization.output_axes[rule_output_count..]);
         input_axes.extend(std::iter::repeat_n(BatchAxis::replicated(), seed_extent_types.len()));

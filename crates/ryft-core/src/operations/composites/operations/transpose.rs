@@ -27,7 +27,7 @@ use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
-    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, boundary_input_count,
+    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -83,10 +83,11 @@ static COMPOSITE_TRANSPOSE_EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects
 ///     [`RegionRole::DeferredRule`](crate::RegionRole::DeferredRule)), so a backward region with effects or deferred
 ///     work makes the carrier carry deferred work, which keeps simplification from removing an unused carrier before
 ///     transposition runs those effects.
-///   - **Retained** ([`Self::new`]): the backward rule is specialized per [`CustomRuleBackwardSpecializationKey`] by
-///     transposing a source program that invokes the rule directly, cached in the definition, and replayed with the
-///     actual known inputs, seeds, and caller-buffer destinations. The runtime buffer identities are invocation inputs
-///     and never part of a specialization. The carrier declares deferred work (refer to the
+///   - **Retained** ([`Self::new`]): the backward rule is specialized for the input and cotangent types, live seeds,
+///     destination kinds, batching levels, and reference discharge state by transposing a source program that invokes
+///     the rule directly, cached in the definition, and replayed with the actual known inputs, seeds, and caller-buffer
+///     destinations. The runtime buffer identities are invocation inputs and never part of a specialization. The
+///     carrier declares deferred work (refer to the
 ///     [Deferred Work](crate::Effects#deferred-work) section of [`Effects`]), so that shared transform boundaries
 ///     retain it until transposition replaces it with the specialized backward program.
 ///
@@ -1010,7 +1011,8 @@ where
             None => batching,
             Some(key) => {
                 let call_input_count = self.leading_input_count - seed_extent_count;
-                let call_boundary_input_count = boundary_input_count(&key.levels);
+                let call_boundary_input_count =
+                    key.levels.iter().map(|level| level.boundary_input_count).sum::<usize>();
                 if call_input_count != call_boundary_input_count + key.input_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
                         "{} has {call_input_count} call inputs but its deferred forward rule expects {} boundary \

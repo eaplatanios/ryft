@@ -115,7 +115,7 @@ pub use operations::{
     ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeKind, CumulativeOperation, CustomCall,
     CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching, CustomCallInputOutputAlias, CustomCallOperation,
     CustomCallUnrolling, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource,
-    CustomRuleSpecializer, CustomRuleTracer, CustomVjpOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE,
+    CustomRuleTracer, CustomVjpOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE,
     DIMENSION_DIV_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME,
     DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME,
     DIMENSION_REM_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME,

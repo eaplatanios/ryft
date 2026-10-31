@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
-use crate::arrays::{ArrayType, DataType};
+use crate::arrays::{ArrayType, DataType, ShardingDimension};
 use crate::axes::NamedAxis;
 use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingPolicy, DiagonalBatchingPolicy,
@@ -32,8 +32,8 @@ use crate::operations::composites::rules::specialization::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
 };
 use crate::operations::composites::rules::{
-    CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleDerivationKey, CustomRuleDifferentiator, CustomRuleProgram,
-    CustomRuleSequentialScan, CustomRuleSpecializationRequest, CustomRuleTracer,
+    CustomRuleBatchedOutputs, CustomRuleDerivationKey, CustomRuleProgram, CustomRuleSpecializationRequest,
+    CustomRuleTracer,
 };
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
@@ -552,8 +552,25 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// [`Self::with_deferred_forward_rule`]).
     pub(super) deferred_forward: bool,
 
-    /// Optional batcher of traced rule programs, without which batched calls can be executed but not differentiated.
-    pub(super) batcher: Option<Arc<CustomRuleBatcher<V, O>>>,
+    /// Optional structural batching of a traced rule program at one recorded level with the provided input batch
+    /// axes. Each output is aligned to its required batch axis, or keeps its natural axis when the requirement is
+    /// [`None`]. The result is the batched program, which consumes the level's boundary inputs before the source
+    /// program's inputs, together with its output batch axes. Without it, batched calls can be executed but not
+    /// differentiated. [`Self::with_batching_support`] captures it where the operation family's batching bounds are
+    /// known, because requiring them on the operations' own rules would form a cycle with the family's payload bounds.
+    pub(super) batcher: Option<
+        Arc<
+            dyn Fn(
+                    &Program<V, O, Vec<V>, Vec<V>>,
+                    &[BatchAxis],
+                    &[Option<BatchAxis>],
+                    &BatchingLevel<<V as Typed>::Type>,
+                    CustomRuleBatchedOutputs,
+                ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
+                + Send
+                + Sync,
+        >,
+    >,
 
     /// Optional batch axes of the outputs of batched calls, which default to mapping every output at axis 0.
     pub(super) batched_output_axes: Option<Vec<BatchAxis>>,
@@ -561,9 +578,24 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Optional custom batching rule, which batches calls instead of structurally batching their primal regions.
     pub(super) batching_rule: Option<Arc<dyn CustomBatchingRule<V, O>>>,
 
-    /// Differentiator of traced rule programs, present when [`Self::batching_rule`] is present, with which the batching
-    /// rules of the definitions derived from this definition differentiate its batching rule's programs.
-    pub(super) differentiator: Option<Arc<CustomRuleDifferentiator<V, O>>>,
+    /// Forward mode differentiation of a traced rule program with respect to the provided inputs, returning its fused
+    /// Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). Present when
+    /// [`Self::batching_rule`] is present. Batching rules of derived definitions (refer to [`CustomRuleDerivation`])
+    /// differentiate the batched programs of their source's custom batching rule with it. [`Self::with_batching_rule`]
+    /// captures it where the operation family's differentiation bounds are known, because requiring them on the
+    /// operations' own rules would form a cycle with the family's payload bounds.
+    pub(super) differentiator: Option<
+        Arc<
+            dyn Fn(
+                    // Program to differentiate.
+                    &Program<V, O, Vec<V>, Vec<V>>,
+                    // Indices of the inputs with respect to which the program is differentiated.
+                    &[usize],
+                ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+                + Send
+                + Sync,
+        >,
+    >,
 
     /// Operations with which the batching rules of the definitions derived from this definition recover exact per-item
     /// tangents, present when [`Self::batching_rule`] depends on its input batch axes (refer to
@@ -575,8 +607,18 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     pub(super) derivation: Option<CustomRuleDerivation<V, O>>,
 
     /// Optional construction of the scan with which calls are batched sequentially when there is no custom batching
-    /// rule (refer to [`Self::with_sequential_batching`]).
-    pub(super) sequential_scan: Option<Arc<CustomRuleSequentialScan<V, O>>>,
+    /// rule (refer to [`Self::with_sequential_batching`]). It receives the batch extent (i.e., the scan's trip count),
+    /// the number of carries (i.e., replicated inputs), the batch axis placement, and the number of stacked outputs,
+    /// and returns the scan operation and the type of the slice index that the scan body receives first.
+    /// [`Self::with_sequential_batching`] captures it where the family's scan bounds are known, because requiring them
+    /// on the operations' own rules would restrict every family that contains the operations to scannable types.
+    pub(super) sequential_scan: Option<
+        Arc<
+            dyn Fn(usize, usize, &ShardingDimension, usize) -> Result<(O, <V as Typed>::Type), ProgramError>
+                + Send
+                + Sync,
+        >,
+    >,
 
     /// Optional reference discharge of a traced rule program whose call was discharged, replacing its local reference
     /// state with explicitly threaded values. Without it, discharged calls can be differentiated only when their rule
@@ -948,12 +990,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// computing the batched primal consistently with those derivative rules.
     ///
     /// When the forward mode rule is derived from the primal, differentiating an unbatched call stages a derived call
-    /// whose batching applies the derivative of this rule (refer to [`CustomRuleSpecializer::derived`]), which may
-    /// apply the rule with every input replicated. This function therefore also captures the family's differentiation
-    /// of traced programs, which is why it requires the family's differentiation bounds. Batching those derivatives
-    /// also requires [`Self::with_batching_support`], which this function cannot configure without the family's
-    /// batching bounds: without it, the first request that batches such a derivative is rejected with a diagnostic
-    /// that names it.
+    /// whose batching applies the derivative of this rule, which may apply the rule with every input replicated. This
+    /// function therefore also captures the family's differentiation of traced programs, which is why it requires the
+    /// family's differentiation bounds. Batching those derivatives also requires [`Self::with_batching_support`],
+    /// which this function cannot configure without the family's batching bounds. Without it, the first request that
+    /// batches such a derivative is rejected with a diagnostic that names it.
     pub fn with_batching_rule<R>(mut self, rule: R) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -988,7 +1029,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// outer product of their mapped tangents with the rule's batch (i.e., by batching the rule's derivative with
     /// respect to them over a second level of the same extent and taking the diagonal of the two batch axes; refer to
     /// [`DiagonalBatchingPolicy`]). This costs as many applications of that derivative as the batch has items, which
-    /// is why it is not the default (refer to [`CustomRuleSpecializer::derived`]).
+    /// is why it is not the default (refer to [`Self::with_batching_rule`]).
     pub fn with_broadcast_sensitive_batching_rule<R>(self, rule: R) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1024,11 +1065,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// call around a batched primal region, and the derivatives of the batched call are those of the scan: its body
     /// differentiates the unbatched call with its own rules, one batch item at a time. A forward mode rule derived from
     /// the primal stays sequential when its derivative is batched after it is taken, because differentiating an
-    /// unbatched call stages a derived call that is itself batched sequentially (refer to
-    /// [`CustomRuleSpecializer::derived`]). A custom batching rule (refer to [`Self::with_batching_rule`]) takes
-    /// precedence over sequential batching. The batch extent must be statically known, including for a first-class
-    /// dimension, and the batch axis must be unnamed because the scan does not bind named collectives across its items
-    /// for the primal or derivative rules.
+    /// unbatched call stages a derived call that is itself batched sequentially. A custom batching rule (refer to
+    /// [`Self::with_batching_rule`]) takes precedence over sequential batching. The batch extent must be statically
+    /// known, including for a first-class dimension, and the batch axis must be unnamed because the scan does not bind
+    /// named collectives across its items for the primal or derivative rules.
     ///
     /// [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
     pub fn with_sequential_batching(mut self) -> Self

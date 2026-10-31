@@ -65,8 +65,8 @@ pub use operations::{
     CompositeTransposeOperation,
 };
 pub use rules::{
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
-    CustomRuleTracer, CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
+    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
+    CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
 };
 
 /// Returns the renaming of the type identities of `source` onto those of `target` when the two type signatures are

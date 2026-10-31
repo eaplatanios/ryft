@@ -36,7 +36,7 @@ pub mod specialization;
 
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
 pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleRegistration};
-pub use specialization::{CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules};
+pub use specialization::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
 pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
@@ -62,7 +62,7 @@ enum CustomRuleBatchedOutputs {
 /// it records this level so that a later derivative request can batch the rule program that it traces at the unbatched
 /// types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CustomRuleBatchingLevel<T> {
+pub(super) struct CustomRuleBatchingLevel<T> {
     /// Context-neutral description of the batching level.
     pub(super) level: BatchingLevel<T>,
 
@@ -91,10 +91,8 @@ pub(super) struct CustomRuleBatching<T> {
     pub(super) levels: Vec<CustomRuleBatchingLevel<T>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type> CustomRuleBatching<T> {
-    /// Returns the number of boundary inputs that all levels together prepended to the operation's inputs.
+    /// Returns the total number of boundary inputs across all [`CustomRuleBatchingLevel`]s.
     pub(super) fn boundary_input_count(&self) -> usize {
         self.levels.iter().map(|level| level.boundary_input_count).sum()
     }
@@ -173,9 +171,9 @@ impl<T: Display> Display for CustomRuleBatching<T> {
     }
 }
 
-/// Specialization key of the forward mode and reverse mode primal rules of a [`CustomRuleDefinition`].
+/// Specialization key for the rules of a [`CustomRuleDefinition`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CustomRuleSpecializationKey<T> {
+pub(super) struct CustomRuleSpecializationKey<T> {
     /// Unbatched types of every input of the call, excluding boundary inputs.
     pub(super) input_types: Vec<T>,
 
@@ -187,18 +185,19 @@ pub struct CustomRuleSpecializationKey<T> {
     /// Whether each output of the rule is an output of the call, or [`None`] when the call returns every output of the
     /// rule (refer to [`CompositeOperation`](crate::CompositeOperation)'s boundary pruning). When present, it has one
     /// entry per output of the rule, and [`Self::output_types`] lists the types of the kept outputs only, against which
-    /// the specialization is validated. A forward mode specialization then returns only the kept outputs and their
-    /// tangents, while a reverse mode forward specialization keeps returning every output of the rule, because the
-    /// backward rule receives a seed for each of them.
+    /// the specialization is validated. A forward mode differentiation rule specialization then returns only the kept
+    /// outputs and their tangents, while a reverse mode forward specialization keeps returning every output of the
+    /// rule, because the backward rule receives a seed for each of them.
     pub(super) kept_outputs: Option<Vec<bool>>,
 
     /// Number of leading inputs that parameterize the rule without being differentiated, excluding boundary inputs.
     pub(super) non_differentiated_count: usize,
 
-    /// Whether each differentiated input's tangent is active (i.e., not a structural zero) in a forward mode request,
-    /// which is empty for reverse mode forward requests, whose rules receive no tangents. A forward mode specialization
-    /// receives only the active tangents, and it materializes the structural zeros itself (or hands them to a rule that
-    /// receives structural zeros), so that the zeros that the rule propagates remain recognizable as zeros.
+    /// Whether each differentiated input's tangent is active (i.e., not a structural zero) in a forward mode
+    /// differentiation request, which is empty for reverse mode forward requests, whose rules receive no tangents.
+    /// A forward mode differentiation rule specialization receives only the active tangents, and it materializes the
+    /// structural zeros itself (or hands them to a rule that receives structural zeros), so that the zeros that the
+    /// rule propagates remain recognizable as zeros.
     pub(super) tangent_activity: Vec<bool>,
 
     /// Batching levels of the call, from the innermost to the outermost, which are empty for an unbatched call.
@@ -207,6 +206,8 @@ pub struct CustomRuleSpecializationKey<T> {
     /// Whether the call's reference state was discharged, in which case the specialization is discharged as well.
     pub(super) discharged: bool,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
     /// Returns the key of the specialization from which this key's specialization is batched (i.e., without its
@@ -292,7 +293,7 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
 /// Specialization key of the backward rule of a [`CustomRuleDefinition`]. It contains only static information, and
 /// never a runtime reference identity or the contents of a value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CustomRuleBackwardSpecializationKey<T> {
+pub(super) struct CustomRuleBackwardSpecializationKey<T> {
     /// Unbatched types of the known leading inputs (i.e., the non-differentiated inputs, the residuals, and the seed
     /// extents), excluding boundary inputs.
     pub(super) leading_input_types: Vec<T>,
@@ -332,7 +333,7 @@ impl<T: Type + Eq + Hash> CustomRuleBackwardSpecializationKey<T> {
 /// [`CustomRuleDefinition::with_batching_rule`]). It contains only static information: the level, the types and batch
 /// axes of the batched call's inputs, and whether the call was discharged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CustomRuleBatchingRuleKey<T> {
+pub(super) struct CustomRuleBatchingRuleKey<T> {
     /// Batching level at which the call is batched.
     pub(super) level: BatchingLevel<T>,
 
@@ -369,11 +370,11 @@ pub(super) enum CustomRuleDerivationKind {
     Pushforward,
 }
 
-/// Key of a definition derived from a source [`CustomRuleDefinition`] (refer to [`CustomRuleSpecializer::derived`]). It
-/// contains only static information about the derived calls, so that calls whose primal regions differ share one
-/// derived definition.
+/// Key of a definition derived from a source [`CustomRuleDefinition`] (refer to
+/// [`CustomRuleSpecializer::derived`](specialization::CustomRuleSpecializer::derived)). It contains only static
+/// information about the derived calls, so that calls whose primal regions differ share one derived definition.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CustomRuleDerivationKey {
+pub(super) struct CustomRuleDerivationKey {
     /// Kind of the derived calls.
     pub(super) kind: CustomRuleDerivationKind,
 
@@ -408,7 +409,7 @@ enum CustomRuleSpecializationRequest<T> {
 
 /// Program produced by specializing a retained custom rule, together with the batch axes of its outputs at the
 /// outermost batching level of its key (which are empty for an unbatched specialization).
-pub struct CustomRuleSpecialization<V: Typed + Parameter, O> {
+pub(super) struct CustomRuleSpecialization<V: Typed + Parameter, O> {
     /// Specialized program.
     pub(super) program: Program<V, O, Vec<V>, Vec<V>>,
 
@@ -430,7 +431,7 @@ impl<V: Typed + Parameter, O> CustomRuleSpecialization<V, O> {
 }
 
 /// Shared [`CustomRuleSpecialization`], as retained by the specialization caches of a [`CustomRuleDefinition`].
-pub type CustomRuleProgram<V, O> = Arc<CustomRuleSpecialization<V, O>>;
+pub(super) type CustomRuleProgram<V, O> = Arc<CustomRuleSpecialization<V, O>>;
 
 #[cfg(test)]
 mod tests {
