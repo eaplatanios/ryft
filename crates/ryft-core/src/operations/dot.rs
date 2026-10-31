@@ -800,23 +800,35 @@ impl Display for RaggedDotMode {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Dimension number specification for a grouped generalized dot product operation. The ordinary [`DotDimensionNumbers`]
-/// describe the contraction and batching axes. Exactly one left-hand side axis is marked ragged, and right-hand side
-/// group dimensions identify the explicit group axis used by non-contracting ragged dots. Refer to
-/// [`RaggedDotOperation`] for the semantics of each [`RaggedDotMode`].
+/// Dimension numbers of a grouped generalized dot operation (i.e., a [`RaggedDotOperation`]). They extend the ordinary
+/// [`DotDimensionNumbers`], which describe the contracting and batching axes, with the axes that carry the groups.
+///
+///   - The left-hand side ragged dimension is the single left-hand side axis that the group sizes input partitions
+///     into consecutive groups. Its role among the dot dimensions selects the [`RaggedDotMode`].
+///   - The optional right-hand side group dimension is the right-hand side axis that indexes groups. A valid
+///     non-contracting specification has one, which must be neither a batching nor a contracting axis, and the
+///     contracting and batching modes have none.
+///
+/// These fields correspond to the `lhs_ragged_dimensions` and `rhs_group_dimensions` lists of JAX's
+/// [`ragged_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ragged_dot_general.html) and of
+/// `chlo.ragged_dot`, which mirror the repeated fields of XLA's `RaggedDotDimensionNumbers` proto but accept exactly
+/// one ragged dimension and at most one group dimension. Construction stores the specification without validating it.
+/// [`Self::mode`] validates the ragged dimension, and [`RaggedDotOperation`] validates the complete specification
+/// against the input types before execution or staging.
+///
+/// For example, [`Self::matmul`] describes `[M, K] × [G, K, N] → [M, N]`, which partitions `M` into `G` groups and
+/// contracts each group with its own `[K, N]` slice of the right-hand side. Refer to [`RaggedDotOperation`] for the
+/// semantics of each mode.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotDimensionNumbers {
     /// Underlying generalized dot dimension numbers.
     dot_dimensions: DotDimensionNumbers,
 
-    /// Left-hand side axes marked ragged. Type inference requires exactly one entry.
-    lhs_ragged_dimensions: Vec<usize>,
+    /// Left-hand side axis that the group sizes partition into consecutive groups.
+    lhs_ragged_dimension: usize,
 
-    /// Right-hand side axes indexing groups. Non-contracting mode requires exactly one, and the other modes require
-    /// none.
-    rhs_group_dimensions: Vec<usize>,
+    /// Right-hand side axis that indexes groups. Non-contracting mode requires one, and the other modes require none.
+    rhs_group_dimension: Option<usize>,
 }
 
 impl RaggedDotDimensionNumbers {
@@ -824,16 +836,16 @@ impl RaggedDotDimensionNumbers {
     #[inline]
     pub fn new(
         dot_dimensions: DotDimensionNumbers,
-        lhs_ragged_dimensions: Vec<usize>,
-        rhs_group_dimensions: Vec<usize>,
+        lhs_ragged_dimension: usize,
+        rhs_group_dimension: Option<usize>,
     ) -> Self {
-        Self { dot_dimensions, lhs_ragged_dimensions, rhs_group_dimensions }
+        Self { dot_dimensions, lhs_ragged_dimension, rhs_group_dimension }
     }
 
     /// Returns the specification of the basic non-contracting matrix form `[M, K] × [G, K, N] → [M, N]`.
     #[inline]
     pub fn matmul() -> Self {
-        Self::new(DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()), vec![0], vec![0])
+        Self::new(DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()), 0, Some(0))
     }
 
     /// Returns the underlying generalized dot dimension numbers.
@@ -842,33 +854,26 @@ impl RaggedDotDimensionNumbers {
         &self.dot_dimensions
     }
 
-    /// Returns the left-hand side ragged dimensions.
+    /// Returns the left-hand side ragged dimension.
     #[inline]
-    pub fn lhs_ragged_dimensions(&self) -> &[usize] {
-        &self.lhs_ragged_dimensions
+    pub fn lhs_ragged_dimension(&self) -> usize {
+        self.lhs_ragged_dimension
     }
 
-    /// Returns the right-hand side group dimensions.
+    /// Returns the right-hand side group dimension, if any.
     #[inline]
-    pub fn rhs_group_dimensions(&self) -> &[usize] {
-        &self.rhs_group_dimensions
+    pub fn rhs_group_dimension(&self) -> Option<usize> {
+        self.rhs_group_dimension
     }
 
-    /// Classifies this specification according to the role of its single left-hand side ragged dimension for a
-    /// left-hand side with rank `lhs_rank`. [`RaggedDotOperation`] validates the remaining dimension number
-    /// constraints.
+    /// Classifies this specification according to the role of its left-hand side ragged dimension for a left-hand
+    /// side with rank `lhs_rank`. [`RaggedDotOperation`] validates the remaining dimension number constraints.
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] when there is not exactly one ragged dimension or when its index is outside `lhs_rank`.
+    /// Returns a [`TypeError`] when the ragged dimension is outside `lhs_rank`.
     pub fn mode(&self, lhs_rank: usize) -> Result<RaggedDotMode, TypeError> {
-        if self.lhs_ragged_dimensions.len() != 1 {
-            return Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` expects exactly one LHS ragged dimension, but got {}",
-                self.lhs_ragged_dimensions.len(),
-            )));
-        }
-        let axis = self.lhs_ragged_dimensions[0];
+        let axis = self.lhs_ragged_dimension;
         if axis >= lhs_rank {
             return Err(TypeError::invalid(format!(
                 "`{RAGGED_DOT_OPERATION_NAME}` LHS ragged dimension {axis} is out of bounds for rank {lhs_rank}",
@@ -893,7 +898,7 @@ impl RaggedDotDimensionNumbers {
     /// Returns a [`TypeError`] for an invalid ragged dimension or for invalid left batching or contracting indices.
     pub fn group_sizes_prefix_dimensions(&self, lhs_rank: usize) -> Result<Vec<usize>, TypeError> {
         let mode = self.mode(lhs_rank)?;
-        let ragged_axis = self.lhs_ragged_dimensions[0];
+        let ragged_axis = self.lhs_ragged_dimension;
         let dimensions = self.dot_dimensions();
         validate_dot_axes(
             RAGGED_DOT_OPERATION_NAME,
@@ -931,24 +936,47 @@ impl RaggedDotDimensionNumbers {
         })
     }
 
-    /// Validates every ordinary, ragged, and group axis before dimension number lifting, returning the ragged mode.
-    fn validate_for_ranks(&self, lhs_rank: usize, rhs_rank: usize) -> Result<RaggedDotMode, TypeError> {
+    /// Validates this specification against the ranks of the left-hand side and right-hand side inputs before
+    /// indexing or lifting, and returns its [`RaggedDotMode`]. The underlying [`DotDimensionNumbers`] must pass
+    /// [`DotDimensionNumbers::validate`], and the ragged dimension must be within the left-hand side rank. A
+    /// non-contracting specification must have a group dimension within the right-hand side rank that is neither a
+    /// batching nor a contracting axis, and the contracting and batching modes must have none.
+    ///
+    /// Validation covers dimension indices. The operation's type inference additionally validates paired extents,
+    /// the group sizes input, element types, and sharding.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{RaggedDotDimensionNumbers, RaggedDotMode};
+    /// assert_eq!(RaggedDotDimensionNumbers::matmul().validate(2, 3), Ok(RaggedDotMode::NonContracting));
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `lhs_rank`: Rank of the left-hand side input.
+    ///   - `rhs_rank`: Rank of the right-hand side input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the underlying dot dimension numbers are invalid, the ragged or group dimension is
+    /// out of bounds, the group dimension is a batching or contracting axis, or the presence of the group dimension
+    /// does not match the mode.
+    pub fn validate(&self, lhs_rank: usize, rhs_rank: usize) -> Result<RaggedDotMode, TypeError> {
         self.dot_dimensions.validate(RAGGED_DOT_OPERATION_NAME, lhs_rank, rhs_rank)?;
         let mode = self.mode(lhs_rank)?;
-        let rhs_group_dimensions = self.rhs_group_dimensions();
-        match mode {
-            RaggedDotMode::NonContracting => {
-                if rhs_group_dimensions.len() != 1 {
-                    return Err(TypeError::invalid(format!(
-                        "`{RAGGED_DOT_OPERATION_NAME}` requires exactly one RHS group dimension when the LHS ragged \
-                         dimension is non-contracting",
-                    )));
-                }
-                let group_axis = rhs_group_dimensions[0];
+        match (mode, self.rhs_group_dimension) {
+            (RaggedDotMode::NonContracting, None) => {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` requires an RHS group dimension when the LHS ragged dimension is \
+                     non-contracting",
+                )));
+            }
+            (RaggedDotMode::NonContracting, Some(group_axis)) => {
                 if group_axis >= rhs_rank {
                     return Err(TypeError::invalid(format!(
-                        "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension {group_axis} is out of bounds for rank \
-                         {rhs_rank}",
+                        "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension {group_axis} is out of bounds \
+                         for rank {rhs_rank}",
                     )));
                 }
                 let dot_dimensions = self.dot_dimensions();
@@ -961,16 +989,18 @@ impl RaggedDotDimensionNumbers {
                     )));
                 }
             }
-            RaggedDotMode::Contracting | RaggedDotMode::Batch if !rhs_group_dimensions.is_empty() => {
+            (RaggedDotMode::Contracting | RaggedDotMode::Batch, Some(_)) => {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` requires zero RHS group dimensions when the LHS ragged dimension is \
-                     contracting or batching",
+                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept an RHS group dimension when the LHS ragged \
+                     dimension is contracting or batching",
                 )));
             }
-            RaggedDotMode::Contracting | RaggedDotMode::Batch => {}
+            (RaggedDotMode::Contracting | RaggedDotMode::Batch, None) => {}
         }
         Ok(mode)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
     /// cotangent `ā` of its linear left-hand side `a`, together with the axes of `a` in the order in which that adjoint
@@ -987,13 +1017,12 @@ impl RaggedDotDimensionNumbers {
         let rhs_result_dimensions = dot_dimensions
             .rhs_result_dimensions(rhs_rank)
             .into_iter()
-            .filter(|axis| !self.rhs_group_dimensions.contains(axis))
+            .filter(|axis| self.rhs_group_dimension != Some(*axis))
             .collect::<Vec<_>>();
         let batching_count = dot_dimensions.lhs_batching_dimensions().len();
         let cotangent_rhs_result_start = batching_count + lhs_result_dimensions.len();
-        let lhs_ragged_axis = self.lhs_ragged_dimensions[0];
         let ragged_output_axis =
-            batching_count + lhs_result_dimensions.iter().position(|axis| *axis == lhs_ragged_axis).unwrap();
+            batching_count + lhs_result_dimensions.iter().position(|axis| *axis == self.lhs_ragged_dimension).unwrap();
         let dimensions = Self::new(
             DotDimensionNumbers::new(
                 (cotangent_rhs_result_start..(cotangent_rhs_result_start + rhs_result_dimensions.len())).collect(),
@@ -1001,8 +1030,8 @@ impl RaggedDotDimensionNumbers {
                 (0..batching_count).collect(),
                 dot_dimensions.rhs_batching_dimensions().to_vec(),
             ),
-            vec![ragged_output_axis],
-            self.rhs_group_dimensions.clone(),
+            ragged_output_axis,
+            self.rhs_group_dimension,
         );
         let mut contracting_pairs = dot_dimensions
             .lhs_contracting_dimensions()
@@ -1036,7 +1065,7 @@ impl RaggedDotDimensionNumbers {
         let rhs_result_dimensions = dot_dimensions
             .rhs_result_dimensions(rhs_rank)
             .into_iter()
-            .filter(|axis| !self.rhs_group_dimensions.contains(axis))
+            .filter(|axis| self.rhs_group_dimension != Some(*axis))
             .collect::<Vec<_>>();
         let batching_count = dot_dimensions.lhs_batching_dimensions().len();
         let cotangent_lhs_result_count = lhs_result_dimensions.len();
@@ -1047,8 +1076,8 @@ impl RaggedDotDimensionNumbers {
                 dot_dimensions.lhs_batching_dimensions().to_vec(),
                 (0..batching_count).collect(),
             ),
-            self.lhs_ragged_dimensions.clone(),
-            Vec::new(),
+            self.lhs_ragged_dimension,
+            None,
         );
         let mut contracting_pairs = dot_dimensions
             .rhs_contracting_dimensions()
@@ -1058,9 +1087,8 @@ impl RaggedDotDimensionNumbers {
             .collect::<Vec<_>>();
         contracting_pairs.sort_by_key(|(_, lhs_axis)| *lhs_axis);
         let output_axes = self
-            .rhs_group_dimensions
-            .iter()
-            .copied()
+            .rhs_group_dimension
+            .into_iter()
             .chain(dot_dimensions.rhs_batching_dimensions().iter().copied())
             .chain(contracting_pairs.into_iter().map(|(rhs_axis, _)| rhs_axis))
             .chain(rhs_result_dimensions)
@@ -1071,18 +1099,20 @@ impl RaggedDotDimensionNumbers {
 
 impl Display for RaggedDotDimensionNumbers {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The group dimension is rendered only when present, like the optional fields of operation renderings.
         write!(
             formatter,
-            "(lhs_contracting={:?}, rhs_contracting={:?}, \
-             lhs_batching={:?}, rhs_batching={:?}, \
-             lhs_ragged={:?}, rhs_group={:?})",
+            "(lhs_contracting={:?}, rhs_contracting={:?}, lhs_batching={:?}, rhs_batching={:?}, lhs_ragged={}",
             self.dot_dimensions.lhs_contracting_dimensions,
             self.dot_dimensions.rhs_contracting_dimensions,
             self.dot_dimensions.lhs_batching_dimensions,
             self.dot_dimensions.rhs_batching_dimensions,
-            self.lhs_ragged_dimensions,
-            self.rhs_group_dimensions,
-        )
+            self.lhs_ragged_dimension,
+        )?;
+        if let Some(rhs_group_dimension) = self.rhs_group_dimension {
+            write!(formatter, ", rhs_group={rhs_group_dimension}")?;
+        }
+        formatter.write_str(")")
     }
 }
 
@@ -1186,7 +1216,7 @@ impl Operation for RaggedDotOperation {
             )));
         }
 
-        let mode = dimensions.validate_for_ranks(lhs.rank(), rhs.rank())?;
+        let mode = dimensions.validate(lhs.rank(), rhs.rank())?;
         let mut output =
             infer_dot_output_type(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None)?;
         let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
@@ -1201,16 +1231,14 @@ impl Operation for RaggedDotOperation {
             }
         }
         let group_count = group_sizes.dimension(group_sizes.rank() - 1);
-        let rhs_group_dimensions = dimensions.rhs_group_dimensions();
-        if mode == RaggedDotMode::NonContracting {
-            let group_axis = rhs_group_dimensions[0];
-            if rhs.dimension(group_axis) != group_count {
-                return Err(TypeError::invalid(format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent {} but group sizes describe \
-                     {group_count}",
-                    rhs.dimension(group_axis),
-                )));
-            }
+        if let Some(group_axis) = dimensions.rhs_group_dimension()
+            && rhs.dimension(group_axis) != group_count
+        {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent {} but group sizes describe \
+                 {group_count}",
+                rhs.dimension(group_axis),
+            )));
         }
         if mode != RaggedDotMode::Batch && lhs.data_type() == DataType::F8E8M0FNU {
             return Err(TypeError::invalid(format!(
@@ -1221,7 +1249,8 @@ impl Operation for RaggedDotOperation {
         match mode {
             RaggedDotMode::NonContracting => {
                 let rhs_result = dimensions.dot_dimensions().rhs_result_dimensions(rhs.rank());
-                let group_position = rhs_result.iter().position(|axis| *axis == rhs_group_dimensions[0]).unwrap();
+                let group_position =
+                    rhs_result.iter().position(|axis| Some(*axis) == dimensions.rhs_group_dimension()).unwrap();
                 let output_axis = dimensions.dot_dimensions().lhs_batching_dimensions().len()
                     + dimensions.dot_dimensions().lhs_result_dimensions(lhs.rank()).len()
                     + group_position;
@@ -1275,9 +1304,7 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 3, ProgramError);
-        let mode = self
-            .dimensions
-            .validate_for_ranks(inputs[0].unbatched_type().rank(), inputs[1].unbatched_type().rank())?;
+        let mode = self.dimensions.validate(inputs[0].unbatched_type().rank(), inputs[1].unbatched_type().rank())?;
         if inputs.iter().all(|input| input.batch_axis_position().is_none()) {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         }
@@ -1290,8 +1317,8 @@ where
         let (dot_dimensions, _) = self.dimensions.dot_dimensions().batched(Some(0), Some(0)).unwrap();
         let dimensions = RaggedDotDimensionNumbers::new(
             dot_dimensions,
-            self.dimensions.lhs_ragged_dimensions().iter().map(|axis| axis + 1).collect(),
-            self.dimensions.rhs_group_dimensions().iter().map(|axis| axis + 1).collect(),
+            self.dimensions.lhs_ragged_dimension() + 1,
+            self.dimensions.rhs_group_dimension().map(|axis| axis + 1),
         );
 
         // Replicated rank-one group sizes are shared by every prefix of the lifted operation as well, so they need no
@@ -2058,7 +2085,7 @@ impl Array {
         )?;
         let output_type = output_types.remove(0);
         let dot_dimensions = dimensions.dot_dimensions();
-        let ragged_axis = dimensions.lhs_ragged_dimensions()[0];
+        let ragged_axis = dimensions.lhs_ragged_dimension();
         let mode = dimensions.mode(self.r#type().rank())?;
         if mode == RaggedDotMode::Batch {
             return self.dot_elements::<T>(rhs, dot_dimensions, None);
@@ -2109,7 +2136,7 @@ impl Array {
         // Non-contracting groups contract one RHS group slice, which drops the group axis and keeps a unit extent on
         // every batching axis that belongs to the group sizes prefix.
         let non_contracting_metadata = (mode == RaggedDotMode::NonContracting).then(|| {
-            let rhs_group_axis = dimensions.rhs_group_dimensions()[0];
+            let rhs_group_axis = dimensions.rhs_group_dimension().unwrap();
             let rhs_slice_shape = Shape::new(
                 rhs_shape
                     .dimensions()
@@ -4424,21 +4451,21 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_dimension_numbers_new() {
-        let dimensions = RaggedDotDimensionNumbers::new(DotDimensionNumbers::inner_product(), vec![0], vec![]);
+        let dimensions = RaggedDotDimensionNumbers::new(DotDimensionNumbers::inner_product(), 0, None);
         assert_eq!(dimensions.dot_dimensions(), &DotDimensionNumbers::inner_product());
-        assert_eq!(dimensions.lhs_ragged_dimensions(), &[0]);
-        assert!(dimensions.rhs_group_dimensions().is_empty());
+        assert_eq!(dimensions.lhs_ragged_dimension(), 0);
+        assert_eq!(dimensions.rhs_group_dimension(), None);
         let dimensions = RaggedDotDimensionNumbers::matmul();
         assert_eq!(
             dimensions.to_string(),
-            "(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], lhs_ragged=[0], \
-             rhs_group=[0])",
+            "(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], lhs_ragged=0, \
+             rhs_group=0)",
         );
         assert_eq!(
             format!("{dimensions:?}"),
             "RaggedDotDimensionNumbers { dot_dimensions: DotDimensionNumbers { lhs_contracting_dimensions: [1], \
              rhs_contracting_dimensions: [1], lhs_batching_dimensions: [], rhs_batching_dimensions: [] }, \
-             lhs_ragged_dimensions: [0], rhs_group_dimensions: [0] }",
+             lhs_ragged_dimension: 0, rhs_group_dimension: Some(0) }",
         );
     }
 
@@ -4446,11 +4473,7 @@ mod tests {
     fn test_ragged_dot_dimension_numbers_matmul() {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul(),
-            RaggedDotDimensionNumbers::new(
-                DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]),
-                vec![0],
-                vec![0],
-            ),
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]), 0, Some(0),),
         );
     }
 
@@ -4458,19 +4481,12 @@ mod tests {
     fn test_ragged_dot_dimension_numbers_mode() {
         assert_eq!(RaggedDotDimensionNumbers::matmul().mode(2), Ok(RaggedDotMode::NonContracting));
         assert_eq!(
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::inner_product(), vec![0], vec![]).mode(1),
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::inner_product(), 0, None).mode(1),
             Ok(RaggedDotMode::Contracting),
         );
         assert_eq!(
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![], vec![], vec![0], vec![0]), vec![0], vec![])
-                .mode(1),
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![], vec![], vec![0], vec![0]), 0, None).mode(1),
             Ok(RaggedDotMode::Batch),
-        );
-        assert_eq!(
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::default(), vec![], vec![]).mode(2),
-            Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` expects exactly one LHS ragged dimension, but got 0",
-            ))),
         );
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().mode(0),
@@ -4482,33 +4498,80 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_dimension_numbers_group_sizes_prefix_dimensions() {
-        let noncontracting = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![3], vec![0], vec![1], vec![1]),
-            vec![2],
-            vec![2],
-        );
+        let noncontracting =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![3], vec![0], vec![1], vec![1]), 2, Some(2));
         assert_eq!(noncontracting.group_sizes_prefix_dimensions(4), Ok(vec![1, 0]));
-        let contracting = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![3, 0], vec![0, 2], vec![1], vec![1]),
-            vec![0],
-            vec![],
-        );
+        let contracting =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![3, 0], vec![0, 2], vec![1], vec![1]), 0, None);
         assert_eq!(contracting.group_sizes_prefix_dimensions(4), Ok(vec![1, 3]));
-        let batching = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![], vec![], vec![2, 0], vec![1, 0]),
-            vec![0],
-            vec![],
-        );
+        let batching =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![], vec![], vec![2, 0], vec![1, 0]), 0, None);
         assert_eq!(batching.group_sizes_prefix_dimensions(3), Ok(vec![2]));
         // Invalid LHS batching or contracting indices are rejected before they index the prefix.
-        let invalid = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]),
-            vec![0],
-            vec![0],
-        );
+        let invalid =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]), 0, Some(0));
         assert_eq!(
             invalid.group_sizes_prefix_dimensions(2),
             Err(TypeError::invalid(format!("`{RAGGED_DOT_OPERATION_NAME}` LHS dimension index out of bounds"))),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dot_dimension_numbers_validate() {
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]);
+        assert_eq!(RaggedDotDimensionNumbers::matmul().validate(2, 3), Ok(RaggedDotMode::NonContracting));
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None).validate(2, 2),
+            Ok(RaggedDotMode::Contracting),
+        );
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, None)
+                .validate(2, 3),
+            Ok(RaggedDotMode::Batch),
+        );
+
+        // Invalid underlying dot dimension numbers are reported with the grouped operation name.
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![0]), 0, Some(0))
+                .validate(2, 3),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` batching dimensions have different lengths on the two inputs",
+            ))),
+        );
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(dimensions.clone(), 2, Some(0)).validate(2, 3),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` LHS ragged dimension 2 is out of bounds for rank 2",
+            ))),
+        );
+
+        // The group dimension must be present exactly in non-contracting mode and must index a result axis.
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(dimensions.clone(), 0, None).validate(2, 3),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` requires an RHS group dimension when the LHS ragged dimension is \
+                 non-contracting",
+            ))),
+        );
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(dimensions.clone(), 0, Some(3)).validate(2, 3),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension 3 is out of bounds for rank 3",
+            ))),
+        );
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(dimensions, 0, Some(1)).validate(2, 3),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension must be distinct from batching and contracting \
+                 dimensions",
+            ))),
+        );
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, Some(1)).validate(2, 2),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` does not accept an RHS group dimension when the LHS ragged dimension \
+                 is contracting or batching",
+            ))),
         );
     }
 
@@ -4518,11 +4581,7 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().lhs_cotangent_dimensions(2, 3),
             (
-                RaggedDotDimensionNumbers::new(
-                    DotDimensionNumbers::new(vec![1], vec![2], vec![], vec![]),
-                    vec![0],
-                    vec![0],
-                ),
+                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![2], vec![], vec![]), 0, Some(0),),
                 vec![0, 1],
             ),
         );
@@ -4534,11 +4593,7 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().rhs_cotangent_dimensions(2, 3),
             (
-                RaggedDotDimensionNumbers::new(
-                    DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]),
-                    vec![0],
-                    vec![],
-                ),
+                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]), 0, None,),
                 vec![0, 1, 2],
             ),
         );
@@ -4556,7 +4611,7 @@ mod tests {
             indoc! {"
                 ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], \
-                        lhs_ragged=[0], rhs_group=[0]),
+                        lhs_ragged=0, rhs_group=0),
                 ]
             "}
             .trim_end(),
@@ -4565,7 +4620,7 @@ mod tests {
             format!("{operation:?}"),
             "RaggedDotOperation { dimensions: RaggedDotDimensionNumbers { dot_dimensions: DotDimensionNumbers { \
              lhs_contracting_dimensions: [1], rhs_contracting_dimensions: [1], lhs_batching_dimensions: [], \
-             rhs_batching_dimensions: [] }, lhs_ragged_dimensions: [0], rhs_group_dimensions: [0] } }",
+             rhs_batching_dimensions: [] }, lhs_ragged_dimension: 0, rhs_group_dimension: Some(0) } }",
         );
 
         // Program rendering uses the canonical operation name and includes the dimension numbers.
@@ -4580,7 +4635,7 @@ mod tests {
                 lambda %0:f32[3, 2], %1:f32[2, 2, 1], %2:i32[2] .
                 let %3:f32[3, 1] = ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], \
-                        lhs_ragged=[0], rhs_group=[0]),
+                        lhs_ragged=0, rhs_group=0),
                 ] %0 %1 %2
                 in (%3)
             "}
@@ -4639,22 +4694,22 @@ mod tests {
         check_operation_type_inference!(
             operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
                 DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-                vec![0],
-                Vec::new(),
+                0,
+                None,
             )),
             cases = [{
                 input_types = [plain_array(&[5, 2]), plain_array(&[3, 2, 4]), group_sizes.clone()],
                 error = format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` requires exactly one RHS group dimension when the LHS ragged \
-                     dimension is non-contracting",
+                    "`{RAGGED_DOT_OPERATION_NAME}` requires an RHS group dimension when the LHS ragged dimension \
+                     is non-contracting",
                 ),
             }],
         );
 
         let contracting = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            vec![1],
-            Vec::new(),
+            1,
+            None,
         ));
         check_operation_type_inference!(
             operation = contracting,
@@ -4688,22 +4743,22 @@ mod tests {
         check_operation_type_inference!(
             operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
                 DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-                vec![1],
-                vec![1],
+                1,
+                Some(1),
             )),
             cases = [{
                 input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), group_sizes.clone()],
                 error = format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` requires zero RHS group dimensions when the LHS ragged dimension is \
-                         contracting or batching",
+                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept an RHS group dimension when the LHS ragged \
+                     dimension is contracting or batching",
                 ),
             }],
         );
 
         let batch = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-            vec![0],
-            Vec::new(),
+            0,
+            None,
         ));
         check_operation_type_inference!(
             operation = batch,
@@ -4725,8 +4780,8 @@ mod tests {
 
         let prefixed = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            vec![1],
-            vec![0],
+            1,
+            Some(0),
         ));
         check_operation_type_inference!(
             operation = prefixed,
@@ -4758,8 +4813,8 @@ mod tests {
 
         let prefixed_contracting = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]),
-            vec![2],
-            Vec::new(),
+            2,
+            None,
         ));
         check_operation_type_inference!(
             operation = prefixed_contracting,
@@ -4775,8 +4830,8 @@ mod tests {
 
         let prefixed_batch = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]),
-            vec![1],
-            Vec::new(),
+            1,
+            None,
         ));
         check_operation_type_inference!(
             operation = prefixed_batch,
@@ -4793,11 +4848,8 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_type_inference_rejects_invalid_prefix_axes() {
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]),
-            vec![0],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]), 0, Some(0));
         check_operation_type_inference!(
             operation = RaggedDotOperation::new(dimensions),
             cases = [{
@@ -4863,11 +4915,8 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_interpretation_contracting_batch_and_group_prefixes() {
-        let contracting_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            vec![1],
-            Vec::new(),
-        );
+        let contracting_dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()), 1, None);
         let lhs = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let rhs = Array::matrix(4, 1, vec![10.0f32, 20.0, 30.0, 40.0]).unwrap();
         let output = lhs
@@ -4887,8 +4936,8 @@ mod tests {
 
         let prefixed_contracting_dimensions = RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![0, 1], vec![0, 1], Vec::new(), Vec::new()),
-            vec![1],
-            Vec::new(),
+            1,
+            None,
         );
         let lhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let rhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[10.0, 20.0, 30.0, 1.0, 2.0, 3.0]).unwrap();
@@ -4899,11 +4948,8 @@ mod tests {
         let group_sizes = Array::matrix(2, 2, vec![2i32, 3, 4, 1]).unwrap();
         let output = lhs.ragged_dot_general(&rhs, &group_sizes, &prefixed_contracting_dimensions).unwrap();
         assert_eq!(output, Array::from_elements(plain_array(&[2, 1, 1]), &[82.0f32, 90.0]).unwrap());
-        let batch_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-            vec![0],
-            Vec::new(),
-        );
+        let batch_dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, None);
         let lhs = Array::matrix(4, 1, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let rhs = Array::from_elements::<f32>(plain_array(&[4, 1, 1]), &[10.0, 20.0, 30.0, 40.0]).unwrap();
         // Batch mode is the ordinary batched dot, so group size values do not participate in its runtime semantics.
@@ -4925,11 +4971,8 @@ mod tests {
         .unwrap();
         let output = lhs.ragged_dot_general(&rhs, &Array::vector(vec![-1i32]).unwrap(), &batch_dimensions).unwrap();
         assert_eq!(output.to_f64s(), vec![2.0, 8.0]);
-        let prefixed_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            vec![1],
-            vec![0],
-        );
+        let prefixed_dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
         let lhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let rhs = Array::from_elements::<f32>(plain_array(&[2, 2, 1, 1]), &[10.0, 100.0, 20.0, 200.0]).unwrap();
         let group_sizes = Array::matrix(2, 2, vec![1i32, 1, 2, 0]).unwrap();
@@ -4937,11 +4980,8 @@ mod tests {
         assert_eq!(output.r#type().into_owned(), plain_array(&[2, 3, 1]));
         assert_eq!(output.to_f64s(), vec![10.0, 40.0, 0.0, 400.0, 500.0, 0.0]);
 
-        let prefixed_batch_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]),
-            vec![1],
-            Vec::new(),
-        );
+        let prefixed_batch_dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]), 1, None);
         let lhs =
             Array::from_elements::<f32>(plain_array(&[2, 4, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let rhs =
@@ -4959,11 +4999,8 @@ mod tests {
         let left =
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, extent, extent, 1]), &[]).unwrap();
         let right = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 0, 0]), &[]).unwrap();
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![0], vec![1], vec![], vec![]),
-            vec![3],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![0], vec![1], vec![], vec![]), 3, Some(0));
         assert_eq!(
             left.ragged_dot_general(&right, &Array::vector(vec![1i32]).unwrap(), &dimensions),
             Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [extent, extent, 1, 0]), &[]).unwrap()),
@@ -5014,8 +5051,8 @@ mod tests {
 
         let contracting_operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            vec![1],
-            Vec::new(),
+            1,
+            None,
         ));
         let contracting_lhs = ArrayBatch::new(
             Array::from_elements::<f32>(
@@ -5056,8 +5093,8 @@ mod tests {
         let sizes = ArrayBatch::new(Array::matrix(2, 1, vec![1i32, 1]).unwrap(), BatchAxis::new(0)).unwrap();
         let operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![usize::MAX], vec![1], vec![], vec![]),
-            vec![0],
-            vec![0],
+            0,
+            Some(0),
         ));
         let inputs = [left, right, sizes];
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
@@ -5069,8 +5106,8 @@ mod tests {
         );
         let invalid_group = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]),
-            vec![0],
-            vec![usize::MAX],
+            0,
+            Some(usize::MAX),
         ));
         assert_eq!(
             invalid_group.batch(&context, &EmptyRegionDriver, &inputs),
@@ -5166,8 +5203,8 @@ mod tests {
             @exact,
             operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
                 DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-                vec![1],
-                vec![0],
+                1,
+                Some(0),
             )),
             axis_size = 2,
             cases = [
@@ -5284,8 +5321,8 @@ mod tests {
                 let mut outputs = lhs.domain().bind(
                     RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
                         DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-                        vec![1],
-                        vec![0],
+                        1,
+                        Some(0),
                     )),
                     Vec::new(),
                     &[lhs, rhs, group_sizes],
@@ -5319,7 +5356,7 @@ mod tests {
                     %13:i32[batch, 2, 2] = broadcast [output_axes=[0, 2]] %2 %3 %11 %12
                     %14:f32[batch, 2, 3, 1] = ragged_dot_general [
                         dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 1], \
-                            rhs_batching=[0, 2], lhs_ragged=[2], rhs_group=[1]),
+                            rhs_batching=[0, 2], lhs_ragged=2, rhs_group=1),
                     ] %0 %10 %13
                 in (%14)
             "}
@@ -5437,15 +5474,15 @@ mod tests {
                 let %4:i32[2] = const [1, 2]
                     %5:f32[3, 1] = ragged_dot_general [
                         dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
-                            rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
+                            rhs_batching=[], lhs_ragged=0, rhs_group=0),
                     ] %0 %1 %4
                     %6:f32[3, 1] = ragged_dot_general [
                         dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
-                            rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
+                            rhs_batching=[], lhs_ragged=0, rhs_group=0),
                     ] %2 %1 %4
                     %7:f32[3, 1] = ragged_dot_general [
                         dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
-                            rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
+                            rhs_batching=[], lhs_ragged=0, rhs_group=0),
                     ] %0 %3 %4
                     %8:f32[3, 1] = add %6 %7
                 in (%5, %8)
@@ -5470,11 +5507,8 @@ mod tests {
     fn test_ragged_dot_differentiation_widened_tangents() {
         let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
         let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2, 1]);
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-            vec![0],
-            Vec::new(),
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, None);
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let lhs = builder.add_input(lhs_type.clone());
         let rhs = builder.add_input(rhs_type.clone());
@@ -5494,7 +5528,7 @@ mod tests {
             let %2:i32[2] = const [1, 2]
                 %3:f8e8m0fnu[3, 1] = ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
+                        rhs_batching=[0], lhs_ragged=0),
                 ] %0 %1 %2
             in (%3)
             "}
@@ -5507,17 +5541,17 @@ mod tests {
             let %4:i32[2] = const [1, 2]
                 %5:f8e8m0fnu[3, 1] = ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
+                        rhs_batching=[0], lhs_ragged=0),
                 ] %0 %1 %4
                 %6:f32[3, 2, 1] = convert_element_type [data_type=f32] %1
                 %7:f32[3, 1] = ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
+                        rhs_batching=[0], lhs_ragged=0),
                 ] %2 %6 %4
                 %8:f32[3, 2] = convert_element_type [data_type=f32] %0
                 %9:f32[3, 1] = ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=[0], rhs_group=[]),
+                        rhs_batching=[0], lhs_ragged=0),
                 ] %8 %3 %4
                 %10:f32[3, 1] = add %7 %9
             in (%5, %10)
@@ -5583,7 +5617,7 @@ mod tests {
                 let %2:i32[2] = const [1, 2]
                     %3:f32[3, 2] = ragged_dot_general [
                         dimensions=(lhs_contracting=[1], rhs_contracting=[2], lhs_batching=[], \
-                        rhs_batching=[], lhs_ragged=[0], rhs_group=[0]),
+                        rhs_batching=[], lhs_ragged=0, rhs_group=0),
                     ] %0 %1 %2
                 in (%3)
             "}
@@ -5621,11 +5655,8 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_transposition_inverts_permuted_output_axes() {
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![2], vec![2]),
-            vec![0],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![2], vec![2]), 0, Some(0));
         let lhs = Array::from_elements::<f32>(
             plain_array(&[3, 2, 2]),
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
@@ -5682,8 +5713,8 @@ mod tests {
             (
                 RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
                     DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-                    vec![1],
-                    Vec::new(),
+                    1,
+                    None,
                 )),
                 [plain_array(&[2, 5]), plain_array(&[5, 4]), ArrayType::new_static(DataType::I32, [3])],
                 RaggedDotMode::Contracting,
@@ -5691,8 +5722,8 @@ mod tests {
             (
                 RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
                     DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-                    vec![0],
-                    Vec::new(),
+                    0,
+                    None,
                 )),
                 [plain_array(&[5, 2]), plain_array(&[5, 2, 4]), ArrayType::new_static(DataType::I32, [3])],
                 RaggedDotMode::Batch,
@@ -5796,8 +5827,8 @@ mod tests {
         let accumulators = context.cotangent_accumulators(&inputs, &[true, false, false]).unwrap();
         let operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![4], vec![1], vec![], vec![]),
-            vec![0],
-            vec![0],
+            0,
+            Some(0),
         ));
         assert_eq!(
             operation.transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators),
@@ -5828,7 +5859,7 @@ mod tests {
                 lambda %0:f32[3, 2], %1:f32[2, 2, 1], %2:i32[2] .
                 let %3:f32[3, 1] = ragged_dot_general [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[], \
-                        lhs_ragged=[0], rhs_group=[0]),
+                        lhs_ragged=0, rhs_group=0),
                 ] %0 %1 %2
                 in (%3)
             "}

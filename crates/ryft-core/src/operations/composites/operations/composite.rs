@@ -178,8 +178,6 @@ pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V
     marker: PhantomData<fn() -> O>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
     CompositeOperation<V, O, S>
 {
@@ -304,10 +302,11 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Returns a description of this call for diagnostics, which names the definition of retained rules unless it has
     /// the default name of [`Composite`](crate::Composite) functions.
+    #[inline]
     fn description(&self) -> String {
         match &self.rules {
             CompositeRules::Retained { rules, .. } if rules.name() != COMPOSITE_OPERATION_NAME => {
-                format!("a `{COMPOSITE_OPERATION_NAME}` call of `{}`", rules.name())
+                format!("a `{}` call of `{}`", COMPOSITE_OPERATION_NAME, rules.name())
             }
             _ => format!("a `{COMPOSITE_OPERATION_NAME}` call"),
         }
@@ -319,8 +318,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         matches!(self.rules, CompositeRules::Attached { jvp_rule: CompositeJvpRule::Explicit, .. }).then_some(1)
     }
 
-    /// Returns the indices of the `"forward"` and `"backward"` rule regions, if this call has attached rules with
-    /// them.
+    /// Returns the indices of the `"forward"` and `"backward"` rule regions, if this call has attached rules with them.
     #[inline]
     fn vjp_region_indices(&self) -> Option<(usize, usize)> {
         let CompositeRules::Attached { has_vjp_rule: true, .. } = self.rules else {
@@ -338,15 +336,15 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         let input_count = values.len();
         if non_differentiated_count > input_count {
             return Err(TypeError::invalid(format!(
-                "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {non_differentiated_count} exceeds \
-                 input count {input_count}",
+                "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {non_differentiated_count} \
+                 exceeds input count {input_count}",
             )));
         }
         Ok(values.split_at(non_differentiated_count))
     }
 
-    /// Returns the specialization key of this call with retained rules, given the current types of its inputs and
-    /// outputs and which outputs of its rules it keeps (refer to the `kept_outputs` field of its retained rules).
+    /// Returns the specialization key of this [`CompositeOperation`] with retained rules, given the current types
+    /// of its inputs and outputs and which outputs of its rules it keeps.
     ///
     /// # Errors
     ///
@@ -380,8 +378,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     .checked_sub(batching.boundary_input_count())
                     .ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
-                            "batched {} has fewer non-differentiated inputs \
-                             than boundary inputs",
+                            "batched {} has fewer non-differentiated inputs than boundary inputs",
                             describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                         ))
                     })?,
@@ -394,6 +391,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Clone for CompositeOperation<V, O, S> {
+    #[inline]
     fn clone(&self) -> Self {
         Self { non_differentiated_count: self.non_differentiated_count, rules: self.rules.clone(), marker: PhantomData }
     }
@@ -427,6 +425,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug 
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> PartialEq for CompositeOperation<V, O, S> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.non_differentiated_count == other.non_differentiated_count && self.rules == other.rules
     }
@@ -435,6 +434,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Partia
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Eq for CompositeOperation<V, O, S> {}
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Hash for CompositeOperation<V, O, S> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.non_differentiated_count.hash(state);
         self.rules.hash(state);
@@ -495,8 +495,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
         if let Some((forward_region_index, _)) = self.vjp_region_indices() {
             // The primal and forward regions were traced independently, so each boundary owns its own formal
-            // identities. Derive each region's caller-specific renaming from its input boundary before using its
-            // outputs to construct the backward region's input signature.
+            // identities. Derive each region's caller-specific renaming from its input boundary before using
+            // its outputs to construct the backward region's input signature.
             let primal_interface = &region_interfaces[0];
             let forward_interface = &region_interfaces[forward_region_index];
             let primal_renaming = V::Type::derive_identity_renaming(primal_interface.input_types(), input_types)?;
@@ -667,14 +667,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 let input_count = input_types.len();
                 if self.non_differentiated_count > input_count {
                     return Err(TypeError::invalid(format!(
-                        "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {} exceeds input count \
-                         {input_count}",
-                        self.non_differentiated_count,
+                        "`{}` non-differentiated input count {} exceeds input count {}",
+                        COMPOSITE_OPERATION_NAME, self.non_differentiated_count, input_count,
                     )));
                 }
 
-                // A batched call's inputs start with the boundary inputs of its batching levels, followed by the inputs
-                // of the unbatched call (and `with_non_differentiated_count` keeps those boundary inputs
+                // A batched call's inputs start with the boundary inputs of its batching levels, followed by the
+                // inputs of the unbatched call (and `with_non_differentiated_count` keeps those boundary inputs
                 // non-differentiated).
                 if let Some(batching) = batching {
                     let boundary_input_count = batching.boundary_input_count();
@@ -689,16 +688,19 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                         )));
                     }
                 }
+
                 check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` input"), [
                     region_interfaces[0].input_types(),
                     input_types,
                 ]);
+
                 validate_composite_reference_boundary(
                     COMPOSITE_OPERATION_NAME,
                     self.non_differentiated_count,
                     input_types,
                     region_interfaces[0].output_types(),
                 )?;
+
                 Ok(region_interfaces[0].output_types().to_vec())
             }
         }
@@ -739,28 +741,27 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         if used_outputs.iter().all(|used| *used) || !used_outputs.contains(&true) {
             return Ok(None);
         }
+
         let rules = match &self.rules {
-            // Attached rule regions mirror the complete output boundary of the primal region, which the region
-            // provenance of the call cannot prune together with it, so only a call without rule regions is pruned (its
-            // forward mode rule, if any, is derived from its pruned primal region).
             CompositeRules::Attached { jvp_rule, has_vjp_rule } => {
+                // Attached rule regions mirror the complete output boundary of the primal region, which the region
+                // provenance of the call cannot prune together with it, so only a call without rule regions is pruned
+                // (its forward mode rule, if any, is derived from its pruned primal region).
                 if *jvp_rule == CompositeJvpRule::Explicit || *has_vjp_rule {
                     return Ok(None);
                 }
                 self.rules.clone()
             }
-
-            // The derived calls with which a forward mode rule derived from the primal keeps a custom batching rule on
-            // the path of batched derivatives (refer to `CustomRuleSpecializer::derived`) apply that rule to every
-            // output, so such calls stay whole.
             CompositeRules::Retained { rules, .. } if rules.derives_jvp_from_primal() && rules.has_batching_rule() => {
+                // The derived calls with which a forward mode rule derived from the primal keeps a custom batching rule
+                // on the path of batched derivatives (refer to `CustomRuleSpecializer::derived`) apply that rule to
+                // every output, so such calls stay whole.
                 return Ok(None);
             }
-
-            // The rules are traced for the complete output structure, so the call records which of their outputs it
-            // keeps, composing this pruning with any earlier one, and its batching record, which describes the call's
-            // own outputs, keeps the used ones.
             CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
+                // The rules are traced for the complete output structure, so the call records which of their outputs
+                // it keeps, composing this pruning with any earlier one, and its batching record, which describes the
+                // call's own outputs, keeps the used ones.
                 let mut used = used_outputs.iter().copied();
                 let kept_outputs = match kept_outputs {
                     None => used_outputs.to_vec(),
@@ -777,25 +778,32 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 };
-                /// Returns the `values` of the outputs that `used_outputs` marks as used.
-                fn keep_used<T: Clone>(values: &[T], used_outputs: &[bool]) -> Result<Vec<T>, ProgramError> {
-                    check_count!("output", values, used_outputs.len(), ProgramError);
-                    Ok(values
-                        .iter()
-                        .zip(used_outputs)
-                        .filter_map(|(value, used)| used.then(|| value.clone()))
-                        .collect())
-                }
                 let batching = match batching {
                     None => None,
                     Some(batching) => Some(CustomRuleBatching {
                         input_types: batching.input_types.clone(),
-                        output_types: keep_used(&batching.output_types, used_outputs)?,
+                        output_types: {
+                            check_count!("output", batching.output_types, used_outputs.len(), ProgramError);
+                            batching
+                                .output_types
+                                .iter()
+                                .zip(used_outputs)
+                                .filter(|&(_, used)| *used)
+                                .map(|(r#type, _)| r#type.clone())
+                                .collect()
+                        },
                         levels: batching
                             .levels
                             .iter()
                             .map(|level| {
-                                let output_axes = keep_used(&level.output_axes, used_outputs)?;
+                                check_count!("output", level.output_axes, used_outputs.len(), ProgramError);
+                                let output_axes = level
+                                    .output_axes
+                                    .iter()
+                                    .zip(used_outputs)
+                                    .filter(|&(_, used)| *used)
+                                    .map(|(axis, _)| *axis)
+                                    .collect();
                                 Ok(CustomRuleBatchingLevel { output_axes, ..level.clone() })
                             })
                             .collect::<Result<Vec<_>, ProgramError>>()?,
@@ -809,7 +817,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 }
             }
         };
+
         let operation = Self { non_differentiated_count: self.non_differentiated_count, rules, marker: PhantomData };
+
         Ok(Some(OperationBoundaryPruning {
             operation,
             kept_inputs: vec![true; input_types.len()],
@@ -881,12 +891,12 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 }
 
-impl<C, P, V, O, S> ReferenceDischargeableOperation<C, P> for CompositeOperation<V, O, S>
+impl<V, O, S, C, P> ReferenceDischargeableOperation<C, P> for CompositeOperation<V, O, S>
 where
-    C: Context<Operation: From<CompositeOperation<V, O, S>>>,
-    P: ReferenceDischargePolicy<C>,
     V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
     S: CustomRuleSource<V, O>,
+    C: Context<Operation: From<CompositeOperation<V, O, S>>>,
+    P: ReferenceDischargePolicy<C>,
     CompositeOperation<V, O, S>: Operation<Type = C::Type>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -896,9 +906,9 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         // Local reference lifecycles discharge inside each region while all user-declared numeric boundaries stay
-        // intact. External reference inputs still require explicit state threading that these derivative interfaces do
-        // not supply. Attached rule regions discharge with the primal region now, while a call with retained rules
-        // records that its lazily traced rule programs must be discharged as well once they are traced.
+        // intact. External reference inputs still require explicit state threading that these derivative interfaces
+        // do not supply. Attached rule regions discharge with the primal region now, while a call with retained
+        // rules records that its lazily traced rule programs must be discharged as well once they are traced.
         let name = match &self.rules {
             CompositeRules::Attached { .. } => COMPOSITE_OPERATION_NAME,
             CompositeRules::Retained { rules, .. } => rules.name(),
@@ -907,9 +917,9 @@ where
             let description = describe_composite(COMPOSITE_OPERATION_NAME, name);
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{description} cannot discharge the reference state of its input {index}, because its rules receive \
-                     non-differentiated reference inputs by identity and cannot thread their state explicitly; pass \
-                     reference-free inputs or discharge external references first",
+                    "{description} cannot discharge the reference state of its input {index}, because its rules \
+                     receive non-differentiated reference inputs by identity and cannot thread their state explicitly; \
+                     pass reference-free inputs or discharge external references first",
                 ),
             });
         }
@@ -935,10 +945,10 @@ where
 // Interpretation replays only the primal region, so it applies in every context, including contexts of families that
 // embed this call's family (e.g., kernel bodies).
 impl<
-    C: Domain<Type = V::Type>,
     V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
     O,
     S: CustomRuleSource<V, O>,
+    C: Domain<Type = V::Type>,
 > InterpretableOperation<C> for CompositeOperation<V, O, S>
 {
     #[inline]
@@ -950,12 +960,12 @@ impl<
     ) -> Result<Vec<C::Value>, ProgramError> {
         // An ordinary call computes only `f(p, x) = y`. Replaying a rule here would also compute derivative work (e.g.,
         // `ẏ` or the residuals `r`) and would charge every non-differentiated execution for it, so interpretation
-        // delegates solely to the primal region at slot 0.
+        // delegates solely to the primal region at slot `0`.
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
 
-// The default partial-evaluation rule is the desired one here: it interprets the primal region when every input is
+// The default partial-evaluation rule is the desired one here as it interprets the primal region when every input is
 // known and otherwise residualizes the complete call, so that its rules remain available to later differentiation.
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
     PartiallyEvaluatableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
@@ -963,6 +973,8 @@ where
     C::Operation: From<CompositeOperation<C::Constant, C::Operation, S>>,
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C, P, S> BatchableOperation<C, P> for CompositeOperation<C::Constant, C::Operation, S>
 where
@@ -989,13 +1001,14 @@ where
             if let Some(axis_name) = context.axis_name() {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "{} cannot batch sequentially over the named axis `{axis_name}`, because its scan does not \
-                         bind that axis for its primal and derivative rules; use an unnamed batch axis or a custom \
-                         batching rule",
+                        "{} cannot batch sequentially over the named axis `{}`, because its scan does not bind that \
+                         axis for its primal and derivative rules; use an unnamed batch axis or a custom batching rule",
                         self.description(),
+                        axis_name,
                     ),
                 });
             }
+
             let length = match level.extent() {
                 BatchingLevelExtent::Static(length) => Some(*length),
                 BatchingLevelExtent::Dynamic(_) => driver.static_batch_axis_extent(context),
@@ -1004,10 +1017,11 @@ where
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
                         "{} batches its calls sequentially, which requires a static batch extent",
-                        describe_composite(COMPOSITE_OPERATION_NAME, rules.name())
+                        describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
                     ),
                 });
             };
+
             if inputs.iter().all(|input| P::batch_axis(input).is_replicated()) {
                 let values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
                 let outputs =
@@ -1071,8 +1085,8 @@ where
                 // independently choose replicated or mapped representations for the same logical output. Reconcile
                 // them to one wrapper axis per output, preferring the first mapped axis so that reconciliation never
                 // discards batch variation, and align every batched region to it. Residuals are internal edges between
-                // the forward and backward rules, so they keep the axes that the forward rule naturally produces. The
-                // backward rule is batched on those exact axes and each `x̄` is aligned with its corresponding
+                // the forward and backward rules, so they keep the axes that the forward rule naturally produces.
+                // The backward rule is batched on those exact axes and each `x̄` is aligned with its corresponding
                 // differentiated input `x`: when a replicated `x` receives a mapped cotangent, the batching policy sums
                 // that mapped axis, which is the transpose of broadcasting `x` across the batch. A forward mode rule
                 // derived from the primal region has no region of its own, so batching the primal region also batches
@@ -1120,8 +1134,8 @@ where
                         )?;
                         if batched.output_axes().len() < output_count {
                             return Err(ProgramError::MalformedProgram(format!(
-                                "batched `{}` forward rule produced {} outputs which is fewer than its {} primal \
-                                 outputs",
+                                "batched `{}` forward rule produced {} outputs \
+                                 which is fewer than its {} primal outputs",
                                 COMPOSITE_OPERATION_NAME,
                                 batched.output_axes().len(),
                                 output_count,
@@ -1147,6 +1161,7 @@ where
                     naturally_batched_primal,
                     output_axes.as_slice(),
                 )?];
+
                 if let (Some(jvp_region_index), Some(naturally_batched_jvp)) =
                     (self.jvp_region_index(), naturally_batched_jvp)
                 {
@@ -1159,6 +1174,7 @@ where
                         jvp_required_output_axes.as_slice(),
                     )?);
                 }
+
                 if let (Some((forward_region_index, backward_region_index)), Some(naturally_batched_forward)) =
                     (self.vjp_region_indices(), naturally_batched_forward)
                 {
@@ -1206,10 +1222,12 @@ where
                     }
                     regions.push(backward);
                 }
+
                 let operation = Self {
                     non_differentiated_count: self.non_differentiated_count + boundary_inputs.len(),
                     ..self.clone()
                 };
+
                 (operation, regions, output_axes)
             }
             CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
@@ -1217,8 +1235,8 @@ where
                 // are first traced. A custom batching rule takes precedence over structurally batching the primal
                 // region, and it declares the batch axes of the outputs. Otherwise, the declared layout is required
                 // exactly, so an incompatible primal is rejected here. Boundary inputs reach the primal and every
-                // batched rule program as leading non-differentiated inputs. A call that keeps only some outputs of its
-                // rules keeps only those of the batching rule and of the declared layout.
+                // batched rule program as leading non-differentiated inputs. A call that keeps only some outputs
+                // of its rules keeps only those of the batching rule and of the declared layout.
                 let level = driver.batching_level(context)?;
                 let output_count = primal_region.output_types().len();
                 let rule_output_count = kept_outputs.as_ref().map_or(output_count, Vec::len);
@@ -1327,13 +1345,17 @@ where
                 let (expected, actual) = (render(&expected_output_types), render(&output_types));
                 let reason = if expected == actual { " with different type identities" } else { "" };
                 return Err(TypeError::invalid(format!(
-                    "{} batching rule output type signature mismatch: expected per-item output types [{expected}] \
-                     but got [{actual}]{reason}",
+                    "{} batching rule output type signature mismatch: \
+                     expected per-item output types [{}] but got [{}]{}",
                     describe_composite(COMPOSITE_OPERATION_NAME, rules.name()),
+                    expected,
+                    actual,
+                    reason,
                 ))
                 .into());
             }
         }
+
         Ok(outputs)
     }
 }
