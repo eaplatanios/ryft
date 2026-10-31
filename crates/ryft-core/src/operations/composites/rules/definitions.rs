@@ -400,22 +400,21 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Forward mode rule of a [`CustomRuleDefinition`].
+/// Forward mode differentiation rule of a [`CustomRuleDefinition`].
 pub(super) enum CustomRuleJvp<V, O> {
-    /// Retained custom JVP rule that receives materialized input tangents (refer to [`CustomJvpRule`]).
+    /// Retained custom Jacobian-Vector Product (JVP) rule that receives materialized input tangents.
     Rule(Arc<dyn CustomJvpRule<V, O>>),
 
-    /// Retained custom JVP rule that receives structural-zero input tangents (refer to [`CustomSymbolicZeroJvpRule`]).
+    /// Retained custom Jacobian-Vector Product (JVP) rule that receives structural-zero input tangents.
     SymbolicZeroRule(Arc<dyn CustomSymbolicZeroJvpRule<V, O>>),
 
-    /// JVP derived from the primal region of each call, which is an explicit registration choice (i.e., never a
-    /// fallback for a missing rule).
+    /// Jacobian-Vector Product (JVP) derived from the primal region of each call, which is an explicit registration
+    /// choice (i.e., never a fallback for a missing rule).
     Primal,
 }
 
-/// Borrowed retained JVP rule of a [`CustomRuleDefinition`], as applied by its forward mode specializations.
+/// Borrowed retained Jacobian-Vector Product (JVP) rule of a [`CustomRuleDefinition`],
+/// as applied by its forward mode differentiation specializations.
 pub(super) enum CustomRuleJvpRule<'r, V, O> {
     /// Rule that receives materialized input tangents.
     Materialized(&'r Arc<dyn CustomJvpRule<V, O>>),
@@ -426,15 +425,17 @@ pub(super) enum CustomRuleJvpRule<'r, V, O> {
 
 /// Retained custom Vector-Jacobian Product (VJP) backward rule of a [`CustomRuleDefinition`].
 pub(super) enum CustomVjpBackward<V, O> {
-    /// Pure backward rule that receives materialized seeds (refer to [`CustomVjpBackwardRule`]).
+    /// Pure backward differentiation rule that receives materialized seeds.
     Pure(Arc<dyn CustomVjpBackwardRule<V, O>>),
 
-    /// Pure backward rule that receives structural-zero seeds (refer to [`CustomSymbolicZeroVjpBackwardRule`]).
+    /// Pure backward differentiation rule that receives structural-zero seeds.
     PureWithSymbolicZeros(Arc<dyn CustomSymbolicZeroVjpBackwardRule<V, O>>),
 
-    /// Accumulating backward rule (refer to [`CustomVjpAccumulatingBackwardRule`]).
+    /// Accumulating backward differentiation rule.
     Accumulating(Arc<dyn CustomVjpAccumulatingBackwardRule<V, O>>),
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Operation family `Self` over values `V` whose programs the reverse mode rules of a [`CustomRuleDefinition`] (refer
 /// to [`CustomRuleDefinition::with_vjp`]) can serve: the family transposes the programs that apply the rules, and it
