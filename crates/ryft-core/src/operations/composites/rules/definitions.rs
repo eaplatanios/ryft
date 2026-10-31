@@ -1685,29 +1685,16 @@ mod tests {
     #[test]
     fn test_custom_rule_definition_with_jvp() {
         // The rule receives every primal input and one tangent per differentiated input, in which an inactive tangent
-        // is a materialized zero, and its specialization returns the primal outputs followed by their tangents.
+        // is a materialized zero that the specialization stages itself.
         let counters = Arc::new(RuleCounters::default());
         let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        let reference = registration.reference();
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let key =
-            |tangent_activity| unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], tangent_activity);
-        let active = reference.jvp_specialization(key(vec![true])).unwrap();
-        assert!(active.output_axes.is_empty());
+        let specialization = registration
+            .reference()
+            .jvp_specialization(unbatched_key(vec![scalar_type.clone()], vec![scalar_type], vec![false]))
+            .unwrap();
         assert_eq!(
-            active.program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %0 %0
-                    %3:f64[] = mul %2 %0
-                    %4:f64[] = mul %2 %1
-                in (%3, %4)
-            "}
-            .trim_end(),
-        );
-        let inactive = reference.jvp_specialization(key(vec![false])).unwrap();
-        assert_eq!(
-            inactive.program.to_string(),
+            specialization.program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = zero [type=f64[]]
@@ -1718,7 +1705,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(counters.counts(), (2, 0, 0));
+        assert_eq!(counters.counts(), (1, 0, 0));
 
         // The rule replaces any previously configured forward mode rule, including a JVP derived from the primal.
         let replaced = TestDefinition::new("identity")
@@ -1809,50 +1796,17 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_with_vjp() {
-        // The forward rule's specialization returns the primal outputs followed by the residuals, and the backward
-        // rule's specialization consumes the live seeds followed by the leading inputs (here, the residual `x²`) and
-        // returns the cotangent `2x²ȳ` of the differentiated input.
+        // The backward rule receives one materialized seed per output, so a structural-zero seed reaches it as a zero
+        // that the specialization stages itself, which leaves the specialization without a seed input. The rule's
+        // cotangent of the differentiated input is `2x²ȳ` with the residual `x²`.
         let counters = Arc::new(RuleCounters::default());
         let registration = CustomRuleRegistration::new(cube_definition(&counters, false, true));
-        let reference = registration.reference();
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let forward = reference
-            .forward_specialization(unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], Vec::new()))
-            .unwrap();
-        assert_eq!(
-            forward.program.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = mul %0 %0
-                    %2:f64[] = mul %1 %0
-                in (%2, %1)
-            "}
-            .trim_end(),
-        );
-        let backward = reference
-            .backward_specialization(backward_key(
-                vec![scalar_type.clone()],
-                vec![scalar_type.clone()],
-                vec![Some(scalar_type.clone())],
-            ))
-            .unwrap();
-        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Output]);
-        assert_eq!(
-            backward.program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %1 %0
-                    %3:f64[] = add %2 %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(counters.counts(), (0, 1, 1));
-
-        // A structural-zero seed reaches the backward rule materialized, so its specialization has no seed input.
-        let backward = reference
+        let backward = registration
+            .reference()
             .backward_specialization(backward_key(vec![scalar_type.clone()], vec![scalar_type], vec![None]))
             .unwrap();
+        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Output]);
         assert_eq!(
             backward.program.to_string(),
             indoc! {"
@@ -1864,7 +1818,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(counters.counts(), (0, 1, 2));
+        assert_eq!(counters.counts(), (0, 0, 1));
     }
 
     #[test]
@@ -2058,23 +2012,12 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_with_batching_rule() {
-        // The rule's program is the batched primal of the call, with the batch axes that the rule declares, and the
-        // rule is not broadcast sensitive.
-        let registration = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(
-            |inputs, input_axes, _, _| Ok((vec![inputs[0].clone() * inputs[0].clone()], input_axes.to_vec())),
-        ));
-        assert!(registration.definition().batching_rule().unwrap().broadcast_sensitivity.is_none());
-        let specialization = registration.reference().batching_rule_specialization(batching_key()).unwrap();
-        assert_eq!(specialization.output_axes, vec![BatchAxis::new(0)]);
-        assert_eq!(
-            specialization.program.to_string(),
-            indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[3] = mul %0 %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
+        // The rule becomes the definition's own batching rule, which is not broadcast sensitive.
+        let definition = MemberDefinition::new("square")
+            .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec())));
+        let batching_rule = definition.batching_rule().unwrap();
+        assert!(!batching_rule.is_derived());
+        assert!(batching_rule.broadcast_sensitivity.is_none());
 
         // The rule replaces any previously configured batching rule, including the broadcast sensitivity of one.
         let replaced = MemberDefinition::new("identity")

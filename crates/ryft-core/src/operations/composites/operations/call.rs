@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingLevelExtent,
-    BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -1002,12 +1002,80 @@ where
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
         // A call whose rules batch it sequentially, without a custom batching rule, becomes a scan over its batch
-        // items.
+        // items. The body keeps the unbatched call and its rules, so enclosing batching levels process those calls
+        // sequentially too. Calls whose inputs are all replicated run once. Named axes are rejected because the scan
+        // does not bind the axis that the primal and derivative rules may observe.
         if let CompositeRules::Retained { rules, .. } = &self.rules
             && !rules.has_batching_rule()
             && rules.has_sequential_batching()
         {
-            return batch_composite_sequentially(self, rules, context, driver, inputs);
+            let primal_region = driver.region(0)?;
+            let level = driver.batching_level(context)?;
+            if let Some(axis_name) = context.axis_name() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "{} cannot batch sequentially over the named axis `{axis_name}`, because its scan does not \
+                         bind that axis for its primal and derivative rules; use an unnamed batch axis or a custom \
+                         batching rule",
+                        self.description(),
+                    ),
+                });
+            }
+            let length = match level.extent() {
+                BatchingLevelExtent::Static(length) => Some(*length),
+                BatchingLevelExtent::Dynamic(_) => driver.static_batch_axis_extent(context),
+            };
+            let Some(length) = length else {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "{} batches its calls sequentially, which requires a static batch extent",
+                        describe_composite(COMPOSITE_OPERATION_NAME, rules.name())
+                    ),
+                });
+            };
+            if inputs.iter().all(|input| P::batch_axis(input).is_replicated()) {
+                let values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+                let outputs =
+                    context.parent().bind(self.clone(), vec![primal_region.to_program()], values.as_slice())?;
+                return Ok(outputs.into_iter().map(P::replicated).collect());
+            }
+
+            // The body receives the slice index first, then the carries, then the slices, and applies the call in its
+            // own input order. It returns the carries unchanged, followed by the call's outputs, which the scan stacks
+            // along the batch axis. Body inputs omit the batch axis, while the packed scan inputs retain it.
+            let (carry_indices, stacked_indices): (Vec<_>, Vec<_>) =
+                (0..inputs.len()).partition(|&index| P::batch_axis(&inputs[index]).is_replicated());
+            let output_count = primal_region.output_types().len();
+            let (scan, index_type) = rules
+                .sequential_batching_scan(length, carry_indices.len(), context.axis_sharding(), output_count)
+                .map_err(ProgramError::from)?;
+            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+            let primal = builder.import_program(primal_region.to_program());
+            builder.add_input(index_type);
+            let mut call_inputs = vec![None; inputs.len()];
+            let mut packed_inputs = Vec::with_capacity(inputs.len());
+            for &index in carry_indices.iter().chain(&stacked_indices) {
+                let input = match P::batch_axis(&inputs[index]).is_replicated() {
+                    true => inputs[index].clone(),
+                    false => driver.align_batch_axis(context, inputs[index].clone(), Axis::from(0))?,
+                };
+                call_inputs[index] = Some(builder.add_input(P::unbatched_type(&input).into_owned()));
+                packed_inputs.push(P::value(&input).clone());
+            }
+
+            // The partition visits every input exactly once, so every input slot is populated.
+            let carries = carry_indices.iter().map(|&index| call_inputs[index].unwrap()).collect::<Vec<_>>();
+            let call_inputs = call_inputs.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+            let outputs = builder.add_instruction(self.clone(), vec![primal], call_inputs, None)?.to_vec();
+            let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                carries.iter().copied().chain(outputs).collect(),
+                vec![Placeholder; 1 + inputs.len()],
+                vec![Placeholder; carries.len() + output_count],
+            )?;
+            let mut outputs = context.parent().bind(scan, vec![body], packed_inputs.as_slice())?;
+            check_count!("output", outputs, carries.len() + output_count, ProgramError);
+            outputs.drain(..carries.len());
+            return outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect();
         }
 
         // Structurally batch the attached regions and rule programs over the packed inputs and their batch axes.
@@ -1388,7 +1456,19 @@ where
                 None,
             ),
             (CompositeJvpRule::Absent, _) => {
-                Err(missing_custom_jvp_rule_error(&self.description(), self.has_vjp_rule()))
+                let call = self.description();
+                Err(ProgramError::UnsupportedOperation {
+                    message: if self.has_vjp_rule() {
+                        format!(
+                            "cannot apply forward-mode differentiation to {call} that has only reverse-mode rules; \
+                             it supports only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                             `jacobian_reverse`)",
+                        )
+                    } else {
+                        format!("cannot differentiate {call} that has no derivative rule")
+                    },
+                }
+                .into())
             }
         }
     }
@@ -1773,6 +1853,97 @@ enum CompositeRules<T, S> {
     },
 }
 
+/// Validates the reference contract of [`CompositeOperation`] over one primal boundary. A reference-typed input is
+/// accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that every
+/// attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a reference, so
+/// an active reference input would have a derivative that no user-supplied rule can express). No output may be a
+/// reference, because a rule region would then have to produce that output's tangent reference or consume its
+/// cotangent reference, and a user-supplied rule can neither allocate nor receive one. The call applies this contract
+/// during type inference, so it holds for every constructed call, and its derivative rules apply it again to the
+/// replayed inputs as defense in depth.
+///
+/// # Parameters
+///
+///   - `name`: Operation name used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
+///   - `input_types`: Primal input types in input order.
+///   - `output_types`: Primal output types in output order.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming the first reference-typed input in the differentiated segment, or otherwise the
+/// first reference-typed output.
+fn validate_composite_reference_boundary<T: Type>(
+    name: &str,
+    non_differentiated_count: usize,
+    input_types: &[T],
+    output_types: &[T],
+) -> Result<(), TypeError> {
+    if let Some((index, r#type)) = input_types
+        .iter()
+        .enumerate()
+        .skip(non_differentiated_count)
+        .find(|(_, r#type)| r#type.is_reference())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{name}` accepts reference inputs only in its leading non-differentiated segment; move input {index} \
+             of type `{type}` before the differentiated inputs",
+        )));
+    }
+    if let Some((index, r#type)) = output_types.iter().enumerate().find(|(_, r#type)| r#type.is_reference()) {
+        return Err(TypeError::invalid(format!(
+            "`{name}` cannot return a reference, but output {index} has type `{type}`",
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the inputs before replaying a custom derivative rule. Rule regions bypass ordinary differentiation
+/// dispatch, so replay checks the reference contract of [`validate_composite_reference_boundary`] that type inference
+/// already enforces and uses [`ReferenceBoundary`] to reject aliased concrete or staged references. Non-differentiated
+/// numeric inputs must have zero tangents, while non-differentiated references carry state whose tangent the rule
+/// leaves untouched.
+///
+/// # Parameters
+///
+///   - `name`: Operation name used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
+///   - `context`: Context in which the rule is replayed, which resolves the inputs.
+///   - `inputs`: Dual inputs of the replayed call, in input order.
+///   - `output_types`: Primal output types in output order.
+///
+/// # Errors
+///
+/// Returns the [`ProgramError`] of the first violated contract: the [`TypeError`] of
+/// [`validate_composite_reference_boundary`], a reference boundary error, or an unsupported non-zero tangent.
+fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
+    name: &str,
+    non_differentiated_count: usize,
+    context: &C,
+    inputs: &[DifferentiationDual<C::Value>],
+    output_types: &[C::Type],
+) -> Result<(), ProgramError> {
+    let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
+    validate_composite_reference_boundary(name, non_differentiated_count, primal_types.as_slice(), output_types)?;
+    ReferenceBoundary::new_for_differentiation(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
+    if let Some(input) = inputs.iter().take(non_differentiated_count).find(|input| {
+        !input.primal().r#type().is_reference()
+            && !input.tangent().is_zero()
+            && !input.tangent().r#type().is_zero_space()
+    }) {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{}` cannot propagate the non-zero tangent of type `{}` supplied for one of its \
+                 {} leading non-differentiated inputs, because its rule has no tangent slot for them",
+                name,
+                input.tangent().r#type(),
+                non_differentiated_count,
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose leading
 /// `non_differentiated_count` inputs `p` are not differentiated. This is the forward mode rule for both attached JVP
 /// regions and retained JVP specializations of [`CompositeOperation`]. A fused [`DifferentiationContext`] replays the
@@ -1916,198 +2087,6 @@ where
             }
         })
         .collect::<Result<Vec<_>, _>>()
-}
-
-/// Validates the reference contract of [`CompositeOperation`] over one primal boundary. A reference-typed input is
-/// accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that every
-/// attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a reference, so
-/// an active reference input would have a derivative that no user-supplied rule can express). No output may be a
-/// reference, because a rule region would then have to produce that output's tangent reference or consume its
-/// cotangent reference, and a user-supplied rule can neither allocate nor receive one. The call applies this contract
-/// during type inference, so it holds for every constructed call, and its derivative rules apply it again to the
-/// replayed inputs as defense in depth.
-///
-/// # Parameters
-///
-///   - `name`: Operation name used in diagnostics.
-///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
-///   - `input_types`: Primal input types in input order.
-///   - `output_types`: Primal output types in output order.
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] naming the first reference-typed input in the differentiated segment, or otherwise the
-/// first reference-typed output.
-fn validate_composite_reference_boundary<T: Type>(
-    name: &str,
-    non_differentiated_count: usize,
-    input_types: &[T],
-    output_types: &[T],
-) -> Result<(), TypeError> {
-    if let Some((index, r#type)) = input_types
-        .iter()
-        .enumerate()
-        .skip(non_differentiated_count)
-        .find(|(_, r#type)| r#type.is_reference())
-    {
-        return Err(TypeError::invalid(format!(
-            "`{name}` accepts reference inputs only in its leading non-differentiated segment; move input {index} \
-             of type `{type}` before the differentiated inputs",
-        )));
-    }
-    if let Some((index, r#type)) = output_types.iter().enumerate().find(|(_, r#type)| r#type.is_reference()) {
-        return Err(TypeError::invalid(format!(
-            "`{name}` cannot return a reference, but output {index} has type `{type}`",
-        )));
-    }
-    Ok(())
-}
-
-/// Validates the inputs before replaying a custom derivative rule. Rule regions bypass ordinary differentiation
-/// dispatch, so replay checks the reference contract of [`validate_composite_reference_boundary`] that type inference
-/// already enforces and uses [`ReferenceBoundary`] to reject aliased concrete or staged references. Non-differentiated
-/// numeric inputs must have zero tangents, while non-differentiated references carry state whose tangent the rule
-/// leaves untouched.
-///
-/// # Parameters
-///
-///   - `name`: Operation name used in diagnostics.
-///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
-///   - `context`: Context in which the rule is replayed, which resolves the inputs.
-///   - `inputs`: Dual inputs of the replayed call, in input order.
-///   - `output_types`: Primal output types in output order.
-///
-/// # Errors
-///
-/// Returns the [`ProgramError`] of the first violated contract: the [`TypeError`] of
-/// [`validate_composite_reference_boundary`], a reference boundary error, or an unsupported non-zero tangent.
-fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
-    name: &str,
-    non_differentiated_count: usize,
-    context: &C,
-    inputs: &[DifferentiationDual<C::Value>],
-    output_types: &[C::Type],
-) -> Result<(), ProgramError> {
-    let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-    validate_composite_reference_boundary(name, non_differentiated_count, primal_types.as_slice(), output_types)?;
-    ReferenceBoundary::new_for_differentiation(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
-    if let Some(input) = inputs.iter().take(non_differentiated_count).find(|input| {
-        !input.primal().r#type().is_reference()
-            && !input.tangent().is_zero()
-            && !input.tangent().r#type().is_zero_space()
-    }) {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{}` cannot propagate the non-zero tangent of type `{}` supplied for one of its \
-                 {} leading non-differentiated inputs, because its rule has no tangent slot for them",
-                name,
-                input.tangent().r#type(),
-                non_differentiated_count,
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Batches the composite call `call`, whose retained rules `rules` batch it sequentially (refer to
-/// [`CustomRuleDefinition::with_sequential_batching`](crate::CustomRuleDefinition::with_sequential_batching)), by
-/// looping over the batch items with a scan whose body applies the unbatched call to one item. The mapped inputs are
-/// aligned to axis 0 and become the scan's stacked inputs, the replicated inputs become invariant carries, and every
-/// output is mapped at axis 0. The body applies the call with its own primal region, so the call's rules keep governing
-/// the derivatives of each item, and batching the scan again (e.g., at an enclosing batching level) batches the calls
-/// in its body sequentially in turn. A call whose inputs are all replicated is applied once instead. Named levels are
-/// rejected because a sequential scan does not bind the named axis that the primal and derivative rules may observe.
-///
-/// # Parameters
-///
-///   - `call`: Unbatched call to batch.
-///   - `rules`: Retained rules of `call`, which construct the scan.
-///   - `context`: Batching context in which the call is batched.
-///   - `driver`: Driver of the call's primal region.
-///   - `inputs`: Batched inputs of the call.
-///
-/// # Errors
-///
-/// Returns a [`BatchingError`] when the level is named or its extent is not statically known, and propagates the errors
-/// of the scan construction, of the axis alignment, and of staging the scan.
-fn batch_composite_sequentially<C, P, D, S>(
-    call: &CompositeOperation<C::Constant, C::Operation, S>,
-    rules: &S,
-    context: &BatchingContext<C, P>,
-    driver: &D,
-    inputs: &[P::Batch],
-) -> Result<Vec<P::Batch>, BatchingError>
-where
-    C: Context<Type: DifferentiableType + Eq + Hash, Operation: From<CompositeOperation<C::Constant, C::Operation, S>>>,
-    P: BatchingPolicy<C>,
-    D: BatchingDriver<C, P>,
-    S: CustomRuleSpecializer<C::Constant, C::Operation>,
-{
-    let primal_region = driver.region(0)?;
-    let level = driver.batching_level(context)?;
-    if let Some(axis_name) = context.axis_name() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "{} cannot batch sequentially over the named axis `{axis_name}`, because its scan does not bind \
-                 that axis for its primal and derivative rules; use an unnamed batch axis or a custom batching rule",
-                call.description(),
-            ),
-        });
-    }
-    let length = match level.extent() {
-        BatchingLevelExtent::Static(length) => Some(*length),
-        BatchingLevelExtent::Dynamic(_) => driver.static_batch_axis_extent(context),
-    };
-    let Some(length) = length else {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "{} batches its calls sequentially, which requires a static batch extent",
-                describe_composite(COMPOSITE_OPERATION_NAME, rules.name())
-            ),
-        });
-    };
-    if inputs.iter().all(|input| P::batch_axis(input).is_replicated()) {
-        let values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
-        let outputs = context.parent().bind(call.clone(), vec![primal_region.to_program()], values.as_slice())?;
-        return Ok(outputs.into_iter().map(P::replicated).collect());
-    }
-
-    // The body receives the slice index first, then the carries, then the slices, and it applies the call to them in
-    // the call's own input order. It returns the carries unchanged, followed by the call's outputs, which the scan
-    // stacks along the batch axis. Body inputs omit the batch axis, while the packed scan inputs retain it.
-    let (carry_indices, stacked_indices): (Vec<_>, Vec<_>) =
-        (0..inputs.len()).partition(|&index| P::batch_axis(&inputs[index]).is_replicated());
-    let output_count = primal_region.output_types().len();
-    let (scan, index_type) = rules
-        .sequential_batching_scan(length, carry_indices.len(), context.axis_sharding(), output_count)
-        .map_err(ProgramError::from)?;
-    let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-    let primal = builder.import_program(primal_region.to_program());
-    builder.add_input(index_type);
-    let mut call_inputs = vec![None; inputs.len()];
-    let mut packed_inputs = Vec::with_capacity(inputs.len());
-    for &index in carry_indices.iter().chain(&stacked_indices) {
-        let input = match P::batch_axis(&inputs[index]).is_replicated() {
-            true => inputs[index].clone(),
-            false => driver.align_batch_axis(context, inputs[index].clone(), Axis::from(0))?,
-        };
-        call_inputs[index] = Some(builder.add_input(P::unbatched_type(&input).into_owned()));
-        packed_inputs.push(P::value(&input).clone());
-    }
-
-    // The partition visits every input exactly once, so every input slot is populated.
-    let carries = carry_indices.iter().map(|&index| call_inputs[index].unwrap()).collect::<Vec<_>>();
-    let call_inputs = call_inputs.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-    let outputs = builder.add_instruction(call.clone(), vec![primal], call_inputs, None)?.to_vec();
-    let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-        carries.iter().copied().chain(outputs).collect(),
-        vec![Placeholder; 1 + inputs.len()],
-        vec![Placeholder; carries.len() + output_count],
-    )?;
-    let mut outputs = context.parent().bind(scan, vec![body], packed_inputs.as_slice())?;
-    check_count!("output", outputs, carries.len() + output_count, ProgramError);
-    outputs.drain(..carries.len());
-    outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect()
 }
 
 /// Differentiates the primal region at slot 0 of a composite call in forward mode, which is the forward mode rule of a
@@ -2270,24 +2249,6 @@ where
             None => DifferentiationDual::new_with_zero_tangent(primal),
         })
         .collect::<Result<Vec<_>, _>>()
-}
-
-/// Returns the error that forward mode differentiation of a composite call without a forward mode rule reports, where
-/// `call` describes the call (e.g., ``a `composite` call``). A call with reverse mode rules supports only reverse mode
-/// differentiation, while a call without any rule is not differentiable. A missing rule never falls back to
-/// differentiating the primal.
-pub(super) fn missing_custom_jvp_rule_error(call: &str, has_vjp_rule: bool) -> DifferentiationError {
-    ProgramError::UnsupportedOperation {
-        message: if has_vjp_rule {
-            format!(
-                "cannot apply forward-mode differentiation to {call} that has only reverse-mode rules; it supports \
-                 only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
-            )
-        } else {
-            format!("cannot differentiate {call} that has no derivative rule")
-        },
-    }
-    .into()
 }
 
 #[cfg(test)]

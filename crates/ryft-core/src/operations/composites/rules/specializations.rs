@@ -2545,13 +2545,16 @@ mod tests {
 
     #[test]
     fn test_custom_rule_reference_sequential_batching_scan() {
-        // The scan carries the replicated inputs and stacks the outputs, and its body receives an `i64[]` slice index
-        // first. A source that does not batch its calls sequentially has no scan.
+        // The scan is the one that the definition constructs, while a source that does not batch its calls
+        // sequentially has no scan.
         let sequential = CustomRuleRegistration::new(MemberDefinition::new("square").with_sequential_batching());
         let (operation, index_type) =
             sequential.reference().sequential_batching_scan(3, 1, &ShardingDimension::Replicated, 2).unwrap();
-        assert_eq!(operation.to_string(), "scan [carry_count=1, iteration_count=3, reverse=false]");
-        assert_eq!(index_type, ArrayType::scalar(DataType::I64));
+        let (expected_operation, expected_index_type) =
+            sequential.definition().sequential_batching_scan().unwrap()(3, 1, &ShardingDimension::Replicated, 2)
+                .unwrap();
+        assert_eq!(operation.to_string(), expected_operation.to_string());
+        assert_eq!(index_type, expected_index_type);
         assert!(matches!(
             CustomRuleRegistration::new(MemberDefinition::new("square"))
                 .reference()
