@@ -23,7 +23,7 @@ use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::dot::{Dot, DotDimensionNumbers, dot_abstract, lift_dot_dimensions};
+use crate::operations::dot::{DOT_OPERATION_NAME, Dot, DotDimensionNumbers, dot_abstract};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};

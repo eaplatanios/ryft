@@ -102,7 +102,7 @@ impl FfiScalar {
                     Ok(Self::C128 { real: parts[0], imaginary: parts[1] })
                 }
                 _ => {
-                    Err(FfiError::invalid_argument(format!("invalid XLA FFI scalar attribute data type '{}'", r#type)))
+                    Err(FfiError::invalid_argument(format!("invalid XLA FFI scalar attribute data type `{}`", r#type)))
                 }
             }
         }
@@ -112,7 +112,7 @@ impl FfiScalar {
     unsafe fn parse_value<T: Copy>(value: *mut std::ffi::c_void, data_type: XLA_FFI_DataType) -> Result<T, FfiError> {
         if value.is_null() {
             Err(FfiError::invalid_argument(format!(
-                "encountered null scalar value pointer for data type '{data_type}'"
+                "encountered null scalar value pointer for data type `{data_type}`"
             )))
         } else {
             Ok(unsafe { *(value as *const T) })
@@ -173,7 +173,7 @@ impl<'o> FfiArray<'o> {
             let data = (*self.handle).data;
             if data.is_null() {
                 return Err(FfiError::invalid_argument(format!(
-                    "encountered null XLA FFI array data pointer for array with data type '{data_type}'"
+                    "encountered null XLA FFI array data pointer for array with data type `{data_type}`"
                 )));
             }
             let offset = index.checked_mul(Self::element_size_in_bytes(data_type)?).ok_or_else(|| {
@@ -219,7 +219,7 @@ impl<'o> FfiArray<'o> {
             XLA_FFI_DataType_C64 => size_of::<[f32; 2]>(),
             XLA_FFI_DataType_C128 => size_of::<[f64; 2]>(),
             _ => {
-                return Err(FfiError::invalid_argument(format!("invalid XLA FFI array data type '{data_type}'")));
+                return Err(FfiError::invalid_argument(format!("invalid XLA FFI array data type `{data_type}`")));
             }
         };
         Ok(element_size)
@@ -316,7 +316,7 @@ impl<'o> FfiAttributes<'o> {
         if low < self.len() && self.key_at(low)? == key {
             Ok(low)
         } else {
-            Err(FfiError::not_found(format!("dictionary key '{key}' not found in XLA FFI attributes")))
+            Err(FfiError::not_found(format!("dictionary key `{key}` not found in XLA FFI attributes")))
         }
     }
 
@@ -468,7 +468,7 @@ impl<'o> FfiAttribute<'o> {
                 ffi::XLA_FFI_AttrType_DICTIONARY => {
                     Ok(Self::Dictionary { dictionary: FfiAttributes::from_c_api(value as *const ffi::XLA_FFI_Attrs)? })
                 }
-                _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI attribute type '{}'", r#type))),
+                _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI attribute type `{}`", r#type))),
             }
         }
     }
@@ -668,14 +668,14 @@ mod tests {
                         assert_eq!(dictionary.contains_key("missing"), Ok(false));
                         let nested_array = dictionary.get("nested_array_attr");
                         let Ok(FfiAttribute::Array { array }) = nested_array else {
-                            panic!("failed to get the 'nested_array_attr' XLA FFI attribute");
+                            panic!("failed to get the `nested_array_attr` XLA FFI attribute");
                         };
                         assert_eq!(array.len(), 2);
                         assert_eq!(array.get(0), Ok(FfiScalar::I32(4)));
                         assert_eq!(array.get(1), Ok(FfiScalar::I32(5)));
                         let nested_dictionary = dictionary.get("nested_dictionary_attr");
                         let Ok(FfiAttribute::Dictionary { dictionary: nested_dictionary }) = nested_dictionary else {
-                            panic!("failed to get the 'nested_dictionary_attr' XLA FFI attribute");
+                            panic!("failed to get the `nested_dictionary_attr` XLA FFI attribute");
                         };
                         assert_eq!(nested_dictionary.len(), 2);
                         assert!(matches!(

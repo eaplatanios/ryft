@@ -36,7 +36,7 @@ macro_rules! linalg_enum_attribute {
             fn try_from(value: &str) -> Result<Self, Self::Error> {
                 match value {
                     $($value => Ok(Self::$variant),)+
-                    _ => Err(format!("'{value}' is not a valid {}", $description)),
+                    _ => Err(format!("`{value}` is not a valid {}", $description)),
                 }
             }
         }
@@ -277,7 +277,7 @@ impl TryFrom<&str> for WinogradConv2DFmr {
             "F_2_3" => Ok(Self::F2R3),
             "F_4_3" => Ok(Self::F4R3),
             "F_2_5" => Ok(Self::F2R5),
-            _ => Err(format!("'{value}' is not a valid Winograd Conv2D FMR value")),
+            _ => Err(format!("`{value}` is not a valid Winograd Conv2D FMR value")),
         }
     }
 }

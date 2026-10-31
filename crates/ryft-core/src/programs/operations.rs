@@ -386,9 +386,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     indentation, so that the enum display matches the canonical program rendering format.
 ///   - `From<Payload> for Enum` conversions for concrete payload variants.
 ///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
-///     These conversions fail with `Error = TypeError`, reporting `"cannot project operation '<name>' into a '<payload
-///     type>' payload"`, where `<name>` is the stored operation's [`Operation::name`] and `<payload type>` is the
-///     statically expected payload type.
+///     These conversions fail with `Error = TypeError`, reporting that the stored operation cannot be projected into
+///     the payload. The message names the stored operation's [`Operation::name`] and the statically expected payload
+///     type, each surrounded by backticks.
 ///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
 ///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
 ///     family-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)

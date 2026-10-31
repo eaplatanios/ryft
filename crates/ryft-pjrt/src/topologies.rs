@@ -112,7 +112,7 @@ impl Topology<'_> {
         let name = name.as_ref();
         self.attributes()?
             .get(&name.to_string())
-            .ok_or_else(|| Error::not_found(format!("no attribute named '{name}' in this PJRT topology")))
+            .ok_or_else(|| Error::not_found(format!("no attribute named `{name}` in this PJRT topology")))
     }
 
     /// Collection of [`Topology`]-specific named attributes that are attached to this [`Topology`].

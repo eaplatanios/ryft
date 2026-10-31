@@ -136,29 +136,19 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
     pub fn reference(&self) -> CustomRuleReference<V, O> {
         CustomRuleReference { definition: self.definition.clone(), caches: Arc::downgrade(&self.caches) }
     }
+
+    /// Returns a [`WeakCustomRuleReference`] to this registration, which keeps neither the definition nor its
+    /// specialization caches alive (e.g., to observe a registration without extending the lifetime of either).
+    #[inline]
+    pub fn downgrade(&self) -> WeakCustomRuleReference<V, O> {
+        WeakCustomRuleReference { definition: Arc::downgrade(&self.definition), caches: Arc::downgrade(&self.caches) }
+    }
 }
 
 // TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
-    /// Returns the specialization caches, which tests use to observe lazy tracing and cache ownership.
-    fn caches(&self) -> &Arc<CustomRuleCaches<V, O>> {
-        &self.caches
-    }
-
-    /// Returns the JVP specialization cache for tests that observe lazy tracing, eviction, and invalidation.
-    pub(super) fn jvp_specializations(
-        &self,
-    ) -> &SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>> {
-        &self.caches.jvp_specializations
-    }
-
-    /// Returns the number of derived registrations retained by this registration's caches.
-    pub(super) fn derived_registration_count(&self) -> usize {
-        self.caches.derived_registrations.lock().expect("custom rule derivation mutex is poisoned").len()
-    }
-
     /// Returns the keys of the cached forward mode, reverse mode forward, and reverse mode backward rule
     /// specializations, in that order, which tests of the operations use to observe lazy tracing.
     #[allow(clippy::type_complexity)]
@@ -174,13 +164,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
             self.caches.forward_specializations.keys(),
             self.caches.backward_specializations.keys(),
         )
-    }
-
-    /// Returns a probe that reports whether the registered definition and its specialization caches are still alive,
-    /// in that order, which tests of the operations use to observe ownership after this handle is dropped.
-    pub(in crate::operations::composites) fn ownership_probe(&self) -> impl Fn() -> (bool, bool) + use<V, O> {
-        let (definition, caches) = (Arc::downgrade(&self.definition), Arc::downgrade(&self.caches));
-        move || (definition.strong_count() > 0, caches.strong_count() > 0)
     }
 }
 
@@ -215,6 +198,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
     #[inline]
     pub fn definition(&self) -> &CustomRuleDefinition<V, O> {
         &self.definition
+    }
+
+    /// Returns `true` if the specializations requested through this reference are cached, which they are while some
+    /// [`CustomRuleRegistration`] handle to its definition is alive. Otherwise, every request traces its rule again.
+    #[inline]
+    pub fn is_cached(&self) -> bool {
+        self.caches.strong_count() > 0
     }
 
     /// Returns a reference to the derived `definition`, retaining its registration in this source's caches while they
@@ -333,14 +323,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
     }
 }
 
-#[cfg(test)]
-impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
-    /// Returns whether this reference's specialization caches still have an owner.
-    pub(super) fn has_caches(&self) -> bool {
-        self.caches.upgrade().is_some()
-    }
-}
-
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Clone for CustomRuleReference<V, O> {
     fn clone(&self) -> Self {
         Self { definition: self.definition.clone(), caches: self.caches.clone() }
@@ -406,16 +388,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for WeakCustomRuleReference
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType, ShardingDimension};
+    use crate::batching::{BatchAxis, BatchingLevel, BatchingLevelExtent};
     use crate::contexts::Context;
     use crate::operations::composites::operations::CompositeOperation;
-    use crate::operations::composites::rules::CustomRuleDerivationKind;
     use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
+    use crate::operations::composites::rules::{CustomRuleBatchingLevel, CustomRuleDerivationKind};
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, cube_program, custom_rule_program,
     };
@@ -428,15 +412,15 @@ mod tests {
         // A registration owns empty caches, which its clones share, and its references share its definition.
         let counters = Arc::new(RuleCounters::default());
         let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        assert!(registration.caches().jvp_specializations.is_empty());
-        assert!(registration.caches().forward_specializations.is_empty());
-        assert!(registration.caches().backward_specializations.is_empty());
-        assert!(registration.caches().batching_rule_specializations.is_empty());
-        assert_eq!(registration.caches().derived_registrations.lock().unwrap().len(), 0);
+        assert!(registration.caches.jvp_specializations.is_empty());
+        assert!(registration.caches.forward_specializations.is_empty());
+        assert!(registration.caches.backward_specializations.is_empty());
+        assert!(registration.caches.batching_rule_specializations.is_empty());
+        assert_eq!(registration.caches.derived_registrations.lock().unwrap().len(), 0);
         assert_eq!(registration.reference(), registration.reference());
         let clone = registration.clone();
         assert!(std::ptr::eq(clone.definition(), registration.definition()));
-        assert!(Arc::ptr_eq(clone.caches(), registration.caches()));
+        assert!(Arc::ptr_eq(&clone.caches, &registration.caches));
         assert_eq!(
             format!("{registration:?}"),
             "CustomRuleRegistration(CustomRuleDefinition { name: \"cube\", has_jvp: true, derives_jvp_from_primal: \
@@ -451,7 +435,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let inner = CustomRuleRegistration::new(cube_definition(&counters, true, true));
         let (retained_inner, retained_inner_caches) =
-            (Arc::downgrade(&inner.definition), Arc::downgrade(&inner.caches()));
+            (Arc::downgrade(&inner.definition), Arc::downgrade(&inner.caches));
         let inner_reference = inner.reference();
         let outer = CustomRuleRegistration::new(TestDefinition::new("outer").with_jvp(move |primals, tangents| {
             let r#type = primals[0].r#type().into_owned();
@@ -460,11 +444,11 @@ mod tests {
             Ok((outputs, vec![tangents[0].clone()]))
         }));
         let (retained_outer, retained_outer_caches) =
-            (Arc::downgrade(&outer.definition), Arc::downgrade(&outer.caches()));
+            (Arc::downgrade(&outer.definition), Arc::downgrade(&outer.caches));
         let program = custom_rule_program(&outer, ArrayType::scalar(DataType::F64));
         let linearization = program.linearize().unwrap();
         assert_eq!(counters.counts(), (0, 0, 0));
-        assert_eq!(outer.caches().jvp_specializations.len(), 1);
+        assert_eq!(outer.caches.jvp_specializations.len(), 1);
 
         // Dropping the handles frees their caches, including the outer specialization that called the inner definition,
         // while the staged programs keep both definitions alive until they are dropped as well.
@@ -542,9 +526,9 @@ mod tests {
         let weak = weak.unwrap();
         let reference = weak.upgrade().unwrap();
         assert_eq!(reference, registration.reference());
-        assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), registration.caches()));
+        assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), &registration.caches));
         drop(reference);
-        let (definition, caches) = (Arc::downgrade(&registration.definition), Arc::downgrade(registration.caches()));
+        let (definition, caches) = (Arc::downgrade(&registration.definition), Arc::downgrade(&registration.caches));
         drop(registration);
         assert!(definition.upgrade().is_none());
         assert!(caches.upgrade().is_none());
@@ -568,11 +552,11 @@ mod tests {
             })
         });
         let (retained_definition, retained_caches) =
-            (Arc::downgrade(&definition.definition), Arc::downgrade(&definition.caches()));
+            (Arc::downgrade(&definition.definition), Arc::downgrade(&definition.caches));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let linearization = program.linearize().unwrap();
         assert_eq!(counters.counts(), (1, 0, 0));
-        assert_eq!(definition.caches().jvp_specializations.len(), 1);
+        assert_eq!(definition.caches.jvp_specializations.len(), 1);
         assert_eq!(
             linearization.primal().to_string(),
             indoc! {"
@@ -626,14 +610,14 @@ mod tests {
         });
         let b = b.unwrap();
         let probes = [
-            (Arc::downgrade(&a.definition), Arc::downgrade(&a.caches())),
-            (Arc::downgrade(&b.definition), Arc::downgrade(&b.caches())),
+            (Arc::downgrade(&a.definition), Arc::downgrade(&a.caches)),
+            (Arc::downgrade(&b.definition), Arc::downgrade(&b.caches)),
         ];
         let program = custom_rule_program(&a, ArrayType::scalar(DataType::F64));
         let first = program.linearize().unwrap();
         let second = first.primal().linearize().unwrap();
-        assert_eq!(a.caches().jvp_specializations.len(), 1);
-        assert_eq!(b.caches().jvp_specializations.len(), 1);
+        assert_eq!(a.caches.jvp_specializations.len(), 1);
+        assert_eq!(b.caches.jvp_specializations.len(), 1);
         drop((a, b));
         assert!(probes.iter().all(|(_, caches)| caches.upgrade().is_none()));
         drop((program, first, second));
@@ -650,15 +634,44 @@ mod tests {
         assert_eq!(reference.clone(), reference);
         assert_eq!(hash_of(&reference), hash_of(&registration.reference()));
         assert_ne!(reference, CustomRuleRegistration::new(TestDefinition::new("cube")).reference());
-        assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), registration.caches()));
+        assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), &registration.caches));
         assert_eq!(
             format!("{reference:?}"),
             "CustomRuleReference(CustomRuleDefinition { name: \"cube\", has_jvp: false, derives_jvp_from_primal: \
              false, has_vjp: false, .. })",
         );
         drop(registration);
-        assert!(reference.caches.upgrade().is_none());
+        assert!(!reference.is_cached());
         assert_eq!(reference.definition().name(), "cube");
+    }
+
+    #[test]
+    fn test_custom_rule_registration_downgrade() {
+        // The weak reference refers to the registration while it is alive, keeps neither its definition nor its caches
+        // alive, and no longer upgrades once both were dropped.
+        let registration = CustomRuleRegistration::new(TestDefinition::new("cube"));
+        let weak = registration.downgrade();
+        let reference = weak.upgrade().unwrap();
+        assert_eq!(reference, registration.reference());
+        assert!(reference.is_cached());
+        drop((reference, registration));
+        assert!(matches!(
+            weak.upgrade(),
+            Err(ProgramError::InvalidArgument { message }) if message == "the `composite` definition was dropped",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_is_cached() {
+        // A reference is cached while some handle to its registration is alive, including a clone of the original one.
+        let registration = CustomRuleRegistration::new(TestDefinition::new("cube"));
+        let reference = registration.reference();
+        assert!(reference.is_cached());
+        let clone = registration.clone();
+        drop(registration);
+        assert!(reference.is_cached());
+        drop(clone);
+        assert!(!reference.is_cached());
     }
 
     #[test]
@@ -682,7 +695,7 @@ mod tests {
             .map(|input_count| registration.reference().derived(key(input_count)).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(
-            registration.caches().derived_registrations.lock().unwrap().len(),
+            registration.caches.derived_registrations.lock().unwrap().len(),
             CUSTOM_RULE_SPECIALIZATION_CAPACITY,
         );
         assert_eq!(registration.reference().derived(key(1)).unwrap(), derived[0]);
@@ -726,7 +739,7 @@ mod tests {
             jvp(extent);
             probes.push(specialization(extent));
         }
-        assert_eq!(definition.caches().jvp_specializations.len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
+        assert_eq!(definition.caches.jvp_specializations.len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
         assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1, 0, 0));
 
         // Bounded caches bound the retained memory: the evicted specialization is freed, and no cached program retains
@@ -739,6 +752,118 @@ mod tests {
         jvp(1);
         jvp(CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1);
         assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 2, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_specialize_outer_cache_hit() {
+        // A batched specialization that is still cached is served without requesting the unbatched specialization from
+        // which it was batched, so evicting the latter neither traces the rule again nor caches it again.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key = CustomRuleForwardSpecializationKey {
+            input_types: vec![scalar_type.clone()],
+            output_types: vec![scalar_type],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels: vec![CustomRuleBatchingLevel {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_count: 0,
+                input_axes: vec![BatchAxis::new(0)],
+                output_axes: vec![BatchAxis::new(0)],
+            }],
+            discharged: false,
+        };
+        let first = definition.reference().jvp_specialization(key.clone()).unwrap();
+        assert_eq!(definition.caches.jvp_specializations.len(), 2);
+        assert_eq!(definition.caches.jvp_specializations.invalidate_entries_if(|key| key.levels.is_empty()), 1);
+        let second = definition.reference().jvp_specialization(key).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(definition.caches.jvp_specializations.len(), 1);
+        assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_specialize_retry_after_failure() {
+        // A failed specialization is not retained, so the next request invokes the rule again.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let definition = CustomRuleRegistration::new(TestDefinition::new("flaky").with_jvp({
+            let attempts = attempts.clone();
+            move |primals, tangents| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(ProgramError::InvalidArgument { message: "transient failure".to_string() });
+                }
+                let square = primals[0].clone() * primals[0].clone();
+                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
+            }
+        }));
+        let x = Array::scalar(2f64).unwrap();
+        let one = Array::scalar(1f64).unwrap();
+        assert!(matches!(
+            call_jvp(&definition, x.clone(), one.clone()),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "transient failure",
+        ));
+        assert!(definition.caches.jvp_specializations.is_empty());
+        for _ in 0..2 {
+            assert_eq!(
+                call_jvp(&definition, x.clone(), one.clone()),
+                Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()])),
+            );
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_custom_rule_reference_specialize_concurrent_cold_requests() {
+        // Both threads enter the rule before either finishes, so both derive the same cold specialization. The
+        // duplicate derivations produce one resident result, which later requests reuse.
+        let barrier = Arc::new(Barrier::new(2));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let definition = CustomRuleRegistration::new(TestDefinition::new("concurrent").with_jvp({
+            let barrier = barrier.clone();
+            let invocations = invocations.clone();
+            move |primals, tangents| {
+                if invocations.fetch_add(1, Ordering::SeqCst) < 2 {
+                    barrier.wait();
+                }
+                let square = primals[0].clone() * primals[0].clone();
+                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
+            }
+        }));
+        let x = Array::scalar(2f64).unwrap();
+        let one = Array::scalar(1f64).unwrap();
+        let expected = (vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()]);
+        std::thread::scope(|scope| {
+            let threads = (0..2)
+                .map(|_| {
+                    let (definition, x, one) = (definition.clone(), x.clone(), one.clone());
+                    scope.spawn(move || call_jvp(&definition, x, one))
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                assert_eq!(thread.join().unwrap(), Ok(expected.clone()));
+            }
+        });
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert_eq!(definition.caches.jvp_specializations.len(), 1);
+        assert_eq!(call_jvp(&definition, x, one), Ok(expected));
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_custom_rule_reference_specialize_debug_recheck() {
+        // A region-transform cache hit re-derives the linearization in debug builds and compares renderings. The
+        // re-derivation reuses the retained specialization, so it neither invokes the rule nor changes the rendering.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let first = program.linearize().unwrap();
+        let second = program.linearize().unwrap();
+        assert_eq!(second.tangent().to_string(), first.tangent().to_string());
+        assert_eq!(counters.counts(), (1, 0, 0));
     }
 
     #[test]
@@ -757,7 +882,7 @@ mod tests {
         drop(registration);
         let upgraded = weak.upgrade().unwrap();
         assert_eq!(upgraded, reference);
-        assert!(upgraded.caches.upgrade().is_none());
+        assert!(!upgraded.is_cached());
         drop((reference, upgraded));
         assert!(matches!(
             weak.upgrade(),

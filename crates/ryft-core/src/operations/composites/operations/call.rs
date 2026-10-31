@@ -2372,7 +2372,7 @@ mod tests {
     };
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestContext, TestDefinition, TestRegistration, call_jvp, cube_definition,
-        cube_program, custom_rule_program, member_cube_definition,
+        cube_program, custom_rule_program, member_cube_definition, ownership_probe,
     };
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -8549,7 +8549,7 @@ mod tests {
 
         // Converted calls follow the ownership of their member definition: the handle owns the caches, and the programs
         // keep the definition alive.
-        let ownership = definition.ownership_probe();
+        let ownership = ownership_probe(&definition);
         drop(definition);
         assert_eq!(ownership(), (true, false));
         drop((member, converted, again, batched, linearization, reverse, pullback));

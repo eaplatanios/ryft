@@ -1,4 +1,4 @@
-error: could not infer a unique operation type because multiple distinct 'Value<Type = T>' bounds are present
+error: could not infer a unique operation type because multiple distinct `Value<Type = T>` bounds are present
   --> tests/operations/error_ambiguous_type.rs:11:18
    |
 11 | enum BadOperation<V: Value<Type = DataType>, W: Value<Type = ArrayType>> {

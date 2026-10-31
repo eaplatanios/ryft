@@ -1618,7 +1618,7 @@ fn test_operation_generates_projected_member_dispatch() {
     assert_eq!(<&ProjectedMemberOperation<0>>::try_from(&first), Ok(&ProjectedMemberOperation));
     assert_eq!(
         <&ProjectedMemberOperation<2>>::try_from(&first),
-        Err(TypeError::invalid("cannot project operation 'projected' into a 'ProjectedMemberOperation<2>' payload")),
+        Err(TypeError::invalid("cannot project operation `projected` into a `ProjectedMemberOperation<2>` payload")),
     );
 }
 
@@ -1783,7 +1783,7 @@ fn test_data_operation() {
     );
     assert_eq!(
         <&AddOperation>::try_from(&zero),
-        Err(TypeError::invalid("cannot project operation 'zero' into a 'AddOperation' payload")),
+        Err(TypeError::invalid("cannot project operation `zero` into a `AddOperation` payload")),
     );
 }
 
@@ -3097,7 +3097,7 @@ fn test_linear_array_operation_shape() {
     );
     assert_eq!(
         <&ZeroOperation<ArrayType>>::try_from(&while_operation),
-        Err(TypeError::invalid("cannot project operation 'while' into a 'ZeroOperation<ArrayType>' payload")),
+        Err(TypeError::invalid("cannot project operation `while` into a `ZeroOperation<ArrayType>` payload")),
     );
 
     // `Backend(Backend)` is a bare generic payload, so its conversion is skipped automatically, while the

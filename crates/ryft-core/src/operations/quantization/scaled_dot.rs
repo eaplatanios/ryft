@@ -167,7 +167,14 @@ impl Operation for ScaledDotOperation {
 
         let dot_lhs = lhs.clone().with_data_type(DataType::BF16);
         let dot_rhs = rhs.clone().with_data_type(DataType::BF16);
-        let output_type = dot_abstract(&dot_lhs, &dot_rhs, &self.dimensions, Some(self.preferred_element_type), None)?;
+        let output_type = dot_abstract(
+            DOT_OPERATION_NAME,
+            &dot_lhs,
+            &dot_rhs,
+            &self.dimensions,
+            Some(self.preferred_element_type),
+            None,
+        )?;
         for (side, input_type, scale, contracting_dimensions) in [
             ("left", lhs, lhs_scale, self.dimensions.lhs_contracting_dimensions()),
             ("right", rhs, rhs_scale, self.dimensions.rhs_contracting_dimensions()),
@@ -261,6 +268,11 @@ where
         if inputs.len() != self.input_count() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_count(), actual: inputs.len() }.into());
         }
+        self.dimensions.validate_for_ranks(
+            DOT_OPERATION_NAME,
+            inputs[0].unbatched_type().rank(),
+            inputs[1].unbatched_type().rank(),
+        )?;
         if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         }
@@ -277,7 +289,7 @@ where
             .iter()
             .map(|input| P::match_axis(context, input, Axis::from(0)))
             .collect::<Result<Vec<_>, _>>()?;
-        let (dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, Some(0), Some(0)).unwrap();
+        let (dimensions, output_axis) = self.dimensions.batched(Some(0), Some(0)).unwrap();
         let lifted =
             ScaledDotOperation::new(dimensions, self.preferred_element_type, self.has_lhs_scale, self.has_rhs_scale);
         Ok(lifted.interpret_with_batch_axes(
@@ -589,10 +601,10 @@ mod tests {
         Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
-    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
+    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::assertions::AssertionError;
-    use crate::operations::dot::DotDimensionNumbers;
+    use crate::operations::dot::{DOT_OPERATION_NAME, DotDimensionNumbers};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, Operation, TypeError};
@@ -915,5 +927,26 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![4.0, 4.0]);
+    }
+
+    #[test]
+    fn test_scaled_dot_batching_validates_original_dimensions() {
+        let input = ArrayBatch::new(Array::matrix(2, 1, vec![1.0f32, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
+        let operation = ScaledDotOperation::new(
+            DotDimensionNumbers::new(vec![usize::MAX], vec![0], vec![], vec![]),
+            DataType::F32,
+            false,
+            false,
+        );
+        assert_eq!(
+            operation.batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                &[input.clone(), input],
+            ),
+            Err(BatchingError::Type(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` LHS dimension index out of bounds",
+            )))),
+        );
     }
 }

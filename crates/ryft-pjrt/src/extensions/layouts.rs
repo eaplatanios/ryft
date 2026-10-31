@@ -338,7 +338,7 @@ impl SerializedLayout {
                             Ok(dimension.to_string())
                         } else {
                             Err(Error::invalid_argument(format!(
-                                "invalid tile dimension '{dimension}': expected non-negative value or '*'",
+                                "invalid tile dimension `{dimension}`: expected non-negative value or `*`",
                             )))
                         }
                     })
@@ -417,7 +417,7 @@ impl SerializedLayout {
             value
                 .trim()
                 .parse::<i64>()
-                .map_err(|error| Error::invalid_argument(format!("invalid {description} '{value}': {error}")))
+                .map_err(|error| Error::invalid_argument(format!("invalid {description} `{value}`: {error}")))
         }
 
         /// Parses a `Vec<i64>` value from a string. The provided `description` is used for error reporting.
@@ -435,7 +435,7 @@ impl SerializedLayout {
         /// if the next character is not `'('` or if the input ends before a matching closing `')'` is found.
         fn parse_parenthesized(characters: &mut Peekable<Chars>, context: &str) -> Result<String, Error> {
             if characters.next() != Some('(') {
-                return Err(Error::invalid_argument(format!("expected '(' while parsing {context}")));
+                return Err(Error::invalid_argument(format!("expected `(` while parsing {context}")));
             }
 
             let mut content = String::new();
@@ -511,7 +511,7 @@ impl SerializedLayout {
                         has_split_group = true;
                         let content = parse_parenthesized(&mut characters, "split config")?;
                         let (dimension, split_indices) = content.split_once(':').ok_or_else(|| {
-                            Error::invalid_argument(format!("split config missing ':' separator: {content}"))
+                            Error::invalid_argument(format!("split config missing `:` separator: {content}"))
                         })?;
                         layout.splits.push(DimensionSplit {
                             dimension: parse_i64(dimension, "split config dimension")?,
@@ -519,7 +519,7 @@ impl SerializedLayout {
                         });
                     }
                     if !has_split_group {
-                        return Err(Error::invalid_argument("expected '(' while parsing split config"));
+                        return Err(Error::invalid_argument("expected `(` while parsing split config"));
                     }
                 }
                 'S' => {
@@ -539,7 +539,7 @@ impl SerializedLayout {
                     // We simply skip whitespace characters to match XLA's permissive parsing of layouts.
                 }
                 _ => {
-                    return Err(Error::invalid_argument(format!("unsupported layout property '{property}'")));
+                    return Err(Error::invalid_argument(format!("unsupported layout property `{property}`")));
                 }
             }
         }
@@ -936,7 +936,7 @@ mod tests {
                 },
             ),
             Err(crate::Error::InvalidArgument { message, .. })
-                if message == "invalid tile dimension '-3': expected non-negative value or '*'",
+                if message == "invalid tile dimension `-3`: expected non-negative value or `*`",
         ));
     }
 

@@ -4,7 +4,7 @@ error: unexpected end of input, expected parentheses
 11 |     #[ryft(projected)]
    |                     ^
 
-error: the 'mixed' operation variant class cannot default its member type because the operation family declares no '#[ryft(members(...))]'; declare the family's members or name the member type as 'mixed(U)'
+error: the `mixed` operation variant class cannot default its member type because the operation family declares no `#[ryft(members(...))]`; declare the family's members or name the member type as `mixed(U)`
   --> tests/operations/error_missing_variant_member_type.rs:14:12
    |
 14 |     #[ryft(mixed)]

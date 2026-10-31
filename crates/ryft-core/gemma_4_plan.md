@@ -993,7 +993,7 @@ the model stays in `bf16`.
 
 > **Status: the core of this section is implemented.** Since this section was written, the
 > exact primitive set it proposed has landed: `ScaledDotOperation`
-> ([crates/ryft-core/src/operations/dot/operation.rs](crates/ryft-core/src/operations/dot/operation.rs))
+> ([crates/ryft-core/src/operations/quantization/scaled_dot.rs](crates/ryft-core/src/operations/quantization/scaled_dot.rs))
 > with interpretation, partial-evaluation, forward-differentiation (bilinear with scales held
 > fixed), and batching rules; the `BlockQuantize` composition
 > ([crates/ryft-core/src/operations/quantization/block.rs](crates/ryft-core/src/operations/quantization/block.rs))
@@ -1435,7 +1435,7 @@ pub trait BlockQuantize: Sized {
     ) -> Result<(Self, Self), ProgramError>;
 }
 
-// crates/ryft-core/src/operations/dot/operation.rs (implemented)
+// crates/ryft-core/src/operations/quantization/scaled_dot.rs (implemented)
 pub trait ScaledDot: Sized {
     /// Block-scaled matrix product of `self` `[b?, m, k]` (scaled by `lhs_scales`
     /// `[b?, m, k / block_size]`) and `rhs` `[b?, n, k]` (scaled by `rhs_scales`), dequantizing
@@ -1766,8 +1766,10 @@ A consolidated list of every external source cited in this document, grouped by 
 - [`crates/ryft-core/src/operations/attention.rs`](crates/ryft-core/src/operations/attention.rs) —
   the fused `DotProductAttentionOperation` (+ backward) with GQA, causal masking, sliding
   windows, dropout, bias, and sequence lengths.
-- [`crates/ryft-core/src/operations/dot/operation.rs`](crates/ryft-core/src/operations/dot/operation.rs) —
-  `DotOperation` and the block-scaled `ScaledDotOperation` (§4).
+- [`crates/ryft-core/src/operations/dot.rs`](crates/ryft-core/src/operations/dot.rs) —
+  `DotOperation`.
+- [`crates/ryft-core/src/operations/quantization/scaled_dot.rs`](crates/ryft-core/src/operations/quantization/scaled_dot.rs) —
+  the block-scaled `ScaledDotOperation` (§4).
 - [`crates/ryft-core/src/operations/quantization/block.rs`](crates/ryft-core/src/operations/quantization/block.rs) —
   the `BlockQuantize` NVFP4/MX quantization recipes (§4).
 - [`crates/ryft-core/src/arrays/types/data.rs:694`](crates/ryft-core/src/arrays/types/data.rs:694) —

@@ -1,4 +1,4 @@
-error: found more than one generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute
+error: found more than one generic types bounded by `Parameter`; to use the ryft `#[derive(Parameterized)]` macro you must bound exactly one type parameter with the `Parameter` trait; not none and not more than one; the bound must be specified as `Parameter` or `ryft::Parameter` where `ryft` must be substituted for the custom ryft `crate` provided, if one was provided using the `#[ryft(crate = ...)]` attribute
  --> tests/parameters/error_enums.rs:4:32
   |
 4 | enum EnumWithMultipleParameters<P: Parameter, V: Parameter> {

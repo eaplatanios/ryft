@@ -37,7 +37,7 @@ impl<V> Attribute<V> {
         V: AttributeValue,
     {
         if self.value.is_some() {
-            Err(syn::Error::new_spanned(&meta.path, format!("duplicate ryft attribute '{}'", self.name)))
+            Err(syn::Error::new_spanned(&meta.path, format!("duplicate ryft attribute `{}`", self.name)))
         } else {
             self.tokens = (&meta.path).into_token_stream();
             self.value = Some(V::from_meta(&self.name, meta)?);
@@ -77,7 +77,7 @@ impl AttributeValue for bool {
 impl AttributeValue for syn::LitStr {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         if &meta.path != name {
-            return Err(meta.error("cannot parse attribute value from a 'ParseNestedMeta' with a different path"));
+            return Err(meta.error("cannot parse attribute value from a `ParseNestedMeta` with a different path"));
         }
 
         let expression: syn::Expr = meta.value()?.parse()?;
@@ -98,7 +98,7 @@ impl AttributeValue for syn::LitStr {
             }
             _ => Err(syn::Error::new_spanned(
                 expression,
-                format!("expected ryft '{name}' attribute to be a string: `{name} = \"...\"`"),
+                format!("expected ryft `{name}` attribute to be a string: `{name} = \"...\"`"),
             )),
         }
     }
@@ -121,7 +121,7 @@ impl AttributeValue for syn::Path {
 impl AttributeValue for syn::Type {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         if &meta.path != name {
-            return Err(meta.error("cannot parse attribute value from a 'ParseNestedMeta' with a different path"));
+            return Err(meta.error("cannot parse attribute value from a `ParseNestedMeta` with a different path"));
         }
         meta.value()?.parse()
     }
@@ -169,7 +169,7 @@ mod tests {
                 .parse2(quote!(crate = "alt_ryft"))
                 .unwrap_err()
                 .to_string()
-                .contains("duplicate ryft attribute 'crate'")
+                .contains("duplicate ryft attribute `crate`")
         );
 
         assert!(
@@ -221,7 +221,7 @@ mod tests {
             .parse2(quote!(crate = 42))
             .unwrap_err()
             .to_string()
-            .contains("expected ryft 'crate' attribute to be a string")
+            .contains("expected ryft `crate` attribute to be a string")
         );
 
         // Test `syn::Ident::from_meta`.

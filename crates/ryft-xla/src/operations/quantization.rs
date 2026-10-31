@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
 use ryft_core::{
     ArrayType, DataType, Dimension, DomainTracingContext, Operation, ProgramError, ScaledDotOperation, Shape,
@@ -260,9 +259,14 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             .lhs_batching_dimensions()
             .iter()
             .copied()
+            .chain(dimensions.lhs_result_dimensions(input_types[0].rank()))
             .map(|axis| (input_values[0], axis))
-            .chain(lhs_result_axes(dimensions, input_types[0].rank()).into_iter().map(|axis| (input_values[0], axis)))
-            .chain(rhs_result_axes(dimensions, input_types[1].rank()).into_iter().map(|axis| (input_values[1], axis)))
+            .chain(
+                dimensions
+                    .rhs_result_dimensions(input_types[1].rank())
+                    .into_iter()
+                    .map(|axis| (input_values[1], axis)),
+            )
             .collect::<Vec<_>>();
         return Ok(vec![lower_restore_dynamic_dimensions(
             results[0],

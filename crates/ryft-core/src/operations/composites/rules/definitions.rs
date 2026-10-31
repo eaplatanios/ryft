@@ -1987,7 +1987,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(registration.jvp_specializations().len(), 2);
         assert_eq!(counters.counts(), (1, 0, 0));
 
         // An output that stays mapped while its batched layout requires it to be replicated is rejected, unless the

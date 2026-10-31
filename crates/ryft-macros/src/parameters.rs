@@ -23,7 +23,7 @@ const DEFAULT_MACRO_ITERATOR_TYPE: Symbol = Symbol::new("__I");
 const DEFAULT_PARAMETER_TYPE: Symbol = Symbol::new("Parameter");
 
 const FIELD_ATTRIBUTE_ERROR: &str = "\
-  the '#[ryft(...)]' attribute is only supported at the top level \
+  the `#[ryft(...)]` attribute is only supported at the top level \
   for structs and enums. It is not supported for fields or variants";
 
 /// [`CodeGenerator`] are used to generate implementations of the [`Parameterized`] trait via the
@@ -261,7 +261,7 @@ impl CodeGenerator {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
                 _ => Err(meta.error(format_args!(
-                    "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
+                    "invalid `#[ryft(...)]` attribute: `{}`; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
                     VALID_CONTAINER_ATTRIBUTES,
                 ))),
@@ -316,22 +316,22 @@ impl CodeGenerator {
         if parameter_types.len() > 1 {
             self.add_error(
                 generics,
-                "found more than one generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' \
-                macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more \
-                than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
-                substituted for the custom ryft 'crate' provided, if one was provided using the \
-                '#[ryft(crate = ...)]' attribute",
+                "found more than one generic types bounded by `Parameter`; to use the ryft `#[derive(Parameterized)]` \
+                macro you must bound exactly one type parameter with the `Parameter` trait; not none and not more \
+                than one; the bound must be specified as `Parameter` or `ryft::Parameter` where `ryft` must be \
+                substituted for the custom ryft `crate` provided, if one was provided using the \
+                `#[ryft(crate = ...)]` attribute",
             );
         } else if let Some(parameter_type) = parameter_types.into_iter().next() {
             self.parameter_type = parameter_type.clone();
         } else {
             self.add_error(
                 &input.ident,
-                "found no generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' \
-                macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more \
-                than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
-                substituted for the custom ryft 'crate' provided, if one was provided using the \
-                '#[ryft(crate = ...)]' attribute",
+                "found no generic types bounded by `Parameter`; to use the ryft `#[derive(Parameterized)]` \
+                macro you must bound exactly one type parameter with the `Parameter` trait; not none and not more \
+                than one; the bound must be specified as `Parameter` or `ryft::Parameter` where `ryft` must be \
+                substituted for the custom ryft `crate` provided, if one was provided using the \
+                `#[ryft(crate = ...)]` attribute",
             );
         }
     }
@@ -484,7 +484,7 @@ impl CodeGenerator {
                 self.data = Data::Enum(EnumData { ident, variants });
             }
             syn::Data::Union(_) => {
-                self.add_error(&input.ident, "the '#[derive(ryft::Parameterized)]' macro does not support unions");
+                self.add_error(&input.ident, "the `#[derive(ryft::Parameterized)]` macro does not support unions");
             }
         }
     }
@@ -613,31 +613,31 @@ impl CodeGenerator {
             syn::GenericParam::Lifetime(parameter) if parameter.lifetime == self.macro_parameter_lifetime => {
                 self.add_error(
                     parameter,
-                    format_args!("identifier '{}' is reserved", self.macro_parameter_lifetime.clone()),
+                    format_args!("identifier `{}` is reserved", self.macro_parameter_lifetime.clone()),
                 );
             }
             syn::GenericParam::Type(parameter) if parameter.matches_ident(&self.macro_parameter_type) => {
                 self.add_error(
                     parameter,
-                    format_args!("identifier '{}' is reserved", self.macro_parameter_type.clone()),
+                    format_args!("identifier `{}` is reserved", self.macro_parameter_type.clone()),
                 );
             }
             syn::GenericParam::Const(parameter) if parameter.matches_ident(&self.macro_parameter_type) => {
                 self.add_error(
                     parameter,
-                    format_args!("identifier '{}' is reserved", self.macro_parameter_type.clone()),
+                    format_args!("identifier `{}` is reserved", self.macro_parameter_type.clone()),
                 );
             }
             syn::GenericParam::Type(parameter) if parameter.matches_ident(&self.macro_iterator_type) => {
                 self.add_error(
                     parameter,
-                    format_args!("identifier '{}' is reserved", self.macro_iterator_type.clone()),
+                    format_args!("identifier `{}` is reserved", self.macro_iterator_type.clone()),
                 );
             }
             syn::GenericParam::Const(parameter) if parameter.matches_ident(&self.macro_iterator_type) => {
                 self.add_error(
                     parameter,
-                    format_args!("identifier '{}' is reserved", self.macro_iterator_type.clone()),
+                    format_args!("identifier `{}` is reserved", self.macro_iterator_type.clone()),
                 );
             }
             _ => {}
@@ -1953,7 +1953,7 @@ mod tests {
         generator.extract_attributes(&input);
         let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("invalid '#[ryft(...)]' attribute: 'unknown'"));
+        assert!(errors[0].contains("invalid `#[ryft(...)]` attribute: `unknown`"));
     }
 
     #[test]
@@ -2009,7 +2009,7 @@ mod tests {
                 .errors
                 .iter()
                 .map(|error| error.to_string())
-                .any(|message| message.contains("found no generic types bounded by 'Parameter'"))
+                .any(|message| message.contains("found no generic types bounded by `Parameter`"))
         );
 
         // Test extracting the parameter type when there are multiple.
@@ -2026,7 +2026,7 @@ mod tests {
                 .errors
                 .iter()
                 .map(|error| error.to_string())
-                .any(|message| message.contains("found more than one generic types bounded by 'Parameter'"))
+                .any(|message| message.contains("found more than one generic types bounded by `Parameter`"))
         );
     }
 
@@ -2062,7 +2062,7 @@ mod tests {
                     .fields
                     .iter()
                     .find(|field| field.ident.as_ref().map(|ident| ident == "nested").unwrap_or(false))
-                    .expect("expected to find the 'nested' field");
+                    .expect("expected to find the `nested` field");
                 assert!(nested_field.is_parameter);
                 let tuple_fields = match nested_field.fields.as_ref() {
                     Some(NestedFields::Tuple(fields)) => fields,
@@ -2093,7 +2093,7 @@ mod tests {
                     .fields
                     .iter()
                     .find(|field| field.ident.as_ref().map(|ident| ident == "maybe").unwrap_or(false))
-                    .expect("expected to find the 'maybe' field");
+                    .expect("expected to find the `maybe` field");
                 assert!(maybe_field.is_parameter);
                 let option_inner = match maybe_field.fields.as_ref() {
                     Some(NestedFields::Option(field)) => field,

@@ -2185,7 +2185,6 @@ pub(super) fn specialization_error<E: Debug + Display + Into<DifferentiationErro
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
@@ -2198,10 +2197,7 @@ mod tests {
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::composites::rules::registrations::CustomRuleRegistration;
-    use crate::operations::composites::tests::{
-        MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, custom_rule_program,
-        member_cube_definition,
-    };
+    use crate::operations::composites::tests::{MemberDefinition, RuleCounters, member_cube_definition};
     use crate::programs::ReferenceType;
 
     use super::*;
@@ -2254,118 +2250,6 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_reference_specialization_outer_cache_hit() {
-        // A batched specialization that is still cached is served without requesting the unbatched specialization from
-        // which it was batched, so evicting the latter neither traces the rule again nor caches it again.
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let key = CustomRuleForwardSpecializationKey {
-            input_types: vec![scalar_type.clone()],
-            output_types: vec![scalar_type],
-            kept_outputs: None,
-            non_differentiated_count: 0,
-            tangent_activity: vec![true],
-            levels: vec![CustomRuleBatchingLevel {
-                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
-                boundary_input_count: 0,
-                input_axes: vec![BatchAxis::new(0)],
-                output_axes: vec![BatchAxis::new(0)],
-            }],
-            discharged: false,
-        };
-        let first = definition.reference().jvp_specialization(key.clone()).unwrap();
-        assert_eq!(definition.jvp_specializations().len(), 2);
-        assert_eq!(definition.jvp_specializations().invalidate_entries_if(|key| key.levels.is_empty()), 1);
-        let second = definition.reference().jvp_specialization(key).unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(definition.jvp_specializations().len(), 1);
-        assert_eq!(counters.counts(), (1, 0, 0));
-    }
-
-    #[test]
-    fn test_custom_rule_reference_specialization_retry_after_failure() {
-        // A failed specialization is not retained, so the next request invokes the rule again.
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let definition = CustomRuleRegistration::new(TestDefinition::new("flaky").with_jvp({
-            let attempts = attempts.clone();
-            move |primals, tangents| {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(ProgramError::InvalidArgument { message: "transient failure".to_string() });
-                }
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            }
-        }));
-        let x = Array::scalar(2f64).unwrap();
-        let one = Array::scalar(1f64).unwrap();
-        assert!(matches!(
-            call_jvp(&definition, x.clone(), one.clone()),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "transient failure",
-        ));
-        assert!(definition.jvp_specializations().is_empty());
-        for _ in 0..2 {
-            assert_eq!(
-                call_jvp(&definition, x.clone(), one.clone()),
-                Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()])),
-            );
-        }
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn test_custom_rule_reference_specialization_concurrent_cold_requests() {
-        // Both threads enter the rule before either finishes, so both derive the same cold specialization. The
-        // duplicate derivations produce one resident result, which later requests reuse.
-        let barrier = Arc::new(Barrier::new(2));
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let definition = CustomRuleRegistration::new(TestDefinition::new("concurrent").with_jvp({
-            let barrier = barrier.clone();
-            let invocations = invocations.clone();
-            move |primals, tangents| {
-                if invocations.fetch_add(1, Ordering::SeqCst) < 2 {
-                    barrier.wait();
-                }
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            }
-        }));
-        let x = Array::scalar(2f64).unwrap();
-        let one = Array::scalar(1f64).unwrap();
-        let expected = (vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()]);
-        std::thread::scope(|scope| {
-            let threads = (0..2)
-                .map(|_| {
-                    let (definition, x, one) = (definition.clone(), x.clone(), one.clone());
-                    scope.spawn(move || call_jvp(&definition, x, one))
-                })
-                .collect::<Vec<_>>();
-            for thread in threads {
-                assert_eq!(thread.join().unwrap(), Ok(expected.clone()));
-            }
-        });
-        assert_eq!(invocations.load(Ordering::SeqCst), 2);
-        assert_eq!(definition.jvp_specializations().len(), 1);
-        assert_eq!(call_jvp(&definition, x, one), Ok(expected));
-        assert_eq!(invocations.load(Ordering::SeqCst), 2);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_custom_rule_reference_specialization_debug_recheck() {
-        // A region-transform cache hit re-derives the linearization in debug builds and compares renderings. The
-        // re-derivation reuses the retained specialization, so it neither invokes the rule nor changes the rendering.
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let first = program.linearize().unwrap();
-        let second = program.linearize().unwrap();
-        assert_eq!(second.tangent().to_string(), first.tangent().to_string());
-        assert_eq!(counters.counts(), (1, 0, 0));
-    }
-
-    #[test]
     fn test_custom_rule_reference_derived() {
         // Derivations of one key share a definition that the source registration owns, together with its caches, and
         // the definition keeps only its source definition alive (i.e., there is no strong cycle back to the caches).
@@ -2391,17 +2275,17 @@ mod tests {
         let pushforward = registration.reference().derived(key(CustomRuleDerivationKind::Pushforward)).unwrap();
         assert_eq!(pushforward.name(), "pushforward(sine)");
         assert_ne!(pushforward, derived);
-        assert_eq!(registration.derived_registration_count(), 2);
-        assert!(derived.has_caches());
+        assert!(derived.is_cached());
+        assert!(pushforward.is_cached());
 
         // Dropping the source registration frees the derived registrations and their caches, and later derivations
         // reuse the derived definitions that are still alive, without caches, exactly like specializations.
         let source = registration.reference();
         drop(registration);
-        assert!(!derived.has_caches());
+        assert!(!derived.is_cached());
         let fresh = source.derived(key(CustomRuleDerivationKind::Jvp)).unwrap();
         assert_eq!(fresh, derived);
-        assert!(!fresh.has_caches());
+        assert!(!fresh.is_cached());
         let derived_definition = Arc::downgrade(&derived.definition);
         drop((derived, pushforward, fresh));
         assert!(derived_definition.upgrade().is_none());

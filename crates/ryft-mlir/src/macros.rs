@@ -214,7 +214,7 @@ macro_rules! mlir_enum_attribute {
                 fn try_from(value: &'s str) -> Result<Self, Self::Error> {
                     match value.as_ref() {
                         $($mlir_variant => Ok(Self::$rust_variant),)+
-                        _ => Err(format!("'{}' is not a valid {}", value, $description)),
+                        _ => Err(format!("`{}` is not a valid {}", value, $description)),
                     }
                 }
             }

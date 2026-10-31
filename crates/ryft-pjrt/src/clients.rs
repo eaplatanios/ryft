@@ -90,7 +90,7 @@ impl<'s> Client<'s> {
         self.attributes()?
             .get(name)
             .cloned()
-            .ok_or_else(|| Error::not_found(format!("no attribute named '{name}' found in this PJRT client")))
+            .ok_or_else(|| Error::not_found(format!("no attribute named `{name}` found in this PJRT client")))
     }
 
     /// Returns the PJRT attributes associated with this [`Client`] (e.g., the version of the XLA compiler that it was
@@ -204,7 +204,7 @@ impl<'s> Client<'s> {
         )
         .and_then(|handle| {
             if handle.is_null() {
-                Err(Error::not_found(format!("device with ID '{id}' not found")))
+                Err(Error::not_found(format!("device with ID `{id}` not found")))
             } else {
                 unsafe { Device::from_c_api(handle, self.api()) }
             }
@@ -242,7 +242,7 @@ impl<'s> Client<'s> {
         )
         .and_then(|handle| {
             if handle.is_null() {
-                Err(Error::not_found(format!("device with ID '{id}' not found in addressable devices")))
+                Err(Error::not_found(format!("device with ID `{id}` not found in addressable devices")))
             } else {
                 unsafe { Device::from_c_api(handle, self.api()) }
             }
@@ -1349,7 +1349,7 @@ mod tests {
                 .unwrap()
                 .get(key)
                 .cloned()
-                .ok_or_else(|| Error::not_found(format!("key '{}' not found", String::from_utf8_lossy(key))))
+                .ok_or_else(|| Error::not_found(format!("key `{}` not found", String::from_utf8_lossy(key))))
         }
     }
 

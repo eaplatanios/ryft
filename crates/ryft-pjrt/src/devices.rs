@@ -97,7 +97,7 @@ impl Device<'_> {
         let name = name.as_ref();
         self.attributes()?
             .get(&name.to_string())
-            .ok_or_else(|| Error::not_found(format!("no attribute named '{name}' in this PJRT device")))
+            .ok_or_else(|| Error::not_found(format!("no attribute named `{name}` in this PJRT device")))
     }
 
     /// Collection of [`Device`]-specific named attributes that are attached to this [`Device`].
@@ -361,7 +361,7 @@ impl Eq for Device<'_> {}
 
 impl HasDefaultMemory for Device<'_> {
     fn default_memory(&self) -> Memory<'_> {
-        self.default_memory().unwrap_or_else(|_| panic!("default memory not set for device '{self}'"))
+        self.default_memory().unwrap_or_else(|_| panic!("default memory not set for device `{self}`"))
     }
 }
 
@@ -455,7 +455,7 @@ impl DeviceDescription<'_> {
         let name = name.as_ref();
         self.attributes()?
             .get(&name.to_string())
-            .ok_or_else(|| Error::not_found(format!("no attribute named '{name}' in this PJRT device description")))
+            .ok_or_else(|| Error::not_found(format!("no attribute named `{name}` in this PJRT device description")))
     }
 
     /// Collection of [`Device`]-specific named attributes that are attached to this [`DeviceDescription`].

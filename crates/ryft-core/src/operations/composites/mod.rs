@@ -92,6 +92,7 @@ fn derive_bijective_identity_renaming<T: Type>(
 
 #[cfg(test)]
 mod tests {
+    use std::hash::Hash;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -101,7 +102,7 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DifferentiationError, ForwardModeDifferentiate};
     use crate::operations::arithmetic::MulOperation;
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{FlatProgram, ProgramBuilder, Typed};
 
     use super::*;
@@ -215,6 +216,15 @@ mod tests {
             .add_instruction(CompositeOperation::new(definition.reference()), vec![primal], vec![input], None)
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Returns a probe that reports whether the definition of `registration` and its specialization caches are still
+    /// alive, in that order, which tests use to observe ownership after the registration handle is dropped.
+    pub(super) fn ownership_probe<V: Typed<Type: Eq + Hash> + Parameter, O>(
+        registration: &CustomRuleRegistration<V, O>,
+    ) -> impl Fn() -> (bool, bool) + use<V, O> {
+        let registration = registration.downgrade();
+        move || registration.upgrade().map_or((false, false), |reference| (true, reference.is_cached()))
     }
 
     /// Returns the outputs and tangents of the forward mode differentiation of one call of `definition` at `x` with

@@ -329,7 +329,7 @@ pub trait PatternOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the rewrite benefit of this pattern.
     fn benefit(&self) -> Result<u16, Error> {
         u16::try_from(self.integer_attribute(BENEFIT_ATTRIBUTE)?.signless_value())
-            .map_err(|_| Error::invalid_argument(format!("invalid '{BENEFIT_ATTRIBUTE}' attribute in `pdl.pattern`")))
+            .map_err(|_| Error::invalid_argument(format!("invalid `{BENEFIT_ATTRIBUTE}` attribute in `pdl.pattern`")))
     }
 
     /// Returns the pattern body region.
@@ -469,7 +469,7 @@ pub trait ResultOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the zero-based result index to extract.
     fn index(&self) -> Result<u32, Error> {
         u32::try_from(self.integer_attribute(INDEX_ATTRIBUTE)?.signless_value())
-            .map_err(|_| Error::invalid_argument(format!("invalid '{INDEX_ATTRIBUTE}' attribute in `pdl.result`")))
+            .map_err(|_| Error::invalid_argument(format!("invalid `{INDEX_ATTRIBUTE}` attribute in `pdl.result`")))
     }
 }
 

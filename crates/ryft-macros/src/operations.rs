@@ -241,11 +241,11 @@ impl OperationParser {
                     [operation_type] => self.operation_type = Some(operation_type.clone()),
                     [] => self.add_error(
                         &input.ident,
-                        "could not infer an operation type because no generic parameter is bounded by 'Value<Type = T>'",
+                        "could not infer an operation type because no generic parameter is bounded by `Value<Type = T>`",
                     ),
                     _ => self.add_error(
                         &input.generics,
-                        "could not infer a unique operation type because multiple distinct 'Value<Type = T>' bounds are present",
+                        "could not infer a unique operation type because multiple distinct `Value<Type = T>` bounds are present",
                     ),
                 }
             }
@@ -348,13 +348,13 @@ impl OperationParser {
     /// structural forward-mode arm the literal member types it needs to classify each output universe.
     fn extract_members_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
         if !self.members.is_empty() {
-            return Err(meta.error("duplicate ryft attribute 'members(...)'"));
+            return Err(meta.error("duplicate ryft attribute `members(...)`"));
         }
 
         let content;
         syn::parenthesized!(content in meta.input);
         if content.is_empty() {
-            return Err(content.error("'#[ryft(members(...))]' must declare at least one member universe"));
+            return Err(content.error("`#[ryft(members(...))]` must declare at least one member universe"));
         }
         let mut members = Vec::<OperationMember>::new();
         while !content.is_empty() {
@@ -367,7 +367,7 @@ impl OperationParser {
             {
                 return Err(syn::Error::new_spanned(
                     role,
-                    format_args!("invalid ryft member universe role '{role}'; only 'structural' is supported here"),
+                    format_args!("invalid ryft member universe role `{role}`; only `structural` is supported here"),
                 ));
             }
             let structural = declared_role.is_some();
@@ -377,7 +377,7 @@ impl OperationParser {
                 syn::parenthesized!(role_content in content);
                 let member_type = role_content.parse::<syn::Type>()?;
                 if !role_content.is_empty() {
-                    return Err(role_content.error("'structural(...)' declares exactly one member type"));
+                    return Err(role_content.error("`structural(...)` declares exactly one member type"));
                 }
                 member_type
             } else {
@@ -387,7 +387,7 @@ impl OperationParser {
                 return Err(syn::Error::new_spanned(
                     &member_type,
                     format_args!(
-                        "duplicate ryft member universe '{}'",
+                        "duplicate ryft member universe `{}`",
                         member_type.to_token_stream().to_string().replace(' ', ""),
                     ),
                 ));
@@ -406,7 +406,7 @@ impl OperationParser {
     /// also checks that the input is an enum, because the operation derives do not support structs or unions.
     fn extract_variants(&mut self, input: &syn::DeriveInput) -> Vec<OperationVariant> {
         let syn::Data::Enum(data) = &input.data else {
-            self.add_error(&input.ident, "the '#[derive(Operation)]' macro only supports enums");
+            self.add_error(&input.ident, "the `#[derive(Operation)]` macro only supports enums");
             return Vec::new();
         };
 
@@ -430,7 +430,7 @@ impl OperationParser {
                 self.add_error(
                     &variant.ident,
                     format_args!(
-                        "operation family holds constructible payload type '{}' in more than one variant",
+                        "operation family holds constructible payload type `{}` in more than one variant",
                         variant.payload_type.to_token_stream().to_string().replace(' ', ""),
                     ),
                 );
@@ -444,7 +444,7 @@ impl OperationParser {
                 self.add_error(
                     &variant.ident,
                     format_args!(
-                        "operation family declares member type '{}' more than once",
+                        "operation family declares member type `{}` more than once",
                         member_type.to_token_stream().to_string().replace(' ', ""),
                     ),
                 );
@@ -469,7 +469,7 @@ impl OperationParser {
                 let Some(program_constant_parameter) = value_type_parameters.first().cloned() else {
                     self.add_error(
                         &generics,
-                        "could not infer the program constant value type for '#[derive(Operation)]'",
+                        "could not infer the program constant value type for `#[derive(Operation)]`",
                     );
                     return None;
                 };
@@ -604,7 +604,7 @@ impl OperationParser {
                 .parse_nested_meta(|meta| {
                     if meta.path == SKIP_FROM_ATTRIBUTE {
                         if !generate_from {
-                            return Err(meta.error("duplicate ryft operation variant attribute 'skip_from'"));
+                            return Err(meta.error("duplicate ryft operation variant attribute `skip_from`"));
                         }
                         generate_from = false;
                         return Ok(());
@@ -620,24 +620,24 @@ impl OperationParser {
                         }
                         path if path == &STRUCTURAL_ATTRIBUTE => {
                             return Err(meta.error(
-                                "the 'structural' operation variant class was replaced by the \
-                                 'projected(U, structural)' role form",
+                                "the `structural` operation variant class was replaced by the \
+                                 `projected(U, structural)` role form",
                             ));
                         }
                         _ => {
                             return Err(meta.error(format_args!(
-                                "invalid operation variant '#[ryft(...)]' attribute: '{}'; only 'projected', \
-                                 'mixed', and 'skip_from' are supported here",
+                                "invalid operation variant `#[ryft(...)]` attribute: `{}`; only `projected`, \
+                                 `mixed`, and `skip_from` are supported here",
                                 meta.path.to_token_stream().to_string().replace(' ', ""),
                             )));
                         }
                     };
                     if let Some(class) = &class {
                         let message = if class.name() == candidate.name() {
-                            format!("duplicate ryft operation variant class '{}'", candidate.name())
+                            format!("duplicate ryft operation variant class `{}`", candidate.name())
                         } else {
                             format!(
-                                "contradictory ryft operation variant classes '{}' and '{}'",
+                                "contradictory ryft operation variant classes `{}` and `{}`",
                                 class.name(),
                                 candidate.name(),
                             )
@@ -696,22 +696,22 @@ fn parse_member_class(
         if role != STRUCTURAL_ATTRIBUTE {
             return Err(syn::Error::new_spanned(
                 &role,
-                format_args!("invalid {class} operation variant role '{role}'; only 'structural' is supported here"),
+                format_args!("invalid {class} operation variant role `{role}`; only `structural` is supported here"),
             ));
         }
         structural = true;
     }
     if !content.is_empty() {
         return Err(content.error(format_args!(
-            "the '{class}' operation variant class accepts one member type and an optional role",
+            "the `{class}` operation variant class accepts one member type and an optional role",
         )));
     }
     if !members.is_empty() && !members.iter().any(|member| type_tokens_equal(&member.r#type, &member_type)) {
         return Err(syn::Error::new_spanned(
             &member_type,
             format_args!(
-                "the '{class}' operation variant class declares member type '{}', which the operation family does not \
-                 declare in '#[ryft(members(...))]'",
+                "the `{class}` operation variant class declares member type `{}`, which the operation family does not \
+                 declare in `#[ryft(members(...))]`",
                 member_type.to_token_stream().to_string().replace(' ', ""),
             ),
         ));
@@ -736,16 +736,16 @@ fn defaulted_member_type<T: ToTokens>(tokens: T, class: &str, members: &[Operati
         [] if members.is_empty() => Err(syn::Error::new_spanned(
             tokens.into_token_stream(),
             format_args!(
-                "the '{class}' operation variant class cannot default its member type because the operation family \
-                 declares no '#[ryft(members(...))]'; declare the family's members or name the member type as \
-                 '{class}(U)'",
+                "the `{class}` operation variant class cannot default its member type because the operation family \
+                 declares no `#[ryft(members(...))]`; declare the family's members or name the member type as \
+                 `{class}(U)`",
             ),
         )),
         _ => Err(syn::Error::new_spanned(
             tokens.into_token_stream(),
             format_args!(
-                "the '{class}' operation variant class cannot default its member type because the operation family \
-                 declares {} computational member universes; name the member type as '{class}(U)'",
+                "the `{class}` operation variant class cannot default its member type because the operation family \
+                 declares {} computational member universes; name the member type as `{class}(U)`",
                 computational_members.len(),
             ),
         )),
@@ -2189,7 +2189,7 @@ impl OperationEnum {
                     match value {
                         #enum_ident::#variant_ident(operation) => #try_from_body,
                         _ => Err(#ryft::TypeError::invalid(::std::format!(
-                            "cannot project operation '{}' into a '{}' payload",
+                            "cannot project operation `{}` into a `{}` payload",
                             <#enum_type as #ryft::Operation>::name(value),
                             #payload_name,
                         ))),
@@ -3109,19 +3109,19 @@ mod tests {
             (quote!(#[ryft(type(DataType) extra, constant(V))]), "expected `,`"),
             (quote!(#[ryft(type(DataType), constant(V W))]), "`#[ryft(constant(...))]` must declare exactly one type"),
             (quote!(#[ryft(type(1), constant(V))]), "expected one of"),
-            (quote!(#[ryft(members())]), "'#[ryft(members(...))]' must declare at least one member universe"),
-            (quote!(#[ryft(members(ArrayType, ArrayType))]), "duplicate ryft member universe 'ArrayType'"),
+            (quote!(#[ryft(members())]), "`#[ryft(members(...))]` must declare at least one member universe"),
+            (quote!(#[ryft(members(ArrayType, ArrayType))]), "duplicate ryft member universe `ArrayType`"),
             (
                 quote!(#[ryft(members(ArrayType, replicated(DimensionType)))]),
-                "invalid ryft member universe role 'replicated'; only 'structural' is supported here",
+                "invalid ryft member universe role `replicated`; only `structural` is supported here",
             ),
             (
                 quote!(#[ryft(members(structural(ArrayType, DimensionType)))]),
-                "'structural(...)' declares exactly one member type",
+                "`structural(...)` declares exactly one member type",
             ),
             (
                 quote!(#[ryft(members(ArrayType))] #[ryft(members(DimensionType))]),
-                "duplicate ryft attribute 'members(...)'",
+                "duplicate ryft attribute `members(...)`",
             ),
         ];
         for (attributes, expected_error) in cases {
@@ -3223,7 +3223,7 @@ mod tests {
         .expect("failed to parse derive input");
         assert_eq!(generator.extract_variants(&input).len(), 1);
         assert_eq!(generator.errors.len(), 2);
-        assert!(generator.errors[0].to_string().contains("invalid operation variant '#[ryft(...)]' attribute"));
+        assert!(generator.errors[0].to_string().contains("invalid operation variant `#[ryft(...)]` attribute"));
         assert_eq!(
             generator.errors[1].to_string(),
             "operation field attributes are not supported; put operation member-class attributes on the enclosing \
@@ -3236,50 +3236,50 @@ mod tests {
         let cases = [
             (
                 quote!(#[ryft(projected(ArrayType), projected(ArrayType))]),
-                "duplicate ryft operation variant class 'projected'",
+                "duplicate ryft operation variant class `projected`",
             ),
-            (quote!(#[ryft(mixed(ArrayType), mixed(ArrayType))]), "duplicate ryft operation variant class 'mixed'"),
+            (quote!(#[ryft(mixed(ArrayType), mixed(ArrayType))]), "duplicate ryft operation variant class `mixed`"),
             (
                 quote!(#[ryft(projected(ArrayType), mixed(ArrayType))]),
-                "contradictory ryft operation variant classes 'projected' and 'mixed'",
+                "contradictory ryft operation variant classes `projected` and `mixed`",
             ),
             (quote!(#[ryft(projected)]), "expected parentheses"),
             (
                 quote!(#[ryft(mixed)]),
-                "the 'mixed' operation variant class cannot default its member type because the operation family \
-                 declares no '#[ryft(members(...))]'; declare the family's members or name the member type as \
-                 'mixed(U)'",
+                "the `mixed` operation variant class cannot default its member type because the operation family \
+                 declares no `#[ryft(members(...))]`; declare the family's members or name the member type as \
+                 `mixed(U)`",
             ),
             (
                 quote!(#[ryft(projected(ArrayType, replicated))]),
-                "invalid projected operation variant role 'replicated'; only 'structural' is supported here",
+                "invalid projected operation variant role `replicated`; only `structural` is supported here",
             ),
             (
                 quote!(#[ryft(mixed(ArrayType, replicated))]),
-                "invalid mixed operation variant role 'replicated'; only 'structural' is supported here",
+                "invalid mixed operation variant role `replicated`; only `structural` is supported here",
             ),
             (
                 quote!(#[ryft(projected(ArrayType, structural, DimensionType))]),
-                "the 'projected' operation variant class accepts one member type and an optional role",
+                "the `projected` operation variant class accepts one member type and an optional role",
             ),
             (
                 quote!(#[ryft(mixed(ArrayType, structural, DimensionType))]),
-                "the 'mixed' operation variant class accepts one member type and an optional role",
+                "the `mixed` operation variant class accepts one member type and an optional role",
             ),
-            (quote!(#[ryft(skip_from, skip_from)]), "duplicate ryft operation variant attribute 'skip_from'"),
+            (quote!(#[ryft(skip_from, skip_from)]), "duplicate ryft operation variant attribute `skip_from`"),
             (
                 quote!(#[ryft(structural(DimensionType))]),
-                "the 'structural' operation variant class was replaced by the 'projected(U, structural)' role form",
+                "the `structural` operation variant class was replaced by the `projected(U, structural)` role form",
             ),
             (
                 quote!(#[ryft(projected(ArrayType), transpose = custom_transpose)]),
-                "invalid operation variant '#[ryft(...)]' attribute: 'transpose'; only 'projected', 'mixed', \
-                 and 'skip_from' are supported here",
+                "invalid operation variant `#[ryft(...)]` attribute: `transpose`; only `projected`, `mixed`, \
+                 and `skip_from` are supported here",
             ),
             (
                 quote!(#[ryft(family_member(ArrayType))]),
-                "invalid operation variant '#[ryft(...)]' attribute: 'family_member'; only 'projected', 'mixed', \
-                 and 'skip_from' are supported here",
+                "invalid operation variant `#[ryft(...)]` attribute: `family_member`; only `projected`, `mixed`, \
+                 and `skip_from` are supported here",
             ),
         ];
         for (attribute, expected_error) in cases {
@@ -3366,8 +3366,8 @@ mod tests {
         assert_eq!(
             parser.errors.iter().map(syn::Error::to_string).collect::<Vec<_>>(),
             vec![
-                "the 'mixed' operation variant class declares member type 'DimensionType', which the operation family \
-                 does not declare in '#[ryft(members(...))]'"
+                "the `mixed` operation variant class declares member type `DimensionType`, which the operation family \
+                 does not declare in `#[ryft(members(...))]`"
                     .to_string(),
             ],
         );
@@ -3385,8 +3385,8 @@ mod tests {
         assert_eq!(
             parser.errors.iter().map(syn::Error::to_string).collect::<Vec<_>>(),
             vec![
-                "the 'mixed' operation variant class cannot default its member type because the operation family \
-                 declares 2 computational member universes; name the member type as 'mixed(U)'"
+                "the `mixed` operation variant class cannot default its member type because the operation family \
+                 declares 2 computational member universes; name the member type as `mixed(U)`"
                     .to_string(),
             ],
         );
@@ -3469,7 +3469,7 @@ mod tests {
         parser.extract_attributes(&input);
         assert!(parser.normalize_input(&input).is_none());
         assert_eq!(parser.errors.len(), 1);
-        assert_eq!(parser.errors[0].to_string(), "operation family declares member type 'DataType' more than once");
+        assert_eq!(parser.errors[0].to_string(), "operation family declares member type `DataType` more than once");
 
         let mut input: syn::DeriveInput = syn::parse_quote! {
             enum DuplicatePayloadOperation<V: Value<Type = DataType>> {
@@ -3491,7 +3491,7 @@ mod tests {
         assert_eq!(parser.errors.len(), 1);
         assert_eq!(
             parser.errors[0].to_string(),
-            "operation family holds constructible payload type 'FirstOperation' in more than one variant",
+            "operation family holds constructible payload type `FirstOperation` in more than one variant",
         );
     }
 
@@ -3602,7 +3602,7 @@ mod tests {
         // Borrowed payload projections report a canonical type error naming the projected operation and the statically
         // expected payload type.
         assert!(generated.contains("typeError=ryft::TypeError;"));
-        assert!(generated_tokens.contains(r#""cannot project operation '{}' into a '{}' payload""#));
+        assert!(generated_tokens.contains(r#""cannot project operation `{}` into a `{}` payload""#));
         assert!(generated_tokens.contains(r#""ArrayOperation<A>""#));
     }
 

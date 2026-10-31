@@ -1278,7 +1278,7 @@ mod tests {
     };
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
-        MemberDefinition, RuleCounters, cube_definition, custom_rule_program, member_cube_definition,
+        MemberDefinition, RuleCounters, cube_definition, custom_rule_program, member_cube_definition, ownership_probe,
     };
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -2618,7 +2618,7 @@ mod tests {
     fn test_composite_transpose_transposition_retained_rules() {
         let invocations = Arc::new(AtomicUsize::new(0));
         let definition = slice_at_one_definition(&invocations);
-        let ownership = definition.ownership_probe();
+        let ownership = ownership_probe(&definition);
         let program = slice_at_one_program(&definition, ArrayType::new_static(DataType::F64, [3]));
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
@@ -3256,7 +3256,7 @@ mod tests {
 
         let invocations = Arc::new(AtomicUsize::new(0));
         let definition = slice_at_one_definition(&invocations);
-        let ownership = definition.ownership_probe();
+        let ownership = ownership_probe(&definition);
         let input_type = ArrayType::new_static(DataType::F64, [4]);
         let mut builder = ProgramBuilder::<Array, MemberCarrier>::new();
         let input = builder.add_input(input_type.clone());

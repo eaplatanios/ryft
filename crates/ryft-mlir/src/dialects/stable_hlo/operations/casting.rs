@@ -310,7 +310,7 @@ pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         u32::try_from(self.integer_attribute(REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE)?.signless_value()).map_err(
             |_| {
                 Error::invalid_argument(format!(
-                    "invalid '{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
+                    "invalid `{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}` attribute in `stable_hlo::reduce_precision`"
                 ))
             },
         )
@@ -321,7 +321,7 @@ pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         u32::try_from(self.integer_attribute(REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE)?.signless_value()).map_err(
             |_| {
                 Error::invalid_argument(format!(
-                    "invalid '{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
+                    "invalid `{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}` attribute in `stable_hlo::reduce_precision`"
                 ))
             },
         )

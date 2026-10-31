@@ -51,7 +51,7 @@ pub trait MapOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o
             .map(usize::try_from)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| {
-                Error::invalid_argument(format!("invalid '{MAP_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::map`"))
+                Error::invalid_argument(format!("invalid `{MAP_DIMENSIONS_ATTRIBUTE}` attribute in `stable_hlo::map`"))
             })
     }
 
@@ -156,7 +156,7 @@ pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| {
                 Error::invalid_argument(format!(
-                    "invalid '{REDUCE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce`"
+                    "invalid `{REDUCE_DIMENSIONS_ATTRIBUTE}` attribute in `stable_hlo::reduce`"
                 ))
             })
     }
@@ -280,7 +280,7 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| {
                 Error::invalid_argument(format!(
-                    "invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"
+                    "invalid `{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}` attribute in `stable_hlo::reduce_window`"
                 ))
             })
     }
@@ -295,7 +295,7 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
                 .map(Some)
                 .map_err(|_| {
                     Error::invalid_argument(format!(
-                        "invalid '{REDUCE_WINDOW_STRIDES_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"
+                        "invalid `{REDUCE_WINDOW_STRIDES_ATTRIBUTE}` attribute in `stable_hlo::reduce_window`"
                     ))
                 })
         } else {
@@ -313,7 +313,7 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
                 .map(Some)
                 .map_err(|_| {
                     Error::invalid_argument(format!(
-                        "invalid '{REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE}' attribute in \
+                        "invalid `{REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE}` attribute in \
                          `stable_hlo::reduce_window`"
                     ))
                 })
@@ -332,7 +332,7 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
                 .map(Some)
                 .map_err(|_| {
                     Error::invalid_argument(format!(
-                        "invalid '{REDUCE_WINDOW_DILATIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"
+                        "invalid `{REDUCE_WINDOW_DILATIONS_ATTRIBUTE}` attribute in `stable_hlo::reduce_window`"
                     ))
                 })
         } else {

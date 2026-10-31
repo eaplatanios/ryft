@@ -266,7 +266,7 @@ impl FfiBufferType {
             "f64" => Ok(Self::F64),
             "c64" => Ok(Self::C64),
             "c128" => Ok(Self::C128),
-            _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI data type '{value}'"))),
+            _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI data type `{value}`"))),
         }
     }
 

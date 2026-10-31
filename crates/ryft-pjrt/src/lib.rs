@@ -95,7 +95,7 @@ impl Api {
         self.attributes()?
             .get(name)
             .cloned()
-            .ok_or_else(|| Error::not_found(format!("no attribute named '{name}' found in this PJRT plugin")))
+            .ok_or_else(|| Error::not_found(format!("no attribute named `{name}` found in this PJRT plugin")))
     }
 
     /// Returns the PJRT attributes associated with this [`Api`] (e.g., the version of the XLA compiler that it was
