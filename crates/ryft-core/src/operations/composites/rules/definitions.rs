@@ -22,12 +22,9 @@ use crate::differentiation::{
 use crate::macros::check_types;
 use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME};
-use crate::operations::composites::rules::specializations::{
-    CustomRuleDerivation, specialization_error, transpose_backward_source_program,
-};
+use crate::operations::composites::rules::specializations::{CustomRuleDerivation, transpose_backward_source_program};
 use crate::operations::composites::rules::{
-    CustomRuleBatchedOutputs, CustomRuleDerivedDefinitionKey, CustomRuleSpecialization,
-    CustomRuleSpecializationRequest, CustomRuleTracer,
+    CustomRuleBatchedOutputs, CustomRuleDerivedDefinitionKey, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
@@ -38,7 +35,6 @@ use crate::programs::{
     ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
     ReferenceType, Type, TypeError, Typed, Value,
 };
-use crate::specialization::{ReentrantSpecializationError, SpecializationCacheError};
 use crate::tracing::TracingContext;
 
 #[cfg(doc)]
@@ -656,8 +652,6 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     pub(super) derived_definitions: Mutex<HashMap<CustomRuleDerivedDefinitionKey, Weak<CustomRuleDefinition<V, O>>>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Creates a new [`CustomRuleDefinition`] with the provided label and no derivative rules.
     #[inline]
@@ -1200,57 +1194,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         };
         Ok(discharger(program)?)
     }
-
-    /// Produces the specialization for `request` with `produce_fn` without caching it, which is how specializations are
-    /// produced once the registration handle, and with it the caches, was dropped. A recursive request for the same
-    /// specialization on the same thread is rejected with the [`ReentrantSpecializationError`] that a cache reports.
-    pub(super) fn produce_uncached<F>(
-        &self,
-        request: CustomRuleSpecializationRequest<V::Type>,
-        produce_fn: F,
-    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
-    where
-        F: FnOnce() -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>,
-    {
-        /// Removes an in-flight marker when production finishes, fails, or unwinds.
-        struct InFlightMarker<'d, T: Type + Eq + Hash> {
-            /// Set from which the marker is removed.
-            in_flight: &'d Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<T>)>>,
-
-            /// Marker to remove.
-            marker: (ThreadId, CustomRuleSpecializationRequest<T>),
-        }
-
-        impl<T: Type + Eq + Hash> Drop for InFlightMarker<'_, T> {
-            fn drop(&mut self) {
-                self.in_flight.lock().expect("custom rule in-flight mutex is poisoned").remove(&self.marker);
-            }
-        }
-
-        let marker = (std::thread::current().id(), request);
-        if !self
-            .uncached_specializations
-            .lock()
-            .expect("custom rule in-flight mutex is poisoned")
-            .insert(marker.clone())
-        {
-            return Err(specialization_error(
-                self.name.as_ref(),
-                SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
-            ));
-        }
-        let _marker = InFlightMarker { in_flight: &self.uncached_specializations, marker };
-        produce_fn()
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V, O> CustomRuleDefinition<V, O>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: Eq + Hash + DifferentiableType>,
     O: Operation<Type = V::Type>
         + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Applies the retained backward rule of this [`CustomRuleDefinition`] directly, as the transposition of a
     /// [`CompositeTransposeOperation`] that invokes it does, and submits the cotangents of the differentiated inputs to
@@ -1340,15 +1294,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
     }
 }
 
-#[cfg(test)]
-impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
-    /// Returns whether any thread is producing an uncached specialization of this definition, which tests use to
-    /// observe that a failed or reentrant request leaves no production behind.
-    pub(super) fn has_uncached_specializations(&self) -> bool {
-        !self.uncached_specializations.lock().expect("custom rule in-flight mutex is poisoned").is_empty()
-    }
-}
-
 /// Returns the error that reports that the custom rule set named `name` has no reverse mode backward rule.
 pub(super) fn missing_backward_rule_error(name: &str) -> ProgramError {
     let description = if name == COMPOSITE_OPERATION_NAME {
@@ -1376,6 +1321,15 @@ fn validate_rule_output_types<T: Type>(name: &str, rule: &str, expected: &[T], a
 }
 
 #[cfg(test)]
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
+    /// Returns whether any thread is producing an uncached specialization of this definition, which tests use to
+    /// observe that a failed or reentrant request leaves no production behind.
+    pub(super) fn has_uncached_specializations(&self) -> bool {
+        !self.uncached_specializations.lock().expect("custom rule in-flight mutex is poisoned").is_empty()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1393,7 +1347,7 @@ mod tests {
     };
     use crate::operations::composites::rules::{
         CustomRuleBackwardSpecializationKey, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey,
-        CustomRuleDerivationKind, CustomRuleForwardSpecializationKey,
+        CustomRuleDerivationKind, CustomRuleForwardSpecializationKey, CustomRuleSpecialization,
     };
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition,

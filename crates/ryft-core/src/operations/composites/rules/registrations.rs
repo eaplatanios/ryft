@@ -1,10 +1,12 @@
 use std::any::{Any, TypeId};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Weak};
+use std::thread::ThreadId;
 
 use lru::LruCache;
 
@@ -18,8 +20,8 @@ use crate::operations::composites::rules::{
     CustomRuleSpecializationRequest,
 };
 use crate::parameters::Parameter;
-use crate::programs::{ProgramError, Typed};
-use crate::specialization::SpecializationCache;
+use crate::programs::{ProgramError, Type, Typed};
+use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheError};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -198,7 +200,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
     }
 
     /// Returns the specialization for `request`, produced by `produce_fn` on a miss. The specialization is retained in
-    /// the registration's caches while they are alive, and produced without caching otherwise.
+    /// the registration's caches while they are alive, and produced without caching otherwise. A recursive request for
+    /// the same specialization on the same thread is rejected with the [`ReentrantSpecializationError`] that a cache
+    /// reports, including when the caches were dropped.
     pub(super) fn specialize<F>(
         &self,
         request: CustomRuleSpecializationRequest<V::Type>,
@@ -207,8 +211,37 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
     where
         F: FnOnce() -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>,
     {
+        /// Removes an in-flight marker when production finishes, fails, or unwinds.
+        struct InFlightMarker<'o, T: Type + Eq + Hash> {
+            /// Set from which the marker is removed.
+            in_flight: &'o Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<T>)>>,
+
+            /// Marker to remove.
+            marker: (ThreadId, CustomRuleSpecializationRequest<T>),
+        }
+
+        impl<T: Type + Eq + Hash> Drop for InFlightMarker<'_, T> {
+            fn drop(&mut self) {
+                self.in_flight.lock().expect("custom rule in-flight mutex is poisoned").remove(&self.marker);
+            }
+        }
+
         let Some(caches) = self.caches.upgrade() else {
-            return self.definition.produce_uncached(request, produce_fn);
+            let marker = (std::thread::current().id(), request);
+            if !self
+                .definition
+                .uncached_specializations
+                .lock()
+                .expect("custom rule in-flight mutex is poisoned")
+                .insert(marker.clone())
+            {
+                return Err(specialization_error(
+                    self.name(),
+                    SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
+                ));
+            }
+            let _marker = InFlightMarker { in_flight: &self.definition.uncached_specializations, marker };
+            return produce_fn();
         };
         match request {
             CustomRuleSpecializationRequest::Jvp(key) => {
@@ -440,7 +473,7 @@ mod tests {
                 program.jvp(),
                 Err(DifferentiationError::Program(ProgramError::InvalidArgument { message })) if message == reentrant,
             ));
-            assert!(!retained.upgrade().unwrap().has_uncached_in_flight());
+            assert!(!retained.upgrade().unwrap().has_uncached_specializations());
         }
     }
 
