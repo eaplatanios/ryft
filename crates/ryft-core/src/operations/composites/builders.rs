@@ -784,8 +784,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     V: Value,
     O: Operation<Type = V::Type>,
@@ -798,12 +796,13 @@ impl<
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    /// Returns this function with its reverse mode forward rule deferred to the backward pass, which is the analogue of
-    /// JAX's `custom_vjp(..., optimize_remat=True)`. Reverse mode then computes the outputs of each call with the
-    /// primal, rather than with `forward`, and keeps only the call's inputs alive for the backward pass, where it runs
-    /// `forward` on them to recover the residuals `r` right before `backward` consumes them. This trades recomputing
-    /// `forward` for the memory that its residuals would otherwise occupy between the two passes, and it pays off when
-    /// the primal is cheaper than `forward` (e.g., when computing the residuals is the expensive part of `forward`).
+    /// Returns this function with its reverse mode forward rule deferred to the backward pass, which is the Ryft
+    /// analogue of JAX's `custom_vjp(..., optimize_remat=True)`. Reverse mode then computes the outputs of each call
+    /// with the primal, rather than with `forward`, and keeps only the call's inputs alive for the backward pass, where
+    /// it runs `forward` on them to recover the residuals `r` right before `backward` consumes them. This trades
+    /// recomputing `forward` for the memory that its residuals would otherwise occupy between the two passes, and it
+    /// pays off when the primal is cheaper than `forward` (e.g., when computing the residuals is the expensive part of
+    /// `forward`).
     ///
     /// The swap applies wherever reverse mode partitions a call (e.g., in [`vjp`](crate::ReverseModeDifferentiate::vjp)
     /// and in rematerialized bodies, refer to [`rematerialize`](crate::rematerialize)), so a residual policy that saves
@@ -866,8 +865,9 @@ where
     Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    /// Returns this function with its reverse mode forward rule deferred to the backward pass, exactly as for the
-    /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
+    /// Returns this function with its reverse mode differentiation forward rule deferred to the backward pass, exactly
+    /// as for the rules of [`Composite::with_vjp`]. Refer to the documentation of the [`ExplicitVjp`] form of this
+    /// function for the semantics.
     #[inline]
     pub fn with_deferred_forward(mut self) -> Self {
         self.vjp.deferred_forward = true;
@@ -891,7 +891,8 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Returns this function with its reverse mode forward rule deferred to the backward pass, exactly as for the
-    /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
+    /// rules of [`Composite::with_vjp`]. Refer to the documentation of the [`ExplicitVjp`] form of this function
+    /// for the semantics.
     #[inline]
     pub fn with_deferred_forward(mut self) -> Self {
         self.vjp.deferred_forward = true;
@@ -911,8 +912,8 @@ impl<
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    /// Returns this function with the provided custom batching rule `(x, x_axes, extent) ↦ (y, y_axes)`, which batches
-    /// its calls instead of structurally batching its primal (i.e., the analogue of JAX's
+    /// Returns this function with the provided custom batching rule `(x, x_axes, extent) ↦ (y, y_axes)`,
+    /// which batches its calls instead of structurally batching its primal (i.e., the Ryft analogue of JAX's
     /// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html)). The rule
     /// receives the batched inputs (as values of the context in which the call is batched), their [`BatchAxis`]es
     /// (i.e., an `Input::To<BatchAxis>` value), and the extent of the batch axis (i.e., [`BatchingLevelExtent::Static`]
@@ -934,8 +935,8 @@ where
     /// How derivatives interact with the rule depends on the forward mode rule (refer to [`composite`] for the rule
     /// selection):
     ///
-    ///   - **Derived from the primal** (i.e., without derivative rules, or with [`Self::with_jvp_from_primal`]): the
-    ///     rule stays on the path of forward mode derivatives in either order of the two transforms, which is the
+    ///   - **Derived from the Primal (i.e., without derivative rules, or with [`Self::with_jvp_from_primal`]):** The
+    ///     rule stays on the path of forward mode derivatives in either order of the two transforms, which is the Ryft
     ///     analogue of JAX's `custom_vmap_jvp`. Differentiating a batched call differentiates the rule's program, and
     ///     differentiating an unbatched call stages a derived call whose batching applies the derivative of the rule,
     ///     including when a forward mode Jacobian batches it or when a linearized pushforward is batched. The derived
@@ -958,11 +959,12 @@ where
     ///     batching that linearization's pushforward batches it structurally. Transposing a linearization transposes
     ///     the primal of its staged pushforward, so the rule does not apply to the transpose. Reverse mode therefore
     ///     inlines the derivative of the primal instead of staging a derived call.
-    ///   - **Explicit** (i.e., [`Self::with_jvp`] or reverse mode rules): differentiating a batched call traces the
-    ///     derivative rules at the unbatched types and batches them structurally, aligned to the batch axes that the
-    ///     rule declared, and batching a derivative batches the explicit rule structurally, which is JAX's
-    ///     `custom_jvp(custom_vmap(f))` nesting order. The other order nests two functions: an outer function with the
-    ///     batching rule, whose primal calls an inner function with the derivative rule.
+    ///
+    ///   - **Explicit (i.e., [`Self::with_jvp`] or reverse mode rules):** Differentiating a batched call traces the
+    ///     derivative rules at the unbatched types and batches them structurally, aligned to the batch axes that
+    ///     the rule declared, and batching a derivative batches the explicit rule structurally, which is JAX's
+    ///     `custom_jvp(custom_vmap(f))` nesting order. The other order nests two functions: an outer function
+    ///     with the batching rule, whose primal calls an inner function with the derivative rule.
     #[inline]
     pub fn with_batching<Rule>(
         self,
@@ -1006,8 +1008,8 @@ where
     /// returns for such inputs.
     ///
     /// The outer product costs one application of the rule's derivative with respect to those inputs per batch item,
-    /// which is why a rule that only computes the batched primal (and therefore gives the same values when an input is
-    /// broadcast) should use [`Self::with_batching`] instead. The family's batching policy must support taking
+    /// which is why a rule that only computes the batched primal (and therefore gives the same values when an input
+    /// is broadcast) should use [`Self::with_batching`] instead. The family's batching policy must support taking
     /// diagonals (refer to [`DiagonalBatchingPolicy`]).
     #[inline]
     pub fn with_broadcast_sensitive_batching<Rule>(
@@ -1042,14 +1044,15 @@ where
 
     /// Returns this function with sequential batching, which batches its calls by looping over the batch items with a
     /// scan (refer to [`ScanOperation`]) whose body applies the unbatched call to one item at a time, instead of
-    /// structurally batching its primal. This is the analogue of JAX's [`custom_batching.sequential_vmap`][sequential],
+    /// structurally batching its primal. This is the Ryft analogue of JAX's
+    /// [`custom_batching.sequential_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html),
     /// and a convenience over [`Self::with_batching`] for primals that have no batched form (e.g., a foreign kernel
-    /// called by [`Self::from_custom_call`] that processes one item at a time): the mapped inputs are moved to axis 0
-    /// and sliced by the scan, the replicated inputs are passed to every iteration unchanged, and every output is
-    /// mapped at axis 0. The batch extent must be statically known, including when represented by a first-class
+    /// called by [`Self::from_custom_call`] that processes one item at a time): the mapped inputs are moved to axis
+    /// `0` and sliced by the scan, the replicated inputs are passed to every iteration unchanged, and every output is
+    /// mapped at axis `0`. The batch extent must be statically known, including when represented by a first-class
     /// dimension, and the context's family must support scans (i.e., its types implement [`ScanType`] and its
-    /// operations contain [`ScanOperation`]). The batch axis must be unnamed because the scan does not bind named
-    /// collectives across its items for the primal or derivative rules.
+    /// operations contain [`ScanOperation`]). The batch axis must be unnamed because the scan does not bind
+    /// named collectives across its items for the primal or derivative rules.
     ///
     /// Unlike a custom batching rule, which replaces the call's primal while preserving the call, batching replaces
     /// the call with the scan, whose body calls the unbatched function. The function's derivative rules therefore keep
@@ -1058,8 +1061,6 @@ where
     /// is batched sequentially as well (i.e., JAX's `custom_vmap_jvp` behavior for `sequential_vmap`). Batching the
     /// scan again at an enclosing batching level batches its body, whose call is again batched sequentially, so nested
     /// batching yields nested scans.
-    ///
-    /// [sequential]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
     ///
     /// # Examples
     ///
@@ -1100,10 +1101,11 @@ where
 
     /// Returns this function with the provided batch axes for the outputs of its batched calls, one per flattened
     /// output leaf. Without a custom batching rule, batching a call structurally batches its primal and maps every
-    /// output at axis 0 by default, which is always valid but broadcasts outputs that do not vary across the batch. The
-    /// declared axes apply at every batching level: the batched primal is aligned to them, and so is each derivative
-    /// rule batched for the call. A custom batching rule declares the axes of its outputs itself, so configuring one
-    /// (refer to [`Self::with_batching`]) discards these axes. Their count is validated when a call is batched.
+    /// output at axis 0 by default, which is always valid but broadcasts outputs that do not vary across the batch.
+    /// The declared axes apply at every batching level: the batched primal is aligned to them, and so is each
+    /// derivative rule batched for the call. A custom batching rule declares the axes of its outputs itself, so
+    /// configuring one (refer to [`Self::with_batching`]) discards these axes. Their count is validated when a
+    /// call is batched.
     ///
     /// # Parameters
     ///
@@ -1135,9 +1137,9 @@ where
     /// documentation of the [`composite`] function for the tracing semantics and for how the transforms treat the
     /// staged call.
     ///
-    /// The [`Context`] `C` whose universe the rules are traced into is the [`Domain`](Value::Domain)
-    /// of the values in `input`, which is exactly the context the call is staged into. It is therefore never named at
-    /// a construction or call site, while the stored closures still pin the tracers that this universe must produce.
+    /// The [`Context`] `C` whose universe the rules are traced into is the [`Domain`](Value::Domain) of the values in
+    /// `input`, which is exactly the context the call is staged into. It is therefore never named at a construction or
+    /// call site, while the stored closures still pin the tracers that this universe must produce.
     ///
     /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded with the
     /// named axes in scope in `C` (refer to [`NamedAxes::named_axes`]). Code in the closures therefore resolves the
@@ -1147,29 +1149,29 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number of
-    /// input leaves, when tracing the primal closure fails, or when the staged [`CompositeOperation`] rejects the
+    /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number
+    /// of input leaves, when tracing the primal closure fails, or when the staged [`CompositeOperation`] rejects the
     /// call (e.g., because the call violates the reference contract). The rules are validated when they are first
     /// traced, so their errors are reported by the derivative requests that trace them.
     pub fn call<
-        Leaf: Value<Type = C::Type, Domain = C>,
-        C: CompositeCallContext<Type = V::Type, Value = Leaf, Constant = V, Operation = O>,
-        InputValues: Parameterized<Leaf, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
+        InputValue: Value<Type = C::Type, Domain = C>,
+        InputValues: Parameterized<InputValue, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
+        C: CompositeCallContext<Type = V::Type, Value = InputValue, Constant = V, Operation = O>,
     >(
         &self,
         input: InputValues,
-    ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<Leaf>, ProgramError>
+    ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<InputValue>, ProgramError>
     where
         V::Type: BatchableType,
+        Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<V>,
+        Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+        Input::ParameterStructure: PartialEq + Send,
+        Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<V> + ParameterizedFamily<InputValue>,
+        Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+        Output::ParameterStructure: PartialEq + Send,
         CustomRuleDefinition<V, O>: CompositeJvp<Jvp, CustomRuleTracer<V, O>, Input, Output>
             + CompositeVjp<Vjp, CustomRuleTracer<V, O>, Input, Output>
             + CompositeBatching<Batching, CustomRuleTracer<V, O>, Input, Output>,
-        Input::ParameterStructure: PartialEq + Send,
-        Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<V>,
-        Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-        Output::ParameterStructure: PartialEq + Send,
-        Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<V> + ParameterizedFamily<Leaf>,
-        Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -1185,17 +1187,17 @@ where
         let input_count = input_values.len();
         if self.non_differentiated_count > input_count {
             return Err(TypeError::invalid(format!(
-                "`{}` non-differentiated input count {} exceeds input count {input_count}",
-                self.name, self.non_differentiated_count,
+                "`{}` non-differentiated input count {} exceeds input count {}",
+                self.name, self.non_differentiated_count, input_count,
             ))
             .into());
         }
 
-        // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The
-        // primal and the rules are traced in fresh traces, which are seeded with the named axes that are visible where
-        // the function is called (e.g., the axis of an enclosing batching level), so that they resolve the same names
-        // as the function would if it were inlined. Rules traced under different bindings may differ, so the named
-        // axes are part of the registration key.
+        // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The primal
+        // and the rules are traced in fresh traces, which are seeded with the named axes that are visible where the
+        // function is called (e.g., the axis of an enclosing batching level), so that they resolve the same names as
+        // the function would if it were inlined. Rules traced under different bindings may differ, so the named axes
+        // are part of the registration key.
         let named_axes = first.domain().named_axes();
         let (output_types, primal) =
             DomainTracingContext::<C>::trace_with_named_axes(&*self.primal, input_types.clone(), named_axes.clone())?;
@@ -1279,6 +1281,8 @@ pub type VjpComposite<V, O, Input, Output, Residual> =
 /// in a struct field).
 pub type BatchedComposite<V, O, Input, Output> =
     Composite<V, O, Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<V, O, Input, Output>>;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any custom
 /// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them, where
