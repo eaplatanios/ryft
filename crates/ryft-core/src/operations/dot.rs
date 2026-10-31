@@ -443,34 +443,32 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
-    // Alignment delegates mapped axis materialization to `ArrayExtentBatchingPolicy::match_axis`, so a dynamic mapped
-    // extent remains a first-class value. The lifted contraction keeps each item independent across the inserted axis.
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Alignment delegates mapped axis materialization to `ArrayExtentBatchingPolicy::match_axis`, so a dynamic
+        // mapped extent remains a first-class value. The lifted contraction keeps each item independent across the
+        // inserted axis.
         check_count!("input", inputs, 2, ProgramError);
         self.dimensions.validate(
             DOT_OPERATION_NAME,
             inputs[0].unbatched_type().rank(),
             inputs[1].unbatched_type().rank(),
         )?;
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-
         check_common_mapped_dimension(DOT_OPERATION_NAME, inputs)?;
 
         // A mixed pair needs a physical batch axis on its replicated input before the logical dimension numbers can be
         // lifted. Insert that axis at position zero through the active policy, so a dynamic mapped extent remains an
         // extent value grounding the broadcast instead of requiring a statically known host size.
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let aligned_inputs: Vec<ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
             (Some(_), None) => vec![inputs[0].clone(), P::match_axis(context, &inputs[1], Axis::from(0))?],
@@ -499,22 +497,22 @@ where
             .with_accumulation_type(self.accumulation_type)
             .with_output_sharding(output_sharding);
         let output_batch_axes = [BatchAxis::from_optional_position(output_axis)];
-        Ok(lifted_operation.interpret_with_batch_axes(context, &aligned_inputs, &output_batch_axes)?)
+        lifted_operation.interpret_with_batch_axes(context, &aligned_inputs, &output_batch_axes)
     }
 }
 
-// Forward mode differentiation applies the product rule. Each term holds the corresponding primal input fixed on its
-// original contracting side and stages an ordinary dot with the primal operation's dimensions, accumulation type, and
-// requested output sharding.
 impl_differentiable_operation! {
     DotOperation,
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<DotOperation>,
         C::Value: ConvertElementType + Dot + Add,
+        C::Operation: From<DotOperation>,
     {
         |operation, context, _driver, inputs| {
+            // Forward mode differentiation applies the product rule. Each term holds the corresponding primal input
+            // fixed on its original contracting side and stages an ordinary dot with the primal operation's dimensions,
+            // accumulation type, and requested output sharding.
             check_count!("input", inputs, 2, ProgramError);
             let left = &inputs[0];
             let right = &inputs[1];
@@ -538,6 +536,7 @@ impl_differentiable_operation! {
                 &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
                 &[],
             )?;
+
             let (linear_index, known_index) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
                 // Both inputs linear is a bilinear product, which is not a linear map in both inputs jointly and so
                 // never appears in a valid pushforward.
@@ -553,11 +552,12 @@ impl_differentiable_operation! {
             };
 
             // Demand is independent of primal knowledge. An ignored linear input stays unknown, but no matrix
-            // multiplication or element conversion is needed for its cotangent. A zero output cotangent stays a
-            // structural zero.
+            // multiplication or element conversion is needed for its cotangent. A zero output cotangent stays
+            // a structural zero.
             if !accumulators[linear_index].is_needed() {
                 return Ok(());
             }
+
             let MaybeZero::Value(output_cotangent) = &outputs[0] else {
                 return Ok(());
             };
@@ -633,6 +633,7 @@ impl_differentiable_operation! {
                     .collect::<Vec<_>>();
                 (dimensions, output_axes)
             };
+
             let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
             let adjoint_output_sharding = linear_cotangent_type
                 .sharding()
@@ -654,16 +655,17 @@ impl_differentiable_operation! {
             } else {
                 adjoint_value.convert_element_type(linear_cotangent_type.data_type())?
             };
+
             accumulators[linear_index].accumulate(context, MaybeZero::Value(adjoint_value))
         }
     },
 }
 
-/// Value-level generalized dot capability.
-///
-/// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It performs the contraction
-/// described by `dimensions`, supporting standard matrix multiplication, batched matrix multiplication, vector inner
-/// products, and arbitrary tensor contractions.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Value-level generalized dot product capability. [`Dot`] is the receiver-style entry point for staging or executing
+/// [`DotOperation`]s. It performs the contraction described by `dimensions`, supporting standard matrix multiplication,
+/// batched matrix multiplication, vector inner products, and arbitrary tensor contractions.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
@@ -673,11 +675,14 @@ pub trait Dot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// the inputs are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError>;
 
+    // TODO(eaplatanios): Should we also introduce a `dot_with_configuration` that takes all of `dimensions`,
+    //  `output_sharding`, and `accumulation_type`. Also, should `accumulation_type` come first in both these arguments
+    //  and also the functions of this trait (i.e., `dot_with_accumulation_type` before `dot_with_output_sharding`)?
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding` for
     /// the result. The requested sharding overrides the inferred output sharding and is validated by the operation's
-    /// type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). Staging values attach it
-    /// to the staged operation, array IR values project it onto their array members, and concrete [`Array`]s record it
-    /// on their result.
+    /// type inference (this is implemented using [`DotOperation::with_output_sharding`]). Staging values attach it to
+    /// the staged operation, array IR values project it onto their array members, and concrete [`Array`]s record it on
+    /// their result.
     fn dot_with_output_sharding(
         &self,
         rhs: &Self,
@@ -686,8 +691,8 @@ pub trait Dot<T = <Self as Capability>::Universe>: Capability + Sized {
     ) -> Result<Self, ProgramError>;
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the inputs to
-    /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type. Refer
-    /// to the documentation of [`DotOperation::with_accumulation_type`] for the exact contract.
+    /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type.
+    /// Refer to the documentation of [`DotOperation::with_accumulation_type`] for the exact contract.
     fn dot_with_accumulation_type(
         &self,
         rhs: &Self,
