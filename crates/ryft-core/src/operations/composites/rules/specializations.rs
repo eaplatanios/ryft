@@ -1051,8 +1051,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Hash for LiftedCustomRules<V, O> 
 
 impl<V: Typed + Parameter, O> sealed::Sealed for LiftedCustomRules<V, O> {}
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V, O, VC, OC> CustomRuleSource<VC, OC> for LiftedCustomRules<V, O>
 where
     V: Typed<Type: Eq + Hash> + Parameter,
@@ -1068,6 +1066,7 @@ where
         self.name_or_unavailable()
     }
 
+    #[inline]
     fn has_jvp(&self) -> bool {
         match self {
             Self::Member(rules) => rules.has_jvp(),
@@ -1075,6 +1074,7 @@ where
         }
     }
 
+    #[inline]
     fn derives_jvp_from_primal(&self) -> bool {
         match self {
             Self::Member(rules) => rules.derives_jvp_from_primal(),
@@ -1082,6 +1082,7 @@ where
         }
     }
 
+    #[inline]
     fn has_vjp(&self) -> bool {
         match self {
             Self::Member(rules) => rules.has_vjp(),
@@ -1089,6 +1090,7 @@ where
         }
     }
 
+    #[inline]
     fn defers_forward(&self) -> bool {
         match self {
             Self::Member(rules) => rules.defers_forward(),
@@ -1096,6 +1098,7 @@ where
         }
     }
 
+    #[inline]
     fn batched_output_axes(&self) -> Option<&[BatchAxis]> {
         match self {
             Self::Member(rules) => rules.batched_output_axes(),
@@ -1103,6 +1106,7 @@ where
         }
     }
 
+    #[inline]
     fn has_batching_rule(&self) -> bool {
         match self {
             Self::Member(rules) => rules.has_batching_rule(),
@@ -1110,6 +1114,7 @@ where
         }
     }
 
+    #[inline]
     fn has_sequential_batching(&self) -> bool {
         match self {
             Self::Member(rules) => rules.has_sequential_batching(),
@@ -1131,14 +1136,14 @@ where
 impl<V, O, VC, OC> CustomRuleSpecializer<VC, OC> for LiftedCustomRules<V, O>
 where
     V: Value<Type: DifferentiableType + Eq + Hash>,
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     O: Operation<Type = V::Type>
         + From<CompositeTransposeOperation<V, O>>
         + ResidualZeroProvider<V::Type, Operation = O>,
     VC: 'static + ValueProjection<V::Type, Projected = V, Type: Eq + Hash + From<V::Type>>,
     OC: 'static + From<O>,
-    CustomRuleSpecialization<VC, OC>: Send + Sync,
     for<'t> &'t V::Type: TryFrom<&'t VC::Type, Error = TypeError>,
+    CustomRuleSpecialization<VC, OC>: Send + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn jvp_specialization(
         &self,
@@ -1209,8 +1214,7 @@ where
         let member = self.member()?;
         if key.destination_kinds.contains(&CotangentDestinationKind::Reference) {
             return Err(ProgramError::MalformedProgram(format!(
-                "{} requested a caller-buffer destination from rules \
-                 that cannot write caller buffers",
+                "{} requested a caller-buffer destination from rules that cannot write caller buffers",
                 describe_composite(COMPOSITE_TRANSPOSE_OPERATION_NAME, self.name_or_unavailable()),
             ))
             .into());
@@ -1259,9 +1263,10 @@ where
             <&V::Type>::try_from(r#type).cloned().map_err(|_| {
                 DifferentiationError::from(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "{} cannot batch a call over type `{type}`, which the \
-                         family in which its rules were registered cannot represent",
+                        "{} cannot batch a call over type `{}`, which the family in \
+                         which its rules were registered cannot represent",
                         describe_composite(COMPOSITE_OPERATION_NAME, self.name_or_unavailable()),
+                        r#type,
                     ),
                 })
             })
@@ -1292,6 +1297,7 @@ where
         })
     }
 
+    #[inline]
     fn sequential_batching_scan(
         &self,
         length: usize,
@@ -1306,6 +1312,7 @@ where
         Ok((OC::from(scan), index_type.into()))
     }
 
+    #[inline]
     fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
         // The member definition derives in its own family, and the derived rules follow the call like the member's
         // rules do. Unavailable rules stay unavailable, so the derived call reports the same error on its first
@@ -1316,6 +1323,8 @@ where
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDerivation<V, O>
 where
