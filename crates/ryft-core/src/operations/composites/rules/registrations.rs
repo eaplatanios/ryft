@@ -230,7 +230,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             let marker = (std::thread::current().id(), request);
             if !self
                 .definition
-                .uncached_specializations
+                .uncached_specializations()
                 .lock()
                 .expect("custom rule in-flight mutex is poisoned")
                 .insert(marker.clone())
@@ -240,7 +240,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
                     SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
                 ));
             }
-            let _marker = InFlightMarker { in_flight: &self.definition.uncached_specializations, marker };
+            let _marker = InFlightMarker { in_flight: self.definition.uncached_specializations(), marker };
             return produce_fn();
         };
         match request {
@@ -303,7 +303,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleReference<V, 
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> PartialEq for CustomRuleReference<V, O> {
     fn eq(&self, other: &Self) -> bool {
-        self.definition.id == other.definition.id
+        self.definition.id() == other.definition.id()
     }
 }
 
@@ -311,7 +311,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Eq for CustomRuleReference<V, O> 
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Hash for CustomRuleReference<V, O> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.definition.id.hash(state);
+        self.definition.id().hash(state);
     }
 }
 

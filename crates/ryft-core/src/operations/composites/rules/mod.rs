@@ -47,7 +47,7 @@ pub type CustomRuleTracer<V, O> = Tracer<TracingContext<V, O>>;
 /// Kind of values that a batched rule program returns, which determines how an output that is mapped while its
 /// required batch axis is replicated is reconciled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum CustomRuleBatchedOutputs {
+pub enum CustomRuleBatchedOutputs {
     /// Primal or tangent values, for which such an output violates the required layout and is rejected.
     Values,
 

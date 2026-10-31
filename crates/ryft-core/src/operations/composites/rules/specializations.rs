@@ -26,7 +26,7 @@ use crate::operations::composites::operations::{
 };
 use crate::operations::composites::rules::definitions::{
     CustomRuleBatching, CustomRuleBatchingRule, CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp,
-    CustomRuleJvpRule, CustomRuleVjp, CustomVjpOperation, missing_backward_rule_error,
+    CustomRuleJvpRule, CustomRuleVjp, CustomVjpOperation,
 };
 use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
@@ -242,47 +242,47 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for CustomRuleReference<V, O> {
     #[inline]
     fn id(&self) -> u64 {
-        self.definition.id
+        self.definition.id()
     }
 
     #[inline]
     fn name(&self) -> &str {
-        self.definition.name.as_ref()
+        self.definition.name()
     }
 
     #[inline]
     fn has_jvp(&self) -> bool {
-        matches!(self.definition.jvp, Some(CustomRuleJvp::Rule(_) | CustomRuleJvp::SymbolicZeroRule(_)))
+        matches!(self.definition.jvp(), Some(CustomRuleJvp::Rule(_) | CustomRuleJvp::SymbolicZeroRule(_)))
     }
 
     #[inline]
     fn derives_jvp_from_primal(&self) -> bool {
-        matches!(self.definition.jvp, Some(CustomRuleJvp::Primal))
+        matches!(self.definition.jvp(), Some(CustomRuleJvp::Primal))
     }
 
     #[inline]
     fn has_vjp(&self) -> bool {
-        self.definition.vjp.is_some()
+        self.definition.vjp().is_some()
     }
 
     #[inline]
     fn defers_forward(&self) -> bool {
-        self.definition.deferred_forward && self.has_vjp()
+        self.definition.deferred_forward() && self.has_vjp()
     }
 
     #[inline]
     fn batched_output_axes(&self) -> Option<&[BatchAxis]> {
-        self.definition.batched_output_axes.as_deref()
+        self.definition.batched_output_axes()
     }
 
     #[inline]
     fn has_batching_rule(&self) -> bool {
-        self.definition.batching_rule.is_some()
+        self.definition.batching_rule().is_some()
     }
 
     #[inline]
     fn has_sequential_batching(&self) -> bool {
-        self.definition.sequential_batching_scan.is_some()
+        self.definition.sequential_batching_scan().is_some()
     }
 
     #[inline]
@@ -312,7 +312,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // its outermost level, so that every batching level shares one trace of the rule.
         //
         // The traced rule is validated against the unbatched output types of `key`.
-        let rule = match &self.definition.jvp {
+        let rule = match self.definition.jvp() {
             Some(CustomRuleJvp::Rule(rule)) => CustomRuleJvpRule::Materialized(rule),
             Some(CustomRuleJvp::SymbolicZeroRule(rule)) => CustomRuleJvpRule::SymbolicZeros(rule),
             _ => {
@@ -442,7 +442,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     rule_input_types,
-                    self.definition.named_axes.clone(),
+                    self.definition.named_axes().to_vec(),
                 )?;
                 // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
                 // whose computation is all that remains of the program.
@@ -515,7 +515,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // The traced rule is validated against the unbatched output types of `key`. A call that keeps only some of
         // the rule's outputs still receives every output of the rule, because the backward rule receives a seed for
         // each of them, but only the kept outputs are validated against the call's output types.
-        let Some(CustomRuleVjp { forward, .. }) = &self.definition.vjp else {
+        let Some(forward) = self.definition.vjp().map(|vjp| vjp.forward()) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: {
                     let name = self.name();
@@ -568,7 +568,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     key.input_types.clone(),
-                    self.definition.named_axes.clone(),
+                    self.definition.named_axes().to_vec(),
                 )?;
                 let kept_output_indices = key.kept_output_indices(output_count);
                 let program = conform_rule_output_types(
@@ -659,8 +659,19 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // a directly invoking [`CompositeTransposeOperation`] and returns only its live-seed outputs, so transposition
         // hands the rule a structural zero for every dropped output. A batched key batches the specialization of its
         // inner key at its outermost level.
-        let Some(CustomRuleVjp { transposer, .. }) = &self.definition.vjp else {
-            return Err(missing_backward_rule_error(self.name()).into());
+        let Some(CustomRuleVjp { transposer, .. }) = self.definition.vjp() else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: {
+                    let name = self.name();
+                    let description = if name == COMPOSITE_OPERATION_NAME {
+                        format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+                    } else {
+                        format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+                    };
+                    format!("{description} has no backward rule")
+                },
+            }
+            .into());
         };
         // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Backward(key.clone()), || {
@@ -763,7 +774,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // Traces the custom batching rule over the level's boundary inputs followed by the batched inputs, recording
         // the batch axes that it declares for its outputs. A derived definition applies the JVP of its source's rule
         // instead. The program becomes the primal region of the batched call, so it is discharged with the call.
-        let Some(batching_rule) = &self.definition.batching_rule else {
+        let Some(batching_rule) = self.definition.batching_rule() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: {
                     let name = self.name();
@@ -816,7 +827,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     Ok(outputs)
                 },
                 key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-                self.definition.named_axes.clone(),
+                self.definition.named_axes().to_vec(),
             )?;
             let program = self.definition.discharge_if(key.discharged, program)?;
             Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
@@ -830,7 +841,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         axis_sharding: &ShardingDimension,
         stacked_output_count: usize,
     ) -> Result<(O, V::Type), DifferentiationError> {
-        let Some(sequential_batching_scan) = &self.definition.sequential_batching_scan else {
+        let Some(sequential_batching_scan) = self.definition.sequential_batching_scan() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: {
                     let name = self.name();
@@ -873,27 +884,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 CustomRuleDerivationKind::Jvp => "jvp",
                 CustomRuleDerivationKind::Pushforward => "pushforward",
             };
-            let batching_rule = self.definition.batching_rule.as_ref().map(|batching_rule| CustomRuleBatching {
+            let batching_rule = self.definition.batching_rule().map(|batching_rule| CustomRuleBatching {
                 rule: CustomRuleBatchingRule::Derived(CustomRuleDerivation { source: self.clone(), key }),
                 differentiator: batching_rule.differentiator.clone(),
                 broadcast_sensitivity: batching_rule.broadcast_sensitivity.clone(),
             });
-            CustomRuleDefinition {
-                name: Cow::Owned(format!("{prefix}({})", self.name())),
-                named_axes: self.definition.named_axes.clone(),
-                jvp: Some(CustomRuleJvp::Primal),
-                structural_batcher: self.definition.structural_batcher.clone(),
-                sequential_batching_scan: self.definition.sequential_batching_scan.clone(),
-                batching_rule,
-                discharger: self.definition.discharger.clone(),
-                ..CustomRuleDefinition::new("")
-            }
+            self.definition.new_derived(format!("{prefix}({})", self.name()), batching_rule)
         };
         // A derived definition that is still alive is reused, so that its calls keep one identity (and with it the
         // entries of enclosing caches) even after its registration was evicted or the source registration dropped.
         let definition = {
             let mut definitions =
-                self.definition.derived_definitions.lock().expect("custom rule derivation mutex is poisoned");
+                self.definition.derived_definitions().lock().expect("custom rule derivation mutex is poisoned");
             definitions.retain(|_, definition| definition.strong_count() > 0);
             match definitions.get(&key).and_then(Weak::upgrade) {
                 Some(definition) => definition,
@@ -1132,7 +1134,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Debug for LiftedCustomRules<Vm,
 impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> PartialEq for LiftedCustomRules<Vm, Om> {
     fn eq(&self, other: &Self) -> bool {
         let id = |rules: &Self| match rules {
-            Self::Member(rules) => rules.definition.id,
+            Self::Member(rules) => rules.definition.id(),
             Self::Unavailable(rules) => rules.id,
         };
         id(self) == id(other)
@@ -1144,7 +1146,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Eq for LiftedCustomRules<Vm, Om
 impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Hash for LiftedCustomRules<Vm, Om> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Self::Member(rules) => rules.definition.id.hash(state),
+            Self::Member(rules) => rules.definition.id().hash(state),
             Self::Unavailable(rules) => rules.id.hash(state),
         }
     }
@@ -1157,7 +1159,7 @@ where
 {
     fn id(&self) -> u64 {
         match self {
-            Self::Member(rules) => rules.definition.id,
+            Self::Member(rules) => rules.definition.id(),
             Self::Unavailable(rules) => rules.id,
         }
     }
@@ -1452,7 +1454,7 @@ where
         let source = &self.source.definition;
 
         // A source has a derivation only when it has a batching rule, so only its structural batcher can be missing.
-        let (Some(batching_rule), Some(batcher)) = (&source.batching_rule, &source.structural_batcher) else {
+        let (Some(batching_rule), Some(batcher)) = (source.batching_rule(), source.structural_batcher()) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "{} cannot batch a derivative because its source definition has no batching support (refer \
@@ -1549,7 +1551,7 @@ where
                     Ok(batched.interpret_in_context(&context, inputs)?)
                 },
                 program_types,
-                self.source.definition.named_axes.clone(),
+                self.source.definition.named_axes().to_vec(),
             )?;
             return Ok(CustomRuleSpecialization::new(program, output_axes));
         }
@@ -1572,7 +1574,7 @@ where
                 &tangent_primal_indices,
                 broadcast_sensitivity.as_ref(),
                 differentiator.as_ref(),
-                batcher.as_ref(),
+                batcher,
             );
         }
         let aligned_inputs =
@@ -1583,7 +1585,7 @@ where
             false => {
                 let alignment = Self::alignment_program(
                     name,
-                    batcher.as_ref(),
+                    batcher,
                     &aligned_inputs.iter().map(|&index| key.unbatched_input_types[index].clone()).collect::<Vec<_>>(),
                     &aligned_inputs.iter().map(|&index| key.input_axes[index]).collect::<Vec<_>>(),
                     &aligned_inputs.iter().map(|&index| aligned_axes[index]).collect::<Vec<_>>(),
@@ -1643,7 +1645,7 @@ where
                 Ok(outputs)
             },
             program_types,
-            self.source.definition.named_axes.clone(),
+            self.source.definition.named_axes().to_vec(),
         )?;
         Ok(CustomRuleSpecialization::new(program, output_axes))
     }
@@ -1923,7 +1925,7 @@ where
                 Ok(outputs)
             },
             key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-            self.source.definition.named_axes.clone(),
+            self.source.definition.named_axes().to_vec(),
         )?;
         Ok(CustomRuleSpecialization::new(program, all_output_axes))
     }
@@ -2084,13 +2086,13 @@ where
         outputs: CustomRuleBatchedOutputs,
         cotangents: Vec<TransposedProgramCotangent>,
     ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError> {
-        let Some(batcher) = &self.structural_batcher else {
+        let Some(batcher) = self.structural_batcher() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "{} cannot differentiate a batched call because its definition has no batching support \
                      (refer to `CustomRuleDefinition::with_batching_support`)",
                     {
-                        let name = self.name.as_ref();
+                        let name = self.name();
                         if name == COMPOSITE_OPERATION_NAME {
                             format!("`{COMPOSITE_OPERATION_NAME}`")
                         } else {
@@ -2264,7 +2266,7 @@ mod tests {
     ) -> Result<CustomRuleSpecialization<Array, ArrayOperation<Array>>, DifferentiationError> {
         let derived = registration.reference().derived(derivation_key)?;
         let Some(CustomRuleBatching { rule: CustomRuleBatchingRule::Derived(derivation), .. }) =
-            &derived.definition.batching_rule
+            derived.definition.batching_rule()
         else {
             panic!("the derived definition has no derivation");
         };

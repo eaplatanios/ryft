@@ -108,7 +108,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> Self {
-        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name(), self.named_axes().to_vec());
+        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name().to_owned(), self.named_axes().to_vec());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         self.with_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -274,7 +274,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> Self {
-        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name(), self.named_axes().to_vec());
+        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name().to_owned(), self.named_axes().to_vec());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         self.with_symbolic_zero_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -520,7 +520,7 @@ where
         let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
             configuration.forward.clone(),
-            self.name(),
+            self.name().to_owned().into(),
             input_structure,
             output_structure,
             &residual_structures,
@@ -528,7 +528,7 @@ where
         );
         let backward = {
             let (backward, name, named_axes) =
-                (configuration.backward.clone(), self.name(), self.named_axes().to_vec());
+                (configuration.backward.clone(), self.name().to_owned(), self.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |context: &TracingContext<V, O>,
                   leading_inputs: &[CustomRuleTracer<V, O>],
@@ -611,6 +611,7 @@ where
     pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangent_seeds)`.
+    #[allow(clippy::type_complexity)]
     pub(super) backward: Arc<
         dyn Fn(
                 Residual,
@@ -673,7 +674,7 @@ where
         let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
             configuration.forward.clone(),
-            self.name(),
+            self.name().to_owned().into(),
             input_structure,
             output_structure,
             &residual_structures,
@@ -681,7 +682,7 @@ where
         );
         let backward = {
             let (backward, name, named_axes) =
-                (configuration.backward.clone(), self.name(), self.named_axes().to_vec());
+                (configuration.backward.clone(), self.name().to_owned(), self.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |context: &TracingContext<V, O>,
                   leading_inputs: &[CustomRuleTracer<V, O>],
@@ -873,7 +874,7 @@ where
         let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, _>(
             configuration.forward.clone(),
-            self.name(),
+            self.name().to_owned().into(),
             input_structure,
             output_structure,
             &residual_structures,
@@ -884,7 +885,7 @@ where
         // non-differentiated inputs, the residuals, and the differentiated inputs' tangents) and one accumulator
         // per carrier input, so it receives the known residuals and the accumulators of the call's inputs.
         let backward = {
-            let (backward, name) = (configuration.backward.clone(), self.name());
+            let (backward, name) = (configuration.backward.clone(), self.name().to_owned());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |context: &mut TranspositionContext<V, O>,
                   inputs: &[PartialValue<CustomRuleTracer<V, O>>],
@@ -1030,7 +1031,7 @@ where
     ) -> Self {
         let rule = retained_custom_batching_rule::<V, O, Input, Output, _>(
             configuration.rule.clone(),
-            self.name(),
+            self.name().to_owned().into(),
             input_structure,
             output_structure,
         );
@@ -1103,7 +1104,7 @@ where
     ) -> Self {
         let rule = retained_custom_batching_rule::<V, O, Input, Output, _>(
             configuration.rule.clone(),
-            self.name(),
+            self.name().to_owned().into(),
             input_structure,
             output_structure,
         );

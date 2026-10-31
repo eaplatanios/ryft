@@ -25,6 +25,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::transpose_carrier_batching;
+use crate::operations::composites::rules::definitions::CustomRuleVjpBackward;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel,
@@ -958,7 +959,7 @@ where
         // Even without leading inputs or live seeds, a retained rule can carry effects or deferred work. Its selected
         // specialization must be traced before unused numerical work can be removed.
         if invokes_rule_directly {
-            let Some(definition) = rules.native_definition() else {
+            let Some(vjp) = rules.native_definition().and_then(|definition| definition.vjp()) else {
                 return Err(ProgramError::UnsupportedOperation {
                     message: {
                         let name = rules.name();
@@ -991,15 +992,56 @@ where
                     .collect::<Vec<_>>();
                 (Cow::Owned(inputs), Cow::Owned(accumulators))
             };
-            return definition.apply_backward_rule(
-                context,
-                &rule_inputs,
-                &leading_values[..rule_leading_input_count],
-                &leading_values,
-                outputs,
-                &rule_accumulators,
-                &self.input_tangent_types,
-            );
+            let cotangents = match vjp.backward() {
+                CustomRuleVjpBackward::Accumulating(rule) => {
+                    return Ok(rule.apply(context, &rule_inputs, outputs, &rule_accumulators)?);
+                }
+
+                // A pure rule receives materialized seeds. A zero seed whose type names runtime extents reads them
+                // from the leading inputs, including the seed extents that the rule itself never receives.
+                CustomRuleVjpBackward::Pure(rule) => {
+                    let seeds = outputs
+                        .iter()
+                        .map(|seed| {
+                            O::materialize_zero_from_residual_sources(&**context, seed.clone(), &leading_values)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    rule.apply(&**context, &leading_values[..rule_leading_input_count], &seeds)?
+                        .into_iter()
+                        .map(MaybeZero::Value)
+                        .collect::<Vec<_>>()
+                }
+
+                // A rule that receives structural zero seeds may also return structural zero cotangents, which
+                // contribute nothing to their destinations, so they stay structural zeros for the transposition.
+                CustomRuleVjpBackward::PureWithSymbolicZeros(rule) => {
+                    rule.apply(&**context, &leading_values[..rule_leading_input_count], outputs)?
+                }
+            };
+
+            // Each cotangent, including a structural zero or an ignored input's contribution, must have the cotangent
+            // type of its differentiated input. This may differ from the input's tangent type (e.g., sharded arrays
+            // swap their reduced and unreduced axes).
+            let cotangent_types =
+                cotangents.iter().map(|cotangent| cotangent.r#type().into_owned()).collect::<Vec<_>>();
+            let expected_cotangent_types =
+                self.input_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
+            check_types!(@same, {
+                let name = rules.name();
+                let description = if name == COMPOSITE_OPERATION_NAME {
+                    format!("`{COMPOSITE_OPERATION_NAME}`")
+                } else {
+                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                };
+                format!("{description} backward rule output")
+            }, [expected_cotangent_types, cotangent_types]);
+
+            // Leading inputs are known and contribute nothing. Each destination adds the contribution of its
+            // differentiated input or discards it when that input is ignored.
+            for (accumulator, cotangent) in rule_accumulators[rule_leading_input_count..].iter().zip(cotangents) {
+                accumulator.accumulate(context, cotangent)?;
+            }
+            return Ok(());
         }
 
         // The leading inputs of a deferred carrier are the inputs of its call rather than the call's residuals, so the
