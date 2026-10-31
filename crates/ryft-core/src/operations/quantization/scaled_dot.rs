@@ -945,7 +945,7 @@ mod tests {
                 &[input.clone(), input],
             ),
             Err(BatchingError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` LHS dimension index out of bounds",
+                "`{DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
             )))),
         );
     }

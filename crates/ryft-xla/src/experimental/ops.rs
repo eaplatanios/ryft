@@ -7,29 +7,30 @@ use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayIrOperation, ArrayIrType,
     ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation,
     AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CastOperation, CeilOperation,
-    ClampOperation, CompareOperation, ComplexOperation, CompositeOperation, CompositeTransposeOperation,
-    ConcatenateOperation, Concretizable, ConditionOperation, ConjugateOperation, ConstantOperation,
-    ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation,
-    DataType, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
-    DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpM1Operation, ExpOperation, FloorOperation,
-    GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
-    LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation,
-    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationProvider,
-    OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
-    ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
-    Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
-    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation,
-    SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation,
-    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError,
-    TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch,
-    ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    ClampOperation, CompareOperation, ComplexOperation, CompositeConversion, CompositeOperation,
+    CompositeTransposeOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConjugateOperation,
+    ConstantOperation, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation,
+    CustomCallOperation, DataType, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+    DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation,
+    DimensionRemOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType,
+    DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpM1Operation, ExpOperation,
+    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules,
+    LinearCallOperation, LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
+    MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
+    ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation,
+    ParallelVaryOperation, Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError,
+    ProjectedValue, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation, ReshapeOperation,
+    ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
+    SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
+    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming,
+    Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
+    XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_macros::Parameter;
@@ -720,29 +721,25 @@ where
             // member calls keep their member definition. Calls registered in the array IR family itself cannot follow
             // their program, because constants of this family cannot represent array IR values, so their rules become
             // unavailable while their primal still executes.
-            ArrayIrOperation::Composite(operation) => {
-                match operation.into_attached_family() {
-                    Ok(operation) => Self::Composite(operation),
-                    Err(operation) => Self::LiftedComposite(operation.into_family(|rules| {
-                        LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&rules))
-                    })),
-                }
-            }
-            ArrayIrOperation::CompositeTranspose(operation) => {
-                match operation.into_attached_family() {
-                    Ok(operation) => Self::CompositeTranspose(operation),
-                    Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(|rules| {
-                        LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&rules))
-                    })),
-                }
-            }
-            ArrayIrOperation::LiftedComposite(operation) => match operation.into_attached_family() {
-                Ok(operation) => Self::Composite(operation),
-                Err(operation) => Self::LiftedComposite(operation.into_family(|rules| rules)),
+            ArrayIrOperation::Composite(operation) => match operation
+                .into_family(|rules| LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&rules)))
+            {
+                CompositeConversion::Attached(operation) => Self::Composite(operation),
+                CompositeConversion::Retained(operation) => Self::LiftedComposite(operation),
             },
-            ArrayIrOperation::LiftedCompositeTranspose(operation) => match operation.into_attached_family() {
-                Ok(operation) => Self::CompositeTranspose(operation),
-                Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(|rules| rules)),
+            ArrayIrOperation::CompositeTranspose(operation) => match operation
+                .into_family(|rules| LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&rules)))
+            {
+                CompositeConversion::Attached(operation) => Self::CompositeTranspose(operation),
+                CompositeConversion::Retained(operation) => Self::LiftedCompositeTranspose(operation),
+            },
+            ArrayIrOperation::LiftedComposite(operation) => match operation.into_family(|rules| rules) {
+                CompositeConversion::Attached(operation) => Self::Composite(operation),
+                CompositeConversion::Retained(operation) => Self::LiftedComposite(operation),
+            },
+            ArrayIrOperation::LiftedCompositeTranspose(operation) => match operation.into_family(|rules| rules) {
+                CompositeConversion::Attached(operation) => Self::CompositeTranspose(operation),
+                CompositeConversion::Retained(operation) => Self::LiftedCompositeTranspose(operation),
             },
         }
     }

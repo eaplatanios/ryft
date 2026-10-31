@@ -323,8 +323,8 @@ impl LowerableOperation for RaggedDotOperation {
                 dot.rhs_batching_dimensions(),
                 dot.lhs_contracting_dimensions(),
                 dot.rhs_contracting_dimensions(),
-                dimensions.lhs_ragged_dimensions(),
-                dimensions.rhs_group_dimensions(),
+                &[dimensions.lhs_ragged_dimension()],
+                dimensions.rhs_group_dimension().as_slice(),
             )?;
             let result = lowerer.block.append_operation(chlo::ragged_dot(
                 input_values[0],
@@ -353,7 +353,7 @@ impl LowerableOperation for RaggedDotOperation {
                 lowerer.location,
             )?]);
         }
-        let lhs_ragged_axis = dimensions.lhs_ragged_dimensions()[0];
+        let lhs_ragged_axis = dimensions.lhs_ragged_dimension();
         let lhs_prefix = dimensions.group_sizes_prefix_dimensions(lhs_type.rank()).map_err(ProgramError::from)?;
         let physical_ragged_extent = physical_bound_type(lhs_type)?.dimension(lhs_ragged_axis).value().unwrap();
         let (group_starts, group_ends) = lower_ragged_dot_group_intervals(
@@ -383,7 +383,7 @@ impl LowerableOperation for RaggedDotOperation {
                 let mut lhs_contracting = shift(dot.lhs_contracting_dimensions());
                 lhs_contracting.push(0);
                 let mut rhs_contracting = dot.rhs_contracting_dimensions().to_vec();
-                rhs_contracting.push(dimensions.rhs_group_dimensions()[0]);
+                rhs_contracting.push(dimensions.rhs_group_dimension().unwrap());
                 DotDimensionNumbers::new(
                     lhs_contracting,
                     rhs_contracting,
@@ -508,11 +508,8 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_lowering_strategies_preserve_prefix_shaped_group_sizes() {
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            vec![1],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
         let module = lowered_ragged_dot_module_for(
             dimensions.clone(),
             ArrayType::new_static(DataType::F32, [2, 3, 1]),
@@ -606,11 +603,8 @@ mod tests {
     #[test]
     fn test_ragged_dot_decomposition_clamps_signed_group_sizes_with_dynamic_prefix() {
         let batch = dynamic_dimension("batch", Some(4));
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            vec![1],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
         let module = lowered_ragged_dot_module_for(
             dimensions,
             ArrayType::new(DataType::F32, Shape::new(vec![batch.clone(), 3.into(), 1.into()])),
@@ -628,11 +622,8 @@ mod tests {
     #[test]
     fn test_ragged_dot_decomposition_broadcasts_shared_group_sizes_across_dynamic_prefix() {
         let batch = dynamic_dimension("batch", Some(4));
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            vec![1],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
         let module = lowered_ragged_dot_module_for(
             dimensions,
             ArrayType::new(DataType::F32, Shape::new(vec![batch.clone(), 3.into(), 1.into()])),
@@ -657,11 +648,8 @@ mod tests {
         use crate::tests::values_from_bytes;
 
         let batch = dynamic_dimension("batch", Some(4));
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            vec![1],
-            vec![0],
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
         let dynamic_module = lowered_ragged_dot_module_for(
             dimensions,
             ArrayType::new(DataType::F32, Shape::new(vec![batch.clone(), 3.into(), 1.into()])),
@@ -894,11 +882,8 @@ mod tests {
             "},
         );
 
-        let contracting_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            vec![1],
-            Vec::new(),
-        );
+        let contracting_dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()), 1, None);
         let contracting = lowered_ragged_dot_module_for(
             contracting_dimensions.clone(),
             ArrayType::new_static(DataType::F32, [2, 5]),
@@ -989,11 +974,8 @@ mod tests {
             "},
         );
 
-        let batch_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-            vec![0],
-            Vec::new(),
-        );
+        let batch_dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, None);
         let batch = lowered_ragged_dot_module_for(
             batch_dimensions.clone(),
             ArrayType::new_static(DataType::F32, [5, 2]),
@@ -1221,11 +1203,8 @@ mod tests {
 
     #[test]
     fn test_contracting_ragged_dot_decomposition_executes_on_cpu() {
-        let dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            vec![1],
-            Vec::new(),
-        );
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()), 1, None);
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 20.0, 30.0, 40.0, 50.0];
         let group_sizes_values = [2_i32, 0, 3];

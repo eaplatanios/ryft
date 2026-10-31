@@ -11,31 +11,31 @@ use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
     AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
     ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations,
-    CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation,
-    ConstantOperation, ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation,
-    Cumulative, CumulativeOperation, CustomCall, CustomCallOperation, DimensionAddOperation, DimensionDivOperation,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
-    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
-    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
-    DivOperation, DotOperation, DotOperations, DotProductAttention, DotProductAttentionBackwardOperation,
-    DotProductAttentionOperation, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
-    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation,
-    ExpOperation, ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, GuardOperation,
-    ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation,
-    LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul,
-    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation,
-    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
-    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
-    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, SaturatingSub,
-    SaturatingSubOperation, ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation,
-    ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
-    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
-    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
-    WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    CompositeConversion, CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation,
+    ConjugateOperation, ConstantOperation, ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation,
+    CosOperation, Cumulative, CumulativeOperation, CustomCall, CustomCallOperation, DimensionAddOperation,
+    DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
+    DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
+    DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
+    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DotProductAttention,
+    DotProductAttentionBackwardOperation, DotProductAttentionOperation, DynamicBroadcastOperation,
+    DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations,
+    ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation,
+    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
+    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
+    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
+    ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
+    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
+    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
+    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
+    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDot, ScaledDotOperation,
+    ScanOperation, ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation,
+    SinOperation, SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation,
+    Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
+    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
 
@@ -572,20 +572,15 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             ArrayOperation::Scan(operation) => Self::Scan(operation.into()),
             ArrayOperation::LinearCall(operation) => Self::LinearCall(operation.into()),
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.into()),
-            ArrayOperation::Composite(operation) => {
-                // The family chooses the native or lifted carrier; payload retyping preserves its rule metadata.
-                match operation.into_attached_family() {
-                    Ok(operation) => Self::Composite(operation),
-                    Err(operation) => Self::LiftedComposite(operation.into_family(LiftedCustomRules::Member)),
-                }
-            }
-            ArrayOperation::CompositeTranspose(operation) => {
-                // The family chooses the native or lifted carrier; payload retyping preserves its rule metadata.
-                match operation.into_attached_family() {
-                    Ok(operation) => Self::CompositeTranspose(operation),
-                    Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(LiftedCustomRules::Member)),
-                }
-            }
+            // The family chooses the native or lifted carrier; payload retyping preserves its rule metadata.
+            ArrayOperation::Composite(operation) => match operation.into_family(LiftedCustomRules::Member) {
+                CompositeConversion::Attached(operation) => Self::Composite(operation),
+                CompositeConversion::Retained(operation) => Self::LiftedComposite(operation),
+            },
+            ArrayOperation::CompositeTranspose(operation) => match operation.into_family(LiftedCustomRules::Member) {
+                CompositeConversion::Attached(operation) => Self::CompositeTranspose(operation),
+                CompositeConversion::Retained(operation) => Self::LiftedCompositeTranspose(operation),
+            },
             operation => {
                 // Preserve existing instruction inputs. Mixed payload conversions such as `PadOperation` require
                 // extra extent inputs, which lifting an existing homogeneous instruction cannot introduce.

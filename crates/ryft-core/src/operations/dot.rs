@@ -240,14 +240,14 @@ impl DotDimensionNumbers {
             &self.lhs_batching_dimensions,
             &self.lhs_contracting_dimensions,
             lhs_rank,
-            "LHS",
+            "left-hand side",
         )?;
         validate_dot_axes(
             operation_name,
             &self.rhs_batching_dimensions,
             &self.rhs_contracting_dimensions,
             rhs_rank,
-            "RHS",
+            "right-hand side",
         )
     }
 }
@@ -876,7 +876,8 @@ impl RaggedDotDimensionNumbers {
         let axis = self.lhs_ragged_dimension;
         if axis >= lhs_rank {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` LHS ragged dimension {axis} is out of bounds for rank {lhs_rank}",
+                "`{RAGGED_DOT_OPERATION_NAME}` left-hand side ragged dimension {axis} is out of bounds for rank \
+                 {lhs_rank}",
             )));
         }
         if self.dot_dimensions.lhs_contracting_dimensions().contains(&axis) {
@@ -905,7 +906,7 @@ impl RaggedDotDimensionNumbers {
             dimensions.lhs_batching_dimensions(),
             dimensions.lhs_contracting_dimensions(),
             lhs_rank,
-            "LHS",
+            "left-hand side",
         )?;
         Ok(match mode {
             RaggedDotMode::NonContracting => {
@@ -968,14 +969,14 @@ impl RaggedDotDimensionNumbers {
         match (mode, self.rhs_group_dimension) {
             (RaggedDotMode::NonContracting, None) => {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` requires an RHS group dimension when the LHS ragged dimension is \
-                     non-contracting",
+                    "`{RAGGED_DOT_OPERATION_NAME}` requires a right-hand side group dimension when the left-hand side \
+                     ragged dimension is non-contracting",
                 )));
             }
             (RaggedDotMode::NonContracting, Some(group_axis)) => {
                 if group_axis >= rhs_rank {
                     return Err(TypeError::invalid(format!(
-                        "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension {group_axis} is out of bounds \
+                        "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension {group_axis} is out of bounds \
                          for rank {rhs_rank}",
                     )));
                 }
@@ -984,15 +985,15 @@ impl RaggedDotDimensionNumbers {
                     || dot_dimensions.rhs_contracting_dimensions().contains(&group_axis)
                 {
                     return Err(TypeError::invalid(format!(
-                        "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension must be distinct from batching and \
-                         contracting dimensions",
+                        "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension must be distinct from batching \
+                         and contracting dimensions",
                     )));
                 }
             }
             (RaggedDotMode::Contracting | RaggedDotMode::Batch, Some(_)) => {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept an RHS group dimension when the LHS ragged \
-                     dimension is contracting or batching",
+                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept a right-hand side group dimension when the \
+                     left-hand side ragged dimension is contracting or batching",
                 )));
             }
             (RaggedDotMode::Contracting | RaggedDotMode::Batch, None) => {}
@@ -1235,7 +1236,7 @@ impl Operation for RaggedDotOperation {
             && rhs.dimension(group_axis) != group_count
         {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent {} but group sizes describe \
+                "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension has extent {} but group sizes describe \
                  {group_count}",
                 rhs.dimension(group_axis),
             )));
@@ -1680,16 +1681,16 @@ pub(crate) fn infer_dot_output_type(
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis \
-                 {rhs_axis})",
+                "`{operation_name}` batching dimension sizes do not match (left-hand side axis {lhs_axis}, \
+                 right-hand side axis {rhs_axis})",
             )));
         }
     }
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis \
-                 {rhs_axis})",
+                "`{operation_name}` contracting dimension sizes do not match (left-hand side axis {lhs_axis}, \
+                 right-hand side axis {rhs_axis})",
             )));
         }
     }
@@ -2402,7 +2403,7 @@ mod tests {
         assert_eq!(DotDimensionNumbers::default().validate(DOT_OPERATION_NAME, 0, 0), Ok(()));
         assert_eq!(
             DotDimensionNumbers::matmul().validate("custom_dot", 1, 2),
-            Err(TypeError::invalid("`custom_dot` LHS dimension index out of bounds")),
+            Err(TypeError::invalid("`custom_dot` left-hand side dimension index out of bounds")),
         );
         assert_eq!(
             DotDimensionNumbers::new(vec![1], vec![0], vec![0], vec![]).validate(DOT_OPERATION_NAME, 2, 2),
@@ -2418,12 +2419,14 @@ mod tests {
         );
         assert_eq!(
             DotDimensionNumbers::new(vec![1, 1], vec![0, 2], vec![], vec![]).validate(DOT_OPERATION_NAME, 2, 3),
-            Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` LHS contracting dimensions must be distinct"))),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` left-hand side contracting dimensions must be distinct",
+            ))),
         );
         assert_eq!(
             DotDimensionNumbers::new(vec![1], vec![0], vec![0], vec![0]).validate(DOT_OPERATION_NAME, 2, 2),
             Err(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` RHS batching and contracting dimensions must be disjoint",
+                "`{DOT_OPERATION_NAME}` right-hand side batching and contracting dimensions must be disjoint",
             ))),
         );
     }
@@ -2488,7 +2491,8 @@ mod tests {
                 {
                     input_types = [plain_array(&[2, 3]), plain_array(&[4, 2])],
                     error = format!(
-                        "`{DOT_OPERATION_NAME}` contracting dimension sizes do not match (LHS axis 1, RHS axis 0)",
+                        "`{DOT_OPERATION_NAME}` contracting dimension sizes do not match (left-hand side axis 1, \
+                         right-hand side axis 0)",
                     ),
                 },
                 {
@@ -2519,7 +2523,7 @@ mod tests {
             operation = DotOperation::new(DotDimensionNumbers::new(vec![1, 1], vec![0, 0], vec![], vec![])),
             cases = [{
                 input_types = [plain_array(&[2, 3]), plain_array(&[3, 4])],
-                error = format!("`{DOT_OPERATION_NAME}` LHS contracting dimensions must be distinct"),
+                error = format!("`{DOT_OPERATION_NAME}` left-hand side contracting dimensions must be distinct"),
             }],
         );
 
@@ -2527,7 +2531,7 @@ mod tests {
             operation = DotOperation::new(DotDimensionNumbers::new(vec![1, 0], vec![0, 0], vec![], vec![])),
             cases = [{
                 input_types = [plain_array(&[3, 3]), plain_array(&[3, 4])],
-                error = format!("`{DOT_OPERATION_NAME}` RHS contracting dimensions must be distinct"),
+                error = format!("`{DOT_OPERATION_NAME}` right-hand side contracting dimensions must be distinct"),
             }],
         );
 
@@ -2535,7 +2539,7 @@ mod tests {
             operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0, 0], vec![0, 0])),
             cases = [{
                 input_types = [plain_array(&[2, 3]), plain_array(&[2, 3])],
-                error = format!("`{DOT_OPERATION_NAME}` LHS batching dimensions must be distinct"),
+                error = format!("`{DOT_OPERATION_NAME}` left-hand side batching dimensions must be distinct"),
             }],
         );
 
@@ -2543,7 +2547,9 @@ mod tests {
             operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![1], vec![0])),
             cases = [{
                 input_types = [plain_array(&[3, 3]), plain_array(&[3, 3])],
-                error = format!("`{DOT_OPERATION_NAME}` LHS batching and contracting dimensions must be disjoint"),
+                error = format!(
+                    "`{DOT_OPERATION_NAME}` left-hand side batching and contracting dimensions must be disjoint",
+                ),
             }],
         );
 
@@ -2551,7 +2557,9 @@ mod tests {
             operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![1])),
             cases = [{
                 input_types = [plain_array(&[3, 3]), plain_array(&[3, 3])],
-                error = format!("`{DOT_OPERATION_NAME}` RHS batching and contracting dimensions must be disjoint"),
+                error = format!(
+                    "`{DOT_OPERATION_NAME}` right-hand side batching and contracting dimensions must be disjoint",
+                ),
             }],
         );
     }
@@ -2602,13 +2610,15 @@ mod tests {
                 {
                     input_types = [lhs.clone(), static_rhs],
                     error = format!(
-                        "`{DOT_OPERATION_NAME}` contracting dimension sizes do not match (LHS axis 2, RHS axis 1)",
+                        "`{DOT_OPERATION_NAME}` contracting dimension sizes do not match (left-hand side axis 2, \
+                         right-hand side axis 1)",
                     ),
                 },
                 {
                     input_types = [lhs, mismatched_batch_rhs],
                     error = format!(
-                        "`{DOT_OPERATION_NAME}` batching dimension sizes do not match (LHS axis 0, RHS axis 0)",
+                        "`{DOT_OPERATION_NAME}` batching dimension sizes do not match (left-hand side axis 0, \
+                         right-hand side axis 0)",
                     ),
                 },
             ],
@@ -3699,7 +3709,7 @@ mod tests {
                 &[input.clone(), input],
             ),
             Err(BatchingError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` LHS dimension index out of bounds",
+                "`{DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
             )))),
         );
     }
@@ -4491,7 +4501,7 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().mode(0),
             Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` LHS ragged dimension 0 is out of bounds for rank 0",
+                "`{RAGGED_DOT_OPERATION_NAME}` left-hand side ragged dimension 0 is out of bounds for rank 0",
             ))),
         );
     }
@@ -4512,7 +4522,9 @@ mod tests {
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]), 0, Some(0));
         assert_eq!(
             invalid.group_sizes_prefix_dimensions(2),
-            Err(TypeError::invalid(format!("`{RAGGED_DOT_OPERATION_NAME}` LHS dimension index out of bounds"))),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
+            ))),
         );
     }
 
@@ -4541,7 +4553,7 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::new(dimensions.clone(), 2, Some(0)).validate(2, 3),
             Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` LHS ragged dimension 2 is out of bounds for rank 2",
+                "`{RAGGED_DOT_OPERATION_NAME}` left-hand side ragged dimension 2 is out of bounds for rank 2",
             ))),
         );
 
@@ -4549,28 +4561,28 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::new(dimensions.clone(), 0, None).validate(2, 3),
             Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` requires an RHS group dimension when the LHS ragged dimension is \
-                 non-contracting",
+                "`{RAGGED_DOT_OPERATION_NAME}` requires a right-hand side group dimension when the left-hand side \
+                 ragged dimension is non-contracting",
             ))),
         );
         assert_eq!(
             RaggedDotDimensionNumbers::new(dimensions.clone(), 0, Some(3)).validate(2, 3),
             Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension 3 is out of bounds for rank 3",
+                "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension 3 is out of bounds for rank 3",
             ))),
         );
         assert_eq!(
             RaggedDotDimensionNumbers::new(dimensions, 0, Some(1)).validate(2, 3),
             Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension must be distinct from batching and contracting \
-                 dimensions",
+                "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension must be distinct from batching and \
+                 contracting dimensions",
             ))),
         );
         assert_eq!(
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, Some(1)).validate(2, 2),
             Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` does not accept an RHS group dimension when the LHS ragged dimension \
-                 is contracting or batching",
+                "`{RAGGED_DOT_OPERATION_NAME}` does not accept a right-hand side group dimension when the \
+                 left-hand side ragged dimension is contracting or batching",
             ))),
         );
     }
@@ -4673,8 +4685,8 @@ mod tests {
                 {
                     input_types = [plain_array(&[5, 2]), plain_array(&[2, 2, 4]), group_sizes.clone()],
                     error = format!(
-                        "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent 2 but group \
-                        sizes describe 3",
+                        "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension has extent 2 but group sizes \
+                         describe 3",
                     ),
                 },
                 {
@@ -4700,8 +4712,8 @@ mod tests {
             cases = [{
                 input_types = [plain_array(&[5, 2]), plain_array(&[3, 2, 4]), group_sizes.clone()],
                 error = format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` requires an RHS group dimension when the LHS ragged dimension \
-                     is non-contracting",
+                    "`{RAGGED_DOT_OPERATION_NAME}` requires a right-hand side group dimension when the left-hand side \
+                     ragged dimension is non-contracting",
                 ),
             }],
         );
@@ -4749,8 +4761,8 @@ mod tests {
             cases = [{
                 input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), group_sizes.clone()],
                 error = format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept an RHS group dimension when the LHS ragged \
-                     dimension is contracting or batching",
+                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept a right-hand side group dimension when the \
+                     left-hand side ragged dimension is contracting or batching",
                 ),
             }],
         );
@@ -4858,7 +4870,7 @@ mod tests {
                     plain_array(&[2, 2, 1]),
                     ArrayType::new_static(DataType::I32, [2, 2]),
                 ],
-                error = format!("`{RAGGED_DOT_OPERATION_NAME}` LHS dimension index out of bounds"),
+                error = format!("`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds"),
             }],
         );
     }
@@ -5101,7 +5113,7 @@ mod tests {
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &inputs),
             Err(BatchingError::Type(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` LHS dimension index out of bounds",
+                "`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
             )))),
         );
         let invalid_group = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
@@ -5112,7 +5124,7 @@ mod tests {
         assert_eq!(
             invalid_group.batch(&context, &EmptyRegionDriver, &inputs),
             Err(BatchingError::Type(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension {} is out of bounds for rank 3",
+                "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension {} is out of bounds for rank 3",
                 usize::MAX,
             )))),
         );
@@ -5833,7 +5845,7 @@ mod tests {
         assert_eq!(
             operation.transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` LHS dimension index out of bounds",
+                "`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
             ))))),
         );
         assert!(context.builder().borrow().instructions().is_empty());

@@ -974,8 +974,6 @@ where
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C, P, S> BatchableOperation<C, P> for CompositeOperation<C::Constant, C::Operation, S>
 where
     C: Context<Type: DifferentiableType + Eq + Hash, Operation: From<CompositeOperation<C::Constant, C::Operation, S>>>,
@@ -1240,7 +1238,6 @@ where
                 let level = driver.batching_level(context)?;
                 let output_count = primal_region.output_types().len();
                 let rule_output_count = kept_outputs.as_ref().map_or(output_count, Vec::len);
-                let is_kept = |index: usize| kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index]);
                 let (primal, output_axes) = if rules.has_batching_rule() {
                     let key = CustomRuleBatchingSpecializationKey {
                         level: level.clone(),
@@ -1254,9 +1251,9 @@ where
                     check_count!("output", specialization.output_axes, rule_output_count, ProgramError);
                     match kept_outputs {
                         None => (specialization.program.clone(), specialization.output_axes.clone()),
-                        Some(_) => {
+                        Some(kept_outputs) => {
                             let kept_indices =
-                                (0..rule_output_count).filter(|&index| is_kept(index)).collect::<Vec<_>>();
+                                (0..rule_output_count).filter(|&index| kept_outputs[index]).collect::<Vec<_>>();
                             let output_axes =
                                 kept_indices.iter().map(|&index| specialization.output_axes[index]).collect();
                             (specialization.program.with_outputs(&kept_indices)?, output_axes)
@@ -1273,7 +1270,9 @@ where
                     let output_axes = output_axes
                         .into_iter()
                         .enumerate()
-                        .filter_map(|(index, axis)| is_kept(index).then_some(axis))
+                        .filter_map(|(index, axis)| {
+                            kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index]).then_some(axis)
+                        })
                         .collect::<Vec<_>>();
                     let batched_primal = driver.batch_program(
                         context,
@@ -1290,6 +1289,7 @@ where
                     )?;
                     (primal, output_axes)
                 };
+
                 let mut batching = batching.clone().unwrap_or_else(|| CustomRuleBatching {
                     input_types: primal_region.input_types(),
                     output_types: primal_region.output_types(),
@@ -1301,6 +1301,7 @@ where
                     input_axes,
                     output_axes: output_axes.clone(),
                 });
+
                 let operation = Self {
                     non_differentiated_count: self.non_differentiated_count + boundary_inputs.len(),
                     rules: CompositeRules::Retained {
@@ -1311,9 +1312,11 @@ where
                     },
                     marker: PhantomData,
                 };
+
                 (operation, vec![primal], output_axes)
             }
         };
+
         let mut packed_inputs = boundary_inputs;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(operation, regions, packed_inputs.as_slice())?;
@@ -1341,8 +1344,8 @@ where
                 output_types.clone(),
             );
             if derive_bijective_identity_renaming(&actual, &expected).is_none() {
-                let render = |types: &[C::Type]| types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
-                let (expected, actual) = (render(&expected_output_types), render(&output_types));
+                let expected = expected_output_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                let actual = output_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
                 let reason = if expected == actual { " with different type identities" } else { "" };
                 return Err(TypeError::invalid(format!(
                     "{} batching rule output type signature mismatch: \
@@ -1362,8 +1365,6 @@ where
 
 impl<C, S> DifferentiableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
 where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<
             Type: DifferentiableType + Eq + Hash,
             Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -1371,6 +1372,8 @@ where
                            + From<CompositeTransposeOperation<C::Constant, C::Operation, S>>,
         > + Zero<C::Value>,
     S: CustomRuleSpecializer<C::Constant, C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1381,26 +1384,28 @@ where
         let input_count = inputs.len();
         if self.non_differentiated_count > input_count {
             return Err(TypeError::invalid(format!(
-                "`{COMPOSITE_OPERATION_NAME}` non-differentiated input count {} exceeds input count {input_count}",
-                self.non_differentiated_count,
+                "`{}` non-differentiated input count {} exceeds input count {}",
+                COMPOSITE_OPERATION_NAME, self.non_differentiated_count, input_count,
             ))
             .into());
         }
-        match (self.jvp_rule(), &self.rules) {
-            // Apply the explicit pushforward directly instead of differentiating the primal region.
-            (CompositeJvpRule::Explicit, CompositeRules::Attached { .. }) => replay_custom_jvp_rule(
-                COMPOSITE_OPERATION_NAME,
-                self.non_differentiated_count,
-                context,
-                driver,
-                driver.region(1)?,
-                inputs,
-                None,
-            ),
 
-            // A retained rule is specialized for the tangent activity of the differentiated inputs, so structural zero
-            // tangents stay symbolic inside the specialization.
+        match (self.jvp_rule(), &self.rules) {
+            (CompositeJvpRule::Explicit, CompositeRules::Attached { .. }) => {
+                // Apply the explicit pushforward directly instead of differentiating the primal region.
+                replay_custom_jvp_rule(
+                    COMPOSITE_OPERATION_NAME,
+                    self.non_differentiated_count,
+                    context,
+                    driver,
+                    driver.region(1)?,
+                    inputs,
+                    None,
+                )
+            }
             (CompositeJvpRule::Explicit, CompositeRules::Retained { rules, batching, discharged, kept_outputs }) => {
+                // A retained rule is specialized for the tangent activity of the differentiated inputs, so structural
+                // zero tangents stay symbolic inside the specialization.
                 let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
                 let tangent_activity = inputs[self.non_differentiated_count..]
                     .iter()
@@ -1428,13 +1433,13 @@ where
                     Some(tangent_activity.as_slice()),
                 )
             }
-            // An unbatched call whose rules have a custom batching rule or batch it sequentially stages a derived call,
-            // which keeps that rule, or the sequential batching, on the path of derivatives that are batched after they
-            // are taken (refer to `CustomRuleSpecializer::derived`). A batched call already computes its primal with
-            // its batching rule, whose derivative is inlined.
             (CompositeJvpRule::Derived, CompositeRules::Retained { rules, batching: None, .. })
                 if rules.has_batching_rule() || rules.has_sequential_batching() =>
             {
+                // An unbatched call whose rules have a custom batching rule or batch it sequentially stages a derived
+                // call, which keeps that rule, or the sequential batching, on the path of derivatives that are batched
+                // after they are taken (refer to `CustomRuleSpecializer::derived`). A batched call already computes its
+                // primal with its batching rule, whose derivative is inlined.
                 differentiate_primal_region(
                     COMPOSITE_OPERATION_NAME,
                     self.non_differentiated_count,
@@ -1457,8 +1462,8 @@ where
                 Err(ProgramError::UnsupportedOperation {
                     message: if self.has_vjp_rule() {
                         format!(
-                            "cannot apply forward-mode differentiation to {call} that has only reverse-mode rules; \
-                             it supports only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                            "cannot apply forward mode differentiation to {call} that has only reverse mode rules; \
+                             it supports only reverse mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
                              `jacobian_reverse`)",
                         )
                     } else {
@@ -1501,11 +1506,11 @@ where
         //
         //   L_(p,r): ẋ ↦ ẏ.
         //
-        // The carrier knows only how to transpose that map: its transpose applies `backward(p, r, ȳ) = x̄`. Passing
-        // `p` and `r` as the carrier's leading known inputs keeps the path capture-free and exposes every dependency
-        // as an ordinary Single Static Assignment (SSA) edge. The forward and backward rules bypass ordinary
-        // differentiation dispatch: the forward rule is replayed directly and the backward rule is retained for later
-        // transposition, so the replayed inputs are validated as defense in depth (refer to the documentation of
+        // The carrier knows only how to transpose that map: its transpose applies `backward(p, r, ȳ) = x̄`. Passing `p`
+        // and `r` as the carrier's leading known inputs keeps the path capture-free and exposes every dependency as an
+        // ordinary Single Static Assignment (SSA) edge. The forward and backward rules bypass ordinary differentiation
+        // dispatch: the forward rule is replayed directly and the backward rule is retained for later transposition,
+        // so the replayed inputs are validated as defense in depth (refer to the documentation of
         // `validate_composite_replay`).
         let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
         let primal_region = driver.region(0)?;
@@ -1523,7 +1528,7 @@ where
         let mut leading_values =
             non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
 
-        // Structural-zero seeds are materialized from the known leading inputs, which need not carry the runtime
+        // Structural zero seeds are materialized from the known leading inputs, which need not carry the runtime
         // extents of the output tangent types (e.g., the extents of a dynamically shaped output that the residuals do
         // not mention), so those extents are read from the primal outputs and appended to the leading inputs as hidden
         // seed extents, which the backward rule never receives. Equal extent types name the same runtime quantity, so
@@ -1541,7 +1546,8 @@ where
                     let value = C::Operation::capture_zero_residual_value(context.primal(), output, &extent_type)?
                         .ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
-                                "seed extent of type `{extent_type}` cannot be captured from output of type `{}`",
+                                "seed extent of type `{}` cannot be captured from output of type `{}`",
+                                extent_type,
                                 output.r#type().as_ref(),
                             ))
                         })?;
@@ -1554,8 +1560,8 @@ where
         let (outputs, seed_extent_count, carrier_rules, carrier_regions, kept_outputs) = match &self.rules {
             CompositeRules::Attached { .. } => {
                 // Replay the forward region on the dual primals, recovering the primal outputs followed by the
-                // residuals. The carrier transposes by replaying the backward region, whose own inputs are exactly the
-                // leading known inputs followed by the output cotangents.
+                // residuals. The carrier transposes by replaying the backward region, whose own inputs are exactly
+                // the leading known inputs followed by the output cotangents.
                 let (forward_region_index, backward_region_index) = self.vjp_region_indices().unwrap();
                 let mut outputs =
                     driver.region(forward_region_index)?.interpret_in_context(context.primal(), primal_inputs)?;
@@ -1580,13 +1586,11 @@ where
                     None,
                 )
             }
-            // A call that defers its forward rule replays its primal region instead (i.e., its batched primal region
-            // when it is batched), and its carrier receives the call's inputs in place of the residuals, from which it
-            // replays the forward rule when it is transposed. The seed extents are read from the primal outputs as
-            // usual. A call that keeps only some outputs of its rules is differentiated without deferral (below),
-            // because only the forward rule computes the outputs that it does not keep, whose seeds and runtime
-            // extents the backward rule needs.
             CompositeRules::Retained { rules, batching, discharged, kept_outputs: None } if rules.defers_forward() => {
+                // A call that defers its forward rule replays its primal region instead (i.e., its batched primal
+                // region when it is batched), and its carrier receives the call's inputs in place of the residuals,
+                // from which it replays the forward rule when it is transposed. The seed extents are read from the
+                // primal outputs as usual.
                 let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
                 let key =
                     self.specialization_key(rules, batching, *discharged, &None, input_types, primal_output_types)?;
@@ -1629,6 +1633,10 @@ where
                 )
             }
             CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
+                // A call that keeps only some outputs of its rules is differentiated without deferral, because only the
+                // forward rule computes the outputs that it does not keep, whose seeds and runtime extents the backward
+                // rule needs.
+                //
                 // Replay the forward rule specialization on the dual primals, returning every output of the rule
                 // followed by the residuals. A call that keeps only some of the rule's outputs still replays them all,
                 // and its carrier receives every output, so that the backward rule receives a seed for each of them
@@ -1697,8 +1705,8 @@ where
             }
         };
 
-        // Stage the carrier over `[leading_values..., differentiated_tangents...]`, producing the output tangents. The
-        // carrier takes every differentiated input tangent as a real input, so structural zeros are materialized
+        // Stage the carrier over `[leading_values..., differentiated_tangents...]`, producing the output tangents.
+        // The carrier takes every differentiated input tangent as a real input, so structural zeros are materialized
         // against their own primal, which names every runtime quantity that a reference-bearing tangent type omits.
         let leading_input_count = leading_values.len();
         let mut carrier_inputs = leading_values
@@ -1729,8 +1737,8 @@ where
         let output_tangents = context.tangent().bind(carrier, carrier_regions, &carrier_inputs)?;
         check_count!("output", output_tangents, outputs.len(), ProgramError);
 
-        // Only the outputs that the call keeps are returned, while the tangents of the others are left unused, so that
-        // transposing the carrier seeds them with structural zeros.
+        // Only the outputs that the call keeps are returned, while the tangents of the others are left unused,
+        // so that transposing the carrier seeds them with structural zeros.
         outputs
             .into_iter()
             .zip(output_tangents)
@@ -1743,10 +1751,10 @@ where
 
 impl<V, O, S> TransposableOperation<V, O> for CompositeOperation<V, O, S>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType + Eq + Hash>,
     O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     S: CustomRuleSource<V, O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1756,14 +1764,15 @@ where
         outputs: &[MaybeZero<CustomRuleTracer<V, O>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // Reverse mode linearizes a call before transposing it: a forward mode rule replaces `f(p, x)` with the
-        // ordinary primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`, and reverse mode rules replace
-        // it with a `CompositeTransposeOperation` carrier, whose transpose evaluates `backward(p, r, ȳ) = x̄`. A call
-        // that reaches transposition is therefore one that is linear in its unknown inputs, such as the pushforward
-        // call that a partitioned differentiation context stages for a call whose forward mode rule is derived from its
-        // primal (refer to `differentiate_primal_region`). Like JAX's transposition of a `custom_jvp_call` through its
-        // call jaxpr, the primal region is transposed with respect to the unknown inputs and replayed inline, so a call
-        // whose primal is not linear in them is rejected by the transpose rules of the primal's own operations.
+        // Reverse mode differentiation linearizes a call before transposing it: a forward mode rule replaces `f(p, x)`
+        // with the ordinary primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`, and reverse mode rules
+        // replace it with a `CompositeTransposeOperation` carrier, whose transpose evaluates `backward(p, r, ȳ) = x̄`.
+        // A call that reaches transposition is therefore one that is linear in its unknown inputs, such as the
+        // pushforward call that a partitioned differentiation context stages for a call whose forward mode rule is
+        // derived from its primal (refer to `differentiate_primal_region`). Like JAX's transposition of a
+        // `custom_jvp_call` through its call jaxpr, the primal region is transposed with respect to the unknown inputs
+        // and replayed inline, so a call whose primal is not linear in them is rejected by the transpose rules of the
+        // primal's own operations.
         let primal = driver.region(0)?;
         check_count!("input", inputs, primal.input_types().len(), ProgramError);
         check_count!("output", outputs, primal.output_types().len(), ProgramError);
@@ -1777,10 +1786,9 @@ where
             return Ok(());
         }
 
-        // The unknown inputs are differentiated inputs, which are never references (refer to
-        // `validate_composite_reference_boundary`), so the cotangent of each one is either ignored or returned to its
-        // accumulator, which adds it to its destination. Structural-zero seeds stay symbolic: the transposed primal
-        // receives only the live seeds, followed by the known inputs.
+        // The unknown inputs are differentiated inputs, which are never references, so the cotangent of each one is
+        // either ignored or returned to its accumulator, which adds it to its destination. Structural zero seeds stay
+        // symbolic: the transposed primal receives only the live seeds, followed by the known inputs.
         let (linear_input_indices, destination_kinds): (Vec<_>, Vec<_>) = inputs
             .iter()
             .zip(accumulators)
@@ -1812,9 +1820,12 @@ where
                 accumulators[index].accumulate(context, cotangent)?;
             }
         }
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Derivative rules of a [`CompositeOperation`], in one of its two representations.
 #[derive(Clone, PartialEq, Eq, Hash)]
