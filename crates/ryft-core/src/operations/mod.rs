@@ -71,7 +71,7 @@ pub use complex::{
 pub use composites::{
     AccumulatingVjp, BatchedComposite, BroadcastInvariantBatching, BroadcastSensitiveBatching,
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeBatching, CompositeCallContext,
-    CompositeJvp, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
+    CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
     CustomVjpOperation, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal,
     LiftedCustomRules, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite,

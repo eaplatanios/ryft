@@ -16,6 +16,18 @@ pub mod composite_transpose;
 pub use composite::{COMPOSITE_OPERATION_NAME, CompositeJvpRule, CompositeOperation};
 pub use composite_transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 
+/// Composite call or carrier converted into another family (refer to [`CompositeOperation::into_family`] and
+/// [`CompositeTransposeOperation::into_family`]). Families keep the two in separate variants because only retained
+/// rules have a source whose type depends on the family in which they were registered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CompositeConversion<A, R> {
+    /// Converted call or carrier whose rules are attached regions, which follow it into any family.
+    Attached(A),
+
+    /// Converted call or carrier whose rules are retained, with the source that the conversion mapped.
+    Retained(R),
+}
+
 /// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode differentiation stages for
 /// a batched call with retained rules whose forward rule specialization key is `key` (whose levels are those of the
 /// call), whose rules have `rule_output_count` outputs, whose carrier receives seed extents of types

@@ -21,7 +21,7 @@ use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::composite_transpose::{
     CompositeTransposeOperation, CompositeTransposeRules,
 };
-use crate::operations::composites::operations::transpose_carrier_batching;
+use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind,
@@ -266,49 +266,39 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Converts this call into the family `(V2, O2)` with the rule source that `rules_fn` derives from its current
-    /// source. This is how a call follows its program into a family that contains its family (e.g., with
+    /// Converts this call into the family `(V2, O2)`, which is how a call follows its program into another family.
+    /// Attached rules are regions that follow their call, so a call with attached rules converts with any source type
+    /// `S2` (e.g., the native source of the family). A call with retained rules converts with the source that
+    /// `rules_fn` derives from its current source (e.g., with
     /// [`LiftedCustomRules::Member`](crate::LiftedCustomRules::Member) when an array program is converted into an
-    /// array IR program). A call with attached rules carries no source, so `rules_fn` is only invoked for retained
-    /// rules. Refer to [`Self::into_attached_family`] for converting calls with attached rules into a family whose
-    /// source type the caller chooses independently.
-    pub fn into_family<V2, O2, S2, F>(self, rules_fn: F) -> CompositeOperation<V2, O2, S2>
+    /// array IR program), and `rules_fn` is only invoked for such calls.
+    pub fn into_family<V2, O2, S2, R, F>(
+        self,
+        rules_fn: F,
+    ) -> CompositeConversion<CompositeOperation<V2, O2, S2>, CompositeOperation<V2, O2, R>>
     where
         V2: Typed<Type: DifferentiableType + Eq + Hash + From<V::Type>> + Parameter,
-        F: FnOnce(S) -> S2,
+        F: FnOnce(S) -> R,
     {
-        CompositeOperation {
-            non_differentiated_count: self.non_differentiated_count,
-            rules: match self.rules {
-                CompositeRules::Attached { jvp_rule, has_vjp_rule } => {
-                    CompositeRules::Attached { jvp_rule, has_vjp_rule }
-                }
-                CompositeRules::Retained { rules, batching, discharged, kept_outputs } => CompositeRules::Retained {
-                    rules: rules_fn(rules),
-                    batching: batching.map(CustomRuleBatching::map_types),
-                    discharged,
-                    kept_outputs,
-                },
-            },
-            marker: PhantomData,
-        }
-    }
-
-    /// Converts this call into the family `(V2, O2)` with any rule source type when its rules are attached, because
-    /// attached rules are regions that follow their call independently of any source. Returns this call unchanged when
-    /// its rules are retained, which [`Self::into_family`] converts instead. Family conversions use this function to
-    /// normalize every call with attached rules into the family's native variant.
-    pub fn into_attached_family<V2, O2, S2>(self) -> Result<CompositeOperation<V2, O2, S2>, Self>
-    where
-        V2: Typed + Parameter,
-    {
+        let non_differentiated_count = self.non_differentiated_count;
         match self.rules {
-            CompositeRules::Attached { jvp_rule, has_vjp_rule } => Ok(CompositeOperation {
-                non_differentiated_count: self.non_differentiated_count,
+            CompositeRules::Attached { jvp_rule, has_vjp_rule } => CompositeConversion::Attached(CompositeOperation {
+                non_differentiated_count,
                 rules: CompositeRules::Attached { jvp_rule, has_vjp_rule },
                 marker: PhantomData,
             }),
-            CompositeRules::Retained { .. } => Err(self),
+            CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
+                CompositeConversion::Retained(CompositeOperation {
+                    non_differentiated_count,
+                    rules: CompositeRules::Retained {
+                        rules: rules_fn(rules),
+                        batching: batching.map(CustomRuleBatching::map_types),
+                        discharged,
+                        kept_outputs,
+                    },
+                    marker: PhantomData,
+                })
+            }
         }
     }
 
@@ -353,127 +343,6 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             )));
         }
         Ok(values.split_at(non_differentiated_count))
-    }
-
-    /// Validates the composite contract over the attached region interfaces (refer to the documentation of
-    /// [`CompositeOperation`] for that contract) and returns the primal interface.
-    fn validated_interfaces<'o>(
-        &self,
-        region_interfaces: &'o [RegionInterface<V::Type>],
-    ) -> Result<&'o RegionInterface<V::Type>, TypeError> {
-        check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
-        let primal_interface = &region_interfaces[0];
-        let input_types = primal_interface.input_types();
-        let output_types = primal_interface.output_types();
-        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
-        validate_composite_reference_boundary(
-            COMPOSITE_OPERATION_NAME,
-            self.non_differentiated_count,
-            input_types,
-            output_types,
-        )?;
-
-        if let Some(jvp_region_index) = self.jvp_region_index() {
-            let jvp_interface = &region_interfaces[jvp_region_index];
-            let mut expected_jvp_input_types = input_types.to_vec();
-            expected_jvp_input_types.extend(
-                differentiated_types
-                    .iter()
-                    .map(DifferentiableType::tangent)
-                    .collect::<Result<Vec<_>, DifferentiationError>>()?,
-            );
-            check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` JVP rule input"), [
-                &expected_jvp_input_types,
-                jvp_interface.input_types(),
-            ]);
-            let mut expected_jvp_output_types = output_types.to_vec();
-            expected_jvp_output_types.extend(
-                output_types
-                    .iter()
-                    .map(DifferentiableType::tangent)
-                    .collect::<Result<Vec<_>, DifferentiationError>>()?,
-            );
-            check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` JVP rule output"), [
-                &expected_jvp_output_types,
-                jvp_interface.output_types(),
-            ]);
-        }
-
-        if let Some((forward_region_index, backward_region_index)) = self.vjp_region_indices() {
-            let forward_interface = &region_interfaces[forward_region_index];
-            let backward_interface = &region_interfaces[backward_region_index];
-            check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` forward rule input"), [
-                input_types,
-                forward_interface.input_types(),
-            ]);
-            let forward_output_types = forward_interface.output_types();
-            if forward_output_types.len() < output_types.len() {
-                return Err(TypeError::invalid(format!(
-                    "`{}` forward rule must produce at least the {} primal output(s) but produced {} value(s)",
-                    COMPOSITE_OPERATION_NAME,
-                    output_types.len(),
-                    forward_output_types.len(),
-                )));
-            }
-            check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` forward rule output"), [
-                output_types,
-                &forward_output_types[..output_types.len()],
-            ]);
-
-            // Reference residuals must have types compatible with distinct leading non-differentiated inputs. This is
-            // only a necessary interface constraint: two inputs can have the same reference type. Tracing the forward
-            // rule of a `Composite` checks the actual forwarded input identities; raw program producers must ensure
-            // that same contract when attaching their forward regions.
-            let residual_types = &forward_output_types[output_types.len()..];
-            let mut forwarded = vec![false; non_differentiated_types.len()];
-            for (index, residual_type) in residual_types.iter().enumerate().filter(|(_, r#type)| r#type.is_reference())
-            {
-                let available = non_differentiated_types
-                    .iter()
-                    .zip(forwarded.iter_mut())
-                    .find(|(r#type, forwarded)| *r#type == residual_type && !**forwarded);
-                match available {
-                    Some((_, forwarded)) => *forwarded = true,
-                    None if non_differentiated_types.contains(residual_type) => {
-                        return Err(TypeError::invalid(format!(
-                            "`{COMPOSITE_OPERATION_NAME}` forward rule returns residual {index} of reference \
-                             type `{residual_type}`, but every leading non-differentiated input of that type is \
-                             already forwarded by an earlier residual",
-                        )));
-                    }
-                    None => {
-                        return Err(TypeError::invalid(format!(
-                            "`{COMPOSITE_OPERATION_NAME}` forward rule returns residual {index} of reference \
-                             type `{residual_type}`, which matches none of its leading non-differentiated inputs",
-                        )));
-                    }
-                }
-            }
-
-            let output_cotangent_types = output_types
-                .iter()
-                .map(DifferentiableType::cotangent)
-                .collect::<Result<Vec<_>, DifferentiationError>>()?;
-            let expected_backward_input_types: Vec<V::Type> = non_differentiated_types
-                .iter()
-                .chain(residual_types)
-                .cloned()
-                .chain(output_cotangent_types)
-                .collect();
-            check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` backward rule input"), [
-                &expected_backward_input_types,
-                backward_interface.input_types(),
-            ]);
-            let expected_backward_output_types = differentiated_types
-                .iter()
-                .map(DifferentiableType::cotangent)
-                .collect::<Result<Vec<_>, DifferentiationError>>()?;
-            check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` backward rule output"), [
-                &expected_backward_output_types,
-                backward_interface.output_types(),
-            ]);
-        }
-        Ok(primal_interface)
     }
 
     /// Returns the specialization key of this call with retained rules, given the current types of its inputs and
@@ -673,7 +542,120 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             // Output inference is a standalone validation entry point, so it must validate the complete
             // post-instantiation region contract even when `infer_region_input_types` was not called first.
             CompositeRules::Attached { .. } => {
-                let primal_interface = self.validated_interfaces(region_interfaces)?;
+                check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
+                let primal_interface = &region_interfaces[0];
+                let primal_input_types = primal_interface.input_types();
+                let primal_output_types = primal_interface.output_types();
+                let (non_differentiated_types, differentiated_types) = self.split_inputs(primal_input_types)?;
+                validate_composite_reference_boundary(
+                    COMPOSITE_OPERATION_NAME,
+                    self.non_differentiated_count,
+                    primal_input_types,
+                    primal_output_types,
+                )?;
+
+                if let Some(jvp_region_index) = self.jvp_region_index() {
+                    let jvp_interface = &region_interfaces[jvp_region_index];
+                    let mut expected_jvp_input_types = primal_input_types.to_vec();
+                    expected_jvp_input_types.extend(
+                        differentiated_types
+                            .iter()
+                            .map(DifferentiableType::tangent)
+                            .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                    );
+                    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` JVP rule input"), [
+                        &expected_jvp_input_types,
+                        jvp_interface.input_types(),
+                    ]);
+                    let mut expected_jvp_output_types = primal_output_types.to_vec();
+                    expected_jvp_output_types.extend(
+                        primal_output_types
+                            .iter()
+                            .map(DifferentiableType::tangent)
+                            .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                    );
+                    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` JVP rule output"), [
+                        &expected_jvp_output_types,
+                        jvp_interface.output_types(),
+                    ]);
+                }
+
+                if let Some((forward_region_index, backward_region_index)) = self.vjp_region_indices() {
+                    let forward_interface = &region_interfaces[forward_region_index];
+                    let backward_interface = &region_interfaces[backward_region_index];
+                    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` forward rule input"), [
+                        primal_input_types,
+                        forward_interface.input_types(),
+                    ]);
+                    let forward_output_types = forward_interface.output_types();
+                    if forward_output_types.len() < primal_output_types.len() {
+                        return Err(TypeError::invalid(format!(
+                            "`{}` forward rule must produce at least the {} primal output(s) but produced {} value(s)",
+                            COMPOSITE_OPERATION_NAME,
+                            primal_output_types.len(),
+                            forward_output_types.len(),
+                        )));
+                    }
+                    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` forward rule output"), [
+                        primal_output_types,
+                        &forward_output_types[..primal_output_types.len()],
+                    ]);
+
+                    // Reference residuals must have types compatible with distinct leading non-differentiated inputs.
+                    // This is only a necessary interface constraint because two inputs can share a reference type.
+                    // Tracing the forward rule of a `Composite` checks the actual forwarded input identities. Raw
+                    // program producers must ensure that same contract when attaching their forward regions.
+                    let residual_types = &forward_output_types[primal_output_types.len()..];
+                    let mut forwarded = vec![false; non_differentiated_types.len()];
+                    for (index, residual_type) in
+                        residual_types.iter().enumerate().filter(|(_, r#type)| r#type.is_reference())
+                    {
+                        let available = non_differentiated_types
+                            .iter()
+                            .zip(forwarded.iter_mut())
+                            .find(|(r#type, forwarded)| *r#type == residual_type && !**forwarded);
+                        match available {
+                            Some((_, forwarded)) => *forwarded = true,
+                            None if non_differentiated_types.contains(residual_type) => {
+                                return Err(TypeError::invalid(format!(
+                                    "`{COMPOSITE_OPERATION_NAME}` forward rule returns residual {index} of reference \
+                                     type `{residual_type}`, but every leading non-differentiated input of that type \
+                                     is already forwarded by an earlier residual",
+                                )));
+                            }
+                            None => {
+                                return Err(TypeError::invalid(format!(
+                                    "`{COMPOSITE_OPERATION_NAME}` forward rule returns residual {index} of reference \
+                                     type `{residual_type}`, which matches none of its leading non-differentiated \
+                                     inputs",
+                                )));
+                            }
+                        }
+                    }
+
+                    let output_cotangent_types = primal_output_types
+                        .iter()
+                        .map(DifferentiableType::cotangent)
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                    let expected_backward_input_types: Vec<V::Type> = non_differentiated_types
+                        .iter()
+                        .chain(residual_types)
+                        .cloned()
+                        .chain(output_cotangent_types)
+                        .collect();
+                    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` backward rule input"), [
+                        &expected_backward_input_types,
+                        backward_interface.input_types(),
+                    ]);
+                    let expected_backward_output_types = differentiated_types
+                        .iter()
+                        .map(DifferentiableType::cotangent)
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` backward rule output"), [
+                        &expected_backward_output_types,
+                        backward_interface.output_types(),
+                    ]);
+                }
                 check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` input"), [
                     primal_interface.input_types(),
                     input_types,
@@ -2312,6 +2294,17 @@ mod tests {
     /// Composite call in the array IR operation family.
     type ArrayIrComposite = CompositeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
+    /// Composite call in the array operation family converted into the array IR operation family, whose retained rules
+    /// become the lifted rules of their definition.
+    type ArrayIrCompositeConversion = CompositeConversion<
+        ArrayIrComposite,
+        CompositeOperation<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+            LiftedCustomRules<Array, ArrayOperation<Array>>,
+        >,
+    >;
+
     /// Eager array IR context whose values may be arrays or references.
     type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
@@ -3201,11 +3194,10 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
         let operation = ArrayComposite::new(definition.reference()).with_non_differentiated_count(1).unwrap();
-        let converted: CompositeOperation<
-            ArrayIrValue<Array>,
-            ArrayIrOperation<Array>,
-            LiftedCustomRules<Array, ArrayOperation<Array>>,
-        > = operation.clone().into_family(LiftedCustomRules::Member);
+        let converted: ArrayIrCompositeConversion = operation.clone().into_family(LiftedCustomRules::Member);
+        let CompositeConversion::Retained(converted) = converted else {
+            panic!("a call with retained rules should keep them");
+        };
         assert_eq!(converted.non_differentiated_count(), 1);
         assert_eq!(converted.rules(), Some(&LiftedCustomRules::Member(definition.reference())));
         assert_eq!(converted.jvp_rule(), CompositeJvpRule::Explicit);
@@ -3217,13 +3209,18 @@ mod tests {
              kept_outputs: None }",
         );
 
-        // A call with attached rules carries no source, so the conversion never derives one.
+        // A call with attached rules carries no source, so the conversion never derives one and the call converts with
+        // the source type of the family's native calls instead.
         let attached = || {
             ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true)
                 .with_non_differentiated_count(1)
                 .unwrap()
         };
-        let converted: ArrayIrComposite = attached().into_family(|_| unreachable!("attached rules carry no source"));
+        let converted: ArrayIrCompositeConversion =
+            attached().into_family(|_| unreachable!("attached rules carry no source"));
+        let CompositeConversion::Attached(converted) = converted else {
+            panic!("a call with attached rules should keep them");
+        };
         assert_eq!(
             converted,
             ArrayIrComposite::from_rule_regions(CompositeJvpRule::Explicit, true)
@@ -3231,34 +3228,6 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(converted.to_string(), attached().to_string());
-    }
-
-    #[test]
-    fn test_composite_into_attached_family() {
-        // A call with attached rules converts into any family with any source type, while a call with retained rules is
-        // returned unchanged.
-        let attached = ArrayComposite::from_rule_regions(CompositeJvpRule::Derived, true);
-        assert_eq!(
-            attached.with_non_differentiated_count(1).unwrap().into_attached_family::<
-                ArrayIrValue<Array>,
-                ArrayIrOperation<Array>,
-                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-            >(),
-            Ok(ArrayIrComposite::from_rule_regions(CompositeJvpRule::Derived, true)
-                .with_non_differentiated_count(1)
-                .unwrap()),
-        );
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
-        let retained = ArrayComposite::new(definition.reference());
-        assert_eq!(
-            retained.clone().into_attached_family::<
-                ArrayIrValue<Array>,
-                ArrayIrOperation<Array>,
-                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-            >(),
-            Err(retained),
-        );
     }
 
     #[test]

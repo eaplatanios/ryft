@@ -25,7 +25,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::composite::COMPOSITE_OPERATION_NAME;
-use crate::operations::composites::operations::transpose_carrier_batching;
+use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
 use crate::operations::composites::rules::definitions::CustomRuleVjpBackward;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
@@ -257,59 +257,51 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Converts this carrier into the family `(V2, O2)` with the rule source that `rules_fn` derives from its current
-    /// source (refer to [`CompositeOperation::into_family`]).
-    pub fn into_family<V2, O2, S2, F>(self, rules_fn: F) -> CompositeTransposeOperation<V2, O2, S2>
+    /// Converts this carrier into the family `(V2, O2)`, with any source type `S2` when its backward rule is attached
+    /// and with the source that `rules_fn` derives from its current source when its backward rule is retained (refer
+    /// to [`CompositeOperation::into_family`]).
+    pub fn into_family<V2, O2, S2, R, F>(
+        self,
+        rules_fn: F,
+    ) -> CompositeConversion<CompositeTransposeOperation<V2, O2, S2>, CompositeTransposeOperation<V2, O2, R>>
     where
         V2: Typed<Type: DifferentiableType + Eq + Hash + From<V::Type>> + Parameter,
-        F: FnOnce(S) -> S2,
+        F: FnOnce(S) -> R,
     {
         let map_types = |types: Vec<V::Type>| types.into_iter().map(V2::Type::from).collect::<Vec<_>>();
-        CompositeTransposeOperation {
-            leading_input_count: self.leading_input_count,
-            seed_extent_count: self.seed_extent_count,
-            input_tangent_types: map_types(self.input_tangent_types),
-            output_tangent_types: map_types(self.output_tangent_types),
-            rules: match self.rules {
-                CompositeTransposeRules::Attached => CompositeTransposeRules::Attached,
-                CompositeTransposeRules::Retained {
-                    rules,
-                    batching,
-                    invokes_rule_directly,
-                    discharged,
-                    deferred_forward,
-                } => CompositeTransposeRules::Retained {
+        let leading_input_count = self.leading_input_count;
+        let seed_extent_count = self.seed_extent_count;
+        let input_tangent_types = map_types(self.input_tangent_types);
+        let output_tangent_types = map_types(self.output_tangent_types);
+        match self.rules {
+            CompositeTransposeRules::Attached => CompositeConversion::Attached(CompositeTransposeOperation {
+                leading_input_count,
+                seed_extent_count,
+                input_tangent_types,
+                output_tangent_types,
+                rules: CompositeTransposeRules::Attached,
+                marker: PhantomData,
+            }),
+            CompositeTransposeRules::Retained {
+                rules,
+                batching,
+                invokes_rule_directly,
+                discharged,
+                deferred_forward,
+            } => CompositeConversion::Retained(CompositeTransposeOperation {
+                leading_input_count,
+                seed_extent_count,
+                input_tangent_types,
+                output_tangent_types,
+                rules: CompositeTransposeRules::Retained {
                     rules: rules_fn(rules),
                     batching: batching.map(CustomRuleBatching::map_types),
                     invokes_rule_directly,
                     discharged,
                     deferred_forward: deferred_forward.map(CustomRuleForwardSpecializationKey::map_types),
                 },
-            },
-            marker: PhantomData,
-        }
-    }
-
-    /// Converts this carrier into the family `(V2, O2)` with any rule source type when its backward rule is attached,
-    /// or returns it unchanged when its backward rule is retained (refer to
-    /// [`CompositeOperation::into_attached_family`]).
-    pub fn into_attached_family<V2, O2, S2>(self) -> Result<CompositeTransposeOperation<V2, O2, S2>, Self>
-    where
-        V2: Typed<Type: From<V::Type>> + Parameter,
-    {
-        match self.rules {
-            CompositeTransposeRules::Attached => {
-                let map_types = |types: Vec<V::Type>| types.into_iter().map(V2::Type::from).collect::<Vec<_>>();
-                Ok(CompositeTransposeOperation {
-                    leading_input_count: self.leading_input_count,
-                    seed_extent_count: self.seed_extent_count,
-                    input_tangent_types: map_types(self.input_tangent_types),
-                    output_tangent_types: map_types(self.output_tangent_types),
-                    rules: CompositeTransposeRules::Attached,
-                    marker: PhantomData,
-                })
-            }
-            CompositeTransposeRules::Retained { .. } => Err(self),
+                marker: PhantomData,
+            }),
         }
     }
 
@@ -1261,6 +1253,17 @@ mod tests {
     /// Reverse mode carrier of a composite call in the array IR operation family.
     type ArrayIrCompositeTranspose = CompositeTransposeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
+    /// Reverse mode carrier of a composite call in the array operation family converted into the array IR operation
+    /// family, whose retained backward rule becomes a lifted rule of its definition.
+    type ArrayIrCompositeTransposeConversion = CompositeConversion<
+        ArrayIrCompositeTranspose,
+        CompositeTransposeOperation<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+            LiftedCustomRules<Array, ArrayOperation<Array>>,
+        >,
+    >;
+
     /// Test-only transposition driver exposing one attached region, used to invoke the transposition rule of a carrier
     /// with an attached backward rule directly on the backward region that it replays.
     struct TestTranspositionDriver<'o> {
@@ -1517,11 +1520,10 @@ mod tests {
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
-        let converted: CompositeTransposeOperation<
-            ArrayIrValue<Array>,
-            ArrayIrOperation<Array>,
-            LiftedCustomRules<Array, ArrayOperation<Array>>,
-        > = carrier.clone().into_family(LiftedCustomRules::Member);
+        let converted: ArrayIrCompositeTransposeConversion = carrier.clone().into_family(LiftedCustomRules::Member);
+        let CompositeConversion::Retained(converted) = converted else {
+            panic!("a carrier with a retained backward rule should keep it");
+        };
         assert_eq!(converted.leading_input_count(), 1);
         assert_eq!(converted.seed_extent_count(), 0);
         assert_eq!(converted.input_tangent_types(), std::slice::from_ref(&ir_scalar_type));
@@ -1529,43 +1531,18 @@ mod tests {
         assert_eq!(converted.rules(), Some(&LiftedCustomRules::Member(definition.reference())));
         assert_eq!(converted.to_string(), carrier.to_string());
 
-        // A carrier with an attached backward rule carries no source, so the conversion never derives one.
+        // A carrier with an attached backward rule carries no source, so the conversion never derives one and the
+        // carrier converts with the source type of the family's native carriers instead.
         let attached = ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type]);
-        let converted: ArrayIrCompositeTranspose =
+        let converted: ArrayIrCompositeTransposeConversion =
             attached.into_family(|_| unreachable!("attached backward rules carry no source"));
         assert_eq!(
             converted,
-            ArrayIrCompositeTranspose::from_backward_region(1, vec![ir_scalar_type.clone()], vec![ir_scalar_type]),
-        );
-    }
-
-    #[test]
-    fn test_composite_transpose_into_attached_family() {
-        // A carrier with an attached backward rule converts into any family with any source type, while a carrier with
-        // a retained backward rule is returned unchanged.
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let ir_scalar_type = ArrayIrType::from(scalar_type.clone());
-        let attached =
-            ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type.clone()]);
-        assert_eq!(
-            attached.into_attached_family::<
-                ArrayIrValue<Array>,
-                ArrayIrOperation<Array>,
-                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-            >(),
-            Ok(ArrayIrCompositeTranspose::from_backward_region(1, vec![ir_scalar_type.clone()], vec![ir_scalar_type])),
-        );
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
-        let retained =
-            ArrayCompositeTranspose::new(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
-        assert_eq!(
-            retained.clone().into_attached_family::<
-                ArrayIrValue<Array>,
-                ArrayIrOperation<Array>,
-                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-            >(),
-            Err(retained),
+            CompositeConversion::Attached(ArrayIrCompositeTranspose::from_backward_region(
+                1,
+                vec![ir_scalar_type.clone()],
+                vec![ir_scalar_type],
+            )),
         );
     }
 

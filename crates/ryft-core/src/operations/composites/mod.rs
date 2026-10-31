@@ -61,8 +61,8 @@ pub use configurations::{
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
 pub use operations::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeJvpRule, CompositeOperation,
-    CompositeTransposeOperation,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeConversion, CompositeJvpRule,
+    CompositeOperation, CompositeTransposeOperation,
 };
 pub use rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
