@@ -59,39 +59,38 @@ use crate::programs::{
     ValueDomainDispatch,
 };
 
-/// Specification of contracting and batching dimensions for a generalized dot product.
+/// Specification of contracting and batching dimensions for a generalized dot product. The contracting dimensions index
+/// axes that are summed over, such as the `K` axes in matrix multiplication. The batching dimensions index axes aligned
+/// pairwise between the inputs and preserved in the output. These are the dimension numbers of StableHLO's
+/// [`dot_general`](https://openxla.org/stablehlo/spec#dot_general).
 ///
-/// The contracting dimensions index axes that are summed over, such as the `K` axes in matrix multiplication. The
-/// batching dimensions index axes aligned pairwise between the inputs and preserved in the output. These are the
-/// dimension numbers of StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general).
-///
-/// Both `lhs_contracting_dimensions` and `rhs_contracting_dimensions` must have the same length and their corresponding
-/// dimensions in the two inputs must match in size. The same applies to `lhs_batching_dimensions` and
+/// Both `lhs_contracting_dimensions` and `rhs_contracting_dimensions` must have the same length and their
+/// corresponding dimensions in the two inputs must match in size. The same applies to `lhs_batching_dimensions` and
 /// `rhs_batching_dimensions`. Every list must contain distinct axes, and an input's batching and contracting lists must
 /// be disjoint. Construction stores the specification without validating input ranks. [`DotOperation`] validates it
 /// against the input types before execution or staging.
 ///
-/// The output shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the remaining
-/// (non-contracting, non-batching) dimensions of each input, in their original order.
+/// The output shape is `[batching..., lhs_result..., rhs_result...]`, where each input's result dimensions are those
+/// that are neither contracting nor batching, preserved in their original order.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotDimensionNumbers {
-    /// Axes on the LHS that contract with `rhs_contracting_dimensions` on the RHS.
+    /// Axes on the left-hand side that contract with `rhs_contracting_dimensions` on the right-hand side.
     lhs_contracting_dimensions: Vec<usize>,
 
-    /// Axes on the RHS that contract with `lhs_contracting_dimensions` on the LHS.
+    /// Axes on the right-hand side that contract with `lhs_contracting_dimensions` on the left-hand side.
     rhs_contracting_dimensions: Vec<usize>,
 
-    /// Axes on the LHS that are aligned 1:1 with `rhs_batching_dimensions` on the RHS and that are preserved in the
-    /// output.
+    /// Axes on the left-hand side that are aligned 1:1 with `rhs_batching_dimensions` on the right-hand side and that
+    /// are preserved in the output.
     lhs_batching_dimensions: Vec<usize>,
 
-    /// Axes on the RHS that are aligned 1:1 with `lhs_batching_dimensions` on the LHS and that are preserved in the
-    /// output.
+    /// Axes on the right-hand side that are aligned 1:1 with `lhs_batching_dimensions` on the left-hand side and that
+    /// are preserved in the output.
     rhs_batching_dimensions: Vec<usize>,
 }
 
 impl DotDimensionNumbers {
-    /// Creates dimension numbers from explicit contracting and batching dimensions.
+    /// Creates a new [`DotDimensionNumbers`] instance from the provided explicit contracting and batching dimensions.
     #[inline]
     pub fn new(
         lhs_contracting_dimensions: Vec<usize>,
@@ -107,47 +106,47 @@ impl DotDimensionNumbers {
         }
     }
 
-    /// Returns the dimension numbers of a rank-two matrix multiplication `[M, K] × [K, N] → [M, N]`. The last left
-    /// input dimension contracts with the first right input dimension, and neither input has batching dimensions.
+    /// Returns the [`DotDimensionNumbers`] of a rank-two matrix multiplication `[M, K] × [K, N] → [M, N]`. The last
+    /// left input dimension contracts with the first right input dimension, and neither input has batching dimensions.
     #[inline]
     pub fn matmul() -> Self {
         Self::new(vec![1], vec![0], Vec::new(), Vec::new())
     }
 
-    /// Returns the dimension numbers of a rank-one inner product `[K] · [K] → []`, which contracts the single dimension
-    /// of each input.
+    /// Returns the [`DotDimensionNumbers`] of a rank-one inner product `[K] · [K] → []`, which contracts the single
+    /// dimension of each input.
     #[inline]
     pub fn inner_product() -> Self {
         Self::new(vec![0], vec![0], Vec::new(), Vec::new())
     }
 
-    /// Returns the contracting dimensions of the LHS.
+    /// Returns the contracting dimensions of the left-hand side.
     #[inline]
     pub fn lhs_contracting_dimensions(&self) -> &[usize] {
         &self.lhs_contracting_dimensions
     }
 
-    /// Returns the contracting dimensions of the RHS.
+    /// Returns the contracting dimensions of the right-hand side.
     #[inline]
     pub fn rhs_contracting_dimensions(&self) -> &[usize] {
         &self.rhs_contracting_dimensions
     }
 
-    /// Returns the batching dimensions of the LHS.
+    /// Returns the batching dimensions of the left-hand side.
     #[inline]
     pub fn lhs_batching_dimensions(&self) -> &[usize] {
         &self.lhs_batching_dimensions
     }
 
-    /// Returns the batching dimensions of the RHS.
+    /// Returns the batching dimensions of the right-hand side.
     #[inline]
     pub fn rhs_batching_dimensions(&self) -> &[usize] {
         &self.rhs_batching_dimensions
     }
 
-    /// Returns the result dimensions of an LHS with rank `lhs_rank`, which are its dimensions that are neither
-    /// batching nor contracting, in their original order. These dimensions follow the batching dimensions in the
-    /// output. This function does not validate the specification against `lhs_rank`.
+    /// Returns the result dimensions of a left-hand side with rank `lhs_rank`, which are its dimensions that are
+    /// neither batching nor contracting, in their original order. These dimensions follow the batching dimensions
+    /// in the output. This function does not validate the specification against `lhs_rank`.
     pub fn lhs_result_dimensions(&self, lhs_rank: usize) -> Vec<usize> {
         (0..lhs_rank)
             .filter(|axis| {
@@ -156,9 +155,9 @@ impl DotDimensionNumbers {
             .collect()
     }
 
-    /// Returns the result dimensions of an RHS with rank `rhs_rank`, which are its dimensions that are neither
-    /// batching nor contracting, in their original order. These dimensions are the trailing output dimensions. This
-    /// function does not validate the specification against `rhs_rank`.
+    /// Returns the result dimensions of a right-hand side with rank `rhs_rank`, which are its dimensions that are
+    /// neither batching nor contracting, in their original order. These dimensions are the trailing output dimensions.
+    /// This function does not validate the specification against `rhs_rank`.
     pub fn rhs_result_dimensions(&self, rhs_rank: usize) -> Vec<usize> {
         (0..rhs_rank)
             .filter(|axis| {
@@ -169,12 +168,11 @@ impl DotDimensionNumbers {
 
     /// Lifts these dimension numbers through one batching level. Batch axis positions refer to the physical inputs,
     /// while these dimension numbers describe each logical item. A missing position denotes a replicated input.
-    ///
     /// When both inputs are mapped, their inserted axes become the first batching pair and every existing axis at or
     /// after its insertion position shifts by one. The output's mapped axis is then zero. Two replicated inputs keep
     /// the original dimensions and have a replicated output. A mixed pair returns [`None`], so callers must first
     /// materialize the mapped axis on the replicated input. This function does not validate ranks or mapped extents.
-    pub(crate) fn batched(
+    pub fn batched(
         &self,
         lhs_batch_axis: Option<usize>,
         rhs_batch_axis: Option<usize>,
@@ -200,6 +198,8 @@ impl DotDimensionNumbers {
             _ => None,
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates paired list lengths and the distinct, disjoint axis indices on both inputs before indexing or lifting.
     /// `operation_name` names the operation that owns these dimension numbers in diagnostics.
@@ -235,13 +235,15 @@ impl DotDimensionNumbers {
         )
     }
 
-    /// Returns the dimension numbers that map the output cotangent of `t ↦ dot(t, rhs)` back toward the linear LHS
-    /// `t`, together with the LHS axes in the order in which that adjoint contraction emits them. These dimension
-    /// numbers must describe a valid contraction of an LHS with rank `lhs_rank` and an RHS with rank `rhs_rank`.
+    /// Returns the dimension numbers that map the output cotangent of `t ↦ dot(t, rhs)` back toward the linear
+    /// left-hand side `t`, together with the left-hand side axes in the order in which that adjoint contraction emits
+    /// them. These dimension numbers must describe a valid contraction of a left-hand side with rank `lhs_rank` and a
+    /// right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint contraction is `dot(cotangent, rhs)`, and it emits the batching axes, the LHS result axes, and then
-    /// the LHS contracting axes sorted by their paired RHS axes. Callers must request any output sharding in that
-    /// intermediate order and then restore the original LHS axis order with the inverse permutation.
+    /// The adjoint contraction is `dot(cotangent, rhs)`, and it emits the batching axes, the left-hand side result
+    /// axes, and then the left-hand side contracting axes sorted by their paired right-hand side axes. Callers must
+    /// request any output sharding in that intermediate order and then restore the original left-hand side axis order
+    /// with the inverse permutation.
     fn lhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
         let batching_count = self.rhs_batching_dimensions.len();
         let lhs_result_dimensions = self.lhs_result_dimensions(lhs_rank);
@@ -270,13 +272,15 @@ impl DotDimensionNumbers {
         (dimensions, output_axes)
     }
 
-    /// Returns the dimension numbers that map the output cotangent of `t ↦ dot(lhs, t)` back toward the linear RHS
-    /// `t`, together with the RHS axes in the order in which that adjoint contraction emits them. These dimension
-    /// numbers must describe a valid contraction of an LHS with rank `lhs_rank` and an RHS with rank `rhs_rank`.
+    /// Returns the dimension numbers that map the output cotangent of `t ↦ dot(lhs, t)` back toward the linear
+    /// right-hand side `t`, together with the right-hand side axes in the order in which that adjoint contraction emits
+    /// them. These dimension numbers must describe a valid contraction of a left-hand side with rank `lhs_rank` and a
+    /// right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint contraction is `dot(lhs, cotangent)`, and it emits the batching axes, the RHS contracting axes
-    /// sorted by their paired LHS axes, and then the RHS result axes. Callers must request any output sharding in that
-    /// intermediate order and then restore the original RHS axis order with the inverse permutation.
+    /// The adjoint contraction is `dot(lhs, cotangent)`, and it emits the batching axes, the right-hand side
+    /// contracting axes sorted by their paired left-hand side axes, and then the right-hand side result axes. Callers
+    /// must request any output sharding in that intermediate order and then restore the original right-hand side axis
+    /// order with the inverse permutation.
     fn rhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
         let batching_count = self.lhs_batching_dimensions.len();
         let lhs_result_dimensions = self.lhs_result_dimensions(lhs_rank);
@@ -536,9 +540,16 @@ where
         // The output batch axis carries the sharding of the inputs' mapped axes, including in a requested output
         // sharding.
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
+        let output_sharding = match (self.output_sharding(), output_axis) {
+            (Some(output_sharding), Some(axis)) => {
+                Some(output_sharding.batched(axis, axis_sharding).map_err(ProgramError::from)?)
+            }
+            (Some(output_sharding), None) => Some(output_sharding.clone()),
+            (None, _) => None,
+        };
         let lifted_operation = DotOperation::new(lifted_dimensions)
             .with_accumulation_type(self.accumulation_type)
-            .with_output_sharding(lift_output_sharding(self.output_sharding(), output_axis, axis_sharding)?);
+            .with_output_sharding(output_sharding);
         let output_batch_axes = [BatchAxis::from_optional_position(output_axis)];
         Ok(lifted_operation.interpret_with_batch_axes(context, &aligned_inputs, &output_batch_axes)?)
     }
@@ -780,13 +791,13 @@ where
     }
 }
 
-/// Role of the single ragged LHS dimension in a [`RaggedDotDimensionNumbers`] specification.
+/// Role of the single ragged left-hand side dimension in a [`RaggedDotDimensionNumbers`] specification.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RaggedDotMode {
     /// The ragged dimension is a non-contracting result dimension.
     NonContracting,
 
-    /// The ragged dimension is contracted with the RHS.
+    /// The ragged dimension is contracted with the right-hand side.
     Contracting,
 
     /// The ragged dimension is one of the paired batching dimensions.
@@ -805,18 +816,19 @@ impl Display for RaggedDotMode {
 
 /// Dimension number specification for a grouped generalized dot product.
 ///
-/// The ordinary [`DotDimensionNumbers`] describe the contraction and batching axes. Exactly one LHS axis is marked
-/// ragged, and RHS group dimensions identify the explicit group axis used by non-contracting ragged dots. Refer to
-/// [`RaggedDotOperation`] for the semantics of each [`RaggedDotMode`].
+/// The ordinary [`DotDimensionNumbers`] describe the contraction and batching axes. Exactly one left-hand side axis is
+/// marked ragged, and right-hand side group dimensions identify the explicit group axis used by non-contracting ragged
+/// dots. Refer to [`RaggedDotOperation`] for the semantics of each [`RaggedDotMode`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotDimensionNumbers {
     /// Underlying generalized dot dimension numbers.
     dot_dimensions: DotDimensionNumbers,
 
-    /// LHS axes marked ragged. Type inference requires exactly one entry.
+    /// Left-hand side axes marked ragged. Type inference requires exactly one entry.
     lhs_ragged_dimensions: Vec<usize>,
 
-    /// RHS axes indexing groups. Non-contracting mode requires exactly one, and the other modes require none.
+    /// Right-hand side axes indexing groups. Non-contracting mode requires exactly one, and the other modes require
+    /// none.
     rhs_group_dimensions: Vec<usize>,
 }
 
@@ -843,20 +855,21 @@ impl RaggedDotDimensionNumbers {
         &self.dot_dimensions
     }
 
-    /// Returns the LHS ragged dimensions.
+    /// Returns the left-hand side ragged dimensions.
     #[inline]
     pub fn lhs_ragged_dimensions(&self) -> &[usize] {
         &self.lhs_ragged_dimensions
     }
 
-    /// Returns the RHS group dimensions.
+    /// Returns the right-hand side group dimensions.
     #[inline]
     pub fn rhs_group_dimensions(&self) -> &[usize] {
         &self.rhs_group_dimensions
     }
 
-    /// Classifies this specification according to the role of its single LHS ragged dimension for an LHS with rank
-    /// `lhs_rank`. [`RaggedDotOperation`] validates the remaining dimension number constraints.
+    /// Classifies this specification according to the role of its single left-hand side ragged dimension for a
+    /// left-hand side with rank `lhs_rank`. [`RaggedDotOperation`] validates the remaining dimension number
+    /// constraints.
     ///
     /// # Errors
     ///
@@ -883,10 +896,10 @@ impl RaggedDotDimensionNumbers {
         }
     }
 
-    /// Returns the left input axes indexing the prefix of a `group_sizes` input for an LHS with rank `lhs_rank`. The
-    /// prefix contains batching axes and the result or contracting axes preceding the ragged position in iteration
-    /// order. A batching ragged axis uses only the batching axes before it. [`RaggedDotOperation`] validates the right
-    /// input's indices.
+    /// Returns the left input axes indexing the prefix of a `group_sizes` input for a left-hand side with rank
+    /// `lhs_rank`. The prefix contains batching axes and the result or contracting axes preceding the ragged position
+    /// in iteration order. A batching ragged axis uses only the batching axes before it. [`RaggedDotOperation`]
+    /// validates the right input's indices.
     ///
     /// # Errors
     ///
@@ -973,13 +986,14 @@ impl RaggedDotDimensionNumbers {
     }
 
     /// Returns the grouped dot dimension numbers that map the output cotangent of `t ↦ ragged_dot(t, rhs)` back toward
-    /// the linear LHS `t`, together with the LHS axes in the order in which that adjoint grouped dot emits them. This
-    /// specification must be a valid non-contracting specification for an LHS with rank `lhs_rank` and an RHS with
-    /// rank `rhs_rank`.
+    /// the linear left-hand side `t`, together with the left-hand side axes in the order in which that adjoint grouped
+    /// dot emits them. This specification must be a valid non-contracting specification for a left-hand side with rank
+    /// `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint is a non-contracting grouped dot of the cotangent with the RHS, whose ragged dimension is the ragged
-    /// output dimension. It emits the batching axes, the LHS result axes, and then the LHS contracting axes sorted by
-    /// their paired RHS axes. Callers must restore the original LHS axis order with the inverse permutation.
+    /// The adjoint is a non-contracting grouped dot of the cotangent with the right-hand side, whose ragged dimension
+    /// is the ragged output dimension. It emits the batching axes, the left-hand side result axes, and then the
+    /// left-hand side contracting axes sorted by their paired right-hand side axes. Callers must restore the original
+    /// left-hand side axis order with the inverse permutation.
     fn lhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
         let dot_dimensions = self.dot_dimensions();
         let lhs_result_dimensions = dot_dimensions.lhs_result_dimensions(lhs_rank);
@@ -1021,13 +1035,14 @@ impl RaggedDotDimensionNumbers {
     }
 
     /// Returns the grouped dot dimension numbers that map the output cotangent of `t ↦ ragged_dot(lhs, t)` back toward
-    /// the linear RHS `t`, together with the RHS axes in the order in which that adjoint grouped dot emits them. This
-    /// specification must be a valid non-contracting specification for an LHS with rank `lhs_rank` and an RHS with
-    /// rank `rhs_rank`.
+    /// the linear right-hand side `t`, together with the right-hand side axes in the order in which that adjoint
+    /// grouped dot emits them. This specification must be a valid non-contracting specification for a left-hand side
+    /// with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint is a contracting grouped dot of the LHS with the cotangent over the ragged dimension, so it emits
-    /// the group axis, the batching axes, the RHS contracting axes sorted by their paired LHS axes, and then the RHS
-    /// result axes. Callers must restore the original RHS axis order with the inverse permutation.
+    /// The adjoint is a contracting grouped dot of the left-hand side with the cotangent over the ragged dimension, so
+    /// it emits the group axis, the batching axes, the right-hand side contracting axes sorted by their paired
+    /// left-hand side axes, and then the right-hand side result axes. Callers must restore the original right-hand side
+    /// axis order with the inverse permutation.
     fn rhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
         let dot_dimensions = self.dot_dimensions();
         let lhs_result_dimensions = dot_dimensions.lhs_result_dimensions(lhs_rank);
@@ -1082,11 +1097,12 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 
 /// Primitive representing a grouped generalized dot with explicit group sizes.
 ///
-/// Exactly one LHS dimension is ragged. Its role selects one of three modes:
+/// Exactly one left-hand side dimension is ragged. Its role selects one of three modes:
 ///
-///   - A non-contracting ragged dimension is partitioned into consecutive groups. The corresponding RHS group
-///     dimension selects one RHS slice per group, and the grouped products are written back along the LHS result
-///     dimension. An empty group contributes nothing and any uncovered suffix of that dimension is zero.
+///   - A non-contracting ragged dimension is partitioned into consecutive groups. The corresponding right-hand side
+///     group dimension selects one right-hand side slice per group, and the grouped products are written back along the
+///     left-hand side result dimension. An empty group contributes nothing and any uncovered suffix of that dimension
+///     is zero.
 ///   - A contracting ragged dimension partitions the paired contracting dimensions into consecutive groups. The
 ///     output gains a leading group dimension, and an empty group produces a zero slice.
 ///   - A batching ragged dimension has ordinary batched dot semantics. `group_sizes` participates in type inference
@@ -1101,9 +1117,9 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// unsigned accumulation, so invalid runtime metadata cannot become a large interval. The instruction lowering passes
 /// metadata unchanged to `chlo.ragged_dot` and therefore relies on the contract that sizes are non-negative.
 ///
-/// The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical LHS ragged
-/// extent, so a group that extends past that extent is clipped, and every later group is empty once its raw start
-/// reaches or exceeds that extent.
+/// The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical left-hand side
+/// ragged extent, so a group that extends past that extent is clipped, and every later group is empty once its raw
+/// start reaches or exceeds that extent.
 ///
 /// Grouped expansion modes require an element type that can represent zero. In particular, they reject `f8e8m0fnu`.
 /// Refer to [`RaggedDotDimensionNumbers`] for the dimension number contract.
@@ -1158,7 +1174,66 @@ impl Operation for RaggedDotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
-        Ok(vec![ragged_dot_abstract(&input_types[0], &input_types[1], &input_types[2], &self.dimensions)?])
+        let lhs = &input_types[0];
+        let rhs = &input_types[1];
+        let group_sizes = &input_types[2];
+        let dimensions = &self.dimensions;
+        ArrayType::check_matching_manual_variation(RAGGED_DOT_OPERATION_NAME, &[lhs, rhs, group_sizes])?;
+        if !group_sizes.data_type().is_integer() {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have an integer data type",
+            )));
+        }
+        if group_sizes.rank() == 0 {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have rank at least one",
+            )));
+        }
+
+        let mode = dimensions.validate_for_ranks(lhs.rank(), rhs.rank())?;
+        let mut output = dot_abstract(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None)?;
+        let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
+        if group_sizes.rank() != 1 {
+            let expected_prefix = Shape::new(prefix_axes.iter().map(|axis| lhs.dimension(*axis)).collect());
+            let actual_prefix = Shape::new(group_sizes.shape().dimensions()[..group_sizes.rank() - 1].to_vec());
+            if actual_prefix != expected_prefix {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` group sizes prefix must be `{expected_prefix}`, but got \
+                     `{actual_prefix}`",
+                )));
+            }
+        }
+        let group_count = group_sizes.dimension(group_sizes.rank() - 1);
+        let rhs_group_dimensions = dimensions.rhs_group_dimensions();
+        if mode == RaggedDotMode::NonContracting {
+            let group_axis = rhs_group_dimensions[0];
+            if rhs.dimension(group_axis) != group_count {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent {} but group sizes describe \
+                     {group_count}",
+                    rhs.dimension(group_axis),
+                )));
+            }
+        }
+        if mode != RaggedDotMode::Batch && lhs.data_type() == DataType::F8E8M0FNU {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` does not support element data type `f8e8m0fnu` in grouped expansion \
+                 modes because it cannot represent zero",
+            )));
+        }
+        match mode {
+            RaggedDotMode::NonContracting => {
+                let rhs_result = dimensions.dot_dimensions().rhs_result_dimensions(rhs.rank());
+                let group_position = rhs_result.iter().position(|axis| *axis == rhs_group_dimensions[0]).unwrap();
+                let output_axis = dimensions.dot_dimensions().lhs_batching_dimensions().len()
+                    + dimensions.dot_dimensions().lhs_result_dimensions(lhs.rank()).len()
+                    + group_position;
+                output = output.without_dimension(output_axis)?.0;
+            }
+            RaggedDotMode::Contracting => output = output.with_inserted_dimension(0, group_count)?,
+            RaggedDotMode::Batch => {}
+        }
+        Ok(vec![output])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1233,7 +1308,52 @@ where
                 let group_sizes = P::match_axis(context, group_sizes, Axis::from(0))?;
                 let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.r#type().rank())?;
                 if inputs[2].unbatched_type().rank() == 1 && prefix_axes.len() > 1 {
-                    broadcast_group_sizes_to_prefix::<C, P>(context, &lhs, &group_sizes, &prefix_axes)?
+                    // Broadcast mapped rank-one metadata `[batch, group_count]` across the remaining prefix, so
+                    // every item shares its group sizes there. The policy's extent value grounds the leading mapped
+                    // axis, and dynamic prefix dimensions are read from the aligned left input itself.
+                    let lhs_type = lhs.r#type();
+                    let group_sizes_type = group_sizes.r#type();
+                    let dimension_source = |source: &C::Value, dimension: Dimension, axis: usize| match dimension {
+                        Dimension::Static(extent) => DimensionSource::Static(extent),
+                        _ => DimensionSource::Value { source: source.clone(), axis },
+                    };
+                    let dimension_sources = prefix_axes
+                        .iter()
+                        .map(|axis| match axis {
+                            0 => DimensionSource::BatchExtent,
+                            _ => dimension_source(lhs.value(), lhs_type.dimension(*axis), *axis),
+                        })
+                        .chain(std::iter::once(dimension_source(group_sizes.value(), group_sizes_type.dimension(1), 1)))
+                        .collect::<Vec<_>>();
+
+                    // The group sizes keep their memory space and manual variation, while each new prefix axis is
+                    // replicated.
+                    let output_rank = prefix_axes.len() + 1;
+                    let output_axes = vec![0, prefix_axes.len()];
+                    let output_sharding = group_sizes_type
+                        .sharding()
+                        .map(|sharding| sharding.with_broadcasted_dimensions(output_rank, &output_axes))
+                        .transpose()
+                        .map_err(TypeError::from)?;
+                    let output_shape = Shape::new(
+                        prefix_axes
+                            .iter()
+                            .map(|axis| lhs_type.dimension(*axis))
+                            .chain(std::iter::once(group_sizes_type.dimension(1)))
+                            .collect(),
+                    );
+                    let output_type = ArrayType::new(group_sizes_type.data_type(), output_shape)
+                        .with_memory(group_sizes_type.memory())
+                        .with_sharding(output_sharding)
+                        .map_err(TypeError::from)?;
+                    P::broadcast_input(
+                        context,
+                        &group_sizes,
+                        output_type,
+                        output_axes,
+                        Axis::from(0),
+                        dimension_sources,
+                    )?
                 } else {
                     group_sizes
                 }
@@ -1483,7 +1603,7 @@ fn validate_dot_axes(
 ///     absent side treated as fully replicated on the present input's mesh. Input meshes must match.
 ///   - Batch dimension entries are merged preferring the more informative entry (`Sharded` over `Replicated` over
 ///     `Unconstrained`). Two different `Sharded` entries are an error when an explicit mesh axis is involved. This
-///     intentionally diverges from JAX, which reads batch dimension specs from the LHS only.
+///     intentionally diverges from JAX, which reads batch dimension specs from the left-hand side only.
 ///   - Contracting dimensions sharded over explicit mesh axes on both inputs are an error. Identically sharded ones
 ///     make the output sharding ambiguous and require an explicit output sharding. A contracting dimension sharded on
 ///     only one input is allowed, and its sharding is dropped from the output.
@@ -1503,13 +1623,22 @@ pub(crate) fn dot_abstract(
     }
     validate_dot_data_type(operation_name, lhs.data_type())?;
     validate_dot_options(accumulation_type, output_sharding)?;
-    if let Some(accumulation_type) = accumulation_type
-        && !accumulation_type_is_compatible(lhs.data_type(), accumulation_type)
-    {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input data type `{}` cannot accumulate at data type `{accumulation_type}`",
-            lhs.data_type(),
-        )));
+    if let Some(accumulation_type) = accumulation_type {
+        // An identical type is valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
+        // accumulate at an integer type with the same signedness that is at least as wide.
+        let input_type = lhs.data_type();
+        let compatible = input_type == accumulation_type
+            || (input_type.is_floating_point() && matches!(accumulation_type, DataType::F32 | DataType::F64))
+            || (input_type.is_integer()
+                && accumulation_type.is_integer()
+                && input_type.is_signed() == accumulation_type.is_signed()
+                && accumulation_type.bit_width() >= input_type.bit_width());
+        if !compatible {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` input data type `{input_type}` cannot accumulate at data type \
+                 `{accumulation_type}`",
+            )));
+        }
     }
     let lhs_batching = dimensions.lhs_batching_dimensions();
     let rhs_batching = dimensions.rhs_batching_dimensions();
@@ -1679,17 +1808,33 @@ pub(crate) fn dot_abstract(
         for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
             let left = dimension_of(lhs_sharding, *lhs_axis);
             let right = dimension_of(rhs_sharding, *rhs_axis);
-            let merged = match merge_batch_sharding_dimensions(&left, &right) {
-                Some(merged) => merged,
-                // A batch dimension conflict is an error only when an explicit axis is involved. A conflict purely over
-                // manual or auto axes drops to `Replicated` and is left to `shard_map` and the compiler.
-                None if left.has_explicit_axis(mesh) || right.has_explicit_axis(mesh) => {
+            // Prefer the more informative entry, `Sharded` over `Replicated` over `Unconstrained`. Taking a sharded
+            // entry from either input deliberately differs from reading only the left input's batch sharding.
+            let merged = match (&left, &right) {
+                (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes))
+                    if left_axes == right_axes =>
+                {
+                    left.clone()
+                }
+                // Conflicts over an explicit axis are errors. Conflicts purely over manual or auto axes become
+                // replicated and are left to `shard_map` and the compiler.
+                (ShardingDimension::Sharded(_), ShardingDimension::Sharded(_))
+                    if left.has_explicit_axis(mesh) || right.has_explicit_axis(mesh) =>
+                {
                     return Err(TypeError::invalid(format!(
                         "`{operation_name}` batching dimensions must have consistent shardings, but got \
-                         `{left}` and `{right}`",
+                             `{left}` and `{right}`",
                     )));
                 }
-                None => ShardingDimension::Replicated,
+                (ShardingDimension::Sharded(_), ShardingDimension::Sharded(_)) => ShardingDimension::Replicated,
+                (ShardingDimension::Sharded(_), _) => left.clone(),
+                (_, ShardingDimension::Sharded(_)) => right.clone(),
+                (ShardingDimension::Replicated, _) | (_, ShardingDimension::Replicated) => {
+                    ShardingDimension::Replicated
+                }
+                (ShardingDimension::Unconstrained, ShardingDimension::Unconstrained) => {
+                    ShardingDimension::Unconstrained
+                }
             };
             placement.push(merged);
         }
@@ -1745,46 +1890,6 @@ fn validate_dot_options(
     Ok(())
 }
 
-/// Returns whether inputs of element type `input` may accumulate at `accumulation`.
-///
-/// The identical type is always valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
-/// accumulate at an integer type with the same signedness that is at least as wide.
-fn accumulation_type_is_compatible(input: DataType, accumulation: DataType) -> bool {
-    /// Returns the signedness and bit width of an integer data type, or `None` for any other type.
-    fn integer_parts(data_type: DataType) -> Option<(bool, usize)> {
-        Some(match data_type {
-            DataType::I1 => (true, 1),
-            DataType::I2 => (true, 2),
-            DataType::I4 => (true, 4),
-            DataType::I8 => (true, 8),
-            DataType::I16 => (true, 16),
-            DataType::I32 => (true, 32),
-            DataType::I64 => (true, 64),
-            DataType::U1 => (false, 1),
-            DataType::U2 => (false, 2),
-            DataType::U4 => (false, 4),
-            DataType::U8 => (false, 8),
-            DataType::U16 => (false, 16),
-            DataType::U32 => (false, 32),
-            DataType::U64 => (false, 64),
-            _ => return None,
-        })
-    }
-
-    if input == accumulation {
-        return true;
-    }
-    if input.is_floating_point() {
-        return matches!(accumulation, DataType::F32 | DataType::F64);
-    }
-    match (integer_parts(input), integer_parts(accumulation)) {
-        (Some((input_signed, input_width)), Some((accumulation_signed, accumulation_width))) => {
-            input_signed == accumulation_signed && accumulation_width >= input_width
-        }
-        _ => false,
-    }
-}
-
 /// Checks that every mapped input of the operation named `operation_name` maps the same extent. Comparing the mapped
 /// dimensions validates static extents exactly as [`ArrayBatch::common_batch_size`] does, and it additionally admits a
 /// dynamic mapped extent, which two inputs share exactly when it is the same dimension variable.
@@ -1807,87 +1912,6 @@ fn check_common_mapped_dimension<V: Value<Type = ArrayType>>(
             },
         }),
     }
-}
-
-/// Merges the [`ShardingDimension`]s of one aligned batch dimension pair, preferring the more informative entry
-/// (`Sharded` over `Replicated` over `Unconstrained`). Returns [`None`] when the two entries are sharded over different
-/// mesh axes, which the caller reports as an inconsistent sharding error. Preferring a `Sharded` entry of either input
-/// over the other input's entry intentionally diverges from JAX, which reads output batch dimension specs from the LHS
-/// only.
-fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimension) -> Option<ShardingDimension> {
-    match (lhs, rhs) {
-        (ShardingDimension::Sharded(left), ShardingDimension::Sharded(right)) if left == right => Some(lhs.clone()),
-        (ShardingDimension::Sharded(_), ShardingDimension::Sharded(_)) => None,
-        (ShardingDimension::Sharded(_), _) => Some(lhs.clone()),
-        (_, ShardingDimension::Sharded(_)) => Some(rhs.clone()),
-        (ShardingDimension::Replicated, _) | (_, ShardingDimension::Replicated) => Some(ShardingDimension::Replicated),
-        (ShardingDimension::Unconstrained, ShardingDimension::Unconstrained) => Some(ShardingDimension::Unconstrained),
-    }
-}
-
-/// Lifts an optional requested output sharding through one batching level by inserting `axis_sharding` at the new
-/// output batch axis. `axis_sharding` is the [`ShardingDimension`] derived from the mapped axes of the batched inputs
-/// (see [`ArrayBatch::sharding_for_inputs`]), so the batched dimension carries the same sharding as those axes.
-fn lift_output_sharding(
-    output_sharding: Option<&Sharding>,
-    output_axis: Option<usize>,
-    axis_sharding: ShardingDimension,
-) -> Result<Option<Sharding>, ProgramError> {
-    match (output_sharding, output_axis) {
-        (Some(output_sharding), Some(axis)) => {
-            output_sharding.batched(axis, axis_sharding).map(Some).map_err(Into::into)
-        }
-        (Some(output_sharding), None) => Ok(Some(output_sharding.clone())),
-        (None, _) => Ok(None),
-    }
-}
-
-/// Broadcasts mapped rank-one `group_sizes` of type `[batch, group_count]` across the complete `group_sizes` prefix of
-/// a lifted [`RaggedDotOperation`], whose LHS axes `prefix_axes` start with the mapped axis zero of the aligned `lhs`.
-/// Every item shares its group sizes across the remaining prefix, exactly as the unbatched rank-one form does. The
-/// active policy materializes the broadcast, so the transform's extent value grounds the mapped axis and dynamic LHS
-/// prefix dimensions are read from `lhs` itself.
-fn broadcast_group_sizes_to_prefix<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>>(
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    lhs: &ArrayBatch<C::Value>,
-    group_sizes: &ArrayBatch<C::Value>,
-    prefix_axes: &[usize],
-) -> Result<ArrayBatch<C::Value>, BatchingError> {
-    let lhs_type = lhs.r#type();
-    let group_sizes_type = group_sizes.r#type();
-    let dimension_source = |source: &C::Value, dimension: Dimension, axis: usize| match dimension {
-        Dimension::Static(extent) => DimensionSource::Static(extent),
-        _ => DimensionSource::Value { source: source.clone(), axis },
-    };
-    let dimension_sources = prefix_axes
-        .iter()
-        .map(|axis| match axis {
-            0 => DimensionSource::BatchExtent,
-            _ => dimension_source(lhs.value(), lhs_type.dimension(*axis), *axis),
-        })
-        .chain(std::iter::once(dimension_source(group_sizes.value(), group_sizes_type.dimension(1), 1)))
-        .collect::<Vec<_>>();
-
-    // The group sizes keep their memory space and manual variation, while each new prefix axis is replicated.
-    let output_rank = prefix_axes.len() + 1;
-    let output_axes = vec![0, prefix_axes.len()];
-    let output_sharding = group_sizes_type
-        .sharding()
-        .map(|sharding| sharding.with_broadcasted_dimensions(output_rank, &output_axes))
-        .transpose()
-        .map_err(TypeError::from)?;
-    let output_shape = Shape::new(
-        prefix_axes
-            .iter()
-            .map(|axis| lhs_type.dimension(*axis))
-            .chain(std::iter::once(group_sizes_type.dimension(1)))
-            .collect(),
-    );
-    let output_type = ArrayType::new(group_sizes_type.data_type(), output_shape)
-        .with_memory(group_sizes_type.memory())
-        .with_sharding(output_sharding)
-        .map_err(TypeError::from)?;
-    P::broadcast_input(context, group_sizes, output_type, output_axes, Axis::from(0), dimension_sources)
 }
 
 /// Applies the product rule shared by dense and grouped bilinear dot operations.
@@ -2035,9 +2059,9 @@ impl Array {
     }
 
     /// Evaluates a grouped generalized dot over the exact physical extents. Each concrete group's raw cumulative
-    /// interval is clipped to the physical ragged extent, the resulting pair of LHS and RHS slices is contracted by the
-    /// ordinary generalized dot kernel, and the result is written into its output window. This keeps temporary storage
-    /// proportional to one group rather than to a whole input times the group count.
+    /// interval is clipped to the physical ragged extent, the resulting pair of left-hand side and right-hand side
+    /// slices is contracted by the ordinary generalized dot kernel, and the result is written into its output window.
+    /// This keeps temporary storage proportional to one group rather than to a whole input times the group count.
     fn ragged_dot_elements<T: NumericArrayElement>(
         &self,
         rhs: &Self,
@@ -2248,71 +2272,6 @@ impl Array {
         }
         Ok(output)
     }
-}
-
-/// Computes the abstract output type of one grouped generalized dot product.
-fn ragged_dot_abstract(
-    lhs: &ArrayType,
-    rhs: &ArrayType,
-    group_sizes: &ArrayType,
-    dimensions: &RaggedDotDimensionNumbers,
-) -> Result<ArrayType, TypeError> {
-    ArrayType::check_matching_manual_variation(RAGGED_DOT_OPERATION_NAME, &[lhs, rhs, group_sizes])?;
-    if !group_sizes.data_type().is_integer() {
-        return Err(TypeError::invalid(format!(
-            "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have an integer data type",
-        )));
-    }
-    if group_sizes.rank() == 0 {
-        return Err(TypeError::invalid(format!(
-            "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have rank at least one",
-        )));
-    }
-
-    let mode = dimensions.validate_for_ranks(lhs.rank(), rhs.rank())?;
-    let mut output = dot_abstract(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None)?;
-    let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
-    if group_sizes.rank() != 1 {
-        let expected_prefix = Shape::new(prefix_axes.iter().map(|axis| lhs.dimension(*axis)).collect());
-        let actual_prefix = Shape::new(group_sizes.shape().dimensions()[..group_sizes.rank() - 1].to_vec());
-        if actual_prefix != expected_prefix {
-            return Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` group sizes prefix must be `{expected_prefix}`, but got \
-                 `{actual_prefix}`",
-            )));
-        }
-    }
-    let group_count = group_sizes.dimension(group_sizes.rank() - 1);
-    let rhs_group_dimensions = dimensions.rhs_group_dimensions();
-    if mode == RaggedDotMode::NonContracting {
-        let group_axis = rhs_group_dimensions[0];
-        if rhs.dimension(group_axis) != group_count {
-            return Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent {} but group sizes describe \
-                 {group_count}",
-                rhs.dimension(group_axis),
-            )));
-        }
-    }
-    if mode != RaggedDotMode::Batch && lhs.data_type() == DataType::F8E8M0FNU {
-        return Err(TypeError::invalid(format!(
-            "`{RAGGED_DOT_OPERATION_NAME}` does not support element data type `f8e8m0fnu` in grouped expansion \
-             modes because it cannot represent zero",
-        )));
-    }
-    match mode {
-        RaggedDotMode::NonContracting => {
-            let rhs_result = dimensions.dot_dimensions().rhs_result_dimensions(rhs.rank());
-            let group_position = rhs_result.iter().position(|axis| *axis == rhs_group_dimensions[0]).unwrap();
-            let output_axis = dimensions.dot_dimensions().lhs_batching_dimensions().len()
-                + dimensions.dot_dimensions().lhs_result_dimensions(lhs.rank()).len()
-                + group_position;
-            output = output.without_dimension(output_axis)?.0;
-        }
-        RaggedDotMode::Contracting => output = output.with_inserted_dimension(0, group_count)?,
-        RaggedDotMode::Batch => {}
-    }
-    Ok(output)
 }
 
 #[cfg(test)]
