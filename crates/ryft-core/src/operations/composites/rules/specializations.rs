@@ -435,7 +435,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     expected_output_types.push(r#type.tangent()?);
                 }
 
-                let program = conform_rule_output_types(self.name(), "JVP", program, &expected_output_types, None)?;
+                let program =
+                    align_rule_output_type_identities(self.name(), "JVP", program, &expected_output_types, None)?;
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization::new(program, Vec::new())));
             };
@@ -531,7 +532,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 )?;
 
                 let kept_output_indices = key.kept_output_indices(output_count);
-                let program = conform_rule_output_types(
+                let program = align_rule_output_type_identities(
                     self.name(),
                     "forward",
                     program,
@@ -1961,8 +1962,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDefinition<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1997,13 +1996,13 @@ where
 
 /// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the
 /// `expected` types as its leading outputs (or as its outputs at the `selected` positions, when provided), and returns
-/// it with its type identities renamed onto those of `expected`.
-/// The trace establishes fresh identities for the extents that the rule computes (e.g., a recomputed `n · n` extent of
-/// the primal outputs), so its outputs can agree with `expected` only up to a renaming of those identities. The
-/// renaming is derived across the complete boundary, so that the identities of the program inputs map to themselves,
-/// and it must be bijective, so that it preserves which outputs share an identity. It is applied to the whole program,
-/// including any trailing outputs (e.g., residuals) that name the renamed identities.
-fn conform_rule_output_types<V: Value, O: Operation<Type = V::Type>>(
+/// it with its type identities renamed onto those of `expected`. The trace establishes fresh identities for the extents
+/// that the rule computes (e.g., a recomputed `n · n` extent of the primal outputs), so its outputs can agree with
+/// `expected` only up to a renaming of those identities. The renaming is derived across the complete boundary, so that
+/// the identities of the program inputs map to themselves, and it must be bijective, so that it preserves which outputs
+/// share an identity. It is applied to the whole program, including any trailing outputs (e.g., residuals) that name
+/// the renamed identities.
+fn align_rule_output_type_identities<V: Value, O: Operation<Type = V::Type>>(
     name: &str,
     rule: &str,
     program: Program<V, O, Vec<V>, Vec<V>>,
@@ -2029,9 +2028,12 @@ where
         let (expected, actual) = (render(expected), render(actual));
         let reason = if expected == actual { " with different type identities" } else { "" };
         return Err(TypeError::invalid(format!(
-            "{} {rule} rule output type signature mismatch: expected \
-             [{expected}] but got [{actual}]{reason}",
+            "{} {} rule output type signature mismatch: expected [{}] but got [{}]{}",
             describe_composite(COMPOSITE_OPERATION_NAME, name),
+            rule,
+            expected,
+            actual,
+            reason,
         ))
         .into());
     };
@@ -2040,6 +2042,8 @@ where
     }
     program.rename_type_identities(&renaming)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -2778,7 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conform_rule_output_types() {
+    fn test_align_rule_output_type_identities() {
         // A rule program whose outputs have the expected types is returned unchanged. Only its leading outputs (e.g.,
         // the primal outputs of a forward rule, which its residuals follow) or the selected ones are compared.
         let (f64_type, f32_type) = (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F32));
@@ -2787,15 +2791,15 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
         let rendering = program.to_string();
-        let conform = |expected: &[ArrayType], selected: Option<&[usize]>| {
-            conform_rule_output_types("pair", "forward", program.clone(), expected, selected)
+        let align = |expected: &[ArrayType], selected: Option<&[usize]>| {
+            align_rule_output_type_identities("pair", "forward", program.clone(), expected, selected)
                 .map(|program| program.to_string())
         };
-        assert_eq!(conform(&[f64_type.clone(), f32_type.clone()], None), Ok(rendering.clone()));
-        assert_eq!(conform(std::slice::from_ref(&f64_type), None), Ok(rendering.clone()));
-        assert_eq!(conform(std::slice::from_ref(&f32_type), Some(&[1])), Ok(rendering));
+        assert_eq!(align(&[f64_type.clone(), f32_type.clone()], None), Ok(rendering.clone()));
+        assert_eq!(align(std::slice::from_ref(&f64_type), None), Ok(rendering.clone()));
+        assert_eq!(align(std::slice::from_ref(&f32_type), Some(&[1])), Ok(rendering));
         assert!(matches!(
-            conform(std::slice::from_ref(&f32_type), None),
+            align(std::slice::from_ref(&f32_type), None),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`composite` `pair` forward rule output type signature mismatch: expected [f32[]] but \
                                got [f64[]]",
@@ -2803,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conform_rule_output_types_different_type_identities() {
+    fn test_align_rule_output_type_identities_different_type_identities() {
         // Outputs that render like the expected types but do not share their identities are rejected with a diagnostic
         // that names the identities, which the renderings alone would not show.
         let bounds = DimensionBounds::new(1, Some(9)).unwrap();
@@ -2815,7 +2819,7 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
         assert!(matches!(
-            conform_rule_output_types("pair", "JVP", program, &[vector_type(&first), vector_type(&first)], None),
+            align_rule_output_type_identities("pair", "JVP", program, &[vector_type(&first), vector_type(&first)], None),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`composite` `pair` JVP rule output type signature mismatch: expected [f32[n], f32[n]] \
                                but got [f32[n], f32[n]] with different type identities",
