@@ -148,36 +148,35 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
     registration: CustomRuleRegistration<V, O>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
-/// an optional forward mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
-/// reverse mode rules (refer to [`Self::with_vjp`]), and an optional batching rule (refer to [`Self::with_batching`]),
-/// and each [`call`](Self::call) stages one [`CompositeOperation`] with retained rules over the traced primal. Without
-/// a batching rule, a batched call maps every output at axis 0, even an output that does not vary across the batch,
-/// unless [`Self::with_batched_output_axes`] declares the batch axes of its outputs.
+/// an optional forward mode differentiation rule (set using [`Self::with_jvp`] or [`Self::with_jvp_from_primal`]),
+/// optional reverse mode differentiation rules (set using [`Self::with_vjp`]), and an optional batching rule (set using
+/// [`Self::with_batching`]), and each [`call`](Self::call) stages one [`CompositeOperation`] with retained rules over
+/// the traced primal. Without a batching rule, a batched call maps every output at axis `0`, even an output that does
+/// not vary across the batch, unless [`Self::with_batched_output_axes`] declares the batch axes of its outputs.
 ///
 /// The rules are retained callbacks rather than traced programs: a call traces only its primal, and each rule is traced
 /// on the first derivative request of each specialization (e.g., each distinct input signature or batching level) and
 /// cached, so a program that is never differentiated never traces its rules. Consequently, a malformed rule is reported
 /// when it is first needed rather than when the function is called. The primal and the rules must be `'static`,
 /// [`Send`], and [`Sync`], because the function stores them type-erased (i.e., as `Arc<dyn Fn(...) + Send + Sync>`)
-/// and staged programs retain the rules. Type erasure lets the type of a configured function be named by its tracer
-/// and structural types alone (e.g., as [`JvpComposite`] or [`VjpComposite`]), so that it can be stored in a struct
-/// field. Retaining the closure types would buy nothing measurable, because a call only traces its primal and each
-/// rule is traced once per specialization and cached.
+/// and staged programs retain the rules. Type erasure lets the type of a configured function be named by its operation
+/// family `(V, O)` and its structural types alone (e.g., as [`JvpComposite`] or [`VjpComposite`]), so that it can be
+/// stored in a struct field. Retaining the closure types would buy nothing measurable, because a call only traces its
+/// primal and each rule is traced once per specialization and cached.
 ///
-/// The function owns the specialization caches of its calls: its tracer selects one operation family, and calls that
-/// share a call structure (i.e., input and output parameter structure) and named axes share one registered definition
+/// The function owns the specialization caches of its calls: calls that share a call structure (i.e., input and output
+/// parameter structure) and named axes share one definition, registered in the function's operation family `(V, O)`,
 /// and its caches for as long as the function lives. Once the function is dropped, the derivative requests of calls
 /// that it staged trace their rules again on every request. The rules of a call cannot discharge reference state, so
 /// differentiating a call whose reference state was discharged is rejected when its rule programs contain reference
-/// state (refer to [`CustomRuleDefinition::with_reference_discharge`]).
+/// state. Refer to [`CustomRuleDefinition::with_reference_discharge`] for more information.
 ///
-/// The forward mode configuration is part of the type (i.e., `Jvp` is [`DefaultJvp`], [`ExplicitJvp`],
-/// [`SymbolicZeroJvp`], or [`JvpFromPrimal`]), so an explicit forward mode rule and a forward mode rule derived from
-/// the primal cannot both be configured, whatever the order of the configuration calls. Refer to the documentation of
-/// the [`composite`] function for the rule selection of every configuration.
+/// Each configuration (i.e., `Jvp`, `Vjp`, and `Batching`) is part of the type, and its configuration functions exist
+/// only while it still holds its default (i.e., [`DefaultJvp`], [`DefaultVjp`], or [`DefaultBatching`]). Each mode is
+/// therefore configured at most once, and conflicting rules for one mode (e.g., an explicit forward mode rule and a
+/// forward mode rule derived from the primal) are rejected at compile time, whatever the order of the configuration
+/// calls. Refer to the documentation of the [`composite`] function for the rule selection of every configuration.
 pub struct Composite<
     V: Value,
     O: Operation<Type = V::Type>,
@@ -194,17 +193,17 @@ pub struct Composite<
     /// context from the input values, so the function stores no context value.
     primal: Arc<dyn Fn(Input) -> Result<Output, ProgramError> + Send + Sync>,
 
-    /// Forward mode configuration.
+    /// Forward mode differentiation configuration.
     jvp: Jvp,
 
-    /// Reverse mode configuration.
+    /// Reverse mode differentiation configuration.
     vjp: Vjp,
 
     /// Batching configuration.
     batching: Batching,
 
     /// Batch axes of the flattened output leaves of calls batched without a custom batching rule, which default to
-    /// mapping every output leaf at axis 0 (refer to [`Composite::with_batched_output_axes`]).
+    /// mapping every output leaf at axis `0`. Refer to [`Composite::with_batched_output_axes`] for more information.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
@@ -217,52 +216,35 @@ pub struct Composite<
     registrations: CompositeRegistrations<V, O, Input::ParameterStructure, Output::ParameterStructure>,
 }
 
-/// [`Composite`] with an explicit forward mode rule (refer to [`Composite::with_jvp`]), which governs both forward and
-/// reverse mode differentiation, and with the default reverse mode and batching configurations. It names the type of
-/// such a function by its operation family `(V, O)` and its input and output types alone (e.g., for storing it in a
-/// struct field).
-pub type JvpComposite<V, O, Input, Output> = Composite<V, O, Input, Output, ExplicitJvp<Input, Output>>;
-
-/// [`Composite`] with explicit reverse mode forward and backward rules (refer to [`Composite::with_vjp`]) whose
-/// residuals have type `Residual`, and with the default forward mode and batching configurations (i.e., forward mode
-/// rejects its calls). It names the type of such a function by its operation family `(V, O)` and its input, output,
-/// and residual types alone (e.g., for storing it in a struct field).
-pub type VjpComposite<V, O, Input, Output, Residual> =
-    Composite<V, O, Input, Output, DefaultJvp, ExplicitVjp<Input, Output, Residual>>;
-
-/// [`Composite`] with a custom batching rule (refer to [`Composite::with_batching`]), and with the default forward mode
-/// and reverse mode configurations (i.e., derivatives are derived from the primal). It names the type of such a
-/// function by its operation family `(V, O)` and its input and output types alone (e.g., for storing it in a struct
-/// field).
-pub type BatchedComposite<V, O, Input, Output> =
-    Composite<V, O, Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<V, O, Input, Output>>;
-
 impl<V: Value, O: Operation<Type = V::Type>> Composite<V, O, Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     CustomRuleTracer<V, O>: CustomCall,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Creates a [`Composite`], without any custom rule, whose primal calls the foreign kernel described by `operation`
     /// (i.e., it stages a [`CustomCallOperation`] whose outputs have the operation's declared output types). Foreign
     /// kernels are opaque, so a custom call rejects differentiation, and this constructor is how a differentiable
     /// foreign kernel is defined: its configuration functions add the derivative rules (e.g., [`Self::with_vjp`]),
     /// which may themselves call foreign kernels. Without derivative rules, differentiating the function differentiates
-    /// its primal, which reaches the custom call and reports its error. This is the analogue of wrapping JAX's
+    /// its primal, which reaches the custom call and reports its error. This is the Ryft analogue of wrapping JAX's
     /// [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html) with
     /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) or
     /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
     ///
-    /// The function takes and returns vectors of values, and it is named after the operation's target, which labels its
-    /// staged calls. Interpretation and backend lowering execute the kernel, while derivative requests replay the
+    /// The function takes and returns vectors of values, and it is named after the operation's target, which labels
+    /// its staged calls. Interpretation and backend lowering execute the kernel, while derivative requests replay the
     /// rules. The values must be arrays (i.e., implement [`CustomCall`]), so heterogeneous contexts (e.g., array IR
     /// contexts) call the function through their [`ProjectedContext`](crate::ProjectedContext) onto arrays, and every
     /// call requires at least one input, whose context the kernel call dispatches through.
+    #[inline]
     pub fn from_custom_call(operation: CustomCallOperation) -> Self {
         let name = operation.target_name().to_owned();
         composite(move |inputs: Vec<CustomRuleTracer<V, O>>| CustomCall::custom_call(&operation, &inputs))
             .with_name(name)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value,
@@ -279,11 +261,11 @@ where
     /// Returns this function with the leading `non_differentiated_count` flattened input leaves treated as
     /// non-differentiated _plumbing_ inputs. Refer to the documentation of the [`composite`] function for the semantics
     /// of non-differentiated inputs. Calls staged before this reconfiguration keep their original rules. The rules
-    /// receive plumbing references by identity and cannot thread their state explicitly, so the reference state of a
-    /// program that calls this function with a reference input cannot be discharged (refer to
-    /// [`Program::discharge_references`]).
+    /// receive plumbing references by identity and cannot thread their state explicitly, so the reference state of
+    /// a program that calls this function with a reference input cannot be discharged. Refer to
+    /// [`Program::discharge_references`] for more information.
     ///
-    /// # Calling Pattern
+    /// # Calling Convention
     ///
     /// A function that wraps a composite with plumbing inputs usually prepares its inputs before the call:
     ///
@@ -293,14 +275,14 @@ where
     ///     rather than silently dropping it, because its rules declare no derivative with respect to that input. This
     ///     deliberately diverges from JAX, which stops the gradients of `nondiff_argnums` implicitly. A wrapper whose
     ///     plumbing inputs may depend on differentiated values therefore applies
-    ///     [`stop_gradient`](crate::StopGradient::stop_gradient) to them first, which states the zero derivative
-    ///     explicitly.
+    ///     [`stop_gradient`](crate::StopGradient::stop_gradient) to them first,
+    ///     which states the zero derivative explicitly.
     ///   - **Aligned Manual Variation:** Inside manual sharding (e.g., in the body of a `shard_map`), a wrapper aligns
     ///     the manual variation of its inputs before the call (refer to
     ///     [`align_manual_variation`](crate::ManualVariationAlignment::align_manual_variation)), so that the transposes
     ///     of those alignments, which precede the call's boundary, sum the cotangent contributions of invariant inputs
-    ///     exactly once. The call cannot align its inputs itself, because alignment
-    ///     is a capability of the input values rather than of every context in which a composite can be called.
+    ///     exactly once. The call cannot align its inputs itself, because alignment is a capability of the input values
+    ///     rather than of every context in which a composite can be called.
     ///
     /// # Examples
     ///
@@ -343,7 +325,8 @@ where
     /// Returns this function with the provided configurations and without registered definitions, because the
     /// definitions registered by earlier calls were configured with the previous configurations. The calls staged
     /// earlier keep their definitions, but since this drops the registrations that own their specialization caches,
-    /// their derivative requests trace their rules again on every request (refer to [`Composite`]).
+    /// their derivative requests trace their rules again on every request. Refer to the documentation of [`Composite`]
+    /// for more information.
     fn with_configuration<NewJvp, NewVjp, NewBatching>(
         primal: Arc<dyn Fn(Input) -> Result<Output, ProgramError> + Send + Sync>,
         jvp: NewJvp,
@@ -477,8 +460,8 @@ where
     /// Each pattern of structurally zero input tangents is a separate specialization of the rule. This is the analogue
     /// of JAX's `defjvp(..., symbolic_zeros=True)`, including its symbolic-zero output tangents.
     ///
-    /// The rule uses the tracer selected by the primal closure, so its tracer arguments need no separate type
-    /// annotation.
+    /// The operation family is inferred from the primal closure, so the rule's tracer arguments need no separate type
+    /// annotations.
     ///
     /// # Examples
     ///
@@ -658,8 +641,8 @@ where
     /// `defvjp(..., symbolic_zeros=True)` together with a backward rule that returns `None` or a `SymbolicZero` for an
     /// input, except that the forward rule receives no per-input differentiation flags (JAX's `perturbed` flags).
     ///
-    /// The seed uses the tracer selected by the primal closure, so it needs no separate type annotation. The residual
-    /// structure may still need an annotation when the backward closure uses overloaded operations.
+    /// The operation family is inferred from the primal closure, so the seed needs no separate type annotation. The
+    /// residual structure may still need an annotation when the backward closure uses overloaded operations.
     ///
     /// # Examples
     ///
@@ -837,9 +820,9 @@ impl<
     Batching,
 > Composite<V, O, Input, Output, Jvp, SymbolicZeroVjp<V, O, Input, Output, Residual>, Batching>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
     Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Returns this function with its reverse mode forward rule deferred to the backward pass, exactly as for the
     /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
@@ -861,9 +844,9 @@ impl<
     Batching,
 > Composite<V, O, Input, Output, Jvp, AccumulatingVjp<V, O, Input, Output, Residual>, Batching>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<CotangentAccumulator>>,
     Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Returns this function with its reverse mode forward rule deferred to the backward pass, exactly as for the
     /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
@@ -896,8 +879,8 @@ where
     /// that the input is the same for every batch item. Broadcasting a replicated input must preserve the rule's
     /// per-item numerical behavior.
     ///
-    /// The rule uses the tracer selected by the primal closure, so its tracer arguments need no separate type
-    /// annotation. [`BatchedComposite`] names the type of a function with only a batching rule.
+    /// The operation family is inferred from the primal closure, so the rule's tracer arguments need no separate type
+    /// annotations. [`BatchedComposite`] names the type of a function with only a batching rule.
     ///
     /// The rule is traced when a call is batched, once per batching level and input signature, and its program becomes
     /// the batched call's primal, so the rule takes precedence over structurally batching the primal (e.g., over the
@@ -1066,9 +1049,9 @@ where
 impl<V: Value, O: Operation<Type = V::Type>, Input, Output, Jvp, Vjp, Batching>
     Composite<V, O, Input, Output, Jvp, Vjp, Batching>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Stages one call of this function on the provided `input` value and returns its output value. Refer to the
     /// documentation of the [`composite`] function for the tracing semantics and for how the transforms treat the
@@ -1198,6 +1181,27 @@ where
     }
 }
 
+/// [`Composite`] with an explicit forward mode differentiation rule (set using [`Composite::with_jvp`]), which governs
+/// both forward and reverse mode differentiation, and with the default reverse mode differentiation and batching
+/// configurations. It names the type of such a function by its operation family `(V, O)` and its input and output
+/// types alone (e.g., for storing it in a struct field).
+pub type JvpComposite<V, O, Input, Output> = Composite<V, O, Input, Output, ExplicitJvp<Input, Output>>;
+
+/// [`Composite`] with explicit reverse mode differentiation forward and backward rules (set using
+/// [`Composite::with_vjp`]) whose residuals have type `Residual`, and with the default forward mode differentiation and
+/// batching configurations (i.e., forward mode differentiation rejects its calls). It names the type of such a function
+/// by its operation family `(V, O)` and its input, output, and residual types alone (e.g., for storing it in a struct
+/// field).
+pub type VjpComposite<V, O, Input, Output, Residual> =
+    Composite<V, O, Input, Output, DefaultJvp, ExplicitVjp<Input, Output, Residual>>;
+
+/// [`Composite`] with a custom batching rule (set using [`Composite::with_batching`]), and with the default forward
+/// mode and reverse mode differentiation configurations (i.e., derivatives are derived from the primal). It names the
+/// type of such a function by its operation family `(V, O)` and its input and output types alone (e.g., for storing it
+/// in a struct field).
+pub type BatchedComposite<V, O, Input, Output> =
+    Composite<V, O, Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<V, O, Input, Output>>;
+
 /// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any custom
 /// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them, where
 /// each configuration is the analogue of one JAX entry point: [`Composite::with_jvp`] of
@@ -1281,10 +1285,10 @@ where
 /// inputs, outputs, and residuals may each be a single tracer, a tuple, or any other parameterized structure. Tangents
 /// and cotangents have the parameter structures of their primal values. Because this function builds a reusable
 /// function before any input is known, the primal closure must annotate the tracer type of its input (e.g.,
-/// `|x: DomainTracer<C>| ...`), which selects the composite's tracer and operation family and fixes the input types
-/// of the rule closures. Static configuration
-/// should be captured by the closures, while a dynamic value should remain an explicit input, either as a
-/// non-differentiated input (see below) or as an ordinary input whose derivative the rules treat as zero.
+/// `|x: DomainTracer<C>| ...`), from which the composite's operation family `(V, O)` is inferred and which fixes the
+/// input types of the rule closures. Static configuration should be captured by the closures, while a dynamic value
+/// should remain an explicit input, either as a non-differentiated input (see below) or as an ordinary input whose
+/// derivative the rules treat as zero.
 ///
 /// # Non-Differentiated Inputs
 ///
