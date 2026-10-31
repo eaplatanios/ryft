@@ -24,9 +24,9 @@ use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
     ResidualZeroProvider, TransposableOperation, TranspositionContext,
 };
-use crate::macros::check_count;
+use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME};
 use crate::operations::composites::rules::specialization::{
     CustomRuleDerivation, specialization_error, transpose_backward_source_program,
 };
@@ -42,7 +42,7 @@ use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatabl
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation, ReferenceDischargePolicy,
     ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
-    ReferenceType, Type, Typed, Value,
+    ReferenceType, Type, TypeError, Typed, Value,
 };
 use crate::specialization::{ReentrantSpecializationError, SpecializationCacheError};
 use crate::tracing::TracingContext;
@@ -178,9 +178,7 @@ where
 /// function of its inputs, like any other traced program, and transposition adds its results to whatever destination
 /// each differentiated input's cotangent has. The explicit tracing context lets structured adapters replay a rule
 /// even when its boundary has no leading inputs or seeds.
-pub(in crate::operations::composites) trait CustomVjpBackwardRule<V, O>:
-    Send + Sync
-{
+pub(super) trait CustomVjpBackwardRule<V, O>: Send + Sync {
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
@@ -221,9 +219,7 @@ where
 /// that they would otherwise require, and that returns its input cotangents as [`MaybeZero`]s, so that it can declare
 /// an input cotangent to be a structural zero without computing it. It is otherwise identical to
 /// [`CustomVjpBackwardRule`].
-pub(in crate::operations::composites) trait CustomSymbolicZeroVjpBackwardRule<V, O>:
-    Send + Sync
-{
+pub(super) trait CustomSymbolicZeroVjpBackwardRule<V, O>: Send + Sync {
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
@@ -265,9 +261,7 @@ where
 /// differentiated inputs to their accumulators. A single rule therefore serves returned, caller-buffer, and ignored
 /// destinations, and can, for example, update only the affected entries of a caller-provided buffer instead of
 /// returning a full-sized cotangent.
-pub(in crate::operations::composites) trait CustomVjpAccumulatingBackwardRule<V, O>:
-    Send + Sync
-{
+pub(super) trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
     /// Applies this rule in the provided transposition context.
     fn apply(
         &self,
@@ -436,7 +430,7 @@ pub(super) enum CustomRuleJvpRule<'r, V, O> {
 }
 
 /// Retained custom Vector-Jacobian Product (VJP) backward rule of a [`CustomRuleDefinition`].
-pub(in crate::operations::composites) enum CustomVjpBackward<V, O> {
+pub(super) enum CustomVjpBackward<V, O> {
     /// Pure backward rule that receives materialized seeds (refer to [`CustomVjpBackwardRule`]).
     Pure(Arc<dyn CustomVjpBackwardRule<V, O>>),
 
@@ -535,7 +529,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     pub(super) forward: Option<Arc<dyn CustomVjpForwardRule<V, O>>>,
 
     /// Optional retained reverse mode backward rule, present exactly when [`Self::forward`] is present.
-    pub(in crate::operations::composites) backward: Option<CustomVjpBackward<V, O>>,
+    pub(super) backward: Option<CustomVjpBackward<V, O>>,
 
     /// Transposer of backward-rule specialization source programs, present exactly when [`Self::backward`] is present.
     pub(super) transposer: Option<Arc<CustomRuleTransposer<V, O>>>,
@@ -1149,6 +1143,88 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     }
 }
 
+impl<V, O> CustomRuleDefinition<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    V: Value<Type: Eq + Hash + DifferentiableType>,
+    O: Operation<Type = V::Type>
+        + ResidualZeroProvider<V::Type, Operation = O>
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+{
+    /// Applies the retained backward rule of this [`CustomRuleDefinition`] directly, as the transposition of a
+    /// [`CompositeTransposeOperation`] that invokes it does, and submits the cotangents of the differentiated inputs to
+    /// their accumulators. An accumulating rule submits its contributions itself. A pure rule receives the known
+    /// leading inputs and the seeds, whose structural zeros are materialized from `zero_sources` unless the rule
+    /// receives structural zeros, and its cotangents must have the cotangent types of the differentiated inputs.
+    /// Structural zero cotangents are checked too, so that a misplaced zero cannot pass as the cotangent of another
+    /// input.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Transposition context of the carrier.
+    ///   - `inputs`: Inputs that the rule receives, i.e., the known leading inputs followed by the differentiated
+    ///     inputs.
+    ///   - `leading_values`: Values of the known leading inputs in `inputs`.
+    ///   - `zero_sources`: Values whose types name every runtime extent of the seed types, from which structural zero
+    ///     seeds are materialized.
+    ///   - `seeds`: Cotangent seeds of the outputs.
+    ///   - `accumulators`: Accumulators of `inputs`, in the same order.
+    ///   - `input_tangent_types`: Tangent types of the differentiated inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DifferentiationError`] when this definition has no backward rule, when the rule fails, when its
+    /// cotangents do not have the cotangent types of the differentiated inputs, or when a cotangent cannot be
+    /// accumulated.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::operations::composites) fn apply_backward_rule(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        inputs: &[PartialValue<CustomRuleTracer<V, O>>],
+        leading_values: &[CustomRuleTracer<V, O>],
+        zero_sources: &[CustomRuleTracer<V, O>],
+        seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
+        accumulators: &[CotangentAccumulator],
+        input_tangent_types: &[V::Type],
+    ) -> Result<(), DifferentiationError> {
+        let Some(backward) = &self.backward else {
+            return Err(missing_backward_rule_error(self.name()).into());
+        };
+        let cotangents = match backward {
+            CustomVjpBackward::Accumulating(rule) => return Ok(rule.apply(context, inputs, seeds, accumulators)?),
+
+            // A pure rule receives materialized seeds, and its cotangents are added to each differentiated input's
+            // destination, which also discards the cotangents of ignored inputs. A zero seed whose type names runtime
+            // extents reads them from the zero sources.
+            CustomVjpBackward::Pure(rule) => {
+                let seeds = seeds
+                    .iter()
+                    .map(|seed| O::materialize_zero_from_residual_sources(&**context, seed.clone(), zero_sources))
+                    .collect::<Result<Vec<_>, _>>()?;
+                rule.apply(&**context, leading_values, &seeds)?
+                    .into_iter()
+                    .map(MaybeZero::Value)
+                    .collect::<Vec<_>>()
+            }
+
+            // A rule that receives structural zero seeds may also return structural zero cotangents, which contribute
+            // nothing to their destinations, so they stay structural zeros for the transposition.
+            CustomVjpBackward::PureWithSymbolicZeros(rule) => rule.apply(&**context, leading_values, seeds)?,
+        };
+
+        // Each cotangent has the cotangent type of its differentiated input, which may differ from the input's tangent
+        // type (e.g., sharded arrays swap their reduced and unreduced axes).
+        let cotangent_types = cotangents.iter().map(|cotangent| cotangent.r#type().into_owned()).collect::<Vec<_>>();
+        let expected_cotangent_types =
+            input_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
+        validate_rule_output_types(self.name(), "backward", &expected_cotangent_types, &cotangent_types)?;
+        for (accumulator, cotangent) in accumulators[leading_values.len()..].iter().zip(cotangents) {
+            accumulator.accumulate(context, cotangent)?;
+        }
+        Ok(())
+    }
+}
+
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1168,6 +1244,32 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     pub(super) fn has_uncached_in_flight(&self) -> bool {
         !self.uncached_in_flight.lock().expect("custom rule in-flight mutex is poisoned").is_empty()
     }
+}
+
+/// Returns the error that reports that the custom rule set named `name` has no reverse mode backward rule.
+pub(super) fn missing_backward_rule_error(name: &str) -> ProgramError {
+    let description = if name == COMPOSITE_OPERATION_NAME {
+        format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
+    } else {
+        format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
+    };
+    ProgramError::UnsupportedOperation { message: format!("{description} has no backward rule") }
+}
+
+/// Validates that a retained rule of the custom rule set named `name` returned the `expected` output types.
+fn validate_rule_output_types<T: Type>(name: &str, rule: &str, expected: &[T], actual: &[T]) -> Result<(), TypeError> {
+    check_types!(@same, {
+        let description = if name == COMPOSITE_OPERATION_NAME {
+            format!("`{COMPOSITE_OPERATION_NAME}`")
+        } else {
+            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+        };
+        format!("{description} {rule} rule output")
+    }, [
+        expected,
+        actual,
+    ]);
+    Ok(())
 }
 
 #[cfg(test)]

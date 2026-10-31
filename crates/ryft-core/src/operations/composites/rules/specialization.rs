@@ -19,20 +19,21 @@ use crate::differentiation::{
     CotangentDestinationKind, DifferentiableType, DifferentiationError, ResidualZeroProvider,
     TransposedProgramCotangent,
 };
-use crate::macros::{check_count, check_types};
+use crate::macros::check_count;
 use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
 use crate::operations::composites::rules::definition::{
     CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomVjpOperation,
+    missing_backward_rule_error,
 };
 use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleBatchingLevel,
     CustomRuleBatchingRuleKey, CustomRuleDerivationKey, CustomRuleDerivationKind, CustomRuleDifferentiator,
     CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationKey, CustomRuleSpecializationRequest,
-    CustomRuleTracer,
+    CustomRuleTracer, boundary_input_count,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -643,18 +644,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // hands the rule a structural zero for every dropped output. A batched key batches the specialization of its
         // inner key at its outermost level.
         let Some(transposer) = &self.definition.transposer else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: {
-                    let name = self.definition.name();
-                    let description = if name == COMPOSITE_OPERATION_NAME {
-                        format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`")
-                    } else {
-                        format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{name}`")
-                    };
-                    format!("{description} has no backward rule")
-                },
-            }
-            .into());
+            return Err(missing_backward_rule_error(self.definition.name()).into());
         };
         // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Backward(key.clone()), || {
@@ -2058,32 +2048,6 @@ where
     let transposed = program.entry_region_ref().transpose(input_indices, &[], destination_kinds)?;
     let cotangents = transposed.cotangents().to_vec();
     Ok((Arc::unwrap_or_clone(transposed.into_program()), cotangents))
-}
-
-/// Returns the number of boundary inputs that the provided batching levels together prepended to an operation's inputs.
-pub(in crate::operations::composites) fn boundary_input_count<T>(levels: &[CustomRuleBatchingLevel<T>]) -> usize {
-    levels.iter().map(|level| level.boundary_input_count).sum()
-}
-
-/// Validates that a retained rule of the custom rule set named `name` returned the `expected` output types.
-pub(in crate::operations::composites) fn validate_rule_output_types<T: Type>(
-    name: &str,
-    rule: &str,
-    expected: &[T],
-    actual: &[T],
-) -> Result<(), TypeError> {
-    check_types!(@same, {
-        let description = if name == COMPOSITE_OPERATION_NAME {
-            format!("`{COMPOSITE_OPERATION_NAME}`")
-        } else {
-            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-        };
-        format!("{description} {rule} rule output")
-    }, [
-        expected,
-        actual,
-    ]);
-    Ok(())
 }
 
 /// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the

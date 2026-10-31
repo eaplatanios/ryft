@@ -37,11 +37,9 @@ pub mod specialization;
 
 // TODO(eaplatanios): Review from here onwards.
 
-pub(in crate::operations::composites) use definition::CustomVjpBackward;
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
 pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleRegistration};
 pub use specialization::{CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules};
-pub(in crate::operations::composites) use specialization::{boundary_input_count, validate_rule_output_types};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
 pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
@@ -142,6 +140,11 @@ pub struct CustomRuleBatchingLevel<T> {
 
     /// Batch axes of the operation's outputs at this level.
     pub(super) output_axes: Vec<BatchAxis>,
+}
+
+/// Returns the number of boundary inputs that the provided batching levels together prepended to an operation's inputs.
+pub(in crate::operations::composites) fn boundary_input_count<T>(levels: &[CustomRuleBatchingLevel<T>]) -> usize {
+    levels.iter().map(|level| level.boundary_input_count).sum()
 }
 
 /// Batching applied to a [`CompositeOperation`](crate::CompositeOperation) or [`CompositeTransposeOperation`]

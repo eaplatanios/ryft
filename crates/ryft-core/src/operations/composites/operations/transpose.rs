@@ -27,8 +27,7 @@ use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::transpose_carrier_batching;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
-    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward,
-    boundary_input_count, validate_rule_output_types,
+    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, boundary_input_count,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -48,39 +47,6 @@ pub const COMPOSITE_TRANSPOSE_OPERATION_NAME: &str = "composite_transpose";
 
 /// Effects of every [`CompositeTransposeOperation`] with retained rules, which carries an unresolved backward rule.
 static COMPOSITE_TRANSPOSE_EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects::empty().clone().with_deferred_work());
-
-/// Backward rule of a [`CompositeTransposeOperation`], in the representation of the call that staged it.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) enum CompositeTransposeRules<T, S> {
-    /// Backward rule attached as the `"backward"` rule region.
-    Attached,
-
-    /// Backward rule retained by a source and specialized lazily, together with the carrier state that its
-    /// specializations depend on.
-    Retained {
-        /// Source of the backward rule.
-        rules: S,
-
-        /// Batching applied to the carrier (or to the call from which it was staged), or [`None`] when it is
-        /// unbatched.
-        batching: Option<CustomRuleBatching<T>>,
-
-        /// Whether transposition invokes the backward rule directly instead of replaying a cached specialization. Only
-        /// the source programs from which specializations are derived set it, and their carriers are never batched.
-        invokes_rule_directly: bool,
-
-        /// Whether the carrier's reference state (or that of the call from which it was staged) was discharged, which
-        /// discharges its backward rule programs as well.
-        discharged: bool,
-
-        /// Specialization key of the forward rule of the call from which the carrier was staged when that call defers
-        /// its forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`]), or [`None`] when the
-        /// carrier's leading inputs already contain the residuals. A deferred carrier's leading
-        /// inputs are the call's inputs (including the boundary inputs of its batching levels, which the key records),
-        /// followed by the seed extents, and it records no batching of its own.
-        deferred_forward: Option<CustomRuleSpecializationKey<T>>,
-    },
-}
 
 /// Selected reverse mode carrier of a [`CompositeOperation`] with reverse mode rules, which its
 /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule stages in place of the call. It represents
@@ -990,7 +956,7 @@ where
         // Even without leading inputs or live seeds, a retained rule can carry effects or deferred work. Its selected
         // specialization must be traced before unused numerical work can be removed.
         if invokes_rule_directly {
-            let Some(backward) = rules.native_definition().and_then(|definition| definition.backward.as_ref()) else {
+            let Some(definition) = rules.native_definition() else {
                 return Err(ProgramError::UnsupportedOperation {
                     message: {
                         let name = rules.name();
@@ -1006,68 +972,32 @@ where
             };
 
             // The seed extents are used only to materialize zero seeds, so the rule sees neither those inputs nor their
-            // accumulators.
+            // accumulators, while the zero seeds may still read runtime extents from them.
             let rule_leading_input_count = self.leading_input_count - seed_extent_count;
-            let rule_leading_values = &leading_values[..rule_leading_input_count];
-            let cotangents = match backward {
-                CustomVjpBackward::Accumulating(rule) => {
-                    if seed_extent_count == 0 {
-                        return Ok(rule.apply(context, inputs, outputs, accumulators)?);
-                    }
-                    let inputs = inputs[..rule_leading_input_count]
-                        .iter()
-                        .chain(&inputs[self.leading_input_count..])
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let accumulators = accumulators[..rule_leading_input_count]
-                        .iter()
-                        .chain(&accumulators[self.leading_input_count..])
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    return Ok(rule.apply(context, &inputs, outputs, &accumulators)?);
-                }
-
-                // A pure rule receives the known leading inputs and materialized seeds, and its cotangents are added
-                // to each differentiated input's destination, which also discards the cotangents of ignored inputs.
-                // A zero seed whose type names runtime extents reads them from the leading inputs, including the seed
-                // extents.
-                CustomVjpBackward::Pure(rule) => {
-                    let seeds = outputs
-                        .iter()
-                        .map(|seed| {
-                            O::materialize_zero_from_residual_sources(&**context, seed.clone(), &leading_values)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    rule.apply(&**context, rule_leading_values, &seeds)?
-                        .into_iter()
-                        .map(MaybeZero::Value)
-                        .collect::<Vec<_>>()
-                }
-
-                // A rule that receives structural zero seeds may also return structural zero cotangents, which
-                // contribute nothing to their destinations, so they stay structural zeros for the transposition.
-                CustomVjpBackward::PureWithSymbolicZeros(rule) => {
-                    rule.apply(&**context, rule_leading_values, outputs)?
-                }
+            let (rule_inputs, rule_accumulators) = if seed_extent_count == 0 {
+                (Cow::Borrowed(inputs), Cow::Borrowed(accumulators))
+            } else {
+                let inputs = inputs[..rule_leading_input_count]
+                    .iter()
+                    .chain(&inputs[self.leading_input_count..])
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let accumulators = accumulators[..rule_leading_input_count]
+                    .iter()
+                    .chain(&accumulators[self.leading_input_count..])
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (Cow::Owned(inputs), Cow::Owned(accumulators))
             };
-
-            // Each cotangent has the cotangent type of its differentiated input, which may differ from the input's
-            // tangent type (e.g., sharded arrays swap their reduced and unreduced axes). Structural zeros are checked
-            // too, so that a misplaced zero cannot pass as the cotangent of another input.
-            let cotangent_types =
-                cotangents.iter().map(|cotangent| cotangent.r#type().into_owned()).collect::<Vec<_>>();
-            let expected_cotangent_types =
-                self.input_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
-            validate_rule_output_types(
-                rules.name(),
-                "backward",
-                expected_cotangent_types.as_slice(),
-                cotangent_types.as_slice(),
-            )?;
-            for (accumulator, cotangent) in accumulators[self.leading_input_count..].iter().zip(cotangents) {
-                accumulator.accumulate(context, cotangent)?;
-            }
-            return Ok(());
+            return definition.apply_backward_rule(
+                context,
+                &rule_inputs,
+                &leading_values[..rule_leading_input_count],
+                &leading_values,
+                outputs,
+                &rule_accumulators,
+                &self.input_tangent_types,
+            );
         }
 
         // The leading inputs of a deferred carrier are the inputs of its call rather than the call's residuals, so the
@@ -1206,8 +1136,8 @@ where
                         seed_types: outputs
                             .iter()
                             .zip(&batching.output_types)
-                            .map(|(output, r#type)| output.as_value().map(|_| r#type.clone()))
-                            .collect(),
+                            .map(|(output, r#type)| output.as_value().map(|_| r#type.cotangent()).transpose())
+                            .collect::<Result<Vec<_>, _>>()?,
                         destination_kinds: destination_kinds.clone(),
                         levels: batching.levels.clone(),
                         discharged,
@@ -1243,6 +1173,39 @@ where
     }
 }
 
+/// Backward rule of a [`CompositeTransposeOperation`], in the representation of the call that staged it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) enum CompositeTransposeRules<T, S> {
+    /// Backward rule attached as the `"backward"` rule region.
+    Attached,
+
+    /// Backward rule retained by a source and specialized lazily, together with the carrier state that its
+    /// specializations depend on.
+    Retained {
+        /// Source of the backward rule.
+        rules: S,
+
+        /// Batching applied to the carrier (or to the call from which it was staged), or [`None`] when it is
+        /// unbatched.
+        batching: Option<CustomRuleBatching<T>>,
+
+        /// Whether transposition invokes the backward rule directly instead of replaying a cached specialization. Only
+        /// the source programs from which specializations are derived set it, and their carriers are never batched.
+        invokes_rule_directly: bool,
+
+        /// Whether the carrier's reference state (or that of the call from which it was staged) was discharged, which
+        /// discharges its backward rule programs as well.
+        discharged: bool,
+
+        /// Specialization key of the forward rule of the call from which the carrier was staged when that call defers
+        /// its forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`]), or [`None`] when the
+        /// carrier's leading inputs already contain the residuals. A deferred carrier's leading
+        /// inputs are the call's inputs (including the boundary inputs of its batching levels, which the key records),
+        /// followed by the seed extents, and it records no batching of its own.
+        deferred_forward: Option<CustomRuleSpecializationKey<T>>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1270,7 +1233,7 @@ mod tests {
     };
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
-        RuleCounters, cube_definition, custom_rule_program, member_cube_definition,
+        MemberDefinition, RuleCounters, cube_definition, custom_rule_program, member_cube_definition,
     };
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -1298,9 +1261,9 @@ mod tests {
 
     /// Test-only transposition driver exposing one attached region, used to invoke the transposition rule of a carrier
     /// with an attached backward rule directly on the backward region that it replays.
-    struct TestTranspositionDriver<'r> {
+    struct TestTranspositionDriver<'o> {
         /// Transpose region exposed by this driver.
-        region: RegionRef<'r, Array, ArrayOperation<Array>>,
+        region: RegionRef<'o, Array, ArrayOperation<Array>>,
     }
 
     impl RegionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
@@ -1825,8 +1788,27 @@ mod tests {
             )
             .unwrap();
         let evaluation = context.into_evaluation(Vec::new()).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %1 %0
+                in ()
+            "}
+            .trim_end(),
+        );
         let transposed =
             evaluation.program().transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]> .
+                let %1:f64[] = const 1.0
+                    () = reference_add_update %0 %1
+                in ()
+            "}
+            .trim_end(),
+        );
         assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
         assert_eq!(transposed.interpret(vec![ArrayIrValue::Reference(stash.clone())]), Ok(Vec::new()));
         assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
@@ -1993,9 +1975,115 @@ mod tests {
 
         // A replicated tangent input receives the sum of its per-item cotangents.
         let batched = batched_program(reverse.tangent(), 3, &[BatchAxis::replicated(), BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[3] .
+                let %2:f64[3] = composite_transpose [
+                    name=\"cube\",
+                    leading_input_count=1,
+                    batching=[(extent=3, input_axes=[axis 0, replicated], output_axes=[axis 0])],
+                ] %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
         let pullback = batched.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = mul %1 %0
+                    %3:f64[3] = add %2 %2
+                    %4:f64[] = reduce [kind=sum, axes=[0]] %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
         assert_eq!(pullback.interpret(vec![seeds, squares]), Ok(vec![Array::scalar(72f64).unwrap()]));
         assert_eq!(counters.counts(), (0, 1, 1));
+    }
+
+    #[test]
+    fn test_composite_transpose_batching_retained_rules_seed_cotangent_types() {
+        // Reduced and unreduced mesh axes are dual. A batched carrier must key its inner specialization with the
+        // cotangent type of the seed, so it shares the specialization already traced by an unbatched carrier.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let tangent_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let cotangent_type = tangent_type.cotangent().unwrap();
+        assert_ne!(tangent_type, cotangent_type);
+        let definition = CustomRuleRegistration::new(
+            MemberDefinition::new("identity")
+                .with_vjp(|inputs| Ok((inputs.to_vec(), Vec::new())), |_, seeds| Ok(seeds.to_vec()))
+                .with_batching_support(),
+        );
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let tangent = builder.add_input(tangent_type.clone());
+        let output = builder
+            .add_instruction(
+                ArrayCompositeTranspose::new(
+                    definition.reference(),
+                    0,
+                    vec![tangent_type.clone()],
+                    vec![tangent_type.clone()],
+                ),
+                Vec::new(),
+                vec![tangent],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let unbatched = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            unbatched.to_string(),
+            format!(
+                indoc! {"
+                    lambda %0:{cotangent_type} .
+                    in (%0)
+                "},
+                cotangent_type = cotangent_type
+            )
+            .trim_end(),
+        );
+        let batched = batched_program(&program, 2, &[BatchAxis::new(0)]);
+        let packed_tangent_type = tangent_type.batched(0, Dimension::Static(2), ShardingDimension::Replicated).unwrap();
+        assert_eq!(
+            batched.to_string(),
+            format!(
+                indoc! {"
+                    lambda %0:{packed_tangent_type} .
+                    let %1:{packed_tangent_type} = composite_transpose [
+                        name=\"identity\",
+                        leading_input_count=0,
+                        batching=[(extent=2, input_axes=[axis 0], output_axes=[axis 0])],
+                    ] %0
+                    in (%1)
+                "},
+                packed_tangent_type = packed_tangent_type
+            )
+            .trim_end(),
+        );
+        let pullback = batched.transpose_with_respect_to(&[0], &[]).unwrap();
+        let packed_cotangent_type =
+            cotangent_type.batched(0, Dimension::Static(2), ShardingDimension::Replicated).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            format!(
+                indoc! {"
+                    lambda %0:{packed_cotangent_type} .
+                    in (%0)
+                "},
+                packed_cotangent_type = packed_cotangent_type
+            )
+            .trim_end(),
+        );
+        let keys = definition.caches().backward_specializations.keys();
+        let unbatched_keys = keys.iter().filter(|key| key.levels.is_empty()).collect::<Vec<_>>();
+        assert_eq!(unbatched_keys.len(), 1);
+        assert_eq!(unbatched_keys[0].seed_types, vec![Some(cotangent_type)]);
     }
 
     #[test]
@@ -2124,6 +2212,25 @@ mod tests {
             .entry_region_ref()
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
+        assert_eq!(
+            reverse.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = composite_transpose [name=\"cube\", leading_input_count=1, deferred_forward=true] %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            reverse.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                in (%2, %0)
+            "}
+            .trim_end(),
+        );
         assert!(matches!(
             reverse.tangent().batched(
                 3,
@@ -2137,7 +2244,29 @@ mod tests {
                                the call before differentiating it, or transpose the derivative before batching it",
         ));
         let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %1
+                    %3:f64[] = mul %2 %0
+                    %4:f64[] = add %3 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
         let batched = batched_program(&pullback, 3, &[BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = mul %1 %1
+                    %3:f64[3] = mul %2 %0
+                    %4:f64[3] = add %3 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             batched.interpret(vec![
                 Array::vector(vec![1f64, 2f64, 3f64]).unwrap(),
@@ -2422,6 +2551,17 @@ mod tests {
         // The unused carrier declares deferred work, so simplification keeps it and its backward effects still run.
         for program in [program.clone(), program.simplified().unwrap()] {
             let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+            assert_eq!(
+                transposed.to_string(),
+                indoc! {"
+                    lambda  .
+                    let %0:f32[] = zero [type=f32[]]
+                        %1:i32[] = const -1
+                        %2:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %1
+                    in ()
+                "}
+                .trim_end(),
+            );
             assert!(transposed.input_ids().is_empty());
             assert!(transposed.output_ids().is_empty());
             assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::Concretization { message })
@@ -3006,7 +3146,7 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda .
+                lambda  .
                 let %0:i32[] = const -1
                     %1:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %0
                 in ()

@@ -61,40 +61,6 @@ pub enum CompositeJvpRule {
     Primal,
 }
 
-/// Derivative rules of a [`CompositeOperation`], in one of its two representations.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum CompositeRules<T, S> {
-    /// Rule programs attached as rule regions that follow the primal region.
-    Attached {
-        /// Forward mode rule, whose explicit form is a `"jvp"` rule region.
-        jvp_rule: CompositeJvpRule,
-
-        /// Whether the call has `"forward"` and `"backward"` reverse mode rule regions.
-        has_vjp_rule: bool,
-    },
-
-    /// Rules retained by a source and traced lazily, together with the call state that their specializations depend
-    /// on.
-    Retained {
-        /// Source of the retained rules.
-        rules: S,
-
-        /// Batching applied to the call after it was staged, or [`None`] for an unbatched call.
-        batching: Option<CustomRuleBatching<T>>,
-
-        /// Whether the call's reference state was discharged, which discharges its rule programs as well (refer to
-        /// [`CustomRuleDefinition::with_reference_discharge`](crate::CustomRuleDefinition::with_reference_discharge)).
-        discharged: bool,
-
-        /// Whether each output of the rules is an output of the call, or [`None`] when the call returns every output
-        /// of its rules. Pruning the unused outputs of a call (refer to [`Operation::prune_boundary`]) prunes them
-        /// from its primal region and records them here, because its rules are traced for the complete output
-        /// structure: the rule specializations of the call project the kept outputs, and its reverse mode carrier
-        /// keeps every output of the forward rule, whose pruned outputs then receive structural zero seeds.
-        kept_outputs: Option<Vec<bool>>,
-    },
-}
-
 /// Higher-order [`Operation`] that calls a primal program with custom derivative rules. It is the operation that
 /// [`Composite`](crate::Composite) functions stage, and it is the one boundary through which every transform treats a
 /// function whose derivative is not the derivative of its implementation (e.g., a fused or foreign kernel, or a
@@ -389,7 +355,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     /// Splits the provided input `values` into the leading non-differentiated group and the trailing differentiated
     /// group, based on the value of [`Self::non_differentiated_count`].
     #[inline]
-    fn split_inputs<'v, T>(&self, values: &'v [T]) -> Result<(&'v [T], &'v [T]), TypeError> {
+    fn split_inputs<'o, T>(&self, values: &'o [T]) -> Result<(&'o [T], &'o [T]), TypeError> {
         let non_differentiated_count = self.non_differentiated_count;
         let input_count = values.len();
         if non_differentiated_count > input_count {
@@ -403,10 +369,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Validates the composite contract over the attached region interfaces (refer to the documentation of
     /// [`CompositeOperation`] for that contract) and returns the primal interface.
-    fn validated_interfaces<'i>(
+    fn validated_interfaces<'o>(
         &self,
-        region_interfaces: &'i [RegionInterface<V::Type>],
-    ) -> Result<&'i RegionInterface<V::Type>, TypeError> {
+        region_interfaces: &'o [RegionInterface<V::Type>],
+    ) -> Result<&'o RegionInterface<V::Type>, TypeError> {
         check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
         let primal_interface = &region_interfaces[0];
         let input_types = primal_interface.input_types();
@@ -1810,6 +1776,40 @@ where
     }
 }
 
+/// Derivative rules of a [`CompositeOperation`], in one of its two representations.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CompositeRules<T, S> {
+    /// Rule programs attached as rule regions that follow the primal region.
+    Attached {
+        /// Forward mode rule, whose explicit form is a `"jvp"` rule region.
+        jvp_rule: CompositeJvpRule,
+
+        /// Whether the call has `"forward"` and `"backward"` reverse mode rule regions.
+        has_vjp_rule: bool,
+    },
+
+    /// Rules retained by a source and traced lazily, together with the call state that their specializations depend
+    /// on.
+    Retained {
+        /// Source of the retained rules.
+        rules: S,
+
+        /// Batching applied to the call after it was staged, or [`None`] for an unbatched call.
+        batching: Option<CustomRuleBatching<T>>,
+
+        /// Whether the call's reference state was discharged, which discharges its rule programs as well (refer to
+        /// [`CustomRuleDefinition::with_reference_discharge`](crate::CustomRuleDefinition::with_reference_discharge)).
+        discharged: bool,
+
+        /// Whether each output of the rules is an output of the call, or [`None`] when the call returns every output
+        /// of its rules. Pruning the unused outputs of a call (refer to [`Operation::prune_boundary`]) prunes them
+        /// from its primal region and records them here, because its rules are traced for the complete output
+        /// structure: the rule specializations of the call project the kept outputs, and its reverse mode carrier
+        /// keeps every output of the forward rule, whose pruned outputs then receive structural zero seeds.
+        kept_outputs: Option<Vec<bool>>,
+    },
+}
+
 /// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose leading
 /// `non_differentiated_count` inputs `p` are not differentiated. This is the forward mode rule for both attached JVP
 /// regions and retained JVP specializations of [`CompositeOperation`]. A fused [`DifferentiationContext`] replays the
@@ -1955,14 +1955,14 @@ where
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Validates the reference contract that the composite operations share over one primal boundary. A reference-typed
-/// input is accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that
-/// every attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a
-/// reference, so an active reference input would have a derivative that no user-supplied rule can express). No output
-/// may be a reference, because a rule region would then have to produce that output's tangent reference or consume its
-/// cotangent reference, and a user-supplied rule can neither allocate nor receive one. The custom derivative operations
-/// apply this contract during type inference, so it holds for every constructed call, and their derivative rules apply
-/// it again to the replayed inputs as defense in depth.
+/// Validates the reference contract of [`CompositeOperation`] over one primal boundary. A reference-typed input is
+/// accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that every
+/// attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a reference, so
+/// an active reference input would have a derivative that no user-supplied rule can express). No output may be a
+/// reference, because a rule region would then have to produce that output's tangent reference or consume its
+/// cotangent reference, and a user-supplied rule can neither allocate nor receive one. The call applies this contract
+/// during type inference, so it holds for every constructed call, and its derivative rules apply it again to the
+/// replayed inputs as defense in depth.
 ///
 /// # Parameters
 ///
@@ -3913,6 +3913,24 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 5)>, %1:f64[batch] .
+                let %2:f64[batch] = composite [
+                    name=\"identity\",
+                    non_differentiated_count=1,
+                    batching=[(extent=dimension<batch ∈ [1, 5)>, input_axes=[axis 0], output_axes=[axis 0])],
+                ] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 5)>, %1:f64[batch] .
+                        in (%1)
+                    },
+                ]
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
         let ArrayIrOperation::Composite(batched_operation) = batched.instructions()[0].operation().clone() else {
             panic!("batching should stage a custom rule call");
         };
@@ -4896,6 +4914,28 @@ mod tests {
             .unwrap()
             .into_parts();
 
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[] .
+                let %2:f64[3] = composite %0 %1 [
+                    primal={
+                        lambda %0:f64[3], %1:f64[] .
+                        let %2:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                        in (%2)
+                    },
+                    jvp={
+                        lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[] .
+                        let %4:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                            %5:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %3
+                            %6:f64[3] = mul %0 %5
+                        in (%4, %6)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
         // The primal ignores its mapped input. Only the custom tangent forces the shared output boundary to be
         // mapped, so a lazy factory cannot recover this natural layout from the primal program alone.
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
@@ -5179,7 +5219,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = composite [name=\"cube\", batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])]] %0 [
+                let %1:f64[3] = composite [name=\"cube\", \
+                batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])]] %0 [
                     primal={
                         lambda %0:f64[3] .
                         let %1:f64[3] = mul %0 %0
@@ -5217,7 +5258,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = composite [name=\"cube\", batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])]] %0 [
+                let %1:f64[3] = composite [name=\"cube\", \
+                batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])]] %0 [
                     primal={
                         lambda %0:f64[3] .
                         let %1:f64[3] = mul %0 %0
@@ -5598,10 +5640,42 @@ mod tests {
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let batched = batched_program(&batched_program(&program, 3, &[BatchAxis::new(0)]), 2, &[BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:f64[2, 3] = composite [
+                    name=\"cube\",
+                    batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0]), (extent=2, input_axes=[axis \
+                0], output_axes=[axis 0])],
+                ] %0 [
+                    primal={
+                        lambda %0:f64[2, 3] .
+                        let %1:f64[2, 3] = mul %0 %0
+                            %2:f64[2, 3] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let jvp = batched.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3], %1:f64[2, 3] .
+                let %2:f64[2, 3] = mul %0 %0
+                    %3:f64[2, 3] = mul %2 %0
+                    %4:f64[2, 3] = mul %2 %1
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
         let x = Array::matrix(2, 3, vec![1f64, 2f64, 3f64, 4f64, 5f64, 6f64]).unwrap();
         let ones = Array::matrix(2, 3, vec![1f64; 6]).unwrap();
         assert_eq!(
-            batched.jvp().unwrap().interpret(vec![x, ones]),
+            jvp.interpret(vec![x, ones]),
             Ok(vec![
                 Array::matrix(2, 3, vec![1f64, 8f64, 27f64, 64f64, 125f64, 216f64]).unwrap(),
                 Array::matrix(2, 3, vec![1f64, 4f64, 9f64, 16f64, 25f64, 36f64]).unwrap(),
@@ -5631,6 +5705,23 @@ mod tests {
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
         assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = composite [name=\"cube\", batching=[(extent=3, input_axes=[axis 0], \
+                output_axes=[axis 0])]] %0 [
+                    primal={
+                        lambda %0:f64[3] .
+                        let %1:f64[3] = mul %0 %0
+                            %2:f64[3] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
             batched.interpret(vec![Array::vector(vec![1f64, 2f64, 3f64]).unwrap()]),
             Ok(vec![Array::vector(vec![1f64, 8f64, 27f64]).unwrap()]),
         );
@@ -5659,17 +5750,22 @@ mod tests {
             .unwrap();
         let regions = AttachedRegions::from(vec![primal.clone()]);
         let driver = RecursiveBatchingDriver::new(&regions);
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerArrayIrContext::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let values = Array::vector(vec![1.0f64, 2.0]).unwrap();
-        let outputs = CompositeOperation::new(definition.reference())
-            .batch(&context, &driver, &[ArrayIrBatch::new(values.clone().into(), BatchAxis::new(0)).unwrap()])
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &ArrayIrValue::Array(values));
+        for (extent, values) in [
+            (0, Array::vector(Vec::<f64>::new()).unwrap()),
+            (1, Array::vector(vec![1.0f64]).unwrap()),
+            (2, Array::vector(vec![1.0f64, 2.0]).unwrap()),
+        ] {
+            let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+                EagerArrayIrContext::new(),
+                ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap()),
+            );
+            let outputs = CompositeOperation::new(definition.reference())
+                .batch(&context, &driver, &[ArrayIrBatch::new(values.clone().into(), BatchAxis::new(0)).unwrap()])
+                .unwrap();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].value(), &ArrayIrValue::Array(values));
+        }
 
         let program = ir_custom_rule_program(&definition, 0, primal);
         let batched = |extent: DimensionType| {
@@ -5703,26 +5799,7 @@ mod tests {
         );
         let exact = DimensionVariable::new("exact", DimensionBounds::new(2, Some(3)).unwrap());
         let exact = batched(exact.into()).unwrap().into_parts().0;
-        assert_eq!(
-            exact.to_string(),
-            indoc! {"
-                lambda %0:dimension<exact ∈ [2, 3)>, %1:f64[2] .
-                let %2:f64[2] = scan [carry_count=0, iteration_count=2, reverse=false] %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[] .
-                        let %2:f64[] = composite [name=\"identity\"] %1 [
-                            primal={
-                                lambda %0:f64[] .
-                                in (%0)
-                            },
-                        ]
-                        in (%2)
-                    },
-                ]
-                in (%0, %2)
-            "}
-            .trim_end(),
-        );
+        assert_eq!(exact.to_string(), constant.to_string());
         let inputs = vec![
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
             Array::vector(vec![1.0f64, 2.0]).unwrap().into(),
@@ -5902,6 +5979,27 @@ mod tests {
             vec![scalar_type.clone(), scalar_type],
         );
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                    %3:f64[] = zero [type=f64[]]
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = sin %0
+                    %3:f64[] = sin %1
+                    %4:f64[] = cos %0
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![Array::scalar(0.7f64).unwrap(), Array::scalar(1.1f64).unwrap()])
@@ -5927,6 +6025,25 @@ mod tests {
             vec![ArrayType::scalar(DataType::F64)],
         );
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = sin %0
+                    %2:f64[] = cos %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(linearization.residual_count(), 1);
         let primals = linearization.primal().interpret(vec![Array::scalar(0.7f64).unwrap()]).unwrap();
         assert_eq!(primals, vec![Array::scalar(0.7f64.sin()).unwrap(), Array::scalar(0.7f64.cos()).unwrap()]);
@@ -6142,9 +6259,32 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = sin %0
+                    %2:f64[] = const 2.0
+                    %3:f64[] = cos %0
+                    %4:f64[] = mul %2 %3
+                in (%1, %4)
+            "}
+            .trim_end(),
+        );
         let residuals = linearization.primal().interpret(vec![Array::scalar(0.7).unwrap()]).unwrap();
         let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(pullback.to_string(), linearization.tangent().to_string());
         let retransposed = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(retransposed.to_string(), linearization.tangent().to_string());
         assert_eq!(
             retransposed.interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
             linearization.tangent().interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
@@ -6221,6 +6361,16 @@ mod tests {
         // execute like any other primitive operations of the identity rule.
         assert!(program.effects().classes().is_empty());
         let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:ref<f32[]> = reference_new %0
+                    %3:f32[] = reference_read %2
+                in (%3, %1)
+            "}
+            .trim_end(),
+        );
         assert!(jvp.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()),
@@ -6522,6 +6672,23 @@ mod tests {
         // A constant zero is a valid linear tangent map. Program linearization must preserve its output arity even
         // though it needs neither the primal input nor any tangent input to produce the result.
         let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
         let inputs = vec![Array::scalar(7.0).unwrap(); linearization.tangent().input_ids().len()];
         assert_eq!(linearization.residual_count(), 0);
         assert_eq!(linearization.tangent().interpret(inputs), Ok(vec![Array::scalar(0.0).unwrap()]));
@@ -6805,7 +6972,8 @@ mod tests {
             tangent,
             indoc! {"
                 lambda %0:f32[n], %1:f32[m], %2:dimension<n ∈ [1, 8)>, %3:dimension<m ∈ [1, 8)> .
-                let %4:f32[n], %5:f32[m] = composite_transpose [leading_input_count=2, seed_extent_count=2] %2 %3 %0 %1 [
+                let %4:f32[n], %5:f32[m] = composite_transpose [leading_input_count=2, seed_extent_count=2] \
+                %2 %3 %0 %1 [
                     backward={
                         lambda %0:f32[n], %1:f32[m] .
                         in (%0, %1)
@@ -6941,14 +7109,56 @@ mod tests {
             .entry_region_ref()
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = composite_transpose [leading_input_count=0] %0 [
+                    backward={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
         assert_eq!(linearization.residual_count(), 0);
         let custom_pullback = linearization.tangent().transpose().unwrap();
+        assert_eq!(
+            custom_pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let derivative = custom_pullback.jvp().unwrap();
+        assert_eq!(
+            derivative.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %0
+                    %3:f64[] = mul %0 %1
+                    %4:f64[] = mul %0 %1
+                    %5:f64[] = add %3 %4
+                in (%2, %5)
+            "}
+            .trim_end(),
+        );
         assert_eq!(custom_pullback.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(9.0).unwrap()]));
         assert_eq!(
-            custom_pullback
-                .jvp()
-                .unwrap()
-                .interpret(vec![Array::scalar(3.0).unwrap(), Array::scalar(1.0).unwrap()]),
+            derivative.interpret(vec![Array::scalar(3.0).unwrap(), Array::scalar(1.0).unwrap()]),
             Ok(vec![Array::scalar(9.0).unwrap(), Array::scalar(6.0).unwrap()]),
         );
 
@@ -6988,14 +7198,53 @@ mod tests {
             .entry_region_ref()
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = composite_transpose [leading_input_count=1] %1 %0 [
+                    backward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 3.0
+                            %3:f64[] = mul %2 %0
+                            %4:f64[] = mul %3 %1
+                        in (%4)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = sin %0
+                    %2:f64[] = cos %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(linearization.residual_count(), 1);
         let residuals = linearization.primal().interpret(vec![Array::scalar(0.7).unwrap()]).unwrap();
         let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = const 3.0
+                    %3:f64[] = mul %2 %1
+                    %4:f64[] = mul %3 %0
+                in (%4)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
             Ok(vec![Array::scalar(3.0 * 0.7f64.cos()).unwrap()]),
         );
         let re_transposed = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(re_transposed.to_string(), pullback.to_string());
         assert_eq!(
             re_transposed.interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
             Ok(vec![Array::scalar(3.0 * 0.7f64.cos()).unwrap()]),
@@ -7158,15 +7407,56 @@ mod tests {
             .entry_region_ref()
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
             .unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = composite_transpose [leading_input_count=0] %0 [
+                    backward={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = composite %0 [
+                    primal={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                    jvp={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:ref<f32[]> = reference_new %0
+                            %3:f32[] = reference_read %2
+                        in (%3, %1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
         let mut outputs =
             linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]).unwrap();
         let mut inputs = vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())];
         inputs.extend(outputs.split_off(1));
         assert_eq!(outputs, vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]);
-        assert_eq!(
-            linearization.pullback().unwrap().program().interpret(inputs),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
-        );
+        let expected = vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())];
+        assert_eq!(pullback.program().interpret(inputs), Ok(expected));
     }
 
     #[test]

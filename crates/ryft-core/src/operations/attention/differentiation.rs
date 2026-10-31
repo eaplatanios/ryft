@@ -145,12 +145,14 @@ where
 {
     /// Composite that stages the attention training call.
     function: Composite<
-        DomainTracer<D>,
+        D::Constant,
+        D::Operation,
         AttentionInputs<DomainTracer<D>>,
         DomainTracer<D>,
         DefaultJvp,
         SymbolicZeroVjp<
-            DomainTracer<D>,
+            D::Constant,
+            D::Operation,
             AttentionInputs<DomainTracer<D>>,
             DomainTracer<D>,
             AttentionResiduals<DomainTracer<D>>,
@@ -171,7 +173,8 @@ where
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
         CustomRuleDefinition<C::Constant, C::Operation>: CompositeVjp<
                 SymbolicZeroVjp<
-                    DomainTracer<D>,
+                    D::Constant,
+                    D::Operation,
                     AttentionInputs<DomainTracer<D>>,
                     DomainTracer<D>,
                     AttentionResiduals<DomainTracer<D>>,

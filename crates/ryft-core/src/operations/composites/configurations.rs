@@ -221,26 +221,32 @@ where
 
 /// Forward mode differentiation configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP)
 /// rule closure implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves, of which
-/// the structurally zero ones are [`MaybeZero::Zero`]s. `Tracer` is the tracer type of the closure's leaves, which the
-/// leaves of its tangents wrap. Refer to [`Composite::with_symbolic_zero_jvp`] for more information.
-pub struct SymbolicZeroJvp<Tracer: Typed + Parameter, Input, Output>
+/// the structurally zero ones are [`MaybeZero::Zero`]s. `(V, O)` is the operation family of the closure's
+/// [`CustomRuleTracer`] leaves, which the leaves of its tangents wrap. Refer to
+/// [`Composite::with_symbolic_zero_jvp`] for more information.
+pub struct SymbolicZeroJvp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
     #[allow(clippy::type_complexity)]
     pub(super) jvp: Arc<
-        dyn Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output::To<MaybeZero<Tracer>>), ProgramError>
+        dyn Fn(
+                Input,
+                Input::To<MaybeZero<CustomRuleTracer<V, O>>>,
+            ) -> Result<(Output, Output::To<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
             + Send
             + Sync,
     >,
 }
 
-impl<Tracer: Typed + Parameter, Input, Output> Debug for SymbolicZeroJvp<Tracer, Input, Output>
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output> Debug for SymbolicZeroJvp<V, O, Input, Output>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -248,8 +254,7 @@ where
     }
 }
 
-impl<V, O, Input, Output>
-    CompositeJvp<SymbolicZeroJvp<CustomRuleTracer<V, O>, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
+impl<V, O, Input, Output> CompositeJvp<SymbolicZeroJvp<V, O, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
     for CustomRuleDefinition<V, O>
 where
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -266,7 +271,7 @@ where
 {
     fn configure_jvp(
         self,
-        configuration: &SymbolicZeroJvp<CustomRuleTracer<V, O>, Input, Output>,
+        configuration: &SymbolicZeroJvp<V, O, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
@@ -294,8 +299,8 @@ where
                 let active_tangent_types = tangent_types[non_differentiated_count..]
                     .iter()
                     .zip(tangent_activity)
-                    .filter(|&(r#type, active)| *active)
-                    .map(|(r#type, active)| r#type.clone())
+                    .filter(|(_, active)| **active)
+                    .map(|(r#type, _)| r#type.clone())
                     .collect::<Vec<_>>();
                 let mut output_tangent_zeros = None;
                 let ((output_types, _), program) = DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
@@ -595,20 +600,24 @@ where
 
 /// Reverse mode differentiation configuration of a [`Composite`] with user-supplied forward and backward rule closures
 /// implementing `x ↦ (y, r)` and the Vector-Jacobian Product (VJP) `(r, ȳ) ↦ x̄`. The backward rule receives `ȳ` and
-/// returns `x̄` with [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s. `Tracer` is the
-/// tracer type of the closures' leaves, which the leaves of the seeds and cotangents wrap. Refer to
-/// [`Composite::with_symbolic_zero_vjp`] for more information.
-pub struct SymbolicZeroVjp<Tracer: Typed + Parameter, Input, Output, Residual>
+/// returns `x̄` with [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s. `(V, O)` is
+/// the operation family of the closures' [`CustomRuleTracer`] leaves, which the leaves of the seeds and cotangents
+/// wrap. Refer to [`Composite::with_symbolic_zero_vjp`] for more information.
+pub struct SymbolicZeroVjp<V: Value, O: Operation<Type = V::Type>, Input, Output, Residual>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangent_seeds)`.
     pub(super) backward: Arc<
-        dyn Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input::To<MaybeZero<Tracer>>, ProgramError>
+        dyn Fn(
+                Residual,
+                Output::To<MaybeZero<CustomRuleTracer<V, O>>>,
+            ) -> Result<Input::To<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
             + Send
             + Sync,
     >,
@@ -618,10 +627,12 @@ where
     pub(super) deferred_forward: bool,
 }
 
-impl<Tracer: Typed + Parameter, Input, Output, Residual> Debug for SymbolicZeroVjp<Tracer, Input, Output, Residual>
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output, Residual> Debug
+    for SymbolicZeroVjp<V, O, Input, Output, Residual>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("SymbolicZeroVjp");
@@ -633,12 +644,8 @@ where
 }
 
 impl<V, O, Input, Output, Residual>
-    CompositeVjp<
-        SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
-        CustomRuleTracer<V, O>,
-        Input,
-        Output,
-    > for CustomRuleDefinition<V, O>
+    CompositeVjp<SymbolicZeroVjp<V, O, Input, Output, Residual>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
@@ -660,7 +667,7 @@ where
 {
     fn configure_vjp(
         self,
-        configuration: &SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>,
+        configuration: &SymbolicZeroVjp<V, O, Input, Output, Residual>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
@@ -790,13 +797,14 @@ where
 
 /// Reverse mode differentiation configuration of a [`Composite`] with a user-supplied forward rule closure implementing
 /// `x ↦ (y, r)` and an accumulating backward rule closure, which submits the input cotangents to their accumulators.
-/// `Tracer` is the tracer type of the closures' leaves, which the leaves of the seeds wrap, and `Transposition` is the
-/// type of the transposition context that the backward rule closure receives. Refer to
+/// `(V, O)` is the operation family of the closures' [`CustomRuleTracer`] leaves, which the leaves of the seeds wrap,
+/// and the backward rule closure receives that family's [`TranspositionContext`]. Refer to
 /// [`Composite::with_accumulating_vjp`] for more information.
-pub struct AccumulatingVjp<Tracer: Typed + Parameter, Transposition, Input, Output, Residual>
+pub struct AccumulatingVjp<V: Value, O: Operation<Type = V::Type>, Input, Output, Residual>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<CotangentAccumulator>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
@@ -806,9 +814,9 @@ where
     #[allow(clippy::type_complexity)]
     pub(super) backward: Arc<
         dyn Fn(
-                &mut Transposition,
+                &mut TranspositionContext<V, O>,
                 Residual,
-                Output::To<MaybeZero<Tracer>>,
+                Output::To<MaybeZero<CustomRuleTracer<V, O>>>,
                 Input::To<CotangentAccumulator>,
             ) -> Result<(), ProgramError>
             + Send
@@ -820,11 +828,12 @@ where
     pub(super) deferred_forward: bool,
 }
 
-impl<Tracer: Typed + Parameter, Transposition, Input, Output, Residual> Debug
-    for AccumulatingVjp<Tracer, Transposition, Input, Output, Residual>
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output, Residual> Debug
+    for AccumulatingVjp<V, O, Input, Output, Residual>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<CotangentAccumulator>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("AccumulatingVjp");
@@ -836,12 +845,8 @@ where
 }
 
 impl<V, O, Input, Output, Residual>
-    CompositeVjp<
-        AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>,
-        CustomRuleTracer<V, O>,
-        Input,
-        Output,
-    > for CustomRuleDefinition<V, O>
+    CompositeVjp<AccumulatingVjp<V, O, Input, Output, Residual>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
@@ -862,7 +867,7 @@ where
 {
     fn configure_vjp(
         self,
-        configuration: &AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>,
+        configuration: &AccumulatingVjp<V, O, Input, Output, Residual>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
@@ -967,13 +972,14 @@ where
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
 /// `(x, x_axes, extent) ↦ (y, y_axes)` whose per-item numerical behavior is preserved when a replicated input is
-/// broadcast. `Tracer` is the tracer type of the closure's leaves, which is also the type of dynamic extents. Refer
-/// to [`Composite::with_batching`] for more information. Rules whose numerical behavior may change when a replicated
-/// input is broadcast use [`BroadcastSensitiveBatching`] instead.
-pub struct BroadcastInvariantBatching<Tracer: Parameter, Input, Output>
+/// broadcast. `(V, O)` is the operation family of the closure's [`CustomRuleTracer`] leaves, which are also the type
+/// of dynamic extents. Refer to [`Composite::with_batching`] for more information. Rules whose numerical behavior may
+/// change when a replicated input is broadcast use [`BroadcastSensitiveBatching`] instead.
+pub struct BroadcastInvariantBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
     #[allow(clippy::type_complexity)]
@@ -981,17 +987,18 @@ where
         dyn Fn(
                 Input,
                 Input::To<BatchAxis>,
-                BatchingLevelExtent<Tracer>,
+                BatchingLevelExtent<CustomRuleTracer<V, O>>,
             ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
             + Send
             + Sync,
     >,
 }
 
-impl<Tracer: Parameter, Input, Output> Debug for BroadcastInvariantBatching<Tracer, Input, Output>
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output> Debug for BroadcastInvariantBatching<V, O, Input, Output>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1000,12 +1007,8 @@ where
 }
 
 impl<V, O, Input, Output>
-    CompositeBatching<
-        BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
-        CustomRuleTracer<V, O>,
-        Input,
-        Output,
-    > for CustomRuleDefinition<V, O>
+    CompositeBatching<BroadcastInvariantBatching<V, O, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
     O: 'static
@@ -1023,7 +1026,7 @@ where
     #[inline]
     fn configure_batching(
         self,
-        configuration: &BroadcastInvariantBatching<CustomRuleTracer<V, O>, Input, Output>,
+        configuration: &BroadcastInvariantBatching<V, O, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
     ) -> Self {
@@ -1039,12 +1042,13 @@ where
 
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
 /// `(x, x_axes, extent) ↦ (y, y_axes)` whose per-item numerical behavior may change when a replicated input is
-/// broadcast. `Tracer` is the tracer type of the closure's leaves, which is also the type of dynamic extents.
-/// Refer to [`Composite::with_broadcast_sensitive_batching`] for more information.
-pub struct BroadcastSensitiveBatching<Tracer: Parameter, Input, Output>
+/// broadcast. `(V, O)` is the operation family of the closure's [`CustomRuleTracer`] leaves, which are also the
+/// type of dynamic extents. Refer to [`Composite::with_broadcast_sensitive_batching`] for more information.
+pub struct BroadcastSensitiveBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
     #[allow(clippy::type_complexity)]
@@ -1052,17 +1056,18 @@ where
         dyn Fn(
                 Input,
                 Input::To<BatchAxis>,
-                BatchingLevelExtent<Tracer>,
+                BatchingLevelExtent<CustomRuleTracer<V, O>>,
             ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
             + Send
             + Sync,
     >,
 }
 
-impl<Tracer: Parameter, Input, Output> Debug for BroadcastSensitiveBatching<Tracer, Input, Output>
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output> Debug for BroadcastSensitiveBatching<V, O, Input, Output>
 where
-    Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
-    Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+    Input: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1071,12 +1076,8 @@ where
 }
 
 impl<V, O, Input, Output>
-    CompositeBatching<
-        BroadcastSensitiveBatching<CustomRuleTracer<V, O>, Input, Output>,
-        CustomRuleTracer<V, O>,
-        Input,
-        Output,
-    > for CustomRuleDefinition<V, O>
+    CompositeBatching<BroadcastSensitiveBatching<V, O, Input, Output>, CustomRuleTracer<V, O>, Input, Output>
+    for CustomRuleDefinition<V, O>
 where
     V: 'static
         + Value<
@@ -1098,7 +1099,7 @@ where
     #[inline]
     fn configure_batching(
         self,
-        configuration: &BroadcastSensitiveBatching<CustomRuleTracer<V, O>, Input, Output>,
+        configuration: &BroadcastSensitiveBatching<V, O, Input, Output>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
     ) -> Self {
@@ -1615,7 +1616,12 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_configure_jvp_symbolic_zeros() {
-        let configuration = SymbolicZeroJvp::<ArrayTracer, (ArrayTracer, ArrayTracer, ArrayTracer), Vec<ArrayTracer>> {
+        let configuration = SymbolicZeroJvp::<
+            Array,
+            ArrayOperation<Array>,
+            (ArrayTracer, ArrayTracer, ArrayTracer),
+            Vec<ArrayTracer>,
+        > {
             jvp: Arc::new(|(_, active, inactive), (parameter_tangent, active_tangent, inactive_tangent)| {
                 // Parameters and inactive inputs have no live tangent slot in the retained signature.
                 assert!(
@@ -1671,7 +1677,7 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_configure_jvp_symbolic_zero_output_structure_mismatch() {
-        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+        let configuration = SymbolicZeroJvp::<Array, ArrayOperation<Array>, ArrayTracer, Vec<ArrayTracer>> {
             jvp: Arc::new(|input, tangent| Ok((vec![input.clone(), input], vec![tangent]))),
         };
         let registration = CustomRuleRegistration::new(ArrayDefinition::new("output").configure_jvp(
@@ -1694,7 +1700,7 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_configure_jvp_symbolic_zero_tangent_structure_mismatch() {
-        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
+        let configuration = SymbolicZeroJvp::<Array, ArrayOperation<Array>, ArrayTracer, Vec<ArrayTracer>> {
             jvp: Arc::new(|input, tangent| Ok((vec![input], vec![tangent.clone(), tangent]))),
         };
         let registration = CustomRuleRegistration::new(ArrayDefinition::new("tangent").configure_jvp(
@@ -1717,7 +1723,7 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_configure_jvp_symbolic_zero_tangent_type_mismatch() {
-        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, ArrayTracer> {
+        let configuration = SymbolicZeroJvp::<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
             jvp: Arc::new(|input, _| Ok((input, MaybeZero::Zero(ArrayType::scalar(DataType::F32))))),
         };
         let registration = CustomRuleRegistration::new(ArrayDefinition::new(COMPOSITE_OPERATION_NAME).configure_jvp(
@@ -1738,7 +1744,7 @@ mod tests {
 
     #[test]
     fn test_symbolic_zero_jvp_debug() {
-        let configuration = SymbolicZeroJvp::<ArrayTracer, ArrayTracer, ArrayTracer> {
+        let configuration = SymbolicZeroJvp::<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
             jvp: Arc::new(|input, tangent| Ok((input, tangent))),
         };
         assert_eq!(format!("{configuration:?}"), "SymbolicZeroJvp { .. }");
@@ -1879,7 +1885,8 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_configure_vjp_symbolic_zero_cotangent_structure_mismatch() {
-        let configuration = SymbolicZeroVjp::<ArrayTracer, Vec<ArrayTracer>, ArrayTracer, ArrayTracer> {
+        type Configuration = SymbolicZeroVjp<Array, ArrayOperation<Array>, Vec<ArrayTracer>, ArrayTracer, ArrayTracer>;
+        let configuration = Configuration {
             forward: Arc::new(|inputs| Ok((inputs[1].clone(), inputs[0].clone()))),
             backward: Arc::new(|_, seed| Ok(vec![seed])),
             deferred_forward: false,
@@ -1925,7 +1932,7 @@ mod tests {
 
     #[test]
     fn test_symbolic_zero_vjp_debug() {
-        let mut configuration = SymbolicZeroVjp::<ArrayTracer, ArrayTracer, ArrayTracer, ArrayTracer> {
+        let mut configuration = SymbolicZeroVjp::<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer, ArrayTracer> {
             forward: Arc::new(|input| Ok((input.clone(), input))),
             backward: Arc::new(|_, seed| Ok(seed)),
             deferred_forward: false,
@@ -1937,13 +1944,7 @@ mod tests {
 
     #[test]
     fn test_accumulating_vjp_debug() {
-        let mut configuration = AccumulatingVjp::<
-            ArrayTracer,
-            TranspositionContext<Array, ArrayOperation<Array>>,
-            ArrayTracer,
-            ArrayTracer,
-            ArrayTracer,
-        > {
+        let mut configuration = AccumulatingVjp::<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer, ArrayTracer> {
             forward: Arc::new(|input| Ok((input.clone(), input))),
             backward: Arc::new(|_, _, _, _| Ok(())),
             deferred_forward: false,
@@ -1956,7 +1957,7 @@ mod tests {
     #[test]
     fn test_custom_rule_definition_configure_batching() {
         let registration = {
-            let configuration = BroadcastInvariantBatching::<ArrayTracer, ArrayTracer, ArrayTracer> {
+            let configuration = BroadcastInvariantBatching::<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
                 rule: Arc::new(|input, axis, extent| {
                     assert!(matches!(extent, BatchingLevelExtent::Static(2)));
                     Ok((input.clone() + input, axis))
@@ -1988,9 +1989,10 @@ mod tests {
     #[test]
     fn test_custom_rule_definition_configure_batching_output_structure_mismatch() {
         let registration = {
-            let configuration = BroadcastInvariantBatching::<ArrayTracer, ArrayTracer, Vec<ArrayTracer>> {
-                rule: Arc::new(|input, axis, _| Ok((vec![input.clone(), input], vec![axis, axis]))),
-            };
+            let configuration =
+                BroadcastInvariantBatching::<Array, ArrayOperation<Array>, ArrayTracer, Vec<ArrayTracer>> {
+                    rule: Arc::new(|input, axis, _| Ok((vec![input.clone(), input], vec![axis, axis]))),
+                };
             CustomRuleRegistration::new(ArrayDefinition::new(String::from("batching_definition")).configure_batching(
                 &configuration,
                 &Placeholder,
@@ -2027,7 +2029,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_sensitive_batching_debug() {
-        let configuration = BroadcastSensitiveBatching::<ArrayTracer, ArrayTracer, ArrayTracer> {
+        let configuration = BroadcastSensitiveBatching::<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
             rule: Arc::new(|input, axis, _| Ok((input, axis))),
         };
         assert_eq!(format!("{configuration:?}"), "BroadcastSensitiveBatching { .. }");

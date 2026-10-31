@@ -4375,15 +4375,16 @@ pub(crate) mod tests {
     type TestOperation = ArrayIrOperation<Array>;
 
     /// Tracer over which the rules of the composite fixtures are written.
-    type CompositeTracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+    type ArrayTracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 
     /// Composite with an explicit JVP rule and reverse mode rules that save residuals of type `Residual`.
     type CompositeWithRules<Input, Residual> = Composite<
-        CompositeTracer,
+        Array,
+        ArrayOperation<Array>,
         Input,
-        CompositeTracer,
-        ExplicitJvp<Input, CompositeTracer>,
-        ExplicitVjp<Input, CompositeTracer, Residual>,
+        ArrayTracer,
+        ExplicitJvp<Input, ArrayTracer>,
+        ExplicitVjp<Input, ArrayTracer, Residual>,
     >;
 
     /// Returns the composite computing `x³` with independent JVP and reverse mode rules. Its JVP rule computes and
@@ -4392,18 +4393,18 @@ pub(crate) mod tests {
     /// allowing tests to detect accidental use of the JVP rule by
     /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) through reusable differentiation,
     /// nested control flow, batching, and higher-order differentiation.
-    fn custom_cube() -> CompositeWithRules<CompositeTracer, CompositeTracer> {
-        composite(|x: CompositeTracer| Ok(x.clone() * x.clone() * x))
+    fn custom_cube() -> CompositeWithRules<ArrayTracer, ArrayTracer> {
+        composite(|x: ArrayTracer| Ok(x.clone() * x.clone() * x))
             .with_name("cube")
-            .with_jvp(|x: CompositeTracer, tangent: CompositeTracer| {
+            .with_jvp(|x: ArrayTracer, tangent: ArrayTracer| {
                 let squared = x.clone() * x.clone();
                 let output = squared.clone() * x;
                 let coefficient = squared.clone() + squared.clone() + squared;
                 Ok((output, coefficient * tangent))
             })
             .with_vjp(
-                |x: CompositeTracer| Ok((x.clone() * x.clone() * x.clone(), x)),
-                |x: CompositeTracer, cotangent: CompositeTracer| {
+                |x: ArrayTracer| Ok((x.clone() * x.clone() * x.clone(), x)),
+                |x: ArrayTracer, cotangent: ArrayTracer| {
                     let squared = x.clone() * x;
                     Ok((squared.clone() + squared.clone() + squared) * cotangent)
                 },
@@ -4412,10 +4413,10 @@ pub(crate) mod tests {
 
     /// Traces one call of `cube` (i.e., of [`custom_cube`]) over a scalar `f64` input.
     fn custom_cube_program(
-        cube: &CompositeWithRules<CompositeTracer, CompositeTracer>,
+        cube: &CompositeWithRules<ArrayTracer, ArrayTracer>,
     ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<CompositeTracer>| Ok(vec![cube.call(inputs[0].clone())?]),
+            |inputs: Vec<ArrayTracer>| Ok(vec![cube.call(inputs[0].clone())?]),
             vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap()
@@ -4426,13 +4427,11 @@ pub(crate) mod tests {
     /// reverse mode rules. Its JVP rule saves the coefficients `x³` and `3w ⊙ x²`, while its reverse mode rules save
     /// both inputs and compute both coefficients in a backward rule with two cotangent outputs. It extends
     /// [`custom_cube`] to multiple residuals, multiple differentiated inputs, and non-scalar values.
-    fn custom_weighted_cube()
-    -> CompositeWithRules<(CompositeTracer, CompositeTracer), (CompositeTracer, CompositeTracer)> {
-        composite(|(weight, x): (CompositeTracer, CompositeTracer)| Ok(weight * (x.clone() * x.clone() * x)))
+    fn custom_weighted_cube() -> CompositeWithRules<(ArrayTracer, ArrayTracer), (ArrayTracer, ArrayTracer)> {
+        composite(|(weight, x): (ArrayTracer, ArrayTracer)| Ok(weight * (x.clone() * x.clone() * x)))
             .with_name("weighted_cube")
             .with_jvp(
-                |(weight, x): (CompositeTracer, CompositeTracer),
-                 (weight_tangent, tangent): (CompositeTracer, CompositeTracer)| {
+                |(weight, x): (ArrayTracer, ArrayTracer), (weight_tangent, tangent): (ArrayTracer, ArrayTracer)| {
                     let squared = x.clone() * x.clone();
                     let cube = squared.clone() * x;
                     let output = weight.clone() * cube.clone();
@@ -4442,11 +4441,11 @@ pub(crate) mod tests {
                 },
             )
             .with_vjp(
-                |(weight, x): (CompositeTracer, CompositeTracer)| {
+                |(weight, x): (ArrayTracer, ArrayTracer)| {
                     Ok((weight.clone() * (x.clone() * x.clone() * x.clone()), (weight, x)))
                 },
                 // The backward rule recomputes both coefficients from the saved inputs: `(w, x, ȳ) ↦ (x³ ȳ, 3w x² ȳ)`.
-                |(weight, x): (CompositeTracer, CompositeTracer), cotangent: CompositeTracer| {
+                |(weight, x): (ArrayTracer, ArrayTracer), cotangent: ArrayTracer| {
                     let squared = x.clone() * x.clone();
                     let cube = squared.clone() * x;
                     let weighted = weight * squared;
@@ -5796,7 +5795,7 @@ pub(crate) mod tests {
         // two inputs and defers the coefficients to its backward program.
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<CompositeTracer>| Ok(vec![weighted_cube.call((inputs[0].clone(), inputs[1].clone()))?]),
+            |inputs: Vec<ArrayTracer>| Ok(vec![weighted_cube.call((inputs[0].clone(), inputs[1].clone()))?]),
             vec![vector_type; 2],
         )
         .unwrap();
@@ -5839,18 +5838,15 @@ pub(crate) mod tests {
         // The pullback of `nested` is its backward rule `ȳ ↦ marker(ȳ)`, where `marker` is an identity whose JVP rule
         // doubles tangents and whose reverse mode rules triple cotangents. A transform applied to the pullback starts a
         // fresh transform that selects the nested call's rule by its own kind.
-        let marker = composite(|seed: CompositeTracer| Ok(seed))
-            .with_jvp(|seed: CompositeTracer, tangent: CompositeTracer| Ok((seed, tangent.clone() + tangent)))
+        let marker = composite(|seed: ArrayTracer| Ok(seed))
+            .with_jvp(|seed: ArrayTracer, tangent: ArrayTracer| Ok((seed, tangent.clone() + tangent)))
             .with_vjp(
-                |seed: CompositeTracer| Ok((seed, ())),
-                |(), cotangent: CompositeTracer| Ok(cotangent.clone() + cotangent.clone() + cotangent),
+                |seed: ArrayTracer| Ok((seed, ())),
+                |(), cotangent: ArrayTracer| Ok(cotangent.clone() + cotangent.clone() + cotangent),
             );
-        let nested = composite(|input: CompositeTracer| Ok(input))
-            .with_jvp(|input: CompositeTracer, tangent: CompositeTracer| Ok((input, tangent)))
-            .with_vjp(
-                |input: CompositeTracer| Ok((input, ())),
-                move |(), cotangent: CompositeTracer| marker.call(cotangent),
-            );
+        let nested = composite(|input: ArrayTracer| Ok(input))
+            .with_jvp(|input: ArrayTracer, tangent: ArrayTracer| Ok((input, tangent)))
+            .with_vjp(|input: ArrayTracer| Ok((input, ())), move |(), cotangent: ArrayTracer| marker.call(cotangent));
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         // Forward mode over the pullback selects the nested JVP rule.

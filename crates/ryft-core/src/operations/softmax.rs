@@ -415,7 +415,7 @@ where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     /// Retained composite whose leading target input is non-differentiated plumbing.
-    composite: JvpComposite<DomainTracer<D>, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
+    composite: JvpComposite<D::Constant, D::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
 }
 
 impl<D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>> SoftmaxCrossEntropyWithTargetLogits<D>
