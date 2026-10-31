@@ -1,22 +1,21 @@
 //! Retained custom rule sets, whose derivative rules are callbacks rather than programs. A [`CustomRuleDefinition`]
-//! holds a human-readable name, an optional forward mode (JVP) rule, optional reverse mode (VJP) forward and backward
-//! rules, and optional batching support. A [`CompositeOperation`](crate::CompositeOperation) with retained
-//! rules calls a definition over a traced primal program: ordinary execution uses only the primal, forward mode traces
-//! and replays the JVP rule, and reverse mode traces the VJP forward rule and stages a [`CompositeTransposeOperation`]
-//! whose transposition specializes the backward rule against the actual cotangent destinations. Every rule is traced
-//! lazily, on the first request of each static specialization, and cached by the definition's
-//! [`CustomRuleRegistration`]. Batching a call or carrier likewise traces no derivative rule: it records the batching
-//! level, and a later derivative request structurally batches the rule program traced at the unbatched types. Only a
-//! custom batching rule (refer to [`CustomRuleDefinition::with_batching_rule`]) is traced when a call is batched,
-//! because its program becomes the batched call's primal region (refer to the Batching sections of
-//! [`CompositeOperation`](crate::CompositeOperation) and [`CompositeTransposeOperation`]).
+//! holds a human-readable name, an optional forward mode differentiation (i.e., Jacobian-Vector Product) rule, optional
+//! reverse mode differentiation (i.e., Vector-Jacobian Product) forward and backward rules, and optional batching
+//! support. A [`CompositeOperation`](crate::CompositeOperation) with retained rules calls a definition over a traced
+//! primal program: ordinary execution uses only the primal, forward mode traces and replays the Jacobian-Vector Product
+//! (JVP) rule, and reverse mode traces the Vector-Jacobian Product (VJP) forward rule and stages a
+//! [`CompositeTransposeOperation`] whose transposition specializes the backward rule against the actual cotangent
+//! destinations. Every rule is traced lazily, on the first request of each static specialization, and cached by the
+//! definition's [`CustomRuleRegistration`]. Batching a call or carrier likewise traces no derivative rule: it records
+//! the batching level, and a later derivative request structurally batches the rule program traced at the unbatched
+//! types. Only a custom batching rule (set via [`CustomRuleDefinition::with_batching_rule`]) is traced when a call is
+//! batched, because its program becomes the batched call's primal region. Refer to the documentation of
+//! [`CompositeOperation`](crate::CompositeOperation) and [`CompositeTransposeOperation`] for more information.
 //!
-//! This module is the flat, family-level representation behind the public [`composite`](fn@crate::composite) builder,
-//! which adapts structured closures to the flat rule interfaces of this module. Rules may receive materialized zeros
-//! (e.g., [`CustomRuleDefinition::with_jvp`]) or structural zeros (e.g.,
-//! [`CustomRuleDefinition::with_symbolic_zero_jvp`]).
-
-// TODO(eaplatanios): Review this module.
+//! This module contains flat, family-level representations that are hidden behind the public
+//! [`composite`](fn@crate::composite) builder. That builder adapts structured closures to the flat rule interfaces
+//! of this module. Also, rules may receive materialized zeros (e.g., [`CustomRuleDefinition::with_jvp`]) or structural
+//! zeros (e.g., [`CustomRuleDefinition::with_symbolic_zero_jvp`]).
 
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
@@ -32,9 +31,11 @@ use crate::tracing::{Tracer, TracingContext};
 #[cfg(doc)]
 use crate::operations::composites::operations::CompositeTransposeOperation;
 
-mod definition;
-mod registration;
-mod specialization;
+pub mod definition;
+pub mod registration;
+pub mod specialization;
+
+// TODO(eaplatanios): Review from here onwards.
 
 pub(in crate::operations::composites) use definition::CustomVjpBackward;
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
