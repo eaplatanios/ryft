@@ -423,8 +423,35 @@ pub(super) enum CustomRuleJvpRule<'r, V, O> {
     SymbolicZeros(&'r Arc<dyn CustomSymbolicZeroJvpRule<V, O>>),
 }
 
+/// Reverse mode differentiation rules of a [`CustomRuleDefinition`].
+pub(super) struct CustomRuleVjp<V: Typed + Parameter, O> {
+    /// Retained forward rule `(p, x) ↦ (y, r)`.
+    pub(super) forward: Arc<dyn CustomVjpForwardRule<V, O>>,
+
+    /// Retained backward rule.
+    pub(super) backward: CustomRuleVjpBackward<V, O>,
+
+    /// Transposition of a backward-rule specialization source program with respect to the provided inputs and
+    /// destination kinds, returning the transposed program and the representation of each selected input's cotangent
+    /// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule
+    /// declares to be structural zeros stay structural zeros instead of being materialized. The reverse mode rule
+    /// builders capture it where the operation family's transposition bounds are known, because requiring them on the
+    /// carrier's own transposition rule would form a cycle with the family's payload bounds.
+    #[allow(clippy::type_complexity)]
+    pub(super) transposer: Arc<
+        dyn Fn(
+                &Program<V, O, Vec<V>, Vec<V>>,
+                &[usize],
+                &[CotangentDestinationKind],
+            )
+                -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
+            + Send
+            + Sync,
+    >,
+}
+
 /// Retained custom Vector-Jacobian Product (VJP) backward rule of a [`CustomRuleDefinition`].
-pub(super) enum CustomVjpBackward<V, O> {
+pub(super) enum CustomRuleVjpBackward<V, O> {
     /// Pure backward differentiation rule that receives materialized seeds.
     Pure(Arc<dyn CustomVjpBackwardRule<V, O>>),
 
@@ -433,6 +460,46 @@ pub(super) enum CustomVjpBackward<V, O> {
 
     /// Accumulating backward differentiation rule.
     Accumulating(Arc<dyn CustomVjpAccumulatingBackwardRule<V, O>>),
+}
+
+/// Batching rule of a [`CustomRuleBatching`].
+pub(super) enum CustomRuleBatchingRule<V: Typed + Parameter, O> {
+    /// Retained custom batching rule.
+    Custom(Arc<dyn CustomBatchingRule<V, O>>),
+
+    /// Derivation of the definition from a source definition, whose batching rule the definition's calls apply in
+    /// derived form.
+    Derived(CustomRuleDerivation<V, O>),
+}
+
+/// Custom batching rule of a [`CustomRuleDefinition`], together with what the batching rules of the definitions
+/// derived from it need.
+pub(super) struct CustomRuleBatching<V: Typed + Parameter, O> {
+    /// Rule that batches calls instead of structurally batching their primal regions.
+    pub(super) rule: CustomRuleBatchingRule<V, O>,
+
+    /// Forward mode differentiation of a traced rule program with respect to the provided inputs, returning its fused
+    /// Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). The batching rules of derived
+    /// definitions (refer to [`CustomRuleDerivation`]) differentiate the batched programs of their source's batching
+    /// rule with it. [`CustomRuleDefinition::with_batching_rule`] captures it where the operation family's
+    /// differentiation bounds are known, because requiring them on the operations' own rules would form a cycle with
+    /// the family's payload bounds.
+    #[allow(clippy::type_complexity)]
+    pub(super) differentiator: Arc<
+        dyn Fn(
+                // Program to differentiate.
+                &Program<V, O, Vec<V>, Vec<V>>,
+                // Indices of the inputs with respect to which the program is differentiated.
+                &[usize],
+            ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+            + Send
+            + Sync,
+    >,
+
+    /// Operations with which the batching rules of the definitions derived from this definition recover exact per-item
+    /// tangents, present when [`Self::rule`] depends on its input batch axes (refer to
+    /// [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]).
+    pub(super) broadcast_sensitivity: Option<Arc<dyn CustomRuleBroadcastSensitivity<V, O>>>,
 }
 
 /// Operation family `Self` over values `V` whose programs the reverse mode rules of a [`CustomRuleDefinition`] (refer
@@ -486,8 +553,6 @@ where
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on the first
 /// request of each specialization. A definition is registered once (refer to [`CustomRuleRegistration`]) and shared by
 /// every call that uses it, and two definitions are the same rule set exactly when they are the same definition (i.e.,
@@ -521,34 +586,11 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Optional forward mode differentiation rule.
     pub(super) jvp: Option<CustomRuleJvp<V, O>>,
 
-    /// Optional retained reverse mode differentiation forward rule, present exactly when [`Self::backward`] is present.
-    pub(super) forward: Option<Arc<dyn CustomVjpForwardRule<V, O>>>,
+    /// Optional reverse mode differentiation rules.
+    pub(super) vjp: Option<CustomRuleVjp<V, O>>,
 
-    /// Optional retained reverse mode differentiation backward rule, present exactly when [`Self::forward`] is present.
-    pub(super) backward: Option<CustomVjpBackward<V, O>>,
-
-    /// Transposition of a backward-rule specialization source program with respect to the provided inputs and
-    /// destination kinds, returning the transposed program and the representation of each selected input's cotangent
-    /// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule
-    /// declares to be structural zeros stay structural zeros instead of being materialized. Present exactly when
-    /// [`Self::backward`] is present. [`Self::with_vjp`] captures it where the operation family's transposition bounds
-    /// are known, because requiring them on the carrier's own transposition rule would form a cycle with the family's
-    /// payload bounds.
-    #[allow(clippy::type_complexity)]
-    pub(super) transposer: Option<
-        Arc<
-            dyn Fn(
-                    &Program<V, O, Vec<V>, Vec<V>>,
-                    &[usize],
-                    &[CotangentDestinationKind],
-                )
-                    -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
-                + Send
-                + Sync,
-        >,
-    >,
-
-    /// Whether reverse mode differentiation defers the forward rule to the backward pass.
+    /// Whether reverse mode differentiation defers the forward rule of [`Self::vjp`] to the backward pass,
+    /// which has no effect without reverse mode rules.
     pub(super) deferred_forward: bool,
 
     /// Optional structural batching of a traced rule program at one recorded level with the provided input batch
@@ -558,7 +600,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// differentiated. [`Self::with_batching_support`] captures it where the operation family's batching bounds are
     /// known, because requiring them on the operations' own rules would form a cycle with the family's payload bounds.
     #[allow(clippy::type_complexity)]
-    pub(super) batcher: Option<
+    pub(super) structural_batcher: Option<
         Arc<
             dyn Fn(
                     &Program<V, O, Vec<V>, Vec<V>>,
@@ -590,36 +632,8 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Optional batch axes of the outputs of batched calls, which default to mapping every output at axis 0.
     pub(super) batched_output_axes: Option<Vec<BatchAxis>>,
 
-    /// Optional custom batching rule, which batches calls instead of structurally batching their primal regions.
-    pub(super) batching_rule: Option<Arc<dyn CustomBatchingRule<V, O>>>,
-
-    /// Forward mode differentiation of a traced rule program with respect to the provided inputs, returning
-    /// its fused Jacobian-Vector Product (JVP) program (refer to [`Program::jvp_with_respect_to`]). Present when
-    /// [`Self::batching_rule`] is present. Batching rules of derived definitions (refer to [`CustomRuleDerivation`])
-    /// differentiate the batched programs of their source's custom batching rule with it. [`Self::with_batching_rule`]
-    /// captures it where the operation family's differentiation bounds are known, because requiring them on the
-    /// operations' own rules would form a cycle with the family's payload bounds.
-    #[allow(clippy::type_complexity)]
-    pub(super) differentiator: Option<
-        Arc<
-            dyn Fn(
-                    // Program to differentiate.
-                    &Program<V, O, Vec<V>, Vec<V>>,
-                    // Indices of the inputs with respect to which the program is differentiated.
-                    &[usize],
-                ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
-                + Send
-                + Sync,
-        >,
-    >,
-
-    /// Operations with which the batching rules of the definitions derived from this definition recover exact per-item
-    /// tangents, present when [`Self::batching_rule`] depends on its input batch axes.
-    pub(super) broadcast_sensitivity: Option<Arc<dyn CustomRuleBroadcastSensitivity<V, O>>>,
-
-    /// Derivation of this definition from a source definition, whose batching rule this definition's calls apply
-    /// instead of [`Self::batching_rule`].
-    pub(super) derivation: Option<CustomRuleDerivation<V, O>>,
+    /// Optional custom batching rule, which is a derivation for the definitions derived from a definition that has one.
+    pub(super) batching_rule: Option<CustomRuleBatching<V, O>>,
 
     /// Optional reference discharge of a traced rule program whose call was discharged, replacing its local reference
     /// state with explicitly threaded values. Without it, discharged calls can be differentiated only when their rule
@@ -634,13 +648,15 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Specializations that each thread is producing without a cache (i.e., after the registration handle was
     /// dropped), which reject recursive production exactly as a [`SpecializationCache`] does. The markers contain
     /// static keys only, so they never retain a program.
-    pub(super) uncached_in_flight: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
+    pub(super) uncached_specializations: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
 
     /// Definitions derived from this definition (refer to [`CustomRuleSpecializer::derived`]), held weakly so that a
     /// derived definition that some call still holds keeps its identity whether or not its registration is alive,
     /// while a derived definition, which holds this definition strongly, never forms a cycle with it.
     pub(super) derived_definitions: Mutex<HashMap<CustomRuleDerivedDefinitionKey, Weak<CustomRuleDefinition<V, O>>>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Creates a new [`CustomRuleDefinition`] with the provided label and no derivative rules.
@@ -650,19 +666,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             name: name.into(),
             named_axes: Vec::new(),
             jvp: None,
-            forward: None,
-            backward: None,
-            transposer: None,
+            vjp: None,
             deferred_forward: false,
-            batcher: None,
+            structural_batcher: None,
             sequential_batching_scan: None,
             batched_output_axes: None,
             batching_rule: None,
-            differentiator: None,
-            broadcast_sensitivity: None,
-            derivation: None,
             discharger: None,
-            uncached_in_flight: Mutex::new(HashSet::new()),
+            uncached_specializations: Mutex::new(HashSet::new()),
             derived_definitions: Mutex::new(HashMap::new()),
         }
     }
@@ -785,9 +796,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        self.forward = Some(Arc::new(forward));
-        self.backward = Some(CustomVjpBackward::Pure(Arc::new(backward)));
-        self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
+        self.vjp = Some(CustomRuleVjp {
+            forward: Arc::new(forward),
+            backward: CustomRuleVjpBackward::Pure(Arc::new(backward)),
+            transposer: Arc::new(transpose_backward_source_program::<V, O>),
+        });
         self
     }
 
@@ -846,9 +859,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        self.forward = Some(Arc::new(forward));
-        self.backward = Some(CustomVjpBackward::PureWithSymbolicZeros(Arc::new(backward)));
-        self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
+        self.vjp = Some(CustomRuleVjp {
+            forward: Arc::new(forward),
+            backward: CustomRuleVjpBackward::PureWithSymbolicZeros(Arc::new(backward)),
+            transposer: Arc::new(transpose_backward_source_program::<V, O>),
+        });
         self
     }
 
@@ -881,9 +896,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        self.forward = Some(Arc::new(forward));
-        self.backward = Some(CustomVjpBackward::Accumulating(Arc::new(backward)));
-        self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
+        self.vjp = Some(CustomRuleVjp {
+            forward: Arc::new(forward),
+            backward: CustomRuleVjpBackward::Accumulating(Arc::new(backward)),
+            transposer: Arc::new(transpose_backward_source_program::<V, O>),
+        });
         self
     }
 
@@ -927,7 +944,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         O: Operation<Type = V::Type>,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        self.batcher = Some(Arc::new(|program, input_axes, output_axes, level, outputs| {
+        self.structural_batcher = Some(Arc::new(|program, input_axes, output_axes, level, outputs| {
             type Policy<T> = <T as BatchableType>::Policy;
 
             // Align every required output first (a replicated alignment request keeps the natural axis), then adapt
@@ -1016,8 +1033,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Sync,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        self.batching_rule = Some(Arc::new(rule));
-        self.differentiator = Some(Arc::new(|program, input_indices| program.jvp_with_respect_to(input_indices)));
+        self.batching_rule = Some(CustomRuleBatching {
+            rule: CustomRuleBatchingRule::Custom(Arc::new(rule)),
+            differentiator: Arc::new(|program, input_indices| program.jvp_with_respect_to(input_indices)),
+            broadcast_sensitivity: None,
+        });
         self
     }
 
@@ -1055,7 +1075,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         let mut definition = self.with_batching_rule(rule);
-        definition.broadcast_sensitivity = Some(Arc::new(PolicyBroadcastSensitivity(PhantomData)));
+        if let Some(batching_rule) = &mut definition.batching_rule {
+            batching_rule.broadcast_sensitivity = Some(Arc::new(PolicyBroadcastSensitivity(PhantomData)));
+        }
         definition
     }
 
@@ -1122,7 +1144,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns `true` if this [`CustomRuleDefinition`] has a forward mode rule or reverse mode rules.
     #[inline]
     pub(in crate::operations::composites) fn has_derivative_rules(&self) -> bool {
-        self.jvp.is_some() || self.forward.is_some()
+        self.jvp.is_some() || self.vjp.is_some()
     }
 
     /// Returns `program` discharged when `discharged` is set (refer to [`Self::with_reference_discharge`]). A program
@@ -1192,7 +1214,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
         let marker = (std::thread::current().id(), request);
         if !self
-            .uncached_in_flight
+            .uncached_specializations
             .lock()
             .expect("custom rule in-flight mutex is poisoned")
             .insert(marker.clone())
@@ -1202,7 +1224,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
             ));
         }
-        let _marker = InFlightMarker { in_flight: &self.uncached_in_flight, marker };
+        let _marker = InFlightMarker { in_flight: &self.uncached_specializations, marker };
         produce_fn()
     }
 }
@@ -1251,16 +1273,18 @@ where
         accumulators: &[CotangentAccumulator],
         input_tangent_types: &[V::Type],
     ) -> Result<(), DifferentiationError> {
-        let Some(backward) = &self.backward else {
+        let Some(CustomRuleVjp { backward, .. }) = &self.vjp else {
             return Err(missing_backward_rule_error(self.name.as_ref()).into());
         };
         let cotangents = match backward {
-            CustomVjpBackward::Accumulating(rule) => return Ok(rule.apply(context, inputs, seeds, accumulators)?),
+            CustomRuleVjpBackward::Accumulating(rule) => {
+                return Ok(rule.apply(context, inputs, seeds, accumulators)?);
+            }
 
             // A pure rule receives materialized seeds, and its cotangents are added to each differentiated input's
             // destination, which also discards the cotangents of ignored inputs. A zero seed whose type names runtime
             // extents reads them from the zero sources.
-            CustomVjpBackward::Pure(rule) => {
+            CustomRuleVjpBackward::Pure(rule) => {
                 let seeds = seeds
                     .iter()
                     .map(|seed| O::materialize_zero_from_residual_sources(&**context, seed.clone(), zero_sources))
@@ -1273,7 +1297,7 @@ where
 
             // A rule that receives structural zero seeds may also return structural zero cotangents, which contribute
             // nothing to their destinations, so they stay structural zeros for the transposition.
-            CustomVjpBackward::PureWithSymbolicZeros(rule) => rule.apply(&**context, leading_values, seeds)?,
+            CustomRuleVjpBackward::PureWithSymbolicZeros(rule) => rule.apply(&**context, leading_values, seeds)?,
         };
 
         // Each cotangent has the cotangent type of its differentiated input, which may differ from the input's tangent
@@ -1296,7 +1320,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
             .field("name", &self.name)
             .field("has_jvp", &matches!(self.jvp, Some(CustomRuleJvp::Rule(_) | CustomRuleJvp::SymbolicZeroRule(_))))
             .field("derives_jvp_from_primal", &matches!(self.jvp, Some(CustomRuleJvp::Primal)))
-            .field("has_vjp", &self.backward.is_some())
+            .field("has_vjp", &self.vjp.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1305,8 +1329,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V,
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns whether any thread is producing an uncached specialization of this definition, which tests use to
     /// observe that a failed or reentrant request leaves no production behind.
-    pub(super) fn has_uncached_in_flight(&self) -> bool {
-        !self.uncached_in_flight.lock().expect("custom rule in-flight mutex is poisoned").is_empty()
+    pub(super) fn has_uncached_specializations(&self) -> bool {
+        !self.uncached_specializations.lock().expect("custom rule in-flight mutex is poisoned").is_empty()
     }
 }
 
@@ -1906,8 +1930,8 @@ mod tests {
         let broadcast_sensitive =
             CustomRuleRegistration::new(MemberDefinition::new("square").with_broadcast_sensitive_batching_rule(rule));
         assert!(broadcast_sensitive.reference().has_batching_rule());
-        assert!(broadcast_sensitive.definition().broadcast_sensitivity.is_some());
-        assert!(plain.definition().broadcast_sensitivity.is_none());
+        assert!(broadcast_sensitive.definition().batching_rule.as_ref().unwrap().broadcast_sensitivity.is_some());
+        assert!(plain.definition().batching_rule.as_ref().unwrap().broadcast_sensitivity.is_none());
         let key = CustomRuleBatchingSpecializationKey {
             level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
             boundary_input_types: Vec::new(),
