@@ -1646,7 +1646,7 @@ mod tests {
             specialization.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:u64[] = axis_index [axis_name=batch]
+                let %2:u64[] = axis_index [axis_name=\"batch\"]
                     %3:f64[] = convert_element_type [data_type=f64] %2
                     %4:f64[] = mul %1 %3
                 in (%0, %4)
@@ -1987,7 +1987,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(registration.caches().jvp_specializations().len(), 2);
+        assert_eq!(registration.jvp_specializations().len(), 2);
         assert_eq!(counters.counts(), (1, 0, 0));
 
         // An output that stays mapped while its batched layout requires it to be replicated is rejected, unless the
@@ -2016,7 +2016,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3] .
                 let %1:f64[3] = mul %0 %0
-                in (%1)
+                    %2:f64[] = reduce [kind=sum, axes=[0]] %1
+                in (%2)
             "}
             .trim_end(),
         );
@@ -2157,7 +2158,13 @@ mod tests {
             undischarged.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
-                in (%0, %1)
+                let %2:ref<f32[]> = reference_new %0
+                    () = reference_add_update %2 %0
+                    %3:ref<f32[]> = reference_new %1
+                    () = reference_add_update %3 %1
+                    %4:f32[] = reference_read %2
+                    %5:f32[] = reference_read %3
+                in (%4, %5)
             "}
             .trim_end(),
         );

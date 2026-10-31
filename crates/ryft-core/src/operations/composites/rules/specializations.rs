@@ -28,7 +28,7 @@ use crate::operations::composites::rules::definitions::{
     CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
     CustomVjpOperation,
 };
-use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
+use crate::operations::composites::rules::registrations::CustomRuleReference;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatchedOutputs, CustomRuleBatchingLevel,
     CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind, CustomRuleDerivedDefinitionKey,
@@ -903,22 +903,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 }
             }
         };
-        let Some(caches) = self.caches.upgrade() else {
-            return Ok(CustomRuleReference { definition, caches: Weak::new() });
-        };
-        let mut registrations = caches.derived_registrations.lock().expect("custom rule derivation mutex is poisoned");
-        if let Some(registration) = registrations.get(&key) {
-            return Ok(registration.reference());
-        }
-        let registration = CustomRuleRegistration::from_definition(definition);
-        let reference = registration.reference();
-
-        // An evicted registration is dropped after the lock is released, because dropping its caches may drop
-        // programs whose destructors reach other definitions.
-        let evicted = registrations.push(key, registration);
-        drop(registrations);
-        drop(evicted);
-        Ok(reference)
+        Ok(self.derived_reference(key, definition))
     }
 }
 
@@ -2212,7 +2197,7 @@ mod tests {
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::composites::rules::CUSTOM_RULE_SPECIALIZATION_CAPACITY;
+    use crate::operations::composites::rules::registrations::CustomRuleRegistration;
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, custom_rule_program,
         member_cube_definition,
@@ -2269,56 +2254,6 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_reference_specialization_eviction() {
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        let jvp = |extent: usize| {
-            let x = Array::vector(vec![2f64; extent]).unwrap();
-            let tangent = Array::vector(vec![1f64; extent]).unwrap();
-            assert_eq!(
-                call_jvp(&definition, x, tangent),
-                Ok((
-                    vec![Array::vector(vec![8f64; extent]).unwrap()],
-                    vec![Array::vector(vec![4f64; extent]).unwrap()]
-                )),
-            );
-        };
-        let specialization = |extent: usize| {
-            let r#type = ArrayType::new_static(DataType::F64, [extent]);
-            let key = CustomRuleForwardSpecializationKey {
-                input_types: vec![r#type.clone()],
-                output_types: vec![r#type],
-                kept_outputs: None,
-                non_differentiated_count: 0,
-                tangent_activity: vec![true],
-                levels: Vec::new(),
-                discharged: false,
-            };
-            Arc::downgrade(&definition.reference().jvp_specialization(key).unwrap())
-        };
-        let retained_definition = Arc::downgrade(&definition.reference().definition);
-        let baseline = retained_definition.strong_count();
-        let mut probes = Vec::new();
-        for extent in 1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1 {
-            jvp(extent);
-            probes.push(specialization(extent));
-        }
-        assert_eq!(definition.caches().jvp_specializations().len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
-        assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1, 0, 0));
-
-        // Bounded caches bound the retained memory: the evicted specialization is freed, and no cached program retains
-        // the definition.
-        assert!(probes[0].upgrade().is_none());
-        assert!(probes[1..].iter().all(|probe| probe.upgrade().is_some()));
-        assert_eq!(retained_definition.strong_count(), baseline);
-
-        // The evicted oldest specialization is traced again, while a resident one is reused.
-        jvp(1);
-        jvp(CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1);
-        assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 2, 0, 0));
-    }
-
-    #[test]
     fn test_custom_rule_reference_specialization_outer_cache_hit() {
         // A batched specialization that is still cached is served without requesting the unbatched specialization from
         // which it was batched, so evicting the latter neither traces the rule again nor caches it again.
@@ -2340,11 +2275,11 @@ mod tests {
             discharged: false,
         };
         let first = definition.reference().jvp_specialization(key.clone()).unwrap();
-        assert_eq!(definition.caches().jvp_specializations().len(), 2);
-        assert_eq!(definition.caches().jvp_specializations().invalidate_entries_if(|key| key.levels.is_empty()), 1);
+        assert_eq!(definition.jvp_specializations().len(), 2);
+        assert_eq!(definition.jvp_specializations().invalidate_entries_if(|key| key.levels.is_empty()), 1);
         let second = definition.reference().jvp_specialization(key).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(definition.caches().jvp_specializations().len(), 1);
+        assert_eq!(definition.jvp_specializations().len(), 1);
         assert_eq!(counters.counts(), (1, 0, 0));
     }
 
@@ -2369,7 +2304,7 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transient failure",
         ));
-        assert!(definition.caches().jvp_specializations().is_empty());
+        assert!(definition.jvp_specializations().is_empty());
         for _ in 0..2 {
             assert_eq!(
                 call_jvp(&definition, x.clone(), one.clone()),
@@ -2411,7 +2346,7 @@ mod tests {
             }
         });
         assert_eq!(invocations.load(Ordering::SeqCst), 2);
-        assert_eq!(definition.caches().jvp_specializations().len(), 1);
+        assert_eq!(definition.jvp_specializations().len(), 1);
         assert_eq!(call_jvp(&definition, x, one), Ok(expected));
         assert_eq!(invocations.load(Ordering::SeqCst), 2);
     }
@@ -2456,17 +2391,17 @@ mod tests {
         let pushforward = registration.reference().derived(key(CustomRuleDerivationKind::Pushforward)).unwrap();
         assert_eq!(pushforward.name(), "pushforward(sine)");
         assert_ne!(pushforward, derived);
-        assert_eq!(registration.caches().derived_registrations.lock().unwrap().len(), 2);
-        assert!(derived.caches.upgrade().is_some());
+        assert_eq!(registration.derived_registration_count(), 2);
+        assert!(derived.has_caches());
 
         // Dropping the source registration frees the derived registrations and their caches, and later derivations
         // reuse the derived definitions that are still alive, without caches, exactly like specializations.
         let source = registration.reference();
         drop(registration);
-        assert!(derived.caches.upgrade().is_none());
+        assert!(!derived.has_caches());
         let fresh = source.derived(key(CustomRuleDerivationKind::Jvp)).unwrap();
         assert_eq!(fresh, derived);
-        assert!(fresh.caches.upgrade().is_none());
+        assert!(!fresh.has_caches());
         let derived_definition = Arc::downgrade(&derived.definition);
         drop((derived, pushforward, fresh));
         assert!(derived_definition.upgrade().is_none());
@@ -2480,36 +2415,6 @@ mod tests {
                 if message == "`composite` `sine` has neither a custom batching rule nor sequential batching from \
                                which to derive rules",
         ));
-    }
-
-    #[test]
-    fn test_custom_rule_reference_derived_capacity() {
-        // The source registration retains as many derived registrations as specializations of each rule. A derived
-        // definition that is still alive is reused for its key, whether or not its registration was evicted or the
-        // source registration was dropped, so that it keeps its identity.
-        let registration = CustomRuleRegistration::new(
-            MemberDefinition::new("sine")
-                .with_jvp_from_primal()
-                .with_batching_support()
-                .with_batching_rule(|inputs, input_axes, _, _| Ok((inputs.to_vec(), input_axes.to_vec()))),
-        );
-        let key = |input_count| CustomRuleDerivedDefinitionKey {
-            kind: CustomRuleDerivationKind::Jvp,
-            input_count,
-            active_input_indices: vec![0],
-            output_tangent_mask: vec![true],
-        };
-        let derived = (1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1)
-            .map(|input_count| registration.reference().derived(key(input_count)).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            registration.caches().derived_registrations.lock().unwrap().len(),
-            CUSTOM_RULE_SPECIALIZATION_CAPACITY,
-        );
-        assert_eq!(registration.reference().derived(key(1)).unwrap(), derived[0]);
-        let source = registration.reference();
-        drop(registration);
-        assert_eq!(source.derived(key(2)).unwrap(), derived[1]);
     }
 
     #[test]

@@ -37,9 +37,6 @@ pub use definitions::{CustomRuleDefinition, CustomVjpOperation};
 pub use registrations::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleReference};
 pub use specializations::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};
 
-/// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
-pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
-
 /// Tracer over which retained custom rules are written. It is typed by the registration family's staged constant and
 /// operation types only, so a rule can be traced lazily under whichever transform later requests it.
 pub type CustomRuleTracer<V, O> = Tracer<TracingContext<V, O>>;
