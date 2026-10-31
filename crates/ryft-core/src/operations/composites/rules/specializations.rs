@@ -280,8 +280,6 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
         Self: Sized;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for CustomRuleReference<V, O> {
     fn jvp_specialization(
         &self,
@@ -296,7 +294,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // tangents of its differentiated inputs and returns the call's outputs followed by their tangents. An unbatched
         // key traces the rule on its first request, while a batched key batches the specialization of its inner key at
         // its outermost level, so that every batching level shares one trace of the rule.
-        //
+
         // The traced rule is validated against the unbatched output types of `key`.
         let rule = match self.definition().jvp() {
             Some(CustomRuleJvp::Rule(rule)) => CustomRuleJvpRule::Materialized(rule),
@@ -316,6 +314,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 .into());
             }
         };
+
         // The inner specialization is requested only when the outer one is not cached.
         self.specialization(CustomRuleSpecializationRequest::Jvp(key.clone()), || {
             let inner = match key.levels.split_last() {
@@ -328,6 +327,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 )),
                 None => None,
             };
+
             let Some((inner, level)) = inner else {
                 // The traced program takes every primal input followed by the active tangents of the differentiated
                 // inputs and returns the primal outputs followed by their tangents, which is exactly the rule program
@@ -352,14 +352,16 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     ))
                     .into());
                 }
+
                 let mut rule_input_types = key.input_types.clone();
                 for (r#type, active) in differentiated_input_types.iter().zip(&key.tangent_activity) {
                     if *active {
                         rule_input_types.push(r#type.tangent()?);
                     }
                 }
-                // The rule's two result partitions are validated separately before they are flattened, because
-                // the flattened types alone cannot tell a missing output from a misplaced tangent.
+
+                // The rule's two result partitions are validated separately before they are flattened,
+                // because the flattened types alone cannot tell a missing output from a misplaced tangent.
                 let output_count = key.rule_output_count()?;
                 let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                     |values: Vec<CustomRuleTracer<V, O>>| {
@@ -373,6 +375,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                 false => Ok(MaybeZero::Zero(primal.r#type().tangent()?)),
                             })
                             .collect::<Result<Vec<_>, ProgramError>>()?;
+
                         let (mut outputs, output_tangents) = match rule {
                             CustomRuleJvpRule::Materialized(rule) => {
                                 let tangents = primals[key.non_differentiated_count..]
@@ -391,10 +394,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                             }
                             CustomRuleJvpRule::SymbolicZeros(rule) => rule.apply(primals, &tangents)?,
                         };
+
                         if outputs.len() != output_count || output_tangents.len() != output_count {
                             return Err(TypeError::invalid(format!(
-                                "{} JVP rule returned {} outputs and {} output \
-                                     tangents but the primal has {output_count} outputs",
+                                "{} JVP rule returned {} outputs and {} output tangents but the primal has {} outputs",
                                 {
                                     let name = self.name();
                                     if name == COMPOSITE_OPERATION_NAME {
@@ -405,6 +408,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                 },
                                 outputs.len(),
                                 output_tangents.len(),
+                                output_count,
                             ))
                             .into());
                         }
@@ -430,6 +434,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     rule_input_types,
                     self.definition().named_axes().to_vec(),
                 )?;
+
                 // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
                 // whose computation is all that remains of the program.
                 let program = match key.kept_outputs {
@@ -444,10 +449,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         program.with_outputs(&selected)?
                     }
                 };
+
                 let mut expected_output_types = key.output_types.clone();
                 for r#type in &key.output_types {
                     expected_output_types.push(r#type.tangent()?);
                 }
+
                 let program = conform_rule_output_types(self.name(), "JVP", program, &expected_output_types, None)?;
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization::new(program, Vec::new())));
@@ -465,6 +472,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 };
                 ProgramError::MalformedProgram(format!("{description} batching level has too few input axes"))
             })?;
+
             let mut input_axes = level.input_axes.clone();
             input_axes.extend(
                 differentiated_input_axes
@@ -493,11 +501,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         O: Operation<Type = V::Type>,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
-        // Returns the reverse mode forward rule specialization for `key`, whose program takes the call's inputs and
-        // returns the call's outputs followed by the residuals. Specializations are traced and batched as for
-        // [`Self::jvp_specialization`], except that residuals keep the batch axes that batching naturally produces,
+        // Returns the reverse mode forward rule specialization for `key`, whose program takes the call's inputs
+        // and returns the call's outputs followed by the residuals. Specializations are traced and batched as for
+        // `Self::jvp_specialization`, except that residuals keep the batch axes that batching naturally produces,
         // which the specialization records.
-        //
+
         // The traced rule is validated against the unbatched output types of `key`. A call that keeps only some of
         // the rule's outputs still receives every output of the rule, because the backward rule receives a seed for
         // each of them, but only the kept outputs are validated against the call's output types.
@@ -515,6 +523,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             }
             .into());
         };
+
         // The inner specialization is requested only when the outer one is not cached.
         let output_count = key.rule_output_count()?;
         self.specialization(CustomRuleSpecializationRequest::Forward(key.clone()), || {
@@ -528,6 +537,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 )),
                 None => None,
             };
+
             let Some((inner, level)) = inner else {
                 // The primal outputs are validated as their own partition before the residuals are appended,
                 // because a residual whose type matches a missing output would otherwise pass as that output.
@@ -536,8 +546,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         let (mut outputs, residuals) = forward.apply(&values)?;
                         if outputs.len() != output_count {
                             return Err(TypeError::invalid(format!(
-                                "{} forward rule returned {} outputs but the \
-                                     primal has {output_count}",
+                                "{} forward rule returned {} outputs but the primal has {}",
                                 {
                                     let name = self.name();
                                     if name == COMPOSITE_OPERATION_NAME {
@@ -547,6 +556,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                     }
                                 },
                                 outputs.len(),
+                                output_count,
                             ))
                             .into());
                         }
@@ -556,6 +566,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     key.input_types.clone(),
                     self.definition().named_axes().to_vec(),
                 )?;
+
                 let kept_output_indices = key.kept_output_indices(output_count);
                 let program = conform_rule_output_types(
                     self.name(),
@@ -564,6 +575,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     &key.output_types,
                     key.kept_outputs.as_ref().map(|_| kept_output_indices.as_slice()),
                 )?;
+
                 // Reference residuals preserve handles, not snapshots, so each one must forward a distinct leading
                 // non-differentiated input by identity, which the backward rule then receives as plumbing.
                 let leading_inputs = &program.input_ids()[..key.non_differentiated_count];
@@ -573,11 +585,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     if !r#type.is_reference() {
                         continue;
                     }
+
                     if !leading_inputs.contains(residual) {
                         return Err(TypeError::invalid(format!(
-                            "{} forward rule returns residual {index} of \
-                             reference type `{type}` that is not a leading non-differentiated input forwarded by \
-                             identity",
+                            "{} forward rule returns residual {} of reference type `{}` that is not a leading \
+                             non-differentiated input forwarded by identity",
                             {
                                 let name = self.name();
                                 if name == COMPOSITE_OPERATION_NAME {
@@ -586,13 +598,16 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                     format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
                                 }
                             },
+                            index,
+                            type,
                         ))
                         .into());
                     }
+
                     if !forwarded_inputs.insert(*residual) {
                         return Err(TypeError::invalid(format!(
-                            "{} forward rule returns residual {index} of \
-                             reference type `{type}` from an input already forwarded by an earlier residual",
+                            "{} forward rule returns residual {} of reference type `{}` \
+                             from an input already forwarded by an earlier residual",
                             {
                                 let name = self.name();
                                 if name == COMPOSITE_OPERATION_NAME {
@@ -601,13 +616,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                     format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
                                 }
                             },
+                            index,
+                            r#type,
                         ))
                         .into());
                     }
                 }
+
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization::new(program, Vec::new())));
             };
+
             // The outputs that the call does not keep, like the residuals, keep their natural batch axes.
             let residual_count = inner.program.output_types().len() - output_count;
             let mut kept_output_axes = level.output_axes.iter().copied();
@@ -631,6 +650,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             )
         })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     fn backward_specialization(
         &self,
@@ -753,9 +774,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleBatchingSpecializationKey<V::Type>,
     ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         // Traces the custom batching rule over the level's boundary inputs followed by the batched inputs, recording
         // the batch axes that it declares for its outputs. A derived definition applies the JVP of its source's rule
