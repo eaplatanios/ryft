@@ -57,8 +57,6 @@ mod sealed {
 
 impl<V: Typed + Parameter, O> sealed::Sealed for CustomRuleReference<V, O> {}
 
-impl<V: Typed + Parameter, O> sealed::Sealed for LiftedCustomRules<V, O> {}
-
 /// Source of the retained rules that a [`CompositeOperation`](crate::CompositeOperation) and its
 /// [`CompositeTransposeOperation`] apply, which provides their specializations as programs of the operations'
 /// own family `(V, O)`. [`CustomRuleReference`] is the source of a definition registered in that family, and
@@ -792,8 +790,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         Ok(sequential_batching_scan(length, carry_count, axis_sharding, stacked_output_count)?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
         // A derived definition copies the capabilities that its calls need from the source definition and holds no
         // program, so calls whose primal regions differ share it (refer to `CustomRuleSpecializer::derived`). A source
@@ -809,18 +805,6 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             .into());
         }
 
-        let derive = |key: CustomRuleDerivedDefinitionKey| {
-            let prefix = match key.kind {
-                CustomRuleDerivationKind::Jvp => "jvp",
-                CustomRuleDerivationKind::Pushforward => "pushforward",
-            };
-            let batching_rule = self
-                .definition()
-                .batching_rule()
-                .map(|batching_rule| batching_rule.new_derived(CustomRuleDerivation { source: self.clone(), key }));
-            self.definition().new_derived(format!("{prefix}({})", self.name()), batching_rule)
-        };
-
         // A derived definition that is still alive is reused, so that its calls keep one identity (and with it the
         // entries of enclosing caches) even after its registration was evicted or the source registration dropped.
         let definition = {
@@ -830,7 +814,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             match definitions.get(&key).and_then(Weak::upgrade) {
                 Some(definition) => definition,
                 None => {
-                    let definition = Arc::new(derive(key.clone()));
+                    let prefix = match key.kind {
+                        CustomRuleDerivationKind::Jvp => "jvp",
+                        CustomRuleDerivationKind::Pushforward => "pushforward",
+                    };
+                    let batching_rule = self.definition().batching_rule().map(|batching_rule| {
+                        batching_rule.new_derived(CustomRuleDerivation { source: self.clone(), key: key.clone() })
+                    });
+                    let definition =
+                        Arc::new(self.definition().new_derived(format!("{}({})", prefix, self.name()), batching_rule));
                     definitions.insert(key.clone(), Arc::downgrade(&definition));
                     definition
                 }
@@ -840,9 +832,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
     }
 }
 
-/// Rules of a definition that cannot be converted into a family (i.e., a definition registered in a family whose
-/// values that family cannot represent, such as array IR programs converted into a backend whose constants are only
-/// captures). Its calls still execute their primal, but every derivative request fails with an exact error.
+/// Rules of a definition registered in a family whose values the target family cannot represent (e.g., array IR rules
+/// converted into a backend whose constants cannot represent every array IR value). Calls can still execute their
+/// converted primal programs. Requests that need the retained rules fail with an error explaining why they are
+/// unavailable. Differentiation explicitly derived from the primal can still succeed when it does not need those rules.
 #[derive(Clone, Debug)]
 pub struct UnavailableCustomRules {
     /// Process-unique identity of the original definition.
@@ -851,16 +844,17 @@ pub struct UnavailableCustomRules {
     /// Human-readable label of the original definition.
     name: Cow<'static, str>,
 
-    /// Whether the original definition has a retained forward mode (i.e., JVP) rule.
+    /// Whether the original definition has a retained forward mode differentiation (i.e., Jacobian-Vector Product
+    /// or JVP) rule.
     has_jvp: bool,
 
-    /// Whether the original definition derives its forward mode rule from the primal.
+    /// Whether the original definition derives its forward mode differentiation rule from the primal.
     derives_jvp_from_primal: bool,
 
-    /// Whether the original definition has reverse mode (i.e., VJP) rules.
+    /// Whether the original definition has reverse mode (i.e., Vector-Jacobian Product or VJP) rules.
     has_vjp: bool,
 
-    /// Whether the original definition defers its reverse mode forward rule to the backward pass.
+    /// Whether the original definition defers its reverse mode differentiation forward rule to the backward pass.
     defers_forward: bool,
 
     /// Declared batch axes of the outputs of batched calls of the original definition.
@@ -875,6 +869,7 @@ pub struct UnavailableCustomRules {
 
 impl UnavailableCustomRules {
     /// Creates [`UnavailableCustomRules`] that keep the identity and description of the provided source.
+    #[inline]
     pub fn from_source<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>(rules: &S) -> Self {
         Self {
             id: rules.id(),
@@ -889,25 +884,23 @@ impl UnavailableCustomRules {
         }
     }
 
-    /// Returns the error that every derivative request of these rules reports.
+    /// Returns the error reported when a request needs these unavailable retained rules.
+    #[inline]
     fn error(&self) -> DifferentiationError {
         ProgramError::UnsupportedOperation {
             message: format!(
                 "{} was converted from a family whose values its current family \
                  cannot represent, so its derivative rules are unavailable",
-                {
-                    let name: &str = &self.name;
-                    describe_composite(COMPOSITE_OPERATION_NAME, name)
-                },
+                describe_composite(COMPOSITE_OPERATION_NAME, &self.name)
             ),
         }
         .into()
     }
 }
 
-/// Source of the rules of a call that was converted from a member family `(V, O)` into a family that contains it
-/// (e.g., from array programs into array IR programs, or into a backend family). Each specialization request projects
-/// its key into the member family, obtains the specialization from the member definition (so that the member
+/// Source of the rules of a call that was converted from a member family `(V, O)` into a family that contains
+/// it (e.g., from array programs into array IR programs, or into a backend family). Each specialization request
+/// projects its key into the member family, obtains the specialization from the member definition (so that the member
 /// definition's caches, batcher, and transposer serve every family that its calls reach), and converts the program
 /// into the requesting family with [`Program::into_unprojected`]. Nested member calls inside that program are converted
 /// in turn, by the same conversion that converted the call. The converted programs are cached per requesting family
@@ -927,8 +920,18 @@ pub enum LiftedCustomRules<V: Typed + Parameter, O> {
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
-    /// Returns the rules of the member definition, or the error that a derivative request of unavailable rules reports.
-    fn member(&self) -> Result<&CustomRuleReference<V, O>, DifferentiationError> {
+    /// Returns the process-unique identity of the source definition, preserved when its rules become unavailable.
+    #[inline]
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Member(rules) => rules.definition().id(),
+            Self::Unavailable(rules) => rules.id,
+        }
+    }
+
+    /// Returns the rules of the member definition, or an error explaining why its retained rules are unavailable.
+    #[inline]
+    pub fn member(&self) -> Result<&CustomRuleReference<V, O>, DifferentiationError> {
         match self {
             Self::Member(rules) => Ok(rules),
             Self::Unavailable(rules) => Err(rules.error()),
@@ -937,10 +940,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
 
     /// Projects the provided types of a converted call into the member family, rejecting types that have no member
     /// representation.
-    fn project_types<Tc>(&self, types: &[Tc]) -> Result<Vec<V::Type>, DifferentiationError>
+    fn project_types<T: Type>(&self, types: &[T]) -> Result<Vec<V::Type>, DifferentiationError>
     where
-        Tc: Type,
-        for<'t> &'t V::Type: TryFrom<&'t Tc, Error = TypeError>,
+        for<'t> &'t V::Type: TryFrom<&'t T, Error = TypeError>,
     {
         types
             .iter()
@@ -948,9 +950,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
                 <&V::Type>::try_from(r#type).cloned().map_err(|_| {
                     ProgramError::UnsupportedOperation {
                         message: format!(
-                            "{} cannot be differentiated with respect to type \
-                             `{type}`, which the family in which its rules were registered cannot represent",
+                            "{} cannot be differentiated with respect to type `{}`, \
+                             which the family in which its rules were registered cannot represent",
                             describe_composite(COMPOSITE_OPERATION_NAME, self.name_or_unavailable()),
+                            type,
                         ),
                     }
                     .into()
@@ -961,13 +964,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
 
     /// Projects the provided batching levels of a converted call into the member family, rejecting dynamic extents
     /// whose types have no member representation.
-    fn project_levels<Tc>(
+    fn project_levels<T: Type>(
         &self,
-        levels: &[CustomRuleBatchingLevel<Tc>],
+        levels: &[CustomRuleBatchingLevel<T>],
     ) -> Result<Vec<CustomRuleBatchingLevel<V::Type>>, DifferentiationError>
     where
-        Tc: Type,
-        for<'t> &'t V::Type: TryFrom<&'t Tc, Error = TypeError>,
+        for<'t> &'t V::Type: TryFrom<&'t T, Error = TypeError>,
     {
         levels
             .iter()
@@ -978,10 +980,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
                         BatchingLevelExtent::Dynamic(<&V::Type>::try_from(r#type).cloned().map_err(|_| {
                             ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "{} cannot differentiate a batched call whose \
-                                     batch extent has type `{type}`, which the family in which its rules were \
-                                     registered cannot represent; differentiate the call before batching it instead",
+                                    "{} cannot differentiate a batched call whose batch extent has type `{}`, \
+                                     which the family in which its rules were registered cannot represent; \
+                                     differentiate the call before batching it instead",
                                     describe_composite(COMPOSITE_OPERATION_NAME, self.name_or_unavailable()),
+                                    r#type,
                                 ),
                             }
                         })?)
@@ -1011,6 +1014,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Clone for LiftedCustomRules<V, O> {
+    #[inline]
     fn clone(&self) -> Self {
         match self {
             Self::Member(rules) => Self::Member(rules.clone()),
@@ -1020,6 +1024,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Clone for LiftedCustomRules<V, O>
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for LiftedCustomRules<V, O> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Member(rules) => formatter.debug_tuple("Member").field(rules).finish(),
@@ -1029,36 +1034,33 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for LiftedCustomRules<V, O>
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> PartialEq for LiftedCustomRules<V, O> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        let id = |rules: &Self| match rules {
-            Self::Member(rules) => rules.definition().id(),
-            Self::Unavailable(rules) => rules.id,
-        };
-        id(self) == id(other)
+        self.id() == other.id()
     }
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Eq for LiftedCustomRules<V, O> {}
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Hash for LiftedCustomRules<V, O> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Member(rules) => rules.definition().id().hash(state),
-            Self::Unavailable(rules) => rules.id.hash(state),
-        }
+        self.id().hash(state);
     }
 }
+
+impl<V: Typed + Parameter, O> sealed::Sealed for LiftedCustomRules<V, O> {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V, O, VC, OC> CustomRuleSource<VC, OC> for LiftedCustomRules<V, O>
 where
     V: Typed<Type: Eq + Hash> + Parameter,
     VC: Typed<Type: Eq + Hash> + Parameter,
 {
+    #[inline]
     fn id(&self) -> u64 {
-        match self {
-            Self::Member(rules) => rules.definition().id(),
-            Self::Unavailable(rules) => rules.id,
-        }
+        self.id()
     }
 
     #[inline]
@@ -2017,6 +2019,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
@@ -2230,11 +2233,10 @@ mod tests {
                                cannot represent; differentiate the call before batching it instead",
         ));
 
-        // Unavailable rules keep the identity and description of their definition but reject every derivative request.
+        // Unavailable rules keep their definition's identity and description but reject requests to specialize its rules.
         let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
             UnavailableCustomRules::from_source(&definition.reference()),
         );
-        assert_eq!(unavailable, lifted);
         assert_eq!(source(&unavailable), "cube");
         assert!(matches!(
             specialize(&unavailable, key(ArrayType::scalar(DataType::F64).into(), Vec::new())),
@@ -2256,6 +2258,29 @@ mod tests {
             &deferred.reference(),
         ))));
         assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_lifted_custom_rules_id() {
+        let registration = CustomRuleRegistration::new(MemberDefinition::new("cube"));
+        let id = registration.definition().id();
+        let member = LiftedCustomRules::Member(registration.reference());
+        let unavailable =
+            LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&registration.reference()));
+        let other = LiftedCustomRules::Member(CustomRuleRegistration::new(MemberDefinition::new("cube")).reference());
+
+        assert_eq!(member.id(), id);
+        assert_eq!(unavailable.id(), id);
+        assert_eq!(CustomRuleSource::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::id(&member), id);
+        assert_eq!(CustomRuleSource::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::id(&unavailable), id);
+        assert_eq!(member, member.clone());
+        assert_eq!(member, unavailable);
+        assert_ne!(member.id(), other.id());
+        assert_ne!(member, other);
+
+        // Availability does not change identity, so both representations address the same map entry.
+        let definitions = HashMap::from([(member, 1), (other, 2)]);
+        assert_eq!(definitions.get(&unavailable), Some(&1));
     }
 
     #[test]
