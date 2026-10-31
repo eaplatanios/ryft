@@ -116,114 +116,6 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     fn supports_reference_destinations(&self) -> bool;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// [`CustomRuleSource`] that produces the specializations of its rules, as programs of the operations' own family
-/// `(V, O)`. The functions that produce specializations carry their bounds themselves rather than on the trait, like
-/// the rule traits, which keeps the operations free of bounds on `O` that would form a cycle with the payload bounds of
-/// the families that contain them. This interface is internal because its specialization keys and results describe
-/// composite implementation details.
-pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>:
-    CustomRuleSource<V, O>
-{
-    /// Returns the forward mode rule specialization for `key`, whose program takes the call's inputs followed by the
-    /// active tangents of its differentiated inputs (refer to the tangent activity of the key) and returns the call's
-    /// outputs followed by their tangents.
-    fn jvp_specialization(
-        &self,
-        key: CustomRuleForwardSpecializationKey<V::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
-    where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: Value<Type: DifferentiableType>,
-        O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>;
-
-    /// Returns the reverse mode forward rule specialization for `key`, whose program takes the call's inputs and
-    /// returns the call's outputs followed by the residuals.
-    fn forward_specialization(
-        &self,
-        key: CustomRuleForwardSpecializationKey<V::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
-    where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: Value<Type: DifferentiableType>,
-        O: Operation<Type = V::Type>;
-
-    /// Returns the destination-specialized backward rule for `key`, whose program consumes the boundary inputs, then
-    /// the live seeds, then the caller buffers, then the remaining known leading inputs, and returns the cotangents of
-    /// the differentiated inputs with returned destinations.
-    fn backward_specialization(
-        &self,
-        key: CustomRuleBackwardSpecializationKey<V::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
-    where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: Value<Type: DifferentiableType>,
-        O: Operation<Type = V::Type> + From<CompositeTransposeOperation<V, O>>;
-
-    /// Returns the batched primal program that the custom batching rule produces for `key`, whose program takes the
-    /// level's boundary inputs followed by the call's batched inputs and returns the batched outputs, together with the
-    /// batch axes of those outputs.
-    fn batching_rule_specialization(
-        &self,
-        key: CustomRuleBatchingSpecializationKey<V::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
-    where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: Value<Type: DifferentiableType>,
-        O: Operation<Type = V::Type>;
-
-    /// Returns the scan operation with which a call of this source loops over `length` batch items when it is batched
-    /// sequentially (refer to [`CustomRuleDefinition::with_sequential_batching`]), carrying `carry_count` replicated
-    /// inputs and stacking `stacked_output_count` outputs along a batch axis placed by `axis_sharding`, together with
-    /// the type of the slice index that the scan body receives first.
-    fn sequential_batching_scan(
-        &self,
-        length: usize,
-        carry_count: usize,
-        axis_sharding: &ShardingDimension,
-        stacked_output_count: usize,
-    ) -> Result<(O, V::Type), DifferentiationError>;
-
-    /// Returns the rules of the definition derived from this source for `key`, with which forward mode differentiation
-    /// stages the derived call of a call whose forward mode rule is derived from its primal and whose source has a
-    /// custom batching rule or batches its calls sequentially. This keeps that rule, or the sequential batching, on the
-    /// path of forward mode derivatives that are batched after they are taken (i.e., the analogue of JAX's
-    /// `custom_vmap_jvp`): the derived call's primal region is the derivative of the call's primal region (i.e., its
-    /// Jacobian-Vector Product (JVP), or the tangent half of it), and the derived definition holds no program. It
-    /// derives its forward mode rule from each call's primal region, so that higher orders recurse through each call's
-    /// own region, and its batching rule applies the JVP of the source's batching rule, while the derived definition of
-    /// a source that batches its calls sequentially batches its own calls sequentially (i.e., it loops over the
-    /// derivative one batch item at a time). Calls whose primal regions differ therefore share one derived definition.
-    ///
-    /// The derived batching rule always computes the derived call's primal outputs with the source rule applied at the
-    /// batch axes of the primal inputs, which is exactly how batching the source call computes them, so a rule whose
-    /// result depends on its input axes gives a derivative whose primal outputs are those of the batched call. Its
-    /// tangents are computed in one of two modes:
-    ///
-    ///   - **Structural:** when every primal input is replicated, and so is every output of the rule applied to them
-    ///     (e.g., the replicated primals and mapped tangents of a forward mode Jacobian), the JVP of the rule's program
-    ///     is batched structurally over the given batch axes.
-    ///   - **Rule:** otherwise, each primal and tangent pair with a mapped side is aligned to one axis (i.e., its
-    ///     replicated side is broadcast, and a tangent mapped along another axis than its primal is moved), and the JVP
-    ///     of the source rule applied at the aligned batch axes computes the tangents. Inputs without a tangent keep
-    ///     their batch axes. Alignment changes the rule's input axes only for a replicated primal whose tangent is
-    ///     mapped, because the rule cannot apply per-item perturbations of a shared input otherwise; only then is the
-    ///     rule applied twice (i.e., once at the primal axes for the primal outputs and once at the aligned axes for
-    ///     the tangents). When the source's rule depends on its input batch axes (refer to
-    ///     [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]), the rule is instead applied once, at the
-    ///     primal axes, and the tangents of such primals are recovered exactly from an outer product (refer to
-    ///     [`DiagonalBatchingPolicy`]).
-    ///
-    /// Derived definitions are registered by the source's registration, which retains a bounded number of derived
-    /// registrations like its specializations. Every request for the same key returns the same derived definition while
-    /// that definition is alive (i.e., while its registration or a call holds it), whether or not the source's
-    /// registration is alive, and a fresh one otherwise.
-    fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError>
-    where
-        Self: Sized;
-}
-
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for CustomRuleReference<V, O> {
     #[inline]
     fn id(&self) -> u64 {
@@ -280,6 +172,115 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
         true
     }
 }
+
+/// [`CustomRuleSource`] that produces the specializations of its rules, as programs of the operations' own family
+/// `(V, O)`. The functions that produce specializations carry their bounds themselves rather than on the trait, like
+/// the rule traits, which keeps the operations free of bounds on `O` that would form a cycle with the payload bounds
+/// of the families that contain them. This interface is internal because its specialization keys and results describe
+/// composite implementation details.
+pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>:
+    CustomRuleSource<V, O>
+{
+    /// Returns the forward mode differentiation rule specialization for `key`, whose program takes the call's inputs
+    /// followed by the active tangents of its differentiated inputs (refer to the tangent activity of the key) and
+    /// returns the call's outputs followed by their tangents.
+    fn jvp_specialization(
+        &self,
+        key: CustomRuleForwardSpecializationKey<V::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
+    where
+        V: Value<Type: DifferentiableType>,
+        O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
+
+    /// Returns the reverse mode differentiation forward rule specialization for `key`, whose program takes the call's
+    /// inputs and returns the call's outputs followed by the residuals.
+    fn forward_specialization(
+        &self,
+        key: CustomRuleForwardSpecializationKey<V::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
+    where
+        V: Value<Type: DifferentiableType>,
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
+
+    /// Returns the destination-specialized backward differentiation rule for `key`, whose program consumes the boundary
+    /// inputs, then the live seeds, then the caller buffers, then the remaining known leading inputs, and returns the
+    /// cotangents of the differentiated inputs with returned destinations.
+    fn backward_specialization(
+        &self,
+        key: CustomRuleBackwardSpecializationKey<V::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
+    where
+        V: Value<Type: DifferentiableType>,
+        O: Operation<Type = V::Type> + From<CompositeTransposeOperation<V, O>>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
+
+    /// Returns the batched primal program that the custom batching rule produces for `key`, whose program takes the
+    /// level's boundary inputs followed by the call's batched inputs and returns the batched outputs, together with the
+    /// batch axes of those outputs.
+    fn batching_rule_specialization(
+        &self,
+        key: CustomRuleBatchingSpecializationKey<V::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError>
+    where
+        V: Value<Type: DifferentiableType>,
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
+
+    /// Returns the scan operation with which a call of this source loops over `length` batch items when it is batched
+    /// sequentially (refer to [`CustomRuleDefinition::with_sequential_batching`]), carrying `carry_count` replicated
+    /// inputs and stacking `stacked_output_count` outputs along a batch axis placed by `axis_sharding`, together with
+    /// the type of the slice index that the scan body receives first.
+    fn sequential_batching_scan(
+        &self,
+        length: usize,
+        carry_count: usize,
+        axis_sharding: &ShardingDimension,
+        stacked_output_count: usize,
+    ) -> Result<(O, V::Type), DifferentiationError>;
+
+    /// Returns the rules of the definition derived from this source for `key`, with which forward mode differentiation
+    /// stages the derived call of a call whose forward mode differentiation rule is derived from its primal and whose
+    /// source has a custom batching rule or batches its calls sequentially. This keeps that rule, or the sequential
+    /// batching, on the path of forward mode derivatives that are batched after they are taken (i.e., the analogue of
+    /// JAX's `custom_vmap_jvp`): the derived call's primal region is the derivative of the call's primal region (i.e.,
+    /// its Jacobian-Vector Product (JVP), or the tangent half of it), and the derived definition holds no program. It
+    /// derives its forward mode differentiation rule from each call's primal region, so that higher orders recurse
+    /// through each call's own region, and its batching rule applies the JVP of the source's batching rule, while the
+    /// derived definition of a source that batches its calls sequentially batches its own calls sequentially (i.e., it
+    /// loops over the derivative one batch item at a time). Calls whose primal regions differ therefore share one
+    /// derived definition.
+    ///
+    /// The derived batching rule always computes the derived call's primal outputs with the source rule applied at the
+    /// batch axes of the primal inputs, which is exactly how batching the source call computes them, so a rule whose
+    /// result depends on its input axes gives a derivative whose primal outputs are those of the batched call. Its
+    /// tangents are computed in one of two modes:
+    ///
+    ///   - **Structural:** When every primal input is replicated, and so is every output of the rule applied to them
+    ///     (e.g., the replicated primals and mapped tangents of a forward mode Jacobian), the JVP of the rule's program
+    ///     is batched structurally over the given batch axes.
+    ///   - **Rule:** Otherwise, each primal and tangent pair with a mapped side is aligned to one axis (i.e., its
+    ///     replicated side is broadcast, and a tangent mapped along another axis than its primal is moved), and the JVP
+    ///     of the source rule applied at the aligned batch axes computes the tangents. Inputs without a tangent keep
+    ///     their batch axes. Alignment changes the rule's input axes only for a replicated primal whose tangent is
+    ///     mapped, because the rule cannot apply per-item perturbations of a shared input otherwise; only then is the
+    ///     rule applied twice (i.e., once at the primal axes for the primal outputs and once at the aligned axes for
+    ///     the tangents). When the source's rule depends on its input batch axes (refer to
+    ///     [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]), the rule is instead applied once, at the
+    ///     primal axes, and the tangents of such primals are recovered exactly from an outer product (refer to
+    ///     [`DiagonalBatchingPolicy`]).
+    ///
+    /// Derived definitions are registered by the source's registration, which retains a bounded number of derived
+    /// registrations like its specializations. Every request for the same key returns the same derived definition
+    /// while that definition is alive (i.e., while its registration or a call holds it), whether or not the source's
+    /// registration is alive, and a fresh one otherwise.
+    fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError>
+    where
+        Self: Sized;
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for CustomRuleReference<V, O> {
     fn jvp_specialization(
