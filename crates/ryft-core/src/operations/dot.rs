@@ -199,16 +199,32 @@ impl DotDimensionNumbers {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Validates paired list lengths and the distinct, disjoint axis indices on both inputs before indexing or lifting.
-    /// `operation_name` names the operation that owns these dimension numbers in diagnostics.
-    pub(crate) fn validate_for_ranks(
-        &self,
-        operation_name: &str,
-        lhs_rank: usize,
-        rhs_rank: usize,
-    ) -> Result<(), TypeError> {
+    /// Validates these dimension numbers against the ranks of the left-hand side and right-hand side inputs before
+    /// indexing or lifting. Paired batching lists and paired contracting lists must have equal lengths. Each list must
+    /// contain distinct indices within its input's rank, and an input's batching and contracting lists must be
+    /// disjoint.
+    ///
+    /// Validation covers list lengths and dimension indices. The operation's type inference additionally validates
+    /// paired extents, element types, and sharding.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation_name`: Name used in diagnostics, allowing other dot-based operations to reuse this validation.
+    ///   - `lhs_rank`: Rank of the left-hand side input.
+    ///   - `rhs_rank`: Rank of the right-hand side input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if paired lists have different lengths, an index is out of bounds, a list repeats an
+    /// axis, or an input uses the same axis for batching and contraction.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{DOT_OPERATION_NAME, DotDimensionNumbers};
+    /// assert_eq!(DotDimensionNumbers::matmul().validate(DOT_OPERATION_NAME, 2, 2), Ok(()));
+    /// ```
+    pub fn validate(&self, operation_name: &str, lhs_rank: usize, rhs_rank: usize) -> Result<(), TypeError> {
         if self.lhs_batching_dimensions.len() != self.rhs_batching_dimensions.len() {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` batching dimensions have different lengths on the two inputs",
@@ -234,82 +250,12 @@ impl DotDimensionNumbers {
             "RHS",
         )
     }
-
-    /// Returns the dimension numbers that map the output cotangent of `t ↦ dot(t, rhs)` back toward the linear
-    /// left-hand side `t`, together with the left-hand side axes in the order in which that adjoint contraction emits
-    /// them. These dimension numbers must describe a valid contraction of a left-hand side with rank `lhs_rank` and a
-    /// right-hand side with rank `rhs_rank`.
-    ///
-    /// The adjoint contraction is `dot(cotangent, rhs)`, and it emits the batching axes, the left-hand side result
-    /// axes, and then the left-hand side contracting axes sorted by their paired right-hand side axes. Callers must
-    /// request any output sharding in that intermediate order and then restore the original left-hand side axis order
-    /// with the inverse permutation.
-    fn lhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
-        let batching_count = self.rhs_batching_dimensions.len();
-        let lhs_result_dimensions = self.lhs_result_dimensions(lhs_rank);
-        let rhs_result_dimensions = self.rhs_result_dimensions(rhs_rank);
-        let cotangent_rhs_result_start = batching_count + lhs_result_dimensions.len();
-        let dimensions = Self::new(
-            (cotangent_rhs_result_start..(cotangent_rhs_result_start + rhs_result_dimensions.len())).collect(),
-            rhs_result_dimensions,
-            (0..batching_count).collect(),
-            self.rhs_batching_dimensions.clone(),
-        );
-        let mut contracting_pairs = self
-            .lhs_contracting_dimensions
-            .iter()
-            .copied()
-            .zip(self.rhs_contracting_dimensions.iter().copied())
-            .collect::<Vec<_>>();
-        contracting_pairs.sort_by_key(|(_, rhs_axis)| *rhs_axis);
-        let output_axes = self
-            .lhs_batching_dimensions
-            .iter()
-            .copied()
-            .chain(lhs_result_dimensions)
-            .chain(contracting_pairs.into_iter().map(|(lhs_axis, _)| lhs_axis))
-            .collect();
-        (dimensions, output_axes)
-    }
-
-    /// Returns the dimension numbers that map the output cotangent of `t ↦ dot(lhs, t)` back toward the linear
-    /// right-hand side `t`, together with the right-hand side axes in the order in which that adjoint contraction emits
-    /// them. These dimension numbers must describe a valid contraction of a left-hand side with rank `lhs_rank` and a
-    /// right-hand side with rank `rhs_rank`.
-    ///
-    /// The adjoint contraction is `dot(lhs, cotangent)`, and it emits the batching axes, the right-hand side
-    /// contracting axes sorted by their paired left-hand side axes, and then the right-hand side result axes. Callers
-    /// must request any output sharding in that intermediate order and then restore the original right-hand side axis
-    /// order with the inverse permutation.
-    fn rhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
-        let batching_count = self.lhs_batching_dimensions.len();
-        let lhs_result_dimensions = self.lhs_result_dimensions(lhs_rank);
-        let cotangent_lhs_result_count = lhs_result_dimensions.len();
-        let dimensions = Self::new(
-            lhs_result_dimensions,
-            (batching_count..(batching_count + cotangent_lhs_result_count)).collect(),
-            self.lhs_batching_dimensions.clone(),
-            (0..batching_count).collect(),
-        );
-        let mut contracting_pairs = self
-            .rhs_contracting_dimensions
-            .iter()
-            .copied()
-            .zip(self.lhs_contracting_dimensions.iter().copied())
-            .collect::<Vec<_>>();
-        contracting_pairs.sort_by_key(|(_, lhs_axis)| *lhs_axis);
-        let output_axes = self
-            .rhs_batching_dimensions
-            .iter()
-            .copied()
-            .chain(contracting_pairs.into_iter().map(|(rhs_axis, _)| rhs_axis))
-            .chain(self.rhs_result_dimensions(rhs_rank))
-            .collect();
-        (dimensions, output_axes)
-    }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl Display for DotDimensionNumbers {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -511,7 +457,7 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        self.dimensions.validate_for_ranks(
+        self.dimensions.validate(
             DOT_OPERATION_NAME,
             inputs[0].unbatched_type().rank(),
             inputs[1].unbatched_type().rank(),
@@ -628,10 +574,62 @@ impl_differentiable_operation! {
             // inverse permutation.
             let left_rank = inputs[0].r#type().rank();
             let right_rank = inputs[1].r#type().rank();
+            let primal_dimensions = operation.dimensions();
             let (dimensions, output_axes) = if linear_index == 0 {
-                operation.dimensions().lhs_cotangent_dimensions(left_rank, right_rank)
+                // Contract the output cotangent with the known right-hand side. The adjoint emits batching axes,
+                // left-hand side result axes, and contracting axes sorted by their paired right-hand side axes.
+                let batching_count = primal_dimensions.rhs_batching_dimensions.len();
+                let lhs_result_dimensions = primal_dimensions.lhs_result_dimensions(left_rank);
+                let rhs_result_dimensions = primal_dimensions.rhs_result_dimensions(right_rank);
+                let cotangent_rhs_result_start = batching_count + lhs_result_dimensions.len();
+                let dimensions = DotDimensionNumbers::new(
+                    (cotangent_rhs_result_start..(cotangent_rhs_result_start + rhs_result_dimensions.len())).collect(),
+                    rhs_result_dimensions,
+                    (0..batching_count).collect(),
+                    primal_dimensions.rhs_batching_dimensions.clone(),
+                );
+                let mut contracting_pairs = primal_dimensions
+                    .lhs_contracting_dimensions
+                    .iter()
+                    .copied()
+                    .zip(primal_dimensions.rhs_contracting_dimensions.iter().copied())
+                    .collect::<Vec<_>>();
+                contracting_pairs.sort_by_key(|(_, rhs_axis)| *rhs_axis);
+                let output_axes = primal_dimensions
+                    .lhs_batching_dimensions
+                    .iter()
+                    .copied()
+                    .chain(lhs_result_dimensions)
+                    .chain(contracting_pairs.into_iter().map(|(lhs_axis, _)| lhs_axis))
+                    .collect::<Vec<_>>();
+                (dimensions, output_axes)
             } else {
-                operation.dimensions().rhs_cotangent_dimensions(left_rank, right_rank)
+                // Contract the known left-hand side with the output cotangent. The adjoint emits batching axes,
+                // contracting axes sorted by their paired left-hand side axes, and right-hand side result axes.
+                let batching_count = primal_dimensions.lhs_batching_dimensions.len();
+                let lhs_result_dimensions = primal_dimensions.lhs_result_dimensions(left_rank);
+                let cotangent_lhs_result_count = lhs_result_dimensions.len();
+                let dimensions = DotDimensionNumbers::new(
+                    lhs_result_dimensions,
+                    (batching_count..(batching_count + cotangent_lhs_result_count)).collect(),
+                    primal_dimensions.lhs_batching_dimensions.clone(),
+                    (0..batching_count).collect(),
+                );
+                let mut contracting_pairs = primal_dimensions
+                    .rhs_contracting_dimensions
+                    .iter()
+                    .copied()
+                    .zip(primal_dimensions.lhs_contracting_dimensions.iter().copied())
+                    .collect::<Vec<_>>();
+                contracting_pairs.sort_by_key(|(_, lhs_axis)| *lhs_axis);
+                let output_axes = primal_dimensions
+                    .rhs_batching_dimensions
+                    .iter()
+                    .copied()
+                    .chain(contracting_pairs.into_iter().map(|(rhs_axis, _)| rhs_axis))
+                    .chain(primal_dimensions.rhs_result_dimensions(right_rank))
+                    .collect::<Vec<_>>();
+                (dimensions, output_axes)
             };
             let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
             let adjoint_output_sharding = linear_cotangent_type
@@ -946,7 +944,7 @@ impl RaggedDotDimensionNumbers {
 
     /// Validates every ordinary, ragged, and group axis before dimension number lifting, returning the ragged mode.
     fn validate_for_ranks(&self, lhs_rank: usize, rhs_rank: usize) -> Result<RaggedDotMode, TypeError> {
-        self.dot_dimensions.validate_for_ranks(RAGGED_DOT_OPERATION_NAME, lhs_rank, rhs_rank)?;
+        self.dot_dimensions.validate(RAGGED_DOT_OPERATION_NAME, lhs_rank, rhs_rank)?;
         let mode = self.mode(lhs_rank)?;
         let rhs_group_dimensions = self.rhs_group_dimensions();
         match mode {
@@ -1644,7 +1642,7 @@ pub(crate) fn dot_abstract(
     let rhs_batching = dimensions.rhs_batching_dimensions();
     let lhs_contracting = dimensions.lhs_contracting_dimensions();
     let rhs_contracting = dimensions.rhs_contracting_dimensions();
-    dimensions.validate_for_ranks(operation_name, lhs.rank(), rhs.rank())?;
+    dimensions.validate(operation_name, lhs.rank(), rhs.rank())?;
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
@@ -2386,30 +2384,34 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_dimension_numbers_lhs_cotangent_dimensions() {
+    fn test_dot_dimension_numbers_validate() {
+        assert_eq!(DotDimensionNumbers::matmul().validate(DOT_OPERATION_NAME, 2, 2), Ok(()));
+        assert_eq!(DotDimensionNumbers::default().validate(DOT_OPERATION_NAME, 0, 0), Ok(()));
         assert_eq!(
-            DotDimensionNumbers::matmul().lhs_cotangent_dimensions(2, 2),
-            (DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]), vec![0, 1]),
+            DotDimensionNumbers::matmul().validate("custom_dot", 1, 2),
+            Err(TypeError::invalid("`custom_dot` LHS dimension index out of bounds")),
         );
-        // The adjoint emits batching, result, and then contracting axes sorted by their paired RHS axes, which differs
-        // from the original LHS axis order.
         assert_eq!(
-            DotDimensionNumbers::new(vec![2, 0], vec![0, 2], vec![1], vec![1]).lhs_cotangent_dimensions(4, 4),
-            (DotDimensionNumbers::new(vec![2], vec![3], vec![0], vec![1]), vec![1, 3, 2, 0]),
+            DotDimensionNumbers::new(vec![1], vec![0], vec![0], vec![]).validate(DOT_OPERATION_NAME, 2, 2),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` batching dimensions have different lengths on the two inputs",
+            ))),
         );
-    }
-
-    #[test]
-    fn test_dot_dimension_numbers_rhs_cotangent_dimensions() {
         assert_eq!(
-            DotDimensionNumbers::matmul().rhs_cotangent_dimensions(2, 2),
-            (DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]), vec![0, 1]),
+            DotDimensionNumbers::new(vec![1], vec![], vec![], vec![]).validate(DOT_OPERATION_NAME, 2, 2),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` contracting dimensions have different lengths on the two inputs",
+            ))),
         );
-        // The adjoint emits batching, contracting axes sorted by their paired LHS axes, and then result axes, which
-        // differs from the original RHS axis order.
         assert_eq!(
-            DotDimensionNumbers::new(vec![2, 0], vec![0, 2], vec![1], vec![1]).rhs_cotangent_dimensions(4, 4),
-            (DotDimensionNumbers::new(vec![3], vec![1], vec![1], vec![0]), vec![1, 2, 0, 3]),
+            DotDimensionNumbers::new(vec![1, 1], vec![0, 2], vec![], vec![]).validate(DOT_OPERATION_NAME, 2, 3),
+            Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` LHS contracting dimensions must be distinct"))),
+        );
+        assert_eq!(
+            DotDimensionNumbers::new(vec![1], vec![0], vec![0], vec![0]).validate(DOT_OPERATION_NAME, 2, 2),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` RHS batching and contracting dimensions must be disjoint",
+            ))),
         );
     }
 
@@ -4098,6 +4100,61 @@ mod tests {
                 ).unwrap()],
                 input_cotangents = [Array::matrix(4, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0]).unwrap()],
             }],
+        );
+    }
+
+    #[test]
+    fn test_dot_transposition_multiple_contracting_axes() {
+        let input_type = plain_array(&[2, 2, 2, 1]);
+        let seed = Array::from_elements::<f32>(plain_array(&[2, 1, 1]), &[3.0, 5.0]).unwrap();
+
+        // Both adjoints must sort contracting axes by their paired input axes and restore the linear input's order.
+        // Pin the complete pullbacks as well as the gradients, because equal extents can hide a wrong permutation.
+        check_operation_transposition!(
+            @exact,
+            operation = DotOperation::new(DotDimensionNumbers::new(vec![2, 0], vec![0, 2], vec![1], vec![1])),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = input_type.clone())),
+                        (@known, Array::from_elements::<f32>(
+                            input_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                        ).unwrap()),
+                    ],
+                    output_cotangents = [seed.clone()],
+                    input_cotangents = [Array::from_elements::<f32>(
+                        input_type.clone(), &[3.0, 15.0, 15.0, 35.0, 6.0, 18.0, 20.0, 40.0],
+                    ).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f32[2, 1, 1], %1:f32[2, 2, 2, 1] .
+                        let %2:f32[2, 1, 2, 2] = dot [
+                            dimensions=(lhs_contracting=[2], rhs_contracting=[3], lhs_batching=[0], rhs_batching=[1]),
+                        ] %0 %1
+                            %3:f32[2, 2, 2, 1] = transpose [permutation=[3, 0, 2, 1]] %2
+                        in (%3)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@known, Array::from_elements::<f32>(
+                            input_type.clone(), &[11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0],
+                        ).unwrap()),
+                        (@linear(type = input_type.clone())),
+                    ],
+                    output_cotangents = [seed],
+                    input_cotangents = [Array::from_elements::<f32>(
+                        input_type, &[33.0, 45.0, 65.0, 85.0, 36.0, 48.0, 70.0, 90.0],
+                    ).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f32[2, 1, 1], %1:f32[2, 2, 2, 1] .
+                        let %2:f32[2, 2, 2, 1] = dot [
+                            dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[1], rhs_batching=[0]),
+                        ] %1 %0
+                            %3:f32[2, 2, 2, 1] = transpose [permutation=[2, 0, 1, 3]] %2
+                        in (%3)
+                    "},
+                },
+            ],
         );
     }
 

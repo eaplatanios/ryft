@@ -1254,7 +1254,6 @@ pub(super) enum CompositeTransposeRules<T, S> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use indoc::indoc;
@@ -1406,22 +1405,34 @@ mod tests {
         retained_carrier(ignored_zero_effect_definition().reference(), 1, vec![scalar_type.clone()], vec![scalar_type])
     }
 
+    /// Log of what the backward rule of a [`slice_at_one_definition`] observed on each invocation: the type of its
+    /// differentiated input, whether its seed is a structural zero, and the kind of its cotangent destination.
+    type SliceAtOneObservations = Arc<Mutex<Vec<(ArrayType, bool, CotangentDestinationKind)>>>;
+
     /// Returns a definition whose backward rule adds the output seed to the element at index 1 of its single
-    /// differentiated input's cotangent, counting its invocations in `invocations`. A caller buffer receives a slice
-    /// update without any full-sized temporary, while a returned cotangent is padded to the input extent.
-    fn slice_at_one_definition(invocations: &Arc<AtomicUsize>) -> IrRegistration {
-        let invocations = invocations.clone();
+    /// differentiated input's cotangent, logging what it observes on each invocation in `observations`. A caller buffer
+    /// receives a slice update without any full-sized temporary, while a returned cotangent is padded to the input
+    /// extent.
+    fn slice_at_one_definition(observations: &SliceAtOneObservations) -> IrRegistration {
+        let observations = observations.clone();
         CustomRuleRegistration::new(IrDefinition::new("slice_at_one").with_accumulating_vjp(
             |_| unreachable!("the tests construct the carrier directly"),
             move |context, inputs, seeds, accumulators| {
-                invocations.fetch_add(1, Ordering::SeqCst);
+                let ArrayIrType::Array(input_type) = inputs[0].r#type().into_owned() else { unreachable!() };
+                let buffer = if accumulators[0].is_needed() { accumulators[0].reference(context)? } else { None };
+                let destination_kind = match (accumulators[0].is_needed(), &buffer) {
+                    (false, _) => CotangentDestinationKind::Ignore,
+                    (true, Some(_)) => CotangentDestinationKind::Reference,
+                    (true, None) => CotangentDestinationKind::Return,
+                };
+                observations.lock().unwrap().push((input_type.clone(), seeds[0].is_zero(), destination_kind));
                 if !accumulators[0].is_needed() {
                     return Ok(());
                 }
                 let MaybeZero::Value(seed) = &seeds[0] else {
                     return Ok(());
                 };
-                if let Some(reference) = accumulators[0].reference(context)? {
+                if let Some(reference) = buffer {
                     let operation =
                         ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Slice {
                             axes: vec![ArraySliceAxis::new(1, 1, 1)],
@@ -1432,7 +1443,6 @@ mod tests {
                         &[reference, seed.clone()],
                     )?;
                 } else {
-                    let ArrayIrType::Array(input_type) = inputs[0].r#type().into_owned() else { unreachable!() };
                     let extent = input_type.shape().dimensions()[0].value().unwrap();
                     let zero = context.lift(ArrayIrValue::Array(Array::scalar(0.0f64)?))?;
                     let operation = ArrayIrOperation::from(ArrayOperation::Pad(PadOperation::new(
@@ -2052,16 +2062,24 @@ mod tests {
     #[test]
     fn test_composite_transpose_batching_retained_rules_seed_cotangent_types() {
         // Reduced and unreduced mesh axes are dual. A batched carrier must key its inner specialization with the
-        // cotangent type of the seed, so it shares the specialization already traced by an unbatched carrier.
+        // cotangent type of the seed, so it shares the specialization already traced by an unbatched carrier, and the
+        // backward rule is traced once, for a seed of the cotangent type.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let tangent_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         let cotangent_type = tangent_type.cotangent().unwrap();
         assert_ne!(tangent_type, cotangent_type);
+        let seed_types = Arc::new(Mutex::new(Vec::new()));
         let definition = CustomRuleRegistration::new(
             MemberDefinition::new("identity")
-                .with_vjp(|inputs| Ok((inputs.to_vec(), Vec::new())), |_, seeds| Ok(seeds.to_vec()))
+                .with_vjp(|inputs| Ok((inputs.to_vec(), Vec::new())), {
+                    let seed_types = seed_types.clone();
+                    move |_, seeds| {
+                        seed_types.lock().unwrap().push(seeds[0].r#type().into_owned());
+                        Ok(seeds.to_vec())
+                    }
+                })
                 .with_batching_support(),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2125,10 +2143,7 @@ mod tests {
             )
             .trim_end(),
         );
-        let (_, _, keys) = definition.cached_specialization_keys();
-        let unbatched_keys = keys.iter().filter(|key| key.levels.is_empty()).collect::<Vec<_>>();
-        assert_eq!(unbatched_keys.len(), 1);
-        assert_eq!(unbatched_keys[0].seed_types, vec![Some(cotangent_type)]);
+        assert_eq!(*seed_types.lock().unwrap(), vec![cotangent_type]);
     }
 
     #[test]
@@ -2616,11 +2631,11 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_transposition_retained_rules() {
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let definition = slice_at_one_definition(&invocations);
+        let observations = SliceAtOneObservations::default();
+        let definition = slice_at_one_definition(&observations);
         let ownership = ownership_probe(&definition);
         let program = slice_at_one_program(&definition, ArrayType::new_static(DataType::F64, [3]));
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(observations.lock().unwrap().is_empty());
 
         // One backward rule specializes to a returned cotangent and a caller buffer. An ignored sole destination leaves
         // the seed unused, so transposition specializes the rule for a structural zero seed as well, before removing
@@ -2670,10 +2685,10 @@ mod tests {
         assert_eq!(buffered.interpret(vec![seed.clone(), second.clone().into()]), Ok(vec![]));
         assert_eq!(second.read(), Ok(Array::vector(vec![40.0f64, 53.0, 60.0]).unwrap()));
         assert_eq!(ignored.interpret(vec![seed.clone()]), Ok(vec![]));
-        assert_eq!(invocations.load(Ordering::SeqCst), 3);
+        assert_eq!(observations.lock().unwrap().len(), 3);
         let repeated = program.clone().transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert_eq!(repeated.to_string(), buffered.to_string());
-        assert_eq!(invocations.load(Ordering::SeqCst), 3);
+        assert_eq!(observations.lock().unwrap().len(), 3);
 
         // A wider input is a different carrier signature, so its returned cotangent is rebuilt from its own extent
         // even though its seed type and destination kind are unchanged.
@@ -2683,51 +2698,43 @@ mod tests {
             wider_pullback.interpret(vec![seed]),
             Ok(vec![Array::vector(vec![0.0f64, 3.0, 0.0, 0.0]).unwrap().into()]),
         );
-        assert_eq!(invocations.load(Ordering::SeqCst), 4);
+        assert_eq!(observations.lock().unwrap().len(), 4);
 
         // The rule receives the current renamed boundary, but existing reference slicing requires a static referent
-        // type. Both failures report their current identity and do not retain failed specializations.
+        // type. Both failures report their current identity and do not retain failed specializations, so a repeated
+        // request traces the rule again.
         let original = DimensionVariable::new("original", DimensionBounds::new(2, Some(6)).unwrap());
         let relocated = DimensionVariable::new("relocated", DimensionBounds::new(2, Some(6)).unwrap());
         let original_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(original.clone())]));
         let relocated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(relocated.clone())]));
-        let symbolic = slice_at_one_program(&definition, original_type);
+        let symbolic = slice_at_one_program(&definition, original_type.clone());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(original, relocated).unwrap();
         let renamed = symbolic.clone().rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed.input_types(), vec![ArrayIrType::Array(relocated_type)]);
+        assert_eq!(renamed.input_types(), vec![ArrayIrType::Array(relocated_type.clone())]);
         assert!(matches!(
             symbolic.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "reference slicing requires a static referent type but got `f64[original]`",
         ));
-        assert!(matches!(
-            renamed.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "reference slicing requires a static referent type but got `f64[relocated]`",
-        ));
-        assert_eq!(invocations.load(Ordering::SeqCst), 6);
-        let seed_type: ArrayIrType = ArrayType::new_static(DataType::F64, [1]).into();
-        let key = |input_extent: usize, seed_type: Option<ArrayIrType>, destination_kind| {
-            CustomRuleBackwardSpecializationKey {
-                leading_input_types: Vec::new(),
-                seed_extent_count: 0,
-                input_tangent_types: vec![ArrayType::new_static(DataType::F64, [input_extent]).into()],
-                output_tangent_types: vec![ArrayType::new_static(DataType::F64, [1]).into()],
-                seed_types: vec![seed_type],
-                destination_kinds: vec![destination_kind],
-                levels: Vec::new(),
-                discharged: false,
-            }
-        };
-        let (_, _, backward_keys) = definition.cached_specialization_keys();
+        for _ in 0..2 {
+            assert!(matches!(
+                renamed.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]),
+                Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                    if message == "reference slicing requires a static referent type but got `f64[relocated]`",
+            ));
+        }
+        let vector = |extent: usize| ArrayType::new_static(DataType::F64, [extent]);
         assert_eq!(
-            backward_keys,
+            *observations.lock().unwrap(),
             vec![
-                key(4, Some(seed_type.clone()), CotangentDestinationKind::Return),
-                key(3, Some(seed_type.clone()), CotangentDestinationKind::Reference),
-                key(3, None, CotangentDestinationKind::Ignore),
-                key(3, Some(seed_type), CotangentDestinationKind::Return),
+                (vector(3), false, CotangentDestinationKind::Return),
+                (vector(3), false, CotangentDestinationKind::Reference),
+                (vector(3), true, CotangentDestinationKind::Ignore),
+                (vector(4), false, CotangentDestinationKind::Return),
+                (original_type, false, CotangentDestinationKind::Reference),
+                (relocated_type.clone(), false, CotangentDestinationKind::Reference),
+                (relocated_type, false, CotangentDestinationKind::Reference),
             ],
         );
 
@@ -3254,8 +3261,8 @@ mod tests {
             }
         }
 
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let definition = slice_at_one_definition(&invocations);
+        let observations = SliceAtOneObservations::default();
+        let definition = slice_at_one_definition(&observations);
         let ownership = ownership_probe(&definition);
         let input_type = ArrayType::new_static(DataType::F64, [4]);
         let mut builder = ProgramBuilder::<Array, MemberCarrier>::new();
@@ -3272,11 +3279,13 @@ mod tests {
             unreachable!()
         };
         assert_eq!(operation.rules(), Some(&definition.reference()));
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(observations.lock().unwrap().is_empty());
 
         // The first specialization happens after the conversion.
         let buffered = converted.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
-        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        let expected_observations =
+            vec![(ArrayType::new_static(DataType::F64, [4]), false, CotangentDestinationKind::Reference)];
+        assert_eq!(*observations.lock().unwrap(), expected_observations);
         assert_eq!(
             buffered.to_string(),
             indoc! {"
@@ -3293,7 +3302,7 @@ mod tests {
         let repeated =
             converted.clone().transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert_eq!(repeated.to_string(), buffered.to_string());
-        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(*observations.lock().unwrap(), expected_observations);
         drop((definition, converted));
         assert_eq!(ownership(), (false, false));
     }

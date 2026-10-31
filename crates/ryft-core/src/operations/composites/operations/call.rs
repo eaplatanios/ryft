@@ -2354,10 +2354,9 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::forward::JvpPartitionTransform;
     use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationContext, DifferentiationDriver,
-        DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule, EverythingSavable,
-        ForwardModeDifferentiate, Linearization, ReverseModeDifferentiate, TransposedProgramCotangent,
-        differentiate_at, rematerialize,
+        CotangentDestination, CotangentSeed, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+        DifferentiationError, DifferentiationPolicy, DifferentiationRule, EverythingSavable, ForwardModeDifferentiate,
+        Linearization, ReverseModeDifferentiate, TransposedProgramCotangent, differentiate_at, rematerialize,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
@@ -2367,9 +2366,7 @@ mod tests {
     use crate::operations::composites::operations::tests::{
         ArrayContext, ConvertedProgram, IrDefinition, IrTracer, batched_program, ir_custom_rule_program,
     };
-    use crate::operations::composites::rules::{
-        CustomRuleBackwardSpecializationKey, CustomRuleRegistration, LiftedCustomRules,
-    };
+    use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestContext, TestDefinition, TestRegistration, call_jvp, cube_definition,
         cube_program, custom_rule_program, member_cube_definition, ownership_probe,
@@ -5400,8 +5397,6 @@ mod tests {
         // specializations share one rule invocation.
         let jvp = batched.jvp().unwrap();
         assert_eq!(counters.counts(), (1, 0, 0));
-        let (jvp_keys, _, _) = definition.cached_specialization_keys();
-        assert_eq!(jvp_keys.len(), 2);
         assert_eq!(
             jvp.to_string(),
             indoc! {"
@@ -5683,8 +5678,6 @@ mod tests {
             ]),
         );
         assert_eq!(counters.counts(), (1, 0, 0));
-        let (jvp_keys, _, _) = definition.cached_specialization_keys();
-        assert_eq!(jvp_keys.iter().map(|key| key.levels.len()).collect::<Vec<_>>(), vec![2, 1, 0],);
     }
 
     #[test]
@@ -5851,7 +5844,6 @@ mod tests {
         let original = DimensionVariable::new("original", DimensionBounds::new(2, Some(6)).unwrap());
         let relocated = DimensionVariable::new("relocated", DimensionBounds::new(2, Some(6)).unwrap());
         let original_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(original.clone())]));
-        let relocated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(relocated.clone())]));
         let batched = batched_program(&custom_rule_program(&definition, original_type), 3, &[BatchAxis::new(0)]);
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(original, relocated).unwrap();
@@ -5867,8 +5859,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let (jvp_keys, _, _) = definition.cached_specialization_keys();
-        assert!(jvp_keys.iter().all(|key| key.input_types == vec![relocated_type.clone()]));
+        assert_eq!(counters.counts(), (1, 0, 0));
     }
 
     #[test]
@@ -7782,8 +7773,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        let (jvp_keys, _, _) = definition.cached_specialization_keys();
-        assert_eq!(jvp_keys.len(), 2);
 
         // A rule that receives structural zeros sees them as `MaybeZero::Zero` leaves and may return them as the
         // tangents of its outputs, which the specialization materializes at its boundary.
@@ -8142,7 +8131,6 @@ mod tests {
         let original = DimensionVariable::new("original", DimensionBounds::new(2, Some(6)).unwrap());
         let relocated = DimensionVariable::new("relocated", DimensionBounds::new(2, Some(6)).unwrap());
         let original_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(original.clone())]));
-        let relocated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(relocated.clone())]));
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let program = custom_rule_program(&definition, original_type);
 
@@ -8189,54 +8177,34 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(counters.counts(), (2, 1, 1));
-        let (jvp_keys, _, backward_keys) = definition.cached_specialization_keys();
-        assert_eq!(
-            jvp_keys,
-            vec![
-                CustomRuleForwardSpecializationKey {
-                    input_types: vec![static_type.clone()],
-                    output_types: vec![static_type],
-                    kept_outputs: None,
-                    non_differentiated_count: 0,
-                    tangent_activity: vec![true],
-                    levels: Vec::new(),
-                    discharged: false,
-                },
-                CustomRuleForwardSpecializationKey {
-                    input_types: vec![relocated_type.clone()],
-                    output_types: vec![relocated_type.clone()],
-                    kept_outputs: None,
-                    non_differentiated_count: 0,
-                    tangent_activity: vec![true],
-                    levels: Vec::new(),
-                    discharged: false,
-                },
-            ],
-        );
-        assert_eq!(
-            backward_keys,
-            vec![CustomRuleBackwardSpecializationKey {
-                leading_input_types: vec![relocated_type.clone()],
-                seed_extent_count: 0,
-                input_tangent_types: vec![relocated_type.clone()],
-                output_tangent_types: vec![relocated_type.clone()],
-                seed_types: vec![Some(relocated_type)],
-                destination_kinds: vec![CotangentDestinationKind::Return],
-                levels: Vec::new(),
-                discharged: false,
-            }],
-        );
     }
 
     #[test]
     fn test_composite_differentiation_retained_rules_specialization_output_signature() {
         // Two calls of one definition with identical input types but different primal outputs must not share a
-        // specialization: after the caches are warmed by a one-output primal, a two-output primal is validated afresh
-        // and rejected, rather than replaying the cached programs against the wrong output boundary.
+        // specialization. After the caches are warmed by a one-output primal, a two-output primal traces the rules
+        // afresh and is rejected, rather than replaying the cached programs against the wrong output boundary, while
+        // the one-output primal keeps reusing its cached specializations.
+        let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(
             TestDefinition::new("forward_input")
-                .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec())))
-                .with_vjp(|primals| Ok((primals.to_vec(), vec![])), |_, seeds| Ok(seeds.to_vec())),
+                .with_jvp({
+                    let counters = counters.clone();
+                    move |primals, tangents| {
+                        counters.jvp.fetch_add(1, Ordering::SeqCst);
+                        Ok((primals.to_vec(), tangents.to_vec()))
+                    }
+                })
+                .with_vjp(
+                    {
+                        let counters = counters.clone();
+                        move |primals| {
+                            counters.forward.fetch_add(1, Ordering::SeqCst);
+                            Ok((primals.to_vec(), vec![]))
+                        }
+                    },
+                    |_, seeds| Ok(seeds.to_vec()),
+                ),
         );
         let r#type = ArrayType::scalar(DataType::F64);
         let primal = |output_count: usize| {
@@ -8275,8 +8243,11 @@ mod tests {
                 )
                 .map(|(outputs, _)| outputs)
         };
-        assert_eq!(jvp(primal(1)), Ok((vec![Array::scalar(2f64).unwrap()], vec![Array::scalar(1f64).unwrap()])));
-        assert_eq!(vjp(primal(1)), Ok(vec![Array::scalar(2f64).unwrap()]));
+        let expected_jvp = Ok((vec![Array::scalar(2f64).unwrap()], vec![Array::scalar(1f64).unwrap()]));
+        let expected_vjp = Ok(vec![Array::scalar(2f64).unwrap()]);
+        assert_eq!(jvp(primal(1)), expected_jvp);
+        assert_eq!(vjp(primal(1)), expected_vjp);
+        assert_eq!(counters.counts(), (1, 1, 0));
         assert!(matches!(
             jvp(primal(2)),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
@@ -8288,9 +8259,10 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "`composite` `forward_input` forward rule returned 1 outputs but the primal has 2",
         ));
-        let (jvp_keys, forward_keys, _) = definition.cached_specialization_keys();
-        assert_eq!(jvp_keys.len(), 1);
-        assert_eq!(forward_keys.len(), 1);
+        assert_eq!(counters.counts(), (2, 2, 0));
+        assert_eq!(jvp(primal(1)), expected_jvp);
+        assert_eq!(vjp(primal(1)), expected_vjp);
+        assert_eq!(counters.counts(), (2, 2, 0));
     }
 
     #[test]
