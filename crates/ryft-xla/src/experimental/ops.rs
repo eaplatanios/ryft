@@ -1439,7 +1439,7 @@ pub(crate) mod tests {
         for (jvp_rule, has_vjp_rule, non_differentiated_count) in [
             (CompositeJvpRule::Explicit, false, 2),
             (CompositeJvpRule::Absent, true, 3),
-            (CompositeJvpRule::Primal, true, 1),
+            (CompositeJvpRule::Derived, true, 1),
         ] {
             let composite = CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule)
                 .with_non_differentiated_count(non_differentiated_count)

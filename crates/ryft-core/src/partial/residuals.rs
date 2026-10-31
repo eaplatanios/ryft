@@ -4817,7 +4817,7 @@ mod tests {
             let mut outputs = Vec::new();
             for (input, output_index) in inputs.into_iter().zip(selected_outputs) {
                 let call =
-                    TestOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false));
+                    TestOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Derived, false));
                 outputs.push(branch.add_instruction(call, vec![body], vec![input], None).unwrap()[output_index]);
             }
             let sum = add(&mut branch, AddOperation::<ArrayType>::new().into(), outputs);

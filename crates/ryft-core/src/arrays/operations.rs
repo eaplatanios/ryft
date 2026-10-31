@@ -2633,7 +2633,7 @@ mod tests {
         // Every region-carrying array payload has an array IR carrier, so none of them reaches the region-free
         // projected `Array` variant. Composite calls preserve their rule layout and non-differentiated input split.
         // Rematerialization preserves its policy's identity, optimization barrier, and differentiation state.
-        for jvp_rule in [CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Primal] {
+        for jvp_rule in [CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Derived] {
             for has_vjp_rule in [false, true] {
                 let operation = CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule)
                     .with_non_differentiated_count(2)

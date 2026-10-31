@@ -2391,7 +2391,7 @@ mod tests {
         let body = build_program(vec![local_type.clone()], |builder, inputs| {
             let primal = builder.import_program(reduce());
             let composite =
-                CompositeOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Primal, false);
+                CompositeOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Derived, false);
             let value = builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap()[0];
             let regions = vec![builder.import_program(reduce()), builder.import_program(identity)];
             let linear_call = LinearCallOperation::<ArrayIrType>::new(0);
