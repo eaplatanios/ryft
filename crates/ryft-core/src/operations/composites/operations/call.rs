@@ -25,10 +25,10 @@ use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 use crate::operations::composites::operations::transpose_carrier_batching;
+use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey,
-    CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey,
-    CustomRuleSpecializer, CustomRuleTracer,
+    CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey, CustomRuleTracer,
 };
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameter, Placeholder};

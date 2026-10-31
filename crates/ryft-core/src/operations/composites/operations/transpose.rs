@@ -25,9 +25,10 @@ use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::call::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::transpose_carrier_batching;
+use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleReference,
-    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer,
+    CustomRuleSource, CustomRuleSpecializationKey, CustomRuleTracer,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
