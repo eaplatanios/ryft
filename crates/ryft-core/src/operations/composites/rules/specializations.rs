@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
@@ -17,7 +17,6 @@ use crate::differentiation::{
     CotangentDestinationKind, DifferentiableType, DifferentiationError, ResidualZeroProvider,
     TransposedProgramCotangent,
 };
-use crate::macros::check_count;
 use crate::operations::composites::derive_bijective_identity_renaming;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
@@ -35,46 +34,41 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
     MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, Value, ValueProjection,
 };
-use crate::specialization::SpecializationCacheError;
 use crate::tracing::TracingContext;
 
 #[cfg(doc)]
 use crate::batching::DiagonalBatchingPolicy;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Derivation of a definition from a source definition, which is stored in the derived definition as its batching rule
-/// (refer to [`CustomRuleDefinition::batching_rule`] and [`CustomRuleSpecializer::derived`]).
+/// Derivation of a definition from a source definition, which is stored in the derived definition as its batching rule.
 pub(super) struct CustomRuleDerivation<V: Typed + Parameter, O> {
-    /// Rules of the source definition.
+    /// Reference to the source [`CustomRuleDefinition`] whose batching rule is differentiated for this derivation.
     source: CustomRuleReference<V, O>,
 
     /// Key of this derivation.
     key: CustomRuleDerivedDefinitionKey,
 }
 
-/// Seals [`CustomRuleSource`] and [`CustomRuleSpecializer`] (refer to the documentation of [`CustomRuleSource`]).
+/// Seals [`CustomRuleSource`] to the source representations supported by composites.
 mod sealed {
-    /// Supertrait of [`CustomRuleSource`](super::CustomRuleSource) that only this module can implement.
+    /// Marker for the supported native and lifted rule source representations.
     pub trait Sealed {}
 }
 
 impl<V: Typed + Parameter, O> sealed::Sealed for CustomRuleReference<V, O> {}
 
-impl<Vm: Typed + Parameter, Om> sealed::Sealed for LiftedCustomRules<Vm, Om> {}
+impl<V: Typed + Parameter, O> sealed::Sealed for LiftedCustomRules<V, O> {}
 
 /// Source of the retained rules that a [`CompositeOperation`](crate::CompositeOperation) and its
-/// [`CompositeTransposeOperation`] apply, which provides their specializations as programs of the operations' own
-/// family `(V, O)`. [`CustomRuleReference`] is the source of a definition registered in that family, and
+/// [`CompositeTransposeOperation`] apply, which provides their specializations as programs of the operations'
+/// own family `(V, O)`. [`CustomRuleReference`] is the source of a definition registered in that family, and
 /// [`LiftedCustomRules`] is the source of a call that was converted into that family from a member family (e.g., from
 /// array programs into array IR programs), whose specializations the member definition produces and caches before they
 /// are converted. Equality and hashing use the identity of the source's definition.
 ///
-/// This trait describes the rules only, which is all that every transform except differentiation needs. Internal
-/// specialization functions produce their programs and carry the heavier bounds of converted sources (e.g., on the
-/// member family's operations). Keeping those bounds separate from this trait keeps them out of the [`Operation`]
-/// implementation of the operations, where they would form a cycle with the payload bounds of the families that
-/// contain them.
+/// This trait exposes metadata without requiring the bounds needed to produce specialized rule programs. The internal
+/// specialization interface carries the heavier bounds of converted sources (e.g., on the member family's operations).
+/// Keeping those bounds separate lets the operations implement [`Operation`] without introducing a cycle with the
+/// payload bounds of the families that contain them.
 ///
 /// This trait is sealed and implemented only by [`CustomRuleReference`] and [`LiftedCustomRules`]. New kinds of rules
 /// are registered through [`CustomRuleDefinition`].
@@ -87,55 +81,48 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// Returns the human-readable label of the source's definition.
     fn name(&self) -> &str;
 
-    /// Returns whether the source has a retained forward mode (i.e., JVP) rule.
+    /// Returns whether the source has a retained forward mode differentiation
+    /// (i.e., Jacobian-Vector Product or JVP) rule.
     fn has_jvp(&self) -> bool;
 
-    /// Returns whether the source derives its forward mode rule from the primal region of each call (refer to
-    /// [`CustomRuleDefinition::with_jvp_from_primal`]).
+    /// Returns whether the source derives its forward mode differentiation rule from the primal region of each call.
     fn derives_jvp_from_primal(&self) -> bool;
 
-    /// Returns whether the source has reverse mode (i.e., VJP) forward and backward rules.
+    /// Returns whether the source has reverse mode differentiation (i.e., Vector-Jacobian Product or VJP)
+    /// forward and backward rules.
     fn has_vjp(&self) -> bool;
 
-    /// Returns whether the source has reverse mode rules whose forward rule reverse mode defers to the backward pass
-    /// (refer to [`CustomRuleDefinition::with_deferred_forward_rule`]).
+    /// Returns whether the source has reverse mode differentiation rules whose forward rule reverse mode defers
+    /// to the backward pass.
     fn defers_forward(&self) -> bool;
 
-    /// Returns the declared batch axes of the outputs of batched calls (refer to
-    /// [`CustomRuleDefinition::with_batched_output_axes`]), or [`None`] when they are not declared.
+    /// Returns the declared batch axes of the outputs of batched calls, or [`None`] when they are not declared.
     fn batched_output_axes(&self) -> Option<&[BatchAxis]>;
 
-    /// Returns whether the source has a custom batching rule (refer to [`CustomRuleDefinition::with_batching_rule`]),
-    /// which takes precedence over structurally batching the primal region of its calls.
+    /// Returns whether the source has a custom batching rule, which takes precedence over structurally batching
+    /// the primal region of its calls.
     fn has_batching_rule(&self) -> bool;
 
-    /// Returns whether the source batches its calls sequentially (refer to
-    /// [`CustomRuleDefinition::with_sequential_batching`]) when it has no custom batching rule.
+    /// Returns whether the source batches its calls sequentially when it has no custom batching rule.
     fn has_sequential_batching(&self) -> bool;
 
-    /// Returns the definition whose rules the source applies directly, or [`None`] when the source obtains its
-    /// specializations elsewhere (e.g., from a member definition).
+    /// Returns the definition of this source if it was registered in the source's own family `(V, O)`, and [`None`] for
+    /// a [`LiftedCustomRules`] source, whose definition belongs to a member family. Only a native definition's rules
+    /// can be applied directly to values of this family (e.g., to invoke a backward rule while transposing).
     fn native_definition(&self) -> Option<&CustomRuleDefinition<V, O>>;
 
     /// Returns whether backward specializations of the source can write cotangents to caller-provided buffers. A
     /// source that cannot returns those cotangents instead, and the carrier's accumulators add them to the buffers.
     fn supports_reference_destinations(&self) -> bool;
-
-    /// Returns the batch axes of the outputs of batched calls that have `output_count` outputs, which map every output
-    /// at axis 0 unless the source declares them.
-    fn batched_call_output_axes(&self, output_count: usize) -> Result<Vec<BatchAxis>, TypeError> {
-        let Some(output_axes) = self.batched_output_axes() else {
-            return Ok(vec![BatchAxis::new(0); output_count]);
-        };
-        check_count!("batched output axis", output_axes, output_count, TypeError);
-        Ok(output_axes.to_vec())
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`CustomRuleSource`] that produces the specializations of its rules, as programs of the operations' own family
 /// `(V, O)`. The functions that produce specializations carry their bounds themselves rather than on the trait, like
 /// the rule traits, which keeps the operations free of bounds on `O` that would form a cycle with the payload bounds of
-/// the families that contain them. It is sealed (refer to the documentation of [`CustomRuleSource`]).
+/// the families that contain them. This interface is internal because its specialization keys and results describe
+/// composite implementation details.
 pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>:
     CustomRuleSource<V, O>
 {
@@ -974,7 +961,7 @@ impl UnavailableCustomRules {
     }
 }
 
-/// Source of the rules of a call that was converted from a member family `(Vm, Om)` into a family that contains it
+/// Source of the rules of a call that was converted from a member family `(V, O)` into a family that contains it
 /// (e.g., from array programs into array IR programs, or into a backend family). Each specialization request projects
 /// its key into the member family, obtains the specialization from the member definition (so that the member
 /// definition's caches, batcher, and transposer serve every family that its calls reach), and converts the program
@@ -987,17 +974,17 @@ impl UnavailableCustomRules {
 /// (e.g., references or first-class dimensions of array IR programs), and batching levels whose dynamic extents have no
 /// member representation. A backward rule of a converted call returns cotangents whose destinations are caller-provided
 /// buffers, and the carrier's accumulators add them to those buffers.
-pub enum LiftedCustomRules<Vm: Typed + Parameter, Om> {
+pub enum LiftedCustomRules<V: Typed + Parameter, O> {
     /// Rules of a definition registered in the member family.
-    Member(CustomRuleReference<Vm, Om>),
+    Member(CustomRuleReference<V, O>),
 
     /// Rules of a definition that cannot be converted into the requesting family.
     Unavailable(UnavailableCustomRules),
 }
 
-impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> LiftedCustomRules<V, O> {
     /// Returns the rules of the member definition, or the error that a derivative request of unavailable rules reports.
-    fn member(&self) -> Result<&CustomRuleReference<Vm, Om>, DifferentiationError> {
+    fn member(&self) -> Result<&CustomRuleReference<V, O>, DifferentiationError> {
         match self {
             Self::Member(rules) => Ok(rules),
             Self::Unavailable(rules) => Err(rules.error()),
@@ -1006,15 +993,15 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
 
     /// Projects the provided types of a converted call into the member family, rejecting types that have no member
     /// representation.
-    fn project_types<Tc>(&self, types: &[Tc]) -> Result<Vec<Vm::Type>, DifferentiationError>
+    fn project_types<Tc>(&self, types: &[Tc]) -> Result<Vec<V::Type>, DifferentiationError>
     where
         Tc: Type,
-        for<'t> &'t Vm::Type: TryFrom<&'t Tc, Error = TypeError>,
+        for<'t> &'t V::Type: TryFrom<&'t Tc, Error = TypeError>,
     {
         types
             .iter()
             .map(|r#type| {
-                <&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
+                <&V::Type>::try_from(r#type).cloned().map_err(|_| {
                     ProgramError::UnsupportedOperation {
                         message: format!(
                             "{} cannot be differentiated with respect to type \
@@ -1040,10 +1027,10 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
     fn project_levels<Tc>(
         &self,
         levels: &[CustomRuleBatchingLevel<Tc>],
-    ) -> Result<Vec<CustomRuleBatchingLevel<Vm::Type>>, DifferentiationError>
+    ) -> Result<Vec<CustomRuleBatchingLevel<V::Type>>, DifferentiationError>
     where
         Tc: Type,
-        for<'t> &'t Vm::Type: TryFrom<&'t Tc, Error = TypeError>,
+        for<'t> &'t V::Type: TryFrom<&'t Tc, Error = TypeError>,
     {
         levels
             .iter()
@@ -1051,7 +1038,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
                 let extent = match level.level.extent() {
                     BatchingLevelExtent::Static(extent) => BatchingLevelExtent::Static(*extent),
                     BatchingLevelExtent::Dynamic(r#type) => {
-                        BatchingLevelExtent::Dynamic(<&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
+                        BatchingLevelExtent::Dynamic(<&V::Type>::try_from(r#type).cloned().map_err(|_| {
                             ProgramError::UnsupportedOperation {
                                 message: format!(
                                     "{} cannot differentiate a batched call whose \
@@ -1093,7 +1080,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
     }
 }
 
-impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Clone for LiftedCustomRules<Vm, Om> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> Clone for LiftedCustomRules<V, O> {
     fn clone(&self) -> Self {
         match self {
             Self::Member(rules) => Self::Member(rules.clone()),
@@ -1102,7 +1089,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Clone for LiftedCustomRules<Vm,
     }
 }
 
-impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Debug for LiftedCustomRules<Vm, Om> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for LiftedCustomRules<V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Member(rules) => formatter.debug_tuple("Member").field(rules).finish(),
@@ -1111,7 +1098,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Debug for LiftedCustomRules<Vm,
     }
 }
 
-impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> PartialEq for LiftedCustomRules<Vm, Om> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> PartialEq for LiftedCustomRules<V, O> {
     fn eq(&self, other: &Self) -> bool {
         let id = |rules: &Self| match rules {
             Self::Member(rules) => rules.definition().id(),
@@ -1121,9 +1108,9 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> PartialEq for LiftedCustomRules
     }
 }
 
-impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Eq for LiftedCustomRules<Vm, Om> {}
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> Eq for LiftedCustomRules<V, O> {}
 
-impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Hash for LiftedCustomRules<Vm, Om> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O> Hash for LiftedCustomRules<V, O> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             Self::Member(rules) => rules.definition().id().hash(state),
@@ -1132,10 +1119,10 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> Hash for LiftedCustomRules<Vm, 
     }
 }
 
-impl<Vm, Om, Vc, Oc> CustomRuleSource<Vc, Oc> for LiftedCustomRules<Vm, Om>
+impl<V, O, VC, OC> CustomRuleSource<VC, OC> for LiftedCustomRules<V, O>
 where
-    Vm: Typed<Type: Eq + Hash> + Parameter,
-    Vc: Typed<Type: Eq + Hash> + Parameter,
+    V: Typed<Type: Eq + Hash> + Parameter,
+    VC: Typed<Type: Eq + Hash> + Parameter,
 {
     fn id(&self) -> u64 {
         match self {
@@ -1199,7 +1186,7 @@ where
     }
 
     #[inline]
-    fn native_definition(&self) -> Option<&CustomRuleDefinition<Vc, Oc>> {
+    fn native_definition(&self) -> Option<&CustomRuleDefinition<VC, OC>> {
         None
     }
 
@@ -1209,25 +1196,25 @@ where
     }
 }
 
-impl<Vm, Om, Vc, Oc> CustomRuleSpecializer<Vc, Oc> for LiftedCustomRules<Vm, Om>
+impl<V, O, VC, OC> CustomRuleSpecializer<VC, OC> for LiftedCustomRules<V, O>
 where
-    Vm: Value<Type: DifferentiableType + Eq + Hash>,
-    TracingContext<Vm, Om>: StagingContext<Type = Vm::Type, Constant = Vm, Operation = Om>,
-    Om: Operation<Type = Vm::Type>
-        + From<CompositeTransposeOperation<Vm, Om>>
-        + ResidualZeroProvider<Vm::Type, Operation = Om>,
-    Vc: 'static + ValueProjection<Vm::Type, Projected = Vm, Type: Eq + Hash + From<Vm::Type>>,
-    Oc: 'static + From<Om>,
-    CustomRuleSpecialization<Vc, Oc>: Send + Sync,
-    for<'t> &'t Vm::Type: TryFrom<&'t Vc::Type, Error = TypeError>,
+    V: Value<Type: DifferentiableType + Eq + Hash>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    O: Operation<Type = V::Type>
+        + From<CompositeTransposeOperation<V, O>>
+        + ResidualZeroProvider<V::Type, Operation = O>,
+    VC: 'static + ValueProjection<V::Type, Projected = V, Type: Eq + Hash + From<V::Type>>,
+    OC: 'static + From<O>,
+    CustomRuleSpecialization<VC, OC>: Send + Sync,
+    for<'t> &'t V::Type: TryFrom<&'t VC::Type, Error = TypeError>,
 {
     fn jvp_specialization(
         &self,
-        key: CustomRuleForwardSpecializationKey<Vc::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
+        key: CustomRuleForwardSpecializationKey<VC::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<VC, OC>>, DifferentiationError>
     where
-        Vc: Value<Type: DifferentiableType>,
-        Oc: Operation<Type = Vc::Type> + ResidualZeroProvider<Vc::Type, Operation = Oc>,
+        VC: Value<Type: DifferentiableType>,
+        OC: Operation<Type = VC::Type> + ResidualZeroProvider<VC::Type, Operation = OC>,
     {
         let member = self.member()?;
         let member_key = CustomRuleForwardSpecializationKey {
@@ -1242,7 +1229,7 @@ where
         member.converted_specialization(CustomRuleSpecializationRequest::Jvp(member_key.clone()), || {
             let specialization = member.jvp_specialization(member_key)?;
             Ok(Arc::new(CustomRuleSpecialization {
-                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                program: specialization.program.clone().into_unprojected::<VC, OC>()?,
                 output_axes: specialization.output_axes.clone(),
                 cotangents: specialization.cotangents.clone(),
             }))
@@ -1251,11 +1238,11 @@ where
 
     fn forward_specialization(
         &self,
-        key: CustomRuleForwardSpecializationKey<Vc::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
+        key: CustomRuleForwardSpecializationKey<VC::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<VC, OC>>, DifferentiationError>
     where
-        Vc: Value<Type: DifferentiableType>,
-        Oc: Operation<Type = Vc::Type>,
+        VC: Value<Type: DifferentiableType>,
+        OC: Operation<Type = VC::Type>,
     {
         let member = self.member()?;
         let member_key = CustomRuleForwardSpecializationKey {
@@ -1270,7 +1257,7 @@ where
         member.converted_specialization(CustomRuleSpecializationRequest::Forward(member_key.clone()), || {
             let specialization = member.forward_specialization(member_key)?;
             Ok(Arc::new(CustomRuleSpecialization {
-                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                program: specialization.program.clone().into_unprojected::<VC, OC>()?,
                 output_axes: specialization.output_axes.clone(),
                 cotangents: specialization.cotangents.clone(),
             }))
@@ -1279,11 +1266,11 @@ where
 
     fn backward_specialization(
         &self,
-        key: CustomRuleBackwardSpecializationKey<Vc::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
+        key: CustomRuleBackwardSpecializationKey<VC::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<VC, OC>>, DifferentiationError>
     where
-        Vc: Value<Type: DifferentiableType>,
-        Oc: Operation<Type = Vc::Type> + From<CompositeTransposeOperation<Vc, Oc>>,
+        VC: Value<Type: DifferentiableType>,
+        OC: Operation<Type = VC::Type> + From<CompositeTransposeOperation<VC, OC>>,
     {
         // Carriers of converted calls request returned cotangents for caller buffers (refer to
         // `supports_reference_destinations`), so a buffer destination here means that a carrier skipped that step.
@@ -1326,7 +1313,7 @@ where
         member.converted_specialization(CustomRuleSpecializationRequest::Backward(member_key.clone()), || {
             let specialization = member.backward_specialization(member_key)?;
             Ok(Arc::new(CustomRuleSpecialization {
-                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                program: specialization.program.clone().into_unprojected::<VC, OC>()?,
                 output_axes: specialization.output_axes.clone(),
                 cotangents: specialization.cotangents.clone(),
             }))
@@ -1335,16 +1322,16 @@ where
 
     fn batching_rule_specialization(
         &self,
-        key: CustomRuleBatchingSpecializationKey<Vc::Type>,
-    ) -> Result<Arc<CustomRuleSpecialization<Vc, Oc>>, DifferentiationError>
+        key: CustomRuleBatchingSpecializationKey<VC::Type>,
+    ) -> Result<Arc<CustomRuleSpecialization<VC, OC>>, DifferentiationError>
     where
-        Vc: Value<Type: DifferentiableType>,
-        Oc: Operation<Type = Vc::Type>,
+        VC: Value<Type: DifferentiableType>,
+        OC: Operation<Type = VC::Type>,
     {
         // The member rule batches the call at the projected input types, and its program is converted back.
         let member = self.member()?;
-        let project = |r#type: &Vc::Type| {
-            <&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
+        let project = |r#type: &VC::Type| {
+            <&V::Type>::try_from(r#type).cloned().map_err(|_| {
                 DifferentiationError::from(ProgramError::UnsupportedOperation {
                     message: format!(
                         "{} cannot batch a call over type `{type}`, which the \
@@ -1380,7 +1367,7 @@ where
         member.converted_specialization(CustomRuleSpecializationRequest::BatchingRule(member_key.clone()), || {
             let specialization = member.batching_rule_specialization(member_key)?;
             Ok(Arc::new(CustomRuleSpecialization {
-                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                program: specialization.program.clone().into_unprojected::<VC, OC>()?,
                 output_axes: specialization.output_axes.clone(),
                 cotangents: specialization.cotangents.clone(),
             }))
@@ -1393,12 +1380,12 @@ where
         carry_count: usize,
         axis_sharding: &ShardingDimension,
         stacked_output_count: usize,
-    ) -> Result<(Oc, Vc::Type), DifferentiationError> {
+    ) -> Result<(OC, VC::Type), DifferentiationError> {
         // The member definition constructs the scan in its own family, which contains the scan operation and the type
         // of its slice index of this family.
         let (scan, index_type) =
             self.member()?.sequential_batching_scan(length, carry_count, axis_sharding, stacked_output_count)?;
-        Ok((Oc::from(scan), index_type.into()))
+        Ok((OC::from(scan), index_type.into()))
     }
 
     fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
@@ -2141,28 +2128,6 @@ where
         return Ok(program);
     }
     program.rename_type_identities(&renaming)
-}
-
-/// Converts a failed or reentrant specialization of a retained rule of the custom rule set named `name` into a
-/// [`DifferentiationError`], keeping the rule's own error when it produced one.
-pub(super) fn specialization_error<E: Debug + Display + Into<DifferentiationError>>(
-    name: &str,
-    error: SpecializationCacheError<E>,
-) -> DifferentiationError {
-    match error {
-        SpecializationCacheError::Production(error) => error.into(),
-        error @ SpecializationCacheError::Reentrant(_) => ProgramError::UnsupportedOperation {
-            message: format!(
-                "{} makes a {error}",
-                if name == COMPOSITE_OPERATION_NAME {
-                    format!("`{COMPOSITE_OPERATION_NAME}`")
-                } else {
-                    format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
-                },
-            ),
-        }
-        .into(),
-    }
 }
 
 #[cfg(test)]

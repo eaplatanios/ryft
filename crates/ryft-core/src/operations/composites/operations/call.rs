@@ -1233,8 +1233,14 @@ where
                         }
                     }
                 } else {
-                    let output_axes = rules
-                        .batched_call_output_axes(rule_output_count)?
+                    let output_axes = match rules.batched_output_axes() {
+                        Some(output_axes) => {
+                            check_count!("batched output axis", output_axes, rule_output_count, TypeError);
+                            output_axes.to_vec()
+                        }
+                        None => vec![BatchAxis::new(0); rule_output_count],
+                    };
+                    let output_axes = output_axes
                         .into_iter()
                         .enumerate()
                         .filter_map(|(index, axis)| is_kept(index).then_some(axis))
@@ -5626,6 +5632,21 @@ mod tests {
             ),
             Err(BatchingError::MisalignedBatchAxes { message })
                 if message == "batched region output axes [axis 0] do not match the target output axes [replicated]",
+        ));
+
+        // The declared layout must describe every rule output before batching the primal.
+        let definition = TestDefinition::new("scaled_parameter")
+            .with_batching_support()
+            .with_batched_output_axes(vec![BatchAxis::new(0), BatchAxis::replicated()]);
+        assert!(matches!(
+            program(definition).batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::Type(TypeError::Invalid { message }))
+                if message == "expected 1 batched output axis but got 2",
         ));
     }
 

@@ -167,7 +167,7 @@ impl Operation for ScaledDotOperation {
 
         let dot_lhs = lhs.clone().with_data_type(DataType::BF16);
         let dot_rhs = rhs.clone().with_data_type(DataType::BF16);
-        let output_type = dot_abstract(
+        let output_type = infer_dot_output_type(
             DOT_OPERATION_NAME,
             &dot_lhs,
             &dot_rhs,

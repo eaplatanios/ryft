@@ -269,23 +269,23 @@ impl Display for DotDimensionNumbers {
 /// Canonical operation name for [`DotOperation`].
 pub const DOT_OPERATION_NAME: &str = "dot";
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Primitive representing a generalized dot (tensor contraction) of two identically typed numeric inputs. Boolean,
-/// token, and structural zero element types are rejected.
+/// Primitive representing a generalized dot operation (i.e., a tensor contraction) of two identically typed numeric
+/// inputs. Boolean, token, and structural zero element types are rejected. [`DotOperation`] is the unified primitive
+/// for matrix multiplication, batched matrix multiplication, vector inner products, and arbitrary tensor contractions.
+/// The XLA backend lowers it to StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general)
+/// instruction.
 ///
-/// [`DotOperation`] is the unified primitive for matrix multiplication, batched matrix multiplication, vector inner
-/// products, and arbitrary tensor contractions. The XLA backend lowers it to StableHLO's
-/// [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) instruction.
+/// Without an accumulation type, the output keeps the input element type. The eager [`Array`] kernel accumulates
+/// floating-point inputs narrower than `f32` at `f32` and rounds each result once, which is how the XLA backend
+/// evaluates such dot operations. Integer products and sums wrap at the declared element width, and every other
+/// element type accumulates at itself.
 ///
-/// Without an accumulation type, the output keeps the input element type. The eager kernel accumulates floating-point
-/// inputs narrower than `f32` at `f32` and rounds each result once, which is how XLA backends evaluate such dots.
-/// Integer products and sums wrap at the declared element width, and every other element type accumulates at itself.
-///
-/// A dot is bilinear. Forward mode differentiation applies `d(dot(lhs, rhs)) = dot(dlhs, rhs) + dot(lhs, drhs)`.
-/// Transposition therefore accepts exactly one linear input and contracts the output cotangent with the other, known
-/// input using the corresponding adjoint dimension numbers. Dots with an accumulation type perform those contractions
-/// at the widened cotangent type before converting the result back to the linear input's cotangent representation.
+/// A dot is bilinear, so for `y = dot(a, b)`, forward mode differentiation computes `ẏ = dot(ȧ, b) + dot(a, ḃ)`.
+/// Transposition accepts exactly one linear input and contracts the output cotangent `ȳ` with the other, known input
+/// using the corresponding adjoint dimension numbers. For a matrix multiplication `y = a · b`, for example, it computes
+/// `ā = ȳ · bᵀ` when `a` is linear and `b̄ = aᵀ · ȳ` when `b` is linear. Dots with an accumulation type perform those
+/// contractions at the widened cotangent type before converting the result back to the linear input's cotangent
+/// representation.
 ///
 /// Each forward mode tangent term is staged as an ordinary dot that preserves the primal dimension numbers,
 /// accumulation type, and requested output sharding without introducing captures. The adjoint contraction emits the
@@ -295,8 +295,7 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 ///
 /// Batching aligns the inputs onto a common mapped axis and lifts the dimension numbers past it. Materializing an axis
 /// on a replicated input preserves a dynamic mapped extent as a first-class value. Two mapped inputs must describe the
-/// same mapped extent. For dynamic extents, they must share the same
-/// [`DimensionVariable`](crate::arrays::DimensionVariable).
+/// same mapped extent. For dynamic extents, they must share the same [`DimensionVariable`](crate::DimensionVariable).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotOperation {
     /// Contracting and batching dimension specification.
@@ -310,7 +309,7 @@ pub struct DotOperation {
 }
 
 impl DotOperation {
-    /// Creates a new [`DotOperation`] with the supplied dimension numbers.
+    /// Creates a new [`DotOperation`] with the provided dimension numbers.
     #[inline]
     pub fn new(dimensions: DotDimensionNumbers) -> Self {
         Self { dimensions, accumulation_type: None, output_sharding: None }
@@ -322,43 +321,44 @@ impl DotOperation {
         Self::new(DotDimensionNumbers::matmul())
     }
 
+    /// Returns this [`DotOperation`] with the provided accumulation data type. The input element types must still
+    /// match each other and must support the accumulation type, which becomes the output element type. The eager
+    /// kernel upcasts the inputs and accumulates the contraction at the wider type. This is the
+    /// `preferred_element_type` contract of XLA, which its low precision matrix units implement natively (e.g.,
+    /// `f8 × f8 → f32` and `bf16 × bf16 → f32`). Dots with an accumulation type differentiate like ordinary dots,
+    /// with tangents and cotangents carried at the accumulation type (refer to the forward mode and transposition
+    /// documentation of this operation), and cannot yet be combined with a requested output sharding.
+    #[inline]
+    pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
+        self.accumulation_type = accumulation_type.into();
+        self
+    }
+
     /// Returns this [`DotOperation`] with a requested output [`Sharding`]. Type inference validates its rank, its mesh,
     /// the absence of auto axes, and the rule for unreduced outputs before using it instead of the inferred sharding.
     /// The request bypasses the ordinary consistency checks for batching and contracting dimension shardings. This is
     /// the only way to produce an output with unreduced axes, which represents partial results on each device whose
     /// reduction across devices is delayed. Logical dependence on manual shards still comes from the input values.
     #[inline]
-    pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
         self
     }
 
-    /// Returns this [`DotOperation`] with the provided accumulation data type. The input element types must still match
-    /// each other and must support the accumulation type, which becomes the output element type. The eager kernel
-    /// upcasts the inputs and accumulates the contraction at the wider type. This is the `preferred_element_type`
-    /// contract of XLA, which its low precision matrix units implement natively (e.g., `f8 × f8 → f32` and
-    /// `bf16 × bf16 → f32`). Dots with an accumulation type differentiate like ordinary dots, with tangents and
-    /// cotangents carried at the accumulation type (refer to the forward mode and transposition documentation of this
-    /// operation), and cannot yet be combined with a requested output sharding.
-    #[inline]
-    pub fn with_accumulation_type(mut self, accumulation_type: impl Into<Option<DataType>>) -> Self {
-        self.accumulation_type = accumulation_type.into();
-        self
-    }
-
-    /// Returns the contracting and batching dimension specification.
+    /// Returns the contracting and batching dimension specification of this [`DotOperation`].
     #[inline]
     pub fn dimensions(&self) -> &DotDimensionNumbers {
         &self.dimensions
     }
 
-    /// Returns the optional accumulation data type. Refer to the documentation of [`Self::with_accumulation_type`].
+    /// Returns the optional accumulation data type of this [`DotOperation`]. Refer to the documentation of
+    /// [`Self::with_accumulation_type`] for more information on what the accumulation data type is and how it is used.
     #[inline]
     pub fn accumulation_type(&self) -> Option<DataType> {
         self.accumulation_type
     }
 
-    /// Returns the requested output sharding, if any.
+    /// Returns the requested output sharding of this [`DotOperation`], if any.
     #[inline]
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
@@ -377,6 +377,7 @@ impl DotOperation {
 }
 
 impl Display for DotOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -396,7 +397,7 @@ impl Operation for DotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        Ok(vec![dot_abstract(
+        Ok(vec![infer_dot_output_type(
             DOT_OPERATION_NAME,
             &input_types[0],
             &input_types[1],
@@ -437,11 +438,12 @@ where
     }
 }
 
-// Partial evaluation uses the default fold-or-residualize behavior.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOperation where
     C::Operation: From<DotOperation>
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for DotOperation
@@ -983,15 +985,15 @@ impl RaggedDotDimensionNumbers {
         Ok(mode)
     }
 
-    /// Returns the grouped dot dimension numbers that map the output cotangent of `t ↦ ragged_dot(t, rhs)` back toward
-    /// the linear left-hand side `t`, together with the left-hand side axes in the order in which that adjoint grouped
-    /// dot emits them. This specification must be a valid non-contracting specification for a left-hand side with rank
-    /// `lhs_rank` and a right-hand side with rank `rhs_rank`.
+    /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
+    /// cotangent `ā` of its linear left-hand side `a`, together with the axes of `a` in the order in which that adjoint
+    /// grouped dot emits them. This specification must be a valid non-contracting specification for a left-hand side
+    /// with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint is a non-contracting grouped dot of the cotangent with the right-hand side, whose ragged dimension
-    /// is the ragged output dimension. It emits the batching axes, the left-hand side result axes, and then the
-    /// left-hand side contracting axes sorted by their paired right-hand side axes. Callers must restore the original
-    /// left-hand side axis order with the inverse permutation.
+    /// The adjoint computes `ā` as a non-contracting grouped dot of `ȳ` with `b`, whose ragged dimension is the ragged
+    /// output dimension. It emits the batching axes, the left-hand side result axes, and then the left-hand side
+    /// contracting axes sorted by their paired right-hand side axes. Callers must restore the original axis order of
+    /// `a` with the inverse permutation.
     fn lhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
         let dot_dimensions = self.dot_dimensions();
         let lhs_result_dimensions = dot_dimensions.lhs_result_dimensions(lhs_rank);
@@ -1032,15 +1034,15 @@ impl RaggedDotDimensionNumbers {
         (dimensions, output_axes)
     }
 
-    /// Returns the grouped dot dimension numbers that map the output cotangent of `t ↦ ragged_dot(lhs, t)` back toward
-    /// the linear right-hand side `t`, together with the right-hand side axes in the order in which that adjoint
-    /// grouped dot emits them. This specification must be a valid non-contracting specification for a left-hand side
-    /// with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
+    /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
+    /// cotangent `b̄` of its linear right-hand side `b`, together with the axes of `b` in the order in which that
+    /// adjoint grouped dot emits them. This specification must be a valid non-contracting specification for a
+    /// left-hand side with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint is a contracting grouped dot of the left-hand side with the cotangent over the ragged dimension, so
-    /// it emits the group axis, the batching axes, the right-hand side contracting axes sorted by their paired
-    /// left-hand side axes, and then the right-hand side result axes. Callers must restore the original right-hand side
-    /// axis order with the inverse permutation.
+    /// The adjoint computes `b̄` as a contracting grouped dot of `a` with `ȳ` over the ragged dimension, so it emits
+    /// the group axis, the batching axes, the right-hand side contracting axes sorted by their paired left-hand side
+    /// axes, and then the right-hand side result axes. Callers must restore the original axis order of `b` with the
+    /// inverse permutation.
     fn rhs_cotangent_dimensions(&self, lhs_rank: usize, rhs_rank: usize) -> (Self, Vec<usize>) {
         let dot_dimensions = self.dot_dimensions();
         let lhs_result_dimensions = dot_dimensions.lhs_result_dimensions(lhs_rank);
@@ -1129,9 +1131,11 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// Grouped expansion modes require an element type that can represent zero. In particular, they reject `f8e8m0fnu`.
 /// Refer to [`RaggedDotDimensionNumbers`] for the dimension number contract.
 ///
-/// The operation is linear in either data input separately, while `group_sizes` is nondifferentiable metadata. Forward
-/// mode differentiation applies the product rule with the same group metadata. Transposition is defined only in
-/// non-contracting mode and applies another grouped dot followed by the inverse permutation of its output axes.
+/// The operation is linear in either data input separately, while the group sizes are nondifferentiable metadata. For
+/// `y = ragged_dot(a, b, g)` with group sizes `g`, forward mode differentiation therefore computes
+/// `ẏ = ragged_dot(ȧ, b, g) + ragged_dot(a, ḃ, g)`. Transposition is defined only in non-contracting mode, and it
+/// computes `ā` or `b̄` from the output cotangent `ȳ` with another grouped dot followed by the inverse permutation of
+/// its output axes.
 ///
 /// Batching accepts any mix of replicated and mapped inputs with mapped axes at any position. It materializes a
 /// replicated data input across the mapped extent and moves every mapped axis to the front, so the mapped axes become
@@ -1196,7 +1200,8 @@ impl Operation for RaggedDotOperation {
         }
 
         let mode = dimensions.validate_for_ranks(lhs.rank(), rhs.rank())?;
-        let mut output = dot_abstract(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None)?;
+        let mut output =
+            infer_dot_output_type(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None)?;
         let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
         if group_sizes.rank() != 1 {
             let expected_prefix = Shape::new(prefix_axes.iter().map(|axis| lhs.dimension(*axis)).collect());
@@ -1584,7 +1589,30 @@ fn validate_dot_axes(
     Ok(())
 }
 
-/// Computes the abstract output type of one generalized dot product, naming `operation_name` in diagnostics.
+/// Rejects dot option combinations that have no shared interpretation and transformation contract.
+fn validate_dot_options(
+    accumulation_type: Option<DataType>,
+    output_sharding: Option<&Sharding>,
+) -> Result<(), TypeError> {
+    if accumulation_type.is_some() && output_sharding.is_some() {
+        return Err(TypeError::invalid(format!(
+            "`{DOT_OPERATION_NAME}` does not support combining an accumulation type with a requested output sharding \
+             yet",
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects element types for which the dot kernels of `operation_name` have no arithmetic implementation.
+fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(), TypeError> {
+    if data_type.is_numeric() {
+        Ok(())
+    } else {
+        Err(TypeError::invalid(format!("`{operation_name}` does not support input data type `{data_type}`")))
+    }
+}
+
+/// Infers the output type of one generalized dot product, naming `operation_name` in diagnostics.
 ///
 /// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes
 /// that are neither batching nor contracting, in their original order. The output element type is the requested
@@ -1614,7 +1642,7 @@ fn validate_dot_axes(
 ///     only one input is allowed, and its sharding is dropped from the output.
 ///   - Result dimension entries are copied from the owning input, and auto mesh axes are stripped from the final
 ///     sharding.
-pub(crate) fn dot_abstract(
+pub(crate) fn infer_dot_output_type(
     operation_name: &str,
     lhs: &ArrayType,
     rhs: &ArrayType,
@@ -1872,29 +1900,6 @@ pub(crate) fn dot_abstract(
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
-/// Rejects element types for which the dot kernels of `operation_name` have no arithmetic implementation.
-fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(), TypeError> {
-    if data_type.is_numeric() {
-        Ok(())
-    } else {
-        Err(TypeError::invalid(format!("`{operation_name}` does not support input data type `{data_type}`")))
-    }
-}
-
-/// Rejects dot option combinations that have no shared interpretation and transformation contract.
-fn validate_dot_options(
-    accumulation_type: Option<DataType>,
-    output_sharding: Option<&Sharding>,
-) -> Result<(), TypeError> {
-    if accumulation_type.is_some() && output_sharding.is_some() {
-        return Err(TypeError::invalid(format!(
-            "`{DOT_OPERATION_NAME}` does not support combining an accumulation type with a requested output sharding \
-             yet",
-        )));
-    }
-    Ok(())
-}
-
 /// Checks that every mapped input of the operation named `operation_name` maps the same extent. Comparing the mapped
 /// dimensions validates static extents exactly as [`ArrayBatch::common_batch_size`] does, and it additionally admits a
 /// dynamic mapped extent, which two inputs share exactly when it is the same dimension variable.
@@ -1919,7 +1924,9 @@ fn check_common_mapped_dimension<V: Value<Type = ArrayType>>(
     }
 }
 
-/// Applies the product rule shared by dense and grouped bilinear dot operations.
+/// Applies the product rule `ẏ = f(ȧ, b) + f(a, ḃ)` of a bilinear dot operation `y = f(a, b)`, where `apply` evaluates
+/// `f`. Structural zero tangents drop their term, so `ẏ` is a structural zero only when both `ȧ` and `ḃ` are. Dense
+/// and grouped dot operations share this rule.
 ///
 /// When one factor of a tangent term uses the widened tangent representation, both factors are converted to the output
 /// tangent element type before applying the operation.

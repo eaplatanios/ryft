@@ -13,7 +13,7 @@ use lru::LruCache;
 use crate::differentiation::DifferentiationError;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::definitions::CustomRuleDefinition;
-use crate::operations::composites::rules::specializations::{CustomRuleSource, specialization_error};
+use crate::operations::composites::rules::specializations::CustomRuleSource;
 use crate::operations::composites::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatchingSpecializationKey, CustomRuleDerivedDefinitionKey,
     CustomRuleForwardSpecializationKey, CustomRuleSpecialization, CustomRuleSpecializationRequest,
@@ -245,10 +245,19 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
                 .expect("custom rule in-flight mutex is poisoned")
                 .insert(marker.clone())
             {
-                return Err(specialization_error(
-                    self.name(),
-                    SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
-                ));
+                let error = SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError);
+                return Err(ProgramError::UnsupportedOperation {
+                    message: {
+                        let name = self.name();
+                        let description = if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        };
+                        format!("{description} makes a {error}")
+                    },
+                }
+                .into());
             }
             let _marker = InFlightMarker { in_flight: self.definition.uncached_specializations(), marker };
             return produce_fn();
@@ -268,10 +277,24 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
                 caches.batching_rule_specializations.get_or_try_insert_with(key, produce_fn)
             }
         }
-        .map_err(|error| specialization_error(self.name(), error))
+        .map_err(|error| match error {
+            SpecializationCacheError::Production(error) => error,
+            error @ SpecializationCacheError::Reentrant(_) => ProgramError::UnsupportedOperation {
+                message: {
+                    let name = self.name();
+                    let description = if name == COMPOSITE_OPERATION_NAME {
+                        format!("`{COMPOSITE_OPERATION_NAME}`")
+                    } else {
+                        format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                    };
+                    format!("{description} makes a {error}")
+                },
+            }
+            .into(),
+        })
     }
 
-    /// Returns the specialization for `request` converted into the family `(Vc, Oc)`, which contains this reference's
+    /// Returns the specialization for `request` converted into the family `(VC, OC)`, which contains this reference's
     /// family, produced by `produce_fn` on a miss. Like the specializations themselves, it is retained in the
     /// registration's caches while they are alive, and produced without caching otherwise.
     pub(super) fn converted_specialization<
@@ -294,7 +317,21 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             .get_or_try_insert_with((TypeId::of::<(VC, OC)>(), request), || {
                 Ok::<_, DifferentiationError>(produce_fn()? as Arc<dyn Any + Send + Sync>)
             })
-            .map_err(|error| specialization_error(self.name(), error))?;
+            .map_err(|error| match error {
+                SpecializationCacheError::Production(error) => error,
+                error @ SpecializationCacheError::Reentrant(_) => ProgramError::UnsupportedOperation {
+                    message: {
+                        let name = self.name();
+                        let description = if name == COMPOSITE_OPERATION_NAME {
+                            format!("`{COMPOSITE_OPERATION_NAME}`")
+                        } else {
+                            format!("`{COMPOSITE_OPERATION_NAME}` `{name}`")
+                        };
+                        format!("{description} makes a {error}")
+                    },
+                }
+                .into(),
+            })?;
 
         // The key names the family, so the retained specialization always belongs to it.
         Ok(specialization.downcast::<CustomRuleSpecialization<VC, OC>>().unwrap())

@@ -2055,17 +2055,11 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_with_batched_output_axes() {
-        // Batched calls map every output at axis 0 unless the definition declares their batch axes, one per output.
-        let default = CustomRuleRegistration::new(TestDefinition::new("pair"));
-        assert_eq!(default.reference().batched_call_output_axes(2), Ok(vec![BatchAxis::new(0); 2]));
-        let output_axes = vec![BatchAxis::new(0), BatchAxis::replicated()];
-        let declared =
-            CustomRuleRegistration::new(TestDefinition::new("pair").with_batched_output_axes(output_axes.clone()));
-        assert_eq!(declared.reference().batched_call_output_axes(2), Ok(output_axes));
-        assert_eq!(
-            declared.reference().batched_call_output_axes(1),
-            Err(TypeError::invalid("expected 1 batched output axis but got 2")),
-        );
+        let output_axes = vec![BatchAxis::replicated(), BatchAxis::new(0)];
+        let definition = TestDefinition::new("pair")
+            .with_batched_output_axes(vec![BatchAxis::new(0), BatchAxis::replicated()])
+            .with_batched_output_axes(output_axes.clone());
+        assert_eq!(definition.batched_output_axes(), Some(output_axes.as_slice()));
     }
 
     #[test]
