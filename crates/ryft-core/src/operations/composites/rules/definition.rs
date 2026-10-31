@@ -1,9 +1,3 @@
-//! The [`CustomRuleDefinition`] of a retained rule set, together with the object-safe rule traits behind which it
-//! stores its JVP, VJP, and batching callbacks, and the [`CustomVjpOperation`] requirements that its reverse mode rules
-//! place on the operation family.
-
-// TODO(eaplatanios): Review from here onwards.
-
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -59,8 +53,8 @@ use crate::operations::composites::operations::CompositeTransposeOperation;
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
 static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);
 
-// The retained rules are stored behind these object-safe traits rather than behind `dyn Fn` types because their
-// signatures mention tracing contexts, which require `O: Operation`. Keeping that requirement on the methods leaves
+// The retained rules are stored behind the following object-safe traits rather than behind `dyn Fn` types because their
+// signatures mention tracing contexts, which require `O: Operation`. Keeping that requirement on the functions leaves
 // `CustomRuleDefinition` and the operations free of an `O: Operation` bound, which would otherwise form a cycle with
 // the payload bounds of any operation family that contains them.
 
@@ -75,20 +69,20 @@ pub(super) trait CustomJvpRule<V, O>: Send + Sync {
         tangents: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomJvpRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[CustomRuleTracer<V, O>],
         ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -112,20 +106,20 @@ pub(super) trait CustomSymbolicZeroJvpRule<V, O>: Send + Sync {
         tangents: &[MaybeZero<CustomRuleTracer<V, O>>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomSymbolicZeroJvpRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
         ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -146,19 +140,19 @@ pub(super) trait CustomVjpForwardRule<V, O>: Send + Sync {
         primals: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpForwardRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
         ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -184,14 +178,13 @@ pub(super) trait CustomVjpBackwardRule<V, O>: Send + Sync {
         seeds: &[CustomRuleTracer<V, O>],
     ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpBackwardRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &TracingContext<V, O>,
             &[CustomRuleTracer<V, O>],
@@ -199,6 +192,7 @@ where
         ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -225,14 +219,13 @@ pub(super) trait CustomSymbolicZeroVjpBackwardRule<V, O>: Send + Sync {
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
     ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomSymbolicZeroVjpBackwardRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &TracingContext<V, O>,
             &[CustomRuleTracer<V, O>],
@@ -240,6 +233,7 @@ where
         ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -253,11 +247,11 @@ where
 }
 
 /// Retained accumulating custom Vector-Jacobian Product (VJP) backward rule. It is invoked while transposing a
-/// [`CompositeTransposeOperation`] with the known leading inputs (i.e., `p` followed by the residuals `r`), the output
-/// cotangent seeds, and one [`CotangentAccumulator`] per carrier input, and it submits the contributions of the
-/// differentiated inputs to their accumulators. A single rule therefore serves returned, caller-buffer, and ignored
-/// destinations, and can, for example, update only the affected entries of a caller-provided buffer instead of
-/// returning a full-sized cotangent.
+/// [`CompositeTransposeOperation`] with the known leading inputs (i.e., `p` followed by the residuals `r`), the
+/// output cotangent seeds, and one [`CotangentAccumulator`] per carrier input, and it submits the contributions
+/// of the differentiated inputs to their accumulators. A single rule therefore serves returned, caller-buffer,
+/// and ignored destinations, and can, for example, update only the affected entries of a caller-provided buffer
+/// instead of returning a full-sized cotangent.
 pub(super) trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
     /// Applies this rule in the provided transposition context.
     fn apply(
@@ -268,14 +262,13 @@ pub(super) trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpAccumulatingBackwardRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &mut TranspositionContext<V, O>,
             &[PartialValue<CustomRuleTracer<V, O>>],
@@ -284,6 +277,7 @@ where
         ) -> Result<(), ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -299,7 +293,8 @@ where
 
 /// Retained custom batching rule, which batches a call of a [`CustomRuleDefinition`] instead of structurally batching
 /// its primal region. It receives the call's batched inputs, their batch axes, the batching level, and the level's
-/// boundary inputs (e.g., a first-class batch extent), and it returns the batched outputs together with their batch axes.
+/// boundary inputs (e.g., a first-class batch extent), and it returns the batched outputs together with their batch
+/// axes.
 pub(super) trait CustomBatchingRule<V: Typed, O>: Send + Sync {
     /// Applies this rule to the provided batched inputs.
     fn apply(
@@ -310,14 +305,13 @@ pub(super) trait CustomBatchingRule<V: Typed, O>: Send + Sync {
         boundary_inputs: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomBatchingRule<V, O> for F
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[BatchAxis],
@@ -326,6 +320,7 @@ where
         ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
         + Send
         + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn apply(
@@ -339,6 +334,8 @@ where
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Operations with which the derived batching rules of a broadcast sensitive custom batching rule recover exact
 /// per-item tangents (refer to [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]).
 pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
@@ -351,9 +348,9 @@ pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
         removed_axis: usize,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 
     /// Returns the sum of two values of the same type.
     fn add(
@@ -362,9 +359,9 @@ pub(super) trait CustomRuleBroadcastSensitivity<V, O>: Send + Sync {
         right: &CustomRuleTracer<V, O>,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError>
     where
-        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
-        O: Operation<Type = V::Type>;
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
 }
 
 /// [`CustomRuleBroadcastSensitivity`] that takes diagonals with the canonical batching policy of the family's type
