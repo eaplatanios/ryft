@@ -1,0 +1,35 @@
+error: the `#[derive(Operation)]` macro only supports enums
+ --> tests/operations/error_enums.rs:5:8
+  |
+5 | struct StructOperation(ZeroOperation<ArrayType>);
+  |        ^^^^^^^^^^^^^^^
+
+error: operation enum variants must be tuple variants with exactly one payload field
+  --> tests/operations/error_enums.rs:10:5
+   |
+10 |     Unit,
+   |     ^^^^
+
+error: operation enum variants must be tuple variants with exactly one payload field
+  --> tests/operations/error_enums.rs:11:5
+   |
+11 |     Named { operation: ZeroOperation<ArrayType> },
+   |     ^^^^^
+
+error: operation enum variants must be tuple variants with exactly one payload field
+  --> tests/operations/error_enums.rs:12:5
+   |
+12 |     Pair(ZeroOperation<ArrayType>, ZeroOperation<ArrayType>),
+   |     ^^^^
+
+error: operation family holds constructible payload type `ZeroOperation<ArrayType>` in more than one variant
+  --> tests/operations/error_enums.rs:19:5
+   |
+19 |     BoxedZero(Box<ZeroOperation<ArrayType>>),
+   |     ^^^^^^^^^
+
+error: operation family declares member type `ArrayType` more than once
+  --> tests/operations/error_enums.rs:28:5
+   |
+28 |     Zero(ZeroOperation<ArrayType>),
+   |     ^^^^

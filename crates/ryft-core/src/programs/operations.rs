@@ -248,9 +248,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     through [`LiteralIdentity`](crate::LiteralIdentity)). Operation identity must be _faithful_, meaning that
 ///     payloads must compare every attribute that affects their semantics or lowering, because consumers such as eager
 ///     dispatch caches reuse compiled programs for equal operations.
-///   - `discharge` delegates native variants to the payload's own
+///   - `discharge` delegates native variants and bare generic extension variants to the payload's own
 ///     [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) implementation, and replays every
-///     member variant and every bare generic extension variant as the complete enum through
+///     member variant as the complete enum through
 ///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation), which rewrites nothing and
 ///     instead rejects an application that carries regions or receives a live reference handle as an input. The
 ///     dispatcher stays generic over the [`ReferenceDischargePolicy`](crate::ReferenceDischargePolicy) it threads,
@@ -362,39 +362,41 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ## Generated Implementations
 ///
-/// The derived implementation generates:
+/// The derived implementation generates the following implementations, in this order:
 ///
+///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
+///     indentation, so that the enum display matches the canonical program rendering format, followed by the
+///     `PartialEq`, `Eq`, and `Hash` implementations of [`#[ryft(dispatch(identity))]`](#dispatchers) when selected.
 ///   - An [`Operation<Type = T>`](Operation) implementation whose semantic and rendering methods forward to the active
 ///     variant payload.
+///   - A [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) dispatcher, when selected through
+///     [`#[ryft(dispatch(...))]`](#dispatchers).
 ///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards native variants
 ///     directly and projects member variants into their native eager value family. Operation-specific eager semantics
 ///     still live on the payload implementations; the enum is only an adapter and dispatcher.
 ///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that forwards native
 ///     variants to their payload rules. Member variants use the enclosing operation's canonical fold-or-residualize
 ///     path, which also consults projected [`Operation::fold`] rules without a second partial-value protocol.
+///   - [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
+///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers, when selected through
+///     [`#[ryft(dispatch(...))]`](#dispatchers).
 ///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
 ///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
 ///     homogeneous operation-family projection.
 ///   - An [`OperationPayloadProjection`] implementation, which recognizes and constructs payloads without naming the
 ///     family that holds them, delegating through projected member variants. Refer to its documentation for which
 ///     payloads it exposes and for the construction precedence.
-///   - [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation),
-///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
-///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers selected through
-///     [`#[ryft(dispatch(...))]`](#dispatchers).
-///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
-///     indentation, so that the enum display matches the canonical program rendering format.
-///   - `From<Payload> for Enum` conversions for concrete payload variants.
-///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
-///     These conversions fail with `Error = TypeError`, reporting that the stored operation cannot be projected into
-///     the payload. The message names the stored operation's [`Operation::name`] and the statically expected payload
-///     type, each surrounded by backticks.
 ///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
 ///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
 ///     family-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
 ///     requires its operation family to provide guard requests, so this lets a family that stores no guard serve as a
 ///     context's family without a handwritten provider. A family with a native guard variant instead provides guards
 ///     through the blanket implementation over its generated `From<GuardOperation<T>>` conversion.
+///   - `From<Payload> for Enum` conversions for concrete payload variants.
+///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
+///     These conversions fail with `Error = TypeError`, reporting that the stored operation cannot be projected into
+///     the payload. The message names the stored operation's [`Operation::name`] and the statically expected payload
+///     type, each surrounded by backticks.
 ///
 /// ## Requirements And Limitations
 ///

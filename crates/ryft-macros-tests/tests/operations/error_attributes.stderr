@@ -1,0 +1,65 @@
+error: invalid `#[ryft(...)]` attribute `unknown`; only `crate`, `type(...)`, `constant(...)`, `members(...)`, and `dispatch(...)` are supported here
+ --> tests/operations/error_attributes.rs:4:42
+  |
+4 | #[ryft(type(ArrayType), constant(Array), unknown = "value")]
+  |                                          ^^^^^^^
+
+error: the `identity` attribute was replaced by the `dispatch(identity)` dispatcher
+  --> tests/operations/error_attributes.rs:10:42
+   |
+10 | #[ryft(type(ArrayType), constant(Array), identity)]
+   |                                          ^^^^^^^^
+
+error: `#[ryft(dispatch(...))]` must select at least one dispatcher
+  --> tests/operations/error_attributes.rs:16:42
+   |
+16 | #[ryft(type(ArrayType), constant(Array), dispatch())]
+   |                                          ^^^^^^^^
+
+error: invalid `#[ryft(dispatch(...))]` dispatcher `lowering`; only `identity`, `discharge`, `batching`, `differentiation`, and `transposition` are supported here
+  --> tests/operations/error_attributes.rs:22:51
+   |
+22 | #[ryft(type(ArrayType), constant(Array), dispatch(lowering))]
+   |                                                   ^^^^^^^^
+
+error: duplicate ryft dispatcher `identity`
+  --> tests/operations/error_attributes.rs:28:71
+   |
+28 | #[ryft(type(ArrayType), constant(Array), dispatch(identity, batching, identity))]
+   |                                                                       ^^^^^^^^
+
+error: duplicate ryft attribute `dispatch(...)`
+  --> tests/operations/error_attributes.rs:35:8
+   |
+35 | #[ryft(dispatch(transposition))]
+   |        ^^^^^^^^
+
+error: `#[ryft(members(...))]` must declare at least one member universe
+  --> tests/operations/error_attributes.rs:41:42
+   |
+41 | #[ryft(type(ArrayType), constant(Array), members())]
+   |                                          ^^^^^^^^^
+
+error: duplicate ryft member universe `ArrayType`
+  --> tests/operations/error_attributes.rs:47:61
+   |
+47 | #[ryft(type(ArrayType), constant(Array), members(ArrayType, ArrayType))]
+   |                                                             ^^^^^^^^^
+
+error: invalid ryft member universe role `replicated`; only `structural` is supported here
+  --> tests/operations/error_attributes.rs:53:61
+   |
+53 | #[ryft(type(ArrayType), constant(Array), members(ArrayType, replicated(DimensionType)))]
+   |                                                             ^^^^^^^^^^
+
+error: `structural(...)` declares exactly one member type
+  --> tests/operations/error_attributes.rs:59:70
+   |
+59 | #[ryft(type(ArrayType), constant(Array), members(structural(ArrayType, DimensionType)))]
+   |                                                                      ^
+
+error: duplicate ryft attribute `members(...)`
+  --> tests/operations/error_attributes.rs:66:8
+   |
+66 | #[ryft(members(DimensionType))]
+   |        ^^^^^^^

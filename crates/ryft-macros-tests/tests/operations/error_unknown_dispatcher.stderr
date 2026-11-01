@@ -1,5 +1,0 @@
-error: invalid `#[ryft(dispatch(...))]` dispatcher `lowering`; only `identity`, `batching`, `discharge`, `differentiation`, and `transposition` are supported here
-  --> tests/operations/error_unknown_dispatcher.rs:10:17
-   |
-10 | #[ryft(dispatch(lowering))]
-   |                 ^^^^^^^^

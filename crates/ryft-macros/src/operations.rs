@@ -3,7 +3,6 @@ use std::fmt::Display;
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
-use syn::visit_mut::VisitMut;
 
 use crate::helpers::attributes::Attribute;
 use crate::helpers::generics::GenericsHelpers;
@@ -497,23 +496,24 @@ impl OperationParser {
         (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from)
     }
 
-    /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload constructions and
-    /// projections, reporting errors otherwise. A payload type that `OperationPayloadProjection::from_payload`
-    /// constructs (i.e., one that is `'static` independently of the generic parameters of the enum) may be held by at
-    /// most one family-native variant, so that its construction is unambiguous. Similarly, a projected member type may
-    /// be declared by at most one variant, because `OperationProjection<U>` names one canonical projected family.
-    fn check_for_conflicting_variants(&mut self, variants: &[OperationVariant], generics: &syn::Generics) {
+    /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload conversions and
+    /// projections, reporting errors otherwise. Every variant other than a bare generic extension receives its own
+    /// borrowed `TryFrom<&Enum>` conversion (and usually also an owned `From<Payload>` conversion) for its payload
+    /// type, and so a payload type may be held by at most one such variant. That also keeps the payload construction
+    /// of `OperationPayloadProjection::from_payload` unambiguous. Payload types are compared by their tokens, and so
+    /// payload types that only overlap for some instantiation of the generic parameters of the enum (e.g.,
+    /// `Operation<V>` and `Operation<C>`) are left to the coherence checks of the compiler. Similarly, a projected
+    /// member type may be declared by at most one variant, because `OperationProjection<U>` names one canonical
+    /// projected family.
+    fn check_for_conflicting_variants(&mut self, variants: &[OperationVariant]) {
         let mut payload_types = HashSet::new();
         let mut member_types = HashSet::new();
         for variant in variants {
-            if matches!(variant.class, OperationVariantClass::FamilyNative)
-                && is_generic_independent(&variant.payload_type, generics)
-                && !payload_types.insert(token_string(&variant.payload_type))
-            {
+            if !variant.is_generic_extension && !payload_types.insert(token_string(&variant.payload_type)) {
                 self.add_error(
                     &variant.ident,
                     format_args!(
-                        "operation family holds constructible payload type `{}` in more than one variant",
+                        "operation family holds payload type `{}` in more than one variant",
                         token_string(&variant.payload_type),
                     ),
                 );
@@ -551,7 +551,7 @@ impl OperationParser {
         // conflicting variants if all variants were extracted without errors, to avoid follow-on errors.
         let mut variants = self.extract_variants(input);
         if self.errors.is_empty() {
-            self.check_for_conflicting_variants(&variants, &input.generics);
+            self.check_for_conflicting_variants(&variants);
         }
 
         let ryft = &self.ryft_crate;
@@ -1200,13 +1200,27 @@ impl OperationEnum {
         let operation_type = &self.operation_type;
         let program_constant_type = &self.program_constant_type;
         let self_type = &self.program_self_type;
-        let value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
+        let context_value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
         let mut generics = self.dispatcher_generics.clone();
         generics.params.push(syn::parse_quote!(__Context));
+
+        // A separate runtime value type is named by a generated type parameter rather than by the value projection of
+        // the context, so that the bounds of the program constant parameter can be renamed onto it, including bounds on
+        // its associated types (e.g., `V::Item: Bound`), which cannot be expressed on a projection.
+        let value_type: syn::Type = if self.has_separate_runtime_value_type {
+            generics.params.push(syn::parse_quote!(__InterpretationValue));
+            syn::parse_quote!(__InterpretationValue)
+        } else {
+            context_value_type.clone()
+        };
         let where_clause = generics.make_where_clause();
         if self.has_separate_runtime_value_type {
-            where_clause.predicates.push(syn::parse_quote!(__Context: #ryft::Domain<Type = #operation_type>));
-            where_clause.predicates.extend(self.program_constant_parameter_predicates(&value_type));
+            where_clause.predicates.push(syn::parse_quote! {
+                __Context: #ryft::Domain<Type = #operation_type, Value = #value_type>
+            });
+            where_clause
+                .predicates
+                .extend(self.program_constant_parameter_predicates(&format_ident!("__InterpretationValue")));
             where_clause.predicates.push(syn::parse_quote! {
                 __Context: #ryft::Constant<#value_type, #program_constant_type>
             });
@@ -1277,8 +1291,8 @@ impl OperationEnum {
                     &self,
                     context: &__Context,
                     driver: &__D,
-                    inputs: &[#value_type],
-                ) -> ::std::result::Result<::std::vec::Vec<#value_type>, #ryft::ProgramError> {
+                    inputs: &[#context_value_type],
+                ) -> ::std::result::Result<::std::vec::Vec<#context_value_type>, #ryft::ProgramError> {
                     match self { #(#arms)* }
                 }
             }
@@ -1739,7 +1753,9 @@ impl OperationEnum {
         let where_clause = generics.make_where_clause();
         if self.has_separate_runtime_value_type {
             where_clause.predicates.push(syn::parse_quote!(#value_type: #ryft::Value<Type = #operation_type>));
-            where_clause.predicates.extend(self.program_constant_parameter_predicates(&value_type));
+            where_clause
+                .predicates
+                .extend(self.program_constant_parameter_predicates(&format_ident!("__TranspositionValue")));
         }
         where_clause
             .predicates
@@ -2030,43 +2046,25 @@ impl OperationEnum {
     }
 
     /// Returns the `where` predicates that copy the declared bounds of [`OperationEnum::program_constant_parameter`]
-    /// (i.e., both its inline bounds and the `where` predicates that reference it) onto the provided value type, so
-    /// that a generated runtime value type inherits the capability requirements that the enum declares for its program
+    /// (i.e., both its inline bounds and the `where` predicates whose bounded type references it) onto the provided
+    /// generated type parameter, renaming every mention of the program constant parameter in them. That way, a
+    /// generated runtime value type inherits the capability requirements that the enum declares for its program
     /// constant parameter. This function returns no predicates for enums that declare an explicit constant type.
-    fn program_constant_parameter_predicates(&self, value_type: &syn::Type) -> Vec<syn::WherePredicate> {
-        /// [`VisitMut`] that replaces mentions of a generic type parameter with a replacement type. Paths that start
-        /// with the parameter (e.g., associated type projections like `V::Item`) keep their remaining segments when the
-        /// replacement is itself a path, and are left unchanged otherwise.
-        struct ParameterReplacer<'r> {
-            parameter: &'r syn::Ident,
-            replacement: &'r syn::Type,
-        }
-
-        impl VisitMut for ParameterReplacer<'_> {
-            fn visit_type_mut(&mut self, ty: &mut syn::Type) {
-                if ty.matches_ident(self.parameter) {
-                    *ty = self.replacement.clone();
-                    return;
-                }
-                if let syn::Type::Path(syn::TypePath { qself: None, path }) = ty
-                    && path.segments.first().is_some_and(|segment| segment.ident == *self.parameter)
-                    && let syn::Type::Path(syn::TypePath { qself: None, path: replacement }) = self.replacement
-                {
-                    path.replace_ident(self.parameter, replacement);
-                }
-                syn::visit_mut::visit_type_mut(self, ty);
-            }
-        }
-
+    fn program_constant_parameter_predicates(&self, value_parameter: &syn::Ident) -> Vec<syn::WherePredicate> {
         let Some(parameter) = &self.program_constant_parameter else {
             return Vec::new();
         };
+        let value_path = syn::Path::from(value_parameter.clone());
         let inline_predicates = self
             .generics
             .type_params()
             .filter(|type_parameter| type_parameter.ident == *parameter)
             .flat_map(|type_parameter| type_parameter.bounds.iter())
-            .map(|bound| syn::parse_quote!(#value_type: #bound));
+            .map(|bound| {
+                let mut predicate: syn::WherePredicate = syn::parse_quote!(#value_parameter: #bound);
+                predicate.replace_ident(parameter, &value_path);
+                predicate
+            });
         let where_predicates = self
             .generics
             .where_clause
@@ -2078,7 +2076,7 @@ impl OperationEnum {
             })
             .map(|predicate| {
                 let mut predicate = predicate.clone();
-                ParameterReplacer { parameter, replacement: value_type }.visit_where_predicate_mut(&mut predicate);
+                predicate.replace_ident(parameter, &value_path);
                 predicate
             });
         inline_predicates.chain(where_predicates).collect()
@@ -2842,13 +2840,16 @@ mod tests {
     fn test_operation_parser_check_for_conflicting_variants() {
         let mut input: syn::DeriveInput = syn::parse_quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<V>))]
-            enum Operation<V: Value<Type = ArrayType>> {
+            enum Operation<V: Value<Type = ArrayType>, Extension> {
                 First(FirstOperation),
-                Second(Box<FirstOperation>),
-                Generic(GenericOperation<V>),
-                OtherGeneric(GenericOperation<V>),
+                Boxed(Box<FirstOperation>),
                 #[ryft(mixed(ArrayType))]
                 Mixed(FirstOperation),
+                Generic(GenericOperation<V>),
+                OtherGeneric(GenericOperation<V>),
+                OtherParameter(GenericOperation<Extension>),
+                Extension(Extension),
+                OtherExtension(Extension),
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<V>),
                 #[ryft(projected(ArrayType, structural))]
@@ -2860,12 +2861,15 @@ mod tests {
         parser.extract_attributes(&input);
         parser.normalize_input(&input);
 
-        // Constructible payload types may repeat only across variants that never construct them, and projected
-        // member types may not repeat at all.
+        // Payload types may only repeat across bare generic extension variants, which receive no conversions, and
+        // projected member types may not repeat at all. Payload types that differ only in their generic arguments are
+        // left to the coherence checks of the compiler.
         assert_eq!(
             errors(&parser),
             vec![
-                "operation family holds constructible payload type `FirstOperation` in more than one variant",
+                "operation family holds payload type `FirstOperation` in more than one variant",
+                "operation family holds payload type `FirstOperation` in more than one variant",
+                "operation family holds payload type `GenericOperation<V>` in more than one variant",
                 "operation family declares member type `ArrayType` more than once",
             ],
         );

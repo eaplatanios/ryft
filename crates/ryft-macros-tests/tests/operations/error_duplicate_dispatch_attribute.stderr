@@ -1,5 +1,0 @@
-error: duplicate ryft attribute `dispatch(...)`
-  --> tests/operations/error_duplicate_dispatch_attribute.rs:11:8
-   |
-11 | #[ryft(dispatch(transposition))]
-   |        ^^^^^^^^

@@ -82,6 +82,13 @@ and testing macros from `crate::macros` where applicable, following their curren
 unqualified as required by the Rust conventions. For example, elementwise operations can use
 `define_elementwise_operation!` and `define_elementwise_capability!` rather than restating shared boilerplate.
 
+Keep operation-specific composition helpers private to their eager interpretation implementations. Reusable numerical
+functionality with an independent contract belongs in a capability that makes choices such as axes and precision
+explicit. Nest helpers owned by one rule at the beginning of that rule's function body. When a backend needs to trace
+the same decomposition, reuse the interpretation rule rather than exposing a public composition helper. Use
+`MemberInterpretableOperation` when the composition needs the parent array IR domain's dimension values internally,
+even if its instruction boundary contains only arrays.
+
 Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when constructing
 or updating operation output types, and propagate validation errors through existing conversions.
 

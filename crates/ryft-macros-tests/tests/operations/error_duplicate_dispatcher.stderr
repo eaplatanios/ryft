@@ -1,5 +1,0 @@
-error: duplicate ryft dispatcher `identity`
-  --> tests/operations/error_duplicate_dispatcher.rs:10:37
-   |
-10 | #[ryft(dispatch(identity, batching, identity))]
-   |                                     ^^^^^^^^
