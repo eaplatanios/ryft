@@ -7,6 +7,7 @@ mod kernels;
 mod operations;
 mod parameters;
 
+use capabilities::CapabilityCodeGenerator;
 use operations::OperationCodeGenerator;
 use parameters::ParameterizedCodeGenerator;
 
@@ -71,17 +72,25 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
 }
 
 // TODO(eaplatanios): Review this.
-/// Validates a capability trait and optionally generates the implementations through which heterogeneous values apply
-/// it by projecting onto their members (e.g., `#[capability(projection(ArrayIrType => ArrayType))]`).
+/// Validates the conventions of the capability trait this attribute is applied on and, for every
+/// `projection(Family => Member)` argument, generates the implementation through which the values of the `Family`
+/// universe apply the capability by projecting onto their `Member` values.
 ///
-/// Refer to the documentation of `ryft-core`'s `Capability` trait for the canonical reference, which covers the checked
-/// conventions, the generated projection implementations, the supported function signatures, and the `crate = "path"`
-/// argument.
+/// The attribute supports the following optional arguments:
+///
+/// ```text
+/// #[capability(crate = "...")]                 // Path through which generated code names `ryft` (by default, `ryft`).
+/// #[capability(projection(Family => Member))]  // Implements the capability for `Family` values (may be repeated).
+/// ```
+///
+/// For example, `#[capability(projection(ArrayIrType => ArrayType))]` implements a capability for array IR values by
+/// projecting them onto their array members. The annotated trait is always emitted unchanged, including when the
+/// attribute reports errors. Refer to the documentation of the `Capability` trait in `ryft-core` for the canonical
+/// reference of this attribute, which covers the checked conventions, the generated projection implementations, and
+/// the supported function signatures.
 #[proc_macro_attribute]
 pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
-    capabilities::expand(attributes.into(), input.into())
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    CapabilityCodeGenerator::generate_capability_impl(attributes.into(), input.into()).into()
 }
 
 // TODO(eaplatanios): Review this.
