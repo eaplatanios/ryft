@@ -1923,6 +1923,30 @@ impl Array {
     }
 }
 
+/// Validates that every mapped input of the operation named `operation_name` maps the same extent. Comparing the
+/// mapped dimensions validates static extents exactly as [`ArrayBatch::common_batch_size`] does, and it additionally
+/// admits a dynamic mapped extent, which two inputs share exactly when it is the same dimension variable.
+pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
+    operation_name: &str,
+    inputs: &[ArrayBatch<V>],
+) -> Result<(), BatchingError> {
+    let mut mapped_dimensions = inputs
+        .iter()
+        .filter_map(|input| input.batch_axis_position().map(|axis| input.r#type().dimension(axis)));
+    let Some(first) = mapped_dimensions.next() else {
+        return Ok(());
+    };
+    match mapped_dimensions.find(|dimension| *dimension != first) {
+        None => Ok(()),
+        Some(other) => Err(match (first.value(), other.value()) {
+            (Some(expected), Some(actual)) => BatchingError::MismatchedBatchSizes { expected, actual },
+            _ => BatchingError::MisalignedBatchAxes {
+                message: format!("`{operation_name}` inputs map different batch extents `{first}` and `{other}`"),
+            },
+        }),
+    }
+}
+
 /// Infers the output type of one generalized dot product operation, naming `operation_name` in diagnostics. The result
 /// shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes that are
 /// neither batching nor contracting, in their original order. The output element type is the requested compatible
@@ -2259,30 +2283,6 @@ fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(
     }
 }
 
-/// Validates that every mapped input of the operation named `operation_name` maps the same extent. Comparing the
-/// mapped dimensions validates static extents exactly as [`ArrayBatch::common_batch_size`] does, and it additionally
-/// admits a dynamic mapped extent, which two inputs share exactly when it is the same dimension variable.
-fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
-    operation_name: &str,
-    inputs: &[ArrayBatch<V>],
-) -> Result<(), BatchingError> {
-    let mut mapped_dimensions = inputs
-        .iter()
-        .filter_map(|input| input.batch_axis_position().map(|axis| input.r#type().dimension(axis)));
-    let Some(first) = mapped_dimensions.next() else {
-        return Ok(());
-    };
-    match mapped_dimensions.find(|dimension| *dimension != first) {
-        None => Ok(()),
-        Some(other) => Err(match (first.value(), other.value()) {
-            (Some(expected), Some(actual)) => BatchingError::MismatchedBatchSizes { expected, actual },
-            _ => BatchingError::MisalignedBatchAxes {
-                message: format!("`{operation_name}` inputs map different batch extents `{first}` and `{other}`"),
-            },
-        }),
-    }
-}
-
 /// Applies the product rule `ẏ = f(ȧ, b) + f(a, ḃ)` of a bilinear dot operation `y = f(a, b)`, where `apply` evaluates
 /// `f`. Structural zero tangents drop their term, so `ẏ` is a structural zero only when both `ȧ` and `ḃ` are. Dense
 /// and ragged dot operations share this rule. When one factor of a tangent term uses the widened tangent
@@ -2338,30 +2338,24 @@ where
     DifferentiationDual::new(primal, tangent)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use half::{bf16, f16};
     use indoc::{formatdoc, indoc};
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
+        Array, ArrayBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
     };
     use crate::batching::{
-        BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, ProgramBatchingOutputAxesPolicy, batch,
+        BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingTracer,
+        ProgramBatchingOutputAxesPolicy, batch,
     };
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, TransposableOperation, TranspositionContext,
-        differentiate_at,
-    };
+    use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -2389,13 +2383,15 @@ mod tests {
 
     /// Creates an unplaced floating-point type with the supplied static extents.
     fn plain_array(sizes: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(sizes.iter().map(|size| Dimension::Static(*size)).collect()))
+        ArrayType::new_static(DataType::F32, sizes)
     }
 
     /// Creates a validated floating-point type with explicit placement.
     fn sharded_array(mesh: &LogicalMesh, sizes: &[usize], dimensions: Vec<ShardingDimension>) -> ArrayType {
         plain_array(sizes).with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
     }
+
+    type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     #[test]
     fn test_dot_dimension_numbers_new() {
@@ -2449,16 +2445,20 @@ mod tests {
         assert_eq!(dimensions.batched(None, None), Some((dimensions.clone(), None)));
         assert_eq!(dimensions.batched(Some(0), None), None);
         assert_eq!(dimensions.batched(None, Some(0)), None);
+
+        // The inserted axes lead the batching pairs, and existing axes at or after an insertion position shift by one.
+        assert_eq!(
+            DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]).batched(Some(1), Some(0)),
+            Some((DotDimensionNumbers::new(vec![3], vec![2], vec![1, 0], vec![0, 1]), Some(0))),
+        );
     }
 
     #[test]
     fn test_dot_dimension_numbers_validate() {
         assert_eq!(DotDimensionNumbers::matmul().validate(DOT_OPERATION_NAME, 2, 2), Ok(()));
         assert_eq!(DotDimensionNumbers::default().validate(DOT_OPERATION_NAME, 0, 0), Ok(()));
-        assert_eq!(
-            DotDimensionNumbers::matmul().validate("custom_dot", 1, 2),
-            Err(TypeError::invalid("`custom_dot` left-hand side dimension index out of bounds")),
-        );
+
+        // Paired lists must have equal lengths.
         assert_eq!(
             DotDimensionNumbers::new(vec![1], vec![0], vec![0], vec![]).validate(DOT_OPERATION_NAME, 2, 2),
             Err(TypeError::invalid(format!(
@@ -2471,10 +2471,40 @@ mod tests {
                 "`{DOT_OPERATION_NAME}` contracting dimensions have different lengths on the two inputs",
             ))),
         );
+
+        // Indices must be within the rank of their input, and errors use the supplied operation name.
+        assert_eq!(
+            DotDimensionNumbers::matmul().validate("custom_dot", 1, 2),
+            Err(TypeError::invalid("`custom_dot` left-hand side dimension index out of bounds")),
+        );
+        assert_eq!(
+            DotDimensionNumbers::matmul().validate(DOT_OPERATION_NAME, 2, 0),
+            Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` right-hand side dimension index out of bounds"))),
+        );
+
+        // Each list must be distinct, and the batching and contracting lists of an input must be disjoint.
         assert_eq!(
             DotDimensionNumbers::new(vec![1, 1], vec![0, 2], vec![], vec![]).validate(DOT_OPERATION_NAME, 2, 3),
             Err(TypeError::invalid(format!(
                 "`{DOT_OPERATION_NAME}` left-hand side contracting dimensions must be distinct",
+            ))),
+        );
+        assert_eq!(
+            DotDimensionNumbers::new(vec![1, 0], vec![0, 0], vec![], vec![]).validate(DOT_OPERATION_NAME, 2, 2),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` right-hand side contracting dimensions must be distinct",
+            ))),
+        );
+        assert_eq!(
+            DotDimensionNumbers::new(vec![1], vec![1], vec![0, 0], vec![0, 0]).validate(DOT_OPERATION_NAME, 2, 2),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` left-hand side batching dimensions must be distinct",
+            ))),
+        );
+        assert_eq!(
+            DotDimensionNumbers::new(vec![1], vec![1], vec![1], vec![0]).validate(DOT_OPERATION_NAME, 2, 2),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` left-hand side batching and contracting dimensions must be disjoint",
             ))),
         );
         assert_eq!(
@@ -2489,20 +2519,24 @@ mod tests {
     fn test_dot() {
         let mesh = test_mesh();
         let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]).unwrap();
-        let operation = DotOperation::matmul().with_output_sharding(sharding.clone());
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
+        let operation =
+            DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding.clone());
 
-        // Operation identity, accessors, and formatting.
+        // Operation identity, accessors, and formatting. The rendering lists the optional fields after the dimension
+        // numbers.
         assert_eq!(operation.name(), DOT_OPERATION_NAME);
         assert_eq!(operation.dimensions(), &DotDimensionNumbers::matmul());
-        assert_eq!(operation.accumulation_type(), None);
+        assert_eq!(operation.accumulation_type(), Some(DataType::F32));
         assert_eq!(operation.output_sharding(), Some(&sharding));
+        assert_eq!(DotOperation::matmul().accumulation_type(), None);
         assert_eq!(DotOperation::matmul().output_sharding(), None);
         assert_eq!(
             operation.to_string(),
             formatdoc! {"
                 dot [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    accumulation_type=f32,
                     output_sharding={sharding},
                 ]
             "}
@@ -2532,10 +2566,39 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Staged dots carry both the accumulation type and the requested output sharding.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right): (Tracer<_>, Tracer<_>)| {
+                left.dot_with_configuration(
+                    &right,
+                    &DotDimensionNumbers::matmul(),
+                    Some(DataType::F32),
+                    Some(&sharding),
+                )
+            },
+            (ArrayType::new_static(DataType::BF16, [2, 3]), ArrayType::new_static(DataType::BF16, [3, 4])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:bf16[2, 3], %1:bf16[3, 4] .
+                let %2:f32[2, 4][sharding={sharding}] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    accumulation_type=f32,
+                    output_sharding={sharding},
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
     fn test_dot_type_inference() {
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(manual_mesh, 2).with_varying_manual_axes(["devices"]).unwrap();
         check_operation_type_inference!(
             operation = DotOperation::matmul(),
             cases = [
@@ -2548,6 +2611,10 @@ mod tests {
                         "`{DOT_OPERATION_NAME}` contracting dimension sizes do not match (left-hand side axis 1, \
                          right-hand side axis 0)",
                     ),
+                },
+                {
+                    input_types = [plain_array(&[2, 3]), ArrayType::new_static(DataType::F64, [3, 4])],
+                    error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
                 },
                 {
                     input_types = [
@@ -2570,9 +2637,18 @@ mod tests {
                     ],
                     error = format!("`{DOT_OPERATION_NAME}` does not support input data type `zero`"),
                 },
+                // An input without a sharding is invariant over every manual axis.
+                {
+                    input_types = [plain_array(&[2, 3]).with_sharding(varying).unwrap(), plain_array(&[3, 4])],
+                    error = format!(
+                        "`{DOT_OPERATION_NAME}` inputs must have matching varying manual axes; insert \
+                         `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
+                    ),
+                },
             ],
         );
 
+        // Type inference validates the dimension numbers against the input ranks.
         check_operation_type_inference!(
             operation = DotOperation::new(DotDimensionNumbers::new(vec![1, 1], vec![0, 0], vec![], vec![])),
             cases = [{
@@ -2580,46 +2656,10 @@ mod tests {
                 error = format!("`{DOT_OPERATION_NAME}` left-hand side contracting dimensions must be distinct"),
             }],
         );
-
-        check_operation_type_inference!(
-            operation = DotOperation::new(DotDimensionNumbers::new(vec![1, 0], vec![0, 0], vec![], vec![])),
-            cases = [{
-                input_types = [plain_array(&[3, 3]), plain_array(&[3, 4])],
-                error = format!("`{DOT_OPERATION_NAME}` right-hand side contracting dimensions must be distinct"),
-            }],
-        );
-
-        check_operation_type_inference!(
-            operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0, 0], vec![0, 0])),
-            cases = [{
-                input_types = [plain_array(&[2, 3]), plain_array(&[2, 3])],
-                error = format!("`{DOT_OPERATION_NAME}` left-hand side batching dimensions must be distinct"),
-            }],
-        );
-
-        check_operation_type_inference!(
-            operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![1], vec![0])),
-            cases = [{
-                input_types = [plain_array(&[3, 3]), plain_array(&[3, 3])],
-                error = format!(
-                    "`{DOT_OPERATION_NAME}` left-hand side batching and contracting dimensions must be disjoint",
-                ),
-            }],
-        );
-
-        check_operation_type_inference!(
-            operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![1])),
-            cases = [{
-                input_types = [plain_array(&[3, 3]), plain_array(&[3, 3])],
-                error = format!(
-                    "`{DOT_OPERATION_NAME}` right-hand side batching and contracting dimensions must be disjoint",
-                ),
-            }],
-        );
     }
 
     #[test]
-    fn test_dot_type_inference_with_dynamic_dimensions() {
+    fn test_dot_type_inference_dynamic_dimensions() {
         let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
         let contracting = DimensionVariable::new("contracting", DimensionBounds::non_negative(Some(4)).unwrap());
         let lhs = ArrayType::new(
@@ -2632,7 +2672,11 @@ mod tests {
         );
         let rhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Dynamic(contracting), Dimension::Static(3)]),
+            Shape::new(vec![
+                Dimension::Dynamic(batch.clone()),
+                Dimension::Dynamic(contracting.clone()),
+                Dimension::Static(3),
+            ]),
         );
         let static_rhs = ArrayType::new(
             DataType::F64,
@@ -2641,12 +2685,14 @@ mod tests {
         let mismatched_batch_rhs = ArrayType::new(
             DataType::F64,
             Shape::new(vec![
-                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(8)).unwrap())),
-                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(4)).unwrap())),
+                Dimension::Dynamic(DimensionVariable::new("other_batch", DimensionBounds::unbounded())),
+                Dimension::Dynamic(contracting),
                 Dimension::Static(3),
             ]),
         );
-        // Batched matrix multiplication contracting axis 2 of the LHS with axis 1 of the RHS over batching axis 0.
+
+        // Batched matrix multiplication contracts axis 2 of the left-hand side with axis 1 of the right-hand side over
+        // batching axis 0.
         check_operation_type_inference!(
             operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0])),
             cases = [
@@ -2659,7 +2705,7 @@ mod tests {
                         Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
                     )],
                 },
-                // Pairs of a static and a dynamic dimension and pairs of unequal dynamic dimensions keep erroring
+                // Pairs of a static and a dynamic dimension and pairs of distinct dynamic dimensions keep erroring
                 // under the strict size equality used for batching and contracting dimensions.
                 {
                     input_types = [lhs.clone(), static_rhs],
@@ -2680,20 +2726,78 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_type_inference_accumulation_type() {
+        let f8_input = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let bf16_input = ArrayType::new_static(DataType::BF16, [2, 2]);
+        let output_type = ArrayType::new_static(DataType::F32, [2, 2]);
+
+        // Floating-point inputs may accumulate at `f32` or `f64`, so the output widens to the accumulation type.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
+            cases = [
+                { input_types = [f8_input.clone(), f8_input.clone()], output_types = [output_type.clone()] },
+                { input_types = [bf16_input.clone(), bf16_input], output_types = [output_type] },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::F16),
+            cases = [{
+                input_types = [plain_array(&[2, 2]), plain_array(&[2, 2])],
+                error = format!("`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `f16`"),
+            }],
+        );
+
+        // Integer inputs may accumulate at an integer type with the same signedness that is at least as wide.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::I32),
+            cases = [{
+                input_types = [
+                    ArrayType::new_static(DataType::I8, [2, 2]),
+                    ArrayType::new_static(DataType::I8, [2, 2]),
+                ],
+                output_types = [ArrayType::new_static(DataType::I32, [2, 2])],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::I16),
+            cases = [{
+                input_types = [
+                    ArrayType::new_static(DataType::I32, [2, 2]),
+                    ArrayType::new_static(DataType::I32, [2, 2]),
+                ],
+                error = format!("`{DOT_OPERATION_NAME}` input data type `i32` cannot accumulate at data type `i16`"),
+            }],
+        );
+
+        // A requested output sharding places the widened output.
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_accumulation_type(DataType::F32)
+                .with_output_sharding(sharding.clone()),
+            cases = [{
+                input_types = [f8_input.clone(), f8_input],
+                output_types = [ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
     fn test_dot_type_inference_batched_sharding_propagation() {
         let mesh = test_mesh();
         let lhs = sharded_array(
             &mesh,
             &[2, 4, 8],
-            vec![ShardingDimension::sharded(["b"]), ShardingDimension::sharded(["m"]), ShardingDimension::replicated()],
+            vec![ShardingDimension::sharded(["b"]), ShardingDimension::sharded(["m"]), ShardingDimension::Replicated],
         );
         let rhs = sharded_array(
             &mesh,
             &[2, 8, 16],
-            vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::sharded(["n"])],
+            vec![ShardingDimension::Replicated, ShardingDimension::Replicated, ShardingDimension::sharded(["n"])],
         );
-        // The batch dimension merges the more informative entry (LHS `b` over RHS replicated), and the result
-        // dimensions are copied from their owning inputs.
+        // The batch dimension merges the more informative entry (left-hand side `b` over right-hand side replicated),
+        // and the result dimensions are copied from their owning inputs.
         check_operation_type_inference!(
             operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0])),
             cases = [{
@@ -2715,13 +2819,12 @@ mod tests {
     fn test_dot_type_inference_matmul_sharding_propagation() {
         let mesh = test_mesh();
         let replicated_lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
+            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
         let replicated_rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
-        let lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
         let rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["n"])]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["n"])]);
         check_operation_type_inference!(
             operation = DotOperation::matmul(),
             cases = [
@@ -2731,7 +2834,7 @@ mod tests {
                     output_types = [sharded_array(
                         &mesh,
                         &[4, 16],
-                        vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                        vec![ShardingDimension::Replicated, ShardingDimension::Replicated],
                     )],
                 },
                 // `[M@m, K] · [K, N@n] -> [M@m, N@n]`.
@@ -2750,8 +2853,7 @@ mod tests {
     #[test]
     fn test_dot_type_inference_one_sided_sharding_propagation() {
         let mesh = test_mesh();
-        let lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
         check_operation_type_inference!(
             operation = DotOperation::matmul(),
             cases = [
@@ -2761,7 +2863,7 @@ mod tests {
                     output_types = [sharded_array(
                         &mesh,
                         &[4, 16],
-                        vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()],
+                        vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated],
                     )],
                 },
                 // Without any input shardings, the output carries none.
@@ -2779,12 +2881,12 @@ mod tests {
         let lhs = sharded_array(
             &mesh,
             &[2, 4, 8],
-            vec![ShardingDimension::sharded(["b"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+            vec![ShardingDimension::sharded(["b"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
         );
         let rhs = sharded_array(
             &mesh,
             &[2, 8, 16],
-            vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+            vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
         );
         check_operation_type_inference!(
             operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0])),
@@ -2799,16 +2901,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_type_inference_contracting_sharding_errors() {
+    fn test_dot_type_inference_contracting_sharding() {
         let mesh = test_mesh();
-        let lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])]);
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["k"])]);
         let rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::Replicated]);
         let mismatched_rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
         let replicated_rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
         check_operation_type_inference!(
             operation = DotOperation::matmul(),
             cases = [
@@ -2834,7 +2935,7 @@ mod tests {
                     output_types = [sharded_array(
                         &mesh,
                         &[4, 16],
-                        vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                        vec![ShardingDimension::Replicated, ShardingDimension::Replicated],
                     )],
                 },
             ],
@@ -2845,12 +2946,11 @@ mod tests {
     fn test_dot_type_inference_mesh_mismatch() {
         let mesh = test_mesh();
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
         let rhs = sharded_array(
             &other_mesh,
             &[8, 16],
-            vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()],
+            vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated],
         );
         check_operation_type_inference!(
             operation = DotOperation::matmul(),
@@ -2866,7 +2966,7 @@ mod tests {
         let mesh = test_mesh();
         let unreduced_lhs = plain_array(&[4, 8])
             .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::Replicated])
                     .unwrap()
                     .with_unreduced_axes(["k"])
                     .unwrap(),
@@ -2874,7 +2974,7 @@ mod tests {
             .unwrap();
         let reduced_lhs = plain_array(&[4, 8])
             .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::Replicated])
                     .unwrap()
                     .with_reduced_axes(["k"])
                     .unwrap(),
@@ -2898,7 +2998,7 @@ mod tests {
                             .with_sharding(
                                 Sharding::new(
                                     mesh,
-                                    vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                                    vec![ShardingDimension::Replicated, ShardingDimension::Replicated],
                                 )
                                 .unwrap()
                                 .with_reduced_axes(["k"])
@@ -2918,10 +3018,9 @@ mod tests {
             MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]);
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["a"]), ShardingDimension::Replicated]);
         let rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["m"])]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["m"])]);
         check_operation_type_inference!(
             operation = DotOperation::matmul(),
             cases = [{
@@ -2929,7 +3028,7 @@ mod tests {
                 output_types = [sharded_array(
                     &mesh,
                     &[4, 16],
-                    vec![ShardingDimension::replicated(), ShardingDimension::sharded(["m"])],
+                    vec![ShardingDimension::Replicated, ShardingDimension::sharded(["m"])],
                 )],
             }],
         );
@@ -2941,18 +3040,18 @@ mod tests {
         let lhs = sharded_array(
             &mesh,
             &[2, 4, 8],
-            vec![ShardingDimension::sharded(["b"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+            vec![ShardingDimension::sharded(["b"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
         );
         let rhs = sharded_array(
             &mesh,
             &[2, 8, 16],
-            vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+            vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
         );
 
         // The requested output sharding bypasses the batch consistency checks (here, conflicting batch shardings).
         let requested = Sharding::new(
             mesh.clone(),
-            vec![ShardingDimension::sharded(["b"]), ShardingDimension::replicated(), ShardingDimension::sharded(["n"])],
+            vec![ShardingDimension::sharded(["b"]), ShardingDimension::Replicated, ShardingDimension::sharded(["n"])],
         )
         .unwrap();
         check_operation_type_inference!(
@@ -2965,7 +3064,7 @@ mod tests {
         );
 
         // Rank validation.
-        let rank_mismatched = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap();
+        let rank_mismatched = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated]).unwrap();
         check_operation_type_inference!(
             operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
                 .with_output_sharding(rank_mismatched),
@@ -2990,7 +3089,7 @@ mod tests {
         // Auto mesh axes cannot be requested explicitly.
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let auto_sharding =
-            Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]).unwrap();
+            Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["a"]), ShardingDimension::Replicated]).unwrap();
         check_operation_type_inference!(
             operation = DotOperation::matmul().with_output_sharding(auto_sharding),
             cases = [{
@@ -3018,17 +3117,15 @@ mod tests {
     #[test]
     fn test_dot_type_inference_unreduced_output_sharding() {
         let mesh = test_mesh();
-        let lhs =
-            sharded_array(&mesh, &[4, 8], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])]);
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["k"])]);
         let rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]);
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::Replicated]);
         let replicated_rhs =
-            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
-        let unreduced =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-                .unwrap()
-                .with_unreduced_axes(["k"])
-                .unwrap();
+            sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
+        let unreduced = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::Replicated])
+            .unwrap()
+            .with_unreduced_axes(["k"])
+            .unwrap();
         check_operation_type_inference!(
             operation = DotOperation::matmul().with_output_sharding(unreduced.clone()),
             cases = [
@@ -3053,7 +3150,7 @@ mod tests {
                         sharded_array(
                             &mesh,
                             &[16, 4],
-                            vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                            vec![ShardingDimension::Replicated, ShardingDimension::Replicated],
                         ),
                     ],
                     error = format!(
@@ -3065,7 +3162,7 @@ mod tests {
         );
 
         // The unreduced set must equal the axes that shard the contracting dimensions.
-        let mismatched = Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+        let mismatched = Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated])
             .unwrap()
             .with_unreduced_axes(["n"])
             .unwrap();
@@ -3082,59 +3179,14 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_type_inference_accumulation_type() {
-        // Type inference widens the output to the accumulation type for promotable input types, rejects non-promotable
-        // ones, and places the widened output according to a requested output sharding.
-        let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
-        assert_eq!(operation.accumulation_type(), Some(DataType::F32));
-        let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let rhs = lhs.clone();
-        let bf16_input = ArrayType::new(DataType::BF16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        check_operation_type_inference!(
-            operation = operation,
-            cases = [
-                {
-                    input_types = [lhs.clone(), rhs.clone()],
-                    output_types = [output_type.clone()],
-                },
-                {
-                    input_types = [bf16_input.clone(), bf16_input],
-                    output_types = [output_type],
-                },
-            ],
-        );
-        let narrowing = DotOperation::matmul().with_accumulation_type(DataType::F16);
-        let f32_input = plain_array(&[2, 2]);
-        check_operation_type_inference!(
-            operation = narrowing,
-            cases = [{
-                input_types = [f32_input.clone(), f32_input],
-                error = format!("`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `f16`"),
-            }],
-        );
-        let sharding =
-            Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
-        let sharded =
-            DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding.clone());
-        check_operation_type_inference!(
-            operation = sharded,
-            cases = [{
-                input_types = [lhs, rhs],
-                output_types = [ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap()],
-            }],
-        );
-    }
-
-    #[test]
     fn test_dot_interpretation() {
-        // Ordinary matrix multiplication uses the generalized contraction order.
+        // Matrix multiplication contracts the columns of the left-hand side with the rows of the right-hand side.
         let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let rhs = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-        let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
-        let product = lhs.dot(&rhs, &dimensions).unwrap();
-        assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
-        assert_eq!(product.to_f64s(), vec![58.0, 64.0, 139.0, 154.0]);
+        assert_eq!(
+            lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+            Ok(Array::matrix(2, 2, vec![58.0, 64.0, 139.0, 154.0]).unwrap()),
+        );
 
         // Both inputs are decoded through their physical layouts rather than through dense logical payload copies.
         let lhs_type =
@@ -3143,16 +3195,20 @@ mod tests {
             ArrayType::new_static(DataType::U16, [3, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, -2])));
         let lhs = Array::from_elements(lhs_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
         let rhs = Array::from_elements(rhs_type, &[7u16, 8, 9, 10, 11, 12]).unwrap();
-        assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<u16>(), Ok(vec![58, 64, 139, 154]));
+        assert_eq!(
+            lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap().elements::<u16>(),
+            Ok(vec![58, 64, 139, 154]),
+        );
 
-        // Batched generalized contraction places batch axes before both inputs' non-contracting axes.
+        // The output axes are the batching axes, then the left-hand side result axes, and then the right-hand side
+        // result axes.
         let lhs = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 2]), &[1i32, 2, 3, 4, 5, 6, 7, 8])
             .unwrap();
         let rhs = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[2i32, 3, 4, 5]).unwrap();
-        let batched = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
-        let product = lhs.dot(&rhs, &batched).unwrap();
-        assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::I32, [2, 2, 1]));
-        assert_eq!(product.elements::<i32>(), Ok(vec![8, 18, 50, 68]));
+        assert_eq!(
+            lhs.dot(&rhs, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0])),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[8i32, 18, 50, 68]).unwrap()),
+        );
 
         // Narrow integer products and sums wrap at the declared element width, and complex accumulation retains both
         // components.
@@ -3166,22 +3222,25 @@ mod tests {
             &[i4::new(2).unwrap(), i4::new(2).unwrap()],
         )
         .unwrap();
-        assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<i4>(), Ok(vec![i4::new(-4).unwrap()]));
+        assert_eq!(
+            lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap().elements::<i4>(),
+            Ok(vec![i4::new(-4).unwrap()]),
+        );
         let lhs = Array::matrix(1, 2, vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, -1.0)]).unwrap();
         let rhs = Array::matrix(2, 1, vec![ComplexNumber::new(2.0f32, -1.0), ComplexNumber::new(0.5, 4.0)]).unwrap();
         assert_eq!(
-            lhs.dot(&rhs, &dimensions).unwrap().elements::<ComplexNumber<f32>>(),
+            lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(9.5, 14.5)]),
         );
 
         // An empty contracting dimension materializes one additive identity for every result coordinate.
         let lhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 0]), &[]).unwrap();
         let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 3]), &[]).unwrap();
-        assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<f32>(), Ok(vec![0.0; 6]));
+        assert_eq!(lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap().elements::<f32>(), Ok(vec![0.0; 6]));
     }
 
     #[test]
-    fn test_dot_interpretation_low_precision_accumulation() {
+    fn test_dot_interpretation_accumulates_narrow_floats_at_f32() {
         // Each small term is below half an ulp of the running sum at `1`, so rounding after every addition would keep
         // the sum at `1`. Accumulating at `f32` reaches exactly one more ulp, which is then rounded once.
         let lhs =
@@ -3209,13 +3268,14 @@ mod tests {
         let left = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, extent, extent]), &[]).unwrap();
         let right =
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [extent, extent, 0]), &[]).unwrap();
-        let dimensions = DotDimensionNumbers::new(vec![1, 2], vec![0, 1], vec![], vec![]);
         assert_eq!(
-            left.dot(&right, &dimensions),
+            left.dot(&right, &DotDimensionNumbers::new(vec![1, 2], vec![0, 1], vec![], vec![])),
             Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 0]), &[]).unwrap()),
         );
-        let dimensions = DotDimensionNumbers::new(vec![0, 1, 2], vec![2, 0, 1], vec![], vec![]);
-        assert_eq!(left.dot(&right, &dimensions), Ok(Array::scalar(0.0f32).unwrap()));
+        assert_eq!(
+            left.dot(&right, &DotDimensionNumbers::new(vec![0, 1, 2], vec![2, 0, 1], vec![], vec![])),
+            Ok(Array::scalar(0.0f32).unwrap()),
+        );
     }
 
     #[test]
@@ -3228,6 +3288,48 @@ mod tests {
                 "`{DOT_OPERATION_NAME}` input element types are incompatible",
             )))),
         );
+        let boolean = Array::matrix(1, 1, vec![true]).unwrap();
+        assert_eq!(
+            boolean.dot(&boolean, &DotDimensionNumbers::matmul()),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` does not support input data type `bool`",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_dot_interpretation_accumulation_type() {
+        // An accumulation type promotes both inputs and then runs the same typed contraction at the wider element data
+        // type, which becomes the element data type of the result.
+        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]).unwrap();
+        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32),
+            Ok(Array::matrix(1, 1, vec![9.0f32]).unwrap()),
+        );
+
+        // Every value below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let lhs = Array::from_elements::<f8e4m3fn>(
+            input_type.clone(),
+            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let rhs = Array::from_elements::<f8e4m3fn>(
+            input_type,
+            &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32),
+            Ok(Array::matrix(2, 2, vec![1.0f32, 1.25, 2.5, 2.75]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dot_interpretation_accumulation_type_rejects_invalid_input_types() {
+        let left = Array::matrix(1, 1, vec![2.0f32]).unwrap();
+        let right = Array::matrix(1, 1, vec![3.0f64]).unwrap();
         assert_eq!(
             left.dot_with_accumulation_type(&right, &DotDimensionNumbers::matmul(), DataType::F64),
             Err(ProgramError::Type(TypeError::invalid(format!(
@@ -3240,105 +3342,63 @@ mod tests {
                 "`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `f16`",
             )))),
         );
-        let boolean = Array::matrix(1, 1, vec![true]).unwrap();
-        assert_eq!(
-            boolean.dot(&boolean, &DotDimensionNumbers::matmul()),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` does not support input data type `bool`",
-            )))),
-        );
-        let signed = Array::matrix(1, 1, vec![2i32]).unwrap();
-        assert_eq!(
-            signed.dot_with_accumulation_type(&signed, &DotDimensionNumbers::matmul(), DataType::U32),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` input data type `i32` cannot accumulate at data type `u32`",
-            )))),
-        );
     }
 
     #[test]
-    fn test_dot_interpretation_with_accumulation_type() {
-        let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
-        // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
-        // element data type.
-        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]).unwrap();
-        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
-        let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F32).unwrap();
-        assert_eq!(product.r#type().data_type(), DataType::F32);
-        assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
-    }
-
-    #[test]
-    fn test_dot_interpretation_with_accumulation_type_low_precision() {
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
-        let rhs = lhs.clone();
-        // The eager reference backend upcasts the inputs and accumulates at the accumulation type. Every value below is
-        // exactly representable in `f8e4m3fn`, so the `f32` results are exact.
-        let lhs_values = Array::from_elements::<f8e4m3fn>(
-            lhs.clone(),
-            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let rhs_values = Array::from_elements::<f8e4m3fn>(
-            rhs.clone(),
-            &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let product = lhs_values
-            .dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32)
-            .unwrap();
-        assert_eq!(
-            product.r#type().as_ref(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-        );
-        assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
-    }
-
-    #[test]
-    fn test_dot_interpretation_with_output_sharding() {
+    fn test_dot_interpretation_output_sharding() {
         // The requested sharding is validated by the operation's type inference and recorded on the computed result.
         let mesh = test_mesh();
-        let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
         let lhs = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let rhs = Array::matrix(3, 2, vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
         let sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()])
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated])
                 .unwrap();
-        let product = lhs.dot_with_output_sharding(&rhs, &dimensions, &sharding).unwrap();
-        assert_eq!(product.r#type().into_owned(), plain_array(&[2, 2]).with_sharding(sharding).unwrap());
-        assert_eq!(product.elements::<f32>(), Ok(vec![58.0, 64.0, 139.0, 154.0]));
+        assert_eq!(
+            lhs.dot_with_output_sharding(&rhs, &DotDimensionNumbers::matmul(), &sharding),
+            Ok(Array::from_elements(
+                plain_array(&[2, 2]).with_sharding(sharding).unwrap(),
+                &[58.0f32, 64.0, 139.0, 154.0]
+            )
+            .unwrap()),
+        );
 
         // Invalid requests are rejected exactly as they are for staged programs.
-        let rank_one = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap();
+        let rank_one = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated]).unwrap();
         assert_eq!(
-            lhs.dot_with_output_sharding(&rhs, &dimensions, &rank_one),
+            lhs.dot_with_output_sharding(&rhs, &DotDimensionNumbers::matmul(), &rank_one),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{DOT_OPERATION_NAME}` output sharding rank (1) does not match the output rank (2)",
             )))),
         );
+
         // Unreduced outputs are recorded as well, because a concrete array's payload is its fully reduced logical
         // value, which is exactly the total of the partial sums that an unreduced sharding describes.
         let lhs = Array::from_elements(
-            sharded_array(&mesh, &[2, 2], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])]),
+            sharded_array(&mesh, &[2, 2], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["k"])]),
             &[1.0f32, 2.0, 3.0, 4.0],
         )
         .unwrap();
         let rhs = Array::from_elements(
-            sharded_array(&mesh, &[2, 2], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]),
+            sharded_array(&mesh, &[2, 2], vec![ShardingDimension::sharded(["k"]), ShardingDimension::Replicated]),
             &[5.0f32, 6.0, 7.0, 8.0],
         )
         .unwrap();
-        let unreduced = Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+        let unreduced = Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated])
             .unwrap()
             .with_unreduced_axes(["k"])
             .unwrap();
-        let product = lhs.dot_with_output_sharding(&rhs, &dimensions, &unreduced).unwrap();
-        assert_eq!(product.r#type().into_owned(), plain_array(&[2, 2]).with_sharding(unreduced).unwrap());
-        assert_eq!(product.elements::<f32>(), Ok(vec![19.0, 22.0, 43.0, 50.0]));
+        assert_eq!(
+            lhs.dot_with_output_sharding(&rhs, &DotDimensionNumbers::matmul(), &unreduced),
+            Ok(Array::from_elements(
+                plain_array(&[2, 2]).with_sharding(unreduced).unwrap(),
+                &[19.0f32, 22.0, 43.0, 50.0]
+            )
+            .unwrap()),
+        );
     }
 
     #[test]
-    fn test_dot_interpretation_with_configuration() {
+    fn test_dot_interpretation_accumulation_type_and_output_sharding() {
         // The accumulation type determines the element type of the result and the requested sharding its placement,
         // including an unreduced placement, which a concrete array records on its fully reduced value. Every value
         // below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
@@ -3346,11 +3406,8 @@ mod tests {
         let lhs = Array::from_elements::<f8e4m3fn>(
             ArrayType::new_static(DataType::F8E4M3FN, [2, 2])
                 .with_sharding(
-                    Sharding::new(
-                        mesh.clone(),
-                        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])],
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["k"])])
+                        .unwrap(),
                 )
                 .unwrap(),
             &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
@@ -3359,28 +3416,25 @@ mod tests {
         let rhs = Array::from_elements::<f8e4m3fn>(
             ArrayType::new_static(DataType::F8E4M3FN, [2, 2])
                 .with_sharding(
-                    Sharding::new(
-                        mesh.clone(),
-                        vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()],
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["k"]), ShardingDimension::Replicated])
+                        .unwrap(),
                 )
                 .unwrap(),
             &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        let unreduced = Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+        let unreduced = Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated])
             .unwrap()
             .with_unreduced_axes(["k"])
             .unwrap();
-        let product = lhs
-            .dot_with_configuration(&rhs, &DotDimensionNumbers::matmul(), Some(DataType::F32), Some(&unreduced))
-            .unwrap();
         assert_eq!(
-            product.r#type().into_owned(),
-            ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(unreduced).unwrap(),
+            lhs.dot_with_configuration(&rhs, &DotDimensionNumbers::matmul(), Some(DataType::F32), Some(&unreduced)),
+            Ok(Array::from_elements(
+                plain_array(&[2, 2]).with_sharding(unreduced).unwrap(),
+                &[1.0f32, 1.25, 2.5, 2.75]
+            )
+            .unwrap()),
         );
-        assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
     }
 
     #[test]
@@ -3415,6 +3469,13 @@ mod tests {
                 },
                 {
                     inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![19.0, 50.0]).unwrap())],
+                },
+                {
+                    inputs = [
                         (@replicated, Array::vector(vec![2.0, 3.0]).unwrap()),
                         (@replicated, Array::vector(vec![5.0, 7.0]).unwrap()),
                     ],
@@ -3426,15 +3487,51 @@ mod tests {
 
     #[test]
     fn test_dot_batching_accumulation_type() {
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
-        let rhs = lhs.clone();
+        // Batching lifts the dimension numbers while carrying the accumulation type, so the products of each item still
+        // accumulate at the widened type. Both batch items repeat the same exactly representable `f8e4m3fn` values.
+        let batched_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2, 2]);
+        check_operation_batching!(
+            @exact,
+            operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f8e4m3fn>(
+                            batched_type.clone(),
+                            &[0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f8e4m3fn>(
+                            batched_type,
+                            &[1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                        )
+                        .unwrap(),
+                    ),
+                ],
+                outputs = [(
+                    @mapped(axis = 0),
+                    Array::from_elements::<f32>(
+                        ArrayType::new_static(DataType::F32, [2, 2, 2]),
+                        &[1.0, 1.25, 2.5, 2.75, 1.0, 1.25, 2.5, 2.75],
+                    )
+                    .unwrap(),
+                )],
+            }],
+        );
+
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let lhs_input = builder.add_input(lhs.clone());
-        let rhs_input = builder.add_input(rhs.clone());
+        let lhs_input = builder.add_input(input_type.clone());
+        let rhs_input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
                 DotOperation::matmul().with_accumulation_type(DataType::F32),
-                Vec::new(),
+                vec![],
                 vec![lhs_input, rhs_input],
                 None,
             )
@@ -3442,21 +3539,6 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-            lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2] .
-            let %2:f32[2, 2] = dot [
-                dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                accumulation_type=f32,
-            ] %0 %1
-            in (%2)
-        "}
-            .trim_end(),
-        );
-
-        // Batching lifts the dimension numbers while carrying the accumulation type, so the products of each item still
-        // accumulate at the widened type.
         let lifted = program
             .batched(
                 2,
@@ -3470,52 +3552,33 @@ mod tests {
         assert_eq!(
             lifted.to_string(),
             indoc! {"
-            lambda %0:f8e4m3fn[2, 2, 2], %1:f8e4m3fn[2, 2, 2] .
-            let %2:f32[2, 2, 2] = dot [
-                dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                accumulation_type=f32,
-            ] %0 %1
-            in (%2)
-        "}
+                lambda %0:f8e4m3fn[2, 2, 2], %1:f8e4m3fn[2, 2, 2] .
+                let %2:f32[2, 2, 2] = dot [
+                    dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    accumulation_type=f32,
+                ] %0 %1
+                in (%2)
+            "}
             .trim_end(),
         );
-        let batched_lhs_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
-        );
-        let batched_lhs = Array::from_elements::<f8e4m3fn>(
-            batched_lhs_type.clone(),
-            &[0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let batched_rhs = Array::from_elements::<f8e4m3fn>(
-            batched_lhs_type,
-            &[1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let outputs = lifted.interpret(vec![batched_lhs, batched_rhs]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().data_type(), DataType::F32);
-        // Both batch items repeat the unbatched case, whose exact product is [[1, 1.25], [2.5, 2.75]].
-        assert_eq!(outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75, 1.0, 1.25, 2.5, 2.75]);
     }
 
     #[test]
     fn test_dot_batching_accumulation_type_and_output_sharding() {
         // Batching lifts the dimension numbers while carrying both the accumulation type and the requested output
         // sharding, which gains the placement of the inserted batch axis.
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let mesh = test_mesh();
         let sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated])
                 .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let lhs_input = builder.add_input(lhs.clone());
-        let rhs_input = builder.add_input(lhs);
+        let lhs_input = builder.add_input(input_type.clone());
+        let rhs_input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
                 DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding),
-                Vec::new(),
+                vec![],
                 vec![lhs_input, rhs_input],
                 None,
             )
@@ -3554,156 +3617,188 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_batching_stages_the_lifted_output_sharding() {
+    fn test_dot_batching_output_sharding() -> Result<(), ProgramError> {
         let mesh = test_mesh();
         let output_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::sharded(["n"])])
                 .unwrap();
         let operation = DotOperation::matmul().with_output_sharding(output_sharding.clone());
-        // Program batching applies lifted operations to tracer inputs. The staged batched dot must carry the lifted
-        // output sharding instead of dropping it.
-        let context = TracingContext::<ArrayType, ArrayOperation<ArrayType>>::new();
-        let builder = context.builder().clone();
-        let lhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 4, 8]));
-        let rhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 8, 16]));
-        let batching_context = BatchingContext::new(context.clone(), 2);
-        let lhs = {
-            let value = context.tracer(lhs_atom, None);
-            ArrayBatch::new(value, Some(0))
-        }
-        .unwrap();
-        let rhs = {
-            let value = context.tracer(rhs_atom, None);
-            ArrayBatch::new(value, Some(0))
-        }
-        .unwrap();
-        let outputs = operation.batch(&batching_context, &EmptyRegionDriver, &[lhs, rhs]).unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        let output_atom = outputs[0].value().atom_id().unwrap();
-        drop(outputs);
-        drop(batching_context);
-        drop(context);
 
-        let builder = Rc::try_unwrap(builder).expect("batching should not hold on to the builder").into_inner();
-        let program = builder
-            .build::<Vec<ArrayType>, Vec<ArrayType>>(vec![output_atom], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+        // Two replicated inputs keep the original operation, including its requested output sharding.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| {
+                let context = BatchingContext::new(left.context().clone(), 2);
+                let mut outputs = operation.batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::replicated(left), ArrayBatch::replicated(right)],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (plain_array(&[4, 8]), plain_array(&[8, 16])),
+        )?;
         assert_eq!(
             program.to_string(),
-            indoc! {"
-            lambda %0:f32[2, 4, 8], %1:f32[2, 8, 16] .
-            let %2:f32[2, 4, 16][sharding={mesh<['b'=2:explicit, 'm'=2:explicit, 'n'=2:explicit, \
-                'k'=2:explicit]>, [{}, {'m'}, {'n'}]}] = dot [
-                dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                output_sharding={mesh<['b'=2:explicit, 'm'=2:explicit, 'n'=2:explicit, 'k'=2:explicit]>, [{}, \
-                    {'m'}, {'n'}]},
-            ] %0 %1
-            in (%2)
-        "}
+            formatdoc! {"
+                lambda %0:f32[4, 8], %1:f32[8, 16] .
+                let %2:f32[4, 16][sharding={output_sharding}] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    output_sharding={output_sharding},
+                ] %0 %1
+                in (%2)
+            "}
             .trim_end(),
         );
+
+        // Two mapped inputs lift the requested output sharding with the sharding of their mapped axes.
+        let batch_sharding =
+            vec![ShardingDimension::sharded(["b"]), ShardingDimension::Replicated, ShardingDimension::Replicated];
+        let lifted_sharding = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["b"]),
+                ShardingDimension::sharded(["m"]),
+                ShardingDimension::sharded(["n"]),
+            ],
+        )
+        .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| {
+                let context = BatchingContext::new(left.context().clone(), 2)
+                    .with_axis_sharding(ShardingDimension::sharded(["b"]));
+                let mut outputs = operation.batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::new(left, BatchAxis::new(0))?, ArrayBatch::new(right, BatchAxis::new(0))?],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (
+                sharded_array(&mesh, &[2, 4, 8], batch_sharding.clone()),
+                sharded_array(&mesh, &[2, 8, 16], batch_sharding.clone()),
+            ),
+        )?;
+        let left_sharding = Sharding::new(mesh, batch_sharding).unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[2, 4, 8][sharding={left_sharding}], %1:f32[2, 8, 16][sharding={left_sharding}] .
+                let %2:f32[2, 4, 16][sharding={lifted_sharding}] = dot [
+                    dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    output_sharding={lifted_sharding},
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_dot_batching_preserves_materialized_batch_placement() {
-        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
-            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let lhs_sharding = Sharding::new(
-                mesh.clone(),
-                vec![
-                    ShardingDimension::sharded(["x"]),
-                    ShardingDimension::replicated(),
-                    ShardingDimension::replicated(),
-                ],
-            )
-            .unwrap()
-            .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
-            .unwrap();
-            let lhs_type = ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
-            )
-            .with_sharding(lhs_sharding)
-            .unwrap();
-            let rhs_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]))
-                .with_sharding(Sharding::replicated(mesh, 2))
-                .unwrap();
-            let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
-            let builder = parent.builder().clone();
-            let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
-            let rhs_atom = builder.borrow_mut().add_input(rhs_type);
-            let lhs = ArrayBatch::new(parent.tracer(lhs_atom, None), BatchAxis::new(0)).unwrap();
-            let rhs = ArrayBatch::replicated(parent.tracer(rhs_atom, None));
-            let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
-            let outputs = DotOperation::matmul().batch(&context, &EmptyRegionDriver, &[lhs, rhs]).unwrap();
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-            let output_atom = outputs[0].value().atom_id().unwrap();
-            drop(outputs);
-            drop(context);
-            drop(parent);
+    fn test_dot_batching_preserves_materialized_batch_placement() -> Result<(), ProgramError> {
+        // Materializing the mapped axis on the replicated right-hand side places it like the mapped left-hand side.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let left_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+        )
+        .unwrap();
+        let right_sharding = Sharding::replicated(mesh, 2);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| {
+                let context = BatchingContext::new(left.context().clone(), 2)
+                    .with_axis_sharding(ShardingDimension::sharded(["x"]));
+                let mut outputs = DotOperation::matmul().batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::new(left, BatchAxis::new(0))?, ArrayBatch::replicated(right)],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (
+                ArrayType::new_static(DataType::F64, [2, 2, 2]).with_sharding(left_sharding.clone()).unwrap(),
+                ArrayType::new_static(DataType::F64, [2, 1]).with_sharding(right_sharding.clone()).unwrap(),
+            ),
+        )?;
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f64[2, 2, 2][sharding={left_sharding}], %1:f64[2, 1][sharding={right_sharding}] .
+                let %2:f64[2, 2, 1][sharding={left_sharding}] = broadcast [
+                    output_type=f64[2, 2, 1][sharding={left_sharding}],
+                    output_axes=[1, 2],
+                ] %1
+                    %3:f64[2, 2, 1][sharding={left_sharding}] = dot [
+                        dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    ] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
 
-            let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
-            let program = builder
-                .build::<Vec<Array>, Vec<Array>>(vec![output_atom], vec![Placeholder, Placeholder], vec![Placeholder])
-                .unwrap();
-            let expected = match axis_type {
-                MeshAxisType::Explicit => indoc! {"
-                    lambda %0:f64[2, 2, 2][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}, {}]}], \
-                    %1:f64[2, 1][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
-                    let %2:f64[2, 2, 1][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}, {}]}] = broadcast [
-                        output_type=f64[2, 2, 1][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}, {}]}],
-                        output_axes=[1, 2],
-                    ] %1
-                        %3:f64[2, 2, 1][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}, {}]}] = dot [
-                            dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                        ] %0 %2
-                    in (%3)
-                "},
-                MeshAxisType::Manual => indoc! {"
-                    lambda %0:f64[2, 2, 2][sharding={mesh<['x'=2:manual]>, [{'x'}, {}, {}], varying_manual={'x'}}], \
-                    %1:f64[2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}]}] .
-                    let %2:f64[2, 2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}, {}], \
-                    varying_manual={'x'}}] = broadcast [
-                        output_type=f64[2, 2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}, {}], \
-                        varying_manual={'x'}}],
-                        output_axes=[1, 2],
-                    ] %1
-                        %3:f64[2, 2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}, {}], \
-                        varying_manual={'x'}}] = dot [
-                            dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                        ] %0 %2
-                    in (%3)
-                "},
-                MeshAxisType::Auto => unreachable!(),
-            };
-            assert_eq!(program.to_string(), expected.trim_end());
-        }
+    #[test]
+    fn test_dot_batching_preserves_materialized_batch_placement_manual_variation() -> Result<(), ProgramError> {
+        // Materializing the mapped axis on the replicated right-hand side also gives it the manual variation of the
+        // mapped left-hand side.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let left_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+        )
+        .unwrap()
+        .with_varying_manual_axes(["x"])
+        .unwrap();
+        let right_sharding = Sharding::replicated(mesh, 2);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| {
+                let context = BatchingContext::new(left.context().clone(), 2)
+                    .with_axis_sharding(ShardingDimension::sharded(["x"]));
+                let mut outputs = DotOperation::matmul().batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::new(left, BatchAxis::new(0))?, ArrayBatch::replicated(right)],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (
+                ArrayType::new_static(DataType::F64, [2, 2, 2]).with_sharding(left_sharding.clone()).unwrap(),
+                ArrayType::new_static(DataType::F64, [2, 1]).with_sharding(right_sharding.clone()).unwrap(),
+            ),
+        )?;
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f64[2, 2, 2][sharding={left_sharding}], %1:f64[2, 1][sharding={right_sharding}] .
+                let %2:f64[2, 2, 1][sharding={left_sharding}] = broadcast [
+                    output_type=f64[2, 2, 1][sharding={left_sharding}],
+                    output_axes=[1, 2],
+                ] %1
+                    %3:f64[2, 2, 1][sharding={left_sharding}] = dot [
+                        dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    ] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 
     #[test]
     fn test_dot_batching_aligns_mapped_manual_variation() -> Result<(), ProgramError> {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let left_type = ArrayType::new_static(DataType::F32, [2, 2, 2])
-            .with_sharding(
-                Sharding::new(
-                    mesh.clone(),
-                    vec![
-                        ShardingDimension::sharded(["x"]),
-                        ShardingDimension::replicated(),
-                        ShardingDimension::replicated(),
-                    ],
-                )
-                .unwrap()
-                .with_varying_manual_axes(["x"])
-                .unwrap(),
-            )
-            .unwrap();
-        let right_type = ArrayType::new_static(DataType::F32, [2, 2, 1])
-            .with_sharding(Sharding::replicated(mesh, 3))
-            .unwrap();
-        // Both inputs already have mapped axes, so axis materialization adds no variation. The Dot capability owns the
-        // transition on the invariant input.
+        let left_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+        )
+        .unwrap()
+        .with_varying_manual_axes(["x"])
+        .unwrap();
+        let right_sharding = Sharding::replicated(mesh, 3);
+        let varying_right_sharding = right_sharding.clone().with_varying_manual_axes(["x"]).unwrap();
+        // Both inputs already have mapped axes, so axis materialization adds no variation. The [`Dot`] capability owns
+        // the transition on the invariant input.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(left, right)| {
                 let context = BatchingContext::new(left.context().clone(), 2)
@@ -3715,16 +3810,17 @@ mod tests {
                 )?;
                 Ok(outputs.remove(0).into_value())
             },
-            (left_type, right_type),
+            (
+                ArrayType::new_static(DataType::F32, [2, 2, 2]).with_sharding(left_sharding.clone()).unwrap(),
+                ArrayType::new_static(DataType::F32, [2, 2, 1]).with_sharding(right_sharding.clone()).unwrap(),
+            ),
         )?;
         assert_eq!(
             program.to_string(),
-            indoc! {"
-                lambda %0:f32[2, 2, 2][sharding={mesh<['x'=2:manual]>, [{'x'}, {}, {}], varying_manual={'x'}}], \
-                %1:f32[2, 2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
-                let %2:f32[2, 2, 1][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] = \
-                parallel_vary [axis_name=\"x\"] %1
-                    %3:f32[2, 2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}, {}], varying_manual={'x'}}] = dot [
+            formatdoc! {"
+                lambda %0:f32[2, 2, 2][sharding={left_sharding}], %1:f32[2, 2, 1][sharding={right_sharding}] .
+                let %2:f32[2, 2, 1][sharding={varying_right_sharding}] = parallel_vary [axis_name=\"x\"] %1
+                    %3:f32[2, 2, 1][sharding={left_sharding}] = dot [
                         dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
                     ] %0 %2
                 in (%3)
@@ -3737,19 +3833,20 @@ mod tests {
     #[test]
     fn test_dot_batching_through_batch_transform() {
         // Mapping axis zero of a [3, 4] matrix gives three vector inner products. Each logical item contracts its only
-        // axis, while the physical operation preserves the leading mapped axis.
+        // axis, while the physical operation preserves the leading mapped axis. The batch items contract to
+        // [1, 2, 3, 4]·[1, 2, 3, 4] = 30, [5, 6, 7, 8]·[5, 6, 7, 8] = 174, and
+        // [9, 10, 11, 12]·[9, 10, 11, 12] = 446.
         let rows = Array::matrix(3, 4, (1..=12).map(|value| value as f64).collect()).unwrap();
-        let output: Array = batch(
-            |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())?),
-            rows,
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3]));
-        // The batch items contract to [1,2,3,4]·[1,2,3,4] = 30, [5,6,7,8]·[5,6,7,8] = 174, and 446.
-        assert_eq!(output.elements::<f64>(), Ok(vec![30.0, 174.0, 446.0]));
+        assert_eq!(
+            batch(
+                |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())?),
+                rows,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(Array::vector(vec![30.0, 174.0, 446.0]).unwrap()),
+        );
     }
 
     #[test]
@@ -3772,92 +3869,76 @@ mod tests {
     fn test_dot_batching_validates_mapped_extents() {
         let context = TracingContext::<ArrayType, ArrayOperation<ArrayType>>::new();
         let batching_context = BatchingContext::new(context.clone(), 2);
-        let input = |r#type: ArrayType| {
-            let atom = context.builder().borrow_mut().add_input(r#type.clone());
-            context.tracer(atom, Some(r#type))
-        };
         let operation = DotOperation::new(DotDimensionNumbers::inner_product());
-        let dynamic_rows = |variable: &DimensionVariable| {
-            input(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(variable.clone()), Dimension::Static(3)]),
-            ))
-        };
 
         // Two mapped inputs whose mapped axes carry different statically known extents cannot describe one batch.
-        assert_eq!(
-            operation
-                .batch(
-                    &batching_context,
-                    &EmptyRegionDriver,
-                    &[
-                        ArrayBatch::new(input(plain_array(&[2, 3])), BatchAxis::new(0)).unwrap(),
-                        ArrayBatch::new(input(plain_array(&[3, 3])), BatchAxis::new(0)).unwrap(),
-                    ],
-                )
-                .unwrap_err(),
-            BatchingError::MismatchedBatchSizes { expected: 2, actual: 3 },
-        );
-        // Two mapped inputs sharing one dynamic mapped extent describe the same batch, so the lifted contraction is
-        // staged with that dimension on its batching dimension.
-        let variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let outputs = operation
-            .batch(
+        assert!(matches!(
+            operation.batch(
                 &batching_context,
                 &EmptyRegionDriver,
                 &[
-                    ArrayBatch::new(dynamic_rows(&variable), BatchAxis::new(0)).unwrap(),
-                    ArrayBatch::new(dynamic_rows(&variable), BatchAxis::new(0)).unwrap(),
+                    ArrayBatch::new(context.input(plain_array(&[2, 3])), BatchAxis::new(0)).unwrap(),
+                    ArrayBatch::new(context.input(plain_array(&[3, 3])), BatchAxis::new(0)).unwrap(),
                 ],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            outputs[0].r#type().into_owned(),
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())])),
-        );
+            ),
+            Err(BatchingError::MismatchedBatchSizes { expected: 2, actual: 3 }),
+        ));
 
         // Dynamic extents are compared by variable identity, so two independently declared variables are two
         // independent extents even when their bounds agree.
-        let other = DimensionVariable::new("other", DimensionBounds::new(1, Some(5)).unwrap());
-        assert_eq!(
-            operation
-                .batch(
-                    &batching_context,
-                    &EmptyRegionDriver,
-                    &[
-                        ArrayBatch::new(dynamic_rows(&variable), BatchAxis::new(0)).unwrap(),
-                        ArrayBatch::new(dynamic_rows(&other), BatchAxis::new(0)).unwrap(),
-                    ],
-                )
-                .unwrap_err(),
-            BatchingError::MisalignedBatchAxes {
-                message: format!("`{DOT_OPERATION_NAME}` inputs map different batch extents `batch` and `other`"),
-            },
-        );
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let other_variable = DimensionVariable::new("other", DimensionBounds::new(1, Some(5)).unwrap());
+        assert!(matches!(
+            operation.batch(
+                &batching_context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayBatch::new(
+                        context.input(ArrayType::new(
+                            DataType::F32,
+                            Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]),
+                        )),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap(),
+                    ArrayBatch::new(
+                        context.input(ArrayType::new(
+                            DataType::F32,
+                            Shape::new(vec![Dimension::Dynamic(other_variable), Dimension::Static(3)]),
+                        )),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap(),
+                ],
+            ),
+            Err(BatchingError::MisalignedBatchAxes { message })
+                if message == format!("`{DOT_OPERATION_NAME}` inputs map different batch extents `batch` and `other`"),
+        ));
     }
 
     #[test]
-    fn test_dot_batching_under_a_dynamic_mapped_extent() -> Result<(), ProgramError> {
+    fn test_dot_batching_dynamic_mapped_extent() -> Result<(), ProgramError> {
         // A dense contraction is batched under a dynamic mapped extent as well. The mapped input keeps the dynamic
-        // batch dimension it already carries, and the replicated right-hand vector gains one through the policy's
+        // batch dimension it already carries, and the replicated right-hand side vector gains one through the policy's
         // dynamic broadcast, whose inserted axis is grounded by the transform's first-class extent value (read off the
         // mapped input's own axis). The lifted dot then contracts the trailing axis under a dynamic batching dimension.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let trace = ArrayIrContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
         let rows = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]))
-                .into(),
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(batch_variable.clone()), Dimension::Static(3)]),
+            )
+            .into(),
         );
-        let vector = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let vector = trace.input(ArrayType::new_static(DataType::F32, [3]).into());
         let output = batch(
             |(row, vector)| {
                 let row = ValueProjection::<ArrayType>::into_projected(row)?;
                 let vector = ValueProjection::<ArrayType>::into_projected(vector)?;
                 let mut outputs = row.domain().bind(
                     DotOperation::new(DotDimensionNumbers::inner_product()),
-                    Vec::new(),
+                    vec![],
                     &[row, vector],
                 )?;
                 Ok(outputs.remove(0).into_value())
@@ -3888,10 +3969,54 @@ mod tests {
         );
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![10.0f32, 100.0, 1000.0]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])?),
+                ArrayIrValue::Array(Array::vector(vec![10.0f32, 100.0, 1000.0])?),
             ])?,
-            ArrayIrValue::Array(Array::vector(vec![3210.0f32, 6540.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3210.0f32, 6540.0])?),
+        );
+
+        // Two mapped inputs that share one dynamic mapped extent describe the same batch. The transform reads both
+        // extents and compares them, which folds to a constant because they are the same variable, and the lifted
+        // contraction is staged with that dimension on its batching dimension.
+        let trace = ArrayIrContext::new();
+        let row_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]));
+        let left = trace.input(row_type.clone().into());
+        let right = trace.input(row_type.into());
+        let output = batch(
+            |(left, right)| {
+                let left = ValueProjection::<ArrayType>::into_projected(left)?;
+                let right = ValueProjection::<ArrayType>::into_projected(right)?;
+                let mut outputs = left.domain().bind(
+                    DotOperation::new(DotDimensionNumbers::inner_product()),
+                    vec![],
+                    &[left, right],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (left, right),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, ArrayIrValue<Array>>(
+            vec![output.atom_id()?],
+            vec![Placeholder, Placeholder],
+            Placeholder,
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[batch, 3], %1:f32[batch, 3] .
+                let %2:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %1
+                    %4:bool[] = const true
+                    %5:f32[batch] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    ] %0 %1
+                in (%5)
+            "}
+            .trim_end(),
         );
         Ok(())
     }
@@ -3922,6 +4047,36 @@ mod tests {
                 "},
             }],
         );
+
+        // A structural zero tangent drops its product rule term. Here, the constant right-hand side has a zero tangent.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
+        let rhs_constant = builder.add_constant(Array::vector(vec![5.0, 7.0]).unwrap());
+        let output = builder
+            .add_instruction(
+                DotOperation::new(DotDimensionNumbers::inner_product()),
+                vec![],
+                vec![lhs_input, rhs_constant],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[2] .
+                let %2:f64[2] = const [5.0, 7.0]
+                    %3:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %2
+                    %4:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %1 %2
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -3934,8 +4089,8 @@ mod tests {
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [left, right] = blocks.as_slice() else { unreachable!() };
-        assert_eq!(left.value().to_f64s(), vec![7.0, 11.0, 13.0]);
-        assert_eq!(right.value().to_f64s(), vec![2.0, 3.0, 5.0]);
+        assert_eq!(left.value(), &Array::vector(vec![7.0, 11.0, 13.0]).unwrap());
+        assert_eq!(right.value(), &Array::vector(vec![2.0, 3.0, 5.0]).unwrap());
 
         // Forward mode batches the basis tangents of the input coordinates through the dot pushforward.
         let jacobian = differentiate_at(inputs)
@@ -3943,34 +4098,87 @@ mod tests {
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [left, right] = blocks.as_slice() else { unreachable!() };
-        assert_eq!(left.value().to_f64s(), vec![7.0, 11.0, 13.0]);
-        assert_eq!(right.value().to_f64s(), vec![2.0, 3.0, 5.0]);
+        assert_eq!(left.value(), &Array::vector(vec![7.0, 11.0, 13.0]).unwrap());
+        assert_eq!(right.value(), &Array::vector(vec![2.0, 3.0, 5.0]).unwrap());
+    }
+
+    #[test]
+    fn test_dot_differentiation_widened_tangents() {
+        // The tangents of `f8e8m0fnu` primals are widened to `f32`, so each product rule term converts its primal
+        // factor to the tangent element type before the contraction.
+        let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
+        let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs = builder.add_input(lhs_type.clone());
+        let rhs = builder.add_input(rhs_type.clone());
+        let output = builder.add_instruction(DotOperation::matmul(), vec![], vec![lhs, rhs], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[2, 1] .
+                let %2:f8e8m0fnu[3, 1] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[2, 1], %2:f32[3, 2], %3:f32[2, 1] .
+                let %4:f8e8m0fnu[3, 1] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                ] %0 %1
+                    %5:f32[2, 1] = convert_element_type [data_type=f32] %1
+                    %6:f32[3, 1] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %2 %5
+                    %7:f32[3, 2] = convert_element_type [data_type=f32] %0
+                    %8:f32[3, 1] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %7 %3
+                    %9:f32[3, 1] = add %6 %8
+                in (%4, %9)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            jvp.interpret(vec![
+                Array::from_elements(lhs_type, &[f8e8m0fnu::from_bits(127); 6]).unwrap(),
+                Array::from_elements(rhs_type, &[f8e8m0fnu::from_bits(127); 2]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [3, 2]), &[1.0f32; 6]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1]), &[1.0f32; 2]).unwrap(),
+            ]),
+            Ok(vec![
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F8E8M0FNU, [3, 1]),
+                    &[f8e8m0fnu::from_bits(128); 3],
+                )
+                .unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [3, 1]), &[4.0f32; 3]).unwrap(),
+            ]),
+        );
     }
 
     #[test]
     fn test_dot_differentiation_accumulation_type() {
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
-        let rhs = lhs.clone();
-        let lhs_values = Array::from_elements::<f8e4m3fn>(
-            lhs.clone(),
-            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let rhs_values = Array::from_elements::<f8e4m3fn>(
-            rhs.clone(),
-            &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
         // Forward mode differentiation stages tangent dots with the accumulation type over tangents of the input type,
         // so the output tangent lives at the accumulation type exactly like the primal output. Every value below is
         // exactly representable in `f8e4m3fn` and every product sum is exact in `f32`.
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let lhs_input = builder.add_input(lhs.clone());
-        let rhs_input = builder.add_input(rhs.clone());
+        let lhs_input = builder.add_input(input_type.clone());
+        let rhs_input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
                 DotOperation::matmul().with_accumulation_type(DataType::F32),
-                Vec::new(),
+                vec![],
                 vec![lhs_input, rhs_input],
                 None,
             )
@@ -3978,76 +4186,74 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-            lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2] .
-            let %2:f32[2, 2] = dot [
-                dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                accumulation_type=f32,
-            ] %0 %1
-            in (%2)
-        "}
-            .trim_end(),
-        );
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
             indoc! {"
-                    lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2], %2:f8e4m3fn[2, 2], %3:f8e4m3fn[2, 2] .
-                    let %4:f32[2, 2] = dot [
+                lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2], %2:f8e4m3fn[2, 2], %3:f8e4m3fn[2, 2] .
+                let %4:f32[2, 2] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    accumulation_type=f32,
+                ] %0 %1
+                    %5:f32[2, 2] = dot [
                         dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
                         accumulation_type=f32,
-                    ] %0 %1
-                        %5:f32[2, 2] = dot [
-                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                            accumulation_type=f32,
-                        ] %2 %1
-                        %6:f32[2, 2] = dot [
-                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                            accumulation_type=f32,
-                        ] %0 %3
-                        %7:f32[2, 2] = add %5 %6
-                    in (%4, %7)
-                "}
+                    ] %2 %1
+                    %6:f32[2, 2] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %0 %3
+                    %7:f32[2, 2] = add %5 %6
+                in (%4, %7)
+            "}
             .trim_end(),
         );
-        let jvp_outputs = jvp
-            .interpret(vec![
-                lhs_values.clone(),
-                rhs_values.clone(),
+
+        // The tangent is `d_lhs · rhs + lhs · d_rhs = [[1.5, 1.5], [1.5, 1.5]] + [[0.75, 0.75], [1.75, 1.75]]`.
+        assert_eq!(
+            jvp.interpret(vec![
                 Array::from_elements::<f8e4m3fn>(
-                    lhs.clone(),
+                    input_type.clone(),
+                    &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                )
+                .unwrap(),
+                Array::from_elements::<f8e4m3fn>(
+                    input_type.clone(),
+                    &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                )
+                .unwrap(),
+                Array::from_elements::<f8e4m3fn>(
+                    input_type.clone(),
                     &[1.0, 1.0, 1.0, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
                 )
                 .unwrap(),
                 Array::from_elements::<f8e4m3fn>(
-                    rhs.clone(),
+                    input_type,
                     &[0.5, 0.5, 0.5, 0.5].map(|value| f8e4m3fn::from_f64(value).unwrap()),
                 )
                 .unwrap(),
-            ])
-            .unwrap();
-        assert_eq!(jvp_outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
-        assert_eq!(jvp_outputs[1].r#type().data_type(), DataType::F32);
-        // Tangent = d_lhs · rhs + lhs · d_rhs = [[1.5, 1.5], [1.5, 1.5]] + [[0.75, 0.75], [1.75, 1.75]].
-        assert_eq!(jvp_outputs[1].to_f64s(), vec![2.25, 2.25, 3.25, 3.25]);
+            ]),
+            Ok(vec![
+                Array::matrix(2, 2, vec![1.0f32, 1.25, 2.5, 2.75]).unwrap(),
+                Array::matrix(2, 2, vec![2.25f32, 2.25, 3.25, 3.25]).unwrap(),
+            ]),
+        );
     }
 
     #[test]
     fn test_dot_differentiation_accumulation_type_and_output_sharding() {
         // Forward mode differentiation stages tangent dots with both the accumulation type and the requested output
         // sharding, so the output tangent has exactly the type of the primal output.
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let sharding =
             Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let lhs_input = builder.add_input(lhs.clone());
-        let rhs_input = builder.add_input(lhs);
+        let lhs_input = builder.add_input(input_type.clone());
+        let rhs_input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
                 DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding.clone()),
-                Vec::new(),
+                vec![],
                 vec![lhs_input, rhs_input],
                 None,
             )
@@ -4083,13 +4289,12 @@ mod tests {
 
     #[test]
     fn test_dot_transposition() {
-        let matmul = DotDimensionNumbers::matmul();
         let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
         let cotangent = Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]).unwrap();
         check_operation_transposition!(
             @exact,
-            operation = DotOperation::new(matmul),
+            operation = DotOperation::matmul(),
             cases = [
                 {
                     inputs = [
@@ -4098,17 +4303,28 @@ mod tests {
                     ],
                     output_cotangents = [cotangent.clone()],
                     input_cotangents = [Array::matrix(3, 2, vec![3.0, 10.0, 4.5, 11.0, 6.0, 12.0]).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[2, 2], %1:f64[2, 3] .
+                        let %2:f64[3, 2] = dot [
+                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %1 %0
+                        in (%2)
+                    "},
                 },
                 {
                     inputs = [
-                        (@linear(type = ArrayType::new(
-                            DataType::F64,
-                            Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]),
-                        ))),
+                        (@linear(type = ArrayType::new_static(DataType::F64, [2, 3]))),
                         (@known, right),
                     ],
                     output_cotangents = [cotangent],
                     input_cotangents = [Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[2, 2], %1:f64[3, 2] .
+                        let %2:f64[2, 3] = dot [
+                            dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]),
+                        ] %0 %1
+                        in (%2)
+                    "},
                 },
             ],
         );
@@ -4116,32 +4332,35 @@ mod tests {
 
     #[test]
     fn test_dot_transposition_accumulation_type() {
-        let lhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
-        let rhs = lhs.clone();
-        let lhs_values = Array::from_elements::<f8e4m3fn>(
-            lhs.clone(),
-            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         // The transpose rule contracts the adjoint at the accumulation type and converts the result back to the linear
-        // input's `f8e4m3fn` cotangent representation. With an identity output cotangent, the adjoint of the linear RHS
-        // is exactly `lhsᵀ`.
+        // input's `f8e4m3fn` cotangent representation. With an identity output cotangent, the adjoint of the linear
+        // right-hand side is exactly `lhsᵀ`.
         check_operation_transposition!(
             @exact,
             operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
             cases = [{
                 inputs = [
-                    (@known, lhs_values),
-                    (@linear(type = rhs.clone())),
+                    (@known, Array::from_elements::<f8e4m3fn>(
+                        input_type.clone(),
+                        &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                    ).unwrap()),
+                    (@linear(type = input_type.clone())),
                 ],
-                output_cotangents = [Array::from_elements::<f32>(
-                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-                    &[1.0, 0.0, 0.0, 1.0],
-                ).unwrap()],
+                output_cotangents = [Array::matrix(2, 2, vec![1.0f32, 0.0, 0.0, 1.0]).unwrap()],
                 input_cotangents = [Array::from_elements::<f8e4m3fn>(
-                    rhs,
+                    input_type,
                     &[0.5, 1.5, 1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
                 ).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[2, 2], %1:f8e4m3fn[2, 2] .
+                    let %2:f32[2, 2] = convert_element_type [data_type=f32] %1
+                        %3:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %2 %0
+                        %4:f8e4m3fn[2, 2] = convert_element_type [data_type=f8e4m3fn] %3
+                    in (%4)
+                "},
             }],
         );
     }
@@ -4151,99 +4370,54 @@ mod tests {
         // The transpose rule contracts the adjoint at the accumulation type, requests the placement of the linear
         // input's cotangent, and converts the result back to its `f8e4m3fn` element type. With an identity output
         // cotangent, the adjoint of the linear right-hand side is exactly `lhsᵀ`.
-        let mesh = test_mesh();
-        let columns = vec![ShardingDimension::Replicated, ShardingDimension::sharded(["n"])];
-        let rhs = ArrayType::new_static(DataType::F8E4M3FN, [2, 2])
-            .with_sharding(Sharding::new(mesh.clone(), columns.clone()).unwrap())
-            .unwrap();
-        let lhs_values = Array::from_elements::<f8e4m3fn>(
-            ArrayType::new_static(DataType::F8E4M3FN, [2, 2]),
-            &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["n"])]).unwrap();
+        let rhs_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]).with_sharding(sharding.clone()).unwrap();
         check_operation_transposition!(
             @exact,
             operation = DotOperation::matmul()
                 .with_accumulation_type(DataType::F32)
-                .with_output_sharding(Sharding::new(mesh.clone(), columns.clone()).unwrap()),
+                .with_output_sharding(sharding.clone()),
             cases = [{
                 inputs = [
-                    (@known, lhs_values),
-                    (@linear(type = rhs.clone())),
+                    (@known, Array::from_elements::<f8e4m3fn>(
+                        ArrayType::new_static(DataType::F8E4M3FN, [2, 2]),
+                        &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                    ).unwrap()),
+                    (@linear(type = rhs_type.clone())),
                 ],
                 output_cotangents = [Array::from_elements::<f32>(
-                    ArrayType::new_static(DataType::F32, [2, 2])
-                        .with_sharding(Sharding::new(mesh, columns).unwrap())
-                        .unwrap(),
+                    ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding.clone()).unwrap(),
                     &[1.0, 0.0, 0.0, 1.0],
                 ).unwrap()],
                 input_cotangents = [Array::from_elements::<f8e4m3fn>(
-                    rhs,
+                    rhs_type,
                     &[0.5, 1.5, 1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
                 ).unwrap()],
+                pullback = formatdoc! {"
+                    lambda %0:f32[2, 2][sharding={sharding}], %1:f8e4m3fn[2, 2] .
+                    let %2:f32[2, 2] = convert_element_type [data_type=f32] %1
+                        %3:f32[2, 2][sharding={sharding}] = dot [
+                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            output_sharding={sharding},
+                        ] %2 %0
+                        %4:f8e4m3fn[2, 2][sharding={sharding}] = convert_element_type [data_type=f8e4m3fn] %3
+                    in (%4)
+                "},
             }],
         );
     }
 
     #[test]
-    fn test_dot_transposition_prunes_unrequested_pullback_gradient() {
-        let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-        let (_, pullback) = differentiate_at((left, right))
-            .vjp(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())?))
-            .unwrap();
-        let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap().into_program();
-        let selected = pullback
-            .transposed_program(&[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
-            .unwrap()
-            .into_program();
-        // Ignoring the right gradient removes its contraction from the pullback itself.
-        assert_eq!(
-            both.to_string(),
-            indoc! {"
-            lambda %0:f64[2, 2], %1:f64[3, 2], %2:f64[2, 3] .
-            let %3:f64[3, 2] = dot [
-                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-            ] %2 %0
-                %4:f64[2, 3] = dot [
-                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]),
-                ] %0 %1
-            in (%4, %3)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            selected.to_string(),
-            indoc! {"
-            lambda %0:f64[2, 2], %1:f64[3, 2], %2:f64[2, 3] .
-            let %3:f64[2, 3] = dot [
-                dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]),
-            ] %0 %1
-            in (%3)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            pullback.apply_with_destinations(
-                CotangentSeed::Value(Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]).unwrap()),
-                (CotangentDestination::Return, CotangentDestination::Ignore),
-            ),
-            Ok((
-                Some(MaybeZero::Value(Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]).unwrap())),
-                None,
-            )),
-        );
-    }
-
-    #[test]
-    fn test_dot_transposition_omits_unrequested_cotangent() {
+    fn test_dot_transposition_unrequested_cotangent() {
+        // An unrequested linear input stages no adjoint and keeps a structural zero cotangent.
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         let right = context.input(ArrayType::new_static(DataType::F64, [3, 2]));
         let seed = context.input(ArrayType::new_static(DataType::F64, [2, 2]));
         let inputs = [PartialValue::Unknown(ArrayType::new_static(DataType::F64, [2, 3])), PartialValue::Known(right)];
         let accumulators = context.cotangent_accumulators(&inputs, &[false, false]).unwrap();
         DotOperation::matmul()
-            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed.clone())], &accumulators)
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
             .unwrap();
         let program = context
             .builder()
@@ -4254,37 +4428,12 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-            lambda %0:f64[3, 2], %1:f64[2, 2] .
-            in ()
-        "}
+                lambda %0:f64[3, 2], %1:f64[2, 2] .
+                in ()
+            "}
             .trim_end(),
         );
         assert!(context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
-        // Requesting the same unknown input constructs its adjoint matrix multiplication with the same knownness.
-        let accumulators = context.cotangent_accumulators(&inputs, &[true, false]).unwrap();
-        DotOperation::matmul()
-            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
-            .unwrap();
-        let contributions = context.take_cotangents(&accumulators).unwrap();
-        let atom = contributions[0].as_value().unwrap().atom_id().unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![atom], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-            lambda %0:f64[3, 2], %1:f64[2, 2] .
-            let %2:f64[2, 3] = dot [
-                dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]),
-            ] %1 %0
-            in (%2)
-        "}
-            .trim_end(),
-        );
-        assert!(!contributions[0].is_zero());
     }
 
     #[test]
@@ -4303,8 +4452,49 @@ mod tests {
                 &accumulators,
             )
             .unwrap();
-        assert!(context.builder().borrow().instructions().is_empty());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder], vec![])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3, 2] .
+                in ()
+            "}
+            .trim_end(),
+        );
         assert!(context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
+    }
+
+    #[test]
+    fn test_dot_transposition_known_inputs() {
+        // A dot with two known inputs is not part of the linear map, so transposition stages nothing.
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let left = context.input(ArrayType::new_static(DataType::F64, [2, 3]));
+        let right = context.input(ArrayType::new_static(DataType::F64, [3, 2]));
+        let seed = context.input(ArrayType::new_static(DataType::F64, [2, 2]));
+        let inputs = [PartialValue::Known(left), PartialValue::Known(right)];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false, false]).unwrap();
+        DotOperation::matmul()
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
+            .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder; 3], vec![])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3], %1:f64[3, 2], %2:f64[2, 2] .
+                in ()
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -4418,45 +4608,103 @@ mod tests {
 
     #[test]
     fn test_dot_transposition_multiple_contracting_axes_and_sharding() {
+        // Each adjoint requests the linear input's sharding permuted into the adjoint axis order, and the restoring
+        // transpose then recovers the linear input's own sharding.
         let mesh = test_mesh();
-        let left_type = sharded_array(
-            &mesh,
-            &[2, 2, 2, 1],
+        let input_sharding = Sharding::new(
+            mesh.clone(),
             vec![
                 ShardingDimension::sharded(["m"]),
                 ShardingDimension::sharded(["b"]),
                 ShardingDimension::Replicated,
                 ShardingDimension::Replicated,
             ],
-        );
-        let seed_type = sharded_array(
-            &mesh,
-            &[2, 1, 1],
+        )
+        .unwrap();
+        let seed_sharding = Sharding::new(
+            mesh.clone(),
             vec![ShardingDimension::sharded(["b"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
-        );
+        )
+        .unwrap();
+        let left_adjoint_sharding = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["b"]),
+                ShardingDimension::Replicated,
+                ShardingDimension::Replicated,
+                ShardingDimension::sharded(["m"]),
+            ],
+        )
+        .unwrap();
+        let right_adjoint_sharding = Sharding::new(
+            mesh,
+            vec![
+                ShardingDimension::sharded(["b"]),
+                ShardingDimension::Replicated,
+                ShardingDimension::sharded(["m"]),
+                ShardingDimension::Replicated,
+            ],
+        )
+        .unwrap();
+        let input_type = plain_array(&[2, 2, 2, 1]).with_sharding(input_sharding.clone()).unwrap();
+        let seed = Array::from_elements::<f32>(
+            plain_array(&[2, 1, 1]).with_sharding(seed_sharding.clone()).unwrap(),
+            &[3.0, 5.0],
+        )
+        .unwrap();
 
         check_operation_transposition!(
             @exact,
             operation = DotOperation::new(DotDimensionNumbers::new(vec![2, 0], vec![0, 2], vec![1], vec![1])),
-            cases = [{
-                inputs = [
-                    (@linear(type = left_type.clone())),
-                    (@known, Array::from_elements::<f32>(
-                        plain_array(&[2, 2, 2, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                    ).unwrap()),
-                ],
-                output_cotangents = [Array::from_elements::<f32>(seed_type, &[3.0, 5.0]).unwrap()],
-                input_cotangents = [Array::from_elements::<f32>(
-                    left_type, &[3.0, 15.0, 15.0, 35.0, 6.0, 18.0, 20.0, 40.0],
-                ).unwrap()],
-            }],
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = input_type.clone())),
+                        (@known, Array::from_elements::<f32>(
+                            plain_array(&[2, 2, 2, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                        ).unwrap()),
+                    ],
+                    output_cotangents = [seed.clone()],
+                    input_cotangents = [Array::from_elements::<f32>(
+                        input_type.clone(), &[3.0, 15.0, 15.0, 35.0, 6.0, 18.0, 20.0, 40.0],
+                    ).unwrap()],
+                    pullback = formatdoc! {"
+                        lambda %0:f32[2, 1, 1][sharding={seed_sharding}], %1:f32[2, 2, 2, 1] .
+                        let %2:f32[2, 1, 2, 2][sharding={left_adjoint_sharding}] = dot [
+                            dimensions=(lhs_contracting=[2], rhs_contracting=[3], lhs_batching=[0], rhs_batching=[1]),
+                            output_sharding={left_adjoint_sharding},
+                        ] %0 %1
+                            %3:f32[2, 2, 2, 1][sharding={input_sharding}] = transpose [permutation=[3, 0, 2, 1]] %2
+                        in (%3)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@known, Array::from_elements::<f32>(
+                            plain_array(&[2, 2, 2, 1]), &[11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0],
+                        ).unwrap()),
+                        (@linear(type = input_type.clone())),
+                    ],
+                    output_cotangents = [seed],
+                    input_cotangents = [Array::from_elements::<f32>(
+                        input_type, &[33.0, 45.0, 65.0, 85.0, 36.0, 48.0, 70.0, 90.0],
+                    ).unwrap()],
+                    pullback = formatdoc! {"
+                        lambda %0:f32[2, 1, 1][sharding={seed_sharding}], %1:f32[2, 2, 2, 1] .
+                        let %2:f32[2, 2, 2, 1][sharding={right_adjoint_sharding}] = dot [
+                            dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[1], rhs_batching=[0]),
+                            output_sharding={right_adjoint_sharding},
+                        ] %1 %0
+                            %3:f32[2, 2, 2, 1][sharding={input_sharding}] = transpose [permutation=[2, 0, 1, 3]] %2
+                        in (%3)
+                    "},
+                },
+            ],
         );
     }
 
     #[test]
     fn test_dot_array_ir() {
-        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
         // Array IR tracers stage the homogeneous dot product as an array member instruction.
         let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
         let (_, program) = ArrayIrContext::trace(
@@ -4471,30 +4719,50 @@ mod tests {
                 let %2:f32[] = dot [
                     dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
                 ] %0 %1
-                in (%2)"
-            },
+                in (%2)
+            "}
+            .trim_end(),
         );
-        let empty = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
-        assert_eq!(
-            empty.dot(&empty, &DotDimensionNumbers::inner_product()),
-            Ok(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())),
-        );
-        let singleton = ArrayIrValue::Array(Array::vector(vec![3.0f32]).unwrap());
-        assert_eq!(
-            singleton.dot(&singleton, &DotDimensionNumbers::inner_product()),
-            Ok(ArrayIrValue::Array(Array::scalar(9.0f32).unwrap())),
-        );
-        // Concrete array IR values contract their array members, and differentiation reaches the homogeneous rule
-        // through the array IR member projection.
+
+        // Concrete array IR values contract their array members, while first-class dimension members are rejected.
         let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
         assert_eq!(
             left.dot(&right, &DotDimensionNumbers::inner_product()),
             Ok(ArrayIrValue::Array(Array::scalar(11.0f32).unwrap())),
         );
+        let singleton = ArrayIrValue::Array(Array::vector(vec![3.0f32]).unwrap());
         assert_eq!(
-            differentiate_at(left.clone())
-                .jvp(right.clone(), |input| input.dot(&input, &DotDimensionNumbers::inner_product())),
+            singleton.dot(&singleton, &DotDimensionNumbers::inner_product()),
+            Ok(ArrayIrValue::Array(Array::scalar(9.0f32).unwrap())),
+        );
+        let empty = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
+        assert_eq!(
+            empty.dot(&empty, &DotDimensionNumbers::inner_product()),
+            Ok(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())),
+        );
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.dot(&dimension, &DotDimensionNumbers::inner_product()),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // Batching and differentiation reach the homogeneous rule through the array IR member projection.
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<
+                    EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                    ArrayIrBatchingPolicy,
+                >| { item.dot(&item, &DotDimensionNumbers::inner_product()) },
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(ArrayIrValue::Array(Array::vector(vec![5.0f32, 25.0]).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(left).jvp(right, |input| input.dot(&input, &DotDimensionNumbers::inner_product())),
             Ok((
                 ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()),
                 ArrayIrValue::Array(Array::scalar(22.0f32).unwrap()),
@@ -4519,6 +4787,10 @@ mod tests {
         assert_eq!(dimensions.dot_dimensions(), &DotDimensionNumbers::inner_product());
         assert_eq!(dimensions.lhs_ragged_dimension(), 0);
         assert_eq!(dimensions.rhs_group_dimension(), None);
+        assert_eq!(
+            dimensions.to_string(),
+            "(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[], lhs_ragged=0)",
+        );
         let dimensions = RaggedDotDimensionNumbers::matmul();
         assert_eq!(
             dimensions.to_string(),
@@ -4537,7 +4809,7 @@ mod tests {
     fn test_ragged_dot_dimension_numbers_matmul() {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul(),
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]), 0, Some(0),),
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]), 0, Some(0)),
         );
     }
 
@@ -4562,16 +4834,17 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_dimension_numbers_group_sizes_prefix_dimensions() {
-        let noncontracting =
+        let non_contracting =
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![3], vec![0], vec![1], vec![1]), 2, Some(2));
-        assert_eq!(noncontracting.group_sizes_prefix_dimensions(4), Ok(vec![1, 0]));
+        assert_eq!(non_contracting.group_sizes_prefix_dimensions(4), Ok(vec![1, 0]));
         let contracting =
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![3, 0], vec![0, 2], vec![1], vec![1]), 0, None);
         assert_eq!(contracting.group_sizes_prefix_dimensions(4), Ok(vec![1, 3]));
-        let batching =
+        let batch =
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![], vec![], vec![2, 0], vec![1, 0]), 0, None);
-        assert_eq!(batching.group_sizes_prefix_dimensions(3), Ok(vec![2]));
-        // Invalid LHS batching or contracting indices are rejected before they index the prefix.
+        assert_eq!(batch.group_sizes_prefix_dimensions(3), Ok(vec![2]));
+
+        // Invalid left-hand side batching or contracting indices are rejected before they index the prefix.
         let invalid =
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]), 0, Some(0));
         assert_eq!(
@@ -4596,7 +4869,7 @@ mod tests {
             Ok(RaggedDotMode::Batch),
         );
 
-        // Invalid underlying dot dimension numbers are reported with the grouped operation name.
+        // Invalid underlying dot dimension numbers are reported with the ragged dot operation name.
         assert_eq!(
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![0]), 0, Some(0))
                 .validate(2, 3),
@@ -4633,7 +4906,23 @@ mod tests {
             ))),
         );
         assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 2, Some(0))
+                .validate(3, 3),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension must be distinct from batching and \
+                 contracting dimensions",
+            ))),
+        );
+        assert_eq!(
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, Some(1)).validate(2, 2),
+            Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` does not accept a right-hand side group dimension when the \
+                 left-hand side ragged dimension is contracting or batching",
+            ))),
+        );
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, Some(2))
+                .validate(2, 3),
             Err(TypeError::invalid(format!(
                 "`{RAGGED_DOT_OPERATION_NAME}` does not accept a right-hand side group dimension when the \
                  left-hand side ragged dimension is contracting or batching",
@@ -4647,8 +4936,22 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().lhs_cotangent_dimensions(2, 3),
             (
-                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![2], vec![], vec![]), 0, Some(0),),
+                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![2], vec![], vec![]), 0, Some(0)),
                 vec![0, 1],
+            ),
+        );
+
+        // The adjoint emits the batching axes first, so the left-hand side axes must be restored with a permutation.
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![2], vec![2]), 0, Some(0))
+                .lhs_cotangent_dimensions(3, 4),
+            (
+                RaggedDotDimensionNumbers::new(
+                    DotDimensionNumbers::new(vec![2], vec![3], vec![0], vec![2]),
+                    1,
+                    Some(0)
+                ),
+                vec![2, 0, 1],
             ),
         );
     }
@@ -4659,8 +4962,18 @@ mod tests {
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().rhs_cotangent_dimensions(2, 3),
             (
-                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]), 0, None,),
+                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]), 0, None),
                 vec![0, 1, 2],
+            ),
+        );
+
+        // The batching axes follow the group axis, ahead of the right-hand side contracting axes.
+        assert_eq!(
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![2], vec![2]), 0, Some(0))
+                .rhs_cotangent_dimensions(3, 4),
+            (
+                RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![0], vec![1], vec![2], vec![0]), 0, None),
+                vec![0, 2, 1, 3],
             ),
         );
     }
@@ -4691,8 +5004,8 @@ mod tests {
 
         // Program rendering uses the canonical operation name and includes the dimension numbers.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(left, right, sizes): (Tracer<_>, Tracer<_>, Tracer<_>)| {
-                left.ragged_dot(&right, &sizes, &RaggedDotDimensionNumbers::matmul())
+            |(left, right, group_sizes): (Tracer<_>, Tracer<_>, Tracer<_>)| {
+                left.ragged_dot(&right, &group_sizes, &RaggedDotDimensionNumbers::matmul())
             },
             (plain_array(&[3, 2]), plain_array(&[2, 2, 1]), ArrayType::new_static(DataType::I32, [2])),
         )
@@ -4713,10 +5026,11 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_type_inference() {
-        let group_sizes = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)]));
-        let dimensions = RaggedDotDimensionNumbers::matmul();
+        let group_sizes = ArrayType::new_static(DataType::I32, [3]);
+
+        // Non-contracting mode drops the right-hand side group dimension from the dot output.
         check_operation_type_inference!(
-            operation = RaggedDotOperation::new(dimensions),
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
             cases = [
                 {
                     input_types = [plain_array(&[5, 2]), plain_array(&[3, 2, 4]), group_sizes.clone()],
@@ -4759,9 +5073,20 @@ mod tests {
             ],
         );
 
+        // The right-hand side group dimension may follow the right-hand side result dimensions.
+        check_operation_type_inference!(
+            operation =
+                RaggedDotOperation::new(RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 0, Some(2))),
+            cases = [{
+                input_types = [plain_array(&[5, 2]), plain_array(&[2, 4, 3]), group_sizes.clone()],
+                output_types = [plain_array(&[5, 4])],
+            }],
+        );
+
+        // Type inference validates the dimension numbers, reporting errors with the ragged dot operation name.
         check_operation_type_inference!(
             operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-                DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]),
                 0,
                 None,
             )),
@@ -4773,14 +5098,25 @@ mod tests {
                 ),
             }],
         );
-
-        let contracting = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            1,
-            None,
-        ));
         check_operation_type_inference!(
-            operation = contracting,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]),
+                0,
+                Some(0),
+            )),
+            cases = [{
+                input_types = [
+                    plain_array(&[3, 2]),
+                    plain_array(&[2, 2, 1]),
+                    ArrayType::new_static(DataType::I32, [2, 2]),
+                ],
+                error = format!("`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds"),
+            }],
+        );
+
+        // Contracting mode inserts a leading group dimension and accepts any integer group sizes.
+        check_operation_type_inference!(
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None)),
             cases = [
                 {
                     input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), group_sizes.clone()],
@@ -4807,13 +5143,9 @@ mod tests {
                 },
             ],
         );
-
         check_operation_type_inference!(
-            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-                DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-                1,
-                Some(1),
-            )),
+            operation =
+                RaggedDotOperation::new(RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, Some(1))),
             cases = [{
                 input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), group_sizes.clone()],
                 error = format!(
@@ -4823,13 +5155,13 @@ mod tests {
             }],
         );
 
-        let batch = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-            0,
-            None,
-        ));
+        // Batch mode keeps the ordinary batched dot output and accepts `f8e8m0fnu`, because it expands no groups.
         check_operation_type_inference!(
-            operation = batch,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+                0,
+                None,
+            )),
             cases = [
                 {
                     input_types = [plain_array(&[5, 2]), plain_array(&[5, 2, 4]), group_sizes.clone()],
@@ -4839,29 +5171,27 @@ mod tests {
                     input_types = [
                         ArrayType::new_static(DataType::F8E8M0FNU, [5, 2]),
                         ArrayType::new_static(DataType::F8E8M0FNU, [5, 2, 4]),
-                        group_sizes.clone(),
+                        group_sizes,
                     ],
                     output_types = [ArrayType::new_static(DataType::F8E8M0FNU, [5, 4])],
                 },
             ],
         );
 
-        let prefixed = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
-            1,
-            Some(0),
-        ));
+        // Group sizes of rank greater than one must have a prefix that matches the left-hand side dimensions preceding
+        // the ragged position in each mode.
         check_operation_type_inference!(
-            operation = prefixed,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
+                1,
+                Some(0),
+            )),
             cases = [
                 {
                     input_types = [
                         plain_array(&[2, 5, 3]),
                         plain_array(&[4, 2, 3, 6]),
-                        ArrayType::new(
-                            DataType::I32,
-                            Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
-                        ),
+                        ArrayType::new_static(DataType::I32, [2, 4]),
                     ],
                     output_types = [plain_array(&[2, 5, 6])],
                 },
@@ -4869,23 +5199,18 @@ mod tests {
                     input_types = [
                         plain_array(&[2, 5, 3]),
                         plain_array(&[4, 2, 3, 6]),
-                        ArrayType::new(
-                            DataType::I32,
-                            Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]),
-                        ),
+                        ArrayType::new_static(DataType::I32, [3, 4]),
                     ],
                     error = format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes prefix must be `[2]`, but got `[3]`"),
                 },
             ],
         );
-
-        let prefixed_contracting = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]),
-            2,
-            None,
-        ));
         check_operation_type_inference!(
-            operation = prefixed_contracting,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]),
+                2,
+                None,
+            )),
             cases = [{
                 input_types = [
                     plain_array(&[2, 3, 4]),
@@ -4895,14 +5220,12 @@ mod tests {
                 output_types = [plain_array(&[3, 2, 3, 5])],
             }],
         );
-
-        let prefixed_batch = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]),
-            1,
-            None,
-        ));
         check_operation_type_inference!(
-            operation = prefixed_batch,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]),
+                1,
+                None,
+            )),
             cases = [{
                 input_types = [
                     plain_array(&[2, 4, 3]),
@@ -4915,65 +5238,219 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_dot_type_inference_rejects_invalid_prefix_axes() {
-        let dimensions =
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![3], vec![0]), 0, Some(0));
+    fn test_ragged_dot_type_inference_sharding() {
+        let mesh = test_mesh();
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]);
+
+        // Non-contracting mode drops the sharding of the right-hand side group dimension with the dimension itself.
         check_operation_type_inference!(
-            operation = RaggedDotOperation::new(dimensions),
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
             cases = [{
                 input_types = [
-                    plain_array(&[3, 2]),
-                    plain_array(&[2, 2, 1]),
-                    ArrayType::new_static(DataType::I32, [2, 2]),
+                    lhs.clone(),
+                    sharded_array(
+                        &mesh,
+                        &[2, 8, 16],
+                        vec![
+                            ShardingDimension::Replicated,
+                            ShardingDimension::Replicated,
+                            ShardingDimension::sharded(["n"]),
+                        ],
+                    ),
+                    ArrayType::new_static(DataType::I32, [2]),
                 ],
-                error = format!("`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds"),
+                output_types = [sharded_array(
+                    &mesh,
+                    &[4, 16],
+                    vec![ShardingDimension::sharded(["m"]), ShardingDimension::sharded(["n"])],
+                )],
+            }],
+        );
+
+        // Contracting mode inserts a replicated leading group dimension.
+        check_operation_type_inference!(
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None)),
+            cases = [{
+                input_types = [
+                    lhs,
+                    sharded_array(
+                        &mesh,
+                        &[8, 16],
+                        vec![ShardingDimension::Replicated, ShardingDimension::sharded(["n"])],
+                    ),
+                    ArrayType::new_static(DataType::I32, [3]),
+                ],
+                output_types = [sharded_array(
+                    &mesh,
+                    &[3, 4, 16],
+                    vec![
+                        ShardingDimension::Replicated,
+                        ShardingDimension::sharded(["m"]),
+                        ShardingDimension::sharded(["n"]),
+                    ],
+                )],
+            }],
+        );
+
+        // The group sizes take part in the manual variation check of the data inputs.
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        check_operation_type_inference!(
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+            cases = [{
+                input_types = [
+                    plain_array(&[5, 2])
+                        .with_sharding(
+                            Sharding::replicated(manual_mesh.clone(), 2).with_varying_manual_axes(["devices"]).unwrap(),
+                        )
+                        .unwrap(),
+                    plain_array(&[3, 2, 4])
+                        .with_sharding(
+                            Sharding::replicated(manual_mesh, 3).with_varying_manual_axes(["devices"]).unwrap(),
+                        )
+                        .unwrap(),
+                    ArrayType::new_static(DataType::I32, [3]),
+                ],
+                error = format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` inputs must have matching varying manual axes; insert \
+                     `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
+                ),
             }],
         );
     }
 
     #[test]
     fn test_ragged_dot_interpretation() {
+        // Consecutive groups of left-hand side rows use their right-hand side slices, and the uncovered suffix is zero.
         let lhs = Array::matrix(5, 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).unwrap();
         let rhs = Array::from_elements::<f32>(plain_array(&[3, 2, 1]), &[10.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        let output = lhs
-            .ragged_dot(&rhs, &Array::vector(vec![2i32, 0, 2]).unwrap(), &RaggedDotDimensionNumbers::matmul())
-            .unwrap();
-        assert_eq!(output.r#type().into_owned(), plain_array(&[5, 1]));
-        assert_eq!(output.to_f64s(), vec![12.0, 34.0, 50.0, 68.0, 0.0]);
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![2i32, 0, 2]).unwrap(), &RaggedDotDimensionNumbers::matmul()),
+            Ok(Array::matrix(5, 1, vec![12.0f32, 34.0, 50.0, 68.0, 0.0]).unwrap()),
+        );
 
         // Sizes that cover more than the extent clip the intersecting group and leave every later raw cumulative
         // interval empty.
         let lhs = Array::matrix(4, 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
-        let output = lhs
-            .ragged_dot(&rhs, &Array::vector(vec![3i32, 3, 2]).unwrap(), &RaggedDotDimensionNumbers::matmul())
-            .unwrap();
-        assert_eq!(output, Array::matrix(4, 1, vec![12.0f32, 34.0, 56.0, 38.0]).unwrap());
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![3i32, 3, 2]).unwrap(), &RaggedDotDimensionNumbers::matmul()),
+            Ok(Array::matrix(4, 1, vec![12.0f32, 34.0, 56.0, 38.0]).unwrap()),
+        );
+
         // Sizes in intervals that begin after the physical extent are unobservable, even when their cumulative sum
         // would overflow the host index type.
         let lhs = Array::matrix(1, 1, vec![2.0f32]).unwrap();
         let rhs = Array::from_elements::<f32>(plain_array(&[2, 1, 1]), &[3.0, 100.0]).unwrap();
-        let output = lhs
-            .ragged_dot(&rhs, &Array::vector(vec![1u64, u64::MAX]).unwrap(), &RaggedDotDimensionNumbers::matmul())
-            .unwrap();
-        assert_eq!(output, Array::matrix(1, 1, vec![6.0f32]).unwrap());
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![1u64, u64::MAX]).unwrap(), &RaggedDotDimensionNumbers::matmul()),
+            Ok(Array::matrix(1, 1, vec![6.0f32]).unwrap()),
+        );
+
+        // The right-hand side group dimension may follow the right-hand side result dimensions.
+        let lhs = Array::matrix(3, 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let rhs = Array::from_elements::<f32>(plain_array(&[2, 1, 2]), &[10.0, 2.0, 1.0, 3.0]).unwrap();
+        assert_eq!(
+            lhs.ragged_dot(
+                &rhs,
+                &Array::vector(vec![1i32, 2]).unwrap(),
+                &RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 0, Some(2)),
+            ),
+            Ok(Array::matrix(3, 1, vec![12.0f32, 18.0, 28.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dot_interpretation_contracting_mode() {
+        // Consecutive groups of contracting positions produce one leading output slice each, and an empty group
+        // produces a zero slice.
+        let dimensions = RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None);
+        let lhs = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+        let rhs = Array::matrix(4, 1, vec![10.0f32, 20.0, 30.0, 40.0]).unwrap();
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![1i32, 0, 2]).unwrap(), &dimensions),
+            Ok(Array::from_elements(plain_array(&[3, 2, 1]), &[10.0f32, 50.0, 0.0, 0.0, 130.0, 330.0]).unwrap()),
+        );
+
+        // Contracting groups use the same clipped raw intervals, with empty trailing groups retaining zero output
+        // slices.
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![3i32, 3, 2]).unwrap(), &dimensions),
+            Ok(Array::from_elements(plain_array(&[3, 2, 1]), &[140.0f32, 380.0, 160.0, 320.0, 0.0, 0.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dot_interpretation_batch_mode() {
+        // Batch mode is the ordinary batched dot, so group size values do not participate in its runtime semantics.
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, None);
+        let lhs = Array::matrix(4, 1, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let rhs = Array::from_elements::<f32>(plain_array(&[4, 1, 1]), &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![5i32, -1, 99]).unwrap(), &dimensions),
+            Ok(Array::matrix(4, 1, vec![10.0f32, 40.0, 90.0, 160.0]).unwrap()),
+        );
+
+        // Batch mode expands no groups, so it also accepts `f8e8m0fnu`, which cannot represent zero.
         let lhs = Array::from_elements::<f8e8m0fnu>(
             ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]),
             &[1.0, 2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
         )
         .unwrap();
         let rhs = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::new_static(DataType::F8E8M0FNU, [1, 1, 1]),
-            &[1.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+            ArrayType::new_static(DataType::F8E8M0FNU, [2, 1, 1]),
+            &[2.0, 4.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
         )
         .unwrap();
-        assert!(matches!(
-            lhs.ragged_dot(&rhs, &Array::vector(vec![1i32]).unwrap(), &RaggedDotDimensionNumbers::matmul()),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` does not support element data type `f8e8m0fnu` in grouped \
-                     expansion modes because it cannot represent zero",
-                ),
-        ));
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::vector(vec![-1i32]).unwrap(), &dimensions),
+            Ok(Array::from_elements::<f8e8m0fnu>(
+                ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]),
+                &[2.0, 8.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+            )
+            .unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dot_interpretation_group_sizes_prefix() {
+        // Group sizes with a prefix select separate group sizes for every prefix coordinate. In contracting mode, the
+        // prefix is the contracting dimension preceding the ragged one.
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![0, 1], vec![0, 1], vec![], vec![]), 1, None);
+        let lhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let rhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[10.0, 20.0, 30.0, 1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::matrix(2, 2, vec![1i32, 2, 2, 1]).unwrap(), &dimensions),
+            Ok(Array::from_elements(plain_array(&[2, 1, 1]), &[24.0f32, 148.0]).unwrap()),
+        );
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::matrix(2, 2, vec![2i32, 3, 4, 1]).unwrap(), &dimensions),
+            Ok(Array::from_elements(plain_array(&[2, 1, 1]), &[82.0f32, 90.0]).unwrap()),
+        );
+
+        // In non-contracting mode, the prefix is the batching dimension.
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
+        let lhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let rhs = Array::from_elements::<f32>(plain_array(&[2, 2, 1, 1]), &[10.0, 100.0, 20.0, 200.0]).unwrap();
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::matrix(2, 2, vec![1i32, 1, 2, 0]).unwrap(), &dimensions),
+            Ok(Array::from_elements(plain_array(&[2, 3, 1]), &[10.0f32, 40.0, 0.0, 400.0, 500.0, 0.0]).unwrap()),
+        );
+
+        // In batch mode, the prefix is the batching dimension preceding the ragged one.
+        let dimensions =
+            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]), 1, None);
+        let lhs =
+            Array::from_elements::<f32>(plain_array(&[2, 4, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+        let rhs =
+            Array::from_elements::<f32>(plain_array(&[2, 4, 1, 1]), &[10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+        assert_eq!(
+            lhs.ragged_dot(&rhs, &Array::matrix(2, 3, vec![1i32, 0, 2, 0, 2, 2]).unwrap(), &dimensions),
+            Ok(Array::from_elements(plain_array(&[2, 4, 1]), &[10.0f32, 40.0, 90.0, 160.0, 5.0, 12.0, 21.0, 32.0])
+                .unwrap()),
+        );
     }
 
     #[test]
@@ -4988,81 +5465,20 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_dot_interpretation_contracting_batch_and_group_prefixes() {
-        let contracting_dimensions =
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()), 1, None);
-        let lhs = Array::matrix(2, 4, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
-        let rhs = Array::matrix(4, 1, vec![10.0f32, 20.0, 30.0, 40.0]).unwrap();
-        let output = lhs.ragged_dot(&rhs, &Array::vector(vec![1i32, 0, 2]).unwrap(), &contracting_dimensions).unwrap();
-        assert_eq!(output.r#type().into_owned(), plain_array(&[3, 2, 1]));
-        assert_eq!(output.to_f64s(), vec![10.0, 50.0, 0.0, 0.0, 130.0, 330.0]);
-        // Contracting groups use the same clipped raw intervals, with empty trailing groups retaining zero output
-        // slices.
-        let output = lhs.ragged_dot(&rhs, &Array::vector(vec![3i32, 3, 2]).unwrap(), &contracting_dimensions).unwrap();
+    fn test_ragged_dot_interpretation_rejects_invalid_input_types() {
+        let lhs = Array::matrix(2, 1, vec![true, false]).unwrap();
+        let rhs = Array::from_elements(ArrayType::new_static(DataType::Boolean, [2, 1, 1]), &[true, true]).unwrap();
         assert_eq!(
-            output,
-            Array::from_elements(plain_array(&[3, 2, 1]), &[140.0f32, 380.0, 160.0, 320.0, 0.0, 0.0]).unwrap(),
+            lhs.ragged_dot(&rhs, &Array::vector(vec![1i32, 1]).unwrap(), &RaggedDotDimensionNumbers::matmul()),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` does not support input data type `bool`",
+            )))),
         );
-
-        let prefixed_contracting_dimensions = RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![0, 1], vec![0, 1], Vec::new(), Vec::new()),
-            1,
-            None,
-        );
-        let lhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let rhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[10.0, 20.0, 30.0, 1.0, 2.0, 3.0]).unwrap();
-        let group_sizes = Array::matrix(2, 2, vec![1i32, 2, 2, 1]).unwrap();
-        let output = lhs.ragged_dot(&rhs, &group_sizes, &prefixed_contracting_dimensions).unwrap();
-        assert_eq!(output.r#type().into_owned(), plain_array(&[2, 1, 1]));
-        assert_eq!(output.to_f64s(), vec![24.0, 148.0]);
-        let group_sizes = Array::matrix(2, 2, vec![2i32, 3, 4, 1]).unwrap();
-        let output = lhs.ragged_dot(&rhs, &group_sizes, &prefixed_contracting_dimensions).unwrap();
-        assert_eq!(output, Array::from_elements(plain_array(&[2, 1, 1]), &[82.0f32, 90.0]).unwrap());
-        let batch_dimensions =
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]), 0, None);
-        let lhs = Array::matrix(4, 1, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let rhs = Array::from_elements::<f32>(plain_array(&[4, 1, 1]), &[10.0, 20.0, 30.0, 40.0]).unwrap();
-        // Batch mode is the ordinary batched dot, so group size values do not participate in its runtime semantics.
-        let output = lhs.ragged_dot(&rhs, &Array::vector(vec![5i32, -1, 99]).unwrap(), &batch_dimensions).unwrap();
-        assert_eq!(output.r#type().into_owned(), plain_array(&[4, 1]));
-        assert_eq!(output.to_f64s(), vec![10.0, 40.0, 90.0, 160.0]);
-
-        let lhs = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]),
-            &[1.0, 2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let rhs = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::new_static(DataType::F8E8M0FNU, [2, 1, 1]),
-            &[2.0, 4.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let output = lhs.ragged_dot(&rhs, &Array::vector(vec![-1i32]).unwrap(), &batch_dimensions).unwrap();
-        assert_eq!(output.to_f64s(), vec![2.0, 8.0]);
-        let prefixed_dimensions =
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
-        let lhs = Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let rhs = Array::from_elements::<f32>(plain_array(&[2, 2, 1, 1]), &[10.0, 100.0, 20.0, 200.0]).unwrap();
-        let group_sizes = Array::matrix(2, 2, vec![1i32, 1, 2, 0]).unwrap();
-        let output = lhs.ragged_dot(&rhs, &group_sizes, &prefixed_dimensions).unwrap();
-        assert_eq!(output.r#type().into_owned(), plain_array(&[2, 3, 1]));
-        assert_eq!(output.to_f64s(), vec![10.0, 40.0, 0.0, 400.0, 500.0, 0.0]);
-
-        let prefixed_batch_dimensions =
-            RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]), 1, None);
-        let lhs =
-            Array::from_elements::<f32>(plain_array(&[2, 4, 1]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
-        let rhs =
-            Array::from_elements::<f32>(plain_array(&[2, 4, 1, 1]), &[10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0])
-                .unwrap();
-        let group_sizes = Array::matrix(2, 3, vec![1i32, 0, 2, 0, 2, 2]).unwrap();
-        let output = lhs.ragged_dot(&rhs, &group_sizes, &prefixed_batch_dimensions).unwrap();
-        assert_eq!(output.r#type().into_owned(), plain_array(&[2, 4, 1]));
-        assert_eq!(output.to_f64s(), vec![10.0, 40.0, 90.0, 160.0, 5.0, 12.0, 21.0, 32.0]);
     }
 
     #[test]
     fn test_ragged_dot_interpretation_empty_output_skips_large_prefix_products() {
+        // These enormous extents require no storage. Their products must never be evaluated for an empty result.
         let extent = 1usize << (usize::BITS / 2);
         let left =
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, extent, extent, 1]), &[]).unwrap();
@@ -5073,10 +5489,12 @@ mod tests {
             left.ragged_dot(&right, &Array::vector(vec![1i32]).unwrap(), &dimensions),
             Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [extent, extent, 1, 0]), &[]).unwrap()),
         );
+
+        // Negative sizes are rejected before the empty output shortcut.
         assert_eq!(
             left.ragged_dot(&right, &Array::vector(vec![-1i32]).unwrap(), &dimensions),
             Err(ProgramError::InvalidArgument {
-                message: "`group_sizes[0]` must be non-negative but got -1".to_string()
+                message: "`group_sizes[0]` must be non-negative but got -1".to_string(),
             }),
         );
     }
@@ -5096,54 +5514,98 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_batching() {
-        let operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul());
-        let lhs = ArrayBatch::new(
-            Array::from_elements::<f32>(plain_array(&[2, 2, 2]), &[1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 4.0, 3.0]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let rhs = ArrayBatch::new(
-            Array::from_elements::<f32>(plain_array(&[2, 2, 2, 1]), &[10.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
-                .unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let group_sizes =
-            ArrayBatch::new(Array::matrix(2, 2, vec![1i32, 1, 1, 1]).unwrap(), BatchAxis::new(0)).unwrap();
-        let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
-        let outputs = operation
-            .batch(&context, &EmptyRegionDriver, &[lhs.clone(), rhs.clone(), group_sizes.clone()])
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![12.0, 18.0, 13.0, 45.0]);
+        // Non-contracting mode keeps the mapped axis first.
+        check_operation_batching!(
+            @exact,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(plain_array(&[2, 2, 2]), &[1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 4.0, 3.0])
+                            .unwrap(),
+                    ),
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(
+                            plain_array(&[2, 2, 2, 1]),
+                            &[10.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                        )
+                        .unwrap(),
+                    ),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1i32, 1, 1, 1]).unwrap()),
+                ],
+                outputs = [(
+                    @mapped(axis = 0),
+                    Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[12.0, 18.0, 13.0, 45.0]).unwrap(),
+                )],
+            }],
+        );
 
-        let contracting_operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-            1,
-            None,
-        ));
-        let contracting_lhs = ArrayBatch::new(
-            Array::from_elements::<f32>(
-                plain_array(&[2, 2, 4]),
-                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 1.0, 0.0],
-            )
-            .unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let contracting_rhs = ArrayBatch::new(
-            Array::from_elements::<f32>(plain_array(&[2, 4, 1]), &[10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0])
-                .unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let contracting_groups =
-            ArrayBatch::new(Array::matrix(2, 2, vec![1i32, 2, 2, 2]).unwrap(), BatchAxis::new(0)).unwrap();
-        let outputs = contracting_operation
-            .batch(&context, &EmptyRegionDriver, &[contracting_lhs, contracting_rhs, contracting_groups])
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[0].value().to_f64s(), vec![10.0, 50.0, 4.0, 5.0, 130.0, 330.0, 4.0, 3.0]);
+        // Contracting mode keeps its leading group output axis ahead of the mapped axis.
+        check_operation_batching!(
+            @exact,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None)),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(
+                            plain_array(&[2, 2, 4]),
+                            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 1.0, 0.0],
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(
+                            plain_array(&[2, 4, 1]),
+                            &[10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0],
+                        )
+                        .unwrap(),
+                    ),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1i32, 2, 2, 2]).unwrap()),
+                ],
+                outputs = [(
+                    @mapped(axis = 1),
+                    Array::from_elements::<f32>(
+                        plain_array(&[2, 2, 2, 1]),
+                        &[10.0, 50.0, 4.0, 5.0, 130.0, 330.0, 4.0, 3.0],
+                    )
+                    .unwrap(),
+                )],
+            }],
+        );
+
+        // Batch mode keeps the mapped axis first, and its replicated group sizes stay shared by every item.
+        check_operation_batching!(
+            @exact,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+                0,
+                None,
+            )),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0, 2.0, 3.0, 4.0]).unwrap(),
+                    ),
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(plain_array(&[2, 2, 1, 1]), &[10.0, 20.0, 30.0, 40.0]).unwrap(),
+                    ),
+                    (@replicated, Array::vector(vec![1i32]).unwrap()),
+                ],
+                outputs = [(
+                    @mapped(axis = 0),
+                    Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[10.0, 40.0, 90.0, 160.0]).unwrap(),
+                )],
+            }],
+        );
     }
 
     #[test]
@@ -5158,13 +5620,13 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let sizes = ArrayBatch::new(Array::matrix(2, 1, vec![1i32, 1]).unwrap(), BatchAxis::new(0)).unwrap();
+        let group_sizes = ArrayBatch::new(Array::matrix(2, 1, vec![1i32, 1]).unwrap(), BatchAxis::new(0)).unwrap();
         let operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![usize::MAX], vec![1], vec![], vec![]),
             0,
             Some(0),
         ));
-        let inputs = [left, right, sizes];
+        let inputs = [left, right, group_sizes];
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &inputs),
@@ -5183,6 +5645,26 @@ mod tests {
                 "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension {} is out of bounds for rank 3",
                 usize::MAX,
             )))),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dot_batching_validates_mapped_extents() {
+        let lhs = ArrayBatch::new(
+            Array::from_elements::<f32>(plain_array(&[2, 3, 2]), &[1.0; 12]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let rhs = ArrayBatch::replicated(Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0; 4]).unwrap());
+        let group_sizes =
+            ArrayBatch::new(Array::matrix(3, 2, vec![1i32, 2, 2, 1, 3, 0]).unwrap(), BatchAxis::new(0)).unwrap();
+        assert_eq!(
+            RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()).batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                &[lhs, rhs, group_sizes],
+            ),
+            Err(BatchingError::MismatchedBatchSizes { expected: 2, actual: 3 }),
         );
     }
 
@@ -5207,8 +5689,7 @@ mod tests {
                         ),
                         (
                             @replicated,
-                            Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0, 10.0, 100.0, 1000.0])
-                            .unwrap(),
+                            Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0, 10.0, 100.0, 1000.0]).unwrap(),
                         ),
                         (@mapped(axis = 0), Array::matrix(2, 2, vec![1i32, 2, 2, 1]).unwrap()),
                     ],
@@ -5248,8 +5729,7 @@ mod tests {
                         (@replicated, Array::matrix(3, 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
                         (
                             @replicated,
-                            Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0, 10.0, 100.0, 1000.0])
-                            .unwrap(),
+                            Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0, 10.0, 100.0, 1000.0]).unwrap(),
                         ),
                         (@mapped(axis = 1), Array::matrix(2, 2, vec![1i32, 3, 2, 0]).unwrap()),
                     ],
@@ -5359,11 +5839,90 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_dot_batching_under_a_dynamic_mapped_extent() -> Result<(), ProgramError> {
-        // The replicated RHS gains the dynamic mapped axis through the policy's dynamic broadcast, and the mapped
-        // rank-one group sizes are broadcast across the batching prefix of the lifted operation. Both broadcasts are
-        // grounded by the transform's first-class extent value.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+    fn test_ragged_dot_batching_per_prefix_group_sizes() {
+        // Group sizes that already have a per-prefix shape only need the mapped axis to lead their prefix, whether
+        // they are mapped or replicated.
+        check_operation_batching!(
+            @exact,
+            operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
+                1,
+                Some(0),
+            )),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (
+                            @mapped(axis = 0),
+                            Array::from_elements::<f32>(
+                                plain_array(&[2, 2, 3, 1]),
+                                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            @mapped(axis = 0),
+                            Array::from_elements::<f32>(
+                                plain_array(&[2, 2, 2, 1, 1]),
+                                &[10.0, 100.0, 20.0, 200.0, 10.0, 100.0, 20.0, 200.0],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            @mapped(axis = 0),
+                            Array::from_elements::<i32>(
+                                ArrayType::new_static(DataType::I32, [2, 2, 2]),
+                                &[1, 1, 2, 0, 2, 1, 1, 1],
+                            )
+                            .unwrap(),
+                        ),
+                    ],
+                    outputs = [(
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(
+                            plain_array(&[2, 2, 3, 1]),
+                            &[10.0, 40.0, 0.0, 400.0, 500.0, 0.0, 20.0, 40.0, 120.0, 800.0, 2000.0, 0.0],
+                        )
+                        .unwrap(),
+                    )],
+                },
+                {
+                    inputs = [
+                        (
+                            @mapped(axis = 0),
+                            Array::from_elements::<f32>(
+                                plain_array(&[2, 2, 3, 1]),
+                                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            @replicated,
+                            Array::from_elements::<f32>(plain_array(&[2, 2, 1, 1]), &[10.0, 100.0, 20.0, 200.0])
+                                .unwrap(),
+                        ),
+                        (@replicated, Array::matrix(2, 2, vec![1i32, 1, 2, 0]).unwrap()),
+                    ],
+                    outputs = [(
+                        @mapped(axis = 0),
+                        Array::from_elements::<f32>(
+                            plain_array(&[2, 2, 3, 1]),
+                            &[10.0, 40.0, 0.0, 400.0, 500.0, 0.0, 20.0, 80.0, 0.0, 800.0, 1000.0, 0.0],
+                        )
+                        .unwrap(),
+                    )],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_ragged_dot_batching_dynamic_mapped_extent() -> Result<(), ProgramError> {
+        // The replicated right-hand side gains the dynamic mapped axis through the policy's dynamic broadcast, and the
+        // mapped rank-one group sizes are broadcast across the batching prefix of the lifted operation. Both
+        // broadcasts are grounded by the transform's first-class extent value.
+        let trace = ArrayIrContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
         let batch_dimension = Dimension::Dynamic(batch_variable);
         let lhs = trace.input(
@@ -5392,7 +5951,7 @@ mod tests {
                         1,
                         Some(0),
                     )),
-                    Vec::new(),
+                    vec![],
                     &[lhs, rhs, group_sizes],
                 )?;
                 Ok(outputs.remove(0).into_value())
@@ -5432,54 +5991,31 @@ mod tests {
         );
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Array(
-                    Array::from_elements::<f32>(
-                        plain_array(&[2, 2, 3, 1]),
-                        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                    )
-                    .unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::from_elements::<f32>(plain_array(&[2, 2, 1, 1]), &[10.0, 20.0, 100.0, 200.0]).unwrap(),
-                ),
-                ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 2, 3, 0]).unwrap()),
-            ])?,
-            ArrayIrValue::Array(
-                Array::from_elements::<f32>(
+                ArrayIrValue::Array(Array::from_elements::<f32>(
                     plain_array(&[2, 2, 3, 1]),
-                    &[10.0, 200.0, 300.0, 80.0, 1000.0, 1200.0, 10.0, 20.0, 30.0, 80.0, 100.0, 120.0],
-                )
-                .unwrap(),
-            ),
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                )?),
+                ArrayIrValue::Array(Array::from_elements::<f32>(
+                    plain_array(&[2, 2, 1, 1]),
+                    &[10.0, 20.0, 100.0, 200.0],
+                )?),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 2, 3, 0])?),
+            ])?,
+            ArrayIrValue::Array(Array::from_elements::<f32>(
+                plain_array(&[2, 2, 3, 1]),
+                &[10.0, 200.0, 300.0, 80.0, 1000.0, 1200.0, 10.0, 20.0, 30.0, 80.0, 100.0, 120.0],
+            )?),
         );
         Ok(())
     }
 
     #[test]
-    fn test_ragged_dot_batching_validates_mapped_extents() {
-        let lhs = ArrayBatch::new(
-            Array::from_elements::<f32>(plain_array(&[2, 3, 2]), &[1.0; 12]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let rhs = ArrayBatch::replicated(Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0; 4]).unwrap());
-        let group_sizes =
-            ArrayBatch::new(Array::matrix(3, 2, vec![1i32, 2, 2, 1, 3, 0]).unwrap(), BatchAxis::new(0)).unwrap();
-        assert_eq!(
-            RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()).batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &EmptyRegionDriver,
-                &[lhs, rhs, group_sizes],
-            ),
-            Err(BatchingError::MismatchedBatchSizes { expected: 2, actual: 3 }),
-        );
-    }
-
-    #[test]
     fn test_ragged_dot_differentiation() {
+        // These checks stay explicit because the finite difference oracle of `check_operation_differentiation!`
+        // perturbs every operation input along a tangent, and the integer group sizes have none.
         let left = Array::matrix(2, 1, vec![2.0, 3.0]).unwrap();
         let right = Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 1]), &[5.0, 7.0]).unwrap();
-        let sizes = Array::vector(vec![1i32, 1]).unwrap();
+        let group_sizes = Array::vector(vec![1i32, 1]).unwrap();
         assert_eq!(
             differentiate_at((left, right)).jvp(
                 (
@@ -5487,8 +6023,8 @@ mod tests {
                     Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 1]), &[3.0, 4.0]).unwrap(),
                 ),
                 |(left, right)| {
-                    let sizes = left.domain().lift(sizes.clone())?;
-                    left.ragged_dot(&right, &sizes, &RaggedDotDimensionNumbers::matmul())
+                    let group_sizes = left.domain().lift(group_sizes.clone())?;
+                    left.ragged_dot(&right, &group_sizes, &RaggedDotDimensionNumbers::matmul())
                 },
             ),
             Ok((Array::matrix(2, 1, vec![10.0, 21.0]).unwrap(), Array::matrix(2, 1, vec![11.0, 26.0]).unwrap())),
@@ -5498,8 +6034,9 @@ mod tests {
                 let right = left
                     .domain()
                     .lift(Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 1]), &[5.0, 7.0])?)?;
-                let sizes = left.domain().lift(Array::vector(vec![1i32, 1])?)?;
-                left.ragged_dot(&right, &sizes, &RaggedDotDimensionNumbers::matmul())?.reduce_sum(&[0, 1], None)
+                let group_sizes = left.domain().lift(Array::vector(vec![1i32, 1])?)?;
+                left.ragged_dot(&right, &group_sizes, &RaggedDotDimensionNumbers::matmul())?
+                    .reduce_sum(&[0, 1], None)
             },
             at = Array::matrix(2, 1, vec![2.0, 3.0]).unwrap(),
             step = 1e-5,
@@ -5508,12 +6045,37 @@ mod tests {
         check_gradient!(
             |right| {
                 let left = right.domain().lift(Array::matrix(2, 1, vec![2.0, 3.0])?)?;
-                let sizes = right.domain().lift(Array::vector(vec![1i32, 1])?)?;
-                left.ragged_dot(&right, &sizes, &RaggedDotDimensionNumbers::matmul())?.reduce_sum(&[0, 1], None)
+                let group_sizes = right.domain().lift(Array::vector(vec![1i32, 1])?)?;
+                left.ragged_dot(&right, &group_sizes, &RaggedDotDimensionNumbers::matmul())?
+                    .reduce_sum(&[0, 1], None)
             },
             at = Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 1]), &[5.0, 7.0]).unwrap(),
             step = 1e-5,
             tolerance = 1e-7,
+        );
+
+        // Contracting mode has no transposition rule, so its product rule is checked in forward mode. The tangent is
+        // `ragged_dot(ȧ, b, g) + ragged_dot(a, ḃ, g) = [10, 10, 50, 50] + [1, 4, 13, 28]`.
+        let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let right = Array::matrix(3, 1, vec![10.0, 20.0, 30.0]).unwrap();
+        let group_sizes = Array::vector(vec![1i32, 2]).unwrap();
+        let output_type = ArrayType::new_static(DataType::F64, [2, 2, 1]);
+        assert_eq!(
+            differentiate_at((left, right)).jvp(
+                (Array::matrix(2, 3, vec![1.0; 6]).unwrap(), Array::matrix(3, 1, vec![1.0, 2.0, 3.0]).unwrap()),
+                |(left, right)| {
+                    let group_sizes = left.domain().lift(group_sizes.clone())?;
+                    left.ragged_dot(
+                        &right,
+                        &group_sizes,
+                        &RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None),
+                    )
+                },
+            ),
+            Ok((
+                Array::from_elements(output_type.clone(), &[10.0, 40.0, 130.0, 280.0]).unwrap(),
+                Array::from_elements(output_type, &[11.0, 14.0, 63.0, 78.0]).unwrap(),
+            )),
         );
 
         // A staged JVP reuses the known group metadata in both product rule terms.
@@ -5522,12 +6084,12 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let lhs_input = builder.add_input(lhs.r#type().into_owned());
         let rhs_input = builder.add_input(rhs.r#type().into_owned());
-        let groups = builder.add_constant(Array::vector(vec![1i32, 2]).unwrap());
+        let group_sizes = builder.add_constant(Array::vector(vec![1i32, 2]).unwrap());
         let output = builder
             .add_instruction(
                 RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
-                Vec::new(),
-                vec![lhs_input, rhs_input, groups],
+                vec![],
+                vec![lhs_input, rhs_input, group_sizes],
                 None,
             )
             .unwrap()[0];
@@ -5559,8 +6121,8 @@ mod tests {
         );
         assert_eq!(
             jvp.interpret(vec![
-                lhs,
-                rhs,
+                lhs.clone(),
+                rhs.clone(),
                 Array::matrix(3, 2, vec![1.0f32; 6]).unwrap(),
                 Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[1.0; 4]).unwrap(),
             ]),
@@ -5568,6 +6130,40 @@ mod tests {
                 Array::matrix(3, 1, vec![12.0f32, 18.0, 28.0]).unwrap(),
                 Array::matrix(3, 1, vec![14.0f32, 12.0, 16.0]).unwrap(),
             ]),
+        );
+
+        // A structural zero tangent drops its product rule term. Here, the constant right-hand side has a zero tangent.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(lhs.r#type().into_owned());
+        let rhs_constant = builder.add_constant(rhs);
+        let group_sizes = builder.add_constant(Array::vector(vec![1i32, 2]).unwrap());
+        let output = builder
+            .add_instruction(
+                RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+                vec![],
+                vec![lhs_input, rhs_constant, group_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[3, 2] .
+                let %2:f32[2, 2, 1] = const [[[10.0], [1.0]], [[2.0], [3.0]]]
+                    %3:i32[2] = const [1, 2]
+                    %4:f32[3, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
+                            rhs_batching=[], lhs_ragged=0, rhs_group=0),
+                    ] %0 %2 %3
+                    %5:f32[3, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], \
+                            rhs_batching=[], lhs_ragged=0, rhs_group=0),
+                    ] %1 %2 %3
+                in (%4, %5)
+            "}
+            .trim_end(),
         );
     }
 
@@ -5582,62 +6178,51 @@ mod tests {
         let rhs = builder.add_input(rhs_type.clone());
         let group_sizes = builder.add_constant(Array::vector(vec![1i32, 2]).unwrap());
         let output = builder
-            .add_instruction(RaggedDotOperation::new(dimensions), Vec::new(), vec![lhs, rhs, group_sizes], None)
+            .add_instruction(RaggedDotOperation::new(dimensions), vec![], vec![lhs, rhs, group_sizes], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-
-        let jvp = program.clone().jvp().unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-            lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[3, 2, 1] .
-            let %2:i32[2] = const [1, 2]
-                %3:f8e8m0fnu[3, 1] = ragged_dot [
-                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=0),
-                ] %0 %1 %2
-            in (%3)
+                lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[3, 2, 1] .
+                let %2:i32[2] = const [1, 2]
+                    %3:f8e8m0fnu[3, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                            rhs_batching=[0], lhs_ragged=0),
+                    ] %0 %1 %2
+                in (%3)
             "}
             .trim_end(),
         );
+
+        // The tangents of `f8e8m0fnu` primals are widened to `f32`, so each product rule term converts its primal
+        // factor to the tangent element type before the contraction.
+        let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
             indoc! {"
-            lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[3, 2, 1], %2:f32[3, 2], %3:f32[3, 2, 1] .
-            let %4:i32[2] = const [1, 2]
-                %5:f8e8m0fnu[3, 1] = ragged_dot [
-                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=0),
-                ] %0 %1 %4
-                %6:f32[3, 2, 1] = convert_element_type [data_type=f32] %1
-                %7:f32[3, 1] = ragged_dot [
-                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=0),
-                ] %2 %6 %4
-                %8:f32[3, 2] = convert_element_type [data_type=f32] %0
-                %9:f32[3, 1] = ragged_dot [
-                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
-                        rhs_batching=[0], lhs_ragged=0),
-                ] %8 %3 %4
-                %10:f32[3, 1] = add %7 %9
-            in (%5, %10)
+                lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[3, 2, 1], %2:f32[3, 2], %3:f32[3, 2, 1] .
+                let %4:i32[2] = const [1, 2]
+                    %5:f8e8m0fnu[3, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                            rhs_batching=[0], lhs_ragged=0),
+                    ] %0 %1 %4
+                    %6:f32[3, 2, 1] = convert_element_type [data_type=f32] %1
+                    %7:f32[3, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                            rhs_batching=[0], lhs_ragged=0),
+                    ] %2 %6 %4
+                    %8:f32[3, 2] = convert_element_type [data_type=f32] %0
+                    %9:f32[3, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], \
+                            rhs_batching=[0], lhs_ragged=0),
+                    ] %8 %3 %4
+                    %10:f32[3, 1] = add %7 %9
+                in (%5, %10)
             "}
             .trim_end(),
-        );
-        assert_eq!(
-            jvp.input_types(),
-            vec![
-                lhs_type.clone(),
-                rhs_type.clone(),
-                ArrayType::new_static(DataType::F32, [3, 2]),
-                ArrayType::new_static(DataType::F32, [3, 2, 1]),
-            ],
-        );
-        assert_eq!(
-            jvp.output_types(),
-            vec![ArrayType::new_static(DataType::F8E8M0FNU, [3, 1]), ArrayType::new_static(DataType::F32, [3, 1])],
         );
         assert_eq!(
             jvp.interpret(vec![
@@ -5662,36 +6247,8 @@ mod tests {
         let lhs = Array::matrix(3, 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let rhs = Array::from_elements::<f32>(plain_array(&[2, 2, 1]), &[10.0, 1.0, 2.0, 3.0]).unwrap();
         let group_sizes = Array::vector(vec![1i32, 2]).unwrap();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let lhs_input = builder.add_input(lhs.r#type().into_owned());
-        let rhs_input = builder.add_input(rhs.r#type().into_owned());
-        let groups = builder.add_constant(group_sizes.clone());
-        let output = builder
-            .add_instruction(
-                RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
-                Vec::new(),
-                vec![lhs_input, rhs_input, groups],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let transpose = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            transpose.to_string(),
-            indoc! {"
-                lambda %0:f32[3, 1], %1:f32[2, 2, 1] .
-                let %2:i32[2] = const [1, 2]
-                    %3:f32[3, 2] = ragged_dot [
-                        dimensions=(lhs_contracting=[1], rhs_contracting=[2], lhs_batching=[], \
-                        rhs_batching=[], lhs_ragged=0, rhs_group=0),
-                    ] %0 %1 %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-
+        // The left-hand side adjoint is a non-contracting ragged dot of the output cotangent with the right-hand side,
+        // and the right-hand side adjoint is a contracting ragged dot of the left-hand side with the output cotangent.
         check_operation_transposition!(
             @exact,
             operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
@@ -5704,10 +6261,18 @@ mod tests {
                     ],
                     output_cotangents = [Array::matrix(3, 1, vec![2.0f32, 3.0, 5.0]).unwrap()],
                     input_cotangents = [Array::matrix(3, 2, vec![20.0f32, 2.0, 6.0, 9.0, 10.0, 15.0]).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f32[3, 1], %1:f32[2, 2, 1], %2:i32[2] .
+                        let %3:f32[3, 2] = ragged_dot [
+                            dimensions=(lhs_contracting=[1], rhs_contracting=[2], lhs_batching=[], \
+                                rhs_batching=[], lhs_ragged=0, rhs_group=0),
+                        ] %0 %1 %2
+                        in (%3)
+                    "},
                 },
                 {
                     inputs = [
-                        (@known, lhs.clone()),
+                        (@known, lhs),
                         (@linear(type = rhs.r#type().into_owned())),
                         (@known, group_sizes),
                     ],
@@ -5716,6 +6281,14 @@ mod tests {
                         plain_array(&[2, 2, 1]),
                         &[2.0, 4.0, 34.0, 42.0],
                     ).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f32[3, 1], %1:f32[3, 2], %2:i32[2] .
+                        let %3:f32[2, 2, 1] = ragged_dot [
+                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], \
+                                rhs_batching=[], lhs_ragged=0),
+                        ] %1 %0 %2
+                        in (%3)
+                    "},
                 },
             ],
         );
@@ -5736,8 +6309,9 @@ mod tests {
         let group_sizes = Array::vector(vec![1i32, 2]).unwrap();
         let output_cotangent =
             Array::from_elements::<f32>(plain_array(&[2, 3, 1]), &[1.0, 2.0, 3.0, 5.0, 7.0, 11.0]).unwrap();
-        // The LHS adjoint is initially ordered `[batch, ragged, contracting]` and must be transposed back to `[ragged,
-        // contracting, batch]` with `[1, 2, 0]`.
+
+        // The left-hand side adjoint is initially ordered `[batch, ragged, contracting]` and must be transposed back
+        // to `[ragged, contracting, batch]` with `[1, 2, 0]`.
         check_operation_transposition!(
             @exact,
             operation = RaggedDotOperation::new(dimensions.clone()),
@@ -5752,11 +6326,20 @@ mod tests {
                     plain_array(&[3, 2, 2]),
                     &[2.0, 15.0, 5.0, 35.0, 22.0, 91.0, 34.0, 133.0, 33.0, 143.0, 51.0, 209.0],
                 ).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[2, 3, 1], %1:f32[2, 2, 2, 1], %2:i32[2] .
+                    let %3:f32[2, 3, 2] = ragged_dot [
+                        dimensions=(lhs_contracting=[2], rhs_contracting=[3], lhs_batching=[0], \
+                            rhs_batching=[2], lhs_ragged=1, rhs_group=0),
+                    ] %0 %1 %2
+                        %4:f32[3, 2, 2] = transpose [permutation=[1, 2, 0]] %3
+                    in (%4)
+                "},
             }],
         );
 
-        // The RHS adjoint is initially ordered `[group, batch, contracting, result]` and must be transposed back to
-        // `[group, contracting, batch, result]` with `[0, 2, 1, 3]`.
+        // The right-hand side adjoint is initially ordered `[group, batch, contracting, result]` and must be
+        // transposed back to `[group, contracting, batch, result]` with `[0, 2, 1, 3]`.
         check_operation_transposition!(
             @exact,
             operation = RaggedDotOperation::new(dimensions),
@@ -5771,6 +6354,15 @@ mod tests {
                     plain_array(&[2, 2, 2, 1]),
                     &[1.0, 10.0, 3.0, 20.0, 37.0, 152.0, 47.0, 188.0],
                 ).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[2, 3, 1], %1:f32[3, 2, 2], %2:i32[2] .
+                    let %3:f32[2, 2, 2, 1] = ragged_dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[1], lhs_batching=[2], \
+                            rhs_batching=[0], lhs_ragged=0),
+                    ] %1 %0 %2
+                        %4:f32[2, 2, 2, 1] = transpose [permutation=[0, 2, 1, 3]] %3
+                    in (%4)
+                "},
             }],
         );
     }
@@ -5779,11 +6371,7 @@ mod tests {
     fn test_ragged_dot_transposition_rejects_contracting_and_batch_modes() {
         let cases = [
             (
-                RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
-                    DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-                    1,
-                    None,
-                )),
+                RaggedDotOperation::new(RaggedDotDimensionNumbers::new(DotDimensionNumbers::matmul(), 1, None)),
                 [plain_array(&[2, 5]), plain_array(&[5, 4]), ArrayType::new_static(DataType::I32, [3])],
                 RaggedDotMode::Contracting,
             ),
@@ -5800,7 +6388,7 @@ mod tests {
         for (operation, input_types, mode) in cases {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let inputs = input_types.map(|input_type| builder.add_input(input_type));
-            let outputs = builder.add_instruction(operation, Vec::new(), inputs.to_vec(), None).unwrap().to_vec();
+            let outputs = builder.add_instruction(operation, vec![], inputs.to_vec(), None).unwrap().to_vec();
             let program =
                 builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder]).unwrap();
             assert_eq!(
@@ -5816,11 +6404,11 @@ mod tests {
     fn test_ragged_dot_transposition_rejects_two_linear_inputs() {
         // The bilinear rejection precedes the early return for a structural zero output cotangent.
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
-        let sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
+        let group_sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
         let inputs = [
             PartialValue::Unknown(plain_array(&[3, 2])),
             PartialValue::Unknown(plain_array(&[2, 2, 1])),
-            PartialValue::Known(sizes),
+            PartialValue::Known(group_sizes),
         ];
         let accumulators = context.cotangent_accumulators(&inputs, &[true, true, false]).unwrap();
         assert_eq!(
@@ -5863,13 +6451,43 @@ mod tests {
     }
 
     #[test]
+    fn test_ragged_dot_transposition_unrequested_cotangent() {
+        // An unrequested linear input stages no adjoint and keeps a structural zero cotangent.
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let right = context.input(plain_array(&[2, 2, 1]));
+        let group_sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
+        let seed = context.input(plain_array(&[3, 1]));
+        let inputs =
+            [PartialValue::Unknown(plain_array(&[3, 2])), PartialValue::Known(right), PartialValue::Known(group_sizes)];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false, false, false]).unwrap();
+        RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul())
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
+            .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder; 3], vec![])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 1], %1:i32[2], %2:f32[3, 1] .
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
+    }
+
+    #[test]
     fn test_ragged_dot_transposition_structural_zero() {
         // A structural zero output cotangent stages no adjoint and leaves the requested cotangent zero.
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         let right = context.input(plain_array(&[2, 2, 1]));
-        let sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
+        let group_sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
         let inputs =
-            [PartialValue::Unknown(plain_array(&[3, 2])), PartialValue::Known(right), PartialValue::Known(sizes)];
+            [PartialValue::Unknown(plain_array(&[3, 2])), PartialValue::Known(right), PartialValue::Known(group_sizes)];
         let accumulators = context.cotangent_accumulators(&inputs, &[true, false, false]).unwrap();
         RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul())
             .transpose(
@@ -5880,18 +6498,60 @@ mod tests {
                 &accumulators,
             )
             .unwrap();
-        assert!(context.builder().borrow().instructions().is_empty());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 1], %1:i32[2] .
+                in ()
+            "}
+            .trim_end(),
+        );
         assert!(context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
+    }
+
+    #[test]
+    fn test_ragged_dot_transposition_known_inputs() {
+        // A ragged dot with two known data inputs is not part of the linear map, so transposition stages nothing.
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let left = context.input(plain_array(&[3, 2]));
+        let right = context.input(plain_array(&[2, 2, 1]));
+        let group_sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
+        let seed = context.input(plain_array(&[3, 1]));
+        let inputs = [PartialValue::Known(left), PartialValue::Known(right), PartialValue::Known(group_sizes)];
+        let accumulators = context.cotangent_accumulators(&inputs, &[false, false, false]).unwrap();
+        RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul())
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
+            .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder; 4], vec![])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2, 2, 1], %2:i32[2], %3:f32[3, 1] .
+                in ()
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
     fn test_ragged_dot_transposition_validates_original_dimensions() {
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         let right = context.input(plain_array(&[2, 2, 1]));
-        let sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
+        let group_sizes = context.input(ArrayType::new_static(DataType::I32, [2]));
         let seed = context.input(plain_array(&[3, 1]));
         let inputs =
-            [PartialValue::Unknown(plain_array(&[3, 2])), PartialValue::Known(right), PartialValue::Known(sizes)];
+            [PartialValue::Unknown(plain_array(&[3, 2])), PartialValue::Known(right), PartialValue::Known(group_sizes)];
         let accumulators = context.cotangent_accumulators(&inputs, &[true, false, false]).unwrap();
         let operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![4], vec![1], vec![], vec![]),
@@ -5904,13 +6564,24 @@ mod tests {
                 "`{RAGGED_DOT_OPERATION_NAME}` left-hand side dimension index out of bounds",
             ))))),
         );
-        assert!(context.builder().borrow().instructions().is_empty());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder; 3], vec![])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 1], %1:i32[2], %2:f32[3, 1] .
+                in ()
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
     fn test_ragged_dot_array_ir() {
-        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
         // Array IR tracers stage the homogeneous ragged dot as an array member instruction.
         let (_, program) = ArrayIrContext::trace(
             |inputs: Vec<Tracer<ArrayIrContext>>| {
