@@ -1,9 +1,3 @@
-//! The [`CompositeTransposeOperation`] carrier that reverse mode stages for the reverse mode rules of a
-//! [`CompositeOperation`]. The carrier holds its rules either as attached rule regions or as retained rule sets (refer
-//! to [`CustomRuleSource`]), and its transposition applies the backward rule.
-
-// TODO(eaplatanios): Review from here onwards.
-
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -48,9 +42,6 @@ use crate::operations::composites::operations::composite::CompositeOperation;
 /// Canonical operation name for [`CompositeTransposeOperation`].
 pub const COMPOSITE_TRANSPOSE_OPERATION_NAME: &str = "composite_transpose";
 
-/// Effects of every [`CompositeTransposeOperation`] with retained rules, which carries an unresolved backward rule.
-static COMPOSITE_TRANSPOSE_EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects::empty().clone().with_deferred_work());
-
 /// Selected reverse mode carrier of a [`CompositeOperation`] with reverse mode rules, which its
 /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule stages in place of the call. It represents
 /// the linear map `ẋ ↦ ẏ` from the differentiated inputs' tangents to the output tangents, whose transpose `ȳ ↦ x̄` is
@@ -58,8 +49,8 @@ static COMPOSITE_TRANSPOSE_EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects
 /// differentiation](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/ad.py), which has no rendered
 /// documentation page and is therefore linked at its source. The map has no forward program: reverse mode rules supply
 /// only its transpose, and deriving the map itself would differentiate the primal, which the custom rules exist to
-/// avoid. The carrier therefore rejects execution, lowering, and forward mode, and it exists only to be transposed. A
-/// call without reverse mode rules stages no carrier, because reverse mode transposes the linearization of its
+/// avoid. The carrier therefore rejects execution, lowering, and forward mode, and it exists only to be transposed.
+/// A call without reverse mode rules stages no carrier, because reverse mode transposes the linearization of its
 /// forward mode rule instead.
 ///
 /// Its inputs are the known leading inputs (i.e., any batching boundary inputs, the non-differentiated inputs, the
@@ -67,32 +58,32 @@ static COMPOSITE_TRANSPOSE_EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects
 /// quantities of the output tangent types (e.g., the extents of dynamically shaped outputs) that structural zero seeds
 /// need when no other leading input names them, and the backward rule never receives them. The carrier of a call whose
 /// retained rules defer their forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`],
-/// rendered as `deferred_forward=true`) receives every input of the call in place of the non-differentiated inputs and
-/// the residuals, and its transposition first replays the forward rule on them to recover the residuals.
+/// rendered as `deferred_forward=true`) receives every input of the call in place of the non-differentiated inputs
+/// and the residuals, and its transposition first replays the forward rule on them to recover the residuals.
 ///
-/// A [`LinearCallOperation`](crate::LinearCallOperation), by contrast, carries both an executable forward map and its
-/// transpose: it executes, lowers, differentiates, and batches through its forward region, and it transposes by
+/// A [`LinearCallOperation`](crate::LinearCallOperation), by contrast, carries both an executable forward map and
+/// its transpose: it executes, lowers, differentiates, and batches through its forward region, and it transposes by
 /// swapping its two regions into another linear call. Keeping maps without a forward program in this carrier spares
 /// every consumer of linear calls a missing-forward case, and it keeps the machinery that only retained backward rules
 /// need (i.e., a rule source, deferred work, and caller-buffer destinations) in one operation.
 ///
 /// The backward rule has the representation of the call that staged the carrier:
 ///
-///   - **Attached** ([`Self::from_backward_region`]): the backward program is the carrier's `"backward"` rule region,
-///     `(leading, ȳ) → x̄` over the leading inputs other than the seed extents, which transposition replays inline into
-///     the pullback, since a user-supplied backward program has no linearity contract of its own that would let it be
-///     transposed again. The region's own effects decide whether transposition must run it when no cotangent is
-///     requested. It is a deferred rule region (refer to
+///   - **Attached (via [`Self::from_backward_region`]):** The backward program is the carrier's `"backward"` rule
+///     region, `(leading, ȳ) → x̄` over the leading inputs other than the seed extents, which transposition replays
+///     inline into the pullback, since a user-supplied backward program has no linearity contract of its own that
+///     would let it be transposed again. The region's own effects decide whether transposition must run it when no
+///     cotangent is requested. It is a deferred rule region (i.e.,
 ///     [`RegionRole::DeferredRule`](crate::RegionRole::DeferredRule)), so a backward region with effects or deferred
 ///     work makes the carrier carry deferred work, which keeps simplification from removing an unused carrier before
 ///     transposition runs those effects.
-///   - **Retained** ([`Self::new`]): the backward rule is specialized for the input and cotangent types, live seeds,
-///     destination kinds, batching levels, and reference discharge state by transposing a source program that invokes
-///     the rule directly, cached in the definition, and replayed with the actual known inputs, seeds, and caller-buffer
-///     destinations. The runtime buffer identities are invocation inputs and never part of a specialization. The
-///     carrier declares deferred work (refer to the
-///     [Deferred Work](crate::Effects#deferred-work) section of [`Effects`]), so that shared transform boundaries
-///     retain it until transposition replaces it with the specialized backward program.
+///   - **Retained (via [`Self::new`]):** The backward rule is specialized for the input and cotangent types, live
+///     seeds, destination kinds, batching levels, and reference discharge state by transposing a source program that
+///     invokes the rule directly, cached in the definition, and replayed with the actual known inputs, seeds, and
+///     caller-buffer destinations. The runtime buffer identities are invocation inputs and never part of a
+///     specialization. The carrier declares deferred work (refer to the [Deferred Work](Effects#deferred-work) section
+///     of [`Effects`] for more information), so that shared transform boundaries retain it until transposition replaces
+///     it with the specialized backward program.
 ///
 /// # Batching
 ///
@@ -102,29 +93,29 @@ static COMPOSITE_TRANSPOSE_EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects
 /// batched call, or that is batched itself (e.g., when a linearization is batched), records its batching levels as the
 /// call does, mapping every output at axis 0 when it is batched itself. Transposition derives the unbatched backward
 /// specialization and batches it once per level. Seeds, caller buffers, and leading inputs keep their recorded batch
-/// axes, and each returned cotangent is aligned to its input, summing the per-item cotangents of a replicated input. A
-/// carrier with a deferred forward rule records the batching levels of the call from which it was staged instead, and
-/// it cannot be batched itself, because its transposition would have to batch the replayed forward rule as well.
+/// axes, and each returned cotangent is aligned to its input, summing the per-item cotangents of a replicated input.
+/// A carrier with a deferred forward rule records the batching levels of the call from which it was staged instead,
+/// and it cannot be batched itself, because its transposition would have to batch the replayed forward rule as well.
 pub struct CompositeTransposeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
     /// Number of leading known inputs (i.e., boundary inputs, non-differentiated inputs, residuals, and seed extents).
-    pub(super) leading_input_count: usize,
+    leading_input_count: usize,
 
     /// Number of trailing leading inputs that carry the runtime extents of the output tangent types (e.g., the extents
     /// of dynamically shaped outputs), from which structural zero seeds are materialized when no other leading input
     /// carries them. The backward rule never receives them.
-    pub(super) seed_extent_count: usize,
+    seed_extent_count: usize,
 
     /// Tangent types of the differentiated inputs.
-    pub(super) input_tangent_types: Vec<V::Type>,
+    input_tangent_types: Vec<V::Type>,
 
     /// Tangent types of the outputs.
-    pub(super) output_tangent_types: Vec<V::Type>,
+    output_tangent_types: Vec<V::Type>,
 
-    /// Backward rule of the carrier.
-    pub(super) rules: CompositeTransposeRules<V::Type, S>,
+    /// [`CompositeTransposeRules`] of the carrier.
+    rules: CompositeTransposeRules<V::Type, S>,
 
-    /// Marker for the operation family, which only the rule source and the rule region name.
-    pub(super) marker: PhantomData<fn() -> O>,
+    /// [`PhantomData`] marker tying this [`Operation`] to the operation family `O` in which it is valid.
+    marker: PhantomData<fn() -> O>,
 }
 
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
@@ -144,6 +135,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     ///     residuals).
     ///   - `input_tangent_types`: Tangent types of the differentiated inputs, which follow the leading inputs.
     ///   - `output_tangent_types`: Tangent types of the outputs.
+    #[inline]
     pub fn new(
         rules: S,
         leading_input_count: usize,
@@ -168,8 +160,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Creates a new [`CompositeTransposeOperation`] whose backward rule is its attached `"backward"` rule region,
     /// exactly as the [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule of a
-    /// [`CompositeOperation`] with attached rules stages it, except that it has no seed extents. The region maps
-    /// the leading inputs followed by one cotangent per output to one cotangent per differentiated input. When the zero
+    /// [`CompositeOperation`] with attached rules stages it, except that it has no seed extents. The region maps the
+    /// leading inputs followed by one cotangent per output to one cotangent per differentiated input. When the zero
     /// seeds of dead outputs need runtime quantities (e.g., dynamic extents) that no leading input names, the region
     /// can receive them as additional leading inputs.
     ///
@@ -179,6 +171,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     ///     residuals).
     ///   - `input_tangent_types`: Tangent types of the differentiated inputs, which follow the leading inputs.
     ///   - `output_tangent_types`: Tangent types of the outputs.
+    #[inline]
     pub fn from_backward_region(
         leading_input_count: usize,
         input_tangent_types: Vec<V::Type>,
@@ -193,6 +186,28 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             marker: PhantomData,
         }
     }
+
+    /// Creates a carrier with the rule state and boundary metadata prepared by the operation that stages it,
+    /// including seed extents, batching levels, reference discharge state, and any deferred forward rule.
+    #[inline]
+    pub(super) fn from_parts(
+        rules: CompositeTransposeRules<V::Type, S>,
+        leading_input_count: usize,
+        seed_extent_count: usize,
+        input_tangent_types: Vec<V::Type>,
+        output_tangent_types: Vec<V::Type>,
+    ) -> Self {
+        Self {
+            leading_input_count,
+            seed_extent_count,
+            input_tangent_types,
+            output_tangent_types,
+            rules,
+            marker: PhantomData,
+        }
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Creates the source carrier from which the backward specializations of `rules` are derived, whose
     /// transposition invokes the retained backward rule directly.
@@ -498,9 +513,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         // A retained backward rule is an unresolved obligation of the carrier itself. An attached backward region is a
         // deferred rule region instead (refer to `region_slots`), which makes the carrier carry deferred work exactly
         // when the region has effects or deferred work of its own.
+        static EFFECTS: LazyLock<Effects> = LazyLock::new(|| Effects::empty().clone().with_deferred_work());
         match self.rules {
             CompositeTransposeRules::Attached => Cow::Borrowed(Effects::empty()),
-            CompositeTransposeRules::Retained { .. } => Cow::Borrowed(&COMPOSITE_TRANSPOSE_EFFECTS),
+            CompositeTransposeRules::Retained { .. } => Cow::Borrowed(&EFFECTS),
         }
     }
 
