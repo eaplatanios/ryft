@@ -225,7 +225,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             (StringRef::from("dimension_numbers"), context.parse_attribute(dimensions.as_str())?),
             (
                 StringRef::from("preferred_element_type"),
-                context.type_attribute(lower_element_type(operation.preferred_element_type(), context)?).as_ref(),
+                context.type_attribute(lower_element_type(operation.accumulation_type(), context)?).as_ref(),
             ),
         ]);
         let result_types = composition_output_types
@@ -296,7 +296,7 @@ pub(crate) fn scaled_dot_composition_key(
                     vec![dimensions.lhs_batching_dimensions().to_vec(), dimensions.rhs_batching_dimensions().to_vec()],
                 ]),
             ),
-            ("preferred_element_type", NamedCompositionAttribute::DataType(operation.preferred_element_type())),
+            ("preferred_element_type", NamedCompositionAttribute::DataType(operation.accumulation_type())),
         ],
         input_types: scaled_dot_composite_input_types(operation, input_types)?,
         output_types: output_types.to_vec(),

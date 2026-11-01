@@ -72,7 +72,7 @@ pub(super) fn scaled_requirements(
 ) -> Result<[ArrayType; 2], Error> {
     let inferred = operation.infer_output_types(inputs, &[])?;
     if operation.dimensions() != DotOperation::matmul().dimensions()
-        || operation.preferred_element_type() != DataType::F32
+        || operation.accumulation_type() != DataType::F32
         || inputs.iter().any(|input| input.data_type() != DataType::BF16)
     {
         return Err(Error::Unsupported {

@@ -70,8 +70,6 @@ use crate::programs::{
 /// Canonical operation name for [`ScaledDotOperation`].
 pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Primitive representing a generalized block-scaled dot product operation. Its first two inputs are the left and right
 /// element arrays. The optional left and right scale arrays follow in that order, and [`Self::has_lhs_scale`] and
 /// [`Self::has_rhs_scale`] record which of them are present. Element and scale arrays may have any real numeric or
@@ -86,17 +84,19 @@ pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 ///
 /// Semantically, this operation expands each present scale to the shape of its element array by repeating every scale
 /// value over its block, converts the elements and expanded scales to `bf16`, and multiplies them. It then contracts
-/// the resulting arrays with a [`DotOperation`](crate::operations::DotOperation) that uses [`Self::dimensions`] and
-/// accumulates at [`Self::preferred_element_type`], which is also the output element type. An absent scale leaves its
-/// element array unchanged apart from the `bf16` conversion. The [`MemberInterpretableOperation`] implementation
-/// evaluates this composition using the parent array IR domain's dimension values. Operation enums reach this
-/// operation through their projected array members and never dispatch to that rule, so its callers invoke it directly.
-/// Eager arrays use it, and the XLA backend traces it as the decomposition of the `xla.scaled_dot` composite that it
-/// lowers this operation to.
+/// the resulting arrays with a [`DotOperation`](crate::DotOperation) that uses [`Self::dimensions`] and accumulates
+/// at [`Self::accumulation_type`], which is also the output element type. It is the accumulation type of
+/// [`DotOperation::with_accumulation_type`](crate::DotOperation::with_accumulation_type) and corresponds to the
+/// `preferred_element_type` of the JAX `scaled_matmul` primitive and of the `xla.scaled_dot` composite. An absent
+/// scale leaves its element array unchanged apart from the `bf16` conversion. The [`MemberInterpretableOperation`]
+/// implementation evaluates this composition using the parent array IR domain's dimension values. Operation enums
+/// reach this operation through their projected array members and never dispatch to that rule, so its callers invoke it
+/// directly. Eager arrays use it, and the XLA backend traces it as the decomposition of the `xla.scaled_dot` composite
+/// that it lowers this operation to.
 ///
 /// Partial evaluation folds the operation when all inputs are known and stages it otherwise. Batching moves every
-/// mapped axis to the front and materializes replicated inputs along a new leading axis, because each scale array must
-/// keep the rank of its element array. The lifted operation pairs those leading axes as an additional batching
+/// mapped axis to the front and materializes replicated inputs along a new leading axis, because each scale array
+/// must keep the rank of its element array. The lifted operation pairs those leading axes as an additional batching
 /// dimension, so repeated batching applies the same lift again without a rank ceiling.
 ///
 /// This operation has no differentiation rule. Its scales are quantization metadata rather than differentiable
@@ -110,7 +110,7 @@ pub struct ScaledDotOperation {
     dimensions: DotDimensionNumbers,
 
     /// Data type of the contraction accumulator and the output.
-    preferred_element_type: DataType,
+    accumulation_type: DataType,
 
     /// Whether the operation has a left scale input.
     has_lhs_scale: bool,
@@ -119,24 +119,26 @@ pub struct ScaledDotOperation {
     has_rhs_scale: bool,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl ScaledDotOperation {
     /// Creates a new [`ScaledDotOperation`].
     ///
     /// # Parameters
     ///
     ///   - `dimensions`: Contracting and batching dimensions of the generalized dot product.
-    ///   - `preferred_element_type`: Data type of the contraction accumulator and the output. Type inference validates
+    ///   - `accumulation_type`: Data type of the contraction accumulator and the output. Type inference validates
     ///     that the `bf16` dequantized inputs can accumulate at this type.
     ///   - `has_lhs_scale`: Whether the inputs include a left scale array after the two element arrays.
     ///   - `has_rhs_scale`: Whether the inputs include a right scale array after the optional left scale array.
     #[inline]
     pub fn new(
         dimensions: DotDimensionNumbers,
-        preferred_element_type: DataType,
+        accumulation_type: DataType,
         has_lhs_scale: bool,
         has_rhs_scale: bool,
     ) -> Self {
-        Self { dimensions, preferred_element_type, has_lhs_scale, has_rhs_scale }
+        Self { dimensions, accumulation_type, has_lhs_scale, has_rhs_scale }
     }
 
     /// Returns the default dimension numbers that [`ScaledDot::scaled_dot`] uses for element arrays of rank `rank`.
@@ -162,8 +164,8 @@ impl ScaledDotOperation {
 
     /// Returns the data type of the contraction accumulator and the output of this [`ScaledDotOperation`].
     #[inline]
-    pub fn preferred_element_type(&self) -> DataType {
-        self.preferred_element_type
+    pub fn accumulation_type(&self) -> DataType {
+        self.accumulation_type
     }
 
     /// Returns whether this [`ScaledDotOperation`] has a left scale input.
@@ -252,7 +254,7 @@ impl Operation for ScaledDotOperation {
             &lhs.clone().with_data_type(DataType::BF16),
             &rhs.clone().with_data_type(DataType::BF16),
             &self.dimensions,
-            Some(self.preferred_element_type),
+            Some(self.accumulation_type),
             None,
         )?;
 
@@ -312,7 +314,7 @@ impl Operation for ScaledDotOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("dimensions", &self.dimensions)?;
-            operation.field("preferred_element_type", &self.preferred_element_type)?;
+            operation.field("accumulation_type", &self.accumulation_type)?;
             operation.field("lhs_scale", &self.has_lhs_scale)?;
             operation.field("rhs_scale", &self.has_rhs_scale)
         })
@@ -330,13 +332,7 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         let (lhs, rhs, lhs_scale, rhs_scale) = self.split_inputs(inputs)?;
-        Ok(vec![lhs.scaled_dot(
-            rhs,
-            lhs_scale,
-            rhs_scale,
-            Some(&self.dimensions),
-            Some(self.preferred_element_type),
-        )?])
+        Ok(vec![lhs.scaled_dot(rhs, lhs_scale, rhs_scale, Some(&self.dimensions), Some(self.accumulation_type))?])
     }
 }
 
@@ -378,8 +374,7 @@ where
             .map(|input| P::match_axis(context, input, Axis::from(0)))
             .collect::<Result<Vec<_>, _>>()?;
         let (dimensions, output_axis) = self.dimensions.batched(Some(0), Some(0)).unwrap();
-        let lifted_operation =
-            Self::new(dimensions, self.preferred_element_type, self.has_lhs_scale, self.has_rhs_scale);
+        let lifted_operation = Self::new(dimensions, self.accumulation_type, self.has_lhs_scale, self.has_rhs_scale);
         lifted_operation.interpret_with_batch_axes(
             context,
             aligned_inputs.as_slice(),
@@ -445,10 +440,10 @@ where
             )?)?,
             None => ValueProjection::<ArrayType>::into_projected(rhs.clone())?.convert_element_type(DataType::BF16)?,
         };
-        let output = if self.preferred_element_type == DataType::BF16 {
+        let output = if self.accumulation_type == DataType::BF16 {
             lhs.dot(&rhs, &self.dimensions)?
         } else {
-            lhs.dot_with_accumulation_type(&rhs, &self.dimensions, self.preferred_element_type)?
+            lhs.dot_with_accumulation_type(&rhs, &self.dimensions, self.accumulation_type)?
         };
         Ok(vec![ValueProjection::<ArrayType>::from_projected(output)])
     }
@@ -476,15 +471,15 @@ pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
     ///   - `rhs_scale`: Optional scale array of the right element array.
     ///   - `dimensions`: Optional dimension numbers of the generalized dot product. They default to
     ///     [`ScaledDotOperation::default_dimensions`] for the rank of `self`.
-    ///   - `preferred_element_type`: Optional data type of the contraction accumulator and the output, which defaults
-    ///     to `f32` so that the contraction of the `bf16` dequantized inputs does not lose precision.
+    ///   - `accumulation_type`: Optional data type of the contraction accumulator and the output, which defaults to
+    ///     `f32` so that the contraction of the `bf16` dequantized inputs does not lose precision.
     fn scaled_dot(
         &self,
         rhs: &Self,
         lhs_scale: Option<&Self>,
         rhs_scale: Option<&Self>,
         dimensions: Option<&DotDimensionNumbers>,
-        preferred_element_type: Option<DataType>,
+        accumulation_type: Option<DataType>,
     ) -> Result<Self, ProgramError>;
 
     /// Computes the rank-three block-scaled batched matrix product `[B, M, K] × [B, N, K] → [B, M, N]` of `self` and
@@ -497,7 +492,7 @@ pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
         rhs: &Self,
         lhs_scale: &Self,
         rhs_scale: &Self,
-        preferred_element_type: Option<DataType>,
+        accumulation_type: Option<DataType>,
     ) -> Result<Self, ProgramError>
     where
         Self: Typed<Type: ArrayMemberType>,
@@ -512,7 +507,7 @@ pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
             Some(lhs_scale),
             Some(rhs_scale),
             Some(&DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0])),
-            preferred_element_type,
+            accumulation_type,
         )
     }
 }
@@ -524,7 +519,7 @@ impl ScaledDot for Array {
         lhs_scale: Option<&Self>,
         rhs_scale: Option<&Self>,
         dimensions: Option<&DotDimensionNumbers>,
-        preferred_element_type: Option<DataType>,
+        accumulation_type: Option<DataType>,
     ) -> Result<Self, ProgramError> {
         // Lift concrete arrays into the array IR so that the eager interpretation rule can read their extents as
         // dimension values and validate the inputs before dequantizing and contracting them.
@@ -532,9 +527,9 @@ impl ScaledDot for Array {
             Some(dimensions) => dimensions.clone(),
             None => ScaledDotOperation::default_dimensions(self.r#type().rank())?,
         };
-        let preferred_element_type = preferred_element_type.unwrap_or(DataType::F32);
+        let accumulation_type = accumulation_type.unwrap_or(DataType::F32);
         let operation =
-            ScaledDotOperation::new(dimensions, preferred_element_type, lhs_scale.is_some(), rhs_scale.is_some());
+            ScaledDotOperation::new(dimensions, accumulation_type, lhs_scale.is_some(), rhs_scale.is_some());
         let inputs = std::iter::once(self)
             .chain(std::iter::once(rhs))
             .chain(lhs_scale)
@@ -560,7 +555,7 @@ where
         lhs_scale: Option<&Self>,
         rhs_scale: Option<&Self>,
         dimensions: Option<&DotDimensionNumbers>,
-        preferred_element_type: Option<DataType>,
+        accumulation_type: Option<DataType>,
     ) -> Result<Self, ProgramError> {
         // Values that carry a context stage a scaled dot through that context. The `ValueDomainDispatch` marker keeps
         // this implementation disjoint from eager values, which implement the capability directly.
@@ -568,13 +563,13 @@ where
             Some(dimensions) => dimensions.clone(),
             None => ScaledDotOperation::default_dimensions(self.r#type().rank())?,
         };
-        let preferred_element_type = preferred_element_type.unwrap_or(DataType::F32);
+        let accumulation_type = accumulation_type.unwrap_or(DataType::F32);
         let mut inputs = vec![self.clone(), rhs.clone()];
         inputs.extend(lhs_scale.cloned());
         inputs.extend(rhs_scale.cloned());
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let operation =
-            ScaledDotOperation::new(dimensions, preferred_element_type, lhs_scale.is_some(), rhs_scale.is_some());
+            ScaledDotOperation::new(dimensions, accumulation_type, lhs_scale.is_some(), rhs_scale.is_some());
         let mut outputs = self.domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -1057,7 +1052,7 @@ mod tests {
         // Operation identity, accessors, and formatting.
         assert_eq!(operation.name(), SCALED_DOT_OPERATION_NAME);
         assert_eq!(operation.dimensions(), &dimensions);
-        assert_eq!(operation.preferred_element_type(), DataType::F32);
+        assert_eq!(operation.accumulation_type(), DataType::F32);
         assert!(operation.has_lhs_scale());
         assert!(!operation.has_rhs_scale());
         assert_eq!(
@@ -1065,7 +1060,7 @@ mod tests {
             indoc! {"
                 scaled_dot [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                    preferred_element_type=f32,
+                    accumulation_type=f32,
                     lhs_scale=true,
                     rhs_scale=false,
                 ]
@@ -1073,7 +1068,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Staging records the default dimension numbers, the default `f32` preferred element type, and the scales.
+        // Staging records the default dimension numbers, the default `f32` accumulation type, and the scales.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(lhs, rhs, lhs_scale, rhs_scale): (Tracer<_>, Tracer<_>, Tracer<_>, Tracer<_>)| {
                 lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, None)
@@ -1092,7 +1087,7 @@ mod tests {
                 lambda %0:f8e4m3fn[2, 4], %1:f8e5m2[4, 3], %2:f8e8m0fnu[2, 2], %3:f8e8m0fnu[2, 3] .
                 let %4:f32[2, 3] = scaled_dot [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                    preferred_element_type=f32,
+                    accumulation_type=f32,
                     lhs_scale=true,
                     rhs_scale=true,
                 ] %0 %1 %2 %3
@@ -1240,7 +1235,7 @@ mod tests {
             ],
         );
 
-        // Without scales, the operation is a dot of the `bf16` element arrays at the preferred element type.
+        // Without scales, the operation is a dot of the `bf16` element arrays at the accumulation type.
         check_operation_type_inference!(
             operation = ScaledDotOperation::new(dimensions.clone(), DataType::F64, false, false),
             cases = [{
@@ -1328,8 +1323,8 @@ mod tests {
             Ok(Array::matrix(2, 3, vec![70.0f32, 80.0, 90.0, 158.0, 184.0, 210.0]).unwrap()),
         );
 
-        // Without a preferred element type, the contraction accumulates at and returns `f32`, while an explicit `bf16`
-        // preferred element type keeps the contraction at the dequantized input type.
+        // Without an accumulation type, the contraction accumulates at and returns `f32`, while an explicit `bf16`
+        // accumulation type keeps the contraction at the dequantized input type.
         assert_eq!(
             lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, None),
             Ok(Array::matrix(2, 3, vec![253.0f32, 284.0, 315.0, 272.5, 308.0, 343.5]).unwrap()),
