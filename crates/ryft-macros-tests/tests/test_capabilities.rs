@@ -1,8 +1,3 @@
-//! Tests for the `#[capability]` attribute, which validates capability traits and generates their projection
-//! implementations, through the default `ryft` path and through a renamed `ryft-core` import.
-
-// TODO(eaplatanios): Review this module.
-
 extern crate ryft_core as core_alias;
 
 use std::fmt::Debug;
@@ -32,7 +27,7 @@ impl Double<ArrayType> for Array {
 }
 
 /// Splits values into a head and a tail, generated against a renamed `ryft-core` import.
-#[ryft::macros::capability(crate = "::core_alias", projection(core_alias::ArrayIrType => core_alias::ArrayType))]
+#[capability(crate = "::core_alias", projection(core_alias::ArrayIrType => core_alias::ArrayType))]
 trait Split<T = <Self as core_alias::Capability>::Universe>: core_alias::Capability + Sized {
     /// Returns this value as the head and `others` as the tail.
     fn split(&self, others: &[Self]) -> Result<(Self, Vec<Self>), core_alias::ProgramError>;
@@ -89,8 +84,8 @@ fn test_capability_crate_path() {
 
 #[test]
 fn test_capability_projected_inputs() {
-    // `Self`-defaulted inputs and optional inputs are projected, while other inputs are passed through unchanged, even
-    // when they are named like the local variables of the generated function.
+    // `Self`-defaulted inputs and optional inputs are projected, while other inputs are passed through unchanged,
+    // even when they are named like the local variables of the generated function.
     let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
     assert_eq!(vector(vec![1.0]).combine(&vector(vec![2.0]), None, 1), Ok(vector(vec![3.0])));
     assert_eq!(vector(vec![1.0]).combine(&vector(vec![2.0]), Some(&vector(vec![3.0])), 2), Ok(vector(vec![12.0])));

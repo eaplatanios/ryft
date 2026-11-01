@@ -1,13 +1,3 @@
-//! Tests for the `#[derive(Operation)]` procedural macro against the real `ryft` vocabulary.
-//!
-//! The canonical reference for the derive is the `# Deriving Operation Enums` section of the [`Operation`] trait
-//! documentation. These tests pin each generated implementation it lists: [`Operation`] forwarding and its
-//! [`Display`](std::fmt::Display), [`From`] and [`TryFrom`] conversions, [`OperationProjection`] and
-//! [`OperationPayloadProjection`], payload identity, the rejecting guard provider, the always-generated interpretation
-//! and partial evaluation dispatchers, and the optional reference discharge, batching, differentiation, and
-//! transposition dispatchers. Families are built from production payloads wherever one observes the contract, and from
-//! small local payloads only where a contract is observable solely through a payload that overrides it.
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
