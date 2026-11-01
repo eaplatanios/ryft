@@ -1363,7 +1363,7 @@ pub(crate) mod tests {
     fn execute_derivative(program: &FlatXlaProgram, inputs: &[f32]) -> Vec<f32> {
         use ryft_core::{
             ArrayType, CompilationDomain, CompilationStagingRequest, CompilationTracer, Device, DeviceMesh,
-            LogicalMesh, StagedFunction, call_function,
+            LogicalMesh, StagedFunction,
         };
 
         use crate::experimental::domains::{XlaDomain, XlaOptions};
@@ -1402,7 +1402,9 @@ pub(crate) mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        call_function(&domain, compiled.executable_function(), inputs)
+        compiled
+            .executable_function()
+            .call(&domain, inputs)
             .unwrap()
             .into_iter()
             .map(|value| {

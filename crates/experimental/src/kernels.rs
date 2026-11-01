@@ -1262,7 +1262,6 @@ mod cutile {
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, CompilationDomain,
         CompilationStagingRequest, ConstantOperation, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
-        call_function,
     };
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
@@ -1415,7 +1414,7 @@ mod cutile {
             arrays[1] = arrays[0].clone();
         }
         let original = arrays[0].clone();
-        let results = call_function(&runtime, &executable, arrays.into_iter().map(XlaValue::Array).collect())?;
+        let results = executable.call(&runtime, arrays.into_iter().map(XlaValue::Array).collect())?;
         let XlaValue::Array(result) = &results[0] else { panic!("kernel output must be an array") };
         let bytes =
             result.device_shard(device.id().unwrap()).unwrap().buffer().unwrap().copy_to_host(None)?.r#await()?;
@@ -2266,7 +2265,7 @@ mod triton {
 
     use ryft_core::{
         ArrayIrType, CompilationCacheDomain, CompilationDomain, CompilationStagingRequest, Device, DeviceMesh,
-        LogicalMesh, MeshAxis, MeshAxisType, call_function,
+        LogicalMesh, MeshAxis, MeshAxisType,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule};
     use ryft_triton::kernels::{Compiler, Options, Target};
@@ -2344,8 +2343,7 @@ mod triton {
             })
             .collect::<Vec<_>>();
         for _ in 0..3 {
-            let outputs =
-                call_function(&runtime, &executable, inputs.iter().cloned().map(XlaValue::Array).collect()).unwrap();
+            let outputs = executable.call(&runtime, inputs.iter().cloned().map(XlaValue::Array).collect()).unwrap();
             let XlaValue::Array(output) = &outputs[0] else { panic!("expected array output") };
             let bytes = output
                 .device_shard(device.id().unwrap())

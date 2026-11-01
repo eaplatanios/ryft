@@ -89,8 +89,8 @@ use ryft_core::{
     CompiledFunction, CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh,
     DifferentiableType, DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics,
     Parameterized, ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution,
-    ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection, call_function,
-    call_function_statefully, call_function_statefully_async, try_jit_with_options as core_try_jit_with_options,
+    ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection,
+    jit_with_options as core_jit_with_options,
 };
 use ryft_pjrt::Execution;
 
@@ -126,12 +126,6 @@ type XlaProgramConstants<P> = XlaProgramParameterValues<P, XlaConstant>;
 ///
 /// This alias is experimental while the external-reference ABI is evolving.
 pub type XlaStatefulValue<'c> = XlaValue<'c>;
-
-/// Traced output tree produced by one heterogeneous stateful XLA closure.
-type XlaStatefulTraceOutput<'c, P> = <P as Parameterized<ArrayIrType>>::To<XlaStatefulCompileTracer<'c>>;
-
-/// Fallible traced output of one heterogeneous stateful XLA closure.
-type XlaStatefulTraceResult<'c, P> = Result<XlaStatefulTraceOutput<'c, P>, XlaDomainError>;
 
 /// Projects one internal array IR tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
@@ -295,8 +289,11 @@ where
     }
 }
 
-/// Constructs a retained dispatcher for a fallible XLA closure using explicit options.
-pub fn try_jitted_with_options<'c, F, Static, In, Out>(
+/// Constructs a retained dispatcher for `function` with explicit options.
+///
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`].
+pub fn jitted_with_options<'c, F, Static, In, Out>(
     function: F,
     domain: &XlaDomain<'c>,
     options: XlaOptions,
@@ -329,43 +326,13 @@ where
         let outputs = function(static_parameters, project_tracers::<In>(inputs)?)?;
         lift_tracers::<Out>(outputs)
     };
-    JittedXlaFunction { function: core_try_jit_with_options(domain, function, options) }
+    JittedXlaFunction { function: core_jit_with_options(domain, function, options) }
 }
 
-/// Constructs a retained dispatcher for an infallible XLA closure using explicit options.
-pub fn jitted_with_options<'c, F, Static, In, Out>(
-    function: F,
-    domain: &XlaDomain<'c>,
-    options: XlaOptions,
-) -> JittedXlaFunction<
-    'c,
-    impl Fn(
-        Static,
-        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
-    Static,
-    In,
-    Out,
->
-where
-    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayType>,
-    In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>,
-    Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType>
-        + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>,
-{
-    try_jitted_with_options(move |static_parameters, inputs| Ok(function(static_parameters, inputs)), domain, options)
-}
-
-/// Constructs a retained dispatcher for an infallible XLA closure on `mesh`.
+/// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options.
+///
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`].
 #[inline]
 pub fn jitted<'c, F, Static, In, Out>(
     function: F,
@@ -382,7 +349,7 @@ pub fn jitted<'c, F, Static, In, Out>(
     Out,
 >
 where
-    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
@@ -517,12 +484,15 @@ where
     }
 }
 
-/// Constructs a retained stateful dispatcher for a fallible heterogeneous XLA closure.
+/// Constructs a retained stateful dispatcher for a heterogeneous XLA `function` with explicit options.
+///
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`].
 ///
 /// # Stability
 ///
 /// This external-state entry point is experimental.
-pub fn try_jitted_statefully_with_options<'c, F, Static, In, Out>(
+pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
     function: F,
     domain: &XlaDomain<'c>,
     options: XlaOptions,
@@ -543,46 +513,14 @@ where
             Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
         >,
 {
-    StatefulJittedXlaFunction { function: core_try_jit_with_options(domain, function, options) }
+    StatefulJittedXlaFunction { function: core_jit_with_options(domain, function, options) }
 }
 
-/// Constructs a retained stateful dispatcher for an infallible heterogeneous XLA closure.
+/// Constructs a retained stateful dispatcher for a heterogeneous XLA `function` on `mesh` with otherwise default
+/// options.
 ///
-/// # Stability
-///
-/// This external-state entry point is experimental.
-pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
-    function: F,
-    domain: &XlaDomain<'c>,
-    options: XlaOptions,
-) -> StatefulJittedXlaFunction<
-    'c,
-    impl Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> XlaStatefulTraceResult<'c, Out>,
-    Static,
-    In,
-    Out,
->
-where
-    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Out::To<XlaStatefulCompileTracer<'c>>,
-    Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<
-            ArrayIrType,
-            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-        >,
-    In::ParameterStructure: Eq + Hash,
-    Out: Parameterized<
-            ArrayIrType,
-            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
-        >,
-{
-    try_jitted_statefully_with_options(
-        move |static_parameters, inputs| Ok(function(static_parameters, inputs)),
-        domain,
-        options,
-    )
-}
-
-/// Constructs a retained stateful dispatcher for an infallible heterogeneous XLA closure on `mesh`.
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`].
 ///
 /// # Stability
 ///
@@ -592,15 +530,12 @@ pub fn jitted_statefully<'c, F, Static, In, Out>(
     function: F,
     domain: &XlaDomain<'c>,
     mesh: DeviceMesh,
-) -> StatefulJittedXlaFunction<
-    'c,
-    impl Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> XlaStatefulTraceResult<'c, Out>,
-    Static,
-    In,
-    Out,
->
+) -> StatefulJittedXlaFunction<'c, F, Static, In, Out>
 where
-    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Out::To<XlaStatefulCompileTracer<'c>>,
+    F: Fn(
+        Static,
+        In::To<XlaStatefulCompileTracer<'c>>,
+    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<
             ArrayIrType,
@@ -662,7 +597,7 @@ where
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
     ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
-        call_function_statefully(domain, self.function.executable_function(), inputs)
+        self.function.executable_function().call_statefully(domain, inputs)
     }
 
     /// Submits a stateful call and returns its non-cancelling completion-bearing result.
@@ -674,7 +609,7 @@ where
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
     ) -> ReferenceExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
-        call_function_statefully_async(domain, self.function.executable_function(), inputs)
+        self.function.executable_function().call_statefully_async(domain, inputs)
     }
 
     /// Returns the public flat output types, excluding the hidden final-state output suffix that reference
@@ -941,7 +876,7 @@ impl<'c> XlaDomain<'c> {
             Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = lift_arrays::<In>(inputs)?;
-        project_arrays::<Out>(call_function(self, &executable.function, inputs)?)
+        project_arrays::<Out>(executable.function.call(self, inputs)?)
     }
 
     /// Enqueues an XLA runtime program and retains whole-execution completion, including for zero-output calls.
@@ -2773,14 +2708,10 @@ mod tests {
             XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
-            ryft_core::call_function(
-                &domain,
-                compiled.executable_function(),
-                (
+            compiled.executable_function().call(&domain, (
                     XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
                     XlaValue::Array(rejected_update),
-                ),
-            ),
+                )),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state requires `call_statefully`",
         ));
@@ -4132,8 +4063,8 @@ mod tests {
             .unwrap();
         let function = jitted_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(), (reference, update): (XlaStatefulCompileTracer<'_>, XlaStatefulCompileTracer<'_>)| {
-                reference.add_update(&update).unwrap();
-                reference.read().unwrap()
+                reference.add_update(&update)?;
+                Ok(reference.read()?)
             },
             &domain,
             mesh.clone(),
@@ -4930,7 +4861,7 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let domain = XlaSession::new(&client).domain();
         let function: JittedXlaFunction<'_, _, bool, ArrayType, ArrayType> = jitted(
-            |apply_sine, input: XlaCompileTracer<'_>| if apply_sine { input.sin().unwrap() } else { input },
+            |apply_sine, input: XlaCompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
             &domain,
             mesh.clone(),
         );
@@ -7339,11 +7270,7 @@ mod tests {
             .unwrap();
         let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
             |_, input: XlaCompileTracer<'_>| {
-                input
-                    .domain()
-                    .differentiate_at(input)
-                    .gradient(|value| Mul::mul(&value, &value))
-                    .expect("the eager gradient should stage inside the jit boundary")
+                Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
             },
             &domain,
             mesh.clone(),

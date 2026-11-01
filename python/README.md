@@ -122,7 +122,7 @@ Build with CUDA 13 from the repository root, then run from `python/`:
 ```bash
 timeout 300 cargo build -p ryft-xla --features differential-testing,cuda-13 --bin differential_testing
 cd python
-CUDA_VISIBLE_DEVICES=0 uv run --with 'jax[cuda13]==0.10.0' python -m ryft.jax.differential_testing \
+CUDA_VISIBLE_DEVICES=0 uv run --with 'jax[cuda13]==0.12.0.1' python -m ryft.jax.differential_testing \
     --suite cuda-collectives --ryft-binary ../target/debug/differential_testing
 ```
 
@@ -152,7 +152,7 @@ from `site-packages/nvidia/nccl/lib`, plus compatible NVRTC and NVJitLink librar
 After the CUDA build above, run from `python/`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run --with 'jax[cuda13]==0.10.0' python -m ryft.jax.differential_testing \
+CUDA_VISIBLE_DEVICES=0 uv run --with 'jax[cuda13]==0.12.0.1' python -m ryft.jax.differential_testing \
     --suite cuda-distributed-collectives --ryft-binary ../target/debug/differential_testing \
     --worker-log-directory /tmp/ryft-distributed-logs
 ```

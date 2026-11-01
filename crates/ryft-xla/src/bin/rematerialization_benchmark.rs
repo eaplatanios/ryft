@@ -21,13 +21,13 @@
 use std::env;
 use std::time::{Duration, Instant};
 
-use ryft_core::compilation::{AnalyzableCompilationDomain, call_function};
+use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
     ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension,
     DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
     MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Typed,
-    Value, ValueProjection, differentiate_at, rematerialize, stage_function,
+    Value, ValueProjection, differentiate_at, rematerialize, stage,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
@@ -234,7 +234,7 @@ where
     F: Fn(Tracer<'c>, Tracer<'c>, Tracer<'c>) -> Result<Tracer<'c>, ProgramError>,
 {
     let hidden_type = array_type(&[model.batch_size, model.width]);
-    stage_function(
+    stage(
         domain,
         |(hidden, up, down)| {
             // The hidden state is differentiated too, so that every input belongs to the differentiated function, and
@@ -322,7 +322,7 @@ fn measure<'c>(
     let memory = domain.analyze(compiled.executable_function()).unwrap().memory;
     let inputs = (XlaValue::Array(inputs.0), XlaValue::Array(inputs.1), XlaValue::Array(inputs.2));
     let execute = || {
-        let (up, down) = call_function(domain, compiled.executable_function(), inputs.clone()).unwrap();
+        let (up, down) = compiled.executable_function().call(domain, inputs.clone()).unwrap();
         let gradients = [up, down].map(|gradient| ValueProjection::<ArrayType>::into_projected(gradient).unwrap());
         gradients.iter().for_each(|gradient| gradient.block_until_ready().unwrap());
         gradients

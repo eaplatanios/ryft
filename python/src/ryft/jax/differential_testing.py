@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 
 SCHEMA = "ryft-jax-differential-v1"
-PINNED_JAX_VERSION = "0.10.0"
+PINNED_JAX_VERSION = "0.12.0.1"
 BUILD_HINT = "cargo build -p ryft-xla --features differential-testing --bin differential_testing"
 SUBPROCESS_TIMEOUT_SECONDS = 300
 CUDA_SUITES = ("cuda-collectives", "cuda-distributed-collectives")
@@ -187,6 +187,14 @@ _COLLECTIVE_PATTERN = re.compile(
 _DENSE_GROUPS_PATTERN = re.compile(
     r"(?:replica_groups|source_target_pairs) = dense<(\[\[.*?\]\]|-?\d+)> : tensor<(\d+)x(\d+)xi64>"
 )
+_MESH_AXES_GROUPS_PATTERN = re.compile(
+    r"replica_groups = #stablehlo\.replica_group_mesh_axes<mesh = @([\w.$-]+), axes = \[(.*?)\]>"
+)
+_MESH_AXIS_REFERENCE_PATTERN = re.compile(r'#stablehlo\.axis_ref<name = "([^"]+)"(.*?)>')
+_SHARDY_MESH_PATTERN = re.compile(
+    r"^\s*sdy\.mesh @([\w.$-]+) = <\[(.*?)\](?:, device_ids=\[([\d, ]*)\])?>", re.MULTILINE
+)
+_SHARDY_MESH_AXIS_PATTERN = re.compile(r'"([^"]+)"=(\d+)')
 _AXIS_PATTERNS = {
     "all_gather_dim": re.compile(r"all_gather_dim = (\d+) : i64"),
     "scatter_dimension": re.compile(r"scatter_dimension = (\d+) : i64"),
@@ -201,7 +209,9 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
 
     The projection intentionally ignores SSA names, channel handles, tensor spellings, wrapper functions, and Shardy
     metadata. It retains the collective family, ordered replica/source-target groups, and operation-defining axis
-    attributes. Independent numerical references also check reduction combiners and tensor layouts.
+    attributes. Independent numerical references also check reduction combiners and tensor layouts. Replica groups
+    that name mesh axes (`#stablehlo.replica_group_mesh_axes`, emitted by JAX 0.12 and later) are resolved against
+    their Shardy mesh into the equivalent dense device groups, so both spellings project identically.
 
     # Parameters
 
@@ -214,9 +224,11 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
         operation_text = match.group(0)
         groups_match = _DENSE_GROUPS_PATTERN.search(operation_text)
         if groups_match is None:
-            raise ValueError(f"stablehlo.{operation} is missing replica/source-target groups")
-        groups_payload = json.loads(groups_match.group(1))
-        if isinstance(groups_payload, int):
+            mesh_axes_match = _MESH_AXES_GROUPS_PATTERN.search(operation_text)
+            if mesh_axes_match is None:
+                raise ValueError(f"stablehlo.{operation} is missing replica/source-target groups")
+            groups = _mesh_axes_groups(module, mesh_axes_match.group(1), mesh_axes_match.group(2))
+        elif isinstance(groups_payload := json.loads(groups_match.group(1)), int):
             groups = tuple(
                 (groups_payload,) * int(groups_match.group(3)) for _ in range(int(groups_match.group(2)))
             )
@@ -231,6 +243,61 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
             StableHloCollective(operation=operation, groups=groups, axis_attributes=axis_attributes)
         )
     return tuple(collectives)
+
+
+def _mesh_axes_groups(module: str, mesh_name: str, axes_text: str) -> tuple[tuple[int, ...], ...]:
+    """Resolves replica groups over the named axes of a Shardy mesh into dense device groups.
+
+    Each group holds the devices whose mesh coordinates differ only along the named axes, enumerated row-major over
+    those axes in the given order. Groups are ordered row-major over the remaining mesh axes. Devices map to mesh
+    coordinates row-major, or through the mesh's explicit `device_ids` when it has them.
+
+    # Parameters
+
+      - `module`: Textual StableHLO module that defines the mesh.
+      - `mesh_name`: Symbol name of the mesh, without the leading `@`.
+      - `axes_text`: Comma-separated `#stablehlo.axis_ref` attributes of the replica groups.
+    """
+
+    meshes = {match.group(1): match for match in _SHARDY_MESH_PATTERN.finditer(module)}
+    if mesh_name not in meshes:
+        raise ValueError(f"replica groups reference the undefined mesh @{mesh_name}")
+    mesh_match = meshes[mesh_name]
+    mesh_axes = [(name, int(size)) for name, size in _SHARDY_MESH_AXIS_PATTERN.findall(mesh_match.group(2))]
+    sizes = dict(mesh_axes)
+    device_count = math.prod(sizes.values())
+    device_ids = (
+        list(range(device_count))
+        if mesh_match.group(3) is None
+        else [int(device) for device in mesh_match.group(3).split(",")]
+    )
+    group_axes = []
+    for name, suffix in _MESH_AXIS_REFERENCE_PATTERN.findall(axes_text):
+        if suffix.strip():
+            raise ValueError(f"replica groups over sub-axes of mesh axis {name!r} are not supported")
+        if name not in sizes:
+            raise ValueError(f"replica groups reference the unknown mesh axis {name!r} of mesh @{mesh_name}")
+        group_axes.append(name)
+    other_axes = [name for name, _ in mesh_axes if name not in group_axes]
+    strides = {}
+    stride = 1
+    for name, size in reversed(mesh_axes):
+        strides[name] = stride
+        stride *= size
+
+    def coordinates(axes: Sequence[str]) -> list[dict[str, int]]:
+        result: list[dict[str, int]] = [{}]
+        for name in axes:
+            result = [{**prefix, name: index} for prefix in result for index in range(sizes[name])]
+        return result
+
+    return tuple(
+        tuple(
+            device_ids[sum(strides[name] * index for name, index in {**outer, **inner}.items())]
+            for inner in coordinates(group_axes)
+        )
+        for outer in coordinates(other_axes)
+    )
 
 
 _BRANCHING_PATTERN = re.compile(r'^(\s*)%[^=]*= "stablehlo\.(?:if|case)"\(')

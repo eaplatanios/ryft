@@ -163,6 +163,37 @@ class DifferentialTestingTest(unittest.TestCase):
             (StableHloCollective("all_reduce", ((0,),), ()),),
         )
 
+    def test_collective_stablehlo_projection_mesh_axes_groups(self) -> None:
+        mesh_axes = '#stablehlo.replica_group_mesh_axes<mesh = @mesh, axes = [{axes}]>'
+        x = '#stablehlo.axis_ref<name = "x">'
+        y = '#stablehlo.axis_ref<name = "y">'
+
+        def module(mesh: str, axes: str) -> str:
+            return (
+                f"sdy.mesh @mesh = {mesh}\n"
+                f'%0 = "stablehlo.all_reduce"(%arg0) <{{replica_groups = {mesh_axes.format(axes=axes)}}}>'
+            )
+
+        # Groups enumerate the named axes row-major and are ordered row-major over the remaining axes.
+        mesh = '<["x"=2, "y"=2]>'
+        self.assertEqual(project_collective_stablehlo(module(mesh, x))[0].groups, ((0, 2), (1, 3)))
+        self.assertEqual(project_collective_stablehlo(module(mesh, y))[0].groups, ((0, 1), (2, 3)))
+        self.assertEqual(project_collective_stablehlo(module(mesh, f"{y}, {x}"))[0].groups, ((0, 2, 1, 3),))
+
+        # Explicit device identifiers replace the row-major device order.
+        permuted = '<["x"=2, "y"=2], device_ids=[3, 1, 2, 0]>'
+        self.assertEqual(project_collective_stablehlo(module(permuted, x))[0].groups, ((3, 2), (1, 0)))
+
+        with self.assertRaisesRegex(ValueError, "undefined mesh @mesh"):
+            project_collective_stablehlo(module(mesh, x).split("\n")[1])
+        with self.assertRaisesRegex(ValueError, "unknown mesh axis 'z' of mesh @mesh"):
+            project_collective_stablehlo(module(mesh, '#stablehlo.axis_ref<name = "z">'))
+        with self.assertRaisesRegex(ValueError, "sub-axes of mesh axis 'x' are not supported"):
+            sub_axis = (
+                '#stablehlo.axis_ref<name = "x", sub_axis_info = #stablehlo.sub_axis_info<pre_size = 1, size = 2>>'
+            )
+            project_collective_stablehlo(module(mesh, sub_axis))
+
     def test_exact_parity_comparison(self) -> None:
         observation = grouped_observation()
         self.assertTrue(compare_case("parity", GROUPED_COLLECTIVES, observation, observation).passed())

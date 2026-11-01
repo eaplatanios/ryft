@@ -56,8 +56,7 @@ pub use compilation::{
     CompilationMissReason, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
     CompiledFunction, CompiledFunctionDispatcher, DiskCache, ExecutableFunction, FlatCompilationProgram,
     FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, LoweringRequest, ReferenceExecution, StageRequest,
-    StagedFunction, StatefulCompilationDomain, call_function, call_function_statefully, call_function_statefully_async,
-    jit, jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
+    StagedFunction, StatefulCompilationDomain, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };
 pub use contexts::{
     Context, ContextProjection, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext,
@@ -98,7 +97,8 @@ pub use operations::{
     Accuracy, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
     ArithmeticDimensionOperation, ArithmeticOperations, ArrayAssertionBatchingPolicy, Assert, AssertOperation,
     AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, AxisIndex, AxisIndexOperation,
-    BROADCAST_OPERATION_NAME, BasicIndex, BatchedComposite, BlockDequantize, BlockQuantize, Broadcast,
+    BROADCAST_OPERATION_NAME, BasicIndex, BatchedComposite, BlockDequantize, BlockQuantize, BlockScaleFormat,
+    BlockScaledDot, BlockScaledDotConfiguration, BlockScaledDotInputs, BlockScaledGlobalScaling, Broadcast,
     BroadcastInvariantBatching, BroadcastOperation, BroadcastSensitiveBatching, CAST_OPERATION_NAME,
     CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME, COMPLEX_OPERATION_NAME,
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME,
@@ -176,8 +176,9 @@ pub use operations::{
     UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While,
     WhileOperation, WhileOptions, WhilePredicate, WhileType, XOR_OPERATION_NAME, Xor, XorOperation,
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    composite, scan, shard_map, shard_map_in_context, shard_map_with_options, softmax_cross_entropy_with_target_logits,
-    trace_shard_map, trace_shard_map_with_named_axes, trace_shard_map_with_options, r#while,
+    block_scaled_dot, composite, scan, shard_map, shard_map_in_context, shard_map_with_options,
+    softmax_cross_entropy_with_target_logits, trace_shard_map, trace_shard_map_with_named_axes,
+    trace_shard_map_with_options, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

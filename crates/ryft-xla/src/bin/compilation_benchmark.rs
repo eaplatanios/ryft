@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use ryft_core::{
     ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache,
     JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
-    stage_function,
+    stage,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
@@ -178,7 +178,7 @@ fn stage_workload<'c>(
     mesh: &DeviceMesh,
     r#type: ArrayType,
 ) -> Result<BenchmarkStagedFunction<'c>, Box<dyn std::error::Error>> {
-    Ok(stage_function(
+    Ok(stage(
         domain,
         |input| {
             let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
@@ -194,7 +194,7 @@ fn call_workload<'c>(
     compiled: &BenchmarkCompiledFunction<'c>,
     input: XlaArray<'c>,
 ) -> Result<XlaArray<'c>, Box<dyn std::error::Error>> {
-    match ryft_core::compilation::call_function(domain, compiled.executable_function(), XlaValue::Array(input))? {
+    match compiled.executable_function().call(domain, XlaValue::Array(input))? {
         XlaValue::Array(output) => Ok(output),
         XlaValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
         XlaValue::Reference(_) => Err("compilation benchmark produced a reference".into()),
@@ -282,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let dispatcher: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
-        |(), input: XlaCompileTracer<'_>| (input.clone() * input.clone() + input).sin().unwrap(),
+        |(), input: XlaCompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?),
         &domain,
         mesh.clone(),
     );

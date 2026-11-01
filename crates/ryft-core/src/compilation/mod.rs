@@ -31,17 +31,18 @@
 //!
 //! # Entry Points
 //!
-//!   - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [1CompiledFunctionDispatcher`] specializes on
-//!     explicit static host parameters, the dynamic input's parameter structure, and the domain's runtime-derived
-//!     dispatch key. Its first call for a specialization traces, lowers, and requests compilation; warm calls dispatch
-//!     directly to the retained executable.
-//!   - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it
-//!     to [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed.
+//!   - Use [`jit`], [`jit_with_options`], or [`jit_with_options_and_capacity`] for a retained JIT dispatcher over a
+//!     fallible closure, which returns its outputs wrapped in [`Ok`] when it cannot fail. A
+//!     [`CompiledFunctionDispatcher`] specializes on explicit static host parameters, the dynamic input's parameter
+//!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization traces, lowers,
+//!     and requests compilation; warm calls dispatch directly to the retained executable.
+//!   - Use [`stage`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
+//!     [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed.
 //!     Then continue with [`CompilationDomain::lower`] and [`CompilationDomain::compile`].
-//!   - Domains with transactional external state implement [`StatefulCompilationDomain`]. Invoke their executable
-//!     handles through [`call_function_statefully`] or [`call_function_statefully_async`]; retained dispatchers expose
-//!     the same capability through [`CompiledFunctionDispatcher::call_statefully`] and
-//!     [`CompiledFunctionDispatcher::call_statefully_async`].
+//!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::call`]. Domains with transactional
+//!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
+//!     [`ExecutableFunction::call_statefully`] or [`ExecutableFunction::call_statefully_async`] instead. Retained
+//!     dispatchers expose the same functions (e.g., [`CompiledFunctionDispatcher::call_statefully`]).
 //!
 //! Backend-facing crates normally wrap these generic entry points with value- and option-specific APIs.
 //! New backend-neutral code can call them directly.
@@ -143,8 +144,8 @@
 //! The generic [`CompilationDomain`] methods use [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
 //! [`CallRequest`] as typed backend extension witnesses. These traits keep the structured input and output bounds
 //! in one place and expose only the artifact operations that a backend needs for each transition. Ordinary callers
-//! construct a [`CompilationStagingRequest`] or use [`stage_function`], while backend implementations name the witness
-//! traits in their bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or
+//! construct a [`CompilationStagingRequest`] or use [`stage`], while backend implementations name the witness traits
+//! in their bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or
 //! `reconstruct` functions.
 
 pub mod caching;
@@ -162,6 +163,5 @@ pub use functions::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
     CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FlatCompilationProgram,
     FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, LoweringRequest, ReferenceExecution, StageRequest,
-    StagedFunction, call_function, call_function_statefully, call_function_statefully_async, jit, jit_with_options,
-    stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
+    StagedFunction, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };

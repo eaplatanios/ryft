@@ -921,6 +921,49 @@ where
     }
 }
 
+impl<C, Input, Output> ExecutableFunction<C, Input, Output>
+where
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Input::To<C::Value>: Parameterized<C::Value>,
+    Output::To<C::Value>:
+        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+{
+    /// Executes this function on the structured runtime `inputs` through `domain` and returns its structured outputs.
+    ///
+    /// Functions that bind external mutable references must be executed through [`Self::call_statefully`] or
+    /// [`Self::call_statefully_async`] instead.
+    pub fn call(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error> {
+        domain.call(CompilationCall::new(self, inputs))
+    }
+
+    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and returns a result
+    /// that carries the completion of the whole invocation.
+    ///
+    /// The returned completion owns error observation but not cancellation. The semantics of submission and of the
+    /// publication of reference state are defined by [`StatefulCompilationDomain::call_statefully_async`].
+    pub fn call_statefully_async(
+        &self,
+        domain: &C,
+        inputs: Input::To<C::Value>,
+    ) -> ReferenceExecution<Output::To<C::Value>, C::Error>
+    where
+        C: StatefulCompilationDomain,
+    {
+        domain.call_statefully_async(CompilationCall::new(self, inputs))
+    }
+
+    /// Executes this function on the structured runtime `inputs` through the stateful `domain` and waits for the whole
+    /// invocation to complete, which makes it the blocking form of [`Self::call_statefully_async`].
+    pub fn call_statefully(&self, domain: &C, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    where
+        C: StatefulCompilationDomain,
+    {
+        domain.call_statefully(CompilationCall::new(self, inputs))
+    }
+}
+
 impl<C, Input, Output> CallRequest<C> for CompilationCall<C, Input, Output>
 where
     C: CompilationDomain,
@@ -1444,7 +1487,7 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let executable = self.specialization(static_parameters, &inputs)?;
-        call_function(&self.state.domain, &executable, inputs)
+        executable.call(&self.state.domain, inputs)
     }
 
     /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
@@ -1479,7 +1522,7 @@ where
             Ok(executable) => executable,
             Err(error) => return ReferenceExecution::ready(Err(error)),
         };
-        call_function_statefully_async(&self.state.domain, &executable, inputs)
+        executable.call_statefully_async(&self.state.domain, inputs)
     }
 
     /// Calls this dispatcher statefully and waits for whole-invocation completion.
@@ -1511,7 +1554,7 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let executable = self.specialization(static_parameters, &inputs)?;
-        call_function_statefully(&self.state.domain, &executable, inputs)
+        executable.call_statefully(&self.state.domain, inputs)
     }
 
     /// Acquires or produces the executable specialization for one runtime input signature.
@@ -1643,8 +1686,12 @@ where
     }
 }
 
-/// Constructs a retained dispatcher for a fallible closure using explicit options and cache capacity.
-pub fn try_jit_with_options_and_capacity<C, F, Static, Input, Output>(
+/// Constructs a retained dispatcher for `function` with explicit options that retains at most `capacity` compiled
+/// specializations.
+///
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`]. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
+pub fn jit_with_options_and_capacity<C, F, Static, Input, Output>(
     domain: &C,
     function: F,
     options: C::Options,
@@ -1653,65 +1700,7 @@ pub fn try_jit_with_options_and_capacity<C, F, Static, Input, Output>(
 where
     C: CompilationDomain,
     C::Type: Eq + Hash,
-    Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-{
-    CompiledFunctionDispatcher::new(domain, function, options, capacity)
-}
-
-/// Constructs a retained dispatcher for a fallible closure using explicit options.
-#[inline]
-pub fn try_jit_with_options<C, F, Static, Input, Output>(
-    domain: &C,
-    function: F,
-    options: C::Options,
-) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
-where
-    C: CompilationDomain,
-    C::Type: Eq + Hash,
-    Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-{
-    try_jit_with_options_and_capacity(domain, function, options, DEFAULT_JIT_CACHE_CAPACITY)
-}
-
-/// Constructs a retained dispatcher for a fallible closure using default options.
-#[inline]
-pub fn try_jit<C, F, Static, Input, Output>(
-    domain: &C,
-    function: F,
-) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
-where
-    C: CompilationDomain<Options: Default>,
-    C::Type: Eq + Hash,
-    Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-{
-    try_jit_with_options(domain, function, C::Options::default())
-}
-
-/// Constructs a retained dispatcher for an infallible closure using explicit options.
-pub fn jit_with_options<C, F, Static, Input, Output>(
-    domain: &C,
-    function: F,
-    options: C::Options,
-) -> CompiledFunctionDispatcher<
-    C,
-    impl Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
-    Static,
-    Input,
-    Output,
->
-where
-    C: CompilationDomain,
-    C::Type: Eq + Hash,
-    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Output::To<CompilationTracer<C>>,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type>,
     Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
@@ -1720,25 +1709,47 @@ where
     Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    try_jit_with_options(domain, move |static_parameters, inputs| Ok(function(static_parameters, inputs)), options)
+    CompiledFunctionDispatcher::new(domain, function, options, capacity)
 }
 
-/// Constructs a retained dispatcher for an infallible closure using default options.
+/// Constructs a retained dispatcher for `function` with explicit options and the default cache capacity.
+///
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`]. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
+#[inline]
+pub fn jit_with_options<C, F, Static, Input, Output>(
+    domain: &C,
+    function: F,
+    options: C::Options,
+) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
+where
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+    Static: Clone + Debug + Eq + Hash,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Input::ParameterStructure: Eq + Hash,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    jit_with_options_and_capacity(domain, function, options, DEFAULT_JIT_CACHE_CAPACITY)
+}
+
+/// Constructs a retained dispatcher for `function` with default options and the default cache capacity.
+///
+/// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
+/// outputs wrapped in [`Ok`]. Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
 #[inline]
 pub fn jit<C, F, Static, Input, Output>(
     domain: &C,
     function: F,
-) -> CompiledFunctionDispatcher<
-    C,
-    impl Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
-    Static,
-    Input,
-    Output,
->
+) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
     C: CompilationDomain<Options: Default>,
     C::Type: Eq + Hash,
-    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Output::To<CompilationTracer<C>>,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type>,
     Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
@@ -1751,7 +1762,11 @@ where
 }
 
 /// Stages an infallible capture-free function through `domain`.
-pub fn stage_function<C, F, Input, Output>(
+///
+/// This is the convenience form of [`CompilationDomain::stage`] for functions without runtime captures. Construct a
+/// [`CompilationStagingRequest`] and pass it to [`CompilationDomain::stage`] directly when the function is fallible or
+/// closes over runtime captures.
+pub fn stage<C, F, Input, Output>(
     domain: &C,
     function: F,
     input_types: Input,
@@ -1769,62 +1784,6 @@ where
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     domain.stage(CompilationStagingRequest::new(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options))
-}
-
-/// Executes a structured runtime call through `domain`.
-pub fn call_function<C, Input, Output>(
-    domain: &C,
-    executable: &ExecutableFunction<C, Input, Output>,
-    inputs: Input::To<C::Value>,
-) -> Result<Output::To<C::Value>, C::Error>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Input::To<C::Value>: Parameterized<C::Value>,
-    Output::To<C::Value>:
-        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-{
-    domain.call(CompilationCall::new(executable, inputs))
-}
-
-/// Executes a completion-bearing structured runtime call through a stateful domain.
-///
-/// The returned completion owns error observation, not cancellation. Submission and reference-state publication
-/// semantics are defined by [`StatefulCompilationDomain::call_statefully_async`].
-pub fn call_function_statefully_async<C, Input, Output>(
-    domain: &C,
-    executable: &ExecutableFunction<C, Input, Output>,
-    inputs: Input::To<C::Value>,
-) -> ReferenceExecution<Output::To<C::Value>, C::Error>
-where
-    C: StatefulCompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Input::To<C::Value>: Parameterized<C::Value>,
-    Output::To<C::Value>:
-        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-{
-    domain.call_statefully_async(CompilationCall::new(executable, inputs))
-}
-
-/// Executes a structured runtime call and waits for whole-invocation completion.
-///
-/// This is the blocking form of [`call_function_statefully_async`].
-pub fn call_function_statefully<C, Input, Output>(
-    domain: &C,
-    executable: &ExecutableFunction<C, Input, Output>,
-    inputs: Input::To<C::Value>,
-) -> Result<Output::To<C::Value>, C::Error>
-where
-    C: StatefulCompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
-    Input::To<C::Value>: Parameterized<C::Value>,
-    Output::To<C::Value>:
-        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-{
-    domain.call_statefully(CompilationCall::new(executable, inputs))
 }
 
 /// Constructs a staged function from types already prepared by a compilation domain.
@@ -2203,7 +2162,7 @@ mod tests {
         domain: &TestDomain,
         negate: bool,
     ) -> CompiledFunction<TestDomain, ArrayType, ArrayType> {
-        let staged = stage_function(
+        let staged = stage(
             domain,
             |input| if negate { input.unary(NegOperation::new()) } else { input },
             ArrayType::scalar(DataType::F64),
@@ -2266,13 +2225,9 @@ mod tests {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            ArrayType::scalar(DataType::F64),
-            options,
-        )
-        .unwrap();
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
+            stage(&domain, |input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F64), options)
+                .unwrap();
 
         assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::I64)]);
         assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::I64)]);
@@ -2314,7 +2269,7 @@ mod tests {
     #[test]
     fn test_staged_function_clone() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage(
             &domain,
             |input: CompilationTracer<TestDomain>| input.unary(NegOperation::new()),
             ArrayType::scalar(DataType::F64),
@@ -2328,11 +2283,11 @@ mod tests {
         let second = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
         assert_eq!(
-            call_function(&domain, first.executable_function(), Array::scalar(2.0).unwrap()).unwrap(),
+            first.executable_function().call(&domain, Array::scalar(2.0).unwrap()).unwrap(),
             Array::scalar(-2.0).unwrap()
         );
         assert_eq!(
-            call_function(&domain, second.executable_function(), Array::scalar(4.0).unwrap()).unwrap(),
+            second.executable_function().call(&domain, Array::scalar(4.0).unwrap()).unwrap(),
             Array::scalar(-4.0).unwrap()
         );
         assert_eq!(domain.compilation_count(), 1);
@@ -2354,14 +2309,8 @@ mod tests {
 
         // The replacement runs the new program with the retained signature, while the original function is unaffected.
         assert_eq!(replaced.input_types(), identity.input_types());
-        assert_eq!(
-            call_function(&domain, &replaced, Array::scalar(3.0).unwrap()).unwrap(),
-            Array::scalar(-3.0).unwrap()
-        );
-        assert_eq!(
-            call_function(&domain, &identity, Array::scalar(3.0).unwrap()).unwrap(),
-            Array::scalar(3.0).unwrap()
-        );
+        assert_eq!(replaced.call(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(identity.call(&domain, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(3.0).unwrap());
     }
 
     #[test]
@@ -2376,9 +2325,9 @@ mod tests {
         let first_domain = domain.clone();
         let second_domain = domain.clone();
         let first_thread =
-            std::thread::spawn(move || call_function(&first_domain, &executable, Array::scalar(3.0).unwrap()).unwrap());
+            std::thread::spawn(move || executable.call(&first_domain, Array::scalar(3.0).unwrap()).unwrap());
         let second_thread =
-            std::thread::spawn(move || call_function(&second_domain, &second, Array::scalar(4.0).unwrap()).unwrap());
+            std::thread::spawn(move || second.call(&second_domain, Array::scalar(4.0).unwrap()).unwrap());
 
         assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0).unwrap());
         assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0).unwrap());
@@ -2397,7 +2346,7 @@ mod tests {
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
-        assert_eq!(call_function(&domain, compiled.executable_function(), ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(compiled.executable_function().call(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(compiled.staged().input_types().is_empty());
         assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
@@ -2422,7 +2371,7 @@ mod tests {
         assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(executable.input_types().is_empty());
         assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(executable.call(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
         assert_eq!(executable.validate_flat_input_count(&[]), Ok(()));
         assert_eq!(
             executable.validate_flat_input_count(&[Array::scalar(1.0).unwrap()]),
@@ -2478,7 +2427,7 @@ mod tests {
         // Eager dimension values have static types, so by default each runtime extent gets its own specialization,
         // which separately created values of that extent share because static types have no identity.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
-            try_jit(&domain, zeros);
+            jit(&domain, zeros);
         assert_eq!(function.call((), three.clone()), Ok(three_zeros.clone()));
         assert_eq!(function.call((), four.clone()), Ok(four_zeros.clone()));
         assert_eq!(
@@ -2493,7 +2442,7 @@ mod tests {
         // input type, and therefore one retained trace, lowering, and compiled specialization, while still producing
         // outputs with different logical shapes.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
-            try_jit(&domain, zeros).with_staged_input_types(Some(extent_type.clone().into())).unwrap();
+            jit(&domain, zeros).with_staged_input_types(Some(extent_type.clone().into())).unwrap();
         assert_eq!(function.staged_input_types(), Some(Some(extent_type.clone().into())));
         assert_eq!(function.call((), three), Ok(three_zeros));
         assert_eq!(function.call((), four), Ok(four_zeros));
@@ -2520,7 +2469,7 @@ mod tests {
 
         // Staged input types must be declared before the dispatcher is shared.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
-            try_jit(&domain, zeros);
+            jit(&domain, zeros);
         let _clone = function.clone();
         assert!(matches!(
             function.with_staged_input_types(Some(extent_type.into())),
@@ -2565,7 +2514,7 @@ mod tests {
         // Distinct declared identities abstract each input independently, so calls that differ only in their runtime
         // extents share one specialization.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            try_jit(&domain, zeros)
+            jit(&domain, zeros)
                 .with_staged_input_types(vec![Some(rows.clone().into()), Some(columns.clone().into())])
                 .unwrap();
         assert_eq!(
@@ -2580,7 +2529,7 @@ mod tests {
 
         // One declared identity shared by both inputs requires their runtime extents to agree.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            try_jit(&domain, zeros)
+            jit(&domain, zeros)
                 .with_staged_input_types(vec![Some(rows.clone().into()), Some(rows.clone().into())])
                 .unwrap();
         assert_eq!(
@@ -2601,7 +2550,7 @@ mod tests {
         // A `None` leaf keeps its input exact, so only calls that also agree on that input's extent share one
         // specialization.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            try_jit(&domain, zeros).with_staged_input_types(vec![Some(rows.clone().into()), None]).unwrap();
+            jit(&domain, zeros).with_staged_input_types(vec![Some(rows.clone().into()), None]).unwrap();
         assert_eq!(function.staged_input_types(), Some(vec![Some(rows.clone().into()), None]));
         for (rows_extent, columns_extent) in [(2, 3), (3, 3), (2, 4)] {
             assert_eq!(
@@ -2615,7 +2564,7 @@ mod tests {
 
         // Inputs must have the structure of the declaration, which otherwise would apply its leaves to other inputs.
         let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            try_jit(&domain, zeros).with_staged_input_types(vec![Some(rows.clone().into())]).unwrap();
+            jit(&domain, zeros).with_staged_input_types(vec![Some(rows.clone().into())]).unwrap();
         assert!(matches!(
             function.call((), extents(2, 3)),
             Err(ProgramError::InvalidArgument { message })
@@ -2627,12 +2576,10 @@ mod tests {
     #[test]
     fn test_compiled_function_dispatcher_invalidate_static() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            jit(&domain, |negate, input: CompilationTracer<TestDomain>| {
+                Ok(if negate { input.unary(NegOperation::new()) } else { input })
+            });
         function.call(true, Array::scalar(2.0).unwrap()).unwrap();
         function.call(false, Array::scalar(2.0).unwrap()).unwrap();
 
@@ -2647,12 +2594,10 @@ mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            jit(&domain, |negate, input: CompilationTracer<TestDomain>| {
+                Ok(if negate { input.unary(NegOperation::new()) } else { input })
+            });
 
         assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
         assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
@@ -2673,7 +2618,7 @@ mod tests {
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
         let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
+            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| Ok(input), options);
 
         assert!(matches!(
             function.call((), Array::scalar(2.0).unwrap()),
@@ -2695,12 +2640,10 @@ mod tests {
         }
 
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, CollidingStatic, ArrayType, ArrayType> = jit(
-            &domain,
-            |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
-                if static_parameters.0 { input.unary(NegOperation::new()) } else { input }
-            },
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, CollidingStatic, ArrayType, ArrayType> =
+            jit(&domain, |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
+                Ok(if static_parameters.0 { input.unary(NegOperation::new()) } else { input })
+            });
 
         assert_eq!(
             function.call(CollidingStatic(false), Array::scalar(2.0).unwrap()).unwrap(),
@@ -2718,7 +2661,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call_partitions_input_structures() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
-            try_jit(&domain, |(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
+            jit(&domain, |(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
                 inputs.drain(..1).next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
 
@@ -2738,7 +2681,7 @@ mod tests {
         // behavior for the second call's structurally different input.
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<Vec<ArrayType>>, Vec<ArrayType>> =
-            try_jit(&domain, |(), inputs: Vec<Vec<CompilationTracer<TestDomain>>>| {
+            jit(&domain, |(), inputs: Vec<Vec<CompilationTracer<TestDomain>>>| {
                 if inputs.len() == 1 {
                     Ok(inputs.into_iter().next().unwrap())
                 } else {
@@ -2761,7 +2704,7 @@ mod tests {
         // specialization regardless of construction order, and replay must bind flat arguments to the same leaves.
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
-            try_jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
+            jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
                 inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
 
@@ -2777,7 +2720,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call_retries_tracing_failures() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
-            try_jit(&domain, |fail, input: CompilationTracer<TestDomain>| {
+            jit(&domain, |fail, input: CompilationTracer<TestDomain>| {
                 if fail {
                     Err(ProgramError::InvalidArgument { message: "expected trace failure".into() })
                 } else {
@@ -2801,7 +2744,7 @@ mod tests {
         let lowering_domain = TestDomain::new();
         let lowering_options = TestOptions { fail_lowering: true, ..TestOptions::default() };
         let lowering_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit_with_options(&lowering_domain, |(), input: CompilationTracer<TestDomain>| input, lowering_options);
+            jit_with_options(&lowering_domain, |(), input: CompilationTracer<TestDomain>| Ok(input), lowering_options);
         for _ in 0..2 {
             assert!(matches!(
                 lowering_function.call((), Array::scalar(2.0).unwrap()),
@@ -2817,7 +2760,7 @@ mod tests {
         let compilation_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit_with_options(
                 &compilation_domain,
-                |(), input: CompilationTracer<TestDomain>| input,
+                |(), input: CompilationTracer<TestDomain>| Ok(input),
                 compilation_options,
             );
         for _ in 0..2 {
@@ -2838,7 +2781,7 @@ mod tests {
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
         let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
+            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| Ok(input), options);
 
         for _ in 0..2 {
             assert!(matches!(
@@ -2861,7 +2804,7 @@ mod tests {
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
-            try_jit(&domain, move |_, input: CompilationTracer<TestDomain>| {
+            jit(&domain, move |_, input: CompilationTracer<TestDomain>| {
                 if let Some(call) = closure_recursive.borrow().as_ref() {
                     call()?;
                 }
@@ -2885,7 +2828,7 @@ mod tests {
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
-            try_jit(&domain, move |nested, input: CompilationTracer<TestDomain>| {
+            jit(&domain, move |nested, input: CompilationTracer<TestDomain>| {
                 if nested {
                     if let Some(call) = closure_recursive.borrow().as_ref() {
                         call()?;
@@ -2905,9 +2848,9 @@ mod tests {
     fn test_compiled_function_dispatcher_call_isolates_dispatchers() {
         let domain = TestDomain::new();
         let first: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
+            jit(&domain, |(), input: CompilationTracer<TestDomain>| Ok(input));
         let second: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
+            jit(&domain, |(), input: CompilationTracer<TestDomain>| Ok(input));
 
         assert_eq!(first.call((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
         assert_eq!(second.call((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
@@ -2921,12 +2864,10 @@ mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_concurrent_warm_calls() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            jit(&domain, |negate, input: CompilationTracer<TestDomain>| {
+                Ok(if negate { input.unary(NegOperation::new()) } else { input })
+            });
         function.call(true, Array::scalar(1.0).unwrap()).unwrap();
 
         std::thread::scope(|scope| {
@@ -2950,12 +2891,10 @@ mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_concurrent_cold_misses() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            jit(&domain, |negate, input: CompilationTracer<TestDomain>| {
+                Ok(if negate { input.unary(NegOperation::new()) } else { input })
+            });
 
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
@@ -2994,20 +2933,18 @@ mod tests {
         assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
 
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            jit(&domain, |negate, input: CompilationTracer<TestDomain>| {
+                Ok(if negate { input.unary(NegOperation::new()) } else { input })
+            });
         assert_dispatcher_send_and_sync(&function);
     }
 
     #[test]
-    fn test_try_jit_with_options_and_capacity() {
+    fn test_jit_with_options_and_capacity() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
-            try_jit_with_options_and_capacity(
+            jit_with_options_and_capacity(
                 &domain,
                 |negate, input: CompilationTracer<TestDomain>| {
                     Ok(if negate { input.unary(NegOperation::new()) } else { input })
@@ -3034,11 +2971,11 @@ mod tests {
         let negate = compile_from_one_call_site(&domain, true);
 
         assert_eq!(
-            call_function(&domain, identity.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
+            identity.executable_function().call(&domain, Array::scalar(3.0).unwrap()).unwrap(),
             Array::scalar(3.0).unwrap()
         );
         assert_eq!(
-            call_function(&domain, negate.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
+            negate.executable_function().call(&domain, Array::scalar(3.0).unwrap()).unwrap(),
             Array::scalar(-3.0).unwrap()
         );
         assert_eq!(domain.compilation_count(), 2);

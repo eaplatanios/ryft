@@ -189,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Warm jitted call of `x + x`.
     let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> =
-        jitted(|_, value: XlaCompileTracer<'_>| Add::add(&value, &value).unwrap(), &domain, mesh.clone());
+        jitted(|_, value: XlaCompileTracer<'_>| Ok(Add::add(&value, &value)?), &domain, mesh.clone());
     if arguments.selects("jit_add") {
         results.insert("jit_add", measure(&arguments, || drop(function.call((), input.clone()).unwrap())));
     }

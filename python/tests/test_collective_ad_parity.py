@@ -1,18 +1,15 @@
 """Executable JAX references for shape-changing collective adjoints.
 
-Run this module with four host devices. The repository's pinned JAX covers the established collective rules; the
-all-gather variance cases additionally require current JAX:
+Run this module with four host devices:
 
 ```
 XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-  uv run --isolated --with jax==0.11.0 --with numpy \
-  python -m unittest discover -s tests -p test_collective_ad_parity.py
+  uv run python -m unittest discover -s tests -p test_collective_ad_parity.py
 ```
 """
 
 from __future__ import annotations
 
-import inspect
 import unittest
 
 import jax
@@ -21,7 +18,6 @@ import numpy as np
 
 
 HAS_FOUR_DEVICES = len(jax.devices()) >= 4
-SUPPORTS_ALL_GATHER_VARIANCE = "to" in inspect.signature(jax.lax.all_gather).parameters
 
 
 @unittest.skipUnless(HAS_FOUR_DEVICES, "collective parity requires four JAX devices")
@@ -75,24 +71,25 @@ class CollectiveAdParityTest(unittest.TestCase):
 
         np.testing.assert_array_equal(input_cotangents, inverse_exchange(output_cotangents))
 
-    @unittest.skipUnless(SUPPORTS_ALL_GATHER_VARIANCE, "all-gather variance requires current JAX")
     def test_invariant_all_gather_transpose_selects_the_local_chunk(self) -> None:
-        inputs = jnp.arange(8.0, dtype=jnp.float32).reshape(4, 2)
-        gather = jax.pmap(
-            lambda value: jax.lax.all_gather(value, "x", axis=0, tiled=True, to="invarying"),
-            axis_name="x",
-        )
+        from jax.sharding import AxisType, PartitionSpec as P
 
-        outputs, pullback = jax.vjp(gather, inputs)
-        output_cotangents = jnp.arange(outputs.size, dtype=outputs.dtype).reshape(outputs.shape)
-        (input_cotangents,) = pullback(output_cotangents)
-        expected = np.stack(
-            [np.asarray(output_cotangents)[index, 2 * index : 2 * (index + 1)] for index in range(4)]
-        )
+        # Use `shard_map` rather than `pmap`, whose JAX 0.12 pullback sums every device's chunk and therefore no longer
+        # isolates this transpose. An invariant output has one cotangent, and each device selects its own chunk of it.
+        mesh = jax.make_mesh((4,), ("x",), axis_types=(AxisType.Explicit,))
+        with jax.set_mesh(mesh):
+            inputs = jax.device_put(jnp.arange(8.0, dtype=jnp.float32).reshape(4, 2), P("x"))
+            gather = jax.shard_map(
+                lambda value: jax.lax.all_gather(value, "x", axis=0, tiled=True, to="invarying"),
+                out_specs=P(),
+            )
 
-        np.testing.assert_array_equal(input_cotangents, expected)
+            outputs, pullback = jax.vjp(gather, inputs)
+            output_cotangents = jnp.arange(outputs.size, dtype=outputs.dtype).reshape(outputs.shape)
+            (input_cotangents,) = pullback(output_cotangents)
 
-    @unittest.skipUnless(SUPPORTS_ALL_GATHER_VARIANCE, "all-gather variance requires current JAX")
+        np.testing.assert_array_equal(input_cotangents, output_cotangents)
+
     def test_reduced_all_gather_transpose_consumes_an_unreduced_cotangent(self) -> None:
         from jax.sharding import AxisType, Mesh, PartitionSpec as P
 

@@ -1,7 +1,8 @@
 """Probe the pinned, internal JAX accumulator-taking high-level primitive interface.
 
-Run with `python/.venv/bin/python python/scripts/compare_hijax_backward_rules_with_jax.py`.
-This uses JAX 0.10.0's private VJPHiPrimitive, not upstream's evolving HiPrim API.
+Run with `uv run --isolated --with jax==0.10.0 --with numpy python scripts/compare_hijax_backward_rules_with_jax.py`
+from the `python` directory. This uses JAX 0.10.0's private VJPHiPrimitive, which JAX 0.12 removed, rather than the
+repository's pinned JAX or upstream's evolving HiPrim API.
 Python callback counters demonstrate tracing behavior, not performance measurements.
 The indexed probe uses in-bounds indices and nonzero output seeds; it is not a
 complete general-purpose primitive implementation.

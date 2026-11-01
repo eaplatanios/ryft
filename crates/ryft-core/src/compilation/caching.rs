@@ -1774,7 +1774,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::CompilationDomain;
     use crate::compilation::functions::{
-        CallRequest, CompilationTracer, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, stage_function,
+        CallRequest, CompilationTracer, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, stage,
     };
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
@@ -2346,8 +2346,7 @@ mod tests {
         let context = CompilationContext::<TestDomain>::new();
         let domain = TestDomain::default();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
-            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ())
-                .unwrap();
+            stage(&domain, |input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ()).unwrap();
         let lowered = domain.lower(staged).unwrap();
 
         let compiled = context

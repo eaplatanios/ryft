@@ -33,7 +33,7 @@ pub use jit::{
     StatefulJittedXlaFunction, XlaCompileTracer, XlaStatefulCompileTracer, XlaStatefulValue, compile,
     compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
     infer_output_types, jitted, jitted_statefully, jitted_statefully_with_options, jitted_with_options, stage,
-    stage_with_captures, try_jitted_statefully_with_options, try_jitted_with_options,
+    stage_with_captures,
 };
 pub use mlir::ToMlir;
 pub use operations::dot::RaggedDotLoweringStrategy;
