@@ -2434,6 +2434,8 @@ fn value_parameters(generics: &syn::Generics) -> Vec<(&syn::Ident, syn::Type)> {
 /// does every lifetime (including `'static`). Const parameters do not count, because they cannot make a type
 /// non-`'static`, even though types that mention them may differ across instantiations.
 fn is_unconditionally_static(ty: &syn::Type, generics: &syn::Generics) -> bool {
+    /// Returns `true` if the provided tokens, including the tokens nested inside delimited groups, contain any of the
+    /// provided parameter identifiers or any lifetime (which is recognized by its leading `'` punctuation).
     fn mentions(tokens: TokenStream, parameters: &[&syn::Ident]) -> bool {
         tokens.into_iter().any(|token| match token {
             proc_macro2::TokenTree::Group(group) => mentions(group.stream(), parameters),
