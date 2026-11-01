@@ -1,3 +1,14 @@
+//! Typed compilation lifecycle handles, backend extension requests, and retained JIT dispatch.
+//!
+//! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
+//! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
+//! structured signatures. The request traits ([`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
+//! [`CallRequest`]) are the typed witnesses through which a [`CompilationDomain`] completes each transition.
+//! [`CompiledFunctionDispatcher`] retains compiled specializations of one Rust closure, and [`jit`] and its variants
+//! construct it.
+
+// TODO(eaplatanios): Review this module.
+
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -7,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
-use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
+use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain, accumulate_duration};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
@@ -34,8 +45,8 @@ use crate::tracing::{DomainTracingContext, Tracer};
 ///     _empty_ substructure, which flat leaf paths and flat leaf types cannot see.
 ///   - **Dispatch Key:** An owner-defined key used to select an interchangeable retained specialization for the dynamic
 ///     inputs. It may be an exact abstract input signature or a normalized equivalence-class key such as a shape
-///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call; unequal keys
-///     conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
+///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call, while
+///     unequal keys conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
 ///     [`CompilationDomain::DispatchKey`], for example.
 ///
 /// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
@@ -44,7 +55,7 @@ use crate::tracing::{DomainTracingContext, Tracer};
 /// since a bare program has neither static parameters nor a structured input. That is what separates function-level
 /// specialization caching from structural region transformation through [`Transform`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct FunctionSpecializationKey<P, I, D> {
+pub struct FunctionSpecializationKey<P, I, K> {
     /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
     static_parameters: P,
 
@@ -52,13 +63,13 @@ pub struct FunctionSpecializationKey<P, I, D> {
     input_structure: I,
 
     /// Owner-defined cache key for the dynamic input, such as an exact abstract signature or normalized shape bucket.
-    dispatch_key: D,
+    dispatch_key: K,
 }
 
-impl<P, I, D> FunctionSpecializationKey<P, I, D> {
+impl<P, I, K> FunctionSpecializationKey<P, I, K> {
     /// Creates a new [`FunctionSpecializationKey`].
     #[inline]
-    pub fn new(static_parameters: P, input_structure: I, dispatch_key: D) -> Self {
+    pub fn new(static_parameters: P, input_structure: I, dispatch_key: K) -> Self {
         Self { static_parameters, input_structure, dispatch_key }
     }
 
@@ -76,45 +87,45 @@ impl<P, I, D> FunctionSpecializationKey<P, I, D> {
 
     /// Returns the owner-defined dispatch key for the dynamic input.
     #[inline]
-    pub fn dispatch_key(&self) -> &D {
+    pub fn dispatch_key(&self) -> &K {
         &self.dispatch_key
     }
 }
 
 /// Flat source-program representation of a compiled call's callee, supplied through the operation's region driver and
 /// interned as a shared callee root region on the staged instruction.
-pub type FlatCompilationProgram<D> = Program<
-    <D as Domain>::Constant,
-    <D as Domain>::Operation,
-    Vec<<D as Domain>::Constant>,
-    Vec<<D as Domain>::Constant>,
+pub type FlatCompilationProgram<C> = Program<
+    <C as Domain>::Constant,
+    <C as Domain>::Operation,
+    Vec<<C as Domain>::Constant>,
+    Vec<<C as Domain>::Constant>,
 >;
 
-/// Tracer used while staging a compiled function in `D`'s operation universe.
-pub type CompilationTracer<D> = Tracer<DomainTracingContext<D, <D as Domain>::Value>>;
+/// Tracer used while staging a compiled function in the operation universe of `C`.
+pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
 
 /// Complete typed request consumed by [`CompilationDomain::stage`].
-pub struct CompilationStagingRequest<D: CompilationDomain, F, Input, Output> {
+pub struct CompilationStagingRequest<C: CompilationDomain, F, Input, Output> {
     /// Function being traced.
     function: F,
 
     /// Concrete runtime captures exposed symbolically while tracing.
-    captures: Vec<D::Value>,
+    captures: Vec<C::Value>,
 
     /// Structured abstract input signature.
     input_types: Input,
 
     /// Options fixed before tracing begins.
-    options: D::Options,
+    options: C::Options,
 
     /// Staged output signature marker.
     output: PhantomData<fn() -> Output>,
 }
 
-impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Input, Output> {
+impl<C: CompilationDomain, F, Input, Output> CompilationStagingRequest<C, F, Input, Output> {
     /// Creates a complete staging request.
     #[inline]
-    pub fn new(function: F, captures: Vec<D::Value>, input_types: Input, options: D::Options) -> Self {
+    pub fn new(function: F, captures: Vec<C::Value>, input_types: Input, options: C::Options) -> Self {
         Self { function, captures, input_types, options, output: PhantomData }
     }
 }
@@ -123,21 +134,21 @@ impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Inp
 ///
 /// This trait encapsulates the structured generic bounds so concrete domains can implement staging without refining
 /// the trait method's requirements. Construct requests with [`CompilationStagingRequest::new`].
-pub trait StageRequest<D: CompilationDomain>: Sized
+pub trait StageRequest<C: CompilationDomain>: Sized
 where
-    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     /// Structured abstract input type.
-    type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>;
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>>;
 
     /// Structured abstract output type.
     type Output: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-            To<CompilationTracer<D>>: Parameterized<
-                CompilationTracer<D>,
-                To<D::Type> = Self::Output,
-                To<D::Constant> = <Self::Output as Parameterized<D::Type>>::To<D::Constant>,
+            C::Type,
+            Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+            To<CompilationTracer<C>>: Parameterized<
+                CompilationTracer<C>,
+                To<C::Type> = Self::Output,
+                To<C::Constant> = <Self::Output as Parameterized<C::Type>>::To<C::Constant>,
             >,
         >;
 
@@ -145,68 +156,161 @@ where
     fn input_types(&self) -> &Self::Input;
 
     /// Returns the fixed compilation options.
-    fn options(&self) -> &D::Options;
+    fn options(&self) -> &C::Options;
 
     /// Replaces the flat input signature while preserving its parameter structure.
-    fn replace_input_types(&mut self, input_types: Vec<D::Type>) -> Result<(), D::Error>;
+    fn replace_input_types(&mut self, input_types: Vec<C::Type>) -> Result<(), C::Error>;
 
     /// Traces this request and normalizes the effective flat output signature.
     fn trace<NormalizeOutput>(
         self,
         normalize_output_types: NormalizeOutput,
-    ) -> Result<StagedFunction<D, Self::Input, Self::Output>, D::Error>
+    ) -> Result<StagedFunction<C, Self::Input, Self::Output>, C::Error>
     where
-        NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>;
+        NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>;
+}
+
+impl<C, F, Input, Output> StageRequest<C> for CompilationStagingRequest<C, F, Input, Output>
+where
+    C: CompilationDomain,
+    F: FnOnce(
+        Vec<C::Constant>,
+        Vec<CompilationTracer<C>>,
+        Input::To<CompilationTracer<C>>,
+    ) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Output::To<CompilationTracer<C>>:
+        Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    type Input = Input;
+    type Output = Output;
+
+    #[inline]
+    fn input_types(&self) -> &Input {
+        &self.input_types
+    }
+
+    #[inline]
+    fn options(&self) -> &C::Options {
+        &self.options
+    }
+
+    fn replace_input_types(&mut self, input_types: Vec<C::Type>) -> Result<(), C::Error> {
+        self.input_types = Input::from_parameters(self.input_types.parameter_structure(), input_types)
+            .map_err(ProgramError::from)
+            .map_err(C::Error::from)?;
+        Ok(())
+    }
+
+    fn trace<NormalizeOutput>(
+        self,
+        normalize_output_types: NormalizeOutput,
+    ) -> Result<StagedFunction<C, Input, Output>, C::Error>
+    where
+        NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
+    {
+        trace_with_capture_references(
+            self.function,
+            self.captures,
+            self.input_types,
+            self.options,
+            normalize_output_types,
+        )
+    }
 }
 
 /// Typed staged-artifact behavior used by [`CompilationDomain::lower`].
-pub trait LoweringRequest<D: CompilationDomain>: Sized {
+pub trait LoweringRequest<C: CompilationDomain>: Sized {
     /// Structured abstract input type.
-    type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>;
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
 
     /// Structured abstract output type.
-    type Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>;
+    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
 
     /// Returns the staged artifact.
-    fn staged(&self) -> &StagedFunction<D, Self::Input, Self::Output>;
+    fn staged(&self) -> &StagedFunction<C, Self::Input, Self::Output>;
 
     /// Opens runtime captures as leading flat inputs.
-    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError>;
+    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError>;
 
     /// Assembles the backend-established lowering.
     fn into_lowered(
         self,
-        program: D::LoweredProgram,
-        output_types: Vec<D::Type>,
-    ) -> LoweredFunction<D, Self::Input, Self::Output>;
+        program: C::LoweredProgram,
+        output_types: Vec<C::Type>,
+    ) -> LoweredFunction<C, Self::Input, Self::Output>;
 }
 
 /// Typed lowered-artifact behavior used by [`CompilationDomain::compile`].
-pub trait CompileRequest<D: CompilationDomain>: Sized {
+pub trait CompileRequest<C: CompilationDomain>: Sized {
     /// Structured abstract input type.
-    type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>;
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
 
     /// Structured abstract output type.
-    type Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>;
+    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
 
     /// Returns the lowered artifact.
-    fn lowered(&self) -> &LoweredFunction<D, Self::Input, Self::Output>;
+    fn lowered(&self) -> &LoweredFunction<C, Self::Input, Self::Output>;
 
     /// Assembles the backend-established compiled artifact.
     fn into_compiled(
         self,
-        program: Arc<D::CompiledProgram>,
-        output_types: Vec<D::Type>,
-    ) -> CompiledFunction<D, Self::Input, Self::Output>;
+        program: Arc<C::CompiledProgram>,
+        output_types: Vec<C::Type>,
+    ) -> CompiledFunction<C, Self::Input, Self::Output>;
 }
 
 /// Complete typed request consumed by [`CompilationDomain::call`].
-pub struct CompilationCall<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
+pub struct CompilationCall<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
     /// Executable being invoked.
-    executable: ExecutableFunction<D, Input, Output>,
+    executable: ExecutableFunction<C, Input, Output>,
 
     /// Flat public runtime inputs, excluding captures.
-    inputs: Vec<D::Value>,
+    inputs: Vec<C::Value>,
+}
+
+impl<C, Input, Output> CompilationCall<C, Input, Output>
+where
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Input::To<C::Value>: Parameterized<C::Value>,
+{
+    /// Creates a structured execution request.
+    pub fn new(executable: &ExecutableFunction<C, Input, Output>, inputs: Input::To<C::Value>) -> Self {
+        Self { executable: executable.clone(), inputs: inputs.into_parameters().collect() }
+    }
+}
+
+/// Typed execution-request behavior used by [`CompilationDomain::call`].
+pub trait CallRequest<C: CompilationDomain>: Sized {
+    /// Structured abstract input type.
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
+
+    /// Structured abstract output type.
+    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
+
+    /// Structured runtime output type.
+    type RuntimeOutput;
+
+    /// Returns the executable artifact.
+    fn executable(&self) -> &ExecutableFunction<C, Self::Input, Self::Output>;
+
+    /// Returns flat public runtime inputs, excluding captures.
+    fn inputs(&self) -> &[C::Value];
+
+    /// Consumes the request and prepends runtime captures to its flat inputs.
+    fn into_arguments(self) -> Vec<C::Value>;
+
+    /// Reconstructs structured runtime outputs.
+    fn reconstruct(
+        executable: &ExecutableFunction<C, Self::Input, Self::Output>,
+        outputs: Vec<C::Value>,
+    ) -> Result<Self::RuntimeOutput, C::Error>;
 }
 
 /// Completion-bearing result of one externally stateful compiled invocation.
@@ -214,9 +318,9 @@ pub struct CompilationCall<D: CompilationDomain, Input: Parameterized<D::Type>, 
 /// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
 /// the whole invocation completion before exposing that result. Completion includes every predecessor dependency of
 /// the references used by the invocation, not only the most recently submitted backend event. Dropping this wrapper
-/// never cancels submitted work or rolls reference state back; callers that need to observe asynchronous failure must
-/// await it. A backend may also record a post-submission failure on the affected mutated references so later accesses
-/// report the same poisoned-state cause.
+/// never cancels submitted work or rolls reference state back, so callers that need to observe asynchronous failure
+/// must await it. A backend may also record a failure that happens after submission on the affected mutated
+/// references, so that later accesses report the same cause for their poisoned state.
 #[must_use = "stateful execution errors are observed by awaiting this completion"]
 pub struct ReferenceExecution<Output, Error> {
     /// Public output or reconstruction failure prepared after submission.
@@ -271,203 +375,13 @@ impl<Output, Error> ReferenceExecution<Output, Error> {
     }
 }
 
-impl<D, Input, Output> CompilationCall<D, Input, Output>
-where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Input::To<D::Value>: Parameterized<D::Value>,
-{
-    /// Creates a structured execution request.
-    pub fn new(executable: &ExecutableFunction<D, Input, Output>, inputs: Input::To<D::Value>) -> Self {
-        Self { executable: executable.clone(), inputs: inputs.into_parameters().collect() }
-    }
-}
-
-/// Typed execution-request behavior used by [`CompilationDomain::call`].
-pub trait CallRequest<D: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>;
-
-    /// Structured runtime output type.
-    type RuntimeOutput;
-
-    /// Returns the executable artifact.
-    fn executable(&self) -> &ExecutableFunction<D, Self::Input, Self::Output>;
-
-    /// Returns flat public runtime inputs, excluding captures.
-    fn inputs(&self) -> &[D::Value];
-
-    /// Consumes the request and prepends runtime captures to its flat inputs.
-    fn into_arguments(self) -> Vec<D::Value>;
-
-    /// Reconstructs structured runtime outputs.
-    fn reconstruct(
-        executable: &ExecutableFunction<D, Self::Input, Self::Output>,
-        outputs: Vec<D::Value>,
-    ) -> Result<Self::RuntimeOutput, D::Error>;
-}
-
-impl<D, F, Input, Output> StageRequest<D> for CompilationStagingRequest<D, F, Input, Output>
-where
-    D: CompilationDomain,
-    F: FnOnce(
-        Vec<D::Constant>,
-        Vec<CompilationTracer<D>>,
-        Input::To<CompilationTracer<D>>,
-    ) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    Output::To<CompilationTracer<D>>:
-        Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-{
-    type Input = Input;
-    type Output = Output;
-
-    #[inline]
-    fn input_types(&self) -> &Input {
-        &self.input_types
-    }
-
-    #[inline]
-    fn options(&self) -> &D::Options {
-        &self.options
-    }
-
-    fn replace_input_types(&mut self, input_types: Vec<D::Type>) -> Result<(), D::Error> {
-        self.input_types = Input::from_parameters(self.input_types.parameter_structure(), input_types)
-            .map_err(ProgramError::from)
-            .map_err(D::Error::from)?;
-        Ok(())
-    }
-
-    fn trace<NormalizeOutput>(
-        self,
-        normalize_output_types: NormalizeOutput,
-    ) -> Result<StagedFunction<D, Input, Output>, D::Error>
-    where
-        NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>,
-    {
-        trace_with_capture_references(
-            self.function,
-            self.captures,
-            self.input_types,
-            self.options,
-            normalize_output_types,
-        )
-    }
-}
-
-/// Snapshot of one retained [`CompiledFunctionDispatcher`]'s dispatch activity.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct JitCacheStatistics {
-    /// Calls served by an already compiled specialization.
-    pub dispatch_hits: u64,
-
-    /// Calls for which no compiled specialization was retained.
-    pub dispatch_misses: u64,
-
-    /// Closure traces performed after dispatch misses.
-    pub traces: u64,
-
-    /// Backend lowerings performed after new traces.
-    pub lowerings: u64,
-
-    /// Requests made to the domain compilation context after lowering.
-    pub compilation_requests: u64,
-
-    /// Total host nanoseconds spent flattening inputs and deriving their dispatch key and effective signature.
-    pub input_abstractification_duration_ns: u64,
-
-    /// Total host nanoseconds spent looking up retained specializations.
-    pub dispatch_duration_ns: u64,
-
-    /// Total host nanoseconds spent tracing specialization misses.
-    pub tracing_duration_ns: u64,
-
-    /// Total host nanoseconds spent lowering newly traced specializations.
-    pub lowering_duration_ns: u64,
-}
-
-struct JitCacheStatisticsState {
-    dispatch_hits: AtomicU64,
-    dispatch_misses: AtomicU64,
-    traces: AtomicU64,
-    lowerings: AtomicU64,
-    compilation_requests: AtomicU64,
-    input_abstractification_duration_ns: AtomicU64,
-    dispatch_duration_ns: AtomicU64,
-    tracing_duration_ns: AtomicU64,
-    lowering_duration_ns: AtomicU64,
-}
-
-impl JitCacheStatisticsState {
-    fn new() -> Self {
-        Self {
-            dispatch_hits: AtomicU64::new(0),
-            dispatch_misses: AtomicU64::new(0),
-            traces: AtomicU64::new(0),
-            lowerings: AtomicU64::new(0),
-            compilation_requests: AtomicU64::new(0),
-            input_abstractification_duration_ns: AtomicU64::new(0),
-            dispatch_duration_ns: AtomicU64::new(0),
-            tracing_duration_ns: AtomicU64::new(0),
-            lowering_duration_ns: AtomicU64::new(0),
-        }
-    }
-
-    fn snapshot(&self) -> JitCacheStatistics {
-        JitCacheStatistics {
-            dispatch_hits: self.dispatch_hits.load(Ordering::Relaxed),
-            dispatch_misses: self.dispatch_misses.load(Ordering::Relaxed),
-            traces: self.traces.load(Ordering::Relaxed),
-            lowerings: self.lowerings.load(Ordering::Relaxed),
-            compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
-            input_abstractification_duration_ns: self.input_abstractification_duration_ns.load(Ordering::Relaxed),
-            dispatch_duration_ns: self.dispatch_duration_ns.load(Ordering::Relaxed),
-            tracing_duration_ns: self.tracing_duration_ns.load(Ordering::Relaxed),
-            lowering_duration_ns: self.lowering_duration_ns.load(Ordering::Relaxed),
-        }
-    }
-
-    fn clear(&self) {
-        self.dispatch_hits.store(0, Ordering::Relaxed);
-        self.dispatch_misses.store(0, Ordering::Relaxed);
-        self.traces.store(0, Ordering::Relaxed);
-        self.lowerings.store(0, Ordering::Relaxed);
-        self.compilation_requests.store(0, Ordering::Relaxed);
-        self.input_abstractification_duration_ns.store(0, Ordering::Relaxed);
-        self.dispatch_duration_ns.store(0, Ordering::Relaxed);
-        self.tracing_duration_ns.store(0, Ordering::Relaxed);
-        self.lowering_duration_ns.store(0, Ordering::Relaxed);
-    }
-
-    fn increment(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn add_duration(counter: &AtomicU64, duration: Duration) {
-        let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        counter.fetch_add(nanoseconds, Ordering::Relaxed);
-    }
-}
-
-/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
-const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
-
 /// Operation-family capability for representing a call to a staged program.
 ///
-/// The call operation is metadata-only: the callee is a flat program (whose captures have been lifted into leading
-/// inputs) composed into the region driver passed to [`Context::bind`], which interns it as a shared callee root
-/// region by [`Arc`] identity. The concrete operation family decides how that boundary lowers and how batching,
+/// The call operation carries only metadata. Its callee is a flat program, whose captures have been lifted into
+/// leading inputs, composed into the region driver passed to [`Context::bind`], which interns it as a shared callee
+/// root region by [`Arc`] identity. The concrete operation family decides how that boundary lowers and how batching,
 /// differentiation, partial evaluation, and other transforms rewrite it. This keeps higher-order call semantics with
-/// the operation that owns them while allowing the lifecycle and capture plumbing to remain backend-neutral.
+/// the operation that owns them while the lifecycle and capture plumbing remain backend-neutral.
 pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Type> + Sized {
     /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee through a shared-callee
     /// region driver, while `capture_count` records the exact leading lifted-capture prefix of that callee boundary.
@@ -475,7 +389,7 @@ pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Typ
 
     /// Constructs one call with its exact callee signature. Families that export callee-local nominal identities
     /// override this hook to allocate instruction-owned result identities while forwarding input identities.
-    /// Allocation happens when the call is built; output inference must remain deterministic.
+    /// Allocation happens when the call is built, and output inference must remain deterministic.
     ///
     /// The default returns [`Self::compiled_call`], leaving result inference to the family. A family whose inference
     /// reports the callee's result types then makes each call instruction define the callee-local identities itself.
@@ -493,88 +407,90 @@ pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Typ
 
 /// Staged, unlowered form of one compiled function.
 ///
-/// A staged function is the first callable package in the lifecycle: it owns the typed source [`ClosedProgram`]
-/// together with the call-level state a bare program never carries, namely its runtime capture table, exact public
-/// input/output structures, and compilation options. It can be inspected, lowered by its domain, or embedded as a
-/// compiled-call boundary in an enclosing trace. No backend lowering or executable compilation has happened yet.
+/// A staged function is the first callable package in the lifecycle. It owns the typed source [`ClosedProgram`]
+/// together with the call-level state that a bare program never carries, namely its runtime capture table, exact
+/// public input and output structures, and compilation options. It can be inspected, lowered by its domain, or
+/// embedded as a compiled-call boundary in an enclosing trace. No backend lowering or executable compilation has
+/// happened yet.
 pub struct StagedFunction<
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > {
     /// Shared immutable staging metadata. Staged-handle clones are therefore constant-time even for large programs.
-    state: Arc<StagedFunctionState<D, Input, Output>>,
+    state: Arc<StagedFunctionState<C, Input, Output>>,
 }
 
+/// Shared immutable state of a [`StagedFunction`].
 struct StagedFunctionState<
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > {
     /// Source program and concrete runtime captures produced by tracing.
-    source_program: ClosedProgram<D::Value, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>>,
+    source_program: ClosedProgram<C::Value, C::Constant, C::Operation, Input::To<C::Constant>, Output::To<C::Constant>>,
 
     /// Flat declared public input types, excluding hidden captures.
-    input_types: Vec<D::Type>,
+    input_types: Vec<C::Type>,
 
     /// Flat declared output types in source-program order.
-    output_types: Vec<D::Type>,
+    output_types: Vec<C::Type>,
 
     /// Output parameter structure used to reconstruct structured values.
     output_structure: Output::ParameterStructure,
 
     /// Options applied before tracing and retained for lowering and compilation.
-    options: Arc<D::Options>,
+    options: Arc<C::Options>,
 
     /// Memoized source program with captures lifted into leading flat inputs.
-    lifted_program: OnceLock<Arc<FlatCompilationProgram<D>>>,
+    lifted_program: OnceLock<Arc<FlatCompilationProgram<C>>>,
 }
 
-impl<D, Input, Output> Clone for StagedFunction<D, Input, Output>
+impl<C, Input, Output> Clone for StagedFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     fn clone(&self) -> Self {
         Self { state: self.state.clone() }
     }
 }
 
-impl<D, Input, Output> StagedFunction<D, Input, Output>
+impl<C, Input, Output> StagedFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// Returns the source program and its runtime captures.
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<D::Value, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
+    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Input::To<C::Constant>, Output::To<C::Constant>> {
         &self.state.source_program
     }
 
     /// Returns the flat declared public input types, excluding hidden captures.
     #[inline]
-    pub fn input_types(&self) -> &[D::Type] {
+    pub fn input_types(&self) -> &[C::Type] {
         self.state.input_types.as_slice()
     }
 
     /// Returns the flat source-program output types.
     #[inline]
-    pub fn output_types(&self) -> &[D::Type] {
+    pub fn output_types(&self) -> &[C::Type] {
         self.state.output_types.as_slice()
     }
 
     /// Reconstructs the structured abstract input signature retained by the source program.
     pub fn input_signature(&self) -> Result<Input, ParameterError>
     where
-        Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Type, To = Input>, To<D::Type> = Input>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Type, To = Input>, To<C::Type> = Input>,
     {
         let program = self.state.source_program.program();
         let input_types =
@@ -590,7 +506,7 @@ where
 
     /// Returns the compilation options bound to this staged function.
     #[inline]
-    pub fn options(&self) -> &D::Options {
+    pub fn options(&self) -> &C::Options {
         self.state.options.as_ref()
     }
 
@@ -600,14 +516,14 @@ where
     /// active context.
     pub fn call<V>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        D::Operation: CompiledCallOperation<D::Constant>,
-        V: Value<Type = D::Type>,
-        V::Domain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>
-            + CapturingContext<Capture = D::Value>
-            + Constant<V, D::Constant>,
-        Input: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
+        C::Operation: CompiledCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
+            + CapturingContext<Capture = C::Value>
+            + Constant<V, C::Constant>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Input::To<V>: Parameterized<V>,
-        Output: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
         let context = inputs
@@ -619,16 +535,20 @@ where
     }
 
     /// Stages a call to this function through an explicitly supplied active `context`.
-    pub fn call_in_context<C, V>(&self, context: &C, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
+    pub fn call_in_context<Caller, V>(
+        &self,
+        context: &Caller,
+        inputs: Input::To<V>,
+    ) -> Result<Output::To<V>, ProgramError>
     where
-        D::Operation: CompiledCallOperation<D::Constant>,
-        V: Value<Type = D::Type>,
-        C: Context<Type = D::Type, Value = V, Constant = D::Constant, Operation = D::Operation>
-            + CapturingContext<Capture = D::Value>
-            + Constant<V, D::Constant>,
-        Input: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
+        C::Operation: CompiledCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        Caller: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + CapturingContext<Capture = C::Value>
+            + Constant<V, C::Constant>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Input::To<V>: Parameterized<V>,
-        Output: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
         let capture_references = self
@@ -646,7 +566,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
         let callee = self.lifted_program()?;
-        let operation = D::Operation::compiled_call_with_type_signature(
+        let operation = C::Operation::compiled_call_with_type_signature(
             capture_count,
             &callee.input_types(),
             &callee.output_types(),
@@ -658,13 +578,13 @@ where
     /// Binds this staged function using capture references already registered in an enclosing capture table.
     pub fn call_with_flat_capture_references<V>(
         &self,
-        capture_references: &[D::Constant],
+        capture_references: &[C::Constant],
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        D::Operation: CompiledCallOperation<D::Constant>,
-        V: Value<Type = D::Type>,
-        V::Domain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation> + Constant<V, D::Constant>,
+        C::Operation: CompiledCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + Constant<V, C::Constant>,
     {
         let context = inputs
             .first()
@@ -677,17 +597,17 @@ where
     ///
     /// Unlike [`Self::call_with_flat_capture_references`], this form also supports nullary and capture-only calls,
     /// because it does not need a public input from which to recover the active context.
-    pub fn call_with_flat_capture_references_in_context<C, V>(
+    pub fn call_with_flat_capture_references_in_context<Caller, V>(
         &self,
-        context: &C,
-        capture_references: &[D::Constant],
+        context: &Caller,
+        capture_references: &[C::Constant],
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        D::Operation: CompiledCallOperation<D::Constant>,
-        V: Value<Type = D::Type>,
-        C: Context<Type = D::Type, Value = V, Constant = D::Constant, Operation = D::Operation>
-            + Constant<V, D::Constant>,
+        C::Operation: CompiledCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        Caller: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + Constant<V, C::Constant>,
     {
         // Capture-reference indices belong to the caller's capture table and may differ from the source program's
         // local indices, and so only positional arity and types can be validated against the source program's
@@ -699,8 +619,7 @@ where
             let actual_type = actual.r#type();
             if expected_type.as_ref() != actual_type.as_ref() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "capture input #{index} has type {}, but capture #{index} has type {}",
-                    actual_type, expected_type,
+                    "capture input #{index} has type {actual_type}, but capture #{index} has type {expected_type}",
                 )));
             }
         }
@@ -711,7 +630,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
         let callee = self.lifted_program()?;
-        let operation = D::Operation::compiled_call_with_type_signature(
+        let operation = C::Operation::compiled_call_with_type_signature(
             captures.len(),
             &callee.input_types(),
             &callee.output_types(),
@@ -730,7 +649,7 @@ where
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
-    pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError> {
+    pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
         if let Some(program) = self.state.lifted_program.get() {
             return Ok(program.clone());
         }
@@ -739,13 +658,13 @@ where
     }
 }
 
-impl<D, Input, Output> LoweringRequest<D> for StagedFunction<D, Input, Output>
+impl<C, Input, Output> LoweringRequest<C> for StagedFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     type Input = Input;
     type Output = Output;
@@ -754,96 +673,96 @@ where
         self
     }
 
-    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError> {
+    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
         StagedFunction::lifted_program(self)
     }
 
-    fn into_lowered(self, program: D::LoweredProgram, output_types: Vec<D::Type>) -> LoweredFunction<D, Input, Output> {
+    fn into_lowered(self, program: C::LoweredProgram, output_types: Vec<C::Type>) -> LoweredFunction<C, Input, Output> {
         LoweredFunction::from_parts(self, program, output_types)
     }
 }
 
 /// Backend lowering of a [`StagedFunction`], ready for executable compilation.
 ///
-/// It stays a function rather than a program: the backend's lowered program is one artifact it carries, alongside the
-/// captures, signatures, and options inherited from its staged source.
+/// It stays a function rather than a program, because the lowered program of the backend is only one of the artifacts
+/// it carries, alongside the captures, signatures, and options inherited from its staged source.
 pub struct LoweredFunction<
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > {
     /// Backend-owned lowered program.
-    program: Arc<D::LoweredProgram>,
+    program: Arc<C::LoweredProgram>,
 
     /// Staged source and structured metadata retained across compilation.
-    staged: StagedFunction<D, Input, Output>,
+    staged: StagedFunction<C, Input, Output>,
 
     /// Effective flat output types after lowering-time rewrites.
-    output_types: Vec<D::Type>,
+    output_types: Vec<C::Type>,
 }
 
-impl<D, Input, Output> Clone for LoweredFunction<D, Input, Output>
+impl<C, Input, Output> Clone for LoweredFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), staged: self.staged.clone(), output_types: self.output_types.clone() }
     }
 }
 
-impl<D, Input, Output> LoweredFunction<D, Input, Output>
+impl<C, Input, Output> LoweredFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// Assembles a lowering whose output signature has already been established by its backend.
     fn from_parts(
-        staged: StagedFunction<D, Input, Output>,
-        program: D::LoweredProgram,
-        output_types: Vec<D::Type>,
+        staged: StagedFunction<C, Input, Output>,
+        program: C::LoweredProgram,
+        output_types: Vec<C::Type>,
     ) -> Self {
         Self { program: Arc::new(program), staged, output_types }
     }
 
     /// Returns the backend-owned lowered program.
     #[inline]
-    pub fn lowered_program(&self) -> &D::LoweredProgram {
+    pub fn lowered_program(&self) -> &C::LoweredProgram {
         self.program.as_ref()
     }
 
     /// Returns the staged function from which this lowering was produced.
     #[inline]
-    pub fn staged(&self) -> &StagedFunction<D, Input, Output> {
+    pub fn staged(&self) -> &StagedFunction<C, Input, Output> {
         &self.staged
     }
 
     /// Returns the compilation options associated with this lowering.
     #[inline]
-    pub fn options(&self) -> &D::Options {
+    pub fn options(&self) -> &C::Options {
         self.staged.options()
     }
 
     /// Returns the effective flat output types after lowering-time rewrites.
     #[inline]
-    pub fn output_types(&self) -> &[D::Type] {
+    pub fn output_types(&self) -> &[C::Type] {
         &self.output_types
     }
 }
 
-impl<D, Input, Output> CompileRequest<D> for LoweredFunction<D, Input, Output>
+impl<C, Input, Output> CompileRequest<C> for LoweredFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     type Input = Input;
     type Output = Output;
@@ -854,35 +773,48 @@ where
 
     fn into_compiled(
         self,
-        program: Arc<D::CompiledProgram>,
-        output_types: Vec<D::Type>,
-    ) -> CompiledFunction<D, Input, Output> {
+        program: Arc<C::CompiledProgram>,
+        output_types: Vec<C::Type>,
+    ) -> CompiledFunction<C, Input, Output> {
         CompiledFunction::from_parts(self, program, output_types)
     }
 }
 
 /// Runtime-only handle for one compiled executable.
 ///
-/// This handle retains only the state required to validate and execute calls: the backend executable, concrete
+/// This handle retains only the state required to validate and execute calls, namely the backend executable, concrete
 /// captures, flat signatures, and structured output shape. That call-level state is what still makes it a function
-/// rather than a program, even though it has shed every transformable artifact: it deliberately does not retain the
+/// rather than a program, even though it has shed every transformable artifact. It deliberately does not retain the
 /// staged or lowered programs, so it becomes [`Send`] and [`Sync`] automatically whenever those runtime fields are
 /// `Send + Sync`. In contrast, [`CompiledFunction`] remains transformable and may retain `Rc`-backed source programs.
-pub struct ExecutableFunction<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
-    state: Arc<ExecutableFunctionState<D, Input, Output>>,
+pub struct ExecutableFunction<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
+    /// Shared immutable runtime state, which makes clones constant-time.
+    state: Arc<ExecutableFunctionState<C, Input, Output>>,
 }
 
-struct ExecutableFunctionState<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
-    program: Arc<D::CompiledProgram>,
-    captures: Vec<D::Value>,
-    input_types: Vec<D::Type>,
-    output_types: Vec<D::Type>,
+/// Shared runtime state of an [`ExecutableFunction`].
+struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
+    /// Shared backend executable.
+    program: Arc<C::CompiledProgram>,
+
+    /// Concrete runtime captures supplied before the public inputs on every call.
+    captures: Vec<C::Value>,
+
+    /// Flat declared public input types, excluding hidden captures.
+    input_types: Vec<C::Type>,
+
+    /// Effective flat output types produced by the executable.
+    output_types: Vec<C::Type>,
+
+    /// Output parameter structure used to reconstruct structured runtime values.
     output_structure: Output::ParameterStructure,
+
+    /// Structured input type marker.
     input: PhantomData<fn(Input)>,
 }
 
-impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> Clone
-    for ExecutableFunction<D, Input, Output>
+impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> Clone
+    for ExecutableFunction<C, Input, Output>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -890,42 +822,14 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     }
 }
 
-/// Type-level source universe for retained JIT specialization.
-///
-/// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
-/// immutable compilation options. This token stores none of them; it only makes the descriptor's key and artifact
-/// families coherent at the type level. If any owner-fixed semantic becomes variable per call, it must enter the
-/// transform arguments instead.
-struct JitCompilationSource<D, StaticParameters, Input, Output>(
-    PhantomData<fn() -> (D, StaticParameters, Input, Output)>,
-);
-
-/// Transform descriptor for the executable specializations retained by one [`CompiledFunctionDispatcher`].
-struct JitCompilationTransform;
-
-impl<D, StaticParameters, Input, Output> Transform<JitCompilationSource<D, StaticParameters, Input, Output>>
-    for JitCompilationTransform
-where
-    D: CompilationDomain,
-    StaticParameters: Clone + Eq + Hash,
-    Input: Parameterized<D::Type>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type>,
-{
-    type Arguments = FunctionSpecializationKey<StaticParameters, Input::ParameterStructure, D::DispatchKey>;
-    type Artifact = ExecutableFunction<D, Input, Output>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = DEFAULT_JIT_CACHE_CAPACITY;
-}
-
-impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>>
-    ExecutableFunction<D, Input, Output>
+impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>>
+    ExecutableFunction<C, Input, Output>
 {
     /// Returns a function that invokes `program` instead of this function's current compiled program, while keeping
     /// this function's runtime captures, flat input types, and output parameter structure. Backends use it to swap in
     /// an equivalent executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
     ///
-    /// This function does not check compatibility, so the caller must establish it first: `program` must accept the
+    /// This function does not check compatibility, so the caller must establish it first. `program` must accept the
     /// same `[captures..., public inputs...]` arguments as the current program, and `output_types` must be its
     /// effective flat output types, with one entry per leaf of the retained output structure. A backend that breaks
     /// these invariants produces a function whose calls fail or return values of unexpected types. The existing
@@ -935,7 +839,7 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     ///
     ///   - `program`: Replacement backend executable.
     ///   - `output_types`: Effective flat output types of `program`.
-    pub fn with_compiled_program(&self, program: Arc<D::CompiledProgram>, output_types: Vec<D::Type>) -> Self {
+    pub fn with_compiled_program(&self, program: Arc<C::CompiledProgram>, output_types: Vec<C::Type>) -> Self {
         Self {
             state: Arc::new(ExecutableFunctionState {
                 program,
@@ -950,25 +854,25 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
 
     /// Returns the shared backend executable.
     #[inline]
-    pub fn compiled_program(&self) -> &D::CompiledProgram {
+    pub fn compiled_program(&self) -> &C::CompiledProgram {
         &self.state.program
     }
 
     /// Returns the concrete runtime captures supplied before public inputs on every call.
     #[inline]
-    pub fn captures(&self) -> &[D::Value] {
+    pub fn captures(&self) -> &[C::Value] {
         &self.state.captures
     }
 
     /// Returns the flat declared public input types, excluding hidden captures.
     #[inline]
-    pub fn input_types(&self) -> &[D::Type] {
+    pub fn input_types(&self) -> &[C::Type] {
         &self.state.input_types
     }
 
     /// Returns the effective flat output types produced by the executable.
     #[inline]
-    pub fn output_types(&self) -> &[D::Type] {
+    pub fn output_types(&self) -> &[C::Type] {
         &self.state.output_types
     }
 
@@ -979,7 +883,7 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     }
 
     /// Validates that `inputs` matches the declared flat public input arity, excluding hidden captures.
-    pub fn validate_flat_input_count(&self, inputs: &[D::Value]) -> Result<(), ProgramError> {
+    pub fn validate_flat_input_count(&self, inputs: &[C::Value]) -> Result<(), ProgramError> {
         if inputs.len() != self.state.input_types.len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: self.state.input_types.len(),
@@ -989,20 +893,9 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
         Ok(())
     }
 
-    /// Validates that `outputs` matches the declared flat output arity.
-    pub fn validate_flat_output_count(&self, outputs: &[D::Value]) -> Result<(), ProgramError> {
-        if outputs.len() != self.state.output_types.len() {
-            return Err(ProgramError::InvalidOutputCount {
-                expected: self.state.output_types.len(),
-                actual: outputs.len(),
-            });
-        }
-        Ok(())
-    }
-
     /// Prepends the retained runtime captures to the flat public `inputs`, producing the complete flat argument
     /// list in the `[captures..., public inputs...]` order every execution expects.
-    pub fn arguments_with_captures(&self, inputs: Vec<D::Value>) -> Vec<D::Value> {
+    pub fn arguments_with_captures(&self, inputs: Vec<C::Value>) -> Vec<C::Value> {
         if self.state.captures.is_empty() {
             return inputs;
         }
@@ -1012,96 +905,96 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     }
 }
 
-impl<D, Input, Output> ExecutableFunction<D, Input, Output>
+impl<C, Input, Output> ExecutableFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Output::To<D::Value>:
-        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output::To<C::Value>:
+        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
 {
     /// Reconstructs structured runtime outputs from the executable's flat `outputs` using the retained output
     /// parameter structure.
-    pub fn reconstruct_outputs(&self, outputs: Vec<D::Value>) -> Result<Output::To<D::Value>, ProgramError> {
-        Output::To::<D::Value>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
+    pub fn reconstruct_outputs(&self, outputs: Vec<C::Value>) -> Result<Output::To<C::Value>, ProgramError> {
+        Output::To::<C::Value>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 }
 
-impl<D, Input, Output> CallRequest<D> for CompilationCall<D, Input, Output>
+impl<C, Input, Output> CallRequest<C> for CompilationCall<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Input::To<D::Value>: Parameterized<D::Value>,
-    Output::To<D::Value>:
-        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Input::To<C::Value>: Parameterized<C::Value>,
+    Output::To<C::Value>:
+        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
 {
     type Input = Input;
     type Output = Output;
-    type RuntimeOutput = Output::To<D::Value>;
+    type RuntimeOutput = Output::To<C::Value>;
 
-    fn executable(&self) -> &ExecutableFunction<D, Input, Output> {
+    fn executable(&self) -> &ExecutableFunction<C, Input, Output> {
         &self.executable
     }
 
-    fn inputs(&self) -> &[D::Value] {
+    fn inputs(&self) -> &[C::Value] {
         &self.inputs
     }
 
-    fn into_arguments(self) -> Vec<D::Value> {
+    fn into_arguments(self) -> Vec<C::Value> {
         self.executable.arguments_with_captures(self.inputs)
     }
 
     fn reconstruct(
-        executable: &ExecutableFunction<D, Input, Output>,
-        outputs: Vec<D::Value>,
-    ) -> Result<Self::RuntimeOutput, D::Error> {
-        executable.reconstruct_outputs(outputs).map_err(D::Error::from)
+        executable: &ExecutableFunction<C, Input, Output>,
+        outputs: Vec<C::Value>,
+    ) -> Result<Self::RuntimeOutput, C::Error> {
+        executable.reconstruct_outputs(outputs).map_err(C::Error::from)
     }
 }
 
 /// Compiled executable plus the staged and lowered metadata required to invoke it safely.
 ///
-/// The backend's compiled program is the artifact this function carries; the captures, structured signatures, and
-/// options carried with it are what make the handle callable as well as transformable.
+/// The compiled program of the backend is the artifact this function carries, while the captures, structured
+/// signatures, and options carried with it are what make the handle callable as well as transformable.
 pub struct CompiledFunction<
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > {
     /// Runtime-only executable handle.
-    executable_function: ExecutableFunction<D, Input, Output>,
+    executable_function: ExecutableFunction<C, Input, Output>,
 
     /// Lowered function retaining source metadata and options.
-    lowered: LoweredFunction<D, Input, Output>,
+    lowered: LoweredFunction<C, Input, Output>,
 }
 
-impl<D, Input, Output> Clone for CompiledFunction<D, Input, Output>
+impl<C, Input, Output> Clone for CompiledFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     fn clone(&self) -> Self {
         Self { executable_function: self.executable_function.clone(), lowered: self.lowered.clone() }
     }
 }
 
-impl<D, Input, Output> CompiledFunction<D, Input, Output>
+impl<C, Input, Output> CompiledFunction<C, Input, Output>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     /// Assembles a compiled function from backend-validated parts.
     fn from_parts(
-        lowered: LoweredFunction<D, Input, Output>,
-        program: Arc<D::CompiledProgram>,
-        output_types: Vec<D::Type>,
+        lowered: LoweredFunction<C, Input, Output>,
+        program: Arc<C::CompiledProgram>,
+        output_types: Vec<C::Type>,
     ) -> Self {
         let executable_function = ExecutableFunction {
             state: Arc::new(ExecutableFunctionState {
@@ -1118,31 +1011,31 @@ where
 
     /// Returns the shared backend executable.
     #[inline]
-    pub fn compiled_program(&self) -> &D::CompiledProgram {
+    pub fn compiled_program(&self) -> &C::CompiledProgram {
         self.executable_function.compiled_program()
     }
 
     /// Returns the runtime-only handle, which omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable_function(&self) -> &ExecutableFunction<D, Input, Output> {
+    pub fn executable_function(&self) -> &ExecutableFunction<C, Input, Output> {
         &self.executable_function
     }
 
     /// Consumes this transformable handle and returns its runtime-only executable state.
     #[inline]
-    pub fn into_executable_function(self) -> ExecutableFunction<D, Input, Output> {
+    pub fn into_executable_function(self) -> ExecutableFunction<C, Input, Output> {
         self.executable_function
     }
 
     /// Returns the lowering from which this executable was compiled.
     #[inline]
-    pub fn lowered(&self) -> &LoweredFunction<D, Input, Output> {
+    pub fn lowered(&self) -> &LoweredFunction<C, Input, Output> {
         &self.lowered
     }
 
     /// Returns the staged source function.
     #[inline]
-    pub fn staged(&self) -> &StagedFunction<D, Input, Output> {
+    pub fn staged(&self) -> &StagedFunction<C, Input, Output> {
         self.lowered.staged()
     }
 
@@ -1150,31 +1043,157 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<D::Value, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
+    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Input::To<C::Constant>, Output::To<C::Constant>> {
         self.staged().source_program()
     }
 
     /// Returns the effective flat output types produced by the executable.
     #[inline]
-    pub fn output_types(&self) -> &[D::Type] {
+    pub fn output_types(&self) -> &[C::Type] {
         self.executable_function.output_types()
     }
 }
 
+/// Snapshot of the dispatch activity of one retained [`CompiledFunctionDispatcher`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct JitCacheStatistics {
+    /// Calls served by an already compiled specialization.
+    pub dispatch_hits: u64,
+
+    /// Calls for which no compiled specialization was retained.
+    pub dispatch_misses: u64,
+
+    /// Closure traces performed after dispatch misses.
+    pub traces: u64,
+
+    /// Backend lowerings performed after new traces.
+    pub lowerings: u64,
+
+    /// Compilation requests made to the domain after lowering.
+    pub compilation_requests: u64,
+
+    /// Total host duration spent flattening inputs and deriving their dispatch key and effective signature.
+    pub input_abstractification_duration: Duration,
+
+    /// Total host duration spent looking up retained specializations.
+    pub dispatch_duration: Duration,
+
+    /// Total host duration spent tracing specialization misses.
+    pub tracing_duration: Duration,
+
+    /// Total host duration spent lowering newly traced specializations.
+    pub lowering_duration: Duration,
+}
+
+/// Lock-free counters underlying [`JitCacheStatistics`]. Durations accumulate in nanoseconds.
+#[derive(Default)]
+struct JitCacheStatisticsAccumulator {
+    /// Counter underlying [`JitCacheStatistics::dispatch_hits`].
+    dispatch_hits: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::dispatch_misses`].
+    dispatch_misses: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::traces`].
+    traces: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::lowerings`].
+    lowerings: AtomicU64,
+
+    /// Counter underlying [`JitCacheStatistics::compilation_requests`].
+    compilation_requests: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::input_abstractification_duration`].
+    input_abstractification_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::dispatch_duration`].
+    dispatch_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::tracing_duration`].
+    tracing_nanoseconds: AtomicU64,
+
+    /// Nanoseconds underlying [`JitCacheStatistics::lowering_duration`].
+    lowering_nanoseconds: AtomicU64,
+}
+
+impl JitCacheStatisticsAccumulator {
+    /// Returns a snapshot of the counters. The counters are read independently, so a snapshot taken during concurrent
+    /// calls need not correspond to a single point in time.
+    fn snapshot(&self) -> JitCacheStatistics {
+        JitCacheStatistics {
+            dispatch_hits: self.dispatch_hits.load(Ordering::Relaxed),
+            dispatch_misses: self.dispatch_misses.load(Ordering::Relaxed),
+            traces: self.traces.load(Ordering::Relaxed),
+            lowerings: self.lowerings.load(Ordering::Relaxed),
+            compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
+            input_abstractification_duration: Duration::from_nanos(
+                self.input_abstractification_nanoseconds.load(Ordering::Relaxed),
+            ),
+            dispatch_duration: Duration::from_nanos(self.dispatch_nanoseconds.load(Ordering::Relaxed)),
+            tracing_duration: Duration::from_nanos(self.tracing_nanoseconds.load(Ordering::Relaxed)),
+            lowering_duration: Duration::from_nanos(self.lowering_nanoseconds.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Resets every counter to zero.
+    fn clear(&self) {
+        self.dispatch_hits.store(0, Ordering::Relaxed);
+        self.dispatch_misses.store(0, Ordering::Relaxed);
+        self.traces.store(0, Ordering::Relaxed);
+        self.lowerings.store(0, Ordering::Relaxed);
+        self.compilation_requests.store(0, Ordering::Relaxed);
+        self.input_abstractification_nanoseconds.store(0, Ordering::Relaxed);
+        self.dispatch_nanoseconds.store(0, Ordering::Relaxed);
+        self.tracing_nanoseconds.store(0, Ordering::Relaxed);
+        self.lowering_nanoseconds.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
+const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
+
+/// Type-level source universe for retained JIT specialization.
+///
+/// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
+/// immutable compilation options. This token stores none of them and only makes the key and artifact families of the
+/// descriptor coherent at the type level. If any of those owner semantics becomes variable per call, it must enter the
+/// transform arguments instead.
+struct JitCompilationSource<C, StaticParameters, Input, Output>(
+    PhantomData<fn() -> (C, StaticParameters, Input, Output)>,
+);
+
+/// Transform descriptor for the executable specializations retained by one [`CompiledFunctionDispatcher`].
+struct JitCompilationTransform;
+
+impl<C, StaticParameters, Input, Output> Transform<JitCompilationSource<C, StaticParameters, Input, Output>>
+    for JitCompilationTransform
+where
+    C: CompilationDomain,
+    StaticParameters: Clone + Eq + Hash,
+    Input: Parameterized<C::Type>,
+    Input::ParameterStructure: Eq + Hash,
+    Output: Parameterized<C::Type>,
+{
+    type Arguments = FunctionSpecializationKey<StaticParameters, Input::ParameterStructure, C::DispatchKey>;
+    type Artifact = ExecutableFunction<C, Input, Output>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = DEFAULT_JIT_CACHE_CAPACITY;
+}
+
 /// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
 ///
-/// Unlike [`CompiledFunction`], which represents one already-specialized executable, a
-/// `CompiledFunctionDispatcher` holds no program of its own: it is a retained dispatcher over a Rust closure that
-/// produces one program, and one function around that program, per specialization from explicit host-side static
-/// parameters and runtime dynamic inputs. Its first call for a specialization traces, lowers, and requests
-/// compilation; later calls with the same static values, input parameter structure, and runtime-derived dispatch key
-/// dispatch directly to the retained executable. Domain staging may normalize distinct runtime signatures to the
-/// same staged signature, which can produce harmless duplicate dispatch specializations.
+/// Unlike [`CompiledFunction`], which represents one executable that is already specialized, a
+/// `CompiledFunctionDispatcher` holds no program of its own. It is a retained dispatcher over a Rust closure that
+/// produces one program, and one function around that program, per specialization from explicit static host
+/// parameters and dynamic runtime inputs. Its first call for a specialization traces, lowers, and requests
+/// compilation, and later calls with the same static values, input parameter structure, and dispatch key dispatch
+/// directly to the retained executable. Domain staging may normalize distinct runtime signatures to the same staged
+/// signature, which can produce harmless duplicate dispatch specializations.
 ///
 /// Tracing executes Rust host code only on a specialization miss. Host side effects inside `function` therefore run
-/// once per retained specialization, not once per runtime call; observable per-call work must be represented by staged
-/// effectful operations. High-cardinality static values can cause repeated tracing and LRU eviction, so arrays and
-/// frequently changing data should remain dynamic inputs.
+/// once per retained specialization rather than once per runtime call, and observable work for every call must be
+/// represented by staged effectful operations. Static values with high cardinality can cause repeated tracing and LRU
+/// eviction, so arrays and frequently changing data should remain dynamic inputs.
 ///
 /// Every runtime input is specialized at its own type by default, and eager values are typed exactly (e.g., an eager
 /// array by its static shape and an eager first-class dimension by its extent), so each distinct extent gets its own
@@ -1182,17 +1201,18 @@ where
 /// (e.g., `dimension<n ∈ [1, 9)>` for a dimension input), so that one specialization serves every runtime input whose
 /// type refines them.
 ///
-/// The dispatcher identity only namespaces this process-local specialization cache. For domains that cache compiled
-/// programs, executable correctness and reuse still depend on
+/// The dispatcher identity only namespaces its specialization cache, which is local to the process. For domains that
+/// cache compiled programs, executable correctness and reuse still depend on
 /// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key), which
 /// receives the complete lowering.
 ///
 /// Cloned handles share one specialization cache, and the dispatcher is usable from multiple threads whenever the
-/// domain, closure, static parameters, and domain artifact types are thread-safe: `Send`/`Sync` derive structurally
-/// from those field types. Recursive same-thread dispatch of the specialization currently being produced is rejected
-/// with an error, while concurrent cold misses for one specialization on different threads deliberately produce
-/// duplicate frontend work (tracing and lowering are cheap and inserts are idempotent); the domain's shared
-/// [`CompilationContext`](super::contexts::CompilationContext) still coordinates the expensive backend compilation.
+/// domain, closure, static parameters, and domain artifact types are thread-safe, because [`Send`] and [`Sync`] derive
+/// structurally from those field types. Recursive dispatch on one thread of the specialization currently being
+/// produced is rejected with an error. Concurrent cold misses for one specialization on different threads instead
+/// deliberately duplicate the frontend work, because tracing and lowering are cheap and inserts are idempotent, while
+/// the shared [`CompilationContext`](super::contexts::CompilationContext) of the domain still coordinates the expensive
+/// backend compilation.
 ///
 /// # Retained JIT Lifecycle
 ///
@@ -1214,36 +1234,49 @@ where
 ///   executable -->|"call"| outputs["Structured Runtime Outputs"]
 /// ```
 ///
-/// The cache-hit edge skips tracing, lowering, and compilation. The dotted edge is the alternative staging path: a
-/// staged function can become a nested call boundary instead of continuing immediately toward an executable.
+/// The cache hit edge skips tracing, lowering, and compilation. The dotted edge is the alternative staging path, along
+/// which a staged function becomes a nested call boundary instead of continuing immediately toward an executable.
 #[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompiledFunctionDispatcher<
-    D: CompilationDomain<Type: Eq + Hash>,
+    C: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > where
     Input::ParameterStructure: Eq + Hash,
 {
-    state: Arc<CompiledFunctionDispatcherState<D, F, Static, Input, Output>>,
+    /// State shared by every clone of this dispatcher.
+    state: Arc<CompiledFunctionDispatcherState<C, F, Static, Input, Output>>,
 }
 
+/// Shared state of a [`CompiledFunctionDispatcher`].
 struct CompiledFunctionDispatcherState<
-    D: CompilationDomain<Type: Eq + Hash>,
+    C: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > where
     Input::ParameterStructure: Eq + Hash,
 {
-    domain: D,
+    /// Compilation domain that stages, lowers, compiles, and executes every specialization.
+    domain: C,
+
+    /// Rust closure traced once per specialization.
     function: F,
-    options: D::Options,
-    staged_input_types: Option<StagedInputTypes<D::Type, Input::ParameterStructure>>,
-    specializations: TransformCache<JitCompilationTransform, JitCompilationSource<D, Static, Input, Output>>,
-    statistics: JitCacheStatisticsState,
+
+    /// Compilation options fixed for every specialization.
+    options: C::Options,
+
+    /// Declared staged input types, or [`None`] when every input is staged at its own type.
+    staged_input_types: Option<StagedInputTypes<C::Type, Input::ParameterStructure>>,
+
+    /// Bounded LRU cache of compiled specializations.
+    specializations: TransformCache<JitCompilationTransform, JitCompilationSource<C, Static, Input, Output>>,
+
+    /// Dispatch activity counters.
+    statistics: JitCacheStatisticsAccumulator,
 }
 
 /// Staged input types declared for a [`CompiledFunctionDispatcher`] (refer to
@@ -1257,33 +1290,34 @@ struct StagedInputTypes<T, Structure> {
     types: Vec<Option<T>>,
 }
 
-impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
-    for CompiledFunctionDispatcher<D, F, Static, Input, Output>
+impl<C, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
+    for CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
-    D: CompilationDomain,
-    D::Type: Eq + Hash,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
     fn clone(&self) -> Self {
         Self { state: self.state.clone() }
     }
 }
 
-impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> CompiledFunctionDispatcher<D, F, Static, Input, Output>
+impl<C, F, Static: Clone + Debug + Eq + Hash, Input, Output> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
-    D: CompilationDomain,
-    D::Type: Eq + Hash,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant>,
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
 {
-    fn new(domain: &D, function: F, options: D::Options, capacity: usize) -> Self {
+    /// Creates a dispatcher for `function` that retains at most `capacity` specializations.
+    fn new(domain: &C, function: F, options: C::Options, capacity: usize) -> Self {
         Self {
             state: Arc::new(CompiledFunctionDispatcherState {
                 domain: domain.clone(),
@@ -1292,9 +1326,9 @@ where
                 staged_input_types: None,
                 specializations: TransformCache::<
                     JitCompilationTransform,
-                    JitCompilationSource<D, Static, Input, Output>,
+                    JitCompilationSource<C, Static, Input, Output>,
                 >::new(capacity),
-                statistics: JitCacheStatisticsState::new(),
+                statistics: JitCacheStatisticsAccumulator::default(),
             }),
         }
     }
@@ -1316,10 +1350,10 @@ where
     /// that must not mix specializations of different declarations.
     pub fn with_staged_input_types(
         mut self,
-        staged_input_types: Input::To<Option<D::Type>>,
+        staged_input_types: Input::To<Option<C::Type>>,
     ) -> Result<Self, ProgramError>
     where
-        Input::Family: ParameterizedFamily<Option<D::Type>>,
+        Input::Family: ParameterizedFamily<Option<C::Type>>,
     {
         let state = Arc::get_mut(&mut self.state).ok_or_else(|| ProgramError::InvalidArgument {
             message: "staged input types must be declared before a jit dispatcher is shared".to_string(),
@@ -1333,23 +1367,23 @@ where
 
     /// Returns the compilation domain used by this dispatcher.
     #[inline]
-    pub fn domain(&self) -> &D {
+    pub fn domain(&self) -> &C {
         &self.state.domain
     }
 
     /// Returns the declared staged input types of this dispatcher (refer to [`Self::with_staged_input_types`]), or
     /// [`None`] when every input is staged at its own type.
-    pub fn staged_input_types(&self) -> Option<Input::To<Option<D::Type>>>
+    pub fn staged_input_types(&self) -> Option<Input::To<Option<C::Type>>>
     where
-        Input::Family: ParameterizedFamily<Option<D::Type>>,
+        Input::Family: ParameterizedFamily<Option<C::Type>>,
     {
         let StagedInputTypes { structure, types } = self.state.staged_input_types.as_ref()?;
-        Some(Input::To::<Option<D::Type>>::from_parameters(structure.clone(), types.iter().cloned()).unwrap())
+        Some(Input::To::<Option<C::Type>>::from_parameters(structure.clone(), types.iter().cloned()).unwrap())
     }
 
     /// Returns the fixed compilation options used for every specialization.
     #[inline]
-    pub fn options(&self) -> &D::Options {
+    pub fn options(&self) -> &C::Options {
         &self.state.options
     }
 
@@ -1388,29 +1422,120 @@ where
         self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
     }
 
+    /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
+    pub fn call(&self, static_parameters: Static, inputs: Input::To<C::Value>) -> Result<Output::To<C::Value>, C::Error>
+    where
+        C::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Input::To<C::Value>: Parameterized<
+                C::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<C::Type> = Input,
+            >,
+        Output::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<C>>:
+            Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let executable = self.specialization(static_parameters, &inputs)?;
+        call_function(&self.state.domain, &executable, inputs)
+    }
+
+    /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
+    ///
+    /// Submission publishes the domain's reference dependencies before this function returns. The returned completion
+    /// must be awaited to observe asynchronous failure, and dropping it does not cancel the invocation.
+    pub fn call_statefully_async(
+        &self,
+        static_parameters: Static,
+        inputs: Input::To<C::Value>,
+    ) -> ReferenceExecution<Output::To<C::Value>, C::Error>
+    where
+        C: StatefulCompilationDomain,
+        C::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Input::To<C::Value>: Parameterized<
+                C::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<C::Type> = Input,
+            >,
+        Output::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<C>>:
+            Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let executable = match self.specialization(static_parameters, &inputs) {
+            Ok(executable) => executable,
+            Err(error) => return ReferenceExecution::ready(Err(error)),
+        };
+        call_function_statefully_async(&self.state.domain, &executable, inputs)
+    }
+
+    /// Calls this dispatcher statefully and waits for whole-invocation completion.
+    ///
+    /// This routes through [`StatefulCompilationDomain::call_statefully`], so it reports asynchronous execution errors
+    /// before returning and does not weaken the domain's reference sequencing contract.
+    pub fn call_statefully(
+        &self,
+        static_parameters: Static,
+        inputs: Input::To<C::Value>,
+    ) -> Result<Output::To<C::Value>, C::Error>
+    where
+        C: StatefulCompilationDomain,
+        C::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Input::To<C::Value>: Parameterized<
+                C::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<C::Type> = Input,
+            >,
+        Output::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<C>>:
+            Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let executable = self.specialization(static_parameters, &inputs)?;
+        call_function_statefully(&self.state.domain, &executable, inputs)
+    }
+
     /// Acquires or produces the executable specialization for one runtime input signature.
     fn specialization(
         &self,
         static_parameters: Static,
-        inputs: &Input::To<D::Value>,
-    ) -> Result<ExecutableFunction<D, Input, Output>, D::Error>
+        inputs: &Input::To<C::Value>,
+    ) -> Result<ExecutableFunction<C, Input, Output>, C::Error>
     where
-        D::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Input::To<D::Value>: Parameterized<
-                D::Value,
+        C::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        Input::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Input::To<C::Value>: Parameterized<
+                C::Value,
                 Family = Input::Family,
                 ParameterStructure = Input::ParameterStructure,
-                To<D::Type> = Input,
+                To<C::Type> = Input,
             >,
-        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Output::To<D::Value>:
-            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-        Output::To<CompilationTracer<D>>:
-            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-        DomainTracingContext<D, D::Value>:
-            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+        Output::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<CompilationTracer<C>>,
+        Output::To<C::Value>:
+            Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<C>>:
+            Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let abstractification_start = Instant::now();
         let input_structure = inputs.parameter_structure();
@@ -1422,24 +1547,25 @@ where
 
         // One clock read both ends input abstractification (including key construction) and starts the dispatch
         // lookup, which keeps the timing of every cached call to three clock reads.
+        let statistics = &self.state.statistics;
         let dispatch_start = Instant::now();
-        JitCacheStatisticsState::add_duration(
-            &self.state.statistics.input_abstractification_duration_ns,
+        accumulate_duration(
+            &statistics.input_abstractification_nanoseconds,
             dispatch_start.duration_since(abstractification_start),
         );
         let entry = self.state.specializations.try_entry(key);
-        JitCacheStatisticsState::add_duration(&self.state.statistics.dispatch_duration_ns, dispatch_start.elapsed());
+        accumulate_duration(&statistics.dispatch_nanoseconds, dispatch_start.elapsed());
         let producer = match entry {
             Ok(SpecializationCacheEntry::Occupied(executable)) => {
-                JitCacheStatisticsState::increment(&self.state.statistics.dispatch_hits);
+                statistics.dispatch_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(executable);
             }
             Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                JitCacheStatisticsState::increment(&self.state.statistics.dispatch_misses);
+                statistics.dispatch_misses.fetch_add(1, Ordering::Relaxed);
                 producer
             }
             Err(_) => {
-                JitCacheStatisticsState::increment(&self.state.statistics.dispatch_misses);
+                statistics.dispatch_misses.fetch_add(1, Ordering::Relaxed);
                 return Err(ProgramError::InvalidArgument {
                     message: "recursive JIT dispatch requested a specialization that is already being produced".into(),
                 }
@@ -1450,40 +1576,22 @@ where
         let input_types =
             Input::from_parameters(producer.key().input_structure().clone(), effective_input_types.iter().cloned())
                 .map_err(ProgramError::from)?;
-        JitCacheStatisticsState::increment(&self.state.statistics.traces);
+        statistics.traces.fetch_add(1, Ordering::Relaxed);
         let tracing_start = Instant::now();
-        let staged = match self.state.domain.stage(CompilationStagingRequest::new(
+        let staged = self.state.domain.stage(CompilationStagingRequest::new(
             |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
             Vec::new(),
             input_types,
             self.state.options.clone(),
-        )) {
-            Ok(staged) => {
-                let duration = tracing_start.elapsed();
-                JitCacheStatisticsState::add_duration(&self.state.statistics.tracing_duration_ns, duration);
-                staged
-            }
-            Err(error) => {
-                let duration = tracing_start.elapsed();
-                JitCacheStatisticsState::add_duration(&self.state.statistics.tracing_duration_ns, duration);
-                return Err(error);
-            }
-        };
-        JitCacheStatisticsState::increment(&self.state.statistics.lowerings);
+        ));
+        accumulate_duration(&statistics.tracing_nanoseconds, tracing_start.elapsed());
+        let staged = staged?;
+        statistics.lowerings.fetch_add(1, Ordering::Relaxed);
         let lowering_start = Instant::now();
-        let lowered = match self.state.domain.lower(staged) {
-            Ok(lowered) => {
-                let duration = lowering_start.elapsed();
-                JitCacheStatisticsState::add_duration(&self.state.statistics.lowering_duration_ns, duration);
-                lowered
-            }
-            Err(error) => {
-                let duration = lowering_start.elapsed();
-                JitCacheStatisticsState::add_duration(&self.state.statistics.lowering_duration_ns, duration);
-                return Err(error);
-            }
-        };
-        JitCacheStatisticsState::increment(&self.state.statistics.compilation_requests);
+        let lowered = self.state.domain.lower(staged);
+        accumulate_duration(&statistics.lowering_nanoseconds, lowering_start.elapsed());
+        let lowered = lowered?;
+        statistics.compilation_requests.fetch_add(1, Ordering::Relaxed);
         let compiled = self.state.domain.compile(lowered)?;
         Ok(producer.insert(compiled.into_executable_function()))
     }
@@ -1494,8 +1602,8 @@ where
     fn staged_runtime_input_types(
         &self,
         input_structure: &Input::ParameterStructure,
-        mut input_types: Vec<D::Type>,
-    ) -> Result<Vec<D::Type>, D::Error> {
+        mut input_types: Vec<C::Type>,
+    ) -> Result<Vec<C::Type>, C::Error> {
         let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types else {
             return Ok(input_types);
         };
@@ -1522,7 +1630,7 @@ where
         }
         // Inputs that share an identity in their declared types must agree, which establishing the facts of all of
         // them together checks.
-        <D::Type as Type>::Refinements::new(
+        <C::Type as Type>::Refinements::new(
             declared.iter().map(|(_, staged_type)| *staged_type),
             declared.iter().map(|(index, _)| &input_types[*index]),
         )
@@ -1532,240 +1640,149 @@ where
         }
         Ok(input_types)
     }
-
-    /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
-    pub fn call(&self, static_parameters: Static, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, D::Error>
-    where
-        D::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Input::To<D::Value>: Parameterized<
-                D::Value,
-                Family = Input::Family,
-                ParameterStructure = Input::ParameterStructure,
-                To<D::Type> = Input,
-            >,
-        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Output::To<D::Value>:
-            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-        Output::To<CompilationTracer<D>>:
-            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-        DomainTracingContext<D, D::Value>:
-            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-    {
-        let executable = self.specialization(static_parameters, &inputs)?;
-        call_function(&self.state.domain, &executable, inputs)
-    }
-
-    /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
-    ///
-    /// Submission publishes the domain's reference dependencies before this function returns. The returned completion
-    /// must be awaited to observe asynchronous failure; dropping it does not cancel the invocation.
-    pub fn call_statefully_async(
-        &self,
-        static_parameters: Static,
-        inputs: Input::To<D::Value>,
-    ) -> ReferenceExecution<Output::To<D::Value>, D::Error>
-    where
-        D: StatefulCompilationDomain,
-        D::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Input::To<D::Value>: Parameterized<
-                D::Value,
-                Family = Input::Family,
-                ParameterStructure = Input::ParameterStructure,
-                To<D::Type> = Input,
-            >,
-        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Output::To<D::Value>:
-            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-        Output::To<CompilationTracer<D>>:
-            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-        DomainTracingContext<D, D::Value>:
-            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-    {
-        let executable = match self.specialization(static_parameters, &inputs) {
-            Ok(executable) => executable,
-            Err(error) => return ReferenceExecution::ready(Err(error)),
-        };
-        call_function_statefully_async(&self.state.domain, &executable, inputs)
-    }
-
-    /// Calls this dispatcher statefully and waits for whole-invocation completion.
-    ///
-    /// This routes through [`StatefulCompilationDomain::call_statefully`], so it reports asynchronous execution errors
-    /// before returning and does not weaken the domain's reference sequencing contract.
-    pub fn call_statefully(
-        &self,
-        static_parameters: Static,
-        inputs: Input::To<D::Value>,
-    ) -> Result<Output::To<D::Value>, D::Error>
-    where
-        D: StatefulCompilationDomain,
-        D::Options: Clone,
-        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Input::To<D::Value>: Parameterized<
-                D::Value,
-                Family = Input::Family,
-                ParameterStructure = Input::ParameterStructure,
-                To<D::Type> = Input,
-            >,
-        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
-        Output::To<D::Value>:
-            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-        Output::To<CompilationTracer<D>>:
-            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-        DomainTracingContext<D, D::Value>:
-            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-    {
-        let executable = self.specialization(static_parameters, &inputs)?;
-        call_function_statefully(&self.state.domain, &executable, inputs)
-    }
 }
 
 /// Constructs a retained dispatcher for a fallible closure using explicit options and cache capacity.
-pub fn try_jit_with_options_and_capacity<D, F, Static, Input, Output>(
-    domain: &D,
+pub fn try_jit_with_options_and_capacity<C, F, Static, Input, Output>(
+    domain: &C,
     function: F,
-    options: D::Options,
+    options: C::Options,
     capacity: usize,
-) -> CompiledFunctionDispatcher<D, F, Static, Input, Output>
+) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
-    D: CompilationDomain,
-    D::Type: Eq + Hash,
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 {
     CompiledFunctionDispatcher::new(domain, function, options, capacity)
 }
 
 /// Constructs a retained dispatcher for a fallible closure using explicit options.
 #[inline]
-pub fn try_jit_with_options<D, F, Static, Input, Output>(
-    domain: &D,
+pub fn try_jit_with_options<C, F, Static, Input, Output>(
+    domain: &C,
     function: F,
-    options: D::Options,
-) -> CompiledFunctionDispatcher<D, F, Static, Input, Output>
+    options: C::Options,
+) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
-    D: CompilationDomain,
-    D::Type: Eq + Hash,
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 {
     try_jit_with_options_and_capacity(domain, function, options, DEFAULT_JIT_CACHE_CAPACITY)
 }
 
 /// Constructs a retained dispatcher for a fallible closure using default options.
 #[inline]
-pub fn try_jit<D, F, Static, Input, Output>(
-    domain: &D,
+pub fn try_jit<C, F, Static, Input, Output>(
+    domain: &C,
     function: F,
-) -> CompiledFunctionDispatcher<D, F, Static, Input, Output>
+) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
 where
-    D: CompilationDomain<Options: Default>,
-    D::Type: Eq + Hash,
+    C: CompilationDomain<Options: Default>,
+    C::Type: Eq + Hash,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 {
-    try_jit_with_options(domain, function, D::Options::default())
+    try_jit_with_options(domain, function, C::Options::default())
 }
 
 /// Constructs a retained dispatcher for an infallible closure using explicit options.
-pub fn jit_with_options<D, F, Static, Input, Output>(
-    domain: &D,
+pub fn jit_with_options<C, F, Static, Input, Output>(
+    domain: &C,
     function: F,
-    options: D::Options,
+    options: C::Options,
 ) -> CompiledFunctionDispatcher<
-    D,
-    impl Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
+    C,
+    impl Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static,
     Input,
     Output,
 >
 where
-    D: CompilationDomain,
-    D::Type: Eq + Hash,
-    F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Output::To<CompilationTracer<C>>,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     try_jit_with_options(domain, move |static_parameters, inputs| Ok(function(static_parameters, inputs)), options)
 }
 
 /// Constructs a retained dispatcher for an infallible closure using default options.
 #[inline]
-pub fn jit<D, F, Static, Input, Output>(
-    domain: &D,
+pub fn jit<C, F, Static, Input, Output>(
+    domain: &C,
     function: F,
 ) -> CompiledFunctionDispatcher<
-    D,
-    impl Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
+    C,
+    impl Fn(Static, Input::To<CompilationTracer<C>>) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
     Static,
     Input,
     Output,
 >
 where
-    D: CompilationDomain<Options: Default>,
-    D::Type: Eq + Hash,
-    F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
+    C: CompilationDomain<Options: Default>,
+    C::Type: Eq + Hash,
+    F: Fn(Static, Input::To<CompilationTracer<C>>) -> Output::To<CompilationTracer<C>>,
     Static: Clone + Debug + Eq + Hash,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    jit_with_options(domain, function, D::Options::default())
+    jit_with_options(domain, function, C::Options::default())
 }
 
 /// Stages an infallible capture-free function through `domain`.
-pub fn stage_function<D, F, Input, Output>(
-    domain: &D,
+pub fn stage_function<C, F, Input, Output>(
+    domain: &C,
     function: F,
     input_types: Input,
-    options: D::Options,
-) -> Result<StagedFunction<D, Input, Output>, D::Error>
+    options: C::Options,
+) -> Result<StagedFunction<C, Input, Output>, C::Error>
 where
-    D: CompilationDomain,
-    F: FnOnce(Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    Output::To<CompilationTracer<D>>:
-        Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+    C: CompilationDomain,
+    F: FnOnce(Input::To<CompilationTracer<C>>) -> Output::To<CompilationTracer<C>>,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Output::To<CompilationTracer<C>>:
+        Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     domain.stage(CompilationStagingRequest::new(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options))
 }
 
 /// Executes a structured runtime call through `domain`.
-pub fn call_function<D, Input, Output>(
-    domain: &D,
-    executable: &ExecutableFunction<D, Input, Output>,
-    inputs: Input::To<D::Value>,
-) -> Result<Output::To<D::Value>, D::Error>
+pub fn call_function<C, Input, Output>(
+    domain: &C,
+    executable: &ExecutableFunction<C, Input, Output>,
+    inputs: Input::To<C::Value>,
+) -> Result<Output::To<C::Value>, C::Error>
 where
-    D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Input::To<D::Value>: Parameterized<D::Value>,
-    Output::To<D::Value>:
-        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Input::To<C::Value>: Parameterized<C::Value>,
+    Output::To<C::Value>:
+        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
 {
     domain.call(CompilationCall::new(executable, inputs))
 }
@@ -1774,18 +1791,18 @@ where
 ///
 /// The returned completion owns error observation, not cancellation. Submission and reference-state publication
 /// semantics are defined by [`StatefulCompilationDomain::call_statefully_async`].
-pub fn call_function_statefully_async<D, Input, Output>(
-    domain: &D,
-    executable: &ExecutableFunction<D, Input, Output>,
-    inputs: Input::To<D::Value>,
-) -> ReferenceExecution<Output::To<D::Value>, D::Error>
+pub fn call_function_statefully_async<C, Input, Output>(
+    domain: &C,
+    executable: &ExecutableFunction<C, Input, Output>,
+    inputs: Input::To<C::Value>,
+) -> ReferenceExecution<Output::To<C::Value>, C::Error>
 where
-    D: StatefulCompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Input::To<D::Value>: Parameterized<D::Value>,
-    Output::To<D::Value>:
-        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    C: StatefulCompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Input::To<C::Value>: Parameterized<C::Value>,
+    Output::To<C::Value>:
+        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
 {
     domain.call_statefully_async(CompilationCall::new(executable, inputs))
 }
@@ -1793,48 +1810,48 @@ where
 /// Executes a structured runtime call and waits for whole-invocation completion.
 ///
 /// This is the blocking form of [`call_function_statefully_async`].
-pub fn call_function_statefully<D, Input, Output>(
-    domain: &D,
-    executable: &ExecutableFunction<D, Input, Output>,
-    inputs: Input::To<D::Value>,
-) -> Result<Output::To<D::Value>, D::Error>
+pub fn call_function_statefully<C, Input, Output>(
+    domain: &C,
+    executable: &ExecutableFunction<C, Input, Output>,
+    inputs: Input::To<C::Value>,
+) -> Result<Output::To<C::Value>, C::Error>
 where
-    D: StatefulCompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
-    Input::To<D::Value>: Parameterized<D::Value>,
-    Output::To<D::Value>:
-        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+    C: StatefulCompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>,
+    Input::To<C::Value>: Parameterized<C::Value>,
+    Output::To<C::Value>:
+        Parameterized<C::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
 {
     domain.call_statefully(CompilationCall::new(executable, inputs))
 }
 
 /// Constructs a staged function from types already prepared by a compilation domain.
-pub(crate) fn trace_with_capture_references<D, F, Input, Output, NormalizeOutput>(
+fn trace_with_capture_references<C, F, Input, Output, NormalizeOutput>(
     function: F,
-    captures: Vec<D::Value>,
+    captures: Vec<C::Value>,
     input_types: Input,
-    options: D::Options,
+    options: C::Options,
     normalize_output_types: NormalizeOutput,
-) -> Result<StagedFunction<D, Input, Output>, D::Error>
+) -> Result<StagedFunction<C, Input, Output>, C::Error>
 where
-    D: CompilationDomain,
+    C: CompilationDomain,
     F: FnOnce(
-        Vec<D::Constant>,
-        Vec<CompilationTracer<D>>,
-        Input::To<CompilationTracer<D>>,
-    ) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-    Input: Parameterized<D::Type>,
-    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    Output: Parameterized<D::Type>,
-    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    Output::To<CompilationTracer<D>>:
-        Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
-    NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>,
-    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+        Vec<C::Constant>,
+        Vec<CompilationTracer<C>>,
+        Input::To<CompilationTracer<C>>,
+    ) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+    Output::To<CompilationTracer<C>>:
+        Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+    NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
-    let context = DomainTracingContext::<D, D::Value>::new();
+    let context = DomainTracingContext::<C, C::Value>::new();
     let capture_table = context.captures().clone();
     let builder = context.builder().clone();
     let capture_references =
@@ -1914,8 +1931,6 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct TestOptions {
         staged_input_type: Option<ArrayType>,
-        lowered_output_type: Option<ArrayType>,
-        compiled_output_type: Option<ArrayType>,
         fail_lowering: bool,
         fail_compilation: bool,
     }
@@ -1984,27 +1999,7 @@ mod tests {
                 return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
             }
             let program = staged.lifted_program()?;
-            let mut output_types: Vec<ArrayType> = program
-                .output_ids()
-                .iter()
-                .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
-                .collect();
-            if let Some(output_type) = &staged.staged().options().lowered_output_type {
-                output_types.fill(output_type.clone());
-            }
-            if output_types.len() != staged.staged().output_types().len() {
-                return Err(ProgramError::InvalidOutputCount {
-                    expected: staged.staged().output_types().len(),
-                    actual: output_types.len(),
-                });
-            }
-            for (declared, actual) in staged.staged().output_types().iter().zip(&output_types) {
-                if !declared.is_refined_by(actual) {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!("output type {actual} does not refine declared type {declared}"),
-                    });
-                }
-            }
+            let output_types = staged.staged().output_types().to_vec();
             let capture_count = staged.staged().source_program().captures().len();
             let options = staged.staged().options().clone();
             Ok(staged.into_lowered(
@@ -2033,11 +2028,10 @@ mod tests {
                     if program.options.fail_compilation {
                         return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
                     }
-                    let mut output_types = program.output_types.clone();
-                    if let Some(output_type) = &program.options.compiled_output_type {
-                        output_types.fill(output_type.clone());
-                    }
-                    Ok(TestCompiledProgram { program: program.program.clone(), output_types })
+                    Ok(TestCompiledProgram {
+                        program: program.program.clone(),
+                        output_types: program.output_types.clone(),
+                    })
                 },
                 |program| program.output_types.clone(),
             )
@@ -2047,12 +2041,7 @@ mod tests {
         where
             Request: CallRequest<Self>,
         {
-            if request.inputs().len() != request.executable().input_types().len() {
-                return Err(ProgramError::InvalidInputCount {
-                    expected: request.executable().input_types().len(),
-                    actual: request.inputs().len(),
-                });
-            }
+            request.executable().validate_flat_input_count(request.inputs())?;
             for (declared, actual) in
                 request.executable().input_types().iter().zip(request.inputs().iter().map(Typed::r#type))
             {
@@ -2227,38 +2216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_execution_returns_a_ready_result_without_a_completion() {
-        // A ready execution carries no completion at all, so awaiting it just yields the stored result.
-        let execution: ReferenceExecution<u32, ProgramError> = ReferenceExecution::ready(Ok(7));
-        assert_eq!(execution.r#await(), Ok(7));
-
-        let execution: ReferenceExecution<u32, ProgramError> =
-            ReferenceExecution::ready(Err(ProgramError::MalformedProgram("specialization failed".to_string())));
-        let expected = Err(ProgramError::MalformedProgram("specialization failed".to_string()));
-        assert_eq!(execution.r#await(), expected);
-    }
-
-    #[test]
-    fn test_reference_execution_returns_the_public_result_after_a_successful_completion() {
-        // A successful completion never rewrites the reconstructed public output.
-        let execution: ReferenceExecution<u32, ProgramError> =
-            ReferenceExecution::pending(Ok(11), ReferenceCompletion::ready(Ok(())), reference_completion_error);
-        assert_eq!(execution.r#await(), Ok(11));
-    }
-
-    #[test]
-    fn test_reference_execution_waits_and_prioritizes_completion_failure() {
-        // A completion failure may invalidate every pending output, so it replaces the reconstruction error.
-        let execution: ReferenceExecution<(), ProgramError> = ReferenceExecution::pending(
-            Err(ProgramError::MalformedProgram("public reconstruction failed".to_string())),
-            ReferenceCompletion::ready(Err("execution failed".into())),
-            reference_completion_error,
-        );
-        let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
-        assert_eq!(execution.r#await(), expected);
-    }
-
-    #[test]
     fn test_function_specialization_key() {
         let key: FunctionSpecializationKey<(&str, usize), Vec<()>, &str> =
             FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
@@ -2274,41 +2231,86 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_compilation_transform_contract() {
-        type Source = JitCompilationSource<TestDomain, usize, Vec<ArrayType>, Vec<ArrayType>>;
-        type Arguments = FunctionSpecializationKey<usize, Vec<Placeholder>, Arc<[ArrayType]>>;
-        type Artifact = ExecutableFunction<TestDomain, Vec<ArrayType>, Vec<ArrayType>>;
-
-        fn assert_contract<T, S>()
-        where
-            T: Transform<S, Arguments = Arguments, Artifact = Artifact>,
-        {
-        }
-
-        assert_contract::<JitCompilationTransform, Source>();
-        assert_eq!(<JitCompilationTransform as Transform<Source>>::DEFAULT_CACHE_CAPACITY, DEFAULT_JIT_CACHE_CAPACITY,);
-    }
-
-    #[test]
-    fn test_compilation_key_distinguishes_computations_from_one_call_site() {
+    fn test_compilation_staging_request_trace_propagates_closure_error() {
         let domain = TestDomain::new();
+        let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> =
+            domain.stage(CompilationStagingRequest::new(
+                |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
+                Vec::new(),
+                ArrayType::scalar(DataType::F64),
+                TestOptions::default(),
+            ));
 
-        let identity = compile_from_one_call_site(&domain, false);
-        let negate = compile_from_one_call_site(&domain, true);
-
-        assert_eq!(
-            call_function(&domain, identity.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
-            Array::scalar(3.0).unwrap()
-        );
-        assert_eq!(
-            call_function(&domain, negate.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
-            Array::scalar(-3.0).unwrap()
-        );
-        assert_eq!(domain.compilation_count(), 2);
+        assert!(matches!(result, Err(ProgramError::InvalidArgument { message }) if message == "staging failed"));
     }
 
     #[test]
-    fn test_staged_and_lowered_handles_reuse_one_compilation() {
+    fn test_compilation_staging_request_trace_prunes_unused_captures() {
+        let domain = TestDomain::new();
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
+            .stage(CompilationStagingRequest::new(
+                |_, _, input: CompilationTracer<TestDomain>| Ok(input),
+                vec![Array::scalar(7.0).unwrap()],
+                ArrayType::scalar(DataType::F64),
+                TestOptions::default(),
+            ))
+            .unwrap();
+
+        assert!(staged.source_program().captures().is_empty());
+    }
+
+    #[test]
+    fn test_compilation_staging_request_replace_input_types() {
+        let domain = TestDomain::new();
+        let options =
+            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
+            &domain,
+            |input: CompilationTracer<TestDomain>| input,
+            ArrayType::scalar(DataType::F64),
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::I64)]);
+        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::I64)]);
+        assert_eq!(staged.options().staged_input_type, Some(ArrayType::scalar(DataType::I64)));
+    }
+
+    #[test]
+    fn test_reference_execution_ready() {
+        // A ready execution carries no completion at all, so awaiting it just yields the stored result.
+        let execution: ReferenceExecution<u32, ProgramError> = ReferenceExecution::ready(Ok(7));
+        assert_eq!(execution.r#await(), Ok(7));
+
+        let execution: ReferenceExecution<u32, ProgramError> =
+            ReferenceExecution::ready(Err(ProgramError::MalformedProgram("specialization failed".to_string())));
+        let expected = Err(ProgramError::MalformedProgram("specialization failed".to_string()));
+        assert_eq!(execution.r#await(), expected);
+    }
+
+    #[test]
+    fn test_reference_execution_pending() {
+        // A successful completion never rewrites the reconstructed public output.
+        let execution: ReferenceExecution<u32, ProgramError> =
+            ReferenceExecution::pending(Ok(11), ReferenceCompletion::ready(Ok(())), reference_completion_error);
+        assert_eq!(execution.r#await(), Ok(11));
+    }
+
+    #[test]
+    fn test_reference_execution_await_prioritizes_completion_failure() {
+        // A completion failure may invalidate every pending output, so it replaces the reconstruction error.
+        let execution: ReferenceExecution<(), ProgramError> = ReferenceExecution::pending(
+            Err(ProgramError::MalformedProgram("public reconstruction failed".to_string())),
+            ReferenceCompletion::ready(Err("execution failed".into())),
+            reference_completion_error,
+        );
+        let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
+        assert_eq!(execution.r#await(), expected);
+    }
+
+    #[test]
+    fn test_staged_function_clone() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
             &domain,
@@ -2336,74 +2338,32 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_options_apply_before_tracing() {
+    fn test_executable_function_with_compiled_program() {
         let domain = TestDomain::new();
-        let options =
-            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            ArrayType::scalar(DataType::F64),
-            options,
-        )
-        .unwrap();
+        let identity = compile_from_one_call_site(&domain, false).into_executable_function();
+        let negate = compile_from_one_call_site(&domain, true).into_executable_function();
+        let replaced = identity.with_compiled_program(
+            Arc::new(TestCompiledProgram {
+                program: negate.compiled_program().program.clone(),
+                output_types: negate.output_types().to_vec(),
+            }),
+            negate.output_types().to_vec(),
+        );
 
-        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::I64)]);
-        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::I64)]);
-        assert_eq!(staged.options().staged_input_type, Some(ArrayType::scalar(DataType::I64)));
+        // The replacement runs the new program with the retained signature, while the original function is unaffected.
+        assert_eq!(replaced.input_types(), identity.input_types());
+        assert_eq!(
+            call_function(&domain, &replaced, Array::scalar(3.0).unwrap()).unwrap(),
+            Array::scalar(-3.0).unwrap()
+        );
+        assert_eq!(
+            call_function(&domain, &identity, Array::scalar(3.0).unwrap()).unwrap(),
+            Array::scalar(3.0).unwrap()
+        );
     }
 
     #[test]
-    fn test_compiled_function_rejects_runtime_input_type_mismatch() {
-        let domain = TestDomain::new();
-        let compiled = compile_from_one_call_site(&domain, false);
-
-        assert!(matches!(
-            call_function(&domain, compiled.executable_function(), Array::scalar(3_i64).unwrap()),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "runtime input type i64[] does not refine declared type f64[]",
-        ));
-    }
-
-    #[test]
-    fn test_compiled_function_executes_explicit_capture() {
-        let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
-            .stage(CompilationStagingRequest::new(
-                |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Array::scalar(7.0).unwrap()],
-                (),
-                TestOptions::default(),
-            ))
-            .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
-
-        assert_eq!(call_function(&domain, compiled.executable_function(), ()).unwrap(), Array::scalar(7.0).unwrap());
-        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
-    }
-
-    #[test]
-    fn test_executable_function_outlives_transform_metadata_and_executes_captures() {
-        let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
-            .stage(CompilationStagingRequest::new(
-                |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Array::scalar(7.0).unwrap()],
-                (),
-                TestOptions::default(),
-            ))
-            .unwrap();
-        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
-        let executable = compiled.into_executable_function();
-
-        assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
-        assert!(executable.input_types().is_empty());
-        assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Array::scalar(7.0).unwrap());
-    }
-
-    #[test]
-    fn test_executable_function_is_send_and_sync_for_thread_safe_runtime_state() {
+    fn test_executable_function_send_and_sync() {
         fn assert_send_and_sync<T: Send + Sync>() {}
 
         assert_send_and_sync::<ExecutableFunction<TestDomain, ArrayType, ArrayType>>();
@@ -2423,100 +2383,73 @@ mod tests {
     }
 
     #[test]
-    fn test_fallible_staging_propagates_closure_error() {
+    fn test_compiled_function() {
         let domain = TestDomain::new();
-        let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> =
-            domain.stage(CompilationStagingRequest::new(
-                |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
-                Vec::new(),
-                ArrayType::scalar(DataType::F64),
-                TestOptions::default(),
-            ));
-
-        assert!(matches!(result, Err(ProgramError::InvalidArgument { message }) if message == "staging failed"));
-    }
-
-    #[test]
-    fn test_staging_prunes_unused_captures() {
-        let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
+        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
             .stage(CompilationStagingRequest::new(
-                |_, _, input: CompilationTracer<TestDomain>| Ok(input),
+                |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
                 vec![Array::scalar(7.0).unwrap()],
-                ArrayType::scalar(DataType::F64),
+                (),
                 TestOptions::default(),
             ))
             .unwrap();
+        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
-        assert!(staged.source_program().captures().is_empty());
+        assert_eq!(call_function(&domain, compiled.executable_function(), ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert!(compiled.staged().input_types().is_empty());
+        assert_eq!(compiled.lowered().output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(compiled.output_types(), &[ArrayType::scalar(DataType::F64)]);
     }
 
     #[test]
-    fn test_lower_rejects_incompatible_output_type() {
+    fn test_compiled_function_into_executable_function() {
         let domain = TestDomain::new();
-        let options =
-            TestOptions { lowered_output_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
+            .stage(CompilationStagingRequest::new(
+                |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
+                vec![Array::scalar(7.0).unwrap()],
+                (),
+                TestOptions::default(),
+            ))
+            .unwrap();
+        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let executable = compiled.into_executable_function();
 
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            ArrayType::scalar(DataType::F64),
-            options,
-        )
-        .unwrap();
-        assert!(matches!(
-            domain.lower(staged),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "output type i64[] does not refine declared type f64[]",
-        ));
-    }
-
-    #[test]
-    fn test_compile_rejects_incompatible_output_type() {
-        let domain = TestDomain::new();
-        let options =
-            TestOptions { compiled_output_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            ArrayType::scalar(DataType::F64),
-            options,
-        )
-        .unwrap();
-        let lowered = domain.lower(staged).unwrap();
-
-        assert!(matches!(
-            domain.compile(lowered),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "output type i64[] does not refine declared type f64[]",
-        ));
-    }
-
-    #[test]
-    fn test_compiled_function_dispatcher_reuses_warm_specializations() {
-        let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
+        // The runtime handle outlives the transform metadata and still supplies its captures on every call.
+        assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
+        assert!(executable.input_types().is_empty());
+        assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(executable.validate_flat_input_count(&[]), Ok(()));
+        assert_eq!(
+            executable.validate_flat_input_count(&[Array::scalar(1.0).unwrap()]),
+            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
-
-        assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
-        assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
-        assert_eq!(function.call(false, Array::scalar(4.0).unwrap()).unwrap(), Array::scalar(4.0).unwrap());
-        assert_eq!(function.specialization_count(), 2);
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_hits, 1);
-        assert_eq!(statistics.dispatch_misses, 2);
-        assert_eq!(statistics.traces, 2);
-        assert_eq!(statistics.lowerings, 2);
-        assert_eq!(statistics.compilation_requests, 2);
-        assert_eq!(domain.compilation_count(), 2);
+        assert_eq!(
+            executable.arguments_with_captures(vec![Array::scalar(1.0).unwrap()]),
+            vec![Array::scalar(7.0).unwrap(), Array::scalar(1.0).unwrap()],
+        );
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_reuses_specialization_across_runtime_extents() {
+    fn test_jit_compilation_transform() {
+        type Source = JitCompilationSource<TestDomain, usize, Vec<ArrayType>, Vec<ArrayType>>;
+        type Arguments = FunctionSpecializationKey<usize, Vec<Placeholder>, Arc<[ArrayType]>>;
+        type Artifact = ExecutableFunction<TestDomain, Vec<ArrayType>, Vec<ArrayType>>;
+
+        fn assert_contract<T, S>()
+        where
+            T: Transform<S, Arguments = Arguments, Artifact = Artifact>,
+        {
+        }
+
+        assert_contract::<JitCompilationTransform, Source>();
+        assert_eq!(<JitCompilationTransform as Transform<Source>>::DEFAULT_CACHE_CAPACITY, DEFAULT_JIT_CACHE_CAPACITY,);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_with_staged_input_types() {
         let domain = TestArrayIrDomain::new();
         let zeros = |(), extent: CompilationTracer<TestArrayIrDomain>| {
             let ArrayIrType::Dimension(extent_type) = extent.r#type().into_owned() else {
@@ -2595,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_declares_staged_dimension_identities() {
+    fn test_compiled_function_dispatcher_with_staged_input_types_shared_identities() {
         let domain = TestArrayIrDomain::new();
         let zeros = |(), extents: Vec<CompilationTracer<TestArrayIrDomain>>| {
             let dimensions = extents
@@ -2690,7 +2623,50 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_applies_staging_options_before_tracing() {
+    fn test_compiled_function_dispatcher_invalidate_static() {
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+            &domain,
+            |negate, input: CompilationTracer<TestDomain>| {
+                if negate { input.unary(NegOperation::new()) } else { input }
+            },
+        );
+        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
+        function.call(false, Array::scalar(2.0).unwrap()).unwrap();
+
+        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
+        assert_eq!(function.invalidate_static(&true), 1);
+        assert_eq!(function.specialization_count(), 1);
+        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
+        assert_eq!(function.statistics().traces, 3);
+        assert_eq!(domain.compilation_count(), 2);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call() {
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+            &domain,
+            |negate, input: CompilationTracer<TestDomain>| {
+                if negate { input.unary(NegOperation::new()) } else { input }
+            },
+        );
+
+        assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
+        assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(function.call(false, Array::scalar(4.0).unwrap()).unwrap(), Array::scalar(4.0).unwrap());
+        assert_eq!(function.specialization_count(), 2);
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.dispatch_misses, 2);
+        assert_eq!(statistics.traces, 2);
+        assert_eq!(statistics.lowerings, 2);
+        assert_eq!(statistics.compilation_requests, 2);
+        assert_eq!(domain.compilation_count(), 2);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_applies_staging_options_before_tracing() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
@@ -2705,17 +2681,17 @@ mod tests {
         assert_eq!(function.statistics().traces, 1);
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct CollidingStatic(bool);
-
-    impl Hash for CollidingStatic {
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            0_u8.hash(state);
-        }
-    }
-
     #[test]
-    fn test_compiled_function_dispatcher_distinguishes_hash_colliding_static_values() {
+    fn test_compiled_function_dispatcher_call_distinguishes_hash_colliding_static_values() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct CollidingStatic(bool);
+
+        impl Hash for CollidingStatic {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                0u8.hash(state);
+            }
+        }
+
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, CollidingStatic, ArrayType, ArrayType> = jit(
             &domain,
@@ -2737,7 +2713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_input_structures_partition_specializations() {
+    fn test_compiled_function_dispatcher_call_partitions_input_structures() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
             try_jit(&domain, |(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
@@ -2753,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_distinguishes_inputs_differing_only_in_empty_substructure() {
+    fn test_compiled_function_dispatcher_call_distinguishes_empty_substructure() {
         // Both calls flatten to zero leaves, so they share static parameters and an empty dispatch signature. Only
         // the input parameter structure distinguishes them, while the traced closure branches on the observed
         // container arity. Key reuse across these calls would therefore silently return the first call's staged
@@ -2778,27 +2754,25 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_invalidates_one_static_specialization() {
+    fn test_compiled_function_dispatcher_call_flattens_map_inputs_deterministically() {
+        // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
+        // specialization regardless of construction order, and replay must bind flat arguments to the same leaves.
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
-        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
-        function.call(false, Array::scalar(2.0).unwrap()).unwrap();
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
+            try_jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
+                inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
+            });
 
-        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
-        assert_eq!(function.invalidate_static(&true), 1);
+        let first = BTreeMap::from([("a", Array::scalar(1.0).unwrap()), ("b", Array::scalar(2.0).unwrap())]);
+        let second = BTreeMap::from([("b", Array::scalar(4.0).unwrap()), ("a", Array::scalar(3.0).unwrap())]);
+        assert_eq!(function.call((), first).unwrap(), Array::scalar(1.0).unwrap());
+        assert_eq!(function.call((), second).unwrap(), Array::scalar(3.0).unwrap());
         assert_eq!(function.specialization_count(), 1);
-        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
-        assert_eq!(function.statistics().traces, 3);
-        assert_eq!(domain.compilation_count(), 2);
+        assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_retries_failed_specialization() {
+    fn test_compiled_function_dispatcher_call_retries_tracing_failures() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
             try_jit(&domain, |fail, input: CompilationTracer<TestDomain>| {
@@ -2821,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_retries_lowering_and_compilation_failures() {
+    fn test_compiled_function_dispatcher_call_retries_lowering_and_compilation_failures() {
         let lowering_domain = TestDomain::new();
         let lowering_options = TestOptions { fail_lowering: true, ..TestOptions::default() };
         let lowering_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
@@ -2857,65 +2831,30 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_owners_isolate_frontend_specializations() {
+    fn test_compiled_function_dispatcher_call_retains_specialization_after_execution_failure() {
         let domain = TestDomain::new();
-        let first: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
-        let second: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
+        let options =
+            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
 
-        assert_eq!(first.call((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
-        assert_eq!(second.call((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
-        assert_eq!(first.specialization_count(), 1);
-        assert_eq!(second.specialization_count(), 1);
-        assert_eq!(first.statistics().traces, 1);
-        assert_eq!(second.statistics().traces, 1);
-        assert_eq!(domain.compilation_count(), 1);
-    }
+        for _ in 0..2 {
+            assert!(matches!(
+                function.call((), Array::scalar(2.0).unwrap()),
+                Err(ProgramError::InvalidArgument { message })
+                    if message == "runtime input type f64[] does not refine declared type i64[]",
+            ));
+        }
 
-    #[test]
-    fn test_compiled_function_dispatcher_lru_capacity_retraces_evicted_specialization() {
-        let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
-            try_jit_with_options_and_capacity(
-                &domain,
-                |negate, input: CompilationTracer<TestDomain>| {
-                    Ok(if negate { input.unary(NegOperation::new()) } else { input })
-                },
-                TestOptions::default(),
-                1,
-            );
-
-        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
-        function.call(true, Array::scalar(1.0).unwrap()).unwrap();
-        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
-
+        // The compiled entry is inserted before runtime execution, so an execution failure does not evict it and the
+        // second call dispatches directly to the retained specialization.
         assert_eq!(function.specialization_count(), 1);
-        assert_eq!(function.statistics().dispatch_misses, 3);
-        assert_eq!(function.statistics().traces, 3);
-        assert_eq!(domain.compilation_count(), 2, "the global exact compilation cache should reuse the evicted entry");
-    }
-
-    #[test]
-    fn test_compiled_function_dispatcher_map_inputs_flatten_deterministically() {
-        // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
-        // specialization regardless of construction order, and replay must bind flat arguments to the same leaves.
-        let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
-            try_jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
-                inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
-            });
-
-        let first = BTreeMap::from([("a", Array::scalar(1.0).unwrap()), ("b", Array::scalar(2.0).unwrap())]);
-        let second = BTreeMap::from([("b", Array::scalar(4.0).unwrap()), ("a", Array::scalar(3.0).unwrap())]);
-        assert_eq!(function.call((), first).unwrap(), Array::scalar(1.0).unwrap());
-        assert_eq!(function.call((), second).unwrap(), Array::scalar(3.0).unwrap());
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().traces, 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_rejects_same_key_recursive_dispatch() {
+    fn test_compiled_function_dispatcher_call_rejects_same_key_recursive_dispatch() {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
@@ -2939,7 +2878,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_allows_different_key_recursive_dispatch() {
+    fn test_compiled_function_dispatcher_call_allows_different_key_recursive_dispatch() {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
@@ -2961,53 +2900,24 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_retains_specialization_after_runtime_execution_failure() {
+    fn test_compiled_function_dispatcher_call_isolates_dispatchers() {
         let domain = TestDomain::new();
-        let options =
-            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
-            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
+        let first: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
+        let second: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
 
-        for _ in 0..2 {
-            assert!(matches!(
-                function.call((), Array::scalar(2.0).unwrap()),
-                Err(ProgramError::InvalidArgument { message })
-                    if message == "runtime input type f64[] does not refine declared type i64[]",
-            ));
-        }
-
-        // The compiled entry is inserted before runtime execution, so an execution failure does not evict it and the
-        // second call dispatches directly to the retained specialization.
-        assert_eq!(function.specialization_count(), 1);
-        assert_eq!(function.statistics().traces, 1);
-        assert_eq!(function.statistics().dispatch_hits, 1);
+        assert_eq!(first.call((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
+        assert_eq!(second.call((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
+        assert_eq!(first.specialization_count(), 1);
+        assert_eq!(second.specialization_count(), 1);
+        assert_eq!(first.statistics().traces, 1);
+        assert_eq!(second.statistics().traces, 1);
+        assert_eq!(domain.compilation_count(), 1);
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_and_staged_functions_are_send_and_sync_for_thread_safe_state() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-        fn assert_dispatcher_send_and_sync<F: Send + Sync>(
-            _function: &CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>,
-        ) {
-            assert_send_and_sync::<CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>>();
-        }
-
-        assert_send_and_sync::<StagedFunction<TestDomain, ArrayType, ArrayType>>();
-        assert_send_and_sync::<LoweredFunction<TestDomain, ArrayType, ArrayType>>();
-        assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
-
-        let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegOperation::new()) } else { input }
-            },
-        );
-        assert_dispatcher_send_and_sync(&function);
-    }
-
-    #[test]
-    fn test_compiled_function_dispatcher_serves_concurrent_warm_calls() {
+    fn test_compiled_function_dispatcher_call_concurrent_warm_calls() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
@@ -3036,7 +2946,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_concurrent_cold_misses_produce_duplicates_and_one_entry() {
+    fn test_compiled_function_dispatcher_call_concurrent_cold_misses() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
@@ -3066,5 +2976,69 @@ mod tests {
         assert!(statistics.traces >= 1 && statistics.traces <= 2);
         assert_eq!(statistics.traces, statistics.dispatch_misses);
         assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_send_and_sync() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+        fn assert_dispatcher_send_and_sync<F: Send + Sync>(
+            _function: &CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>,
+        ) {
+            assert_send_and_sync::<CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>>();
+        }
+
+        assert_send_and_sync::<StagedFunction<TestDomain, ArrayType, ArrayType>>();
+        assert_send_and_sync::<LoweredFunction<TestDomain, ArrayType, ArrayType>>();
+        assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
+
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+            &domain,
+            |negate, input: CompilationTracer<TestDomain>| {
+                if negate { input.unary(NegOperation::new()) } else { input }
+            },
+        );
+        assert_dispatcher_send_and_sync(&function);
+    }
+
+    #[test]
+    fn test_try_jit_with_options_and_capacity() {
+        let domain = TestDomain::new();
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            try_jit_with_options_and_capacity(
+                &domain,
+                |negate, input: CompilationTracer<TestDomain>| {
+                    Ok(if negate { input.unary(NegOperation::new()) } else { input })
+                },
+                TestOptions::default(),
+                1,
+            );
+
+        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
+        function.call(true, Array::scalar(1.0).unwrap()).unwrap();
+        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
+
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().dispatch_misses, 3);
+        assert_eq!(function.statistics().traces, 3);
+        assert_eq!(domain.compilation_count(), 2, "the global exact compilation cache should reuse the evicted entry");
+    }
+
+    #[test]
+    fn test_stage_function_distinguishes_computations_from_one_call_site() {
+        let domain = TestDomain::new();
+
+        let identity = compile_from_one_call_site(&domain, false);
+        let negate = compile_from_one_call_site(&domain, true);
+
+        assert_eq!(
+            call_function(&domain, identity.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
+            Array::scalar(3.0).unwrap()
+        );
+        assert_eq!(
+            call_function(&domain, negate.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
+            Array::scalar(-3.0).unwrap()
+        );
+        assert_eq!(domain.compilation_count(), 2);
     }
 }

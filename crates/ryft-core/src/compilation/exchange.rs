@@ -1,13 +1,39 @@
-//! Backend-neutral exchange of serialized compilation artifacts.
+//! Backend-neutral exchange of serialized compilation artifacts among the processes of one distributed run.
 
-use std::fmt::{Display, Formatter};
+// TODO(eaplatanios): Review this module.
+
 use std::time::Duration;
+
+use thiserror::Error;
+
+/// Failure reported by a [`CompilationArtifactExchange`] implementation.
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum CompilationExchangeError {
+    /// The exchange deadline elapsed before an artifact became available.
+    #[error("compilation artifact exchange timed out")]
+    TimedOut,
+
+    /// Participating processes disagreed about the launch, compilation, backend, or topology identity.
+    #[error("compilation artifact exchange is incompatible: {message}")]
+    Incompatible {
+        /// Human-readable lowercase description of the incompatibility.
+        message: String,
+    },
+
+    /// The exchange transport or coordination protocol failed.
+    #[error("compilation artifact exchange failed: {message}")]
+    Failed {
+        /// Human-readable lowercase description of the failure.
+        message: String,
+    },
+}
 
 /// Exchanges serialized compiled programs between processes participating in one distributed run.
 ///
 /// Core treats keys and artifacts as opaque bytes. Backends remain responsible for producing a complete stable key,
 /// serializing every piece of invocation metadata, and rejecting artifacts that are incompatible with the local
-/// runtime.
+/// runtime. Process zero is the leader that compiles and publishes, and every other process is a follower that
+/// receives.
 pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the zero-based index of this process.
     fn process_index(&self) -> usize;
@@ -17,9 +43,9 @@ pub trait CompilationArtifactExchange: Send + Sync {
 
     /// Verifies that every process is participating in the same compilation round.
     ///
-    /// Implementations should compare `key`, process count, and any transport-owned launch or backend compatibility
-    /// identity before allowing the producer to compile or followers to wait for an artifact. The default validates
-    /// only the local process coordinates so simple transports remain usable.
+    /// Implementations should compare `key`, the process count, and any launch or backend compatibility identity that
+    /// the transport owns before allowing the leader to compile or followers to wait for an artifact. The default
+    /// validates only the local process coordinates so that simple transports remain usable.
     fn preflight(&self, _key: &[u8], _timeout: Duration) -> Result<(), CompilationExchangeError> {
         if self.process_count() == 0 {
             return Err(CompilationExchangeError::Incompatible {
@@ -34,13 +60,14 @@ pub trait CompilationArtifactExchange: Send + Sync {
         Ok(())
     }
 
-    /// Publishes `artifact` for `key` so follower processes can receive it.
+    /// Publishes `artifact` for `key` so that follower processes can receive it.
     fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError>;
 
-    /// Publishes a terminal producer failure so followers do not wait until their deadline.
+    /// Publishes a terminal leader failure for `key` so that followers do not wait until their deadline.
     ///
-    /// Transports that cannot represent terminal failures may keep the default no-op behavior; followers then follow
-    /// their configured timeout policy.
+    /// The leader calls this function whenever it cannot publish an artifact for `key`, which includes failed
+    /// compilations as well as compiled programs that cannot be serialized. Transports that cannot represent terminal
+    /// failures may keep the default no-op behavior, in which case followers follow their configured timeout policy.
     #[inline]
     fn publish_failure(&self, _key: &[u8], _message: &str) -> Result<(), CompilationExchangeError> {
         Ok(())
@@ -48,21 +75,21 @@ pub trait CompilationArtifactExchange: Send + Sync {
 
     /// Waits up to `timeout` for an artifact published for `key`.
     ///
-    /// `Ok(None)` means no artifact became available before the deadline. Transport and protocol failures are returned
-    /// explicitly.
+    /// `Ok(None)` means that no artifact became available before the deadline. Transport and protocol failures,
+    /// including terminal failures published by the leader, are returned explicitly.
     fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError>;
 }
 
-/// Policy controlling distributed compiled-artifact exchange.
+/// Policy controlling the distributed exchange of compiled artifacts.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum CompilationArtifactExchangePolicy {
     /// Never publish or receive compilation artifacts.
     #[default]
     Disabled,
 
-    /// Prefer an exchanged artifact and optionally compile locally when exchange is unavailable or fails.
+    /// Prefer an exchanged artifact and optionally compile locally when the exchange is unavailable or fails.
     PreferSharing {
-        /// Maximum time followers wait for the producer.
+        /// Maximum time that followers wait for the leader.
         timeout: Duration,
 
         /// Whether a follower may compile locally after an exchange miss or failure.
@@ -71,12 +98,13 @@ pub enum CompilationArtifactExchangePolicy {
 
     /// Require a compatible exchanged artifact and fail instead of compiling on follower processes.
     RequireSharing {
-        /// Maximum time followers wait for the producer.
+        /// Maximum time that followers wait for the leader.
         timeout: Duration,
     },
 }
 
 impl CompilationArtifactExchangePolicy {
+    /// Returns the follower deadline, or [`None`] when this policy disables the exchange.
     #[inline]
     pub(crate) fn timeout(self) -> Option<Duration> {
         match self {
@@ -85,6 +113,7 @@ impl CompilationArtifactExchangePolicy {
         }
     }
 
+    /// Returns whether a process may compile locally after the exchange could not supply or publish an artifact.
     #[inline]
     pub(crate) fn permits_local_fallback(self) -> bool {
         match self {
@@ -95,35 +124,87 @@ impl CompilationArtifactExchangePolicy {
     }
 }
 
-/// Failure reported by a compiled-artifact exchange implementation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CompilationExchangeError {
-    /// The exchange deadline elapsed before an artifact became available.
-    TimedOut,
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Participating processes disagreed about the launch, compilation, backend, or topology identity.
-    Incompatible {
-        /// Human-readable lower-case description of the incompatibility.
-        message: String,
-    },
+    #[test]
+    fn test_compilation_exchange_error_display() {
+        assert_eq!(CompilationExchangeError::TimedOut.to_string(), "compilation artifact exchange timed out");
+        assert_eq!(
+            CompilationExchangeError::Incompatible { message: "launch identities differ".to_string() }.to_string(),
+            "compilation artifact exchange is incompatible: launch identities differ",
+        );
+        assert_eq!(
+            CompilationExchangeError::Failed { message: "connection reset".to_string() }.to_string(),
+            "compilation artifact exchange failed: connection reset",
+        );
+    }
 
-    /// The exchange transport or coordination protocol failed.
-    Failed {
-        /// Human-readable lower-case description of the failure.
-        message: String,
-    },
-}
-
-impl Display for CompilationExchangeError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TimedOut => write!(formatter, "compilation artifact exchange timed out"),
-            Self::Incompatible { message } => {
-                write!(formatter, "compilation artifact exchange is incompatible: {message}")
-            }
-            Self::Failed { message } => write!(formatter, "compilation artifact exchange failed: {message}"),
+    #[test]
+    fn test_compilation_artifact_exchange_preflight() {
+        struct TestExchange {
+            process_index: usize,
+            process_count: usize,
         }
+
+        impl CompilationArtifactExchange for TestExchange {
+            fn process_index(&self) -> usize {
+                self.process_index
+            }
+
+            fn process_count(&self) -> usize {
+                self.process_count
+            }
+
+            fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationExchangeError> {
+                Ok(())
+            }
+
+            fn receive(&self, _key: &[u8], _timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
+                Ok(None)
+            }
+        }
+
+        let timeout = Duration::from_secs(1);
+        assert_eq!(TestExchange { process_index: 1, process_count: 2 }.preflight(b"key", timeout), Ok(()));
+        assert_eq!(
+            TestExchange { process_index: 0, process_count: 0 }.preflight(b"key", timeout),
+            Err(CompilationExchangeError::Incompatible {
+                message: "exchange process count must be greater than zero".to_string(),
+            }),
+        );
+        assert_eq!(
+            TestExchange { process_index: 2, process_count: 2 }.preflight(b"key", timeout),
+            Err(CompilationExchangeError::Incompatible {
+                message: "exchange process index is outside the configured process count".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_compilation_artifact_exchange_policy_timeout() {
+        let timeout = Duration::from_millis(10);
+        assert_eq!(CompilationArtifactExchangePolicy::Disabled.timeout(), None);
+        assert_eq!(
+            CompilationArtifactExchangePolicy::PreferSharing { timeout, fallback_to_local_compile: false }.timeout(),
+            Some(timeout),
+        );
+        assert_eq!(CompilationArtifactExchangePolicy::RequireSharing { timeout }.timeout(), Some(timeout));
+    }
+
+    #[test]
+    fn test_compilation_artifact_exchange_policy_permits_local_fallback() {
+        let timeout = Duration::from_millis(10);
+        assert!(CompilationArtifactExchangePolicy::Disabled.permits_local_fallback());
+        assert!(
+            CompilationArtifactExchangePolicy::PreferSharing { timeout, fallback_to_local_compile: true }
+                .permits_local_fallback()
+        );
+        assert!(
+            !CompilationArtifactExchangePolicy::PreferSharing { timeout, fallback_to_local_compile: false }
+                .permits_local_fallback()
+        );
+        assert!(!CompilationArtifactExchangePolicy::RequireSharing { timeout }.permits_local_fallback());
     }
 }
-
-impl std::error::Error for CompilationExchangeError {}

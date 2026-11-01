@@ -7244,8 +7244,8 @@ mod tests {
         println!(
             "  compilation cache: retained_entries={} lookup_ms={:.3} compilation_ms={:.3}",
             domain.cache_size(),
-            statistics.memory_lookup_duration_ns as f64 / 1e6,
-            statistics.compilation_duration_ns as f64 / 1e6,
+            statistics.memory_lookup_duration.as_secs_f64() * 1e3,
+            statistics.compilation_duration.as_secs_f64() * 1e3,
         );
     }
 
@@ -7385,10 +7385,10 @@ mod tests {
         );
         println!(
             "  jit cache: abstractification_ms={:.3} dispatch_ms={:.3} tracing_ms={:.3} lowering_ms={:.3}",
-            statistics.input_abstractification_duration_ns as f64 / 1e6,
-            statistics.dispatch_duration_ns as f64 / 1e6,
-            statistics.tracing_duration_ns as f64 / 1e6,
-            statistics.lowering_duration_ns as f64 / 1e6,
+            statistics.input_abstractification_duration.as_secs_f64() * 1e3,
+            statistics.dispatch_duration.as_secs_f64() * 1e3,
+            statistics.tracing_duration.as_secs_f64() * 1e3,
+            statistics.lowering_duration.as_secs_f64() * 1e3,
         );
         print_baseline_compilation_statistics(&domain);
     }
@@ -7521,25 +7521,25 @@ mod tests {
             let mut jvp_totals = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
             let mut jvp_backends = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
             for outer in &outers {
-                let before = domain.compilation_context().statistics().compilation_duration_ns;
+                let before = domain.compilation_context().statistics().compilation_duration;
                 let start = Instant::now();
                 let derived: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
                     outer.jvp(&domain).unwrap();
                 jvp_totals.push(start.elapsed());
-                let after = domain.compilation_context().statistics().compilation_duration_ns;
-                jvp_backends.push(Duration::from_nanos(after - before));
+                let after = domain.compilation_context().statistics().compilation_duration;
+                jvp_backends.push(after - before);
                 assert_eq!(derived.output_types().len(), 2);
             }
 
             let mut gradient_totals = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
             let mut gradient_backends = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
             for outer in &outers {
-                let before = domain.compilation_context().statistics().compilation_duration_ns;
+                let before = domain.compilation_context().statistics().compilation_duration;
                 let start = Instant::now();
                 let derived: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.gradient(&domain).unwrap();
                 gradient_totals.push(start.elapsed());
-                let after = domain.compilation_context().statistics().compilation_duration_ns;
-                gradient_backends.push(Duration::from_nanos(after - before));
+                let after = domain.compilation_context().statistics().compilation_duration;
+                gradient_backends.push(after - before);
                 assert_eq!(derived.output_types().len(), 1);
             }
 

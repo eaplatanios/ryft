@@ -20,12 +20,12 @@
 //!
 //! # Terminology
 //!
-//! A _program_ is the transformable IR value: atoms, instructions, regions, and boundary types, carrying neither
-//! captures nor a structured signature. A _function_ is the callable package that pairs a program with everything a
-//! call needs, namely the capture table, the structured input and output signatures, the compilation options, and the
-//! backend artifacts. Every lifecycle handle below is therefore a function rather than a program, and
-//! [`CompiledFunctionDispatcher`] is not a program at all: it is a retained dispatcher over a Rust closure that
-//! produces one program per specialization. The `*Program` names inside the domain contracts
+//! A _program_ is the transformable IR value (i.e., atoms, instructions, regions, and boundary types), which carries
+//! neither captures nor a structured signature. A _function_ is the callable package that pairs a program with
+//! everything a call needs, namely the capture table, the structured input and output signatures, the compilation
+//! options, and the backend artifacts. Every lifecycle handle below is therefore a function rather than a program, and
+//! [`CompiledFunctionDispatcher`] is not a program at all but a retained dispatcher over a Rust closure that produces
+//! one program per specialization. The `*Program` names inside the domain contracts
 //! ([`CompilationDomain::LoweredProgram`], [`CompilationDomain::CompiledProgram`], and [`FlatCompilationProgram`])
 //! name the backend and IR artifacts that those functions carry.
 //!
@@ -76,7 +76,7 @@
 //!    transformations. Pure runtime execution uses [`CompilationDomain::call`]; transactional external state uses
 //!    [`StatefulCompilationDomain::call_statefully_async`].
 //! 4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
-//!    [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed; this runtime-only
+//!    [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed. This runtime-only
 //!    handle gains `Send` and `Sync` structurally whenever its backend fields do.
 //!
 //! # Captures and Nested Calls
@@ -90,7 +90,7 @@
 //!
 //! [`CapturingContext`](crate::captures::CapturingContext) lets ordinary and transform contexts register captures
 //! through their parent. To embed a staged function in a larger trace, an operation family implements
-//! [`CompiledCallOperation`]; that operation then owns how the nested call behaves under lowering, batching,
+//! [`CompiledCallOperation`], and that operation then owns how the nested call behaves under lowering, batching,
 //! differentiation, partial evaluation, and interpretation.
 //!
 //! # Specialization and Caching
@@ -98,10 +98,10 @@
 //! [`CompiledFunctionDispatcher`] keeps one bounded LRU cache of compiled specializations, built on the general
 //! [`SpecializationCache`](crate::specialization::SpecializationCache) primitive and keyed by the static parameters,
 //! the input parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained
-//! executable; a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
+//! executable, while a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
 //! resulting executable. Tracing and lowering are cheap relative to backend compilation, so there are no intermediate
-//! trace/lowering caches: after an eviction or failure the miss path simply reruns those stages, and the shared
-//! [`CompilationContext`] below still deduplicates the expensive backend compile.
+//! tracing or lowering caches. After an eviction or failure, the miss path simply reruns those stages, and the shared
+//! [`CompilationContext`] below still deduplicates the expensive backend compilation.
 //!
 //! That argument does not carry over to eager (op-by-op) dispatch, where a compiled program is reused for every
 //! application of the same operation and the relevant comparison is with _executing_ one small operation rather than
@@ -111,21 +111,21 @@
 //! `(primitive, params)` dispatch cache. For example, the XLA backend keeps such a cache in each of its sessions.
 //!
 //! Cloned [`CompiledFunctionDispatcher`] handles share one cache, and the dispatcher is usable from multiple threads
-//! whenever its domain, closure, static parameters, and artifact types are thread-safe: same-thread recursive dispatch
-//! of the specialization currently being produced is rejected with an error, while concurrent cold misses on
-//! different threads deliberately duplicate the cheap frontend work with idempotent inserts and leave backend-compile
-//! coordination to the shared context.
+//! whenever its domain, closure, static parameters, and artifact types are thread-safe. Recursive dispatch on one
+//! thread of the specialization currently being produced is rejected with an error, while concurrent cold misses on
+//! different threads deliberately duplicate the cheap frontend work with idempotent inserts and leave the coordination
+//! of backend compilation to the shared context.
 //!
 //! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle,
 //! and it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight
 //! coordination, optional persistent storage, optional distributed exchange, and finally backend compilation. Refer
 //! to [`CompilationContext`] for the rendered tier diagram.
 //!
-//! Same-key misses are single-flight while different keys may compile concurrently. [`DiskCache`] provides optional
-//! checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts among
-//! processes according to [`CompilationArtifactExchangePolicy`]. [`JitCacheStatistics`] reports frontend dispatch
-//! activity, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report shared-context
-//! activity across the memory, persistent, exchange, and backend compilation tiers.
+//! Misses for the same key are single flight, while different keys may compile concurrently. [`DiskCache`] provides
+//! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
+//! among processes according to [`CompilationArtifactExchangePolicy`]. [`JitCacheStatistics`] reports frontend
+//! dispatch activity, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report the activity of
+//! the shared context across the memory, persistent, exchange, and backend compilation tiers.
 //!
 //! # Extending Compilation
 //!
@@ -142,11 +142,11 @@
 //! staged functions must compose inside other traces.
 //!
 //! The generic [`CompilationDomain`] methods use [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
-//! [`CallRequest`] as typed backend-extension witnesses. These traits keep the structured input/output bounds in one
-//! place and expose only the transition-specific artifact operations a backend needs. Ordinary callers construct a
-//! [`CompilationStagingRequest`] or use [`stage_function`]; backend implementations name the witness traits in their
-//! method bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or `reconstruct`
-//! methods.
+//! [`CallRequest`] as typed backend extension witnesses. These traits keep the structured input and output bounds in
+//! one place and expose only the artifact operations that a backend needs for each transition. Ordinary callers
+//! construct a [`CompilationStagingRequest`] or use [`stage_function`], while backend implementations name the witness
+//! traits in their bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or
+//! `reconstruct` functions.
 //!
 //! # Reading Order
 //!
@@ -159,6 +159,8 @@
 //! 4. Read [`CompilationContext`] for single-flight compilation and cache tiers.
 //! 5. Read [`DiskCache`] and [`CompilationArtifactExchange`] only when adding persistence or distributed sharing.
 //! 6. Continue with a backend crate such as `ryft-xla` for a concrete [`CompilationDomain`] implementation.
+
+// TODO(eaplatanios): Review this module.
 
 pub mod contexts;
 pub mod disk_cache;

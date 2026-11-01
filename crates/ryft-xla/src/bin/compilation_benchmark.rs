@@ -96,7 +96,11 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
 }
 
 fn duration_nanoseconds(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    nanoseconds(start.elapsed())
+}
+
+fn nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn distribution(samples: &[u64]) -> Value {
@@ -123,10 +127,10 @@ fn jit_statistics(statistics: JitCacheStatistics) -> Value {
         "traces": statistics.traces,
         "lowerings": statistics.lowerings,
         "compilation_requests": statistics.compilation_requests,
-        "input_abstractification_duration_ns": statistics.input_abstractification_duration_ns,
-        "dispatch_duration_ns": statistics.dispatch_duration_ns,
-        "tracing_duration_ns": statistics.tracing_duration_ns,
-        "lowering_duration_ns": statistics.lowering_duration_ns,
+        "input_abstractification_duration_ns": nanoseconds(statistics.input_abstractification_duration),
+        "dispatch_duration_ns": nanoseconds(statistics.dispatch_duration),
+        "tracing_duration_ns": nanoseconds(statistics.tracing_duration),
+        "lowering_duration_ns": nanoseconds(statistics.lowering_duration),
     })
 }
 
@@ -139,9 +143,9 @@ fn compilation_statistics(domain: &XlaDomain<'_>) -> Value {
         "compilations": statistics.compilations,
         "waits": statistics.waits,
         "persistent_errors": statistics.persistent_errors,
-        "persistent_lookup_duration_ns": statistics.persistent_lookup_duration_ns,
-        "memory_lookup_duration_ns": statistics.memory_lookup_duration_ns,
-        "compilation_duration_ns": statistics.compilation_duration_ns,
+        "persistent_lookup_duration_ns": nanoseconds(statistics.persistent_lookup_duration),
+        "memory_lookup_duration_ns": nanoseconds(statistics.memory_lookup_duration),
+        "compilation_duration_ns": nanoseconds(statistics.compilation_duration),
     })
 }
 
