@@ -141,8 +141,9 @@
 //! analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when staged
 //! functions must compose inside other traces.
 //!
-//! Core implements [`CompilationDomain::stage`], which backends must not override. Backends customize staging
-//! through [`CompilationDomain::staged_input_types`] and [`CompilationDomain::staged_output_types`]. The remaining
+//! Core implements [`CompilationDomain::stage`], which backends must not override and which traces exactly
+//! the input types that it receives. Backends apply options that change input types before staging (e.g., in
+//! [`CompilationDomain::dispatch_signature`]) and options that change output types during lowering. The remaining
 //! [`CompilationDomain`] functions accept [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
 //! implementations. These traits keep the structured input and output bounds of each stage in one place and expose
 //! only the operations that a backend needs to complete it. They are also required by a limitation of the Rust

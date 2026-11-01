@@ -107,10 +107,9 @@ pub type FlatCompilationProgram<C> = Program<
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
 
-/// Traces `function` into a staged function through the staging hooks of `domain`, implementing
-/// [`CompilationDomain::stage`] (refer to its documentation for the meaning of the arguments).
+/// Traces `function` into a staged function, implementing [`CompilationDomain::stage`] (refer to its documentation for
+/// the meaning of the arguments).
 pub(crate) fn trace_function<C, F, Input, Output>(
-    domain: &C,
     function: F,
     captures: Vec<C::Value>,
     input_types: Input,
@@ -133,9 +132,7 @@ where
 {
     validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
     let input_structure = input_types.parameter_structure();
-    let input_type_values = domain.staged_input_types(input_types.into_parameters().collect(), &options)?;
-    let input_types = Input::from_parameters(input_structure.clone(), input_type_values.iter().cloned())
-        .map_err(ProgramError::from)?;
+    let input_type_values = input_types.parameters().cloned().collect::<Vec<_>>();
     let context = DomainTracingContext::<C, C::Value>::new();
     let capture_table = context.captures().clone();
     let builder = context.builder().clone();
@@ -155,7 +152,6 @@ where
     let output_structure = outputs.parameter_structure();
     let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
     let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-    let output_types = domain.staged_output_types(output_types, &options)?;
     drop(outputs);
     drop(context);
     let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
@@ -1771,21 +1767,13 @@ mod tests {
         fn dispatch_signature(
             &self,
             input_types: Vec<ArrayType>,
-            _options: &Self::Options,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
-            let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types))
-        }
-
-        fn staged_input_types(
-            &self,
-            input_types: Vec<ArrayType>,
             options: &Self::Options,
-        ) -> Result<Vec<ArrayType>, Self::Error> {
-            match &options.staged_input_type {
-                Some(input_type) => Ok(input_types.iter().map(|_| input_type.clone()).collect()),
-                None => Ok(input_types),
-            }
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
+            let input_types: Arc<[ArrayType]> = match &options.staged_input_type {
+                Some(input_type) => input_types.iter().map(|_| input_type.clone()).collect(),
+                None => input_types.into(),
+            };
+            Ok((input_types.clone(), input_types))
         }
 
         fn lower<Request>(
@@ -2046,20 +2034,6 @@ mod tests {
             .unwrap();
 
         assert!(staged.source_program().captures().is_empty());
-    }
-
-    #[test]
-    fn test_compilation_domain_stage_applies_staged_input_types() {
-        let domain = TestDomain::new();
-        let options =
-            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> =
-            stage(&domain, |input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F64), options)
-                .unwrap();
-
-        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::I64)]);
-        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::I64)]);
-        assert_eq!(staged.options().staged_input_type, Some(ArrayType::scalar(DataType::I64)));
     }
 
     #[test]

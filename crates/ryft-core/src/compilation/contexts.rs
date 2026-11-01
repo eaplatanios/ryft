@@ -97,8 +97,9 @@ pub trait CallRequest<C: CompilationDomain>: Sized {
 /// The domain performs every stage, while staged, lowered, compiled, and executable functions remain passive values.
 /// Lowering, compilation, and execution are implemented entirely by the backend, including any validation, caching, or
 /// runtime conversion that the backend chooses to apply. Staging is implemented by core, because only core can trace
-/// Rust closures, and backends customize it through [`Self::staged_input_types`] and [`Self::staged_output_types`].
-/// Backends that cannot execute some staged functions reject them during lowering.
+/// Rust closures, and it traces exactly the input types that it receives. Backends apply options that change input
+/// types before staging (e.g., in [`Self::dispatch_signature`] for retained dispatch), apply options that change output
+/// types during lowering, and reject staged functions that they cannot execute during lowering as well.
 ///
 /// # Request Traits
 ///
@@ -149,35 +150,10 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    /// Returns the flat input types at which a function is traced, given its declared flat input types and the
-    /// options of its staging request. Backends use this hook to apply options that affect the input signature (e.g.,
-    /// input sharding overrides). The returned types must preserve the number of inputs, because they are placed back
-    /// into the parameter structure of the request. The default implementation returns `input_types` unchanged.
-    #[inline]
-    fn staged_input_types(
-        &self,
-        input_types: Vec<Self::Type>,
-        _options: &Self::Options,
-    ) -> Result<Vec<Self::Type>, Self::Error> {
-        Ok(input_types)
-    }
-
-    /// Returns the flat output types that a staged function declares, given the output types that tracing produced
-    /// and the options of its staging request. Backends use this hook to apply options that affect the output
-    /// signature (e.g., output sharding overrides). The default implementation returns `output_types` unchanged.
-    #[inline]
-    fn staged_output_types(
-        &self,
-        output_types: Vec<Self::Type>,
-        _options: &Self::Options,
-    ) -> Result<Vec<Self::Type>, Self::Error> {
-        Ok(output_types)
-    }
-
     /// Traces the fallible `function` into a staged function. `function` receives the symbolic references of
     /// `captures`, tracers for those captures, and tracers for inputs of `input_types`, and returns its traced outputs.
-    /// This is the only staging primitive. It applies [`Self::staged_input_types`] before tracing and
-    /// [`Self::staged_output_types`] after tracing, and retains `options` in the returned staged function.
+    /// This is the only staging primitive. It traces at exactly `input_types` and retains `options` in the returned
+    /// staged function for lowering and compilation.
     ///
     /// Backends must not override this function (refer to the [`CompilationDomain`] documentation for why).
     #[inline]
@@ -207,7 +183,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
-        trace_function(self, function, captures, input_types, options)
+        trace_function(function, captures, input_types, options)
     }
 
     /// Lowers a staged function into the program representation of this backend (i.e., [`Self::LoweredProgram`]).
