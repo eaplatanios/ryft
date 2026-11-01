@@ -8,6 +8,7 @@ mod operations;
 mod parameters;
 
 use capabilities::CapabilityCodeGenerator;
+use diagrams::DiagramRenderer;
 use operations::OperationCodeGenerator;
 use parameters::ParameterizedCodeGenerator;
 
@@ -132,11 +133,15 @@ pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// The attribute rewrites every ```` ```mermaid ```` code fence (or `~~~mermaid` fence) in the outer documentation
 /// attributes of the item, which include its `///` comments, into a `<pre class="mermaid">` HTML block, and inserts a
 /// small module script before the first diagram of the item that loads Mermaid and renders the diagrams of the page in
-/// the browser. The script renders each page once even when several of its items carry diagrams, and it selects the
-/// dark Mermaid theme when the browser prefers a dark color scheme. All other documentation lines, including other code
-/// fences, are preserved verbatim and in order, and items without diagrams are returned unchanged. The attribute takes
-/// no arguments, and it rejects unterminated diagrams, code fences nested inside diagrams, and attributes other than
-/// literal documentation attributes placed between the lines of a diagram.
+/// the browser. The script renders each page once even when several of its items carry diagrams. It selects the dark
+/// Mermaid theme when the page uses a dark rustdoc theme (i.e., `dark` or `ayu`), or when the page uses no other
+/// built-in rustdoc theme and the browser prefers a dark color scheme. The theme is selected when the diagrams are
+/// rendered, so diagrams pick up a rustdoc theme change only after the page is reloaded. All other documentation lines,
+/// including other code fences, are preserved verbatim and in order, and items without diagrams are returned unchanged.
+/// The attribute takes no arguments, and it rejects unterminated diagrams, code fences nested inside diagrams, and
+/// attributes other than literal documentation attributes placed between the lines of a diagram. When it reports
+/// errors, the item is still emitted unchanged, so that its uses elsewhere do not report additional errors about
+/// a missing item.
 ///
 /// Diagram text reaches Mermaid as written, except that HTML character references in it are decoded first, so that
 /// labels can contain HTML elements spelled with entities (e.g., `&lt;code&gt;` for a `code` element).
@@ -168,10 +173,8 @@ pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// elsewhere (e.g., by `cargo doc --target <triple>`, which writes to `<target>/<triple>/doc`, or into a target
 /// directory configured through `--target-dir` or `build.target-dir`) does not receive the bundle and renders its
 /// diagrams through the CDN. The same holds when the bundle is deleted while the documentation of the crate is fresh,
-/// since rustdoc only expands the attribute when it documents the crate again.
+/// because rustdoc only expands the attribute when it documents the crate again.
 #[proc_macro_attribute]
 pub fn mermaid(attributes: TokenStream, input: TokenStream) -> TokenStream {
-    diagrams::expand(attributes.into(), input.into())
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    DiagramRenderer::render_diagrams(attributes.into(), input.into()).into()
 }

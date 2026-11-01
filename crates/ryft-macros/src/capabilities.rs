@@ -351,9 +351,9 @@ impl CapabilityCodeGenerator {
 
     /// Generates one function of a projection implementation. The function projects the receiver and every `&Self`,
     /// `&[Self]`, and `Option<&Self>` input onto the member universe, applies the member implementation, and lifts its
-    /// outputs back through [`lift`], while passing all other inputs through unchanged. The generated function keeps
-    /// the `#[cfg]` and `#[cfg_attr]` attributes of the trait function, so that both are compiled under the same
-    /// configuration, and its local variables are named so that they cannot shadow the inputs of the function.
+    /// outputs back through [`lift_projected_output`], while passing all other inputs through unchanged. The generated
+    /// function keeps the `#[cfg]` and `#[cfg_attr]` attributes of the trait function, so that both are compiled under
+    /// the same configuration, and its local variables are named so that they cannot shadow the inputs of the function.
     ///
     /// # Parameters
     ///
@@ -442,10 +442,23 @@ impl CapabilityCodeGenerator {
         let syn::ReturnType::Type(_, output) = &signature.output else {
             return Err(syn::Error::new_spanned(&signature, "projected capability functions must return a `Result`"));
         };
-        let Some(output) = result_value_type(output) else {
+
+        // The success type `R` of the returned `Result<R, E>` (named through any path to `Result`) is the type of the
+        // outputs that are lifted back into the heterogeneous universe.
+        let output = if let syn::Type::Path(syn::TypePath { qself: None, path }) = output.as_ref()
+            && let Some(segment) = path.segments.last()
+            && segment.ident == "Result"
+            && let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments
+            && arguments.args.len() == 2
+            && let Some(syn::GenericArgument::Type(output)) = arguments.args.first()
+            && let Some(syn::GenericArgument::Type(_)) = arguments.args.last()
+        {
+            output
+        } else {
             return Err(syn::Error::new_spanned(output, "projected capability functions must return a `Result`"));
         };
-        let lifted = lift(output, quote!(__output), member, ryft)?;
+
+        let lifted = lift_projected_output(output, quote!(__output), member, ryft)?;
         let value_type: syn::Path = MACRO_VALUE_TYPE.into();
         let attributes = function
             .attrs
@@ -480,8 +493,6 @@ struct Projection {
     member: syn::Type,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns `true` if the provided type is `<Self as Capability>::Universe`, with any path to `Capability`.
 fn is_universe_default(r#type: &syn::Type) -> bool {
     let syn::Type::Path(syn::TypePath { qself: Some(qualified_self), path }) = r#type else {
@@ -495,8 +506,8 @@ fn is_universe_default(r#type: &syn::Type) -> bool {
         && segments[qualified_self.position].ident == UNIVERSE_TYPE
 }
 
-/// Returns the single type argument `A` of the provided type if it is a path whose last segment is `name<A>` (e.g.,
-/// `Option<A>`, `Vec<A>`, or `std::vec::Vec<A>`), and [`None`] otherwise.
+/// Returns the single type argument `A` of the provided type if it is a path whose last segment is `name<A>`
+/// (e.g., `Option<A>`, `Vec<A>`, or `std::vec::Vec<A>`), and [`None`] otherwise.
 fn single_type_argument<'t>(r#type: &'t syn::Type, name: &str) -> Option<&'t syn::Type> {
     let syn::Type::Path(syn::TypePath { qself: None, path }) = r#type else {
         return None;
@@ -511,24 +522,8 @@ fn single_type_argument<'t>(r#type: &'t syn::Type, name: &str) -> Option<&'t syn
     }
 }
 
-/// Returns the success type `R` of the provided type if it is a path whose last segment is `Result<R, E>`, and [`None`]
-/// otherwise.
-fn result_value_type(r#type: &syn::Type) -> Option<&syn::Type> {
-    let syn::Type::Path(syn::TypePath { qself: None, path }) = r#type else {
-        return None;
-    };
-    let segment = path.segments.last()?;
-    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return None;
-    };
-    match arguments.args.iter().collect::<Vec<_>>().as_slice() {
-        [syn::GenericArgument::Type(value), syn::GenericArgument::Type(_)] if segment.ident == "Result" => Some(value),
-        _ => None,
-    }
-}
-
-/// Lifts the projected value of the provided expression, whose type is `type` with `Self` read as the projected
-/// member, back into the heterogeneous universe. `Self` is lifted through `ValueProjection::from_projected`,
+/// Lifts the projected output value of the provided expression, whose type is `type` with `Self` read as the
+/// projected member, back into the heterogeneous universe. `Self` is lifted through `ValueProjection::from_projected`,
 /// `Vec<Self>` is lifted element by element, tuples are lifted component by component, and types that do not mention
 /// `Self` are passed through unchanged. Returns an error for all other types that mention `Self`.
 ///
@@ -538,7 +533,12 @@ fn result_value_type(r#type: &syn::Type) -> Option<&syn::Type> {
 ///   - `expression`: Expression that evaluates to the projected value.
 ///   - `member`: Member universe of the projected value.
 ///   - `ryft`: Root `ryft` library path used by the generated code.
-fn lift(r#type: &syn::Type, expression: TokenStream, member: &syn::Type, ryft: &syn::Path) -> syn::Result<TokenStream> {
+fn lift_projected_output(
+    r#type: &syn::Type,
+    expression: TokenStream,
+    member: &syn::Type,
+    ryft: &syn::Path,
+) -> syn::Result<TokenStream> {
     let from_projected = quote!(<Self as #ryft::ValueProjection<#member>>::from_projected);
     if r#type.matches_ident(&SELF_TYPE.into()) {
         return Ok(quote!(#from_projected(#expression)));
@@ -558,7 +558,7 @@ fn lift(r#type: &syn::Type, expression: TokenStream, member: &syn::Type, ryft: &
                 .elems
                 .iter()
                 .zip(&names)
-                .map(|(element, name)| lift(element, quote!(#name), member, ryft))
+                .map(|(element, name)| lift_projected_output(element, quote!(#name), member, ryft))
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(quote!({
                 let (#(#names,)*) = #expression;
@@ -976,6 +976,12 @@ mod tests {
             ),
             (
                 quote!(
+                    fn double(&self) -> Result<Self>;
+                ),
+                "projected capability functions must return a `Result`",
+            ),
+            (
+                quote!(
                     fn double(&self);
                 ),
                 "projected capability functions must return a `Result`",
@@ -1009,19 +1015,11 @@ mod tests {
     }
 
     #[test]
-    fn test_result_value_type() {
-        let r#type: syn::Type = syn::parse_quote!(std::result::Result<Vec<Self>, ProgramError>);
-        assert_eq!(result_value_type(&r#type).map(TokensHelpers::to_compact_string), Some("Vec<Self>".to_string()));
-        assert!(result_value_type(&syn::parse_quote!(Result<Self>)).is_none());
-        assert!(result_value_type(&syn::parse_quote!(Option<Self>)).is_none());
-    }
-
-    #[test]
-    fn test_lift() {
+    fn test_lift_projected_output() {
         let member: syn::Type = syn::parse_quote!(ArrayType);
         let ryft: syn::Path = syn::parse_quote!(ryft);
         let lift = |r#type: syn::Type| {
-            lift(&r#type, quote!(value), &member, &ryft)
+            lift_projected_output(&r#type, quote!(value), &member, &ryft)
                 .map(|lifted| rendering(&lifted))
                 .map_err(|error| error.to_string())
         };
