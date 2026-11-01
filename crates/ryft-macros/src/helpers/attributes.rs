@@ -127,6 +127,15 @@ impl AttributeValue for syn::Type {
     }
 }
 
+impl AttributeValue for syn::Expr {
+    fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
+        if &meta.path != name {
+            return Err(meta.error("cannot parse attribute value from a `ParseNestedMeta` with a different path"));
+        }
+        meta.value()?.parse()
+    }
+}
+
 impl AttributeValue for syn::ExprPath {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
@@ -289,6 +298,19 @@ mod tests {
         .parse2(quote!(crate = Vec<ryft::Placeholder>))
         .unwrap();
         assert_eq!(ty.expect("expected type to be parsed").to_compact_string(), "Vec<ryft::Placeholder>",);
+
+        // Test `syn::Expr::from_meta`.
+        let mut expression = None;
+        syn::meta::parser(|meta| {
+            expression = Some(syn::Expr::from_meta(&Symbol::new("requires"), &meta)?);
+            Ok(())
+        })
+        .parse2(quote!(requires = left.shape()[0] == right.shape()[0]))
+        .unwrap();
+        assert_eq!(
+            expression.expect("expected expression to be parsed").to_compact_string(),
+            "left.shape()[0]==right.shape()[0]",
+        );
 
         let error = syn::meta::parser(|meta| {
             let _ = syn::Ident::from_meta(&Symbol::new("crate"), &meta)?;
