@@ -5,12 +5,10 @@ use dyn_eq::DynEq;
 use dyn_hash::DynHash;
 use thiserror::Error;
 
+use crate::arrays::{BroadcastingError, DataTypeError, LayoutError, ShardingError};
 use crate::axes::AxisError;
-use crate::broadcasting::BroadcastingError;
 use crate::parameters::ParameterError;
-use crate::programs::types::TypeError;
-use crate::sharding::ShardingError;
-use crate::types::{DataTypeError, LayoutError};
+use crate::programs::{ProgramError, ReferenceError, TypeError};
 
 /// Represents errors that can occur in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -25,9 +23,6 @@ pub enum Error {
     Layout(#[from] LayoutError),
 
     #[error(transparent)]
-    Type(#[from] TypeError),
-
-    #[error(transparent)]
     Broadcasting(#[from] BroadcastingError),
 
     #[error(transparent)]
@@ -35,6 +30,15 @@ pub enum Error {
 
     #[error(transparent)]
     Axis(#[from] AxisError),
+
+    #[error(transparent)]
+    Type(#[from] TypeError),
+
+    #[error(transparent)]
+    Reference(#[from] ReferenceError),
+
+    #[error(transparent)]
+    Program(#[from] ProgramError),
 
     #[error("{0}")]
     Custom(Arc<dyn CustomError>),
@@ -80,20 +84,24 @@ dyn_hash::hash_trait_object!(CustomError);
 
 /// Adapter that lets closure-taking entry points accept both plain and fallible closures. An entry point that expects
 /// a closure producing `T` and reports errors as `E` can instead accept any closure output implementing
-/// `MaybeFallible<T, E>`. Returning `T` directly requires no wrapping, while returning `Result<T, SourceError>`
-/// for any `SourceError` that converts into `E` enables using `?` inside the closure.
+/// `MaybeFallible<T, E>`. Returning `T` directly requires no wrapping, while returning `Result<T, E>`, with `E` being
+/// exactly the entry point's error type, enables using `?` inside the closure: `?` still converts each intermediate
+/// error into `E` through [`From`]. A closure that instead returns a foreign-error [`Result`] wholesale adapts it with
+/// `.map_err(Into::into)`. The fallible implementation is deliberately exact rather than covering every source error
+/// that converts into `E`, because exact unification is what lets a bare `Ok(...)` closure body infer its error type
+/// from the entry point instead of requiring an explicit annotation.
 ///
 /// This dual-mode contract is only sound where the expected closure output `T` has a concrete outer type
-/// constructor at the entry point (e.g., the reverse-mode gradient entry points, whose closures produce a
+/// constructor at the entry point (e.g., the reverse mode gradient entry points, whose closures produce a
 /// [`LinearizationTracer`](crate::LinearizationTracer) or a tracer/auxiliary tuple). A plain output can then never
 /// unify with [`Result`], which is what lets type inference select between the two implementations unambiguously.
 /// When `T` is itself a fully generic parameter inferred from the closure (e.g., the traced output structures of
-/// [`trace`](crate::trace), [`batch`](crate::batch), [`vjp`](crate::vjp), etc.), a [`Result`]-returning closure
-/// would make both implementations applicable and inference ambiguous, and so those entry points accept fallible
-/// closures only.
+/// [`trace`](crate::trace), [`batch`](crate::batch), and the [`differentiate_at`](crate::differentiate_at) mechanism),
+/// a [`Result`]-returning closure would make both implementations applicable and inference ambiguous, and so those
+/// entry points accept fallible closures only.
 pub trait MaybeFallible<T, E> {
-    /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and converting the error type
-    /// of already fallible outputs into `E`.
+    /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and returning already fallible
+    /// outputs unchanged.
     fn into_result(self) -> Result<T, E>;
 }
 
@@ -104,9 +112,32 @@ impl<T, E> MaybeFallible<T, E> for T {
     }
 }
 
-impl<T, E, SourceError: Into<E>> MaybeFallible<T, E> for Result<T, SourceError> {
+impl<T, E> MaybeFallible<T, E> for Result<T, E> {
     #[inline]
     fn into_result(self) -> Result<T, E> {
-        self.map_err(Into::into)
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_error_from_reference_error() {
+        let error = Error::from(ReferenceError::Frozen);
+        assert_eq!(error, Error::Reference(ReferenceError::Frozen));
+        assert_eq!(error.to_string(), "reference is frozen");
+        assert_eq!(format!("{error:?}"), "Reference(Frozen)");
+    }
+
+    #[test]
+    fn test_error_from_program_error() {
+        let error = Error::from(ProgramError::PoisonedValue);
+        assert_eq!(error, Error::Program(ProgramError::PoisonedValue));
+        assert_eq!(error.to_string(), "encountered poisoned value where a live value was required");
+        assert_eq!(format!("{error:?}"), "Program(PoisonedValue)");
     }
 }

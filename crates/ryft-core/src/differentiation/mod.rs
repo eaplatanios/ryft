@@ -1,0 +1,3354 @@
+//! Contains machinery for forward and reverse mode automatic _differentiation_.
+//!
+//! Differentiation is expressed as [`Context`] composition and [`Program`](crate::Program) transformation rather than
+//! as a backend-specific facility. Values flowing through a [`DifferentiationContext`] carry a primal and a tangent,
+//! operation-owned Jacobian-Vector Product (JVP) rules propagate those duals, partial evaluation splits primal work
+//! from reusable linear work, and transposition turns the resulting linear program into a pullback for reverse mode
+//! differentiation.
+//!
+//! # Entry Points
+//!
+//! [`differentiate_at`] takes the active primal and returns a typed [`DifferentiationBuilder`] for composing
+//! value-level transforms with orthogonal options. Each terminal method receives the transformed closure as its last
+//! argument, so the builder state fixes the closure's parameter types before they are deduced and call sites rarely
+//! need to annotate them. The builder recovers its execution context from the active primal by default;
+//! [`DifferentiationBuilder::in_context`] binds one explicitly, and the blanket [`Differentiate`] trait provides the
+//! equivalent `context.differentiate_at(primal)` syntax. Its terminal methods provide the complete value-level API:
+//!
+//!   - [`DifferentiationBuilder::jvp`] computes a Jacobian-Vector Product (JVP) for one primal value and one tangent
+//!     value. It is the direct forward mode transform and is usually best when there are few input directions or when
+//!     both primal and tangent outputs are needed immediately.
+//!   - [`DifferentiationBuilder::linearize`] runs the primal computation once and returns its value together with a
+//!     reusable [`Pushforward`] that can be applied to many tangent inputs without repeating nonlinear primal work.
+//!   - [`DifferentiationBuilder::vjp`] runs the primal computation and returns a reusable [`Pullback`] mapping output
+//!     cotangents to input cotangents. It constructs a derivative program using
+//!     [`DifferentiableOperation::jvp_for_transpose`], then transposes that program to compute the Vector-Jacobian
+//!     Product (VJP). The default rule delegates to [`DifferentiableOperation::jvp`].
+//!   - [`DifferentiationBuilder::value_and_gradient`] and [`DifferentiationBuilder::gradient`] are scalar-output
+//!     conveniences that seed the pullback with one and materialize structural-zero gradients from primal inputs.
+//!   - [`DifferentiationBuilder::jacobian_forward`] and [`DifferentiationBuilder::jacobian_reverse`] materialize
+//!     complete [`Jacobian`]s by batching coordinate directions through JVPs or pullbacks. Their relative cost depends
+//!     on the input and output coordinate counts.
+//!   - [`DifferentiationBuilder::hessian`] differentiates a scalar-output gradient and returns the resulting structured
+//!     [`Hessian`] block matrix.
+//!
+//! [`DifferentiationBuilder::with_auxiliary_output`] preserves non-differentiated auxiliary output, while
+//! [`DifferentiationBuilder::holomorphic`] explicitly opts into the complex holomorphic contract.
+//! Furthermore, [`DifferentiationBuilder::with_captures`] accepts dynamic runtime values that affect the primal
+//! computation while only the first closure argument is differentiated. Captures are useful for model training,
+//! for example, where the model being trained is the active argument (or the primal), and a potentially large data
+//! batch is a captured input whose derivatives we do not want to compute. In this case, [`Jacobian`] and [`Hessian`]
+//! materialization will only enumerate basis directions for model parameters and not for the data batch.
+//!
+//! Active inputs, differentiated outputs, captures, and auxiliary outputs are independently polymorphic
+//! [`Parameterized`] trees. Each may be a leaf, tuple, array, [`Vec`], map, or user-defined struct or enum deriving
+//! `Parameterized`. Derived types may also contain optional parameter fields. The trees need neither share a container
+//! type nor have the same number of leaves. A transform replaces each dynamic leaf with the tracer type required by
+//! that transform, invokes the closure with the reparameterized trees, and reconstructs the same public tree shapes
+//! with runtime values. Non-parameter metadata in a derived type is preserved unchanged.
+//! [`DifferentiationBuilder::with_auxiliary_output`] applies this treatment to the second member of a closure result
+//! `(differentiated_output, auxiliary_output)`, returning the entire auxiliary tree without seeding or transposing it.
+//!
+//! The trees are structurally polymorphic but homogeneous in their dynamic leaf family meaning that one builder
+//! invocation uses a single runtime value type `V` for all active, output, capture, and auxiliary leaves. Individual
+//! leaves may still carry different element types, shapes, shardings, and placements when `V` represents those
+//! properties dynamically, as [`Array`](crate::Array) does. Unrelated host configuration belongs in non-parameter
+//! fields of a derived tree or in the closure itself.
+//!
+//! Differentiation captures are not static arguments and do not embed host values into a trace. They retain their
+//! runtime types, shapes, shardings, and placement, and changing capture values alone does not specialize the
+//! computation. They also differ from [`StopGradients::stop_gradients`](crate::StopGradients::stop_gradients), which
+//! blocks derivative flow but leaves the stopped value inside the active parameter structure and its derivative
+//! bookkeeping. Finally, they differ from [`ClosedProgram`](crate::ClosedProgram) and Just-In-Time (JIT) compilation
+//! captures as those hide lifted runtime values from a compiled function's public signature, whereas differentiation
+//! captures are explicit inputs to the binary closure. Auxiliary outputs are similarly runtime outputs rather than
+//! differentiation variables. They remain part of the closure result but are excluded from derivative seeding and
+//! pullback construction.
+//!
+//! Context-generic code can use [`ForwardModeDifferentiate`] and [`ReverseModeDifferentiate`] directly, and already
+//! traced programs expose the corresponding program-level JVP, linearization, and transposition methods documented on
+//! [`Program`](crate::programs::Program).
+//!
+//! # Differentiation Pipeline
+//!
+//! Residuals are runtime values from the chosen linearization point. The reusable programs describe derivative
+//! structure, while each [`Pushforward`] or [`Pullback`] binds that structure to the residual values captured
+//! for one invocation. Refer to [`Linearization`] for a rendered diagram of the complete forward/reverse pipeline.
+//!
+//! # Forward Mode Differentiation
+//!
+//! [`DifferentiationDual`] pairs each primal with a [`MaybeZero`] tangent, and a [`DifferentiationTracer`] carries that
+//! dual through a [`DifferentiationContext`]. When an operation is bound, its [`DifferentiableOperation`] rule receives
+//! primal and tangent inputs, stages or evaluates the primal operation, and produces tangent outputs. Symbolic zero
+//! tangents avoid materializing unnecessary zero arrays.
+//!
+//! [`DifferentiationBuilder::linearize`] composes differentiation with [`PartialEvaluationContext`]. The primal is
+//! known and the tangent is unknown. Nonlinear primal work is evaluated once, values needed by the tangent computation
+//! become residuals, and the residual program becomes a reusable [`Pushforward`]. Host control flow may branch on
+//! a concrete primal value during this process, so only the taken path is linearized.
+//!
+//! # Reverse Mode Differentiation
+//!
+//! Reverse mode differentiation reuses the forward partitioning machinery while selecting
+//! [`DifferentiableOperation::jvp_for_transpose`]. Its default delegates to the standard JVP rule while an override
+//! can choose different primal computations and saved residuals without changing public forward linearization. The
+//! resulting derivative carrier is transposed by applying [`TransposableOperation`] rules in reverse data flow order,
+//! and the result is a [`Pullback`] that accepts output cotangents, consumes saved residuals, and accumulates input
+//! cotangents. This architecture keeps primal execution, residualization, and linear algebra as separate, composable
+//! concerns. Nested region requests preserve rule selection, and the two derivative rules use distinct cache keys.
+//! Differentiating a selected rule body starts an ordinary transform of that body; the rule selection does not change
+//! the surrounding transform. A caller explicitly transposing a public forward linearization still gets the transpose
+//! of that selected JVP, rather than an independently registered reverse rule.
+//!
+//! # Gradients of Reference Inputs
+//!
+//! Scalar gradient functions return ordinary values at every active input position. An input of type `T` returns
+//! `cotangent(T)`; an input of type `ref<T>` returns `cotangent(T)`, the derivative with respect to its initial
+//! contents. The original parameter structure is preserved, so the value family must represent both references and
+//! their referents.
+//!
+//! The primal runs exactly once and retains its mutations. For example, starting with `r = 3`, the function
+//! `r <- 2*r; return r*r` returns value `36` and gradient `24`, leaving `r = 6`. Each call uses fresh internal zero
+//! cotangent references: the final primal state contributes no seed, and completed cotangent references are frozen into
+//! ordinary values before returning. Runtime extents are captured before primal execution, including when the function
+//! consumes an input reference. Duplicate references, views, and aliases at the differentiation boundary remain subject
+//! to the usual boundary validation. Auxiliary gradient outputs must be ordinary values.
+//!
+//! Use [`Pullback::apply_with_destinations`] for explicit cotangent storage or nonzero final-state cotangent seeds.
+//! For reference inputs, those destinations hold final-state cotangents before replay and initial-state cotangents
+//! afterward; replay may replace their contents. For ordinary inputs, reference destinations accumulate by addition.
+//!
+//! # Zero Differential Spaces
+//!
+//! [`DifferentiableType`] may describe a tangent or cotangent space containing only zero. Such leaves remain present
+//! in public primal structures but need no Single Static Assignment (SSA) slots in linear tangent or pullback programs.
+//! Derivative entry points omit those internal slots, preserve their boundary positions as metadata, and reconstruct
+//! typed zeros when rebuilding public results. Pullbacks preserve those leaves as [`MaybeZero::Zero`], and gradients
+//! materialize them from their primal inputs. [`MaybeZero`] also lets operation rules propagate symbolic zeros without
+//! materializing arrays.
+//!
+//! # Structural Transform Reuse
+//!
+//! Higher-order rules frequently differentiate the same sealed [`Region`](crate::Region) from several outer programs.
+//! Region-level JVP, linearization, and transposition paths retain their context-free derived programs against the
+//! region's complete reachable contents and the transform's structural arguments. Faithful copies reuse those
+//! artifacts, while content-changing rewrites and changed descendant closures invalidate them. These built-ins use
+//! the same [`Transform`](crate::Transform) extension mechanism available to external structural program transforms;
+//! differentiation-specific artifact layouts remain private adapters around that general API.
+//!
+//! Runtime callables are deliberately different. A [`Pushforward`] or [`Pullback`] owns concrete residual values from
+//! one linearization point and is never cached as a type-only structural artifact. Immediate value-level transforms
+//! likewise retain their existing semantics, including concrete host control flow chosen from the current primal.
+//!
+//! # Extending Differentiation
+//!
+//! Implement [`DifferentiableType`] for types that possess tangent and cotangent spaces. Implement
+//! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided
+//! context and preserve symbolic zeros where possible. Implement [`MemberDifferentiableOperation`] when a homogeneous
+//! member operation needs values from its projection's parent context while constructing its derivative. Ordinary
+//! homogeneous projected rules should forward their named hooks through [`jvp_projected_operation`] and
+//! [`jvp_for_transpose_projected_operation`]. The context's [`rule`](DifferentiationContext::rule) identifies the
+//! selection inherited by recursive drivers; explicit hook calls do not change it. Implement [`TransposableOperation`]
+//! for linear primitives that may occur in a homogeneous pushforward. A member payload whose parent instruction has a
+//! mixed signature needs no separate rule, because [`transpose_mixed_operation`] delegates that instruction's
+//! member-typed data inputs, wherever they sit in its input list, to that same homogeneous rule. Higher-order
+//! [`Operation`] logic belongs with the operation whose instruction attaches to the nested [`Region`](crate::Region).
+//! Wrapper operation enums should provide family dispatch and forward to those payload rules.
+
+use std::fmt::{Debug, Display, Formatter};
+
+use thiserror::Error;
+
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
+use crate::differentiation::hessian::hessian_in_context;
+use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
+use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
+use crate::errors::MaybeFallible;
+use crate::operations::{
+    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
+    ZeroLikeOperation,
+};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
+use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::programs::{
+    EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessOperation,
+    ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType, ReferenceTransform, TypeError, Value,
+    ValueProjection,
+};
+use crate::tracing::TracingContext;
+
+pub mod batching;
+pub mod elementwise;
+pub mod forward;
+pub mod hessian;
+pub mod jacobian;
+pub mod rematerialization;
+pub mod reverse;
+pub mod types;
+pub mod zeros;
+
+pub use batching::CotangentBatchingPolicy;
+pub use elementwise::{
+    BinaryElementwiseJvpInputs, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
+    UnaryElementwiseJvpInputs, binary_elementwise_jvp, unary_elementwise_jvp,
+};
+pub use forward::{
+    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,
+    DifferentiationTracer, ForwardModeDifferentiate, FusedDifferentiationPolicy, Linearization, LinearizationContext,
+    LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy,
+    ProjectedDifferentiationPolicy, Pushforward, TangentActivity, jvp_for_transpose_projected_operation,
+    jvp_projected_operation,
+};
+pub use hessian::{Hessian, HessianBlock};
+pub use jacobian::{Jacobian, JacobianBlock};
+pub use rematerialization::{
+    DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
+    DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
+    NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
+    OffloadDotsWithNoBatchDimensions, REMATERIALIZATION_POLICY_FN_POLICY_NAME, RematerializationPolicyFn,
+    RematerializedFunction, ResidualSource, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
+    SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
+    SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
+    SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual,
+    rematerialize, saved_residuals,
+};
+pub use reverse::{
+    CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
+    CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,
+    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    transpose_mixed_operation, transpose_projected_operation,
+};
+pub use types::{DenseDifferentiableType, DifferentiableType};
+pub use zeros::ResidualZeroProvider;
+
+/// Represents differentiation-related errors.
+///
+/// [`DifferentiationError`] forms normalized conversion cycles with [`TypeError`] and [`ProgramError`].
+/// Every differentiation surface including the value-level entry points (i.e., `jvp`, `linearize`, `vjp`, etc.),
+/// the program-level transforms (i.e., [`Program::jvp`](crate::Program::jvp),
+/// [`Program::linearize`](crate::Program::linearize), [`Program::transpose`](crate::Program::transpose), etc.),
+/// and the per-operation rule traits (i.e., [`DifferentiableOperation`] and [`TransposableOperation`]), returns
+/// [`DifferentiationError`], while the errors those rules produce _through_ the kernel (i.e., binding and staging
+/// operations) are [`ProgramError`]s. The paired [`From`] implementations keep these cycles normalized instead of
+/// letting the error types nest: converting to [`ProgramError`] unwraps a [`DifferentiationError::Program`] back into
+/// the program error that it carries and wraps every other variant in [`ProgramError::Custom`], while converting to
+/// [`DifferentiationError`] unwraps a [`ProgramError::Custom`] payload holding a [`DifferentiationError`] and wraps
+/// every other program error in [`DifferentiationError::Program`]. Roundtrips therefore never nest one error type
+/// inside the other, and `?` re-types errors correctly at both boundaries. Outside of these conversions, a
+/// [`DifferentiationError`] carried by a [`ProgramError`] can be recovered using [`ProgramError::downcast_custom`].
+/// Type inference uses the analogous [`TypeError::Custom`] carrier so a failed tangent or cotangent mapping keeps
+/// its concrete differentiation error across an operation-inference boundary.
+#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
+pub enum DifferentiationError {
+    /// Error returned when a differentiation entry point is invoked on an active input with no leaf values/parameters.
+    /// A function without differentiation variables has no direction to perturb, so its Jacobian has no columns.
+    /// Captures are deliberately not used to recover a context because they are not differentiation variables.
+    #[error("differentiation requires an input with at least one leaf value")]
+    EmptyInput,
+
+    /// Error returned when reverse mode differentiation is requested for a function whose output is not a single
+    /// scalar. Reverse mode differentiation seeds the output cotangent with the multiplicative identity (i.e., a scalar
+    /// value of `1`) and pulls it back to the inputs, which yields a gradient only when the output is a rank-0 scalar.
+    /// A non-scalar output describes a vector-valued function whose full derivative is a Jacobian. Seeding that output
+    /// with an all-ones cotangent would instead compute the gradient of the sum of its elements, which is a different
+    /// operation and not a canonical gradient of the vector-valued function. So, the gradient entry points reject it
+    /// up front using this error variant. Use a Jacobian transform for non-scalar outputs.
+    #[error("gradient output must be a rank-0 scalar but got {output_type}")]
+    NonScalarGradientOutput { output_type: String },
+
+    /// Error returned when reverse mode differentiation is requested for a function whose output type carries no
+    /// cotangent space (i.e., a non-differentiable type such as a Boolean or an integer scalar). Reverse mode
+    /// differentiation seeds the output cotangent with the multiplicative identity (i.e., a scalar value of `1`), but
+    /// a non-differentiable output has no such value to seed. So, in this case, the gradient is degenerate and the
+    /// gradient entry points reject it up front rather than fabricating a seed.
+    #[error("gradient output type {output_type} is non-differentiable and carries no cotangent space")]
+    NonDifferentiableGradientOutput { output_type: String },
+
+    /// Error returned when a transposition rule receives a different number of cotangent accumulators than expected.
+    #[error("invalid number of accumulators; expected {expected} but got {actual}")]
+    InvalidAccumulatorCount { expected: usize, actual: usize },
+
+    /// Error returned when reverse mode differentiation is requested through a plain (i.e., non-holomorphic) gradient
+    /// entry point for a function whose scalar output is complex. A single reverse mode seed recovers the derivative
+    /// of a complex-output function only when the function is holomorphic (i.e., complex-differentiable), a promise
+    /// the plain entry points do not ask for, so they reject complex outputs up front instead of silently computing a
+    /// value that is not a derivative. Use [`DifferentiationBuilder::holomorphic`] when the function is holomorphic,
+    /// or split the function into its real and imaginary parts and differentiate those otherwise.
+    #[error(
+        "gradient output type {output_type} is complex; use a holomorphic gradient entry point \
+        if the function is holomorphic"
+    )]
+    ComplexGradientOutput { output_type: String },
+
+    /// Error returned when a Jacobian or Hessian transform encounters a structured input or output parameter
+    /// with no tangent or cotangent space.
+    #[error("{transform} {role} parameter at {path} has non-differentiable type {type}")]
+    NonDifferentiableParameter {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a non-holomorphic Jacobian or Hessian transform receives a complex active input or
+    /// differentiated output parameter whose derivative requires an explicit holomorphy promise or a real-coordinate
+    /// representation that Ryft does not yet expose. Captures are exempt because they are not part of the
+    /// differentiated map.
+    #[error("{transform} {role} parameter at {path} has complex type {type}; use holomorphic {transform} instead")]
+    ComplexParameter {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a holomorphic Jacobian or Hessian transform receives a non-complex active input or
+    /// differentiated output parameter. Captures are exempt because they are not part of the complex-linear map.
+    #[error("holomorphic {transform} {role} parameter at {path} must be complex but has type {type}")]
+    NonComplexParameter {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a Jacobian or Hessian transform cannot enumerate a finite coordinate space for one of its
+    /// structured input or output parameters.
+    #[error("{transform} {role} parameter at {path} does not have a finite static coordinate space: {type}")]
+    NonFiniteCoordinateSpace {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a type has no representation for forward mode perturbations.
+    #[error("type {primal_type} does not define a tangent representation")]
+    UndefinedTangentType { primal_type: String },
+
+    /// Error returned when a type has no representation for reverse mode adjoints.
+    #[error("type {primal_type} does not define a cotangent representation")]
+    UndefinedCotangentType { primal_type: String },
+
+    /// Error returned when the finite coordinate count of a Jacobian or Hessian parameter structure exceeds `usize`.
+    #[error("{transform} {role} coordinate count overflows usize at parameter {path}: {type}")]
+    CoordinateCountOverflow {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    #[error(transparent)]
+    Program(ProgramError),
+}
+
+impl From<TypeError> for DifferentiationError {
+    #[inline]
+    fn from(error: TypeError) -> Self {
+        if let Some(differentiation) = error.downcast_custom::<DifferentiationError>() {
+            differentiation.clone()
+        } else {
+            DifferentiationError::Program(error.into())
+        }
+    }
+}
+
+impl From<DifferentiationError> for TypeError {
+    #[inline]
+    fn from(error: DifferentiationError) -> Self {
+        match error {
+            DifferentiationError::Program(ProgramError::Type(error)) => error,
+            error => TypeError::custom(error),
+        }
+    }
+}
+
+impl From<ParameterError> for DifferentiationError {
+    #[inline]
+    fn from(error: ParameterError) -> Self {
+        DifferentiationError::Program(error.into())
+    }
+}
+
+impl From<ProgramError> for DifferentiationError {
+    #[inline]
+    fn from(error: ProgramError) -> Self {
+        if let Some(differentiation) = error.downcast_custom::<DifferentiationError>() {
+            differentiation.clone()
+        } else {
+            DifferentiationError::Program(error)
+        }
+    }
+}
+
+impl From<DifferentiationError> for ProgramError {
+    #[inline]
+    fn from(error: DifferentiationError) -> Self {
+        match error {
+            DifferentiationError::Program(error) => error,
+            error => ProgramError::custom(error),
+        }
+    }
+}
+
+/// Selects which derivative rule a [`DifferentiationContext`] applies when constructing a derivative
+/// program. [`Self::Jvp`] selects [`DifferentiableOperation::jvp`] for executable forward derivatives, while
+/// [`Self::JvpForTranspose`] selects [`DifferentiableOperation::jvp_for_transpose`] for derivatives that will be
+/// transposed by reverse mode differentiation. Both use the same dual propagation and partitioning machinery; this
+/// selection is independent of the policy that determines where primal and tangent operations execute or are staged.
+///
+/// Context projection and recursive region drivers preserve the selected rule so that nested operations use the same
+/// contract as their enclosing derivative construction. Transform cache keys also include this selection: the two
+/// rules may compute different primal intermediates, save different residuals, or produce different tangent programs,
+/// so an artifact derived with one rule cannot generally be reused for the other. A separate differentiation transform
+/// applied to a generated rule program selects its own rule rather than inheriting the enclosing transform's choice.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiationRule {
+    /// Use [`DifferentiableOperation::jvp`] to construct an executable JVP or reusable pushforward.
+    Jvp,
+
+    /// Use [`DifferentiableOperation::jvp_for_transpose`] to construct primal outputs and a derivative program that
+    /// supports transposition but need not support execution as a pushforward.
+    JvpForTranspose,
+}
+
+impl DifferentiationRule {
+    /// Dispatches the selected native rule without changing the context or recursive driver.
+    #[inline]
+    pub(crate) fn apply<
+        O: Operation<Type = C::Type> + DifferentiableOperation<C>,
+        C: Context,
+        D: DifferentiationDriver<C>,
+        P: DifferentiationPolicy<C>,
+    >(
+        self,
+        operation: &O,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        match self {
+            Self::Jvp => operation.jvp(context, driver, inputs),
+            Self::JvpForTranspose => operation.jvp_for_transpose(context, driver, inputs),
+        }
+    }
+
+    /// Dispatches the selected parent-universe member rule without changing the context or recursive driver.
+    #[inline]
+    pub(crate) fn apply_member<
+        O: MemberDifferentiableOperation<C>,
+        C: Context,
+        D: DifferentiationDriver<C>,
+        P: DifferentiationPolicy<C>,
+    >(
+        self,
+        operation: &O,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        match self {
+            Self::Jvp => operation.jvp_in_parent(context, driver, inputs),
+            Self::JvpForTranspose => operation.jvp_for_transpose_in_parent(context, driver, inputs),
+        }
+    }
+
+    /// Projects inputs, applies the explicitly selected member rule, and lifts its outputs into the parent universe.
+    pub(crate) fn apply_projected<
+        T: DifferentiableType,
+        O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
+        C: ContextProjection<T, Type: DifferentiableType>,
+        P: DifferentiationPolicy<C>,
+    >(
+        self,
+        context: &DifferentiationContext<C, P>,
+        operation: &O,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if !operation.region_slots().is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "projected operation `{}` carries regions and cannot be differentiated through its member family; \
+                     differentiate it through a family-level carrier for that operation instead",
+                    operation.name(),
+                ),
+            }
+            .into());
+        }
+        let projected_inputs = inputs
+            .iter()
+            .map(|input| {
+                let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
+                match input.tangent() {
+                    MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
+                    MaybeZero::Value(value) => {
+                        let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
+                        DifferentiationDual::new(primal, tangent)
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        let projected_context = context.project::<T>();
+        let outputs = self.apply(operation, &projected_context, &EmptyRegionDriver, &projected_inputs)?;
+        outputs
+            .into_iter()
+            .map(|output| {
+                let (primal, tangent) = output.into_parts();
+                let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
+                let tangent = match tangent {
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.into()),
+                    MaybeZero::Value(value) => {
+                        MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
+                    }
+                };
+                DifferentiationDual::new(primal, tangent)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+/// Position of a value at a differentiation boundary, numbered within its flattened parameter group.
+/// This is used for diagnostic purposes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiationBoundaryPosition {
+    /// Active primal input at the specified index.
+    Input(usize),
+
+    /// Captured primal value at the specified index.
+    Capture(usize),
+
+    /// Tangent paired with the primal input at the provided index.
+    Tangent(usize),
+
+    /// Caller-provided cotangent destination for the primal input at the provided index.
+    Cotangent(usize),
+}
+
+impl Display for DifferentiationBoundaryPosition {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(index) => write!(formatter, "input {index}"),
+            Self::Capture(index) => write!(formatter, "capture {index}"),
+            Self::Tangent(index) => write!(formatter, "tangent {index}"),
+            Self::Cotangent(index) => write!(formatter, "cotangent {index}"),
+        }
+    }
+}
+
+impl ReferenceBoundary<DifferentiationBoundaryPosition> {
+    /// Creates a differentiation [`ReferenceBoundary`], checking that inputs, captures, and tangents identify distinct
+    /// allocations, in that order. Non-reference values do not contribute allocation identities. The boundary retains
+    /// reference identities so that a reusable [`Pushforward`] or [`Pullback`] can reject later arguments that alias
+    /// the original primal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first identity or alias error in boundary order, preserving context-resolution errors unchanged.
+    pub(crate) fn new_for_differentiation<
+        'v,
+        C: Context<Value: 'v>,
+        II: IntoIterator<Item = &'v C::Value>,
+        TI: IntoIterator<Item = &'v C::Value>,
+        CI: IntoIterator<Item = &'v C::Value>,
+    >(
+        context: &C,
+        inputs: II,
+        tangents: TI,
+        captures: CI,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (DifferentiationBoundaryPosition::Input(index), value));
+        let captures = captures
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (DifferentiationBoundaryPosition::Capture(index), value));
+        let tangents = tangents
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (DifferentiationBoundaryPosition::Tangent(index), value));
+        Ok(Self::new(context, inputs.chain(captures).chain(tangents))?)
+    }
+
+    /// Checks that the provided reference arguments to a reusable derivative function are distinct from one another
+    /// and from its original primal inputs and captures. For example, a pushforward must reject the original primal
+    /// reference as a tangent argument, since tangent updates would then mutate the primal state.
+    ///
+    /// # Errors
+    ///
+    /// Reports an alias of a retained allocation as a primal boundary conflict. Other identity, alias, and context
+    /// errors retain the core validator's diagnostics.
+    pub(crate) fn validate_differentiation_arguments<
+        'v,
+        C: Context<Value: 'v>,
+        V: IntoIterator<Item = (DifferentiationBoundaryPosition, &'v C::Value)>,
+    >(
+        &self,
+        context: &C,
+        values: V,
+    ) -> Result<(), ProgramError> {
+        match self.validate(context, values) {
+            Err(ReferenceBoundaryError::AliasedRetained { position, .. }) => Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "{position} aliases a reference bound at the primal boundary of the differentiated function",
+                ),
+            }),
+            result => result.map_err(ProgramError::from),
+        }
+    }
+}
+
+/// Derivative transform family that was active when an error occurred. Holomorphic entry points use the same forward-
+/// or reverse-Jacobian family as their non-holomorphic counterparts. Holomorphy changes the admissible element types,
+/// not the mathematical derivative object being materialized.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DerivativeTransform {
+    /// Forward mode Jacobian materialization, including its holomorphic entry point.
+    JacobianForward,
+
+    /// Reverse mode Jacobian materialization, including its holomorphic entry point.
+    JacobianReverse,
+
+    /// Hessian materialization.
+    Hessian,
+}
+
+impl Display for DerivativeTransform {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JacobianForward => write!(formatter, "forward Jacobian"),
+            Self::JacobianReverse => write!(formatter, "reverse Jacobian"),
+            Self::Hessian => write!(formatter, "hessian"),
+        }
+    }
+}
+
+/// Role of a structured parameter in a derivative transform.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiationParameterRole {
+    /// Parameter belongs to the differentiated input structure.
+    Input,
+
+    /// Parameter belongs to the differentiated output structure.
+    Output,
+
+    /// Parameter describes a materialized derivative block.
+    Derivative,
+}
+
+impl Display for DifferentiationParameterRole {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input => write!(formatter, "input"),
+            Self::Output => write!(formatter, "output"),
+            Self::Derivative => write!(formatter, "derivative"),
+        }
+    }
+}
+
+mod private {
+    /// Seals implementation-only differentiation builder type-state traits.
+    pub trait Sealed {}
+}
+
+/// Sealed behavior shared by the ordinary and holomorphic builder type states.
+pub trait DifferentiationBuilderLinearityMode: private::Sealed {
+    /// Specified whether the differentiation transform uses the holomorphic complex-linearity contract or not.
+    const HOLOMORPHIC: bool;
+}
+
+/// Resolves the [`Context`] used by a [`DifferentiationBuilder`] terminal function.
+pub trait DifferentiationBuilderContext<V: Value, Input: Parameterized<V>>: private::Sealed {
+    /// [`Context`] selected for the transform.
+    type Context: Context<Type = V::Type, Value = V>;
+
+    /// Returns the [`Context`] in which the differentiation transform must execute.
+    fn resolve(self, primal: &Input) -> Result<Self::Context, DifferentiationError>;
+}
+
+/// Type state indicating that a [`DifferentiationBuilder`] has no runtime captures.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WithoutCapture;
+
+/// Type state containing the dynamic non-differentiated runtime values supplied to a [`DifferentiationBuilder`].
+#[derive(Clone, Debug)]
+pub struct WithCapture<Capture>(Capture);
+
+/// Type state indicating that a [`DifferentiationBuilder`] differentiates only its primary output.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WithoutAuxiliaryOutput;
+
+/// Type state indicating that a [`DifferentiationBuilder`] returns a non-differentiated auxiliary output.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WithAuxiliaryOutput;
+
+/// Type state selecting ordinary real-valued differentiation semantics.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RealLinearity;
+
+impl private::Sealed for RealLinearity {}
+
+impl DifferentiationBuilderLinearityMode for RealLinearity {
+    const HOLOMORPHIC: bool = false;
+}
+
+/// Type state selecting complex-linear differentiation under a holomorphy promise.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HolomorphicLinearity;
+
+impl private::Sealed for HolomorphicLinearity {}
+
+impl DifferentiationBuilderLinearityMode for HolomorphicLinearity {
+    const HOLOMORPHIC: bool = true;
+}
+
+/// Type state indicating that the execution context is recovered from the active primal.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WithoutContext;
+
+impl private::Sealed for WithoutContext {}
+
+impl<V: Value<Domain: Context<Type = V::Type, Value = V>>, Input: Parameterized<V>>
+    DifferentiationBuilderContext<V, Input> for WithoutContext
+{
+    type Context = V::Domain;
+
+    #[inline]
+    fn resolve(self, primal: &Input) -> Result<V::Domain, DifferentiationError> {
+        primal.parameters().next().map(Value::domain).ok_or(DifferentiationError::EmptyInput)
+    }
+}
+
+/// Type state containing the execution context explicitly selected for a [`DifferentiationBuilder`].
+#[derive(Clone, Debug)]
+pub struct WithContext<C>(C);
+
+impl<C> private::Sealed for WithContext<C> {}
+
+impl<C: Context<Type = V::Type, Value = V>, V: Value, Input: Parameterized<V>> DifferentiationBuilderContext<V, Input>
+    for WithContext<C>
+{
+    type Context = C;
+
+    #[inline]
+    fn resolve(self, _primal: &Input) -> Result<C, DifferentiationError> {
+        Ok(self.0)
+    }
+}
+
+/// Helper that is used to configure a value-level automatic differentiation transform.
+///
+/// Use [`differentiate_at`] or [`Differentiate::differentiate_at`] to construct instances of this builder from primal
+/// values. Each terminal function takes the differentiated closure as its last argument, and the builder state
+/// determines the closure's parameter types. The following functions can be used to configure the automatic
+/// differentiation transform:
+///
+///   - [`with_captures`](Self::with_captures) supplies dynamic runtime values that participate in the primal
+///     computation but which are excluded from derivative bookkeeping. The active input and captures can have unrelated
+///     [`Parameterized`] structures. For example, a derived model struct can be active while a tuple containing
+///     batches, targets, and optional runtime state is captured. The builder reparameterizes both structures
+///     from runtime leaves to the terminal function's tracer leaves before invoking the closure. Unlike
+///     [`StopGradients::stop_gradients`](crate::StopGradients::stop_gradients), captures do not allocate
+///     any gradient, Jacobian, or Hessian values. They are also distinct from compilation captures stored by
+///     [`ClosedProgram`](crate::ClosedProgram). Differentiation captures remain explicit runtime inputs to the function
+///     being differentiated, and changing their values does not make them static specialization arguments. Captures
+///     follow the same operational validity rules as ordinary values. If a capture is incompatible with the selected
+///     context, the operation or execution boundary that uses it returns its normal context- or backend-specific error.
+///     An unused capture is harmless and does not fail the builder's up-front signature validation.
+///   - [`with_auxiliary_output`](Self::with_auxiliary_output) declares that the closure being differentiated returns
+///     `(output, auxiliary)`. `auxiliary` may be any third, independently shaped [`Parameterized`] tree and is
+///     reconstructed with runtime leaves without being differentiated.
+///   - [`holomorphic`](Self::holomorphic) promises that the differentiated function is _holomorphic_ (i.e., that it
+///     satisfies the [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations)).
+///   - [`in_context`](Self::in_context) selects a specific execution context. Otherwise, terminal methods recover one
+///     from the first active primal value.
+///
+/// These modifiers represent orthogonal type-state transitions, avoiding combined function-name variants. The terminal
+/// functions infer their context parameter `C` from the builder's [`DifferentiationBuilderContext::Context`] type. When
+/// specifying their generic arguments explicitly, use `_` for `C` to retain this inference.
+///
+/// Note that all parameter leaves in one invocation use the same runtime value family `V`. However, the structures are
+/// otherwise fully polymorphic (i.e., tuples, arrays, [`Vec`]s, maps, and types deriving `Parameterized` may be nested
+/// freely). Derived types additionally support optional parameter fields and retain non-parameter metadata. A dynamic
+/// value family such as [`Array`](crate::Array) may represent different element types, shardings, and placements at
+/// individual leaves.
+#[derive(Clone, Debug)]
+pub struct DifferentiationBuilder<
+    Input,
+    CaptureState = WithoutCapture,
+    AuxiliaryOutputState = WithoutAuxiliaryOutput,
+    LinearityState = RealLinearity,
+    ContextState = WithoutContext,
+> {
+    /// Active primal inputs at which the differentiation transform is evaluated.
+    primal: Input,
+
+    /// Dynamic non-differentiated runtime captures type state.
+    capture: CaptureState,
+
+    /// Auxiliary-output type state.
+    auxiliary: AuxiliaryOutputState,
+
+    /// Linearity type state.
+    linearity: LinearityState,
+
+    /// Execution-context selection type state.
+    context: ContextState,
+}
+
+impl<Input, AuxiliaryOutputState, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, AuxiliaryOutputState, LinearityState, ContextState>
+{
+    /// Supplies dynamic runtime values that affect primal evaluation without becoming differentiation variables.
+    /// `captures` may be any [`Parameterized`] tree whose leaves use the same runtime value family as the active input.
+    /// The terminal function passes the closure a reparameterized copy whose leaves are its tracer type. Container
+    /// shape and non-parameter metadata are preserved. Captures remain explicit runtime inputs but contribute no
+    /// tangent, cotangent, Jacobian, or Hessian values.
+    #[inline]
+    pub fn with_captures<Capture>(
+        self,
+        captures: Capture,
+    ) -> DifferentiationBuilder<Input, WithCapture<Capture>, AuxiliaryOutputState, LinearityState, ContextState> {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(captures),
+            auxiliary: self.auxiliary,
+            linearity: self.linearity,
+            context: self.context,
+        }
+    }
+}
+
+impl<Input, CaptureState, LinearityState, ContextState>
+    DifferentiationBuilder<Input, CaptureState, WithoutAuxiliaryOutput, LinearityState, ContextState>
+{
+    /// Declares that the transformed closure returns `(differentiated_output, auxiliary_output)`. The auxiliary output
+    /// may be any [`Parameterized`] tree. Its leaves are traced during primal evaluation and reconstructed as runtime
+    /// values in the terminal result, but they are excluded from derivative seeding and transposition. Its structure is
+    /// independent of both the active input and any captures.
+    #[inline]
+    pub fn with_auxiliary_output(
+        self,
+    ) -> DifferentiationBuilder<Input, CaptureState, WithAuxiliaryOutput, LinearityState, ContextState> {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: self.capture,
+            auxiliary: WithAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+    }
+}
+
+impl<Input, CaptureState, AuxiliaryOutputState, ContextState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, RealLinearity, ContextState>
+{
+    /// Promises that the differentiated function is _holomorphic_. The differentiation transform validates that active
+    /// inputs and differentiated outputs are complex, but it cannot prove that the function satisfies the
+    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations). Runtime captures are
+    /// exempt because they are fixed coefficients rather than coordinates of the differentiated map. Holomorphic mode
+    /// is available for Jacobian, Hessian, and scalar-gradient terminal functions. Jacobian-Vector Products (JVPs),
+    /// linearization, and Vector-Jacobian Products (VJPs) do not define a separate holomorphic validation contract.
+    #[inline]
+    pub fn holomorphic(
+        self,
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, HolomorphicLinearity, ContextState> {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: self.capture,
+            auxiliary: self.auxiliary,
+            linearity: HolomorphicLinearity,
+            context: self.context,
+        }
+    }
+}
+
+impl<Input, CaptureState, AuxiliaryOutputState, LinearityState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, LinearityState, WithoutContext>
+{
+    /// Selects the context in which the differentiation transform executes. Without this modifier, terminal functions
+    /// will try to recover the context from the first active primal value.
+    #[inline]
+    pub fn in_context<C: Context>(
+        self,
+        context: &C,
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, LinearityState, WithContext<C>> {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: self.capture,
+            auxiliary: self.auxiliary,
+            linearity: self.linearity,
+            context: WithContext(context.clone()),
+        }
+    }
+}
+
+impl<Input, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, ContextState>
+{
+    /// Evaluates `function` at the builder's active primal and propagates `tangent` through its Jacobian function.
+    /// For a function `y = f(x)`, this returns the dual `(y, ẏ) = (f(x), J_f(x) · ẋ)`, where `ẋ` is the supplied
+    /// tangent and `J_f(x) = ∂f/∂x`. This is direct forward mode differentiation, analogous to
+    /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html). The closure runs once on
+    /// [`DifferentiationTracer`] duals, and every operation propagates its primal and tangent together through its
+    /// [`DifferentiableOperation`] rule.
+    ///
+    /// The selected context determines execution. An eager context computes both dual halves immediately, so host
+    /// control flow may inspect concrete primal. A staging context records primal and tangent operations in one fused
+    /// trace, and data-dependent Rust control flow on a traced primal is unavailable. Structural-zero tangents remain
+    /// symbolic between operations and are materialized at the output boundary through [`ResidualZeroProvider`],
+    /// preserving runtime extents for dynamically shaped values. Nested transforms differentiate through these duals
+    /// and therefore compose forward, reverse over forward, and higher-order differentiation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `tangent`: Tangent tree matching the structure of the builder's active primal.
+    ///   - `function`: Function whose primal output and directional derivative are evaluated. The closure executes
+    ///     exactly as written. The transform does not trim dead code, and observable effects fire as the closure runs.
+    #[inline]
+    pub fn jvp<C, V, Output, F>(
+        self,
+        tangent: Input::To<V>,
+        function: F,
+    ) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError>
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: DifferentiableOperation<C> + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value<Type: DifferentiableType>,
+        Input: Parameterized<V, Family: ParameterizedFamily<DifferentiationTracer<C>>>,
+        Input::ParameterStructure: Debug + PartialEq,
+        Output: Parameterized<DifferentiationTracer<C>, Family: ParameterizedFamily<V>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<DifferentiationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .jvp(tangent, |input, ()| function(input))
+    }
+
+    /// Linearizes `function` at the builder's active primal, returning its value and a reusable [`Pushforward`]. For
+    /// `y = f(x)`, this returns `y` together with the linear map `ẋ ↦ ẏ = J_f(x) · ẋ` at the fixed linearization point
+    /// `x`, analogous to [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html). Unlike
+    /// [`jvp`](Self::jvp), which evaluates one `(primal, tangent)` pair, linearization performs the nonlinear primal
+    /// work once. The returned [`Pushforward`] can then apply the same Jacobian to any number of tangent trees without
+    /// retracing or redifferentiating `function`.
+    ///
+    /// Internally, the closure runs on [`LinearizationTracer`] duals over a [`PartialEvaluationContext`]. Primal halves
+    /// are known and execute in the selected context, while tangent halves are unknown and residualize into a linear
+    /// program `(ẋ, r) ↦ ẏ`. The residuals `r` contain the values from the linearization point needed by that program
+    /// and the returned pushforward closes over them. Under an eager context, concrete primal values may drive host
+    /// control flow and only the taken path is linearized; under a staging context, primal work composes into the
+    /// enclosing trace.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function to evaluate and linearize at the builder's active primal.
+    #[inline]
+    pub fn linearize<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<(Output::To<V>, Pushforward<C, Input, Output::To<V>>), DifferentiationError>
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<C>
+                               + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value<Type: DifferentiableType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .linearize(|input, ()| function(input))
+    }
+
+    /// Differentiates `function` using reverse mode differentiation, returning its value and a reusable [`Pullback`].
+    /// For `y = f(x)`, this returns `y` together with the transposed linear map `ȳ ↦ x̄ = J_f(x)ᵀ · ȳ`, analogous to
+    /// [JAX's `vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.vjp.html). Applying the pullback maps an output
+    /// cotangent tree to the corresponding input cotangent tree at the builder's fixed primal point.
+    ///
+    /// Reverse mode uses the partitioning machinery of [`linearize`](Self::linearize), selecting
+    /// [`DifferentiableOperation::jvp_for_transpose`] before primal work executes. Its default delegates to
+    /// the standard JVP rule while overrides can select independent residuals and backward implementations.
+    /// [`TransposableOperation`] rules transpose the resulting derivative program in reverse data flow order.
+    /// The returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
+    /// arguments and reconstructs the structured input cotangents as [`MaybeZero`] leaves. Disconnected inputs
+    /// return structural zeros without retaining extent residuals. Callers that need concrete values can use
+    /// [`Pullback::apply_materialized`], which constructs them from the primal inputs that the pullback retains
+    /// as zero sources.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function to evaluate and differentiate in reverse mode at the builder's active primal.
+    #[inline]
+    pub fn vjp<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<(Output::To<V>, Pullback<C, Input, Output::To<V>>), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V> + ReverseModeDifferentiate,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .vjp(|input, ()| function(input))
+    }
+}
+
+impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, LinearityState, ContextState>
+{
+    /// Computes the scalar value of `function` and its gradient using reverse mode differentiation. For a real scalar
+    /// `y = f(x)`, this returns `(f(x), ∇f(x))`, where `∇f(x) = J_f(x)ᵀ · 1` is the pullback of the multiplicative
+    /// identity cotangent seed. In [`HolomorphicLinearity`] mode, a holomorphic complex scalar function `y = f(z)`
+    /// instead returns `(f(z), ∂f/∂z)` (i.e., the complex derivative itself, rather than a conjugate steepest-ascent
+    /// direction). Calling [`holomorphic`](Self::holomorphic) promises that the function is holomorphic; the transform
+    /// validates complex input and output types but cannot prove the
+    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
+    ///
+    /// Structural-zero gradients become concrete values using the corresponding primal inputs as zero sources.
+    /// Reference inputs return ordinary gradients with respect to their initial contents. The primal runs once,
+    /// preserving mutations, and each invocation uses fresh zero cotangent references that are frozen before return.
+    /// Refer to the module's [reference gradient contract](self#gradients-of-reference-inputs) for an example and to
+    /// [`Pullback::apply_with_destinations`] for explicit final state seeds.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Scalar-valued function to evaluate and differentiate at the builder's active primal.
+    ///     This closure may return its traced scalar directly or in a [`Result`] whose error type is
+    ///     [`ProgramError`], as specified by [`MaybeFallible`].
+    #[inline]
+    pub fn value_and_gradient<C, V, Output, F>(self, function: F) -> Result<(V, Input::To<V>), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .value_and_gradient(|input, ()| function(input))
+    }
+
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation. For a real scalar
+    /// `y = f(x)`, this returns `∇f(x) = J_f(x)ᵀ · 1`, analogous to
+    /// [JAX's `grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html). In [`HolomorphicLinearity`] mode,
+    /// a holomorphic complex scalar function returns `∂f/∂z`. This is the gradient-only counterpart of
+    /// [`value_and_gradient`](Self::value_and_gradient), discarding the primal scalar output while retaining the same
+    /// output validation and [`MaybeFallible`] closure contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Scalar-valued function to differentiate at the builder's active primal.
+    #[inline]
+    pub fn gradient<C, V, Output, F>(self, function: F) -> Result<Input::To<V>, DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        self.value_and_gradient(function).map(|(_, gradient)| gradient)
+    }
+
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation. For `y = f(x)`, the Jacobian is the
+    /// linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This method linearizes `function` once, applies the
+    /// resulting [`Pushforward`] to a packed basis of the finite input coordinate space, and assembles the resulting
+    /// columns into a Jacobian. Each block corresponds to one output leaf and one input leaf in deterministic
+    /// output-major/input-minor order. For arrays, a block places output axes before input axes.
+    ///
+    /// Let `n` and `m` be the total input and output coordinate counts, `T_linearize` the one-time cost of constructing
+    /// the pushforward, and `T_pushforward` the cost of one tangent direction. Forward materialization evaluates an
+    /// `n`-way packed pushforward, so its derivative work is approximately `O(T_linearize + n · T_pushforward)`. If
+    /// `R_forward` is the shared residual storage and `M_pushforward` the additional peak memory for one direction,
+    /// its working memory excluding the result is approximately `O(R_forward + n · M_pushforward)`. The materialized
+    /// Jacobian itself necessarily occupies `Θ(mn)` storage. [`jacobian_reverse`](Self::jacobian_reverse) produces the
+    /// same representation and is generally preferable when `m < n`; use forward mode when `n <= m`. Packing lets the
+    /// backend evaluate derivative directions concurrently, potentially reducing wall-clock time, but it does not
+    /// reduce the total arithmetic work or asymptotic storage required.
+    ///
+    /// Ordinary mode requires real active input leaves but permits complex differentiated outputs.
+    /// [`HolomorphicLinearity`] mode treats the derivative as complex linear and requires every active input and
+    /// differentiated output leaf to be complex; selecting it is a promise of holomorphy that type validation cannot
+    /// prove.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function whose complete Jacobian is materialized at the builder's active primal.
+    #[inline]
+    pub fn jacobian_forward<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<C>
+                               + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value,
+        V::Type: DenseDifferentiableType<C>,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .jacobian_forward(|input, ()| function(input))
+    }
+
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation. For `y = f(x)`, the pullback maps
+    /// `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This method constructs one [`Pullback`], applies it to a
+    /// packed basis of the finite output coordinate space, and reorients the resulting rows into the same
+    /// output-major/input-minor [`Jacobian`] representation returned by [`jacobian_forward`](Self::jacobian_forward).
+    /// Array blocks place output axes before input axes.
+    ///
+    /// Let `n` and `m` be the total input and output coordinate counts, `T_vjp` the one-time cost of constructing the
+    /// pullback, and `T_pullback` the cost of one cotangent direction. Reverse materialization evaluates an `m`-way
+    /// packed pullback, so its derivative work is approximately `O(T_vjp + m · T_pullback)`. If `R_reverse` is the
+    /// shared residual storage and `M_pullback` the additional peak memory for one direction, its working memory
+    /// excluding the result is approximately `O(R_reverse + m · M_pullback)`. The materialized Jacobian itself
+    /// necessarily occupies `Θ(mn)` storage. Reverse mode is generally preferable when `m < n`; use forward mode when
+    /// `n <= m`. Packing lets the backend evaluate derivative directions concurrently, potentially reducing wall-clock
+    /// time, but it does not reduce the total arithmetic work or asymptotic storage required.
+    ///
+    /// Ordinary mode requires real differentiated output leaves but permits complex active inputs.
+    /// [`HolomorphicLinearity`] mode treats the derivative as complex linear and requires every active input and
+    /// differentiated output leaf to be complex; selecting it is a promise of holomorphy that type validation cannot
+    /// prove.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function whose complete Jacobian is materialized at the builder's active primal.
+    #[inline]
+    pub fn jacobian_reverse<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .jacobian_reverse(|input, ()| function(input))
+    }
+
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation. For `y = f(x)`, each
+    /// entry is `H_f(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. The inner reverse transform materializes `J_f(x)` by applying
+    /// a [`Pullback`] to packed output-coordinate basis cotangents. The outer forward transform differentiates those
+    /// Jacobian entries by applying a [`Pushforward`] to packed input-coordinate basis tangents. The result stores
+    /// blocks in output-major/first-input-major/second-input-minor order. For arrays, a block places output axes first,
+    /// followed by first-input axes and then second-input axes.
+    ///
+    /// Let `n` and `m` be the total input and output coordinate counts. The transform performs an `m`-way packed inner
+    /// pullback and an `n`-way packed outer pushforward. If `T_inner_vjp` and `T_outer_linearize` are the one-time
+    /// costs of those transforms and `T_inner_pullback` and `T_outer_pushforward` are their per-direction costs, the
+    /// derivative work is approximately `O(T_inner_vjp + m · T_inner_pullback + T_outer_linearize + n ·
+    /// T_outer_pushforward)`. If `R_hessian` is the nested residual storage and `M_inner_pullback` and
+    /// `M_outer_pushforward` are the additional peak memories for one direction, working memory excluding the result
+    /// is approximately `O(R_hessian + m · M_inner_pullback + n · M_outer_pushforward)`. The materialized Hessian
+    /// necessarily occupies `Θ(mn²)` storage. This decomposition is particularly well suited to scalar-output
+    /// functions, where `m = 1`: reverse mode constructs the gradient with one cotangent direction, and forward mode
+    /// differentiates that input-to-gradient map. Packing lets the backend evaluate derivative directions concurrently,
+    /// potentially reducing wall-clock time, but it does not reduce the total arithmetic work or asymptotic storage
+    /// required.
+    ///
+    /// Complete materialization requires finite, statically enumerable coordinate spaces. Ordinary mode requires real
+    /// active input and differentiated output leaves. [`HolomorphicLinearity`] mode requires them all to be complex and
+    /// treats both nested transforms as complex linear; selecting it promises holomorphy but cannot prove it.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function whose complete Hessian is materialized at the builder's active primal.
+    #[inline]
+    pub fn hessian<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<LinearizationContext<C>>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::To<V::Type>: Clone,
+        Input::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = Input::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Input::To<
+                    LinearizationTracer<LinearizationContext<C>>,
+                >,
+                To<V::Type> = Input::To<V::Type>,
+            >,
+        Input::Family: ParameterizedFamily<V::Type>
+            + ParameterizedFamily<LinearizationTracer<C>>
+            + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
+        Output: Parameterized<LinearizationTracer<LinearizationContext<C>>>,
+        Output::To<V::Type>: Clone,
+        Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<LinearizationContext<C>>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithoutAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .hessian(|input, ()| function(input))
+    }
+}
+
+impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithAuxiliaryOutput, LinearityState, ContextState>
+{
+    /// Computes the scalar value and auxiliary output of `function` and its gradient using reverse mode
+    /// differentiation. For `(y, a) = f(x)` with a real scalar `y`, this returns `((y, a), J_y(x)ᵀ · 1)`. Only
+    /// `y` receives the multiplicative-identity cotangent seed; every auxiliary leaf receives a zero seed and is
+    /// reconstructed as a primal runtime value. In [`HolomorphicLinearity`] mode, complex `y` instead yields the
+    /// complex derivative `∂y/∂z`, under the caller's holomorphy promise. The auxiliary tree may have a structure
+    /// unrelated to the active input.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function returning the differentiated scalar and auxiliary output. This closure may return its
+    ///     outputs directly or in a [`Result`] whose error type is [`ProgramError`], as specified by
+    ///     [`MaybeFallible`].
+    #[inline]
+    pub fn value_and_gradient<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<((V, AuxiliaryOutput), Input::To<V>), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
+        AuxiliaryOutput: Parameterized<
+                V,
+                To<V> = AuxiliaryOutput,
+                Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
+            >,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .value_and_gradient(|input, ()| function(input))
+    }
+
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation and returns its auxiliary
+    /// output. For `(y, a) = f(x)` with real scalar `y`, this returns `(J_y(x)ᵀ · 1, a)`. In [`HolomorphicLinearity`]
+    /// mode it returns `(∂y/∂z, a)` under the caller's holomorphy promise. This is the gradient-only counterpart of
+    /// [`value_and_gradient`](Self::value_and_gradient): it discards `y`, while auxiliary leaves remain primal values
+    /// with zero cotangent seeds. The closure supports the same [`MaybeFallible`] result forms.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function returning the differentiated scalar and auxiliary output.
+    #[inline]
+    pub fn gradient<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<(Input::To<V>, AuxiliaryOutput), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
+        AuxiliaryOutput: Parameterized<
+                V,
+                To<V> = AuxiliaryOutput,
+                Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
+            >,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
+    }
+
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation and returns its auxiliary output. For
+    /// `(y, a) = f(x)`, only `J_y(x) = ∂y/∂x` is materialized: the method linearizes once, applies its [`Pushforward`]
+    /// to a packed input-coordinate basis, and assembles output-major/input-minor blocks. Auxiliary leaves are
+    /// recovered from the primal trace and returned unchanged; they add no Jacobian coordinates. Forward mode is
+    /// generally preferable when the input coordinate count does not exceed the differentiated output coordinate count.
+    /// Ordinary and [`HolomorphicLinearity`] element-type rules are the same as for the non-auxiliary forward Jacobian.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn jacobian_forward<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<C>
+                               + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value,
+        V::Type: DenseDifferentiableType<C>,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        AuxiliaryOutput: Parameterized<LinearizationTracer<C>>,
+        AuxiliaryOutput::Family: ParameterizedFamily<V>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .jacobian_forward(|input, ()| function(input))
+    }
+
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation and returns its auxiliary output. For
+    /// `(y, a) = f(x)`, only `J_y(x) = ∂y/∂x` is materialized: the method constructs one [`Pullback`], applies it to
+    /// a packed differentiated-output basis, and assembles the same output-major/input-minor blocks as forward mode.
+    /// Auxiliary leaves are recovered from the primal trace and returned unchanged; they receive zero cotangent seeds
+    /// and add no Jacobian coordinates. Reverse mode is generally preferable when the differentiated output coordinate
+    /// count is smaller than the input coordinate count. Ordinary and [`HolomorphicLinearity`] element-type rules are
+    /// the same as for the non-auxiliary reverse Jacobian.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn jacobian_reverse<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        AuxiliaryOutput: Parameterized<LinearizationTracer<C>>,
+        AuxiliaryOutput::Family: ParameterizedFamily<V>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .jacobian_reverse(|input, ()| function(input))
+    }
+
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation and returns its
+    /// auxiliary output. For `(y, a) = f(x)`, this returns the blocks `H_y(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])` in
+    /// output-major/first-input-major/second-input-minor order. Only `y` participates in the inner reverse Jacobian
+    /// and outer forward differentiation; auxiliary leaves are recovered as primal runtime values and introduce no
+    /// derivative coordinates. Complete materialization requires finite coordinate spaces and occupies `Θ(mn²)` for `n`
+    /// active-input and `m` differentiated-output coordinates. Ordinary and [`HolomorphicLinearity`] element-type rules
+    /// are the same as for the non-auxiliary Hessian.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn hessian<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<
+        (Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<LinearizationContext<C>>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::To<V::Type>: Clone,
+        Input::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = Input::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Input::To<
+                    LinearizationTracer<LinearizationContext<C>>,
+                >,
+                To<V::Type> = Input::To<V::Type>,
+            >,
+        Input::Family: ParameterizedFamily<V::Type>
+            + ParameterizedFamily<LinearizationTracer<C>>
+            + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
+        Output: Parameterized<LinearizationTracer<LinearizationContext<C>>>,
+        Output::To<V::Type>: Clone,
+        Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
+        AuxiliaryOutput: Parameterized<LinearizationTracer<LinearizationContext<C>>>,
+        AuxiliaryOutput::To<LinearizationTracer<C>>:
+            Parameterized<LinearizationTracer<C>, To<V> = AuxiliaryOutput::To<V>>,
+        AuxiliaryOutput::Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<V>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<LinearizationContext<C>>>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        DifferentiationBuilder {
+            primal: self.primal,
+            capture: WithCapture(()),
+            auxiliary: WithAuxiliaryOutput,
+            linearity: self.linearity,
+            context: self.context,
+        }
+        .hessian(|input, ()| function(input))
+    }
+}
+
+impl<Input, Capture, ContextState>
+    DifferentiationBuilder<Input, WithCapture<Capture>, WithoutAuxiliaryOutput, RealLinearity, ContextState>
+{
+    /// Evaluates `function` and its Jacobian-vector product while holding runtime captures fixed. For `y = f(x; c)`,
+    /// this returns `(y, ẏ) = (f(x; c), (∂f/∂x)(x; c) · ẋ)`. Only the active primal `x` pairs with the supplied tangent
+    /// value; capture `c` affects the primal and tangent computations as runtime coefficients but receives no tangent
+    /// values and contributes no derivative coordinates. The closure otherwise follows the direct forward mode
+    /// execution, structural-zero, nesting, and eager-versus-staged semantics of the capture-free [`jvp`](Self::jvp).
+    ///
+    /// # Parameters
+    ///
+    ///   - `tangent`: Tangent tree matching the structure of the builder's active primal.
+    ///   - `function`: Binary function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn jvp<C, V, Output, F>(
+        self,
+        tangent: Input::To<V>,
+        function: F,
+    ) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError>
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: DifferentiableOperation<C> + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value<Type: DifferentiableType>,
+        Input: Parameterized<V, Family: ParameterizedFamily<DifferentiationTracer<C>>>,
+        Input::ParameterStructure: Debug + PartialEq,
+        Capture: Parameterized<V, Family: ParameterizedFamily<DifferentiationTracer<C>>>,
+        Output: Parameterized<DifferentiationTracer<C>, Family: ParameterizedFamily<V>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<DifferentiationTracer<C>>,
+            Capture::To<DifferentiationTracer<C>>,
+        ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        self.context.resolve(&self.primal)?.jvp(function, self.primal, tangent, self.capture.0)
+    }
+
+    /// Linearizes `function` with respect to the active primal while holding runtime captures fixed.
+    ///
+    /// For `y = f(x; c)`, this returns `f(x; c)` and the reusable map
+    /// `ẋ ↦ ẏ = (∂f/∂x)(x; c) · ẋ`. Partial evaluation executes known primal and capture work in the
+    /// selected context and residualizes the unknown tangent computation. The returned [`Pushforward`] closes over
+    /// both ordinary linearization residuals and any runtime capture values it needs, so repeated applications require
+    /// only active tangent trees and never tangent values for captures.
+    ///
+    /// Host-control-flow and eager-versus-staged behavior are the same as for the capture-free
+    /// [`linearize`](Self::linearize). The active primal tree, not the capture tree, must contain at least one leaf.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn linearize<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<(Output::To<V>, Pushforward<C, Input, Output::To<V>>), DifferentiationError>
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<C>
+                               + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value<Type: DifferentiableType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<C>>,
+            Capture::To<LinearizationTracer<C>>,
+        ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let context = self.context.resolve(&self.primal)?;
+        context.linearize(function, self.primal, self.capture.0)
+    }
+
+    /// Differentiates `function` in reverse mode with respect to the active primal, holding runtime captures fixed.
+    ///
+    /// For `y = f(x; c)`, this returns `f(x; c)` and the reusable map `ȳ ↦ x̄ = (∂f/∂x)(x; c)ᵀ · ȳ`. Reverse mode
+    /// selects [`DifferentiableOperation::jvp_for_transpose`] and transposes the active derivative carrier. Captures
+    /// may remain among the residuals closed over by the [`Pullback`], but callers provide only output cotangents and
+    /// receive [`MaybeZero`] cotangents only for `x`; no capture cotangent tree is constructed. Disconnected leaves
+    /// remain structural zeros. [`Pullback::apply_materialized`] constructs concrete cotangents from the primal inputs
+    /// that the pullback retains as zero sources.
+    ///
+    /// The active primal tree, not the capture tree, must contain at least one leaf.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn vjp<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<(Output::To<V>, Pullback<C, Input, Output::To<V>>), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V> + ReverseModeDifferentiate,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<C>>,
+            Capture::To<LinearizationTracer<C>>,
+        ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        let context = self.context.resolve(&self.primal)?;
+        context.vjp(function, self.primal, self.capture.0)
+    }
+}
+
+impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithCapture<Capture>, WithoutAuxiliaryOutput, LinearityState, ContextState>
+{
+    /// Computes the scalar value of `function` and its gradient using reverse mode differentiation with respect to
+    /// the active primal only. For `y = f(x; c)` with real scalar `y`, this returns `(f(x; c), (∂f/∂x)(x; c)ᵀ · 1)`.
+    /// Captures are fixed runtime coefficients: they may change the value and gradient but receive no gradient result.
+    /// In [`HolomorphicLinearity`] mode, complex `y` yields `(f(x; c), ∂f/∂x)` under the caller's holomorphy promise.
+    /// The closure may return its traced scalar directly or in a [`Result`] whose error type is [`ProgramError`],
+    /// as specified by [`MaybeFallible`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary scalar-valued function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn value_and_gradient<C, V, Output, F>(self, function: F) -> Result<(V, Input::To<V>), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        value_and_gradient_in_context(
+            &self.context.resolve(&self.primal)?,
+            function,
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )
+    }
+
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation with respect
+    /// to the active primal only. For real scalar `y = f(x; c)`, this returns `(∂f/∂x)(x; c)ᵀ · 1`. In
+    /// [`HolomorphicLinearity`] mode it returns the complex derivative with respect to `x`. This discards the primal
+    /// scalar from [`value_and_gradient`](Self::value_and_gradient). Captures remain fixed runtime coefficients and
+    /// receive no gradient result. The closure supports the same [`MaybeFallible`] result contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary scalar-valued function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn gradient<C, V, Output, F>(self, function: F) -> Result<Input::To<V>, DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        self.value_and_gradient(function).map(|(_, gradient)| gradient)
+    }
+
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation with respect to the active primal
+    /// only. For `y = f(x; c)`, this materializes `J_x f(x; c) = ∂f/∂x` by applying one [`Pushforward`] to a packed
+    /// basis of active-input coordinates. Captures affect every evaluated column as fixed runtime coefficients but
+    /// contribute no basis directions or Jacobian blocks. Blocks use deterministic output-major/active-input-minor
+    /// order, with output axes before input axes for arrays.
+    ///
+    /// Forward materialization is generally preferable when the number of active-input coordinates does not exceed the
+    /// number of differentiated-output coordinates. Ordinary mode requires real active inputs but permits complex
+    /// outputs. [`HolomorphicLinearity`] mode requires complex active inputs and differentiated outputs and treats the
+    /// map as complex linear under the caller's holomorphy promise.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn jacobian_forward<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<C>
+                               + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value,
+        V::Type: DenseDifferentiableType<C>,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Capture: Parameterized<V, To<V> = Capture>,
+        Capture::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<C>>,
+            Capture::To<LinearizationTracer<C>>,
+        ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let context = self.context.resolve(&self.primal)?;
+        let (jacobian, ()) = jacobian_forward_in_context(
+            &context,
+            |input, captures| Ok((function(input, captures)?, ())),
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )?;
+        Ok(jacobian)
+    }
+
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation with respect to the active primal
+    /// only. For `y = f(x; c)`, this constructs a [`Pullback`] for `J_x f(x; c)ᵀ`, applies it to a packed basis of
+    /// differentiated-output coordinates, and assembles the same output-major/active-input-minor blocks as forward
+    /// mode. Captures affect the pullback as fixed runtime coefficients but receive no cotangents and contribute no
+    /// Jacobian blocks.
+    ///
+    /// Reverse materialization is generally preferable when the differentiated-output coordinate count is smaller than
+    /// the active-input coordinate count. Ordinary mode requires real differentiated outputs but permits complex active
+    /// inputs. [`HolomorphicLinearity`] mode requires complex active inputs and outputs and treats the map as complex
+    /// linear under the caller's holomorphy promise.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn jacobian_reverse<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Capture: Parameterized<V, To<V> = Capture>,
+        Capture::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<C>>,
+            Capture::To<LinearizationTracer<C>>,
+        ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let context = self.context.resolve(&self.primal)?;
+        let (jacobian, ()) = jacobian_reverse_in_context(
+            &context,
+            |input, captures| Ok((function(input, captures)?, ())),
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )?;
+        Ok(jacobian)
+    }
+
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation with respect to the
+    /// active primal only. For `y = f(x; c)`, this materializes `H_x f(x; c)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. Captures
+    /// remain fixed through both the inner reverse Jacobian and the outer forward transform. They may affect every
+    /// derivative value, but introduce neither first- nor second-order coordinates. Blocks use
+    /// output-major/first-active-input-major/second-active-input-minor order.
+    ///
+    /// With `n` active-input and `m` differentiated-output coordinates, the result occupies `Θ(mn²)` storage. Complete
+    /// materialization requires finite coordinate spaces. Ordinary mode requires real active inputs and outputs.
+    /// [`HolomorphicLinearity`] mode requires complex active inputs and outputs and treats both nested transforms
+    /// as complex linear under the caller's holomorphy promise.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function receiving reparameterized active primal and captures.
+    #[inline]
+    pub fn hessian<C, V, Output, F>(
+        self,
+        function: F,
+    ) -> Result<Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<LinearizationContext<C>>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::To<V::Type>: Clone,
+        Input::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = Input::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Input::To<
+                    LinearizationTracer<LinearizationContext<C>>,
+                >,
+                To<V::Type> = Input::To<V::Type>,
+            >,
+        Input::Family: ParameterizedFamily<V::Type>
+            + ParameterizedFamily<LinearizationTracer<C>>
+            + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
+        Capture: Parameterized<V, To<V> = Capture>,
+        Capture::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = Capture::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Capture::To<
+                    LinearizationTracer<LinearizationContext<C>>,
+                >,
+            >,
+        Capture::Family: ParameterizedFamily<LinearizationTracer<C>>
+            + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
+        Output: Parameterized<LinearizationTracer<LinearizationContext<C>>>,
+        Output::To<V::Type>: Clone,
+        Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<LinearizationContext<C>>>,
+            Capture::To<LinearizationTracer<LinearizationContext<C>>>,
+        ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let context = self.context.resolve(&self.primal)?;
+        let (hessian, ()) = hessian_in_context(
+            &context,
+            |input, captures| Ok((function(input, captures)?, ())),
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )?;
+        Ok(hessian)
+    }
+}
+
+impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithCapture<Capture>, WithAuxiliaryOutput, LinearityState, ContextState>
+{
+    /// Computes the scalar value and auxiliary output of `function` and its gradient using reverse mode differentiation
+    /// with respect to the active primal while holding captures fixed. For `(y, a) = f(x; c)` with real scalar `y`,
+    /// this returns `((y, a), (∂y/∂x)(x; c)ᵀ · 1)`. Captures affect the computation as fixed runtime coefficients,
+    /// auxiliary leaves receive zero cotangent seeds, and neither receives a gradient result. In
+    /// [`HolomorphicLinearity`] mode, complex `y` yields `∂y/∂x` under the caller's holomorphy promise. The closure may
+    /// return its outputs directly or in a [`Result`] whose error type is [`ProgramError`], as specified by
+    /// [`MaybeFallible`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function returning the differentiated scalar and auxiliary output.
+    #[inline]
+    pub fn value_and_gradient<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<((V, AuxiliaryOutput), Input::To<V>), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        AuxiliaryOutput: Parameterized<
+                V,
+                To<V> = AuxiliaryOutput,
+                Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
+            >,
+        Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        value_and_gradient_auxiliary_in_context(
+            &self.context.resolve(&self.primal)?,
+            function,
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )
+    }
+
+    /// Computes the gradient of a scalar-valued `function` using reverse mode differentiation with respect to the
+    /// active primal and returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)` with real
+    /// scalar `y`, this returns `((∂y/∂x)(x; c)ᵀ · 1, a)`. In [`HolomorphicLinearity`] mode, complex `y` yields the
+    /// complex derivative with respect to `x`. This discards the primal scalar from
+    /// [`value_and_gradient`](Self::value_and_gradient); captures remain fixed and auxiliary leaves remain primal
+    /// values, so neither receives a gradient result. The closure supports the [`MaybeFallible`] result contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function returning the differentiated scalar and auxiliary output.
+    #[inline]
+    pub fn gradient<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<(Input::To<V>, AuxiliaryOutput), DifferentiationError>
+    where
+        C: Context<Type = V::Type, Value = V>
+            + ReverseModeDifferentiate<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
+        Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+        AuxiliaryOutput: Parameterized<
+                V,
+                To<V> = AuxiliaryOutput,
+                Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
+            >,
+        Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>):
+            Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        <PartialEvaluationContext<C> as Domain>::Operation: DifferentiableOperation<PartialEvaluationContext<C>>,
+    {
+        self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
+    }
+
+    /// Computes the [`Jacobian`] of `function` using forward mode differentiation with respect to the active primal and
+    /// returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)`, this materializes `∂y/∂x`
+    /// from a packed active-input basis. Capture `c` remains a runtime coefficient, and auxiliary leaves `a` are
+    /// reconstructed as primal values. Neither introduces Jacobian coordinates. Blocks use
+    /// output-major/active-input-minor order. Forward mode is generally preferable when the active-input coordinate
+    /// count does not exceed the differentiated-output coordinate count. [`HolomorphicLinearity`] mode applies the same
+    /// complex-linearity promise and validation as the non-auxiliary transform.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn jacobian_forward<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
+    where
+        C: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<C>
+                               + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
+            >,
+        V: Value,
+        V::Type: DenseDifferentiableType<C>,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Capture: Parameterized<V, To<V> = Capture>,
+        Capture::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        AuxiliaryOutput: Parameterized<LinearizationTracer<C>>,
+        AuxiliaryOutput::Family: ParameterizedFamily<V>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<C>>,
+            Capture::To<LinearizationTracer<C>>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        jacobian_forward_in_context(
+            &self.context.resolve(&self.primal)?,
+            function,
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )
+    }
+
+    /// Computes the [`Jacobian`] of `function` using reverse mode differentiation with respect to the active primal
+    /// and returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)`, this materializes `∂y/∂x`
+    /// from a packed differentiated-output cotangent basis. Capture `c` remains a runtime coefficient, while auxiliary
+    /// leaves `a` receive zero cotangent seeds and are reconstructed as primal values. Neither contributes derivative
+    /// coordinates. Reverse mode is generally preferable when the differentiated-output coordinate count is smaller
+    /// than the active-input coordinate count. [`HolomorphicLinearity`] mode applies the same complex-linearity promise
+    /// and validation as the non-auxiliary transform.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn jacobian_reverse<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Capture: Parameterized<V, To<V> = Capture>,
+        Capture::Family: ParameterizedFamily<LinearizationTracer<C>>,
+        Output: Parameterized<LinearizationTracer<C>>,
+        Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        AuxiliaryOutput: Parameterized<LinearizationTracer<C>>,
+        AuxiliaryOutput::Family: ParameterizedFamily<V>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<C>>,
+            Capture::To<LinearizationTracer<C>>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        jacobian_reverse_in_context(
+            &self.context.resolve(&self.primal)?,
+            function,
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )
+    }
+
+    /// Computes the [`Hessian`] of `function` using forward over reverse mode differentiation with respect to the
+    /// active primal and returns its auxiliary output while holding captures fixed. For `(y, a) = f(x; c)`, this
+    /// materializes `H_x y[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. Captures remain fixed through both derivative levels,
+    /// while auxiliary leaves are reconstructed from primal values; neither contributes first- or second-order
+    /// coordinates. Blocks use output-major/first-active-input-major/second-active-input-minor order, and the result
+    /// occupies `Θ(mn²)` for `n` active-input and `m` differentiated-output coordinates. Complete materialization
+    /// requires finite coordinate spaces. [`HolomorphicLinearity`] mode treats both nested transforms as complex linear
+    /// under the caller's promise.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Binary function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn hessian<C, V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<
+        (Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
+    where
+        C: Context<Type = V::Type, Value = V>,
+        C::Operation: PartiallyEvaluatableOperation<C>
+            + PartiallyEvaluatableOperation<LinearizationContext<C>>
+            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<C>>
+            + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
+            + TransposableOperation<C::Constant, C::Operation>
+            + ResidualZeroProvider<V::Type, Operation = C::Operation>
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
+                Operation = C::Operation,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
+        V: Value,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
+        Input: Parameterized<V, To<V> = Input>,
+        Input::To<V::Type>: Clone,
+        Input::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = Input::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Input::To<
+                    LinearizationTracer<LinearizationContext<C>>,
+                >,
+                To<V::Type> = Input::To<V::Type>,
+            >,
+        Input::Family: ParameterizedFamily<V::Type>
+            + ParameterizedFamily<LinearizationTracer<C>>
+            + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
+        Capture: Parameterized<V, To<V> = Capture>,
+        Capture::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = Capture::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Capture::To<
+                    LinearizationTracer<LinearizationContext<C>>,
+                >,
+            >,
+        Capture::Family: ParameterizedFamily<LinearizationTracer<C>>
+            + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
+        Output: Parameterized<LinearizationTracer<LinearizationContext<C>>>,
+        Output::To<V::Type>: Clone,
+        Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
+        AuxiliaryOutput: Parameterized<LinearizationTracer<LinearizationContext<C>>>,
+        AuxiliaryOutput::To<LinearizationTracer<C>>:
+            Parameterized<LinearizationTracer<C>, To<V> = AuxiliaryOutput::To<V>>,
+        AuxiliaryOutput::Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<V>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<LinearizationContext<C>>>,
+            Capture::To<LinearizationTracer<LinearizationContext<C>>>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        hessian_in_context(
+            &self.context.resolve(&self.primal)?,
+            function,
+            self.primal,
+            self.capture.0,
+            LinearityState::HOLOMORPHIC,
+        )
+    }
+}
+
+/// Provides the ability to initiate a differentiation transform that executes in the current [`Context`]. This
+/// trait is blanket-implemented for every differentiable [`Context`]. Calling `context.differentiate_at(primal)`
+/// is equivalent to calling `differentiate_at(primal).in_context(&context)`.
+///
+/// # Example
+///
+/// ```
+/// # use std::ops::Mul;
+/// #
+/// # use ryft_core::{Array, ArrayOperation, Differentiate, EagerContext};
+///
+/// fn square<A: Clone + Mul<Output = A>>(input: A) -> A {
+///     input.clone() * input
+/// }
+///
+/// let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+/// let (_, gradient) = context.differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(square)?;
+/// assert_eq!(gradient.to_f64s(), vec![4.0]);
+/// # Ok::<(), ryft_core::DifferentiationError>(())
+/// ```
+pub trait Differentiate: Context<Type: DifferentiableType> {
+    /// Creates a new [`DifferentiationBuilder`] that can be used to differentiate a closure at the `primal` point,
+    /// within this [`Context`]. Refer to the documentation of [`differentiate_at`] for information on how to use
+    /// this function.
+    #[inline]
+    fn differentiate_at<Input>(
+        &self,
+        primal: Input,
+    ) -> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, WithContext<Self>> {
+        differentiate_at(primal).in_context(self)
+    }
+}
+
+impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
+
+/// Creates a new [`DifferentiationBuilder`] that can be used to differentiate a closure at the `primal` point, with
+/// respect to the active [`Parameterized`] input value. The builder's modifier functions select nondifferentiated
+/// runtime captures, auxiliary outputs, holomorphic validation, and an explicit execution context, and each of its
+/// terminal functions takes the differentiated closure as its last argument.
+///
+/// The closure's contract follows the builder state. By default, the closure takes the active input as its only
+/// argument, and calling [`DifferentiationBuilder::with_captures`] changes that contract to a binary closure whose
+/// second argument is the traced capture structure. Because the active input, captures, and execution context are all
+/// fixed by the time a terminal function receives the closure, the closure's parameter and result types are deduced
+/// from the builder state and they usually require no annotations.
+///
+/// # Examples
+///
+/// The following is an example showing differentiation with respect to an input value while also providing
+/// a non-differentiated runtime capture:
+///
+/// ```
+/// # use std::ops::Mul;
+/// #
+/// # use ryft_core::{Array, differentiate_at};
+///
+/// fn scale<A: Mul<Output = A>>(input: A, scale: A) -> A {
+///     input * scale
+/// }
+///
+/// let (_, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
+///     .with_captures(Array::scalar(3.0).unwrap())
+///     .value_and_gradient(scale)?;
+///
+/// assert_eq!(gradient.to_f64s(), vec![3.0]);
+/// # Ok::<(), ryft_core::DifferentiationError>(())
+/// ```
+///
+/// And the following example shows how the capture and the auxiliary output structures are independent:
+///
+/// ```
+/// # use std::ops::{Add, Mul};
+/// #
+/// # use ryft_core::{Array, Parameter, differentiate_at};
+/// #
+/// # /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
+/// # mod ryft {
+/// #     pub use ryft_core::parameters::ParameterError;
+/// #     pub use ryft_core::parameters::{
+/// #         Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+/// #         PathPrefixedParameterIterator, Placeholder,
+/// #     };
+/// #     pub use ryft_macros::Parameterized;
+/// # }
+/// # use ryft::Parameterized;
+///
+/// #[derive(Clone, Parameterized)]
+/// struct Auxiliary<P: Parameter> {
+///     prediction: P,
+///     diagnostic: Option<P>,
+/// }
+///
+/// fn evaluate<A: Clone + Parameter + Add<Output = A> + Mul<Output = A>>(
+///     input: A,
+///     (scale, offsets): (A, Vec<A>),
+/// ) -> (A, Auxiliary<A>) {
+///     let output = input * scale + offsets[0].clone();
+///     (output.clone(), Auxiliary { prediction: output, diagnostic: offsets.into_iter().next() })
+/// }
+///
+/// let ((value, auxiliary), gradient): ((Array, Auxiliary<Array>), Array) = differentiate_at(Array::scalar(2.0).unwrap())
+///     .with_captures((Array::scalar(3.0).unwrap(), vec![Array::scalar(4.0).unwrap()]))
+///     .with_auxiliary_output()
+///     .value_and_gradient(evaluate)?;
+/// assert_eq!(value.to_f64s(), vec![10.0]);
+/// assert_eq!(auxiliary.prediction.to_f64s(), vec![10.0]);
+/// assert_eq!(auxiliary.diagnostic.unwrap().to_f64s(), vec![4.0]);
+/// assert_eq!(gradient.to_f64s(), vec![3.0]);
+/// # Ok::<(), ryft_core::DifferentiationError>(())
+/// ```
+///
+/// The remaining examples fail to compile by design, because the builder's type states reject invalid configurations
+/// at compile time. Closure arity follows the builder state and is checked where the terminal function receives the
+/// closure. A capture-free builder requires a unary closure, so a binary closure literal fails to match the expected
+/// signature:
+///
+/// ```compile_fail
+/// # use ryft_core::{Array, differentiate_at};
+///
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).gradient(|input, capture| input * capture);
+/// ```
+///
+/// A builder with captures requires a binary closure, so a unary closure literal fails the same way:
+///
+/// ```compile_fail
+/// # use ryft_core::{Array, differentiate_at};
+///
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).with_captures(Array::scalar(3.0).unwrap()).gradient(|input| input);
+/// ```
+///
+/// An explicitly selected context cannot be silently replaced, because [`DifferentiationBuilder::in_context`] only
+/// exists in the unconfigured [`WithoutContext`] state:
+///
+/// ```compile_fail
+/// # use ryft_core::{Array, ArrayOperation, EagerContext, differentiate_at};
+///
+/// let first = EagerContext::<Array, ArrayOperation<Array>>::new();
+/// let second = EagerContext::<Array, ArrayOperation<Array>>::new();
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).in_context(&first).in_context(&second);
+/// ```
+///
+/// Holomorphic validation is intentionally unavailable for the Jacobian-Vector Product (JVP), linearization,
+/// and Vector-Jacobian Product (VJP) terminal functions, so those terminal functions do not exist in the
+/// [`HolomorphicLinearity`] state:
+///
+/// ```compile_fail
+/// # use std::ops::Mul;
+/// #
+/// # use ryft_core::{Array, ProgramError, differentiate_at};
+///
+/// fn square<A: Clone + Mul<Output = A>>(input: A) -> Result<A, ProgramError> {
+///     Ok(input.clone() * input)
+/// }
+///
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).holomorphic().linearize(square);
+/// ```
+///
+/// # Parameters
+///
+///   - `primal`: Active [`Parameterized`] input value the transform differentiates with respect to. It may be a leaf,
+///     tuple, array, [`Vec`], map, or any other type that implements the [`Parameterized`] trait.
+#[inline]
+pub fn differentiate_at<Input>(
+    primal: Input,
+) -> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, WithoutContext> {
+    DifferentiationBuilder {
+        primal,
+        capture: WithoutCapture,
+        auxiliary: WithoutAuxiliaryOutput,
+        linearity: RealLinearity,
+        context: WithoutContext,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use indoc::indoc;
+    use num_complex::Complex as ComplexNumber;
+    use pretty_assertions::assert_eq;
+
+    use ryft_macros::Parameterized;
+
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType};
+    use crate::axes::{NamedAxes, NamedAxis};
+    use crate::batching::{BatchAxis, batch};
+    use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
+    use crate::operations::{Complex, One, Real, Reduce, ReductionKind};
+    use crate::parameters::Parameter;
+    use crate::programs::{AttachedRegions, Provenance, ProvenanceScope, ReferenceType};
+    use crate::tracing::DomainTracingContext;
+
+    use super::*;
+
+    #[derive(Clone, Parameterized)]
+    struct StructuredCaptures<P: Parameter> {
+        scale: P,
+        offsets: Vec<P>,
+        extra: Option<P>,
+    }
+
+    #[derive(Clone, Parameterized)]
+    struct StructuredAuxiliary<P: Parameter> {
+        prediction: P,
+        intermediates: Vec<P>,
+        diagnostic: Option<P>,
+        training: bool,
+    }
+
+    #[test]
+    fn test_differentiation_error_display() {
+        let cases = [
+            (DifferentiationError::EmptyInput, "differentiation requires an input with at least one leaf value"),
+            (
+                DifferentiationError::NonScalarGradientOutput { output_type: "f32[2]".to_string() },
+                "gradient output must be a rank-0 scalar but got f32[2]",
+            ),
+            (
+                DifferentiationError::NonDifferentiableGradientOutput { output_type: "i32[]".to_string() },
+                "gradient output type i32[] is non-differentiable and carries no cotangent space",
+            ),
+            (
+                DifferentiationError::ComplexGradientOutput { output_type: "c64[]".to_string() },
+                "gradient output type c64[] is complex; use a holomorphic gradient entry point if the function is \
+                 holomorphic",
+            ),
+            (
+                DifferentiationError::NonDifferentiableParameter {
+                    transform: DerivativeTransform::JacobianForward,
+                    role: DifferentiationParameterRole::Input,
+                    path: "$.value".to_string(),
+                    r#type: "i32[]".to_string(),
+                },
+                "forward Jacobian input parameter at $.value has non-differentiable type i32[]",
+            ),
+            (
+                DifferentiationError::UndefinedTangentType { primal_type: "ref<f32[4]>".to_string() },
+                "type ref<f32[4]> does not define a tangent representation",
+            ),
+            (
+                DifferentiationError::UndefinedCotangentType { primal_type: "ref<f32[4]>".to_string() },
+                "type ref<f32[4]> does not define a cotangent representation",
+            ),
+            (
+                DifferentiationError::ComplexParameter {
+                    transform: DerivativeTransform::JacobianForward,
+                    role: DifferentiationParameterRole::Input,
+                    path: "$.value".to_string(),
+                    r#type: "c64[]".to_string(),
+                },
+                "forward Jacobian input parameter at $.value has complex type c64[]; use holomorphic forward \
+                 Jacobian instead",
+            ),
+            (
+                DifferentiationError::NonComplexParameter {
+                    transform: DerivativeTransform::JacobianReverse,
+                    role: DifferentiationParameterRole::Output,
+                    path: "$".to_string(),
+                    r#type: "f64[]".to_string(),
+                },
+                "holomorphic reverse Jacobian output parameter at $ must be complex but has type f64[]",
+            ),
+            (
+                DifferentiationError::NonFiniteCoordinateSpace {
+                    transform: DerivativeTransform::Hessian,
+                    role: DifferentiationParameterRole::Derivative,
+                    path: "$.0".to_string(),
+                    r#type: "f64[dynamic]".to_string(),
+                },
+                "hessian derivative parameter at $.0 does not have a finite static coordinate space: f64[dynamic]",
+            ),
+            (
+                DifferentiationError::CoordinateCountOverflow {
+                    transform: DerivativeTransform::JacobianReverse,
+                    role: DifferentiationParameterRole::Input,
+                    path: "$.1".to_string(),
+                    r#type: "f64[]".to_string(),
+                },
+                "reverse Jacobian input coordinate count overflows usize at parameter $.1: f64[]",
+            ),
+            (
+                DifferentiationError::Program(ProgramError::MalformedProgram("invalid program".to_string())),
+                "encountered malformed program: invalid program",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_differentiation_error_conversions() {
+        let program_error = ProgramError::MalformedProgram("invalid program".to_string());
+        assert_eq!(ProgramError::from(DifferentiationError::from(program_error.clone())), program_error);
+
+        let differentiation_error = DifferentiationError::EmptyInput;
+        assert_eq!(
+            DifferentiationError::from(ProgramError::from(differentiation_error.clone())),
+            differentiation_error
+        );
+
+        let type_error = TypeError::invalid("invalid type");
+        assert_eq!(TypeError::from(DifferentiationError::from(type_error.clone())), type_error);
+
+        let differentiation_error =
+            DifferentiationError::UndefinedTangentType { primal_type: "ref<f32[4]>".to_string() };
+        assert_eq!(DifferentiationError::from(TypeError::from(differentiation_error.clone())), differentiation_error,);
+    }
+
+    #[test]
+    fn test_differentiation_boundary_position() {
+        for (position, expected) in [
+            (DifferentiationBoundaryPosition::Input(1), "input 1"),
+            (DifferentiationBoundaryPosition::Capture(2), "capture 2"),
+            (DifferentiationBoundaryPosition::Tangent(3), "tangent 3"),
+            (DifferentiationBoundaryPosition::Cotangent(4), "cotangent 4"),
+        ] {
+            assert_eq!(position.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_reference_boundary_new_for_differentiation() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = [
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
+            ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+        ];
+        let tangents = [
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap())),
+            ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()),
+        ];
+        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32).unwrap()))];
+        assert_eq!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, &tangents, &captures).map(|_| ()),
+            Ok(())
+        );
+
+        // Inputs and captures precede tangent aliases, and repeated tangents retain their own group indices.
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&inputs[0]], &captures),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 and input 0 bind the same reference allocation",
+        ));
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&captures[0]], &captures),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 and capture 0 bind the same reference allocation",
+        ));
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&tangents[0], &tangents[0]], []),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 1 and tangent 0 bind the same reference allocation",
+        ));
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&inputs[0]], [&inputs[0]]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "capture 0 and input 0 bind the same reference allocation",
+        ));
+
+        // A tangent owned by a different trace cannot supply a boundary identity in the active trace.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let foreign = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+            .input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&trace, [], [&foreign], []),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 has reference type `ref<f32[]>` but reports no reference allocation identity",
+        ));
+    }
+
+    #[test]
+    fn test_reference_boundary_validate_differentiation_arguments() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let primal = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let derivative = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap()));
+        let boundary = ReferenceBoundary::new_for_differentiation(&context, [&primal], [], []).unwrap();
+        assert_eq!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [(DifferentiationBoundaryPosition::Cotangent(0), &derivative)],
+            ),
+            Ok(()),
+        );
+        assert!(matches!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [(DifferentiationBoundaryPosition::Tangent(0), &primal)],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 aliases a reference bound at the primal boundary of the \
+                    differentiated function",
+        ));
+        assert!(matches!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [(DifferentiationBoundaryPosition::Cotangent(0), &primal)],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "cotangent 0 aliases a reference bound at the primal boundary of the \
+                    differentiated function",
+        ));
+        assert!(matches!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [
+                    (DifferentiationBoundaryPosition::Cotangent(0), &derivative),
+                    (DifferentiationBoundaryPosition::Cotangent(1), &derivative),
+                ],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "cotangent 1 and cotangent 0 bind the same reference allocation",
+        ));
+    }
+
+    #[test]
+    fn test_derivative_transform() {
+        assert_eq!(DerivativeTransform::JacobianForward.to_string(), "forward Jacobian");
+        assert_eq!(DerivativeTransform::JacobianReverse.to_string(), "reverse Jacobian");
+        assert_eq!(DerivativeTransform::Hessian.to_string(), "hessian");
+    }
+
+    #[test]
+    fn test_differentiation_parameter_role() {
+        assert_eq!(DifferentiationParameterRole::Input.to_string(), "input");
+        assert_eq!(DifferentiationParameterRole::Output.to_string(), "output");
+        assert_eq!(DifferentiationParameterRole::Derivative.to_string(), "derivative");
+    }
+
+    #[test]
+    fn test_differentiation_builder_forward_and_reverse_transforms_with_captures() {
+        let primal = Array::scalar(2.0).unwrap();
+        let capture = Array::scalar(3.0).unwrap();
+
+        // JVP differentiates only the active primal while treating the capture as a fixed runtime coefficient.
+        let (value, tangent) = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .jvp(Array::scalar(1.0).unwrap(), |input, scale| Ok(input * scale))
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(tangent.to_f64s(), vec![3.0]);
+
+        // Linearization retains that runtime coefficient in the reusable pushforward.
+        let (value, pushforward) = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .linearize(|input, scale| Ok(input * scale))
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(pushforward.apply(Array::scalar(2.0).unwrap()).unwrap().to_f64s(), vec![6.0]);
+
+        // Reverse mode likewise excludes captures from the pullback result.
+        let (value, pullback) = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .vjp(|input, scale| Ok(input * scale))
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(pullback.apply_materialized(Array::scalar(2.0).unwrap()).unwrap().to_f64s(), vec![6.0]);
+
+        // Scalar-gradient projection returns no gradient leaf for the capture.
+        let (value, gradient) = differentiate_at(primal)
+            .with_captures(capture)
+            .value_and_gradient(|input, scale| input * scale)
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(gradient.to_f64s(), vec![3.0]);
+
+        // Tangents must remain structurally isomorphic to the active primals.
+        let error = differentiate_at(vec![Array::scalar(2.0).unwrap()])
+            .with_captures(Array::scalar(3.0).unwrap())
+            .jvp(Vec::<Array>::new(), |inputs, scale| Ok(inputs[0].clone() * scale))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DifferentiationError::Program(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
+                left_structure: "[<Parameter>]".to_string(),
+                right_structure: "[]".to_string(),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_differentiation_builder_jacobian_and_hessian_with_captures() {
+        let primal = Array::scalar(2.0).unwrap();
+        let capture = Array::scalar(3.0).unwrap();
+
+        // Both Jacobian directions materialize derivatives only with respect to the active primal.
+        let forward = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .jacobian_forward(|input, scale| Ok(input * scale))
+            .unwrap();
+        let reverse = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .jacobian_reverse(|input, scale| Ok(input * scale))
+            .unwrap();
+        assert_eq!(forward.values()[0].to_f64s(), vec![3.0]);
+        assert_eq!(reverse.values()[0].to_f64s(), vec![3.0]);
+
+        // Hessian materialization holds the same capture fixed through both derivative levels.
+        let hessian = differentiate_at(primal)
+            .with_captures(capture)
+            .hessian(|input, scale| Ok(input.clone() * input * scale))
+            .unwrap();
+        assert_eq!(hessian.values()[0].to_f64s(), vec![6.0]);
+
+        // Auxiliary output is reconstructed from primal values and excluded from both Jacobian directions.
+        let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .with_auxiliary_output()
+            .jacobian_reverse(|input, scale| {
+                let output = input * scale;
+                Ok::<_, ProgramError>((output.clone(), output))
+            })
+            .unwrap();
+        assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
+        assert_eq!(auxiliary.to_f64s(), vec![6.0]);
+
+        let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .with_auxiliary_output()
+            .jacobian_forward(|input, scale| {
+                let output = input * scale;
+                Ok::<_, ProgramError>((output.clone(), output))
+            })
+            .unwrap();
+        assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
+        assert_eq!(auxiliary.to_f64s(), vec![6.0]);
+
+        // Hessian auxiliary output follows the same nondifferentiated contract.
+        let (hessian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .with_auxiliary_output()
+            .hessian(|input, scale| {
+                let output = input.clone() * input * scale;
+                Ok((output.clone(), output))
+            })
+            .unwrap();
+        assert_eq!(hessian_with_auxiliary.values()[0].to_f64s(), vec![6.0]);
+        assert_eq!(auxiliary.to_f64s(), vec![12.0]);
+    }
+
+    #[test]
+    fn test_differentiation_builder_capture_free_terminal_functions() {
+        let primal = Array::scalar(2.0).unwrap();
+
+        // Capture-free scalar gradients retain the ergonomic unary closure shape.
+        let (value, gradient) =
+            differentiate_at(primal.clone()).value_and_gradient(|input| input.clone() * input).unwrap();
+        assert_eq!(value.to_f64s(), vec![4.0]);
+        assert_eq!(gradient.to_f64s(), vec![4.0]);
+
+        // A fallible gradient closure needs no error-type annotation: the terminal's `MaybeFallible` bound names
+        // `ProgramError` exactly, so a bare `Ok(...)` body infers its error type from the terminal itself.
+        let (value, gradient) =
+            differentiate_at(primal.clone()).value_and_gradient(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(value.to_f64s(), vec![4.0]);
+        assert_eq!(gradient.to_f64s(), vec![4.0]);
+
+        // Fallible and infallible unary VJP closures produce equivalent pullbacks.
+        let (expected_value, expected_pullback) =
+            differentiate_at(primal.clone()).vjp(|input| Ok(input.clone() * input)).unwrap();
+        let (actual_value, actual_pullback) = differentiate_at(primal).vjp(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(actual_value, expected_value);
+        assert_eq!(
+            actual_pullback.apply(Array::scalar(1.0).unwrap()).unwrap(),
+            expected_pullback.apply(Array::scalar(1.0).unwrap()).unwrap(),
+        );
+
+        // Capture-free linearization stages the expected unary pushforward program.
+        let (_, actual_pushforward) =
+            differentiate_at(Array::scalar(2.0).unwrap()).linearize(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(
+            actual_pushforward.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                    %3:f64[] = mul %1 %0
+                    %4:f64[] = add %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // Higher-order terminal functions retain the same unary closure shape.
+        let hessian = differentiate_at(Array::scalar(2.0).unwrap()).hessian(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(hessian.values()[0].to_f64s(), vec![2.0]);
+    }
+
+    #[test]
+    fn test_differentiation_builder_capture_values_do_not_specialize_linearization() {
+        let (_, pushforward_at_three) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .linearize(|input, scale| Ok(input * scale))
+            .unwrap();
+        let (_, pushforward_at_five) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(5.0).unwrap())
+            .linearize(|input, scale| Ok(input * scale))
+            .unwrap();
+
+        assert_eq!(pushforward_at_three.program().to_string(), pushforward_at_five.program().to_string());
+        assert_eq!(pushforward_at_three.apply(Array::scalar(1.0).unwrap()).unwrap().to_f64s(), vec![3.0]);
+        assert_eq!(pushforward_at_five.apply(Array::scalar(1.0).unwrap()).unwrap().to_f64s(), vec![5.0]);
+    }
+
+    #[test]
+    fn test_differentiation_builder_captures_compose_with_batching() {
+        let capture_tangent_was_zero = Cell::new(false);
+        let per_example = batch(
+            |(input, scale)| {
+                differentiate_at(input)
+                    .with_captures(scale)
+                    .value_and_gradient(|input, scale| {
+                        capture_tangent_was_zero.set(scale.tangent().is_zero());
+                        input * scale
+                    })
+                    .map_err(ProgramError::from)
+            },
+            (Array::vector(vec![2.0, 3.0]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap()),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(per_example.0.to_f64s(), vec![8.0, 15.0]);
+        assert_eq!(per_example.1.to_f64s(), vec![4.0, 5.0]);
+        assert!(capture_tangent_was_zero.get());
+
+        let (value, gradient) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
+            .with_captures(Array::vector(vec![4.0, 5.0]).unwrap())
+            .value_and_gradient(|input, scale| {
+                let mapped = batch(
+                    |(item, factor)| Ok(item * factor),
+                    (input, scale),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    BatchAxis::new(0),
+                    None,
+                )?;
+                Ok(mapped.reduce(&[0], ReductionKind::Sum)?)
+            })
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![23.0]);
+        assert_eq!(gradient.to_f64s(), vec![4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_differentiation_builder_explicit_context() {
+        #[derive(Clone)]
+        struct ExplicitContext(EagerContext<Array, ArrayOperation<Array>>);
+
+        impl Domain for ExplicitContext {
+            type Type = ArrayType;
+            type Value = Array;
+            type Constant = Array;
+            type Operation = ArrayOperation<Array>;
+        }
+
+        impl Context for ExplicitContext {
+            fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
+                self.0.lift(constant)
+            }
+
+            fn bind<'r, Operation: Into<Self::Operation>, R: Into<AttachedRegions<'r, Array, Self::Operation>>>(
+                &self,
+                operation: Operation,
+                regions: R,
+                inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError>
+            where
+                Array: 'r,
+                Self::Operation: 'r,
+            {
+                self.0.bind(operation, regions, inputs)
+            }
+
+            fn is_eager(&self) -> bool {
+                self.0.is_eager()
+            }
+
+            fn provenance(&self) -> Provenance {
+                self.0.provenance()
+            }
+
+            fn resolve(&self, value: &Array) -> ValueResolution<Array> {
+                self.0.resolve(value)
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+                self.0.invoke_with_provenance_origin(origin, function)
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+                self.0.invoke_with_provenance_scope(scope, function)
+            }
+        }
+
+        impl NamedAxes for ExplicitContext {
+            fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+                self.0.named_axis(name)
+            }
+
+            fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+                self.0.named_axes()
+            }
+        }
+
+        impl Zero<Array> for ExplicitContext {
+            fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+                self.0.zero(r#type)
+            }
+        }
+
+        impl One<Array> for ExplicitContext {
+            fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+                self.0.one(r#type)
+            }
+        }
+
+        // The selected context may differ from `Array::Domain`; its type drives all tracer and transform
+        // machinery when the builder is context-bound.
+        let context = ExplicitContext(EagerContext::new());
+        let (_, gradient) = context
+            .differentiate_at(Array::scalar(2.0).unwrap())
+            .value_and_gradient(|input| input.clone() * input)
+            .unwrap();
+        assert_eq!(gradient.to_f64s(), vec![4.0]);
+
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (_, gradient) = context
+            .differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .value_and_gradient(|input, scale| input * scale)
+            .unwrap();
+        assert_eq!(gradient.to_f64s(), vec![3.0]);
+
+        // Binding a different live tracing context must fail. Deriving the context from the primal would incorrectly
+        // make both calls succeed, so these assertions pin the explicit-context semantics of both entry points.
+        let primal_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let explicit_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = primal_context.input(ArrayType::scalar(DataType::F64));
+        let result = explicit_context.differentiate_at(primal).value_and_gradient(|input| input.clone() * input);
+        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
+
+        let primal_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let explicit_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = primal_context.input(ArrayType::scalar(DataType::F64));
+        let result = differentiate_at(primal)
+            .in_context(&explicit_context)
+            .value_and_gradient(|input| input.clone() * input);
+        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
+    }
+
+    #[test]
+    fn test_differentiation_builder_holomorphic_terminal_functions_with_captures() {
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
+        let capture = Array::scalar(ComplexNumber::new(3.0f32, -1.0)).unwrap();
+        let (_, gradient) = differentiate_at(input)
+            .with_captures(capture.clone())
+            .holomorphic()
+            .value_and_gradient(|input, capture| input * capture)
+            .unwrap();
+        assert_eq!(gradient.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, -1.0)]));
+
+        let jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
+            .with_captures(capture.clone())
+            .holomorphic()
+            .jacobian_reverse(|input, capture| Ok(input * capture))
+            .unwrap();
+        assert_eq!(jacobian.values()[0].elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, -1.0)]));
+
+        let forward_jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
+            .with_captures(capture.clone())
+            .holomorphic()
+            .jacobian_forward(|input, capture| Ok(input * capture))
+            .unwrap();
+        assert_eq!(
+            forward_jacobian.values()[0].elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(3.0, -1.0)]),
+        );
+
+        let hessian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
+            .with_captures(capture.clone())
+            .holomorphic()
+            .hessian(|input, scale| Ok(input.clone() * input * scale))
+            .unwrap();
+        assert_eq!(hessian.values()[0].elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(6.0, -2.0)]));
+
+        // Linearity-mode validation constrains only active inputs and differentiated outputs, so captures are exempt
+        // in both directions. A real capture under `holomorphic()` must not raise `NonComplexParameter`, even though
+        // the same type in the active input position would.
+        let real_capture = Array::scalar(3.0f32).unwrap();
+        let (value, gradient) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
+            .with_captures(real_capture.clone())
+            .holomorphic()
+            .value_and_gradient(|input, capture| Ok(input * capture.complex(&capture)?))
+            .unwrap();
+        assert_eq!(value.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, 9.0)]));
+        assert_eq!(gradient.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, 3.0)]));
+
+        let real_capture_jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
+            .with_captures(real_capture)
+            .holomorphic()
+            .jacobian_forward(|input, capture| Ok(input * capture.complex(&capture)?))
+            .unwrap();
+        assert_eq!(
+            real_capture_jacobian.values()[0].elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(3.0, 3.0)]),
+        );
+
+        // Symmetrically, a complex capture in ordinary (i.e., real-valued) mode must not raise `ComplexParameter`.
+        let (value, gradient) = differentiate_at(Array::scalar(2.0f32).unwrap())
+            .with_captures(capture.clone())
+            .value_and_gradient(|input, capture| Ok(input * capture.real()?))
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(gradient.to_f64s(), vec![3.0]);
+
+        let complex_capture_jacobian = differentiate_at(Array::scalar(2.0f32).unwrap())
+            .with_captures(capture)
+            .jacobian_reverse(|input, capture| Ok(input * capture.real()?))
+            .unwrap();
+        assert_eq!(complex_capture_jacobian.values()[0].to_f64s(), vec![3.0]);
+    }
+
+    #[test]
+    fn test_differentiation_builder_empty_active_input_ignores_captures() {
+        let error = differentiate_at(Vec::<Array>::new())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .value_and_gradient(|_input, capture| capture)
+            .unwrap_err();
+        assert_eq!(error, DifferentiationError::EmptyInput);
+    }
+
+    #[test]
+    fn test_differentiation_builder_validates_captures_when_used() {
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::F64));
+        let foreign_capture = foreign_context.input(ArrayType::scalar(DataType::F64));
+        let invoked = Cell::new(false);
+
+        // An unused capture never enters the staged program, so its foreign context is irrelevant.
+        let result = differentiate_at(primal.clone()).with_captures(foreign_capture.clone()).value_and_gradient(
+            |input, _capture| {
+                invoked.set(true);
+                input
+            },
+        );
+        let (value, gradient) = result.unwrap();
+        assert!(invoked.get());
+        assert_eq!(value, primal);
+        assert!(matches!(context.resolve(&gradient), ValueResolution::Staged(_)));
+
+        // Using that capture binds it into the active program and therefore validates its context identity.
+        let result = differentiate_at(primal)
+            .with_captures(foreign_capture)
+            .value_and_gradient(|input, capture| input * capture);
+        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
+    }
+
+    #[test]
+    fn test_differentiation_builder_hessian_composes_over_staging_context() {
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::F64));
+        let capture = context.input(ArrayType::scalar(DataType::F64));
+        let hessian = differentiate_at(primal)
+            .with_captures(capture)
+            .hessian(|input, scale| Ok(input.clone() * input * scale))
+            .unwrap();
+
+        assert_eq!(hessian.values().len(), 1);
+        assert!(matches!(context.resolve(&hessian.values()[0]), ValueResolution::Staged(_)));
+    }
+
+    #[test]
+    fn test_differentiation_builder_structured_captures_and_auxiliary_output() {
+        let captures = StructuredCaptures {
+            scale: Array::scalar(3.0).unwrap(),
+            offsets: vec![Array::scalar(4.0).unwrap()],
+            extra: Some(Array::scalar(5.0).unwrap()),
+        };
+        let ((value, auxiliary), gradient): ((Array, StructuredAuxiliary<Array>), Array) =
+            differentiate_at(Array::scalar(2.0).unwrap())
+                .with_captures((captures, Array::scalar(1.0).unwrap()))
+                .with_auxiliary_output()
+                .value_and_gradient(|input, (captures, tail)| {
+                    let scaled = input * captures.scale;
+                    let offset = captures.offsets[0].clone();
+                    let output = scaled.clone() + offset.clone() + captures.extra.unwrap() + tail;
+                    (
+                        output.clone(),
+                        StructuredAuxiliary {
+                            prediction: output,
+                            intermediates: vec![scaled],
+                            diagnostic: Some(offset),
+                            training: true,
+                        },
+                    )
+                })
+                .unwrap();
+        assert_eq!(value.to_f64s(), vec![16.0]);
+        assert_eq!(auxiliary.prediction.to_f64s(), vec![16.0]);
+        assert_eq!(auxiliary.intermediates[0].to_f64s(), vec![6.0]);
+        assert_eq!(auxiliary.diagnostic.unwrap().to_f64s(), vec![4.0]);
+        assert!(auxiliary.training);
+        assert_eq!(gradient.to_f64s(), vec![3.0]);
+    }
+
+    #[test]
+    fn test_differentiation_builder_modifier_order_is_orthogonal() {
+        let first: (Array, Array) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
+            .with_auxiliary_output()
+            .gradient(|input, scale| {
+                let output = input * scale;
+                Ok((output.clone(), output))
+            })
+            .unwrap();
+        let second: (Array, Array) = differentiate_at(Array::scalar(2.0).unwrap())
+            // This reverse order is intentional because this test verifies that these transitions are orthogonal.
+            .with_auxiliary_output()
+            .with_captures(Array::scalar(3.0).unwrap())
+            .gradient(|input, scale| {
+                let output = input * scale;
+                Ok((output.clone(), output))
+            })
+            .unwrap();
+
+        assert_eq!(first.0.to_f64s(), vec![3.0]);
+        assert_eq!(first.1.to_f64s(), vec![6.0]);
+        assert_eq!(second.0.to_f64s(), vec![3.0]);
+        assert_eq!(second.1.to_f64s(), vec![6.0]);
+    }
+}

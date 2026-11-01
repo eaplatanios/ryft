@@ -1,0 +1,461 @@
+use std::fmt::Display;
+
+use ryft_macros::capability;
+
+use crate::arrays::{
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
+    DimensionValue,
+};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_dischargeable_operation,
+};
+use crate::operations::Capability;
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::{
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch, ValueProjection,
+};
+
+/// Canonical element [`DataType`] used when first-class [`DimensionValue`]s become ordinary array data. Although
+/// dimensions are non-negative, Ryft represents compiled dimension Single Static Assignment (SSA) values as signed
+/// 64-bit integers and caps [`MAX_DIMENSION_EXTENT`](crate::MAX_DIMENSION_EXTENT) accordingly. Therefore, unsigned
+/// 64-bit data would admit no additional dimension values, would require a conversion instead of letting this gateway
+/// lower to an identity, and would interact poorly with ordinary signed index and offset arithmetic.
+pub const DIMENSION_DATA_TYPE: DataType = DataType::I64;
+
+/// Canonical operation name for [`DimensionToScalarOperation`].
+pub const DIMENSION_TO_SCALAR_OPERATION_NAME: &str = "dimension_to_scalar";
+
+/// Dimension-to-array operation used by [`DimensionToScalar`]. Refer to the documentation of [`DimensionToScalar`]
+/// for semantic details and an example.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DimensionToScalarOperation;
+
+impl Display for DimensionToScalarOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for DimensionToScalarOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        DIMENSION_TO_SCALAR_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        <&DimensionType>::try_from(&input_types[0])?;
+        Ok(vec![ArrayType::scalar(DIMENSION_DATA_TYPE).into()])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, DIMENSION_TO_SCALAR_OPERATION_NAME).map(|_| ())
+    }
+}
+
+impl_reference_dischargeable_operation!(@reference_free DimensionToScalarOperation);
+
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DimensionToScalarOperation
+where
+    C::Value: DimensionToScalar<C::Value>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        self.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+        Ok(vec![inputs[0].to_scalar()?])
+    }
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>> PartiallyEvaluatableOperation<C>
+    for DimensionToScalarOperation
+{
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionToScalarOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        _driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // Batching converts one replicated first-class dimension into one replicated scalar array. Mapped dimension
+        // inputs are rejected by the array IR batch carrier before conversion.
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
+        input.validate_replicated_dimension()?;
+        Ok(context
+            .parent()
+            .bind(*self, Vec::new(), std::slice::from_ref(input.value()))?
+            .into_iter()
+            .map(ArrayIrBatch::replicated)
+            .collect::<Vec<_>>())
+    }
+}
+
+impl_non_differentiable_operation!(DimensionToScalarOperation);
+impl_non_transposable_operation!(DimensionToScalarOperation);
+
+/// Capability to convert first-class [`DimensionValue`]s into ordinary rank-zero signed 64-bit [`Array`]s.
+///
+/// This is the explicit boundary from a first-class dimension to numerical data. Array IR program values produce an
+/// array member in their parent carrier, while concrete dimension backends can select a concrete array representation
+/// through `Output`. The returned scalar cannot define an array extent and converting it back into a first-class
+/// dimension requires a separate checked gateway.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that first-class dimension
+/// values (including the projected dimension members of array IR values) implement this capability for
+/// [`DimensionType`] and array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayIrValue, DimensionToScalar, DimensionValue, ProgramError};
+/// # fn main() -> Result<(), ProgramError> {
+/// let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
+/// let scalar = dimension.to_scalar()?;
+/// let ArrayIrValue::Array(scalar) = scalar else {
+///     unreachable!("`dimension_to_scalar` always returns an array member");
+/// };
+/// assert_eq!(scalar, Array::scalar(3_i64).unwrap());
+/// # Ok(())
+/// # }
+/// ```
+#[capability]
+pub trait DimensionToScalar<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Returns this dimension as an ordinary rank-zero signed 64-bit array represented by `Output`.
+    fn to_scalar(&self) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DimensionToScalar<V, ArrayIrType> for V
+where
+    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
+{
+    #[inline]
+    fn to_scalar(&self) -> Result<V, ProgramError> {
+        Ok(self.domain().bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+    }
+}
+
+impl DimensionToScalar<Array, DimensionType> for DimensionValue {
+    #[inline]
+    fn to_scalar(&self) -> Result<Array, ProgramError> {
+        Array::scalar(i64::try_from(self.extent()).unwrap())
+    }
+}
+
+impl<A: Value<Type = ArrayType>> DimensionToScalar<Self, ArrayIrType> for ArrayIrValue<A>
+where
+    DimensionValue: DimensionToScalar<A>,
+{
+    fn to_scalar(&self) -> Result<Self, ProgramError> {
+        let dimension = <Self as ValueProjection<DimensionType>>::projected(self)?;
+        Ok(Self::Array(dimension.to_scalar()?))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DimensionToScalar<V, DimensionType>
+    for ProjectedValue<DimensionType, V>
+where
+    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
+{
+    fn to_scalar(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .domain()
+            .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, MAX_DIMENSION_EXTENT, Memory,
+    };
+    use crate::batching::BatchAxis;
+    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::parameters::Placeholder;
+    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface};
+    use crate::tracing::TracingContext;
+
+    use super::*;
+
+    #[test]
+    fn test_dimension_to_scalar() {
+        let operation = DimensionToScalarOperation;
+        assert_eq!(operation.name(), DIMENSION_TO_SCALAR_OPERATION_NAME);
+        assert_eq!(operation.to_string(), "dimension_to_scalar");
+        assert_eq!(format!("{operation:?}"), "DimensionToScalarOperation");
+
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(dimension_type.clone().into());
+        let input_id = input.atom_id().unwrap();
+        let output = input.to_scalar().unwrap();
+        let output_id = output.atom_id().unwrap();
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one dimension-to-scalar instruction");
+        };
+        assert_eq!(instruction.inputs(), &[input_id]);
+        assert_eq!(instruction.outputs(), &[output_id]);
+        assert!(instruction.regions().is_empty());
+        assert!(matches!(instruction.operation(), ArrayIrOperation::DimensionToScalar(_)));
+        assert_eq!(output.r#type().as_ref(), &scalar_type);
+
+        let program = builder
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output_id],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        drop(builder);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<extent ∈ [0, 9)> .
+                let %1:i64[] = dimension_to_scalar %0
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_type_inference() {
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        check_operation_type_inference!(
+            operation = DimensionToScalarOperation,
+            cases = [
+                {
+                    input_types = [ArrayIrType::Dimension(dimension_type.clone())],
+                    output_types = [ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
+                },
+                {
+                    input_types = [ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
+                    error = "expected dimension type but got array type",
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+            ],
+        );
+        assert_eq!(
+            DimensionToScalarOperation.infer_output_types(
+                &[dimension_type.into()],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_splicing() {
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(dimension_type.clone().into());
+        let output = input.to_scalar().unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let relocated_input = relocated_builder.add_input(ArrayIrType::Dimension(dimension_type.clone()));
+        let relocated_outputs = relocated_builder.splice_program(&program, &[relocated_input]).unwrap();
+        let [relocated_instruction] = relocated_builder.instructions() else {
+            panic!("expected one relocated dimension-to-scalar instruction");
+        };
+        assert_eq!(relocated_instruction.inputs(), &[relocated_input]);
+        assert_eq!(relocated_instruction.outputs(), relocated_outputs.as_slice());
+        assert!(relocated_instruction.regions().is_empty());
+        assert!(matches!(
+            relocated_instruction.operation(),
+            ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
+        ));
+        let relocated = relocated_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                relocated_outputs,
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(relocated.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_interpretation() {
+        let operation = DimensionToScalarOperation;
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let zero = DimensionValue::new(dimension_type.clone(), 0).unwrap();
+        assert_eq!(zero.to_scalar(), Ok(Array::scalar(0_i64).unwrap()));
+        let maximum_type =
+            DimensionType::new("maximum", DimensionBounds::new(0, Some(MAX_DIMENSION_EXTENT + 1)).unwrap());
+        let maximum = DimensionValue::new(maximum_type, MAX_DIMENSION_EXTENT).unwrap();
+        assert_eq!(maximum.to_scalar(), Ok(Array::scalar(i64::try_from(MAX_DIMENSION_EXTENT).unwrap()).unwrap()));
+
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 7).unwrap());
+        assert_eq!(
+            context.bind(operation, Vec::new(), &[input]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(7_i64).unwrap())]),
+        );
+        assert_eq!(
+            context.bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i64).unwrap())]),
+            Err(TypeError::invalid("expected dimension type but got array type").into()),
+        );
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_partial_evaluation() {
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = DimensionToScalarOperation,
+            cases = [
+                {
+                    inputs = [
+                        (@known, ArrayIrValue::Dimension(
+                            DimensionValue::new(dimension_type.clone(), 7).unwrap()
+                        )),
+                    ],
+                    outputs = [
+                        (@known, ArrayIrValue::Array(Array::scalar(7_i64).unwrap())),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(
+                            type = ArrayIrType::Dimension(dimension_type.clone()),
+                            replay = ArrayIrValue::Dimension(
+                                DimensionValue::new(dimension_type.clone(), 7).unwrap()
+                            )
+                        )),
+                    ],
+                    outputs = [
+                        (@residual, ArrayIrValue::Array(Array::scalar(7_i64).unwrap())),
+                    ],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_batching() -> Result<(), ProgramError> {
+        let length = DimensionType::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let replicated =
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::new(length.clone(), 3).unwrap()));
+        assert_eq!(
+            DimensionToScalarOperation.batch(&context, &EmptyRegionDriver, &[replicated])?,
+            vec![ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(3i64).unwrap()))],
+        );
+
+        // An integer array is ordinary data, even when mapped; it is rejected before conversion.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        );
+        let extents =
+            trace.input(ArrayType::new_static(DataType::I32, [2]).with_memory(Memory::Host { pinned: true }).into());
+        let input = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
+        assert_eq!(
+            DimensionToScalarOperation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
+            Err(BatchingError::Type(TypeError::invalid("expected dimension type but got array type"))),
+        );
+        assert!(trace.builder().borrow().instructions().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_differentiation() {
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(dimension_type.clone().into());
+        let output = input.to_scalar().unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_ids().len(), 1);
+        assert_eq!(jvp.output_ids().len(), 1);
+
+        // Dimensions and integer scalars have zero differential spaces, so only the primal is returned.
+        assert_eq!(
+            jvp.interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 7).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(7_i64).unwrap())]),
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert!(pullback.input_ids().is_empty());
+        assert!(pullback.output_ids().is_empty());
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_transposition() {
+        let operation = DimensionToScalarOperation;
+        let transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert!(matches!(
+            <DimensionToScalarOperation as TransposableOperation<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+            >>::transpose(
+                &operation,
+                &mut TranspositionContext::new(transposition_context),
+                &EmptyRegionDriver,
+                &[],
+                &[],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `dimension_to_scalar` is not transposable",
+        ));
+    }
+}

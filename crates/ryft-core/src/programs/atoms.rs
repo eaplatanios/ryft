@@ -4,23 +4,30 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::contexts::Context;
-use crate::operations::constants::Zero;
+use crate::operations::Zero;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::types::Typed;
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`](crate::Type).
-/// [`MaybeZero`] is the symbolic zero representation shared by transforms like forward-mode and reverse-mode
+/// [`MaybeZero`] is the symbolic zero representation shared by transforms like forward mode and reverse mode
 /// differentiation, where it is the tangent type carried by [`DifferentiationTracer`](crate::DifferentiationTracer)s
 /// and the cotangent type that transposition rules consume and produce. A [`MaybeZero::Zero`] means that no value
 /// exists and nothing has been staged or computed for it. In the context of differentiation, it means that the
 /// corresponding derivative is zero *by construction* (e.g., a disconnected input, a severed tangent, an unused output,
 /// etc.), and is not a runtime value that happens to contain zeros. Differentiation rules branch on the variant to skip
 /// work entirely. A rule that sees a zero tangent or cotangent emits no operations for it, and "zero-ness" propagates
-/// transitively through rules without ever inspecting a program or materializing a buffer. A zero is _materialized_
-/// into a real value only at boundaries where one is structurally required (e.g., a nested sub-program operand, a
-/// program output, or an eagerly returned tangent), which is also where its carried [`Type`](crate::Type) is consumed.
-#[derive(Clone, Debug)]
+/// transitively through rules without ever inspecting a program or materializing a buffer.
+///
+/// A structural zero becomes a value at the consumer that owns a source for its runtime extents. Callable pullbacks
+/// preserve structural zeros across their output boundary and retain, as zero sources, the primal inputs whose zeros
+/// cannot be constructed from their types alone.
+/// [`Pullback::materialize_cotangents`](crate::Pullback::materialize_cotangents) and scalar-gradient entry points
+/// materialize them from those sources. A nested region materializes a zero inside itself when its boundary requires
+/// a value, such as a scan carry or a condition branch paired with a nonzero branch. The
+/// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol constructs the value from the consumer's available
+/// sources without threading extra program residuals solely for a disconnected cotangent.
+#[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum MaybeZero<V: Typed> {
     /// Structural zero of the carried [`Type`](crate::Type) (i.e., no value exists and nothing has been staged or
     /// computed for it).
@@ -32,13 +39,11 @@ pub enum MaybeZero<V: Typed> {
 
 impl<V: Typed> MaybeZero<V> {
     /// Returns `true` if this is a [`MaybeZero::Zero`].
-    #[inline]
     pub const fn is_zero(&self) -> bool {
         matches!(self, Self::Zero(_))
     }
 
     /// Returns the value stored in this [`MaybeZero`], if it is a [`MaybeZero::Value`], and [`None`] otherwise.
-    #[inline]
     pub const fn as_value(&self) -> Option<&V> {
         match self {
             Self::Zero(_) => None,
@@ -60,6 +65,12 @@ impl<V: Typed> MaybeZero<V> {
     /// Returns the value inside this [`MaybeZero`], materializing a structural [`MaybeZero::Zero`] as a real typed
     /// zero value in the provided [`Context`] through its [`Zero`] capability (a staging context stages a typed
     /// [`ZeroOperation`](crate::ZeroOperation) instruction, while an eager context constructs a concrete zero value).
+    ///
+    /// This is the type-only form, which requires the carried [`Type`](crate::Type) to pin everything the zero needs.
+    /// A type that names runtime quantities it does not pin (e.g., an array type with dynamic axes) has no such zero,
+    /// and its materialization is a differentiation-owned concern that reads those quantities from the values in scope.
+    /// [`materialize_zero_from_residual_sources`](crate::ResidualZeroProvider::materialize_zero_from_residual_sources)
+    /// should be used instead in that case.
     #[inline]
     pub fn materialize<C: Context<Value = V> + Zero<V>>(self, context: &C) -> Result<V, ProgramError> {
         match self {
@@ -122,7 +133,7 @@ impl Display for AtomId {
 
 /// [`Atom`]s represent nodes in the [`Region`](crate::Region)s of [`Program`](crate::Program)s that represent either
 /// concrete values or variables of specific [`Type`](crate::Type)s.
-#[derive(Clone, Debug, Parameter)]
+#[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum Atom<V: Typed> {
     /// Literal constant value that appears in a [`Program`](crate::Program).
     Constant(V),
@@ -169,10 +180,20 @@ impl<V: Typed> Typed for Atom<V> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::types::DataType;
+    use crate::arrays::{Array, ArrayType, DataType};
 
     use super::*;
+
+    #[test]
+    fn test_maybe_zero() {
+        let zero = MaybeZero::<Array>::Zero(ArrayType::scalar(DataType::F32));
+        let value = MaybeZero::Value(Array::scalar(0f32).unwrap());
+        assert_eq!(zero, zero.clone());
+        assert_eq!(value, value.clone());
+        assert_ne!(zero, MaybeZero::Zero(ArrayType::scalar(DataType::F64)));
+        assert_ne!(value, MaybeZero::Value(Array::scalar(1f32).unwrap()));
+        assert_ne!(zero, value);
+    }
 
     #[test]
     fn test_atom_id() {
@@ -181,16 +202,16 @@ mod tests {
 
     #[test]
     fn test_atom() {
-        let constant = Atom::<Scalar>::Constant(Scalar::from(3.0));
-        let variable = Atom::<Scalar>::Variable(DataType::F64);
+        let constant = Atom::<Array>::Constant(Array::scalar(3.0).unwrap());
+        let variable = Atom::<Array>::Variable(ArrayType::scalar(DataType::F64));
 
         assert!(constant.is_constant());
         assert!(!constant.is_variable());
-        assert_eq!(constant.as_constant(), Some(&Scalar::from(3.0)));
-        assert_eq!(constant.r#type().into_owned(), DataType::F64);
+        assert_eq!(constant.as_constant(), Some(&Array::scalar(3.0).unwrap()));
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
 
         assert!(variable.is_variable());
         assert_eq!(variable.as_constant(), None);
-        assert_eq!(variable.r#type().into_owned(), DataType::F64);
+        assert_eq!(variable.r#type().into_owned(), ArrayType::scalar(DataType::F64));
     }
 }

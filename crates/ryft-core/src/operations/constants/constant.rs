@@ -1,0 +1,596 @@
+use std::borrow::Cow;
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
+
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayType, DimensionOperation,
+    DimensionValue,
+};
+use crate::batching::{
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, BatchingTracer,
+};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
+};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{
+    check_count, impl_guardless_operation, impl_non_differentiable_operation, impl_nullary_transposable_operation,
+};
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
+use crate::programs::{
+    LiteralIdentity, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Value, ValueProjection,
+};
+use crate::tracing::Tracer;
+
+/// Canonical operation name for [`ConstantOperation`].
+pub const CONSTANT_OPERATION_NAME: &str = "constant";
+
+/// [`Operation`] that has no inputs and produces a single output equal to a stored typed literal. It carries a `V`
+/// [`Value`], so its output type is exactly the literal value's type and interpreting it materializes that value
+/// through the active context. Program capture references are normally represented as constant [`Atom`](crate::Atom)s
+/// instead (they name runtime values in a side table and are not literal operations). Type inference and direct
+/// interpretation validate the stored payload with [`Value::validate_as_constant`] before using it as a literal.
+#[derive(Copy, Clone)]
+pub struct ConstantOperation<V: Value> {
+    /// Literal value produced by this [`Operation`] when interpreted.
+    value: V,
+}
+
+impl<V: Value> ConstantOperation<V> {
+    /// Creates a new [`ConstantOperation`] storing the provided typed literal.
+    #[inline]
+    pub fn new(value: V) -> Self {
+        Self { value }
+    }
+
+    /// Returns the type of the value produced by this operation.
+    #[inline]
+    pub fn r#type(&self) -> Cow<'_, V::Type> {
+        self.value.r#type()
+    }
+
+    /// Returns the literal value produced by this operation.
+    #[inline]
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+}
+
+impl<V: Value> Display for ConstantOperation<V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V: Value> Debug for ConstantOperation<V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
+    }
+}
+
+impl<V: Value + LiteralIdentity> PartialEq for ConstantOperation<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Constant operations are identical exactly when their literals are, as defined by `LiteralIdentity`.
+        self.value.literal_eq(&other.value)
+    }
+}
+
+impl<V: Value + LiteralIdentity> Eq for ConstantOperation<V> {}
+
+impl<V: Value + LiteralIdentity> Hash for ConstantOperation<V> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.literal_hash(state);
+    }
+}
+
+impl<V: Value> Operation for ConstantOperation<V> {
+    type Type = V::Type;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONSTANT_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[V::Type],
+        _region_interfaces: &[RegionInterface<V::Type>],
+    ) -> Result<Vec<V::Type>, TypeError> {
+        check_count!("input", input_types, 0, TypeError);
+        self.value.validate_as_constant()?;
+        Ok(vec![self.value.r#type().into_owned()])
+    }
+
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self::new(self.value.rename_type_identities(renaming)?))
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CONSTANT_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("value", &self.value))
+    }
+}
+
+impl<Stored: Value, C: Domain<Type = Stored::Type> + Constant<C::Value, Stored>> InterpretableOperation<C>
+    for ConstantOperation<Stored>
+{
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 0, ProgramError);
+        self.value.validate_as_constant()?;
+        Ok(vec![context.constant(self.value.clone())?])
+    }
+}
+
+impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>> PartiallyEvaluatableOperation<C>
+    for ConstantOperation<V>
+{
+}
+
+impl<
+    Stored: Value<Type = ArrayType>,
+    C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for ConstantOperation<Stored>
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // This rule is handwritten instead of using `impl_nullary_batchable_operation!(@replicated ...)` because that
+        // macro derives its bounds from `InterpretableOperation<C>`, which for constants requires the batching context
+        // to implement `Constant<C::Value, Stored>`. Downstream backends batch constants through projected contexts
+        // that only accept the constant through their operation family (e.g., `ryft-xla` stores captured buffers),
+        // so the rule stages the constant through the parent context and requires nothing beyond
+        // `From<ConstantOperation<Stored>>`.
+        check_count!("input", inputs, 0, ProgramError);
+        Ok(context
+            .parent()
+            .bind(self.clone(), Vec::new(), &[])?
+            .into_iter()
+            .map(ArrayBatch::replicated)
+            .collect::<Vec<_>>())
+    }
+}
+
+impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
+impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
+
+impl_guardless_operation!(<V> ConstantOperation<V> where V: Value);
+
+impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ArrayIrOperation<A> {
+    // Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
+    // can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
+
+    #[inline]
+    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
+        Self::Dimension(DimensionOperation::Constant(operation))
+    }
+}
+
+/// Represents the ability to materialize a stored [`ConstantOperation`] payload and is typically implemented by
+/// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and
+/// [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing a runtime value from a stored payload
+/// can be context-dependent. For example, [`EagerContext`]s can return the value directly while [`StagingContext`]s
+/// record a builder constant. The convenience delegates to [`Context::lift`] wherever its context contract is
+/// available, including partial evaluation and batching over mixed array and dimension values. Like `lift`, it can
+/// also carry runtime captures supported by the context, preserving its validation and capture restrictions rather
+/// than creating a literal instruction. [`ConstantOperation`] validates its payload separately before calling this
+/// capability.
+pub trait Constant<V, C> {
+    /// Returns the runtime value represented by `value`.
+    fn constant(&self, value: C) -> Result<V, ProgramError>;
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> Constant<V, V> for EagerContext<V, O> {
+    #[inline]
+    fn constant(&self, value: V) -> Result<V, ProgramError> {
+        // Eager lifting is the identity. Requiring the full `Context` contract here would make the operation
+        // family's interpretation depend recursively on this same capability.
+        Ok(value)
+    }
+}
+
+impl<C: ContextProjection<T>, T: Type>
+    Constant<<C::Value as ValueProjection<T>>::Projected, <C::Constant as ValueProjection<T>>::Projected>
+    for ProjectedContext<C, T>
+{
+    #[inline]
+    fn constant(
+        &self,
+        value: <C::Constant as ValueProjection<T>>::Projected,
+    ) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
+        self.lift(value)
+    }
+}
+
+impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
+    #[inline]
+    fn constant(&self, value: C::Constant) -> Result<Tracer<C>, ProgramError> {
+        self.lift(value)
+    }
+}
+
+impl<C: Context> Constant<PartialTracer<C>, C::Constant> for PartialEvaluationContext<C>
+where
+    Self: Context<Value = PartialTracer<C>, Constant = C::Constant>,
+{
+    #[inline]
+    fn constant(&self, value: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
+        self.lift(value)
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> Constant<BatchingTracer<C, P>, C::Constant> for BatchingContext<C, P>
+where
+    Self: Context<Value = BatchingTracer<C, P>, Constant = C::Constant>,
+{
+    #[inline]
+    fn constant(&self, value: C::Constant) -> Result<BatchingTracer<C, P>, ProgramError> {
+        self.lift(value)
+    }
+}
+
+impl<C: Context<Type: DifferentiableType>, P: DifferentiationPolicy<C>>
+    Constant<DifferentiationTracer<C, P>, C::Constant> for DifferentiationContext<C, P>
+{
+    #[inline]
+    fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C, P>, ProgramError> {
+        // Keep the same lifting semantics without requiring the entire operation family's differentiation
+        // and partial evaluation closure merely to materialize a value with a structural zero tangent.
+        let dual = DifferentiationDual::new_with_zero_tangent(self.primal().lift(value)?)?;
+        Ok(DifferentiationTracer::new(dual, self.clone()))
+    }
+}
+
+/// Capability to stage an exact first-class dimension literal in a [`Context`]. This is the dimension literal
+/// counterpart of [`Constant`], and it is the one way a static extent enters a program as a value: the literal is
+/// staged as a [`ConstantOperation`] carrying a [`DimensionValue`], so it is an ordinary instruction that partial
+/// evaluation folds, rendering shows as `constant [value=n]`, and lowering emits as a constant. It is never stored as a
+/// program constant atom, which is the representation of captured runtime values. The capability is blanket-implemented
+/// for every context whose operation family includes [`ConstantOperation<DimensionValue>`], so it is available under
+/// eager, tracing, batching, partial-evaluation, and differentiation contexts alike without per-context support.
+pub trait DimensionConstant: Context {
+    /// Stages the dimension literal `extent` in this context and returns the resulting value.
+    fn dimension_constant(&self, extent: usize) -> Result<Self::Value, ProgramError>;
+}
+
+impl<C: Context<Operation: From<ConstantOperation<DimensionValue>>>> DimensionConstant for C {
+    #[inline]
+    fn dimension_constant(&self, extent: usize) -> Result<Self::Value, ProgramError> {
+        let mut outputs = self.bind(ConstantOperation::new(DimensionValue::constant(extent)?), Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayType, DataType, DimensionOperation,
+    };
+    use crate::batching::BatchAxis;
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{TransposableOperation, TranspositionContext};
+    use crate::interpretation::InterpretableOperation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
+    use crate::parameters::Placeholder;
+    use crate::programs::{Atom, AtomId, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, Typed};
+    use crate::tests::hash_of;
+    use crate::tracing::{DomainTracingContext, TracingContext};
+
+    use super::*;
+
+    #[test]
+    fn test_constant() {
+        // Verify the operation's literal value, identity, and rendering.
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
+        assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "constant [value=3.5]");
+        assert_eq!(operation.value(), &Array::scalar(3.5).unwrap());
+
+        // Verify the operation's textual form when it appears in a program.
+        let mut program_builder = ProgramBuilder::<Array, ConstantOperation<Array>>::new();
+        let output = program_builder.add_instruction(operation, Vec::new(), vec![], None).unwrap()[0];
+        let program = program_builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = constant [value=3.5]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_constant_identity() {
+        // Constants with identical literals are equal and hash identically, so they work as map keys.
+        let operation = ConstantOperation::new(Array::scalar(3.5).unwrap());
+        let same_operation = ConstantOperation::new(Array::scalar(3.5).unwrap());
+        assert_eq!(operation, same_operation);
+        assert_eq!(hash_of(&operation), hash_of(&same_operation));
+        let operations = HashMap::from([(operation.clone(), "constant")]);
+        assert_eq!(operations.get(&same_operation), Some(&"constant"));
+        assert_ne!(operation, ConstantOperation::new(Array::scalar(4.5).unwrap()));
+        assert_ne!(operation, ConstantOperation::new(Array::scalar(3.5f32).unwrap()));
+
+        // Constant identity follows literal identity rather than IEEE value equality.
+        let negative_zero = ConstantOperation::new(Array::scalar(-0.0f64).unwrap());
+        let positive_zero = ConstantOperation::new(Array::scalar(0.0f64).unwrap());
+        assert_eq!(negative_zero.value(), positive_zero.value());
+        assert_ne!(negative_zero, positive_zero);
+        assert_eq!(operations.get(&negative_zero), None);
+        let nan = ConstantOperation::new(Array::scalar(f64::NAN).unwrap());
+        let same_nan = ConstantOperation::new(Array::scalar(f64::NAN).unwrap());
+        assert_ne!(nan.value(), same_nan.value());
+        assert_eq!(nan, same_nan);
+        assert_eq!(hash_of(&nan), hash_of(&same_nan));
+
+        // Array IR literals follow the identity of their kind.
+        let dimension = DimensionValue::constant(3).unwrap();
+        let dimension_operation = ConstantOperation::new(ArrayIrValue::<Array>::Dimension(dimension.clone()));
+        assert_eq!(dimension_operation, ConstantOperation::new(ArrayIrValue::Dimension(dimension)));
+        assert_ne!(
+            ConstantOperation::new(ArrayIrValue::<Array>::Array(Array::scalar(-0.0f64).unwrap())),
+            ConstantOperation::new(ArrayIrValue::<Array>::Array(Array::scalar(0.0f64).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_constant_type_inference() {
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
+
+        // Dimension literals retain their complete identity-bearing type.
+        let dimension = DimensionValue::constant(3).unwrap();
+        assert_eq!(
+            ConstantOperation::new(dimension.clone()).infer_output_types(&[], &[]),
+            Ok(vec![dimension.r#type().into_owned()]),
+        );
+
+        // Mutable reference identity is absent from rendering and cannot be embedded in a literal operation.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        assert!(matches!(
+            ConstantOperation::new(reference).infer_output_types(&[], &[]),
+            Err(TypeError::Invalid { message, .. }) if message ==
+                "reference values cannot be stored as program constants; pass external references through program \
+                 inputs or captures instead",
+        ));
+    }
+
+    #[test]
+    fn test_constant_interpretation() {
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
+        // Eager interpretation returns the literal value unchanged.
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Ok(vec![Array::scalar(3.5).unwrap()]),
+        );
+
+        // Direct interpretation enforces the same literal contract even without prior inference or sealing.
+        let dimension = DimensionValue::constant(3).unwrap();
+        assert_eq!(
+            ConstantOperation::new(dimension.clone()).interpret(
+                &EagerContext::<DimensionValue>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Ok(vec![dimension]),
+        );
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        assert!(matches!(
+            ConstantOperation::new(reference).interpret(
+                &EagerContext::<ArrayIrValue<Array>>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. })) if message ==
+                "reference values cannot be stored as program constants; pass external references through program \
+                 inputs or captures instead",
+        ));
+
+        // Staged interpretation records the payload as a constant atom without emitting an instruction.
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let output =
+            InterpretableOperation::<DomainTracingContext<EagerContext<Array, ArrayOperation<Array>>>>::interpret(
+                &operation,
+                &context,
+                &EmptyRegionDriver,
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.atom_id(), Ok(AtomId::new(0)));
+        let staged_builder = context.builder().borrow();
+        assert!(staged_builder.instructions().is_empty());
+        assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == Array::scalar(3.5).unwrap()));
+
+        // Direct capability calls also validate through lifting, without an operation's preceding payload check.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = ArrayIrValue::Array(Array::scalar(3.5).unwrap());
+        let output = Constant::constant(&context, value.clone()).unwrap();
+        assert_eq!(output.atom_id(), Ok(AtomId::new(0)));
+        assert_eq!(context.builder().borrow().atoms(), &[Atom::Constant(value)]);
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // Lifting follows the tracing boundary's validation rather than bypassing it through raw staging.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        assert!(matches!(
+            Constant::constant(&context, reference),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. })) if message ==
+                "reference values cannot be stored as program constants; pass external references through program \
+                 inputs or captures instead",
+        ));
+        assert_eq!(context.builder().borrow().atoms().len(), 1);
+    }
+
+    #[test]
+    fn test_constant_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ConstantOperation::new(Array::scalar(3.5).unwrap()),
+            cases = [{
+                inputs = [],
+                outputs = [(@known, Array::scalar(3.5).unwrap())],
+                residual_instructions = 0,
+            }],
+        );
+
+        // Direct capability calls lift values as known partial values.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let value = Array::scalar(3.5).unwrap();
+        let output = context.constant(value.clone()).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&value));
+
+        // Mixed contexts retain the value's kind rather than projecting every constant to an array.
+        let context =
+            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = context.constant(dimension.clone()).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&dimension));
+    }
+
+    #[test]
+    fn test_constant_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ConstantOperation::new(Array::scalar(3.5).unwrap()),
+            axis_size = 2,
+            cases = [{
+                inputs = [],
+                outputs = [(@replicated, Array::scalar(3.5).unwrap())],
+            }],
+        );
+
+        // Direct capability calls lift values as replicated batches.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let value = Array::scalar(3.5).unwrap();
+        let output = context.constant(value.clone()).unwrap();
+        assert_eq!(output.batch().value(), &value);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+
+        // The mixed policy lifts arrays, dimensions, and runtime reference captures as replicated values.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let value = ArrayIrValue::Array(value);
+        let output = context.constant(value.clone()).unwrap();
+        assert_eq!(output.batch().value(), &value);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = context.constant(dimension.clone()).unwrap();
+        assert_eq!(output.batch().value(), &dimension);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        let output = context.constant(reference.clone()).unwrap();
+        assert_eq!(output.batch().value(), &reference);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+    }
+
+    #[test]
+    fn test_constant_differentiation() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output = context.constant(Array::scalar(3.5).unwrap()).unwrap();
+        assert_eq!(output.primal(), &Array::scalar(3.5).unwrap());
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
+    }
+
+    #[test]
+    fn test_constant_transposition() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
+        let input_cotangents = ConstantOperation::new(Array::scalar(3.5).unwrap())
+            .transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[],
+                &[MaybeZero::Value(output_cotangent)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(input_cotangents, ());
+    }
+
+    #[test]
+    fn test_dimension_constant() {
+        // Dimension variables carry a distinct identity per construction, so the literals are compared by extent.
+        let dimension_extent = |value: ArrayIrValue<Array>| match value {
+            ArrayIrValue::Dimension(dimension) => (dimension.extent(), dimension.r#type().extent()),
+            value => panic!("expected a dimension value but got {value}"),
+        };
+
+        // Eager contexts materialize the literal directly.
+        let eager = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().dimension_constant(3).unwrap();
+        assert_eq!(dimension_extent(eager), (3, Some(3)));
+
+        // The capability is not tied to the array IR family: a pure dimension program materializes the same literal.
+        let dimension = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().dimension_constant(2);
+        assert_eq!(dimension.map(|dimension| dimension.extent()), Ok(2));
+
+        // Staging records the literal as a `constant` instruction with an exact dimension type, never as a program
+        // constant atom.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let output = context.dimension_constant(3).unwrap();
+        let ArrayIrType::Dimension(output_type) = output.r#type().into_owned() else {
+            panic!("expected a dimension type");
+        };
+        assert_eq!(output_type.extent(), Some(3));
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one staged instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(!builder.atoms().iter().any(|atom| matches!(atom, Atom::Constant(_))));
+        let program = builder
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<3> = constant [value=3]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+}

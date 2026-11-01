@@ -1,0 +1,1303 @@
+//! Contains shared differentiation scaffolding for [`ElementwiseOperation`](crate::ElementwiseOperation)s. Elementwise
+//! arithmetic rules all follow the same shape. They first compute the primal through the operation's own value-level
+//! capability. Then, they resolve the tangent target type of the primal output, convert and broadcast every live input
+//! tangent (and any primal coefficients) into that widened differential representation, and combine the per-input
+//! contributions. Finally, they pair the primal with the combined tangent. This module owns that scaffolding
+//! (including the structural-zero policy for outputs without a tangent space) so that each operation's
+//! [`DifferentiableOperation`](crate::DifferentiableOperation) implementation only supplies its mathematical content
+//! (i.e., the primal computation and the per-input tangent terms), and the [`ElementwiseDerivativeAlignment`] trait
+//! those rules (and the broadcasting, selection, and reduction rules) use to align derivative contributions between
+//! input types and the common type inferred for an implicitly broadcasting result.
+
+use crate::arrays::{ArrayType, DataType, Dimension};
+use crate::contexts::Context;
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationPolicy};
+use crate::differentiation::types::DifferentiableType;
+use crate::macros::check_count;
+use crate::operations::{
+    Add, Broadcast, ConvertElementType, Reduce, ReductionKind, Reshape, Reshard, Transpose, ZeroLike,
+};
+use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
+
+/// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
+/// implicitly broadcasting elementwise result and _unaligned_ back to an input type. The two methods form an adjoint
+/// pair: [`align_tangent`](Self::align_tangent) applies the implicit element-type promotion, broadcast, and resharding
+/// an [`ElementwiseOperation`](crate::ElementwiseOperation) performs on an input, and
+/// [`unalign_cotangent`](Self::unalign_cotangent) applies the adjoint of that linear map
+/// (i.e., demotion, sum-reduction over broadcasting axes, and the reverse reshard).
+pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T> {
+    /// Aligns this tangent [`Value`] (or primal coefficient) with `target`, converting and broadcasting it
+    /// into that [`Type`](crate::Type).
+    ///
+    /// # Parameters
+    ///
+    ///   - `target`: [`Type`](crate::Type) to align this [`Value`] with.
+    ///   - `exemplar`: [`Value`] whose type carries `target`'s exact shape (i.e., the same dimensions, including
+    ///     any dynamic dimension identities, typically the rule's own primal output or the output cotangent being
+    ///     transposed). It is consulted only when `target` has a runtime extent that `self` does not already carry,
+    ///     because such an extent cannot be named by a type alone (the metadata-only broadcast stores its output type
+    ///     in the operation payload, and program replay never refines a payload type). Passing `self` is correct
+    ///     whenever the alignment cannot introduce a runtime extent.
+    fn align_tangent(&self, target: &T, exemplar: &Self) -> Result<Self, DifferentiationError>;
+
+    /// Maps this cotangent [`Value`], which has the type of an implicitly broadcasting elementwise result, back to
+    /// the type `target` of one of the inputs of the operation that produced it, returning the cotangent of that input.
+    ///
+    /// This is the adjoint of the linear map that [`align_tangent`](Self::align_tangent) applies when it takes an
+    /// input of type `target` to the result type. Every contribution that the implicit broadcast spread over axes
+    /// the input does not have (i.e., the leading axes of this [`Value`] beyond `target`'s rank, and any axis that
+    /// `target` holds at unit extent) is summed back onto the input's axes, the element type is converted back to
+    /// `target`'s, and a differing sharding is resharded back. The result has exactly type `target`. This [`Value`]
+    /// must have at least `target`'s rank, since an input never has more axes than the result.
+    ///
+    /// # Parameters
+    ///
+    ///   - `target`: [`Type`](crate::Type) of the input whose cotangent is being recovered (i.e., the type that
+    ///     [`align_tangent`](Self::align_tangent) converted and broadcast _from_).
+    fn unalign_cotangent(&self, target: &T) -> Result<Self, DifferentiationError>;
+}
+
+impl<V: Value<Type = DataType> + ConvertElementType> ElementwiseDerivativeAlignment<DataType> for V {
+    #[inline]
+    fn align_tangent(&self, target: &DataType, _exemplar: &Self) -> Result<Self, DifferentiationError> {
+        if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
+    }
+
+    #[inline]
+    fn unalign_cotangent(&self, target: &DataType) -> Result<Self, DifferentiationError> {
+        if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
+    }
+}
+
+impl<
+    V: Value<Type = ArrayType> + ZeroLike + Add + Broadcast + ConvertElementType + Reshape + Transpose + Reduce + Reshard,
+> ElementwiseDerivativeAlignment<ArrayType> for V
+{
+    fn align_tangent(&self, target: &ArrayType, exemplar: &Self) -> Result<Self, DifferentiationError> {
+        let mut value = if self.r#type().data_type() == target.data_type() {
+            self.clone()
+        } else {
+            self.convert_element_type(target.data_type())?
+        };
+
+        if value.r#type().as_ref() == target {
+            return Ok(value);
+        }
+
+        let requires_reshard = value.r#type().sharding() != target.sharding();
+
+        let rank = value.r#type().rank();
+        if rank > target.rank() {
+            return Err(TypeError::invalid(format!(
+                "cannot align tangent type {} to output type {}",
+                value.r#type().as_ref(),
+                target,
+            ))
+            .into());
+        }
+
+        let offset = target.rank() - rank;
+
+        // Replicating into a target axis whose extent is only known at run time is not a metadata-only broadcast.
+        // That operation stores its output type in its payload, and program replay refines boundary types rather than
+        // payload types, so the replication count would never become known. Such an alignment therefore takes its shape
+        // from `exemplar` through an input edge instead, which is what makes the runtime extent available.
+        let value_type = value.r#type().into_owned();
+        let requires_runtime_shape = target.shape().dimensions().iter().enumerate().any(|(axis, target_dimension)| {
+            matches!(target_dimension, Dimension::Dynamic(_))
+                && (axis < offset || &value_type.dimension(axis - offset) != target_dimension)
+        });
+        value = if requires_runtime_shape {
+            let exemplar_type = exemplar.r#type().into_owned();
+            if exemplar_type.shape() != target.shape() {
+                return Err(TypeError::invalid(format!(
+                    "cannot align tangent type {value_type} to output type {target} because the exemplar \
+                     type {exemplar_type} has a different shape",
+                ))
+                .into());
+            }
+
+            // The zero carries the exemplar's runtime extents, so adding it replicates this value through exactly the
+            // implicit broadcast that the elementwise operation being differentiated performs on its own inputs.
+            let exemplar = if exemplar_type.data_type() == target.data_type() {
+                exemplar.clone()
+            } else {
+                exemplar.convert_element_type(target.data_type())?
+            };
+            value.add(&exemplar.zero_like()?)?
+        } else {
+            let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
+            let sharding = value
+                .r#type()
+                .sharding()
+                .map(|sharding| sharding.with_broadcasted_dimensions(target.rank(), &output_axes))
+                .transpose()
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+            let output_type =
+                target.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+            value.broadcast(output_type, output_axes.as_slice())?
+        };
+
+        // Broadcasting preserves input placement. Explicit redistribution is a separate operation as manual variation
+        // has already been made explicit by forward input binding and is never repaired here.
+        if requires_reshard && let Some(sharding) = target.sharding() {
+            value = value.reshard(&sharding.without_manual_reduction_axes())?;
+        }
+
+        // The exemplar path infers its result type from its inputs, so pin any remaining metadata-only difference
+        // (e.g., a memory placement or layout that the addition did not carry) with an axis-identity broadcast, which
+        // maps every axis from an identical input dimension and therefore accepts runtime extents.
+        if requires_runtime_shape && value.r#type().as_ref() != target {
+            let output_axes = (0..target.rank()).collect::<Vec<_>>();
+            value = value.broadcast(target.clone(), output_axes.as_slice())?;
+        }
+
+        if value.r#type().as_ref() != target {
+            return Err(TypeError::invalid(format!(
+                "aligned tangent type `{}` does not match required output tangent type `{}`",
+                value.r#type(),
+                target,
+            ))
+            .into());
+        }
+
+        Ok(value)
+    }
+
+    fn unalign_cotangent(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
+        let offset = self.r#type().rank().checked_sub(target.rank()).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "cannot unalign cotangent type {} to input cotangent type {}",
+                self.r#type().as_ref(),
+                target,
+            ))
+        })?;
+        let output_axes = (0..target.rank()).map(|axis| axis + offset).collect::<Vec<_>>();
+        self.unalign_cotangent_along(target, output_axes.as_slice())
+    }
+}
+
+/// [`ArrayType`]-typed [`Value`] whose cotangents can additionally be _unaligned_ through the adjoint of an *explicit*
+/// broadcast (e.g., using [`Broadcast`]) that placed the input's axes at arbitrary result positions. This extends
+/// [`ElementwiseDerivativeAlignment`] as a separate trait because axis placement is a concept that is specific to
+/// [`ArrayType`]-typed values. Scalar types have no axes and participate only in implicit suffix-aligned alignment
+/// maps.
+pub trait BroadcastDerivativeAlignment: ElementwiseDerivativeAlignment<ArrayType> {
+    /// Unaligns this cotangent [`Value`] back to `target` by applying the adjoint of an explicit broadcast that
+    /// mapped each axis of `target` to the axis of this [`Value`] named by the corresponding entry of `output_axes`.
+    /// Contributions along this [`Value`]'s remaining axes are sum-reduced away, the kept axes are permuted back
+    /// into `target`'s axis order, and the element type, sharding, and stretched unit axes are restored.
+    /// [`ElementwiseDerivativeAlignment::unalign_cotangent`] is the implicit special case that suffix-aligns
+    /// the trailing axes.
+    fn unalign_cotangent_along(&self, target: &ArrayType, output_axes: &[usize]) -> Result<Self, DifferentiationError>;
+}
+
+impl<V> BroadcastDerivativeAlignment for V
+where
+    V: Value<Type = ArrayType> + Add + Broadcast + ConvertElementType + Reshape + Transpose + Reshard,
+    V: Reduce + ZeroLike,
+{
+    fn unalign_cotangent_along(&self, target: &ArrayType, output_axes: &[usize]) -> Result<Self, DifferentiationError> {
+        let mut contribution = reduce_broadcast_cotangent(self, target, output_axes)?;
+
+        // Reinstate stretched unit axes and any statically proven extent refinements. A homogeneous reshape
+        // cannot change a dynamic shape, but a broadcast can reinsert unit axes without reading runtime extents.
+        if contribution.r#type().shape() != target.shape() {
+            if contribution.r#type().static_shape().is_some() && target.static_shape().is_some() {
+                contribution = contribution.reshape(target.shape().clone())?;
+            } else {
+                let value_type = self.r#type();
+                let surviving_axes = output_axes
+                    .iter()
+                    .enumerate()
+                    .filter(|(axis, output_axis)| {
+                        target.dimension(*axis) != Dimension::Static(1)
+                            || value_type.dimension(**output_axis).bounds() == Dimension::Static(1).bounds()
+                    })
+                    .map(|(axis, _)| axis)
+                    .collect::<Vec<_>>();
+                let output_type = target.clone().with_data_type(contribution.r#type().data_type()).with_layout(None);
+                contribution = contribution.broadcast(output_type, &surviving_axes)?;
+            }
+        }
+
+        // Convert back to the input's cotangent element type (the adjoint of the element-type promotion the
+        // broadcast side performed).
+        if contribution.r#type().data_type() != target.data_type() {
+            contribution = contribution.convert_element_type(target.data_type())?;
+        }
+
+        // Redistribute the contribution onto the input cotangent's placement. Like in `align_tangent`, this is a
+        // semantic redistribution that must be staged explicitly rather than relabeled by backend lowering.
+        if contribution.r#type().sharding() != target.sharding()
+            && let Some(sharding) = target.sharding()
+        {
+            contribution = contribution.reshard(&sharding.without_manual_reduction_axes())?;
+        }
+
+        // Pin any remaining metadata-only difference (e.g., a layout that no step above can attach) with an
+        // axis-identity broadcast, which carries its full requested output type.
+        if contribution.r#type().as_ref() != target {
+            let output_axes = (0..target.rank()).collect::<Vec<_>>();
+            contribution = contribution.broadcast(target.clone(), output_axes.as_slice())?;
+        }
+
+        // As a defensive final check, report a mismatch instead of returning a mistyped cotangent, because a wrong
+        // cotangent type would surface much later as a confusing accumulation or interpretation error.
+        if contribution.r#type().as_ref() != target {
+            return Err(TypeError::invalid(format!(
+                "unaligned cotangent type {} does not match required input cotangent type {}",
+                contribution.r#type().as_ref(),
+                target,
+            ))
+            .into());
+        }
+
+        Ok(contribution)
+    }
+}
+
+/// Reduces broadcast copies and restores surviving axes to input order. Stretched singleton axes remain omitted;
+/// callers restore those axes and exact type metadata using their static shapes or retained runtime extents. The
+/// mapping must name one distinct output axis per target axis. A mapped dimension must either match its target
+/// dimension (including equivalent static and exact-bound representations) or expand a statically singleton target
+/// dimension.
+pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + Transpose>(
+    cotangent: &V,
+    target: &ArrayType,
+    output_axes: &[usize],
+) -> Result<V, DifferentiationError> {
+    // The broadcast being transposed mapped each `target` axis to the axis of this cotangent named by the
+    // corresponding `output_axes` entry, so the mapping must name one in-range axis per `target` axis.
+    // Anything else means the caller's axis mapping and the input type disagree.
+    let value_type = cotangent.r#type();
+    if output_axes.len() != target.rank() || output_axes.iter().any(|axis| *axis >= value_type.rank()) {
+        return Err(TypeError::invalid(format!(
+            "cannot unalign cotangent type {} to input cotangent type {} using output axes {:?}",
+            value_type, target, output_axes,
+        ))
+        .into());
+    }
+
+    if output_axes.iter().enumerate().any(|(index, axis)| output_axes[..index].contains(axis)) {
+        return Err(TypeError::invalid("`broadcast` output axes must be distinct").into());
+    }
+
+    // Classify each `target` axis. An axis whose extent survived the broadcast unchanged is _kept_ (i.e., its
+    // cotangent flows straight through), while an axis the broadcast stretched from extent one is dropped here and
+    // summed over below, with its unit extent restored by the later reshaping (i.e., the adjoint of stretching is
+    // summation). Any other extent mismatch means that the mapping never described a valid broadcast.
+    let mut kept_axes = Vec::with_capacity(target.rank());
+    for (target_axis, &output_axis) in output_axes.iter().enumerate() {
+        let target_dimension = target.dimension(target_axis);
+        let value_dimension = value_type.dimension(output_axis);
+        let same_extent = target_dimension == value_dimension
+            || match (&target_dimension, &value_dimension) {
+                (Dimension::Static(size), dimension) | (dimension, Dimension::Static(size)) => {
+                    dimension.bounds() == Dimension::Static(*size).bounds()
+                }
+                _ => false,
+            };
+        if !same_extent {
+            if target_dimension != Dimension::Static(1) {
+                return Err(TypeError::invalid(format!(
+                    "cannot unalign cotangent axis {} of size {} to input axis {} of size {}",
+                    output_axis, value_dimension, target_axis, target_dimension,
+                ))
+                .into());
+            }
+        } else {
+            kept_axes.push((target_axis, output_axis));
+        }
+    }
+
+    // Sum-reduce every non-kept axis of this cotangent: both the axes the broadcast introduced outright (i.e.,
+    // that are never named by a kept `target` axis) and the stretched axes classified above. This is the core
+    // adjoint step, since a broadcast duplicates values along exactly these axes.
+    let reduce_axes = (0..value_type.rank())
+        .filter(|axis| kept_axes.iter().all(|(_, value_axis)| value_axis != axis))
+        .collect::<Vec<_>>();
+    let mut contribution = if reduce_axes.is_empty() {
+        cotangent.clone()
+    } else {
+        cotangent.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
+    };
+
+    // The reduction leaves the kept axes in this cotangent's axis order but an explicit broadcast may have permuted
+    // them relative to `target`, so compute the permutation that restores `target`'s axis order and transpose only
+    // when it is not the identity.
+    let mut kept_axes_by_value = kept_axes.clone();
+    kept_axes_by_value.sort_by_key(|(_, value_axis)| *value_axis);
+    let permutation = kept_axes
+        .iter()
+        .map(|kept| kept_axes_by_value.iter().position(|candidate| candidate == kept).unwrap())
+        .collect::<Vec<_>>();
+    if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
+        contribution = Transpose::transpose(&contribution, permutation)?;
+    }
+
+    Ok(contribution)
+}
+
+/// Represents the inputs handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
+/// input accessors convert and broadcast lazily to the output tangent [`Type`](crate::Type), while the output primal
+/// stays at its own (possibly narrower) type so terms can reuse it when no widening is required.
+pub struct UnaryElementwiseJvpInputs<'o, C: Context, F> {
+    /// Context used when re-evaluating a widened primal coefficient for the tangent computation.
+    tangent_context: &'o C,
+
+    /// Input primal [`Value`] at its original [`Type`](crate::Type).
+    input_primal: &'o C::Value,
+
+    /// Input tangent [`Value`] at its original [`Type`](crate::Type).
+    input_tangent: &'o C::Value,
+
+    /// Primal output [`Value`] of the operation, at its own [`Type`](crate::Type).
+    output_primal: &'o C::Value,
+
+    /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
+    output_tangent_type: &'o C::Type,
+
+    /// Function that evaluates the operation's primal output from its input primal.
+    evaluate_primal: &'o F,
+}
+
+impl<
+    C: Context<Type: DifferentiableType, Value: ElementwiseDerivativeAlignment<C::Type>>,
+    F: Fn(&C, &C::Value) -> Result<C::Value, ProgramError>,
+> UnaryElementwiseJvpInputs<'_, C, F>
+{
+    /// Returns the input primal [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
+    #[inline]
+    pub fn input_primal(&self) -> Result<C::Value, DifferentiationError> {
+        self.input_primal.align_tangent(self.output_tangent_type, self.output_primal)
+    }
+
+    /// Returns the input tangent [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
+    #[inline]
+    pub fn input_tangent(&self) -> Result<C::Value, DifferentiationError> {
+        self.input_tangent.align_tangent(self.output_tangent_type, self.output_primal)
+    }
+
+    /// Returns the operation's output primal [`Value`] evaluated at the output tangent [`Type`](crate::Type). When the
+    /// original output primal already has that type, this reuses it directly. Otherwise, it re-evaluates the operation
+    /// from the converted input primal so that nonlinear rounding at the narrower primal type does not affect the
+    /// tangent computation.
+    #[inline]
+    pub fn output_primal_at_tangent_type(&self) -> Result<C::Value, DifferentiationError> {
+        if self.output_primal.r#type().as_ref() == self.output_tangent_type {
+            Ok(self.output_primal.clone())
+        } else {
+            Ok((self.evaluate_primal)(self.tangent_context, &self.input_primal()?)?)
+        }
+    }
+}
+
+/// Computes the Jacobian-Vector Product (JVP) for a unary elementwise [`Operation`]. This function computes the output
+/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts the input primal and any live
+/// input tangent into that representation, and delegates the mathematical content to `tangent_fn`. The prepared inputs
+/// retain `primal_fn` so that a rule can re-evaluate the output at the tangent type without repeating the evaluator at
+/// the call site. A structural-zero input tangent propagates as a structural zero, including through outputs without a
+/// tangent space (e.g., integer outputs), which only reject *live* tangents.
+///
+/// # Parameters
+///
+///   - `context`: [`Context`] that computes primal results and transfers coefficients to the tangent computation.
+///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
+///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
+///   - `primal_fn`: Function that computes the primal output in the supplied context from the input primal.
+///   - `tangent_fn`: Function that computes the output tangent from the prepared [`UnaryElementwiseJvpInputs`].
+pub fn unary_elementwise_jvp<
+    T: DifferentiableType,
+    V: ElementwiseDerivativeAlignment<T>,
+    O: Operation<Type = T>,
+    C: Context<Type = T, Value = V>,
+    P: DifferentiationPolicy<C>,
+    PrimalFn: Fn(&C, &V) -> Result<V, ProgramError>,
+    TangentFn: FnOnce(UnaryElementwiseJvpInputs<'_, C, PrimalFn>) -> Result<V, DifferentiationError>,
+>(
+    context: &DifferentiationContext<C, P>,
+    operation: &O,
+    inputs: &[DifferentiationDual<V>],
+    primal_fn: PrimalFn,
+    tangent_fn: TangentFn,
+) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError> {
+    check_count!("input", inputs, 1, ProgramError);
+    let input = &inputs[0];
+    let output_primal = primal_fn(context.primal(), input.primal())?;
+    let target = output_primal.r#type().tangent()?;
+    let output_tangent = match input.tangent() {
+        MaybeZero::Zero(_) => MaybeZero::Zero(target),
+        MaybeZero::Value(_) if target.is_zero_space() => {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` output type {} has no tangent space", operation.name(), output_primal.r#type()),
+            }
+            .into());
+        }
+        MaybeZero::Value(input_tangent) => {
+            let input_primal = context.primal_to_tangent(input.primal().clone())?;
+            let tangent_output_primal = context.primal_to_tangent(output_primal.clone())?;
+            let jvp_inputs = UnaryElementwiseJvpInputs {
+                tangent_context: context.tangent(),
+                input_primal: &input_primal,
+                input_tangent,
+                output_primal: &tangent_output_primal,
+                output_tangent_type: &target,
+                evaluate_primal: &primal_fn,
+            };
+            MaybeZero::Value(tangent_fn(jvp_inputs)?)
+        }
+    };
+    Ok(vec![DifferentiationDual::new(output_primal, output_tangent)?])
+}
+
+/// Represents the inputs handed to the per-side tangent terms of a binary elementwise JVP rule by
+/// [`binary_elementwise_jvp`]. Primal accessors convert and broadcast lazily so that a term only stages
+/// the conversions that it actually consumes.
+pub struct BinaryElementwiseJvpInputs<'o, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
+    /// Primal [`Value`] of the left input.
+    left_primal: &'o V,
+
+    /// Primal [`Value`] of the right input.
+    right_primal: &'o V,
+
+    /// Primal output [`Value`] of the operation, which carries the result [`Type`](crate::Type).
+    output_primal: &'o V,
+
+    /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
+    output_tangent_type: &'o T,
+}
+
+impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementwiseJvpInputs<'_, T, V> {
+    /// Returns the left input's primal [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
+    pub fn left_primal(&self) -> Result<V, DifferentiationError> {
+        self.left_primal.align_tangent(self.output_tangent_type, self.output_primal)
+    }
+
+    /// Returns the right input's primal [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
+    pub fn right_primal(&self) -> Result<V, DifferentiationError> {
+        self.right_primal.align_tangent(self.output_tangent_type, self.output_primal)
+    }
+}
+
+/// Computes the Jacobian-Vector Product (JVP) for a binary elementwise [`Operation`]. This function computes the output
+/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts each live input tangent into
+/// that representation, and delegates the mathematical content to the per-side terms, invoking each term only when that
+/// side's tangent is live so terms stay lazy in staged programs. Live contributions are summed, and structural-zero
+/// input tangents propagate as structural zeros, including through outputs without a tangent space (e.g., integer
+/// outputs), which only reject *live* tangents.
+///
+/// # Parameters
+///
+///   - `context`: [`Context`] that computes primal results and transfers coefficients to the tangent computation.
+///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
+///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
+///   - `primal_fn`: Function that computes the primal output in the supplied context from both input primals.
+///   - `left_tangent_term_fn`: Function that computes the left input's tangent contribution from the prepared
+///     [`BinaryElementwiseJvpInputs`] and the left input's live tangent (already converted and broadcast to the
+///     tangent target type).
+///   - `right_tangent_term_fn`: Function that computes the right input's tangent contribution from the prepared
+///     [`BinaryElementwiseJvpInputs`] and the right input's live tangent (already converted and broadcast to the
+///     tangent target type).
+pub fn binary_elementwise_jvp<
+    T: DifferentiableType,
+    V: Add + ElementwiseDerivativeAlignment<T>,
+    O: Operation<Type = T>,
+    C: Context<Type = T, Value = V>,
+    P: DifferentiationPolicy<C>,
+    PrimalFn: FnOnce(&C, &V, &V) -> Result<V, ProgramError>,
+    LeftTangentTermFn: FnOnce(&BinaryElementwiseJvpInputs<'_, T, V>, V) -> Result<V, DifferentiationError>,
+    RightTangentTermFn: FnOnce(&BinaryElementwiseJvpInputs<'_, T, V>, V) -> Result<V, DifferentiationError>,
+>(
+    context: &DifferentiationContext<C, P>,
+    operation: &O,
+    inputs: &[DifferentiationDual<V>],
+    primal_fn: PrimalFn,
+    left_tangent_term_fn: LeftTangentTermFn,
+    right_tangent_term_fn: RightTangentTermFn,
+) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError> {
+    check_count!("input", inputs, 2, ProgramError);
+    let left = &inputs[0];
+    let right = &inputs[1];
+    let primal = primal_fn(context.primal(), left.primal(), right.primal())?;
+    let target = primal.r#type().tangent()?;
+    if left.tangent().is_zero() && right.tangent().is_zero() {
+        return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
+    }
+    if target.is_zero_space() {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!("`{}` output type {} has no tangent space", operation.name(), primal.r#type()),
+        }
+        .into());
+    }
+    let left_primal = context.primal_to_tangent(left.primal().clone())?;
+    let right_primal = context.primal_to_tangent(right.primal().clone())?;
+    let tangent_primal = context.primal_to_tangent(primal.clone())?;
+    let jvp_inputs = BinaryElementwiseJvpInputs {
+        left_primal: &left_primal,
+        right_primal: &right_primal,
+        output_primal: &tangent_primal,
+        output_tangent_type: &target,
+    };
+    let left_contribution = left
+        .tangent()
+        .as_value()
+        .map(|tangent| left_tangent_term_fn(&jvp_inputs, tangent.align_tangent(&target, &tangent_primal)?))
+        .transpose()?;
+    let right_contribution = right
+        .tangent()
+        .as_value()
+        .map(|tangent| right_tangent_term_fn(&jvp_inputs, tangent.align_tangent(&target, &tangent_primal)?))
+        .transpose()?;
+    let output_tangent = match (left_contribution, right_contribution) {
+        (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
+        (Some(term), None) | (None, Some(term)) => MaybeZero::Value(term),
+        (None, None) => MaybeZero::Zero(target),
+    };
+    Ok(vec![DifferentiationDual::new(primal, output_tangent)?])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{Differentiate, differentiate_at};
+    use crate::operations::{
+        AddOperation, BroadcastOperation, CompareOperation, ComparisonDirection, ConvertElementType, MulOperation,
+        NegOperation, ReduceOperation, TanhOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::programs::{MaybeZero, ProgramBuilder};
+    use crate::tracing::TracingContext;
+
+    use super::*;
+
+    #[test]
+    fn test_rank_zero_array_elementwise_derivative_alignment() {
+        let value = Array::scalar(1.5f64).unwrap();
+        assert_eq!(value.align_tangent(&ArrayType::scalar(DataType::F64), &value), Ok(value.clone()));
+        assert_eq!(value.align_tangent(&ArrayType::scalar(DataType::F32), &value), Ok(Array::scalar(1.5f32).unwrap()));
+
+        let value = Array::scalar(1.5f32).unwrap();
+        assert_eq!(value.unalign_cotangent(&ArrayType::scalar(DataType::F32)), Ok(value.clone()));
+        assert_eq!(value.unalign_cotangent(&ArrayType::scalar(DataType::F64)), Ok(Array::scalar(1.5f64).unwrap()));
+    }
+
+    #[test]
+    fn test_array_elementwise_derivative_alignment() {
+        let scalar = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap();
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let exemplar = Array::from_elements::<f64>(target.clone(), &[0.0; 6]).unwrap();
+        assert_eq!(
+            scalar.align_tangent(&target, &exemplar),
+            Ok(Array::from_elements::<f64>(target, &[2.0, 2.0, 2.0, 2.0, 2.0, 2.0]).unwrap()),
+        );
+
+        let cotangent = Array::from_elements::<f64>(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let target = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        assert_eq!(
+            cotangent.unalign_cotangent(&target),
+            Ok(Array::from_elements::<f32>(target, &[5.0, 7.0, 9.0]).unwrap()),
+        );
+
+        let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        assert!(matches!(
+            value.align_tangent(&target, &value),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "cannot align tangent type f64[2, 3] to output type f64[3]",
+        ));
+    }
+
+    #[test]
+    fn test_array_elementwise_derivative_alignment_with_dynamic_output_axes() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+        let bias_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+
+        // The exemplar supplies the runtime extents through an input edge, so one whose shape does not describe the
+        // alignment target cannot stand in for it.
+        let value = Array::vector(vec![1.0, 2.0]).unwrap();
+        assert!(matches!(
+            value.align_tangent(&dynamic_type, &Array::scalar(0.0).unwrap()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "cannot align tangent type f64[2] to output type f64[batch, 2] because the exemplar \
+                               type f64[] has a different shape",
+        ));
+
+        // An implicitly broadcasting result with a runtime extent is served by the array IR arm instead. The narrow
+        // input is replicated explicitly against first-class extents read off the input that owns the runtime
+        // axis, because the metadata-only broadcast's payload output type is one that program replay never refines.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.into());
+        let bias = builder.add_input(bias_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                Vec::new(),
+                vec![input, bias],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[batch, 2], %1:f64[2], %2:f64[batch, 2], %3:f64[2] .
+                let %4:dimension<batch ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %5:dimension<2> = constant [value=2]
+                    %6:f64[batch, 2] = broadcast [output_axes=[1]] %1 %4 %5
+                    %7:f64[batch, 2] = broadcast [output_axes=[1]] %3 %4 %5
+                    %8:f64[batch, 2] = add %0 %6
+                    %9:f64[batch, 2] = add %2 %7
+                in (%8, %9)"},
+        );
+
+        // Linearizing the same program carries only first-class extents across the primal-linear boundary
+        // (i.e., the runtime one plus the static one the mixed broadcast names explicitly).
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.5, -0.25]).unwrap()),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+        let extents = residuals
+            .iter()
+            .map(|residual| match residual {
+                ArrayIrValue::Dimension(extent) => extent.extent(),
+                residual => panic!("expected only first-class extent residuals but got {residual:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(extents, vec![3, 2]);
+        assert_eq!(
+            primal_outputs,
+            vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.5, 1.75, 3.5, 3.75, 5.5, 5.75]).unwrap())],
+        );
+    }
+
+    #[test]
+    fn test_broadcast_derivative_alignment() {
+        let cotangent = Array::from_elements::<f64>(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(
+            cotangent.unalign_cotangent_along(&target, &[1, 0]),
+            Ok(Array::from_elements::<f64>(target, &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]).unwrap()),
+        );
+
+        let cotangent = Array::from_elements::<f64>(
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
+            ),
+            &(1..=24).map(|value| value as f64).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        assert_eq!(
+            cotangent.unalign_cotangent_along(&target, &[1, 2]),
+            Ok(Array::from_elements::<f64>(target, &[126.0, 174.0]).unwrap())
+        );
+
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        assert!(matches!(
+            cotangent.unalign_cotangent_along(&target, &[3]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message
+                    == "cannot unalign cotangent type f64[3, 2, 4] to input cotangent type f64[2] using output axes [3]",
+        ));
+    }
+
+    #[test]
+    fn test_broadcast_derivative_alignment_dynamic_shape() {
+        // Exact singleton bounds permit a mapped axis to retain its extent under a different representation. The
+        // first axis consumes the symbolic identity so the forward and transposed programs both have it in scope.
+        let size = DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(2)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Dynamic(size)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![0, 1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let values = Array::matrix(2, 2, vec![2_f32, 5., 7., 9.]).unwrap();
+        assert_eq!(program.interpret(vec![values.clone()]), Ok(vec![values.clone()]));
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(pullback.output_types(), vec![input_type]);
+        assert_eq!(pullback.interpret(vec![values.clone()]), Ok(vec![values]));
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[size, size] .
+                let %1:f32[size, 2] = broadcast [output_type=f32[size, 2], output_axes=[0, 1]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Reinstating a stretched singleton beside a genuinely dynamic axis needs no runtime extent read: an
+        // identity-axis broadcast restores that unit axis, while an ordinary reshape cannot change dynamic shapes.
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(1)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size), Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![0, 1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.interpret(vec![Array::matrix(2, 1, vec![2_f32, 5.]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![2_f32, 2., 2., 5., 5., 5.]).unwrap()]),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(pullback.output_types(), vec![input_type]);
+        assert_eq!(
+            pullback.interpret(vec![Array::matrix(2, 3, vec![1_f32, 2., 3., 4., 5., 6.]).unwrap()]),
+            Ok(vec![Array::matrix(2, 1, vec![6_f32, 15.]).unwrap()]),
+        );
+        assert_eq!(
+            pullback.interpret(vec![Array::matrix::<f32>(0, 3, Vec::new()).unwrap()]),
+            Ok(vec![Array::matrix::<f32>(0, 1, Vec::new()).unwrap()]),
+        );
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[size, 3] .
+                let %1:f32[size] = reduce [kind=sum, axes=[1]] %0
+                    %2:f32[size, 1] = broadcast [output_type=f32[size, 1], output_axes=[0]] %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_reduce_broadcast_cotangent() {
+        // Introduced and stretched axes are summed away; restoring the stretched unit axis and element type belongs
+        // to the caller, so this result deliberately has a compact shape and the cotangent's original element type.
+        let cotangent = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [3, 2, 4]),
+            &(1..=24).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let target = ArrayType::new_static(DataType::F32, [2, 1]);
+        assert_eq!(
+            reduce_broadcast_cotangent(&cotangent, &target, &[1, 2]),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[126_f64, 174.]).unwrap()),
+        );
+
+        // Reducing an introduced middle axis preserves the relative physical order of the others until the inverse
+        // permutation puts them back in the input's axis order.
+        let cotangent = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [2, 3, 4]),
+            &(1..=24).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let target = ArrayType::new_static(DataType::F64, [4, 2]);
+        let contribution = reduce_broadcast_cotangent(&cotangent, &target, &[2, 0]).unwrap();
+        assert_eq!(contribution.r#type().shape(), target.shape());
+        assert_eq!(contribution.elements::<f64>(), Ok(vec![15., 51., 18., 54., 21., 57., 24., 60.]));
+
+        // Summing an empty introduced axis yields zero, including when the target itself is nonempty.
+        let cotangent = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 2]), &[]).unwrap();
+        let target = ArrayType::new_static(DataType::F64, [2]);
+        assert_eq!(
+            reduce_broadcast_cotangent(&cotangent, &target, &[1]),
+            Ok(Array::from_elements(target, &[0_f64, 0.]).unwrap()),
+        );
+
+        // A symbolic exact bound equal to a static target extent keeps the axis without staging a reduction.
+        let size = DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let cotangent = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)])));
+        let target = ArrayType::new_static(DataType::F32, [2]);
+        assert_eq!(reduce_broadcast_cotangent(&cotangent, &target, &[0]).unwrap().atom_id(), cotangent.atom_id(),);
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        let cotangent =
+            Array::from_elements(ArrayType::new_static(DataType::F64, [2, 2]), &[1_f64, 2., 3., 4.]).unwrap();
+        let target = ArrayType::new_static(DataType::F64, [2, 2]);
+        assert!(matches!(
+            reduce_broadcast_cotangent(&cotangent, &target, &[0, 0]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`broadcast` output axes must be distinct",
+        ));
+    }
+
+    #[test]
+    fn test_unary_elementwise_jvp() {
+        #[derive(Clone)]
+        struct BooleanOutputOperation;
+
+        impl Operation for BooleanOutputOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "boolean_output"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayType],
+                _region_interfaces: &[crate::programs::regions::RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(vec![ArrayType::scalar(DataType::Boolean)])
+            }
+        }
+
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let tangent_calls = Cell::new(0);
+        let outputs = unary_elementwise_jvp(
+            &context,
+            &NegOperation::<ArrayType>::new(),
+            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64).unwrap()).unwrap()],
+            |_, input| Ok(input.clone()),
+            |_| {
+                tangent_calls.set(tangent_calls.get() + 1);
+                Ok(Array::scalar(1.0f64).unwrap())
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f64).unwrap());
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
+        assert_eq!(tangent_calls.get(), 0);
+
+        let primal_evaluations = Cell::new(0);
+        let outputs = unary_elementwise_jvp(
+            &context,
+            &NegOperation::<ArrayType>::new(),
+            &[DifferentiationDual::new(Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()).unwrap()],
+            |_, input| {
+                primal_evaluations.set(primal_evaluations.get() + 1);
+                Ok(input.clone())
+            },
+            |jvp_inputs| {
+                tangent_calls.set(tangent_calls.get() + 1);
+                Ok(jvp_inputs.output_primal_at_tangent_type()? * jvp_inputs.input_tangent()?)
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f64).unwrap());
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(6.0f64).unwrap()));
+        assert_eq!(tangent_calls.get(), 1);
+        assert_eq!(primal_evaluations.get(), 1);
+
+        let primal_evaluations = Cell::new(0);
+        let input_primal = Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let outputs = unary_elementwise_jvp(
+            &context,
+            &NegOperation::<ArrayType>::new(),
+            &[DifferentiationDual::new(input_primal.clone(), Array::scalar(3.0f32).unwrap()).unwrap()],
+            |_, input| {
+                primal_evaluations.set(primal_evaluations.get() + 1);
+                Ok(input.clone())
+            },
+            |jvp_inputs| jvp_inputs.output_primal_at_tangent_type(),
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &input_primal);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(2.0f32).unwrap()));
+        assert_eq!(primal_evaluations.get(), 2);
+
+        let outputs = unary_elementwise_jvp(
+            &context,
+            &BooleanOutputOperation,
+            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64).unwrap()).unwrap()],
+            |_, _| Ok(Array::scalar(true).unwrap()),
+            |_| -> Result<Array, DifferentiationError> {
+                panic!("zero-space output invoked its tangent function for a structural-zero input tangent")
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+        );
+
+        assert!(matches!(
+            unary_elementwise_jvp(
+                &context,
+                &BooleanOutputOperation,
+                &[DifferentiationDual::new(Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()).unwrap()],
+                |_, _| Ok(Array::scalar(true).unwrap()),
+                |_| -> Result<Array, DifferentiationError> { panic!("zero-space output invoked its tangent function") },
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`boolean_output` output type bool[] has no tangent space",
+        ));
+        assert!(matches!(
+            unary_elementwise_jvp(
+                &context,
+                &NegOperation::<ArrayType>::new(),
+                &[],
+                |_, input: &Array| Ok(input.clone()),
+                |_| Ok(Array::scalar(1.0f64).unwrap()),
+            ),
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+        ));
+    }
+
+    #[test]
+    fn test_binary_elementwise_jvp() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let left_calls = Cell::new(0);
+        let right_calls = Cell::new(0);
+        let left_primal = Array::scalar(2.0f64).unwrap();
+        let right_primal = Array::scalar(5.0f64).unwrap();
+        let compare = CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan);
+
+        let outputs = binary_elementwise_jvp(
+            &context,
+            &AddOperation::<ArrayType>::new(),
+            &[
+                DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
+                DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
+            ],
+            |_, left, right| Ok(left.clone() + right.clone()),
+            |_, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(tangent)
+            },
+            |_, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(tangent)
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Array::scalar(7.0f64).unwrap());
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
+        assert_eq!((left_calls.get(), right_calls.get()), (0, 0));
+
+        let outputs = binary_elementwise_jvp(
+            &context,
+            &compare,
+            &[
+                DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
+                DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
+            ],
+            |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0]).unwrap()),
+            |_, _| -> Result<Array, DifferentiationError> {
+                panic!("zero-space output invoked its left tangent term function for structural-zero input tangents")
+            },
+            |_, _| -> Result<Array, DifferentiationError> {
+                panic!("zero-space output invoked its right tangent term function for structural-zero input tangents")
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+        );
+
+        let outputs = binary_elementwise_jvp(
+            &context,
+            &AddOperation::<ArrayType>::new(),
+            &[
+                DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64).unwrap()).unwrap(),
+                DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
+            ],
+            |_, left, right| Ok(left.clone() + right.clone()),
+            |_, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(tangent)
+            },
+            |_, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(tangent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(3.0f64).unwrap()));
+        assert_eq!((left_calls.get(), right_calls.get()), (1, 0));
+
+        let outputs = binary_elementwise_jvp(
+            &context,
+            &AddOperation::<ArrayType>::new(),
+            &[
+                DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
+                DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64).unwrap()).unwrap(),
+            ],
+            |_, left, right| Ok(left.clone() + right.clone()),
+            |_, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(tangent)
+            },
+            |_, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(tangent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(4.0f64).unwrap()));
+        assert_eq!((left_calls.get(), right_calls.get()), (1, 1));
+
+        let outputs = binary_elementwise_jvp(
+            &context,
+            &AddOperation::<ArrayType>::new(),
+            &[
+                DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64).unwrap()).unwrap(),
+                DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64).unwrap()).unwrap(),
+            ],
+            |_, left, right| Ok(left.clone() + right.clone()),
+            |jvp_inputs, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(jvp_inputs.right_primal()? * tangent)
+            },
+            |jvp_inputs, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(jvp_inputs.left_primal()? * tangent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(23.0f64).unwrap()));
+        assert_eq!((left_calls.get(), right_calls.get()), (2, 2));
+
+        assert!(matches!(
+            binary_elementwise_jvp(
+                &context,
+                &compare,
+                &[
+                    DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64).unwrap()).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
+                ],
+                |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0]).unwrap()),
+                |_, _| -> Result<Array, DifferentiationError> {
+                    panic!("zero-space output invoked its left tangent term function")
+                },
+                |_, _| -> Result<Array, DifferentiationError> {
+                    panic!("zero-space output invoked its right tangent term function")
+                },
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`compare` output type bool[] has no tangent space",
+        ));
+        assert!(matches!(
+            binary_elementwise_jvp(
+                &context,
+                &AddOperation::<ArrayType>::new(),
+                &[DifferentiationDual::new_with_zero_tangent(left_primal).unwrap()],
+                |_, left, right| Ok(left.clone() + right.clone()),
+                |_, tangent| Ok(tangent),
+                |_, tangent| Ok(tangent),
+            ),
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 })),
+        ));
+    }
+
+    #[test]
+    fn test_binary_elementwise_vjp_restores_each_input_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (output, pullback) = context
+            .differentiate_at((
+                Array::from_elements::<f64>(sharded_type.clone(), &[1.0, 2.0]).unwrap(),
+                Array::from_elements::<f64>(replicated_type.clone(), &[3.0, 4.0]).unwrap(),
+            ))
+            .vjp(|(left, right)| Ok(left + right))
+            .unwrap();
+        assert!(
+            pullback
+                .linear_program()
+                .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[], &[])
+                .unwrap()
+                .program()
+                .to_string()
+                .contains("reshard")
+        );
+        let (left, right) = pullback
+            .apply(Array::from_elements::<f64>(output.r#type().into_owned(), &[1.0, 1.0]).unwrap())
+            .unwrap();
+        assert_eq!(left.r#type().as_ref(), &sharded_type);
+        assert_eq!(right.r#type().as_ref(), &replicated_type);
+    }
+
+    #[test]
+    fn test_elementwise_differentiation_with_dynamic_output_axes() {
+        // `tanh(x + b)` summed over both axes, with a runtime-sized leading axis: the implicitly broadcasting `add`
+        // and the reduction over the runtime-sized axis must both differentiate, and the resulting pullback must
+        // replay at more than one concrete extent.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.into());
+        let bias = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let sum = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                Vec::new(),
+                vec![input, bias],
+                None,
+            )
+            .unwrap()[0];
+        let activated = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Tanh(TanhOperation::new())),
+                Vec::new(),
+                vec![sum],
+                None,
+            )
+            .unwrap()[0];
+        let loss = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
+                Vec::new(),
+                vec![activated],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![loss],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let bias_values = vec![0.5, -0.25];
+        for rows in [4usize, 2] {
+            let values = (0..rows * 2).map(|index| index as f64 * 0.1).collect::<Vec<_>>();
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![
+                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone()).unwrap()),
+                    ArrayIrValue::Array(Array::vector(bias_values.clone()).unwrap()),
+                ])
+                .unwrap();
+            let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+
+            // `d loss / d x_ij = 1 - tanh(x_ij + b_j)²` and `d loss / d b_j` sums that derivative over the batch.
+            let expected_input_cotangents = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| 1.0 - (value + bias_values[index % 2]).tanh().powi(2))
+                .collect::<Vec<_>>();
+            let expected_bias_cotangents = vec![
+                expected_input_cotangents.iter().step_by(2).sum::<f64>(),
+                expected_input_cotangents.iter().skip(1).step_by(2).sum::<f64>(),
+            ];
+            let expected_loss =
+                values.iter().enumerate().map(|(index, value)| (value + bias_values[index % 2]).tanh()).sum::<f64>();
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_loss).unwrap()));
+
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                pullback.interpret(pullback_inputs),
+                Ok(vec![
+                    ArrayIrValue::Array(Array::matrix(rows, 2, expected_input_cotangents).unwrap()),
+                    ArrayIrValue::Array(Array::vector(expected_bias_cotangents).unwrap()),
+                ]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_bilinear_elementwise_differentiation_with_dynamic_output_axes() {
+        // `sum(x * scale)` with a runtime-sized leading axis. A bilinear rule aligns the primal coefficient of each
+        // side as well as the tangents, so this pins the replicated inputs against the eager gradients of the same
+        // computation at two concrete extents.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.into());
+        let scale = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let scaled = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![input, scale],
+                None,
+            )
+            .unwrap()[0];
+        let loss = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
+                Vec::new(),
+                vec![scaled],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![loss],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let scale_values = vec![1.5, -0.5];
+        for rows in [3usize, 1] {
+            let values = (0..rows * 2).map(|index| index as f64 * 0.25 + 1.0).collect::<Vec<_>>();
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![
+                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone()).unwrap()),
+                    ArrayIrValue::Array(Array::vector(scale_values.clone()).unwrap()),
+                ])
+                .unwrap();
+            let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())];
+            pullback_inputs.extend(residuals);
+
+            // The same computation differentiated eagerly at this concrete extent, which never involves a runtime
+            // extent and therefore never takes the replication path.
+            let primals = (Array::matrix(rows, 2, values).unwrap(), Array::vector(scale_values.clone()).unwrap());
+            let (eager_loss, eager_pullback) = differentiate_at(primals)
+                .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)?))
+                .unwrap();
+            let (input_cotangent, scale_cotangent) =
+                eager_pullback.apply_materialized(Array::scalar(1.0).unwrap()).unwrap();
+            assert_eq!(primal_outputs, vec![ArrayIrValue::Array(eager_loss)]);
+            assert_eq!(
+                pullback.interpret(pullback_inputs),
+                Ok(vec![ArrayIrValue::Array(input_cotangent), ArrayIrValue::Array(scale_cotangent)]),
+            );
+        }
+    }
+}

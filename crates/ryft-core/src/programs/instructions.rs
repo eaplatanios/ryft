@@ -1,5 +1,11 @@
+use std::fmt::Display;
+
+use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
-use crate::programs::regions::RegionId;
+use crate::programs::effects::EffectsSummary;
+use crate::programs::operations::Operation;
+use crate::programs::provenance::Provenance;
+use crate::programs::regions::{RegionId, RegionRole};
 
 /// Location of one [`Instruction`] in a multi-region [`Program`](crate::Program), identified by its containing
 /// [`Region`](crate::Region) and its zero-based index within that region's instruction sequence.
@@ -31,26 +37,34 @@ impl InstructionId {
         self.index
     }
 }
-/// [`Instruction`]s represent applications of [`Operation`](crate::Operation)s to input values in
-/// [`Program`](crate::Program)s. Each [`Region`](crate::Region) executes its [`Instruction`]s in sequential order.
-/// Beyond its operation and its input and output [`Atom`](crate::Atom)s, an instruction carries the [`RegionId`]s of
-/// the nested computations attached to the application (e.g., the `true`/`false` branches of a condition, a scan body,
-/// or the shared program of a JIT call), in the operation-defined order. Note that there is one
-/// [`Region`](crate::Region) edge kind, and sharing is expressed directly in the graph. Several [`Instruction`]s may
-/// reference the same [`RegionId`], and a region stays alive for as long as it is reachable from the entry region. What
-/// a slot *means* (i.e., a branch-like computation that lowers inline versus a call-like computation that lowers and
-/// compiles once as a shared function) is defined by the operation and not by the edge. For example,
-/// `if p { f(x) + f(2 * x) } else { x }` with a JIT-compiled `f` is one condition instruction attaching a `true` and a
-/// `false` branch [`Region`](crate::Region), where the `true` branch contains two call instructions that both reference
-/// the single region holding `f`'s body  (i.e., one shared region, three region edges, and the inline-versus-shared
-/// lowering decision carried by the condition and call operations, respectively). Two structurally equal but
-/// independently created computations remain distinct regions, because [`ProgramBuilder`](crate::ProgramBuilder)
-/// imports regions by *identity* (i.e., [`import_region`](crate::ProgramBuilder::import_region) always copies and
+
+impl Display for InstructionId {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}[{}]", self.region, self.index)
+    }
+}
+
+/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`](crate::Program)s. Each
+/// [`Region`](crate::Region) executes its [`Instruction`]s in sequential order. Beyond its operation and its input and
+/// output [`Atom`](crate::Atom)s, an instruction carries the [`RegionId`]s of the nested computations attached to the
+/// application (e.g., the `true`/`false` branches of a condition, a scan body, or the shared program of a JIT call),
+/// in the operation-defined order. Note that there is one [`Region`](crate::Region) edge kind, and sharing is expressed
+/// directly in the graph. Several [`Instruction`]s may reference the same [`RegionId`], and a region stays alive for as
+/// long as it is reachable from the entry region. What a slot _means_ (i.e., a branch-like computation that lowers
+/// inline versus a call-like computation that lowers and compiles once as a shared function) is defined by the
+/// operation and not by the edge. For example, `if p { f(x) + f(2 * x) } else { x }` with a JIT-compiled `f` is one
+/// condition instruction attaching a `true` and a `false` branch [`Region`](crate::Region), where the `true` branch
+/// contains two call instructions that both reference the single region holding `f`'s body  (i.e., one shared region,
+/// three region edges, and the inline-versus-shared lowering decision carried by the condition and call operations,
+/// respectively). Two structurally equal but independently created computations remain distinct regions, because
+/// [`ProgramBuilder`](crate::ProgramBuilder) imports regions by _identity_ (i.e.,
+/// [`import_region`](crate::ProgramBuilder::import_region) always copies and
 /// [`intern_callee`](crate::ProgramBuilder::intern_callee) interns by [`Rc`](std::rc::Rc) identity),
 /// never by structure.
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
-    /// [`Operation`](crate::Operation) applied by this [`Instruction`].
+    /// [`Operation`] applied by this [`Instruction`].
     pub(crate) operation: O,
 
     /// [`AtomId`]s of the input [`Atom`](crate::Atom)s consumed by this [`Instruction`].
@@ -61,16 +75,29 @@ pub struct Instruction<O> {
 
     /// [`RegionId`]s of the nested computations attached to this [`Instruction`], in the operation-defined order.
     pub(crate) regions: Vec<RegionId>,
+
+    /// [`Provenance`] recording where this [`Instruction`] came from. Note that this field is intended to serve
+    /// diagnostic purposes only. It does not affect type inference, effects, interpretation, transformation legality,
+    /// or the canonical semantic program rendering.
+    pub(crate) provenance: Provenance,
 }
 
 impl<O> Instruction<O> {
-    /// Creates a new [`Instruction`].
+    /// Creates a new [`Instruction`] with unknown [`Provenance`]. Builders and rebuilds that carry a recorded origin
+    /// attach it through [`with_provenance`](Self::with_provenance).
     #[inline]
     pub fn new(operation: O, inputs: Vec<AtomId>, outputs: Vec<AtomId>, regions: Vec<RegionId>) -> Self {
-        Self { operation, inputs, outputs, regions }
+        Self { operation, inputs, outputs, regions, provenance: Provenance::unknown() }
     }
 
-    /// Returns the [`Operation`](crate::Operation) applied by this [`Instruction`].
+    /// Returns this [`Instruction`] with its [`Provenance`] replaced by the provided one.
+    #[inline]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    /// Returns the [`Operation`] applied by this [`Instruction`].
     #[inline]
     pub fn operation(&self) -> &O {
         &self.operation
@@ -95,10 +122,131 @@ impl<O> Instruction<O> {
         &self.regions
     }
 
-    /// Consumes this [`Instruction`] and returns its [`Operation`](crate::Operation), input [`AtomId`]s,
-    /// output [`AtomId`]s, and attached region [`RegionId`]s.
+    /// Returns the [`Provenance`] recording where this [`Instruction`] came from. Note that this information is
+    /// intended to serve diagnostic purposes only. It does not affect type inference, effects, interpretation,
+    /// transformation legality, or the canonical semantic program rendering.
     #[inline]
-    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>) {
-        (self.operation, self.inputs, self.outputs, self.regions)
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, output [`AtomId`]s, attached
+    /// region [`RegionId`]s, and [`Provenance`], in that order. Rebuilds that destructure an instruction this way must
+    /// reattach the returned provenance through [`Self::with_provenance`] instead of silently dropping it.
+    #[inline]
+    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>, Provenance) {
+        (self.operation, self.inputs, self.outputs, self.regions, self.provenance)
+    }
+}
+
+impl<O: Operation> Instruction<O> {
+    /// Returns the [`EffectsSummary`] of this [`Instruction`], which combines its operation's intrinsic summary with
+    /// the part of each attached [`Region`](crate::Region)'s summary that the operation carries according to the
+    /// region's [`RegionRole`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `summary_of`: Returns the recursively derived [`EffectsSummary`] of an attached region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the number of attached regions does not match the operation's region slots,
+    /// or when `summary_of` fails.
+    pub(crate) fn effects_summary<F: Fn(RegionId) -> Result<EffectsSummary, ProgramError>>(
+        &self,
+        summary_of: F,
+    ) -> Result<EffectsSummary, ProgramError> {
+        let operation = self.operation();
+        operation.validate_region_count(self.regions().len())?;
+        self.regions().iter().zip(operation.region_slots()).try_fold(
+            operation.effects().summary(),
+            |effects, (region, slot)| {
+                let region_effects = summary_of(*region)?;
+                Ok(effects.union(match slot.role {
+                    RegionRole::Computation => {
+                        // A computation region may execute as part of the operation, so all of its effects are effects
+                        // of the operation. The union retains the observable-when-unused property of either side, so an
+                        // enclosing operation can never suppress an observable nested effect.
+                        region_effects
+                    }
+                    RegionRole::Rule => {
+                        // A rule region is a dormant transform definition. Attaching one does not execute it,
+                        // so none of its effects belong to the operation.
+                        EffectsSummary::PURE
+                    }
+                    RegionRole::DeferredRule => {
+                        // A deferred rule region does not execute during ordinary interpretation either, but a later
+                        // transform of the operation executes it. When it has effects or deferred work of its own, the
+                        // operation therefore carries deferred work until that transform replaces it.
+                        if region_effects == EffectsSummary::PURE {
+                            EffectsSummary::PURE
+                        } else {
+                            EffectsSummary::DEFERRED_WORK
+                        }
+                    }
+                }))
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects};
+    use crate::programs::regions::RegionSlot;
+    use crate::tests::TestRegionOperation;
+
+    use super::*;
+
+    #[test]
+    fn test_instruction_id_display() {
+        assert_eq!(InstructionId::new(RegionId::new(2), 7).to_string(), "^2[7]");
+    }
+
+    #[test]
+    fn test_instruction_effects_summary() {
+        // Regions `0`, `1`, and `2` are attached as a computation, a rule, and a deferred rule. A computation region
+        // contributes its complete summary, a rule region contributes nothing, and a deferred rule region contributes
+        // deferred work exactly when it has effects or deferred work of its own.
+        let instruction = Instruction::new(
+            TestRegionOperation::WithRegions(
+                const {
+                    &[
+                        RegionSlot::computation("computation"),
+                        RegionSlot::rule("rule"),
+                        RegionSlot::deferred_rule("deferred"),
+                    ]
+                },
+            ),
+            Vec::new(),
+            Vec::new(),
+            vec![RegionId::new(0), RegionId::new(1), RegionId::new(2)],
+        );
+        let effectful = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)).summary();
+        let deferred = Effects::empty().clone().with_deferred_work().summary();
+        let summary =
+            |summaries: [EffectsSummary; 3]| instruction.effects_summary(|region| Ok(summaries[region.index()]));
+        assert_eq!(summary([EffectsSummary::PURE; 3]), Ok(EffectsSummary::PURE));
+        assert_eq!(summary([effectful, EffectsSummary::PURE, EffectsSummary::PURE]), Ok(effectful));
+        assert_eq!(summary([EffectsSummary::PURE, effectful, EffectsSummary::PURE]), Ok(EffectsSummary::PURE));
+        assert_eq!(summary([EffectsSummary::PURE, deferred, EffectsSummary::PURE]), Ok(EffectsSummary::PURE));
+        assert_eq!(summary([EffectsSummary::PURE, EffectsSummary::PURE, effectful]), Ok(EffectsSummary::DEFERRED_WORK));
+        assert_eq!(summary([EffectsSummary::PURE, EffectsSummary::PURE, deferred]), Ok(EffectsSummary::DEFERRED_WORK));
+
+        // The number of attached regions must match the operation's region slots.
+        let mismatched = Instruction::new(
+            TestRegionOperation::WithRegions(const { &[RegionSlot::computation("computation")] }),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            mismatched.effects_summary(|_| Ok(EffectsSummary::PURE)),
+            Err(ProgramError::MalformedProgram(
+                "operation `with_regions` declares 1 region slots but 0 regions were attached".to_string(),
+            )),
+        );
     }
 }

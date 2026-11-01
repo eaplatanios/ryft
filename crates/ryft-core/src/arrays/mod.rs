@@ -1,0 +1,66 @@
+//! Multidimensional arrays and the types, values, and operation families used to execute, stage, and transform array
+//! programs. [`ArrayType`] describes an array's element [`DataType`], [`Shape`], storage [`Layout`], [`Memory`] space,
+//! and [`Sharding`]. Shapes can contain static extents or symbolic [`Dimension`]s with bounds tracked during tracing.
+//! The value representations serve different roles:
+//!
+//!   - [`Array`] is an eager reference implementation for tests and examples, with shared immutable storage and fully
+//!     static shapes.
+//!   - [`DimensionValue`] represents one concrete extent and performs checked host-side dimension arithmetic.
+//!   - [`ArrayIrValue`] holds an array, a dimension, or an [`ArrayReference`], so that all three can participate in one
+//!     program. Programs with dynamic shapes pass runtime extents explicitly as dimension inputs.
+//!
+//! [`ArrayOperation`] and [`DimensionOperation`] describe operations within the array and dimension families,
+//! respectively, while [`ArrayIrOperation`] also supports operations that cross those families or access references.
+//! The [`ArrayOperations`], [`DimensionOperations`], and [`ArrayIrOperations`] bundles group those capabilities for
+//! generic code. The remaining modules provide element encodings, broadcasting, addressing, sharding, and
+//! array-specific batching and differentiation support.
+
+pub mod addressing;
+#[allow(clippy::module_inception)]
+pub mod arrays;
+pub mod batching;
+pub mod broadcasting;
+pub mod differentiation;
+pub mod dimensions;
+pub mod elements;
+pub mod ir;
+pub mod macros;
+pub mod operations;
+pub mod references;
+pub mod sharding;
+pub mod types;
+
+pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySliceAxis};
+pub use arrays::Array;
+pub use batching::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, DimensionSource,
+    DynamicArrayExtentBatchingPolicy, StaticArrayExtentBatchingPolicy, ThreadedExtentBatchedProgram,
+};
+pub use broadcasting::{Broadcastable, BroadcastingError};
+pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals, materialize_array_tangent};
+pub use dimensions::DimensionValue;
+pub use elements::{
+    ArrayElement, Complex, FloatingPointArrayElement, NumericArrayElement, RealArrayElement,
+    RealFloatingPointArrayElement, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes,
+    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
+    f16, i1, i2, i4, u1, u2, u4,
+};
+pub use ir::{ArrayIrContext, ArrayIrValue};
+pub use macros::dispatch_on_array_element_type;
+pub use operations::{
+    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, DimensionOperation, DimensionOperations,
+};
+pub use references::{
+    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayReferenceViewError,
+};
+pub use sharding::{
+    Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, ShardableType, Sharding,
+    ShardingDimension, ShardingError, ShardingVisualization,
+};
+pub use types::{
+    ArrayIrType, ArrayIrTypeRefinements, ArrayMemberType, ArrayType, ArrayTypeRefinements, DataType, DataTypeError,
+    Dimension, DimensionBounds, DimensionError, DimensionMemberType, DimensionRefinements, DimensionType,
+    DimensionTypeRefinements, DimensionVariable, Layout, LayoutError, MAX_DIMENSION_EXTENT, Memory, Shape, StaticShape,
+    StridedLayout, Tile, TileDimension, TiledLayout,
+};

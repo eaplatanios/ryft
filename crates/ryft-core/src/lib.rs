@@ -1,118 +1,1122 @@
 // Derive macros emitted by `ryft-macros` use the public `ryft::...` facade path by default. This `self`-alias
 // lets those same generated paths resolve when those macros are used inside `ryft-core` itself.
+extern crate core;
 extern crate self as ryft;
 
+pub mod arrays;
 pub mod axes;
-pub mod broadcasting;
+pub mod batching;
+pub mod captures;
 pub mod contexts;
+pub mod differentiation;
 pub mod errors;
 pub mod interpretation;
 pub mod macros;
+pub mod operations;
 pub mod parameters;
+pub mod partial;
 pub mod programs;
-pub mod sharding;
+pub mod specialization;
 pub mod tracing;
-pub mod types;
 pub mod utilities;
 
-pub use axes::{AxisError, NamedAxis};
-pub use broadcasting::{Broadcastable, BroadcastingError};
-pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
+pub use arrays::{
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIndexRange,
+    ArrayIndexRanges, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrOperations,
+    ArrayIrType, ArrayIrTypeRefinements, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayOperations,
+    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayReferenceViewError, ArraySliceAxis, ArrayType,
+    ArrayTypeRefinements, Broadcastable, BroadcastingError, Complex, DataType, DataTypeError, Device, DeviceId,
+    DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionMemberType, DimensionOperation,
+    DimensionOperations, DimensionRefinements, DimensionSource, DimensionType, DimensionTypeRefinements,
+    DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, ExactShape, ExactShapeDimension,
+    FloatingPointArrayElement, Layout, LayoutError, LinearResiduals, LogicalMesh, MAX_DIMENSION_EXTENT, Memory,
+    MeshAxis, MeshAxisType, NumericArrayElement, ProcessIndex, RealArrayElement, RealFloatingPointArrayElement, Shape,
+    ShardableType, Sharding, ShardingDimension, ShardingError, ShardingVisualization, StaticArrayExtentBatchingPolicy,
+    StaticShape, StridedLayout, ThreadedExtentBatchedProgram, Tile, TileDimension, TiledLayout, bf16, decode_elements,
+    decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
+    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1,
+    u2, u4,
+};
+pub use axes::{Axes, Axis, AxisError, NamedAxes, NamedAxis};
+pub use batching::{
+    Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
+    BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
+    BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
+    InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
+    RecursiveBatchingDriver, RecursiveBatchingPolicy, ReplicatedBatchingPolicyProjection, batch,
+    batch_projected_operation, batch_replicated_projected_operation, check_batching_rule_consistency,
+};
+pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
+pub use contexts::{
+    Context, ContextProjection, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext,
+    ValueResolution,
+};
+pub use differentiation::{
+    BinaryElementwiseJvpInputs, BroadcastDerivativeAlignment, CotangentAccumulator, CotangentBatchingPolicy,
+    CotangentDestination, CotangentDestinationKind, CotangentDestinations, CotangentReferenceAccumulator,
+    CotangentSeed, DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME,
+    DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate,
+    DifferentiationBoundaryPosition, DifferentiationBuilder, DifferentiationBuilderContext,
+    DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationRule,
+    DifferentiationTracer, DotsSavable, DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME,
+    ElementwiseDerivativeAlignment, EverythingSavable, ForwardModeDifferentiate, FusedDifferentiationPolicy, Hessian,
+    HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext,
+    LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, MemoryTransferStorage,
+    NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
+    OffloadDotsWithNoBatchDimensions, PartitionedDifferentiationPolicy, ProjectedDifferentiationPolicy, Pullback,
+    Pushforward, REMATERIALIZATION_POLICY_FN_POLICY_NAME, RealLinearity, RematerializationPolicyFn,
+    RematerializedFunction, ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate,
+    SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
+    SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
+    SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, TangentActivity,
+    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture,
+    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_for_transpose_projected_operation,
+    jvp_projected_operation, rematerialize, saved_residuals, transpose_mixed_operation, transpose_projected_operation,
+    unary_elementwise_jvp,
+};
 pub use errors::{CustomError, Error, MaybeFallible};
-pub use interpretation::{InterpretableOperation, InterpretationDriver};
-pub use operations::*;
+pub use interpretation::{
+    EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, MemberInterpretableOperation,
+    RegionInterpreter, interpret_projected_operation,
+};
+pub use operations::{
+    ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME,
+    ASSERT_OPERATION_NAME, ATAN2_OPERATION_NAME, AXIS_INDEX_OPERATION_NAME, Abs, AbsOperation, AccumulatingVjp,
+    Accuracy, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
+    ArithmeticDimensionOperation, ArithmeticOperations, ArrayAssertionBatchingPolicy, Assert, AssertOperation,
+    AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, AxisIndex, AxisIndexOperation,
+    BROADCAST_OPERATION_NAME, BasicIndex, BatchedComposite, BlockQuantize, Broadcast, BroadcastInvariantBatching,
+    BroadcastOperation, BroadcastSensitiveBatching, CAST_OPERATION_NAME, CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME,
+    COMPARE_OPERATION_NAME, COMPLEX_OPERATION_NAME, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME,
+    CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONJUGATE_OPERATION_NAME, CONSTANT_OPERATION_NAME,
+    CONSTRAIN_SHARDING_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_CALL_OPERATION_NAME, Capability, Cast, CastOperation, CastType,
+    CategoricalSamplingMode, Ceil, CeilOperation, Clamp, ClampOperation, CollectiveMode, CollectiveOperations,
+    CollectiveOptions, Compare, CompareOperation, ComparisonDirection, ComparisonType, ComplexOperation,
+    ComplexOperations, Composite, CompositeBatching, CompositeCallContext, CompositeConversion, CompositeJvp,
+    CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, CompositeVjp, Concatenate, ConcatenateOperation,
+    Condition, ConditionOperation, ConditionType, Conjugate, ConjugateOperation, Constant, ConstantOperation,
+    ConstantOperations, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, ConvertElementType,
+    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeKind, CumulativeOperation, CustomCall,
+    CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching, CustomCallInputOutputAlias, CustomCallOperation,
+    CustomCallUnrolling, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource,
+    CustomRuleTracer, CustomVjpOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE,
+    DIMENSION_DIV_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME,
+    DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME,
+    DIMENSION_REM_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME,
+    DIMENSION_TO_SCALAR_OPERATION_NAME, DIV_OPERATION_NAME, DOT_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME,
+    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DefaultBatching, DefaultJvp, DefaultVjp, DimensionAddOperation,
+    DimensionConstant, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation,
+    DotOperations, DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicFill, DynamicGather, DynamicIota,
+    DynamicManipulationOperations, DynamicOne, DynamicPad, DynamicReshape, DynamicReshapeOperation,
+    DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,
+    DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, DynamicZero, ERF_OPERATION_NAME,
+    EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp, ExpM1,
+    ExpM1Operation, ExpOperation, ExplicitJvp, ExplicitVjp, ExponentialOperations, ExtremaOperations,
+    FLOOR_OPERATION_NAME, Fill, Floor, FloorOperation, GATHER_OPERATION_NAME, GUARD_OPERATION_NAME, Gather,
+    GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, GuardOperation, IMAGINARY_OPERATION_NAME,
+    IOTA_OPERATION_NAME, Imaginary, ImaginaryOperation, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed,
+    Indexing, Iota, IotaOperation, JvpComposite, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME, LN_1P_OPERATION_NAME,
+    LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LiftedCustomRules, LinearCallOperation,
+    Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, LogicalOperations, Logistic,
+    LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManipulationOperations,
+    ManualVariationAlignment, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME,
+    NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME,
+    OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, PAD_OPERATION_NAME,
+    PARALLEL_ALL_GATHER_OPERATION_NAME, PARALLEL_ALL_TO_ALL_OPERATION_NAME, PARALLEL_PERMUTE_OPERATION_NAME,
+    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_SUM_SCATTER_OPERATION_NAME,
+    PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelAllGather,
+    ParallelAllGatherOperation, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation,
+    ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelReduce,
+    ParallelReduceOperation, ParallelSumScatter, ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation,
+    Permutation, Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME, REAL_OPERATION_NAME,
+    REDUCE_OPERATION_NAME, REDUCE_PRECISION_OPERATION_NAME, REFERENCE_ADD_UPDATE_OPERATION_NAME,
+    REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
+    REMATERIALIZE_OPERATION_NAME, RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME,
+    RNG_BIT_GENERATOR_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers,
+    RaggedDotMode, RaggedDotOperation, Random, RandomAlgorithm, Real, RealOperation, Reduce, ReduceOperation,
+    ReducePrecision, ReducePrecisionOperation, ReductionKind, ReductionOperations, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceOperations, ReferenceRead,
+    ReferenceReadOperation, ReferenceReadTransposition, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializationOptimizationBarrier, RematerializeOperation, Reshape,
+    ReshapeOperation, Reshard, ReshardDispatch, ReshardOperation, ResidualStorageOperation, Reverse, ReverseOperation,
+    RngBitGenerator, RngBitGeneratorOperation, Round, RoundOperation, RoundingOperations, Rsqrt, RsqrtOperation,
+    SATURATING_SUB_OPERATION_NAME, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
+    SELECT_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
+    SORT_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, SaturatingSub,
+    SaturatingSubOperation, ScaledDot, ScaledDotOperation, Scan, ScanInterpretationDomain, ScanIterationCount,
+    ScanOperation, ScanOptions, ScanType, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
+    ScatterOptions, ScatterReductionKind, Select, SelectOperation, SequentialBatching, ShapeChangingCollectiveValue,
+    ShardMap, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer, ShardingOperations, Sign,
+    SignOperation, Sin, SinOperation, Slice, SliceOperation, Softmax, SoftmaxCrossEntropyWithTargetLogits, Sort,
+    SortDirection, SortOperation, SortOrdering, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    StopGradients, Sub, SubOperation, SymbolicZeroJvp, SymbolicZeroVjp, TAG_OPERATION_NAME, TAN_OPERATION_NAME,
+    TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan,
+    TanOperation, Tanh, TanhOperation, Tolerance, TopK, TracedShardMap, TransferToMemory, TransferToMemoryOperation,
+    Transpose, TransposeOperation, TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
+    UpdateSlice, UpdateSliceOperation, VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While,
+    WhileOperation, WhileOptions, WhilePredicate, WhileType, XOR_OPERATION_NAME, Xor, XorOperation,
+    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
+    composite, scan, shard_map, shard_map_in_context, shard_map_with_options, softmax_cross_entropy_with_target_logits,
+    trace_shard_map, trace_shard_map_with_named_axes, trace_shard_map_with_options, r#while,
+};
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
     ParameterParameterizedFamily, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
-    PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
+    Parameterwise, PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, SameAs,
+    VecParameterizedFamily,
 };
-pub use programs::*;
-pub use sharding::*;
+pub use partial::{
+    ErasedResidualStorage, NativeResidualPolicies, NoStorage, PartialEvaluation, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
+    PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram,
+    ProjectionFallbackCandidate, ReferencePlacement, ResidualCandidate, ResidualDecision, ResidualInputSource,
+    ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualProducer, ResidualRejection, ResidualStorage,
+};
+pub use programs::{
+    Atom, AtomId, AttachedRegionStatistics, AttachedRegions, BatchableReferenceTransform, BoundReferenceTransform,
+    Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, EffectClassesIterator, Effects, EffectsSummary,
+    EmptyRegionDriver, ErasedOperation, ExternalReferenceBinding, FlatProgram, InputRegionProvenance, Instruction,
+    InstructionId, LiteralIdentity, MaybeZero, MemberOperation, NoIdentity, NoReferenceTransform,
+    NoReferenceTransformBinding, NoReferent, Operation, OperationBoundaryPruning, OperationFoldOutput,
+    OperationFoldReplacement, OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider,
+    OutputRegionProvenance, ParameterProjection, PartialReferenceDischargeResult, PreparedReferenceReplacement,
+    Program, ProgramBuilder, ProgramBuilderId, ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics,
+    ProjectedValue, Provenance, ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
+    RecursiveReferenceDischargeDriver, Reference, ReferenceAccess, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceAliasEdge, ReferenceAnalysis,
+    ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening,
+    ReferenceDischargeCaptureScope, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeRegionResult,
+    ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeTargets,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
+    ReferenceError, ReferenceGeneration, ReferenceId, ReferenceIdentity, ReferenceMemberType, ReferenceObservation,
+    ReferenceRegionInputBinding, ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot,
+    ReferenceSource, ReferenceTransform, ReferenceTransformPath, ReferenceTransitiveAccess, ReferenceType,
+    ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOverlap,
+    Region, RegionArena, RegionArenaIterator, RegionContentIdentity, RegionDataFlow, RegionDataFlowBoundary,
+    RegionDataFlowRegionBoundary, RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionDriver,
+    RegionId, RegionInterface, RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot,
+    RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
+    TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch,
+    ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms,
+    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
+    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    infer_reference_view_type, prune_projected_operation_boundary, rewrite_reference_access_transforms,
+    type_identities_needing_runtime_checks, validate_projected_operation_region_interfaces,
+    validate_reference_boundary, validated_reference_access_descriptors,
+};
+pub use specialization::{
+    ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
+    SpecializationCacheProducer, SpecializationCacheStatistics,
+};
 pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
 };
-pub use types::*;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::macros::check_count;
-    use crate::programs::effects::{Effect, Effects};
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::RegionInterface;
-    use crate::programs::types::TypeError;
-    use crate::types::DataType;
+    use std::any::TypeId;
+    use std::borrow::Cow;
+    use std::convert::Infallible;
+    use std::fmt::{Debug, Display};
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::sync::{Arc, Weak};
 
-    /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
-    /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,
-    /// splicing, and rebuild paths) in isolation. Production region-carrying operations (e.g., the control-flow family)
-    /// impose their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture
-    /// declares arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures
-    /// whose failures cannot be masked by control-flow inference.
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum TestRegionOperation {
-        /// Region-free binary addition stand-in used inside region bodies.
-        Add,
+    use crate::arrays::{Array, ArrayOperation, ArrayType};
+    use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::{
+        CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+        DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
+        TranspositionContext, TranspositionDriver,
+    };
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+    use crate::macros::{check_count, impl_guardless_operation};
+    use crate::operations::{AddOperation, GuardOperation};
+    use crate::parameters::Parameter;
+    use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+    use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
+    use crate::programs::{
+        EffectClass, EffectClasses, Effects, LiteralIdentity, MaybeZero, NoIdentity, Operation, OperationProjection,
+        OperationProvider, Program, ProgramError, ProvenanceScope, Region, RegionInterface, RegionRef, RegionSlot,
+        Transform, TransformArtifact, Type, TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
+    };
+    use crate::specialization::SpecializationCacheStatistics;
+    use crate::tracing::{Tracer, TracingContext};
 
-        /// Region-free unary identity stand-in with an observable ordered-IO effect.
-        Effectful,
-
-        /// Region-carrying operation declaring the region slot names. Its inferred output types are the first attached
-        /// region's output types, which pins that region interfaces are derived and delivered during inference.
-        WithRegions(&'static [&'static str]),
+    /// Returns the hash of `value` under the standard library's default hasher, so that tests can check that equal
+    /// values hash equally (e.g., for operation payloads whose [`Hash`] implementations normalize floating-point
+    /// values).
+    pub(crate) fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
-    impl Operation<DataType> for TestRegionOperation {
+    /// Returns the [`LiteralIdentity::literal_hash`] of `value` under the standard library's default hasher.
+    pub(crate) fn literal_hash_of<V: LiteralIdentity>(value: &V) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.literal_hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Eager array context over the production [`ArrayOperation`] family for core protocol tests. Tests use that
+    /// family over the fixed `Array` value family, so that their transform instantiations are shared with the
+    /// production tests; malformed rules and arbitrary region interfaces remain explicit, separate protocol fixtures.
+    pub(crate) type TestArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+
+    /// Staging context for the same production array family, used to replay residual programs into an outer trace.
+    pub(crate) type TestArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
+
+    /// Test-only homogeneous member type used by the generic projected-context fixtures.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ProjectedMemberType<const MEMBER: u8>;
+
+    impl<const MEMBER: u8> Display for ProjectedMemberType<MEMBER> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "member_{MEMBER}")
+        }
+    }
+
+    impl<const MEMBER: u8> Parameter for ProjectedMemberType<MEMBER> {}
+
+    impl<const MEMBER: u8> Type for ProjectedMemberType<MEMBER> {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    impl<const MEMBER: u8> DifferentiableType for ProjectedMemberType<MEMBER> {
+        fn is_zero_space(&self) -> bool {
+            false
+        }
+
+        fn tangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+
+        fn cotangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+    }
+
+    /// Test-only concrete value for one homogeneous projected member.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ProjectedMemberValue<const MEMBER: u8>(pub(crate) usize);
+
+    impl<const MEMBER: u8> Display for ProjectedMemberValue<MEMBER> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.0)
+        }
+    }
+
+    impl<const MEMBER: u8> Parameter for ProjectedMemberValue<MEMBER> {}
+
+    impl<const MEMBER: u8> Typed for ProjectedMemberValue<MEMBER> {
+        type Type = ProjectedMemberType<MEMBER>;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Owned(ProjectedMemberType)
+        }
+    }
+
+    impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
+
+        fn domain(&self) -> Self::Domain {
+            EagerContext::new()
+        }
+    }
+
+    /// Test-only heterogeneous storage type with three distinct member kinds.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedProgramType {
+        /// First member kind, used by the ordinary projection tests.
+        First(ProjectedMemberType<0>),
+
+        /// Second member kind, which exercises the additional-member extensibility gate.
+        Second(ProjectedMemberType<1>),
+
+        /// Third member kind, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberType<2>),
+    }
+
+    impl Display for ProjectedProgramType {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::First(r#type) => Display::fmt(r#type, formatter),
+                Self::Second(r#type) => Display::fmt(r#type, formatter),
+                Self::Third(r#type) => Display::fmt(r#type, formatter),
+            }
+        }
+    }
+
+    impl Parameter for ProjectedProgramType {}
+
+    impl Type for ProjectedProgramType {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    impl DifferentiableType for ProjectedProgramType {
+        fn is_zero_space(&self) -> bool {
+            false
+        }
+
+        fn tangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+
+        fn cotangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+    }
+
+    /// Test-only heterogeneous storage value mirroring [`ProjectedProgramType`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedProgramValue {
+        /// First member value, used by the ordinary projection tests.
+        First(ProjectedMemberValue<0>),
+
+        /// Second member value, which exercises the additional-member extensibility gate.
+        Second(ProjectedMemberValue<1>),
+
+        /// Third member value, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberValue<2>),
+    }
+
+    impl Display for ProjectedProgramValue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::First(value) => Display::fmt(value, formatter),
+                Self::Second(value) => Display::fmt(value, formatter),
+                Self::Third(value) => Display::fmt(value, formatter),
+            }
+        }
+    }
+
+    impl Parameter for ProjectedProgramValue {}
+
+    impl Typed for ProjectedProgramValue {
+        type Type = ProjectedProgramType;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Owned(match self {
+                Self::First(_) => ProjectedProgramType::First(ProjectedMemberType),
+                Self::Second(_) => ProjectedProgramType::Second(ProjectedMemberType),
+                Self::Third(_) => ProjectedProgramType::Third(ProjectedMemberType),
+            })
+        }
+    }
+
+    impl Value for ProjectedProgramValue {
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
+
+        fn domain(&self) -> Self::Domain {
+            EagerContext::new()
+        }
+    }
+
+    /// Implements type/value conversion and projection for one named member of the heterogeneous test family.
+    macro_rules! impl_projected_test_member {
+        ($member:literal, $variant:ident) => {
+            impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
+                fn from(r#type: ProjectedMemberType<$member>) -> Self {
+                    Self::$variant(r#type)
+                }
+            }
+
+            impl<'t> TryFrom<&'t ProjectedProgramType> for &'t ProjectedMemberType<$member> {
+                type Error = TypeError;
+
+                fn try_from(r#type: &'t ProjectedProgramType) -> Result<Self, Self::Error> {
+                    match r#type {
+                        ProjectedProgramType::$variant(r#type) => Ok(r#type),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, r#type))),
+                    }
+                }
+            }
+
+            impl ValueProjection<ProjectedMemberType<$member>> for ProjectedProgramValue {
+                type Projected = ProjectedMemberValue<$member>;
+                type ProjectedRef<'v>
+                    = &'v ProjectedMemberValue<$member>
+                where
+                    Self: 'v;
+
+                fn from_projected(value: Self::Projected) -> Self {
+                    Self::$variant(value)
+                }
+
+                fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+                where
+                    ProjectedMemberType<$member>: 'v,
+                {
+                    match self {
+                        Self::$variant(value) => Ok(value),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, self.r#type()))),
+                    }
+                }
+
+                fn into_projected(self) -> Result<Self::Projected, TypeError> {
+                    match self {
+                        Self::$variant(value) => Ok(value),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, self.r#type()))),
+                    }
+                }
+            }
+
+            impl From<ProjectedMemberOperation<$member>> for ProjectedProgramOperation {
+                fn from(operation: ProjectedMemberOperation<$member>) -> Self {
+                    Self::$variant(operation)
+                }
+            }
+
+            impl OperationProjection<ProjectedMemberType<$member>> for ProjectedProgramOperation {
+                type Projected = ProjectedMemberOperation<$member>;
+            }
+        };
+    }
+
+    impl_projected_test_member!(0, First);
+    impl_projected_test_member!(1, Second);
+    impl_projected_test_member!(2, Third);
+
+    /// Test-only homogeneous identity, addition, and doubling operations for one projected member kind.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedMemberOperation<const MEMBER: u8> {
+        /// Preserves one value.
+        Identity,
+
+        /// Adds two values in the same member family. As a binary linear operation over member-typed data inputs, it
+        /// also pins that mixed transposition classifies interleaved data and shape inputs one by one.
+        Add,
+
+        /// Doubles one value. Its transposition submits the output cotangent twice, once under each of the `first` and
+        /// `second` provenance scopes, which pins that member-local scopes survive projected transposition.
+        Scoped,
+    }
+
+    impl<const MEMBER: u8> ProjectedMemberOperation<MEMBER> {
+        /// Returns the number of inputs of this operation.
+        fn input_count(&self) -> usize {
+            if matches!(self, Self::Add) { 2 } else { 1 }
+        }
+    }
+
+    impl<const MEMBER: u8> From<AddOperation<ProjectedMemberType<MEMBER>>> for ProjectedMemberOperation<MEMBER> {
+        fn from(_: AddOperation<ProjectedMemberType<MEMBER>>) -> Self {
+            Self::Add
+        }
+    }
+
+    impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
+        type Type = ProjectedMemberType<MEMBER>;
+
         fn name(&self) -> &'static str {
             match self {
+                Self::Identity => "projected_member",
                 Self::Add => "add",
-                Self::Effectful => "effectful",
-                Self::WithRegions(_) => "with_regions",
+                Self::Scoped => "scoped",
             }
         }
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ProjectedMemberType<MEMBER>],
+            _region_interfaces: &[RegionInterface<ProjectedMemberType<MEMBER>>],
+        ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
+            check_count!("input", input_types, self.input_count(), TypeError);
+            Ok(vec![ProjectedMemberType])
+        }
+    }
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>, Operation: From<Self>>>
+        DifferentiableOperation<C> for ProjectedMemberOperation<MEMBER>
+    {
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            check_count!("input", inputs, self.input_count(), ProgramError);
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.primal().bind(self.clone(), Vec::new(), &primals)?.remove(0);
+            let tangent = match self {
+                Self::Identity => inputs[0].tangent().clone(),
+                Self::Add => match (inputs[0].tangent(), inputs[1].tangent()) {
+                    (MaybeZero::Zero(_), tangent) | (tangent, MaybeZero::Zero(_)) => tangent.clone(),
+                    (MaybeZero::Value(left), MaybeZero::Value(right)) => MaybeZero::Value(
+                        context.tangent().bind(self.clone(), Vec::new(), &[left.clone(), right.clone()])?.remove(0),
+                    ),
+                },
+                Self::Scoped => match inputs[0].tangent() {
+                    MaybeZero::Zero(_) => inputs[0].tangent().clone(),
+                    MaybeZero::Value(tangent) => MaybeZero::Value(
+                        context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?.remove(0),
+                    ),
+                },
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    }
+
+    impl<
+        const MEMBER: u8,
+        V: Value<Type = ProjectedMemberType<MEMBER>>,
+        O: Operation<Type = ProjectedMemberType<MEMBER>> + From<AddOperation<ProjectedMemberType<MEMBER>>>,
+    > TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
+    where
+        O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+    {
+        fn transpose<D: TranspositionDriver<V, O>>(
+            &self,
+            context: &mut TranspositionContext<V, O>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), DifferentiationError> {
+            check_count!("input", inputs, self.input_count(), ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            if matches!(self, Self::Scoped) {
+                (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("first"), || {
+                    accumulators[0].accumulate(context, outputs[0].clone())
+                })?;
+                return (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("second"), || {
+                    accumulators[0].accumulate(context, outputs[0].clone())
+                });
+            }
+            for accumulator in accumulators {
+                accumulator.accumulate(context, outputs[0].clone())?;
+            }
+            Ok(())
+        }
+    }
+
+    impl_guardless_operation!(<const MEMBER: u8> ProjectedMemberOperation<MEMBER>);
+
+    /// Test-only heterogeneous operation family embedding all three member families.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedProgramOperation {
+        /// First member operation, used by the ordinary projection tests.
+        First(ProjectedMemberOperation<0>),
+
+        /// Second member operation, which exercises the additional-member extensibility gate.
+        Second(ProjectedMemberOperation<1>),
+
+        /// Third member operation, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberOperation<2>),
+
+        /// Adds two values of the same member type.
+        Add,
+    }
+
+    impl From<AddOperation<ProjectedProgramType>> for ProjectedProgramOperation {
+        fn from(_: AddOperation<ProjectedProgramType>) -> Self {
+            Self::Add
+        }
+    }
+
+    impl ProjectedProgramOperation {
+        /// Delegates family-level inference to one member operation. Fixture operations declare no region slots,
+        /// so staging rejects attached regions before inference and the member sees none.
+        fn infer_member<const MEMBER: u8>(
+            operation: &ProjectedMemberOperation<MEMBER>,
+            input_types: &[ProjectedProgramType],
+        ) -> Result<Vec<ProjectedProgramType>, TypeError>
+        where
+            for<'t> &'t ProjectedMemberType<MEMBER>: TryFrom<&'t ProjectedProgramType, Error = TypeError>,
+            ProjectedProgramType: From<ProjectedMemberType<MEMBER>>,
+        {
+            let input_types = input_types
+                .iter()
+                .map(|r#type| <&ProjectedMemberType<MEMBER>>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            operation
+                .infer_output_types(input_types.as_slice(), &[])
+                .map(|types| types.into_iter().map(Into::into).collect())
+        }
+    }
+
+    impl Operation for ProjectedProgramOperation {
+        type Type = ProjectedProgramType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::First(operation) => operation.name(),
+                Self::Second(operation) => operation.name(),
+                Self::Third(operation) => operation.name(),
+                Self::Add => "add",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ProjectedProgramType],
+            _region_interfaces: &[RegionInterface<ProjectedProgramType>],
+        ) -> Result<Vec<ProjectedProgramType>, TypeError> {
+            match self {
+                Self::First(operation) => Self::infer_member(operation, input_types),
+                Self::Second(operation) => Self::infer_member(operation, input_types),
+                Self::Third(operation) => Self::infer_member(operation, input_types),
+                Self::Add => {
+                    check_count!("input", input_types, 2, TypeError);
+                    if input_types[0] != input_types[1] {
+                        return Err(TypeError::invalid("addition requires matching member types"));
+                    }
+                    Ok(vec![input_types[0].clone()])
+                }
+            }
+        }
+    }
+
+    impl InterpretableOperation<EagerContext<ProjectedProgramValue, Self>> for ProjectedProgramOperation {
+        fn interpret<D: InterpretationDriver<EagerContext<ProjectedProgramValue, Self>>>(
+            &self,
+            _context: &EagerContext<ProjectedProgramValue, Self>,
+            _driver: &D,
+            inputs: &[ProjectedProgramValue],
+        ) -> Result<Vec<ProjectedProgramValue>, ProgramError> {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            self.infer_output_types(input_types.as_slice(), &[])?;
+            let summands = match self {
+                Self::Add
+                | Self::First(ProjectedMemberOperation::Add)
+                | Self::Second(ProjectedMemberOperation::Add)
+                | Self::Third(ProjectedMemberOperation::Add) => Some((&inputs[0], &inputs[1])),
+                Self::First(ProjectedMemberOperation::Scoped)
+                | Self::Second(ProjectedMemberOperation::Scoped)
+                | Self::Third(ProjectedMemberOperation::Scoped) => Some((&inputs[0], &inputs[0])),
+                _ => None,
+            };
+            if let Some(summands) = summands {
+                let output = match summands {
+                    (ProjectedProgramValue::First(left), ProjectedProgramValue::First(right)) => {
+                        ProjectedProgramValue::First(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    (ProjectedProgramValue::Second(left), ProjectedProgramValue::Second(right)) => {
+                        ProjectedProgramValue::Second(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    (ProjectedProgramValue::Third(left), ProjectedProgramValue::Third(right)) => {
+                        ProjectedProgramValue::Third(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(vec![output])
+            } else {
+                Ok(inputs.to_vec())
+            }
+        }
+    }
+
+    impl_guardless_operation!(ProjectedProgramOperation);
+
+    /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`] machinery (i.e.,
+    /// construction, interning and sharing, interface derivation, validation, effects propagation, rendering, splicing,
+    /// and rebuild paths) in isolation. Production region-carrying operations (e.g., the control-flow family) impose
+    /// their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture declares
+    /// arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures whose
+    /// failures cannot be masked by control-flow inference. Staging-context tests also use its staging variant to
+    /// validate region attachment counts and region-input inference results, and its identity-instantiating variant to
+    /// instantiate formal region input identities, including for regions whose inputs depend on another region's
+    /// outputs. Partial-evaluation tests use its preparation-failure variant to check that residualization propagates
+    /// region preparation failures.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub enum TestRegionOperation {
+        /// Region-free binary addition stand-in used inside region bodies.
+        Add,
+
+        /// Region-free unary identity stand-in with the declared observable effect.
+        Effectful(EffectClass),
+
+        /// Region-free unary identity stand-in that carries deferred work (i.e., an unresolved transformation
+        /// obligation) without any observable effect.
+        Deferred,
+
+        /// Region-carrying operation declaring its region slots. Its inferred output types are the first attached
+        /// region's output types, which pins that region interfaces are derived and delivered during inference.
+        WithRegions(&'static [RegionSlot]),
+
+        /// Pure call whose body input types must match its input types, used by builder identity-instantiation tests.
+        Call,
+
+        /// Pure call whose body input types must match its input types and whose region-input inference returns
+        /// `region_input_type_count` entries that request no instantiation, or fails when
+        /// `fail_region_input_inference` is set.
+        Staging { region_input_type_count: usize, fail_region_input_inference: bool },
+
+        /// Pure call that instantiates its body from its input types and returns the body's output types. With
+        /// `dependent_regions`, it instead carries a `forward` region instantiated from its inputs and `first` and
+        /// `second` regions instantiated from the `forward` outputs, and returns the `first` region's output types.
+        IdentityInstantiating { dependent_regions: bool },
+
+        /// Unary identity with one body region whose region-input inference always fails, although its output
+        /// inference accepts the application.
+        PreparationFailure,
+    }
+
+    impl Operation for TestRegionOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Add => "add",
+                Self::Effectful(_) => "effectful",
+                Self::Deferred => "deferred",
+                Self::WithRegions(_) => "with_regions",
+                Self::Call => "array_identity",
+                Self::Staging { .. } => "staging_region",
+                Self::IdentityInstantiating { .. } => "identity_instantiating_region",
+                Self::PreparationFailure => "preparation_failure",
+            }
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            match self {
+                Self::Add | Self::Effectful(_) | Self::Deferred => &[],
+                Self::WithRegions(slots) => slots,
+                Self::Call
+                | Self::Staging { .. }
+                | Self::IdentityInstantiating { dependent_regions: false }
+                | Self::PreparationFailure => const { &[RegionSlot::computation("body")] },
+                Self::IdentityInstantiating { dependent_regions: true } => {
+                    const {
+                        &[
+                            RegionSlot::computation("forward"),
+                            RegionSlot::computation("first"),
+                            RegionSlot::computation("second"),
+                        ]
+                    }
+                }
+            }
+        }
+
+        fn infer_region_input_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
+            match self {
+                Self::Add | Self::Effectful(_) | Self::Deferred | Self::WithRegions(_) | Self::Call => {
+                    Ok(vec![None; region_interfaces.len()])
+                }
+                Self::Staging { fail_region_input_inference: true, .. } => {
+                    Err(TypeError::invalid("failed to infer staging region input types"))
+                }
+                Self::Staging { region_input_type_count, .. } => Ok(vec![None; *region_input_type_count]),
+                Self::IdentityInstantiating { dependent_regions: false } => Ok(vec![Some(input_types.to_vec())]),
+                Self::IdentityInstantiating { dependent_regions: true } => Ok(vec![
+                    Some(input_types.to_vec()),
+                    Some(region_interfaces[0].output_types().to_vec()),
+                    Some(region_interfaces[0].output_types().to_vec()),
+                ]),
+                Self::PreparationFailure => Err(TypeError::invalid("region preparation failed")),
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             match self {
                 Self::Add => {
                     check_count!("input", input_types, 2, TypeError);
-                    Ok(vec![input_types[0]])
+                    Ok(vec![input_types[0].clone()])
                 }
-                Self::Effectful => {
+                Self::Effectful(_) | Self::Deferred => {
                     check_count!("input", input_types, 1, TypeError);
-                    Ok(vec![input_types[0]])
+                    Ok(vec![input_types[0].clone()])
                 }
                 Self::WithRegions(names) => {
                     check_count!("input", input_types, 1, TypeError);
                     if region_interfaces.len() != names.len() {
-                        return Err(TypeError {
-                            message: format!(
-                                "expected {} region interfaces but got {}",
-                                names.len(),
-                                region_interfaces.len(),
-                            ),
-                        });
+                        return Err(TypeError::invalid(format!(
+                            "expected {} region interfaces but got {}",
+                            names.len(),
+                            region_interfaces.len(),
+                        )));
                     }
                     Ok(region_interfaces[0].output_types().to_vec())
+                }
+                Self::Call => {
+                    let [region_interface] = region_interfaces else {
+                        return Err(TypeError::invalid(format!(
+                            "array identity expects 1 attached region but got {}",
+                            region_interfaces.len(),
+                        )));
+                    };
+                    if region_interface.input_types() != input_types {
+                        return Err(TypeError::invalid(
+                            "array identity region input types do not match the instruction input types",
+                        ));
+                    }
+                    Ok(region_interface.output_types().to_vec())
+                }
+                Self::Staging { .. } => {
+                    let [region_interface] = region_interfaces else {
+                        return Err(TypeError::invalid(format!(
+                            "staging region expects 1 attached region but got {}",
+                            region_interfaces.len(),
+                        )));
+                    };
+                    if region_interface.input_types() != input_types {
+                        return Err(TypeError::invalid(
+                            "staging region input types do not match the instruction input types",
+                        ));
+                    }
+                    Ok(region_interface.output_types().to_vec())
+                }
+                Self::IdentityInstantiating { dependent_regions: false } => {
+                    let [region_interface] = region_interfaces else {
+                        return Err(TypeError::invalid(format!(
+                            "identity-instantiating region expects 1 attached region but got {}",
+                            region_interfaces.len(),
+                        )));
+                    };
+                    Ok(region_interface.output_types().to_vec())
+                }
+                Self::IdentityInstantiating { dependent_regions: true } => {
+                    Ok(region_interfaces[1].output_types().to_vec())
+                }
+                Self::PreparationFailure => {
+                    check_count!("input", input_types, 1, TypeError);
+                    Ok(input_types.to_vec())
                 }
             }
         }
 
-        fn region_names(&self) -> &'static [&'static str] {
+        fn effects(&self) -> Cow<'_, Effects> {
             match self {
-                Self::Add | Self::Effectful => &[],
-                Self::WithRegions(names) => names,
+                Self::Add
+                | Self::WithRegions(_)
+                | Self::Call
+                | Self::Staging { .. }
+                | Self::IdentityInstantiating { .. }
+                | Self::PreparationFailure => Cow::Borrowed(Effects::empty()),
+                Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
+                Self::Deferred => Cow::Owned(Effects::empty().clone().with_deferred_work()),
+            }
+        }
+    }
+
+    impl_guardless_operation!(TestRegionOperation);
+
+    /// Region-free test [`Operation`] family isolating ordered-state effect handling (i.e., simplification liveness
+    /// and ordering) from reference-operation semantics. Because this family has no entry guard, partial-evaluation
+    /// tests also use it to check that unproven entry relationships are rejected rather than dropped. Its unavailable
+    /// variant lets partial-evaluation tests control how eager execution fails and which effects forbid deferring it.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum TestOrderedStateOperation {
+        /// Pure unary work that transforms may remove when its result is dead.
+        Pure,
+
+        /// Unary ordered-state access carrying a stable ordinal used to assert relative order.
+        State(u8),
+
+        /// Unary identity with a controlled execution failure and effect classification.
+        Unavailable {
+            /// Error reported by eager execution after successful type inference.
+            error: ProgramError,
+
+            /// Observable effects that forbid deferring a failed execution attempt.
+            effects: Effects,
+        },
+    }
+
+    impl Operation for TestOrderedStateOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Pure => "pure",
+                Self::State(_) => "state",
+                Self::Unavailable { .. } => "unavailable",
             }
         }
 
-        fn effects(&self) -> Effects {
-            match self {
-                Self::Add | Self::WithRegions(_) => Effects::PURE,
-                Self::Effectful => Effects::single(Effect::OrderedIo),
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            check_count!("input", input_types, 1, TypeError);
+            if matches!(self, Self::Unavailable { .. }) {
+                check_count!("region", region_interfaces, 0, TypeError);
             }
+            Ok(input_types.to_vec())
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            if let Self::Unavailable { effects, .. } = self {
+                return Cow::Borrowed(effects);
+            }
+            Cow::Owned(Effects::explicit(if matches!(self, Self::State(_)) {
+                EffectClasses::single(EffectClass::OrderedState)
+            } else {
+                EffectClasses::NONE
+            }))
+        }
+    }
+
+    impl_guardless_operation!(TestOrderedStateOperation);
+
+    impl InterpretableOperation<EagerContext<Array, Self>> for TestOrderedStateOperation {
+        fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(
+            &self,
+            _context: &EagerContext<Array, Self>,
+            _driver: &D,
+            inputs: &[Array],
+        ) -> Result<Vec<Array>, ProgramError> {
+            match self {
+                Self::Unavailable { error, .. } => Err(error.clone()),
+                Self::Pure | Self::State(_) => Ok(inputs.to_vec()),
+            }
+        }
+    }
+
+    impl<C: Context<Type = ArrayType, Operation = Self>> PartiallyEvaluatableOperation<C> for TestOrderedStateOperation {}
+
+    /// Transform marker used to observe generic region-cache preservation without depending on a built-in transform.
+    pub(crate) struct IdentityTransform;
+
+    impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for IdentityTransform {
+        type Arguments = ();
+        type Artifact = TransformArtifact<V, O, ()>;
+
+        const DEFAULT_CACHE_CAPACITY: usize = 1;
+    }
+
+    /// Weak handle used to test [`RegionTransformCache`] ownership and cycle behavior.
+    pub(crate) struct WeakRegionTransformCache<V: Typed + Parameter, O> {
+        /// Weak reference to the cache state under test.
+        state: Weak<RegionTransformRegistry<V, O>>,
+    }
+
+    impl<V: Typed + Parameter, O> WeakRegionTransformCache<V, O> {
+        /// Returns whether the source cache state is still retained.
+        #[inline]
+        pub(crate) fn is_alive(&self) -> bool {
+            self.state.upgrade().is_some()
+        }
+    }
+
+    impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
+        /// Returns a weak handle to this cache state for ownership tests.
+        #[inline]
+        pub(crate) fn downgrade(&self) -> WeakRegionTransformCache<V, O> {
+            WeakRegionTransformCache { state: Arc::downgrade(&self.state) }
+        }
+
+        /// Returns whether any transform namespace has been created on this cache.
+        #[inline]
+        pub(crate) fn has_namespaces(&self) -> bool {
+            !self.state.lock().expect("region transform registry mutex is poisoned").is_empty()
+        }
+
+        /// Returns statistics for `T` when its namespace has been initialized.
+        pub(crate) fn statistics<T: 'static>(&self) -> Option<SpecializationCacheStatistics> {
+            self.state
+                .lock()
+                .expect("region transform registry mutex is poisoned")
+                .get(&TypeId::of::<T>())
+                .map(|namespace| namespace.statistics())
+        }
+    }
+
+    impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
+        /// Returns statistics for transform `T` when its namespace has been initialized.
+        #[inline]
+        pub(crate) fn transform_statistics<T: 'static>(self) -> Option<SpecializationCacheStatistics> {
+            self.transform_cache().statistics::<T>()
+        }
+
+        /// Inserts a purpose-built artifact into `T`'s namespace for diagnostic-corruption and provenance tests.
+        #[cfg(debug_assertions)]
+        pub(crate) fn insert_transform_artifact_for_testing<
+            T: 'static
+                + Transform<
+                    Region<V, O>,
+                    Arguments: 'static + Debug + Send + Sync,
+                    Artifact = TransformArtifact<V, O, Metadata>,
+                >,
+            Metadata: 'static + Clone + Debug + PartialEq + Send + Sync,
+        >(
+            self,
+            arguments: T::Arguments,
+            artifact: TransformArtifact<V, O, Metadata>,
+        ) {
+            let previous_productions = self.transform_statistics::<T>().map_or(0, |statistics| statistics.productions);
+            let retained = self.transform::<T, _, Infallible>(arguments, move |_, _| Ok(artifact)).unwrap();
+            drop(retained);
+            let statistics = self.transform_statistics::<T>().unwrap();
+            assert_eq!(
+                statistics.productions,
+                previous_productions + 1,
+                "test transform namespace entry must be vacant",
+            );
+        }
+
+        /// Returns this region materialized through the test-only [`IdentityTransform`] namespace.
+        pub(crate) fn retained_identity_transform(self) -> Arc<Program<V, O, Vec<V>, Vec<V>>> {
+            let artifact = self
+                .transform::<IdentityTransform, _, Infallible>((), |region, _| {
+                    Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], ()))
+                })
+                .unwrap();
+            let (mut programs, ()) = artifact.into_parts();
+            assert_eq!(programs.len(), 1);
+            programs.pop().unwrap()
         }
     }
 }
