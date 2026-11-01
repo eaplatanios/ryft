@@ -1626,7 +1626,7 @@ where
                         batching: None,
                         invokes_rule_directly: false,
                         discharged: *discharged,
-                        deferred_forward: Some(key),
+                        deferred_forward: Some(Box::new(key)),
                     },
                     Vec::new(),
                     None,

@@ -311,7 +311,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     batching: batching.map(CustomRuleBatching::map_types),
                     invokes_rule_directly,
                     discharged,
-                    deferred_forward: deferred_forward.map(CustomRuleForwardSpecializationKey::map_types),
+                    deferred_forward: deferred_forward.map(|key| Box::new(key.map_types())),
                 },
                 marker: PhantomData,
             }),
@@ -542,7 +542,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 batching: batching.as_ref().map(|batching| batching.rename_identities(renaming)).transpose()?,
                 invokes_rule_directly: *invokes_rule_directly,
                 discharged: *discharged,
-                deferred_forward: deferred_forward.as_ref().map(|key| key.rename_identities(renaming)).transpose()?,
+                deferred_forward: deferred_forward
+                    .as_ref()
+                    .map(|key| key.rename_identities(renaming).map(Box::new))
+                    .transpose()?,
             },
         };
         Ok(Self {
@@ -637,9 +640,9 @@ where
                         batching: batching.clone(),
                         invokes_rule_directly: *invokes_rule_directly,
                         discharged: true,
-                        deferred_forward: deferred_forward
-                            .as_ref()
-                            .map(|key| CustomRuleForwardSpecializationKey { discharged: true, ..key.clone() }),
+                        deferred_forward: deferred_forward.as_ref().map(|key| {
+                            Box::new(CustomRuleForwardSpecializationKey { discharged: true, ..key.as_ref().clone() })
+                        }),
                     },
                     ..self.clone()
                 };
@@ -1196,8 +1199,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Backward rule of a [`CompositeTransposeOperation`], in the representation of the call that staged it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum CompositeTransposeRules<T, S> {
@@ -1224,12 +1225,15 @@ pub(super) enum CompositeTransposeRules<T, S> {
 
         /// Specialization key of the forward rule of the call from which the carrier was staged when that call defers
         /// its forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`]), or [`None`] when the
-        /// carrier's leading inputs already contain the residuals. A deferred carrier's leading
-        /// inputs are the call's inputs (including the boundary inputs of its batching levels, which the key records),
-        /// followed by the seed extents, and it records no batching of its own.
-        deferred_forward: Option<CustomRuleForwardSpecializationKey<T>>,
+        /// carrier's leading inputs already contain the residuals. A deferred carrier's leading inputs are the call's
+        /// inputs (including the boundary inputs of its batching levels, which the key records), followed by the seed
+        /// extents, and it records no batching of its own. The key is boxed because it is large and rarely present,
+        /// and every carrier (and every operation family that embeds carriers) would otherwise reserve space for it.
+        deferred_forward: Option<Box<CustomRuleForwardSpecializationKey<T>>>,
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
