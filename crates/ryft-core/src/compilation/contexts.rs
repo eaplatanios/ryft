@@ -11,7 +11,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
-use crate::compilation::function::{
+use crate::compilation::functions::{
     CallRequest, CompileRequest, CompiledFunction, ExecutableFunction, LoweredFunction, LoweringRequest,
     ReferenceExecution, StageRequest, StagedFunction,
 };

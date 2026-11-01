@@ -29,7 +29,7 @@ use crate::compilation::contexts::CompilationCacheDomain;
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
 };
-use crate::compilation::function::{CompileRequest, CompiledFunction};
+use crate::compilation::functions::{CompileRequest, CompiledFunction};
 use crate::programs::{ProgramError, Type};
 
 /// Default capacity of the in-memory tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`] when
@@ -1773,7 +1773,7 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::CompilationDomain;
-    use crate::compilation::function::{
+    use crate::compilation::functions::{
         CallRequest, CompilationTracer, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, stage_function,
     };
     use crate::contexts::Domain;

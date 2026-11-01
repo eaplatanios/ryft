@@ -150,7 +150,7 @@
 pub mod caching;
 pub mod contexts;
 pub mod exchange;
-pub mod function;
+pub mod functions;
 
 pub use caching::{
     CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
@@ -158,7 +158,7 @@ pub use caching::{
 };
 pub use contexts::{AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, StatefulCompilationDomain};
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
-pub use function::{
+pub use functions::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
     CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FlatCompilationProgram,
     FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, LoweringRequest, ReferenceExecution, StageRequest,
