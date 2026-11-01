@@ -1923,65 +1923,28 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Validates the batching and contracting dimension indices of one input with rank `rank` before inference or metadata
-/// queries index its shape. `operation_name` names the validating operation and `side` names the input in diagnostics.
-fn validate_dot_axes(
-    operation_name: &str,
-    batching: &[usize],
-    contracting: &[usize],
-    rank: usize,
-    side: &str,
-) -> Result<(), TypeError> {
-    if batching.iter().chain(contracting).any(|axis| *axis >= rank) {
-        return Err(TypeError::invalid(format!("`{operation_name}` {side} dimension index out of bounds")));
-    }
-    for (role, axes) in [("batching", batching), ("contracting", contracting)] {
-        if axes.iter().copied().collect::<BTreeSet<_>>().len() != axes.len() {
-            return Err(TypeError::invalid(format!("`{operation_name}` {side} {role} dimensions must be distinct",)));
-        }
-    }
-    if batching.iter().any(|axis| contracting.contains(axis)) {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` {side} batching and contracting dimensions must be disjoint",
-        )));
-    }
-    Ok(())
-}
-
-/// Rejects element types for which the dot kernels of `operation_name` have no arithmetic implementation.
-fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(), TypeError> {
-    if data_type.is_numeric() {
-        Ok(())
-    } else {
-        Err(TypeError::invalid(format!("`{operation_name}` does not support input data type `{data_type}`")))
-    }
-}
-
-/// Infers the output type of one generalized dot product, naming `operation_name` in diagnostics.
-///
-/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes
-/// that are neither batching nor contracting, in their original order. The output element type is the requested
-/// compatible accumulation type when one is provided, or otherwise the common input element type.
+/// Infers the output type of one generalized dot product operation, naming `operation_name` in diagnostics. The result
+/// shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes that are
+/// neither batching nor contracting, in their original order. The output element type is the requested compatible
+/// accumulation type when one is provided, or otherwise the common input element type.
 ///
 /// Floating-point compatibility deliberately does not use the standard elementwise promotion lattice. Backend dot
-/// instructions expose an independent preferred accumulator type, so even sub-byte and 8-bit inputs may accumulate at
-/// `f32` or `f64`. Integer accumulation preserves signedness and may only widen the input type.
+/// instructions expose an independent preferred accumulator type, so even sub-byte and 8-bit inputs may accumulate
+/// at `f32` or `f64`. Integer accumulation preserves signedness and may only widen the input type.
 ///
-/// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (`_dot_general_sharding_rule` in the
-/// [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The [StableHLO `dot_general`
-/// specification](https://openxla.org/stablehlo/spec#dot_general) describes the underlying contraction semantics.
-/// Placement is inferred as follows.
+/// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (i.e., `_dot_general_sharding_rule`
+/// in the [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The StableHLO
+/// [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) specification describes the underlying
+/// contraction semantics. Placement is inferred as follows:
 ///
 ///   - When `output_sharding` is provided, it is validated and returned directly, bypassing the ordinary input
-///     consistency checks. Validation checks its rank and mesh, rejects auto axes, and accepts unreduced axes only when
-///     the contracting dimensions are sharded identically over exactly those axes.
+///     consistency checks. Validation checks its rank and mesh, rejects auto axes, and accepts unreduced axes only
+///     when the contracting dimensions are sharded identically over exactly those axes.
 ///   - Inputs must not be unreduced over explicit mesh axes. Reduced inputs are legal, and reduced and varying manual
-///     axes are unioned across the inputs into the output sharding.
+///     axes are "unioned" across the inputs into the output sharding.
 ///   - When neither input carries a sharding, the output carries none. When exactly one does, the rule runs with the
 ///     absent side treated as fully replicated on the present input's mesh. Input meshes must match.
-///   - Batch dimension entries are merged preferring the more informative entry (`Sharded` over `Replicated` over
+///   - Batch dimension entries are merged preferring the more informative entry (i.e., `Sharded` over `Replicated` over
 ///     `Unconstrained`). Two different `Sharded` entries are an error when an explicit mesh axis is involved. This
 ///     intentionally diverges from JAX, which reads batch dimension specs from the left-hand side only.
 ///   - Contracting dimensions sharded over explicit mesh axes on both inputs are an error. Identically sharded ones
@@ -2001,7 +1964,9 @@ pub(crate) fn infer_dot_output_type(
     if lhs.data_type() != rhs.data_type() {
         return Err(TypeError::invalid(format!("`{operation_name}` input element types are incompatible")));
     }
+
     validate_dot_data_type(operation_name, lhs.data_type())?;
+
     if let Some(accumulation_type) = accumulation_type {
         // An identical type is valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
         // accumulate at an integer type with the same signedness that is at least as wide.
@@ -2019,11 +1984,13 @@ pub(crate) fn infer_dot_output_type(
             )));
         }
     }
+
     let lhs_batching = dimensions.lhs_batching_dimensions();
     let rhs_batching = dimensions.rhs_batching_dimensions();
     let lhs_contracting = dimensions.lhs_contracting_dimensions();
     let rhs_contracting = dimensions.rhs_contracting_dimensions();
     dimensions.validate(operation_name, lhs.rank(), rhs.rank())?;
+
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
@@ -2032,6 +1999,7 @@ pub(crate) fn infer_dot_output_type(
             )));
         }
     }
+
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
@@ -2040,6 +2008,7 @@ pub(crate) fn infer_dot_output_type(
             )));
         }
     }
+
     let lhs_result = dimensions.lhs_result_dimensions(lhs.rank());
     let rhs_result = dimensions.rhs_result_dimensions(rhs.rank());
     let output_dimensions: Vec<Dimension> = lhs_batching
@@ -2085,7 +2054,8 @@ pub(crate) fn infer_dot_output_type(
         // batching and contracting dimension shardings, like the `out_sharding` argument of JAX.
         if output_sharding.rank() != output_dimensions.len() {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` output sharding rank ({}) does not match the output rank ({})",
+                "`{}` output sharding rank ({}) does not match the output rank ({})",
+                operation_name,
                 output_sharding.rank(),
                 output_dimensions.len(),
             )));
@@ -2097,6 +2067,7 @@ pub(crate) fn infer_dot_output_type(
                 "`{operation_name}` output sharding must use the same mesh as the inputs",
             )));
         }
+
         let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
         referenced_axes.extend(output_sharding.reduced_axes());
         for dimension in output_sharding.dimensions() {
@@ -2104,6 +2075,7 @@ pub(crate) fn infer_dot_output_type(
                 referenced_axes.extend(axis_names);
             }
         }
+
         if referenced_axes
             .iter()
             .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
@@ -2114,28 +2086,30 @@ pub(crate) fn infer_dot_output_type(
         }
 
         // A requested unreduced output defers an all-reduce. Contracting over a dimension sharded across mesh axes
-        // leaves each device holding only a partial product sum over its shard of the contraction, whose true value is
-        // the sum across devices. Marking the output unreduced over exactly those axes defers that sum to a later
+        // leaves each device holding only a partial product sum over its shard of the contraction, whose true value
+        // is the sum across devices. Marking the output unreduced over exactly those axes defers that sum to a later
         // operation instead of materializing it here, so the request is valid only when it names precisely the axes
-        // that shard the (identically sharded) contracting dimensions. This is the `_dot_general_unreduced_rule` of
-        // JAX.
+        // that shard the (identically sharded) contracting dimensions. This is JAX's `_dot_general_unreduced_rule`.
         if !output_sharding.unreduced_axes().is_empty() {
             let lhs_contracting_spec: Vec<ShardingDimension> =
                 lhs_contracting.iter().map(|axis| dimension_of(lhs_sharding, *axis)).collect();
             let rhs_contracting_spec: Vec<ShardingDimension> =
                 rhs_contracting.iter().map(|axis| dimension_of(rhs_sharding, *axis)).collect();
+
             if lhs_contracting_spec != rhs_contracting_spec {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` contracting dimensions must be sharded identically when the output \
                      sharding is unreduced",
                 )));
             }
+
             let mut contracting_axes = BTreeSet::new();
             for dimension in &lhs_contracting_spec {
                 if let ShardingDimension::Sharded(axis_names) = dimension {
                     contracting_axes.extend(axis_names.iter().cloned());
                 }
             }
+
             if output_sharding.unreduced_axes() != &contracting_axes {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` output sharding unreduced axes must equal the axes that shard the \
@@ -2161,21 +2135,24 @@ pub(crate) fn infer_dot_output_type(
         for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting) {
             let left = dimension_of(lhs_sharding, *lhs_axis);
             let right = dimension_of(rhs_sharding, *rhs_axis);
+
             // Only explicit axis sharding of both contracting inputs triggers the ambiguity and consistency errors.
-            // Contracting shardings over only manual or auto axes are left to `shard_map` and the compiler. A
-            // contracting dimension sharded on only one input is allowed, and its sharding is dropped from the output,
-            // because the partitioner inserts the necessary communication.
+            // Contracting shardings over only manual or auto axes are left to `shard_map` and the compiler.
+            // A contracting dimension sharded on only one input is allowed, and its sharding is dropped from
+            // the output, because the partitioner inserts the necessary communication.
             if left.has_explicit_axis(mesh) && right.has_explicit_axis(mesh) {
                 let (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes)) = (&left, &right)
                 else {
                     unreachable!("`has_explicit_axis` only returns true for sharded dimensions")
                 };
+
                 if left_axes != right_axes {
                     return Err(TypeError::invalid(format!(
                         "`{operation_name}` contracting dimensions must have consistent shardings, but got \
                          `{left}` and `{right}`",
                     )));
                 }
+
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` contracting dimensions are sharded, making the output sharding ambiguous; \
                      request an explicit output sharding (e.g., one with unreduced axes) to resolve it",
@@ -2187,6 +2164,7 @@ pub(crate) fn infer_dot_output_type(
         for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
             let left = dimension_of(lhs_sharding, *lhs_axis);
             let right = dimension_of(rhs_sharding, *rhs_axis);
+
             // Prefer the more informative entry, `Sharded` over `Replicated` over `Unconstrained`. Taking a sharded
             // entry from either input deliberately differs from reading only the left input's batch sharding.
             let merged = match (&left, &right) {
@@ -2195,11 +2173,11 @@ pub(crate) fn infer_dot_output_type(
                 {
                     left.clone()
                 }
-                // Conflicts over an explicit axis are errors. Conflicts purely over manual or auto axes become
-                // replicated and are left to `shard_map` and the compiler.
                 (ShardingDimension::Sharded(_), ShardingDimension::Sharded(_))
                     if left.has_explicit_axis(mesh) || right.has_explicit_axis(mesh) =>
                 {
+                    // Conflicts over an explicit axis are errors. Conflicts purely over manual or auto axes become
+                    // replicated and are left to `shard_map` and the compiler.
                     return Err(TypeError::invalid(format!(
                         "`{operation_name}` batching dimensions must have consistent shardings, but got \
                              `{left}` and `{right}`",
@@ -2215,6 +2193,7 @@ pub(crate) fn infer_dot_output_type(
                     ShardingDimension::Unconstrained
                 }
             };
+
             placement.push(merged);
         }
         placement.extend(lhs_result.iter().map(|axis| dimension_of(lhs_sharding, *axis)));
@@ -2244,6 +2223,42 @@ pub(crate) fn infer_dot_output_type(
     ArrayType::new(accumulation_type.unwrap_or(lhs.data_type()), Shape::new(output_dimensions))
         .with_sharding(sharding)
         .map_err(|error| TypeError::invalid(error.to_string()))
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Validates the batching and contracting dimension indices of one input with rank `rank` before inference or metadata
+/// queries index its shape. `operation_name` names the validating operation and `side` names the input in diagnostics.
+fn validate_dot_axes(
+    operation_name: &str,
+    batching: &[usize],
+    contracting: &[usize],
+    rank: usize,
+    side: &str,
+) -> Result<(), TypeError> {
+    if batching.iter().chain(contracting).any(|axis| *axis >= rank) {
+        return Err(TypeError::invalid(format!("`{operation_name}` {side} dimension index out of bounds")));
+    }
+    for (role, axes) in [("batching", batching), ("contracting", contracting)] {
+        if axes.iter().copied().collect::<BTreeSet<_>>().len() != axes.len() {
+            return Err(TypeError::invalid(format!("`{operation_name}` {side} {role} dimensions must be distinct",)));
+        }
+    }
+    if batching.iter().any(|axis| contracting.contains(axis)) {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` {side} batching and contracting dimensions must be disjoint",
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects element types for which the dot kernels of `operation_name` have no arithmetic implementation.
+fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(), TypeError> {
+    if data_type.is_numeric() {
+        Ok(())
+    } else {
+        Err(TypeError::invalid(format!("`{operation_name}` does not support input data type `{data_type}`")))
+    }
 }
 
 /// Checks that every mapped input of the operation named `operation_name` maps the same extent. Comparing the mapped
