@@ -21,9 +21,9 @@ use crate::tracing::DomainTracingContext;
 ///   3. [`Self::compile`] transforms the lowered artifact into [`Self::CompiledProgram`].
 ///   4. [`Self::call`] executes an [`ExecutableFunction`] against structured runtime inputs.
 ///
-/// The domain is the active service for every transition, while staged, lowered, compiled, and executable artifacts
-/// remain passive values. Each function owns its complete backend-specific transition, including any validation,
-/// caching, or runtime conversion policy that the backend chooses to apply.
+/// The domain performs every stage, while staged, lowered, compiled, and executable functions remain passive values.
+/// Each stage is implemented entirely by the backend, including any validation, caching, or runtime conversion that
+/// the backend chooses to apply.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-defined key for one input specialization of a retained Just-In-Time (JIT) dispatcher.
     type DispatchKey: Clone + Eq + Hash;
@@ -70,10 +70,9 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>;
 
-    /// Performs the complete backend-specific lowering transition. The returned lowered artifact must be
-    /// self-describing. Every option, compiler, target, and topology property that affects compilation must be folded
-    /// into [`Self::LoweredProgram`] during this transition, because caching backends derive compiled program identity
-    /// from the lowered program alone.
+    /// Lowers a staged function into the program representation of this backend (i.e., [`Self::LoweredProgram`]).
+    /// The lowered program must capture every option, compiler, target, and topology property that affects
+    /// compilation, because caching backends derive the identity of compiled programs from the lowered program alone.
     fn lower<Request>(
         &self,
         staged: Request,
@@ -82,7 +81,9 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         Self: Sized,
         Request: LoweringRequest<Self>;
 
-    /// Performs the complete backend-specific compilation transition.
+    /// Compiles a lowered function into an executable program of this backend (i.e., [`Self::CompiledProgram`]).
+    /// Caching backends usually implement this function via
+    /// [`CompilationContext::compile_request`](super::caching::CompilationContext::compile_request).
     fn compile<Request>(
         &self,
         lowered: Request,
@@ -91,7 +92,8 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         Self: Sized,
         Request: CompileRequest<Self>;
 
-    /// Performs the complete backend-specific structured execution transition.
+    /// Executes a compiled function on structured runtime inputs and returns its structured outputs. Callers
+    /// typically use [`ExecutableFunction::call`] rather than calling this function directly.
     fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
     where
         Self: Sized,
@@ -103,7 +105,8 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
 /// Implementations must keep hidden state results out of [`CallRequest::RuntimeOutput`] and preserve their reference
 /// transaction guarantees even when the public output has no leaves or fails reconstruction.
 pub trait StatefulCompilationDomain: CompilationDomain {
-    /// Performs a stateful structured execution transition that returns a completion bearing result.
+    /// Executes a compiled function that binds external mutable references and returns its structured outputs
+    /// together with the completion of the whole invocation, without waiting for that completion.
     fn call_statefully_async<Request>(
         &self,
         request: Request,
