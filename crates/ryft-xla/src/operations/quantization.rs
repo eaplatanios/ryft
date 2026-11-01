@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::quantization::scaled_dot_ir_composition;
 use ryft_core::{
-    ArrayType, DataType, Dimension, DomainTracingContext, Operation, ProgramError, ScaledDotOperation, Shape,
+    ArrayType, DataType, Dimension, DomainTracingContext, EmptyRegionDriver, MemberInterpretableOperation, Operation,
+    ProgramError, ScaledDotOperation, Shape, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -34,17 +34,10 @@ pub(crate) fn trace_scaled_dot_composition(
             let [lhs, rhs, lhs_scale, rhs_scale] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() });
             };
-            Ok(vec![
-                scaled_dot_ir_composition(
-                    lhs,
-                    rhs,
-                    operation.has_lhs_scale().then_some(lhs_scale),
-                    operation.has_rhs_scale().then_some(rhs_scale),
-                    operation.dimensions(),
-                    operation.preferred_element_type(),
-                )?
-                .into_value(),
-            ])
+            let mut inputs = vec![lhs.clone(), rhs.clone()];
+            inputs.extend(operation.has_lhs_scale().then(|| lhs_scale.clone()));
+            inputs.extend(operation.has_rhs_scale().then(|| rhs_scale.clone()));
+            operation.interpret_in_parent(&lhs.domain(), &EmptyRegionDriver, &inputs)
         },
         input_types,
     )?;

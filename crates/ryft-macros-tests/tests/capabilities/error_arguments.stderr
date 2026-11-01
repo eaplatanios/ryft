@@ -1,0 +1,23 @@
+error: invalid `#[capability(...)]` argument `projections`; only `crate` and `projection(...)` are supported here
+ --> tests/capabilities/error_arguments.rs:3:14
+  |
+3 | #[capability(projections(ArrayIrType => ArrayType))]
+  |              ^^^^^^^^^^^
+
+error: duplicate ryft attribute `crate`
+ --> tests/capabilities/error_arguments.rs:8:30
+  |
+8 | #[capability(crate = "ryft", crate = "ryft")]
+  |                              ^^^^^
+
+error: duplicate capability projection of family `ArrayIrType`
+  --> tests/capabilities/error_arguments.rs:13:63
+   |
+13 | #[capability(projection(ArrayIrType => ArrayType), projection(ArrayIrType => ArrayType))]
+   |                                                               ^^^^^^^^^^^
+
+error: `projection(...)` declares exactly one `Family => Member` pair
+  --> tests/capabilities/error_arguments.rs:18:49
+   |
+18 | #[capability(projection(ArrayIrType => ArrayType, ArrayType))]
+   |                                                 ^
