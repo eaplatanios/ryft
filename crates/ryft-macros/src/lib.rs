@@ -9,6 +9,7 @@ mod parameters;
 
 use capabilities::CapabilityCodeGenerator;
 use diagrams::DiagramRenderer;
+use kernels::KernelCodeGenerator;
 use operations::OperationCodeGenerator;
 use parameters::ParameterizedCodeGenerator;
 
@@ -123,9 +124,7 @@ pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// also accepts `requires = expression`, a shape requirement over the input annotations that `definition` validates.
 #[proc_macro_attribute]
 pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
-    kernels::expand(attributes.into(), input.into())
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    KernelCodeGenerator::generate_kernel_impl(attributes.into(), input.into()).into()
 }
 
 /// Renders the [Mermaid](https://mermaid.js.org/) diagrams in the documentation of the item that it is applied on.
@@ -155,7 +154,7 @@ pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// /// flowchart LR
 /// ///   source --> target
 /// /// ```
-/// #[cfg_attr(doc, ryft_macros::mermaid)]
+/// #[cfg_attr(doc, mermaid)]
 /// pub struct Graph;
 /// ```
 ///
