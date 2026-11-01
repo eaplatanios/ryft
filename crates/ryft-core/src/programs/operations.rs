@@ -969,6 +969,17 @@ pub trait Operation: Clone {
         true
     }
 
+    /// Returns whether this [`Operation`] defers part of its reference discharge to programs that it traces later
+    /// (e.g., a composite call whose retained rules are traced on demand, which records that its rule programs must be
+    /// discharged when they are traced). Reference discharge (refer to
+    /// [`Program::discharge_references`](crate::Program::discharge_references)) visits such an operation even when its
+    /// program touches no reference, because only its discharge rule can record that obligation. The `false` default
+    /// is correct for every operation whose reference state is visible in its own effects and attached regions.
+    #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        false
+    }
+
     /// Returns the complete operation-local effect declaration of this [`Operation`] that contains its explicit
     /// [`EffectClass`](crate::EffectClass)es and its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and
     /// accesses), all expressed in this operation's input/output index space. Refer to the documentation of [`Effects`]
@@ -1153,6 +1164,11 @@ impl<O: Operation> Operation for Box<O> {
     #[inline]
     fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
         self.as_ref().allows_reference_access_through_region_input(region_index, mode)
+    }
+
+    #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        self.as_ref().defers_reference_discharge()
     }
 
     #[inline]

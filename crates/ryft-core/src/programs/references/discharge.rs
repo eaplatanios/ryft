@@ -4035,9 +4035,11 @@ where
         // A program that touches no reference anywhere is already its own discharge, so it is returned untouched rather
         // than replayed into a fresh trace. This is not only cheaper on the two transform adapters that discharge
         // unconditionally: re-tracing would also renumber its atoms, drop its dead constants, and abandon the region
-        // transform cache its regions carry, all for a rewrite that has nothing to rewrite.
+        // transform cache its regions carry, all for a rewrite that has nothing to rewrite. An operation that defers
+        // part of its discharge to programs that it traces later still needs its discharge rule to record that, so a
+        // program that contains one is replayed regardless.
         let entry = self.entry_region_ref();
-        if !entry.contains_references_in_closure() {
+        if !entry.contains_references_in_closure() && !entry.defers_reference_discharge_in_closure() {
             return PartialReferenceDischargeResult::new(self, capture_count, output_count, Vec::new());
         }
 
@@ -4224,12 +4226,14 @@ where
 /// The precondition is reference freedom, not purity in the [`Effects::is_pure`](crate::Effects::is_pure) sense. An
 /// operation with ordered or other effects replays here unchanged, because the replay reproduces those effects in the
 /// destination exactly as the source performed them. Attached regions are copied into the destination as they stand,
-/// which is the complete rewrite for regions that hold no state to thread. An application is rejected as soon as a
-/// reference appears among its inputs or anywhere inside an attached region's closure. If references are confined to
-/// individual regions, [`discharge_local_reference_operation`] rebuilds those regions without adding state inputs or
-/// outputs. If references cross a region boundary, the operation's rule must specify how state is threaded through that
-/// boundary. For operations that forward their inputs to their regions positionally, use
-/// [`discharge_positional_region_operation`].
+/// which is the complete rewrite for regions that hold no state to thread, unless an operation in a region defers part
+/// of its discharge (refer to [`Operation::defers_reference_discharge`]). Those regions are rebuilt by
+/// [`discharge_local_reference_operation`] instead, so that the deferring operation records its discharge. An
+/// application is rejected as soon as a reference appears among its inputs or anywhere inside an attached region's
+/// closure. If references are confined to individual regions, [`discharge_local_reference_operation`] rebuilds those
+/// regions without adding state inputs or outputs. If references cross a region boundary, the operation's rule must
+/// specify how state is threaded through that boundary. For operations that forward their inputs to their regions
+/// positionally, use [`discharge_positional_region_operation`].
 ///
 /// # Parameters
 ///
@@ -4261,6 +4265,9 @@ pub fn discharge_reference_free_operation<
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` carries reference state but has no reference discharge rule", operation.name()),
             });
+        }
+        if driver.regions().any(RegionRef::defers_reference_discharge_in_closure) {
+            return discharge_local_reference_operation(operation, context, driver, inputs);
         }
     }
     let regions = driver.region_programs();
@@ -4920,31 +4927,52 @@ mod tests {
     #[derive(Copy, Clone, Debug)]
     enum ListOperation {
         Add,
+
         Select {
             offset: usize,
             length: usize,
         },
+
         Splice {
             offset: usize,
         },
+
         ReferenceNew,
+
         Read(Option<ListAlias>),
+
         Write(Option<ListAlias>),
+
         Swap(Option<ListAlias>),
+
         AddUpdate(Option<ListAlias>),
+
         AtomicAddUpdate(Option<ListAlias>),
+
         Freeze,
+
         UnreportedFreeze,
+
         Call,
+
         ScopedCall {
             /// Leading inputs that establish a new capture scope, or none to inherit the outer scope.
             capture_count: Option<usize>,
+
             /// Sole permitted access mode, or none to permit all modes.
             allowed: Option<ReferenceAccessMode>,
+
             /// Whether each reference output must preserve the corresponding input's identity.
             identity: bool,
+
             /// Whether the attached region is a rule for later transforms rather than an executed computation.
             dormant: bool,
+        },
+
+        /// Identity that defers part of its discharge, like a call whose rules are traced on demand, until its
+        /// discharge rule records that it was discharged.
+        Deferred {
+            discharged: bool,
         },
     }
 
@@ -4972,6 +5000,7 @@ mod tests {
                 Self::UnreportedFreeze => "test.unreported_freeze",
                 Self::Call => "list.call",
                 Self::ScopedCall { .. } => "test.scoped_call",
+                Self::Deferred { .. } => "test.deferred",
             }
         }
 
@@ -5070,6 +5099,10 @@ mod tests {
                     check_count!("input", input_types, region_interfaces[0].input_types().len(), TypeError);
                     Ok(region_interfaces[0].output_types().to_vec())
                 }
+                Self::Deferred { .. } => {
+                    check_count!("input", input_types, 1, TypeError);
+                    Ok(input_types.to_vec())
+                }
             }
         }
 
@@ -5125,11 +5158,18 @@ mod tests {
                 Self::AtomicAddUpdate(_) => access(ReferenceAccessMode::AtomicAccumulate),
                 Self::Freeze => access(ReferenceAccessMode::Consume),
                 Self::UnreportedFreeze => Effects::explicit(EffectClasses::single(EffectClass::OrderedState)),
-                Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::Call | Self::ScopedCall { .. } => {
-                    return Cow::Borrowed(Effects::empty());
-                }
+                Self::Add
+                | Self::Select { .. }
+                | Self::Splice { .. }
+                | Self::Call
+                | Self::ScopedCall { .. }
+                | Self::Deferred { .. } => return Cow::Borrowed(Effects::empty()),
             };
             Cow::Owned(effects)
+        }
+
+        fn defers_reference_discharge(&self) -> bool {
+            matches!(self, Self::Deferred { discharged: false })
         }
 
         fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -5144,6 +5184,8 @@ mod tests {
                     OperationFormatter::new(formatter, indentation, self.name())?
                         .bracketed(|formatter| formatter.list("transforms", &[transform]))
                 }
+                Self::Deferred { discharged: true } => OperationFormatter::new(formatter, indentation, self.name())?
+                    .bracketed(|formatter| formatter.field("discharged", true)),
                 _ => formatter.write_str(self.name()),
             }
         }
@@ -5164,6 +5206,9 @@ mod tests {
             match self {
                 Self::Add | Self::Select { .. } | Self::Splice { .. } => {
                     discharge_reference_free_operation(self, context, driver, inputs)
+                }
+                Self::Deferred { .. } => {
+                    discharge_reference_free_operation(&Self::Deferred { discharged: true }, context, driver, inputs)
                 }
                 Self::ReferenceNew => {
                     check_count!("input", inputs, 1, ProgramError);
@@ -9558,6 +9603,48 @@ mod tests {
     }
 
     #[test]
+    fn test_program_discharge_references_replays_deferred_discharge() {
+        // A program that touches no reference is still replayed when an operation in it defers part of its discharge,
+        // so that its rule records the discharge, including inside a region.
+        let list_type = ListIrType::List(ListType { length: 2 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(list_type.clone());
+        let output = builder
+            .add_instruction(ListOperation::Deferred { discharged: false }, Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            callee.clone().discharge_references(0).unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = test.deferred [discharged=true] %0
+                in (%1)"},
+        );
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let callee = builder.import_program(callee);
+        let input = builder.add_input(list_type);
+        let output = builder.add_instruction(ListOperation::Call, vec![callee], vec![input], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            source.discharge_references(0).unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = list.call %0 [
+                    callee={
+                        lambda %0:list<2> .
+                        let %1:list<2> = test.deferred [discharged=true] %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
     fn test_program_discharge_references_rejects_an_oversized_capture_prefix() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -10305,6 +10392,51 @@ mod tests {
             Err(ProgramError::MalformedProgram(
                 "operation `list.add` declares no region slots but 1 regions were attached".to_string(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_discharge_reference_free_operation_rebuilds_regions_with_deferred_discharge() {
+        // A reference-free region whose closure defers part of its discharge is rebuilt rather than copied,
+        // so that the deferring operation inside it records its discharge.
+        let list_type = ListIrType::List(ListType { length: 2 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let callee_input = builder.add_input(list_type.clone());
+        let deferred = builder
+            .add_instruction(ListOperation::Deferred { discharged: false }, Vec::new(), vec![callee_input], None)
+            .unwrap()[0];
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![deferred], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let regions = AttachedRegions::from([callee]);
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let staging = TracingContext::<ListIrValue, ListOperation>::new();
+        let builder = staging.builder().clone();
+        let outputs = {
+            let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(staging.clone());
+            let input = ReferenceDischargeValue::Value(staging.input(list_type));
+            let outputs =
+                discharge_reference_free_operation(&ListOperation::Call, &context, &driver, &[input]).unwrap();
+            vec![outputs[0].try_as_value("the call output").unwrap().atom_id().unwrap()]
+        };
+        drop(staging);
+        let program = Rc::try_unwrap(builder)
+            .unwrap()
+            .into_inner()
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = list.call %0 [
+                    callee={
+                        lambda %0:list<2> .
+                        let %1:list<2> = test.deferred [discharged=true] %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
         );
     }
 

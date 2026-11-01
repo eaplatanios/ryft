@@ -1122,6 +1122,8 @@ impl OperationEnum {
             quote!(allows_reference_access_through_region_input),
             quote!(, region_index, mode),
         );
+        let defers_reference_discharge_arms =
+            self.operation_forwarding_arms(quote!(defers_reference_discharge), quote!());
         let effects_arms = self.operation_forwarding_arms(quote!(effects), quote!());
         let render_arms = self.operation_forwarding_arms(quote!(render), quote!(, formatter, indentation));
 
@@ -1230,6 +1232,10 @@ impl OperationEnum {
                     mode: #ryft::ReferenceAccessMode,
                 ) -> bool {
                     match self { #(#allows_reference_access_through_region_input_arms)* }
+                }
+
+                fn defers_reference_discharge(&self) -> bool {
+                    match self { #(#defers_reference_discharge_arms)* }
                 }
 
                 fn effects(&self) -> ::std::borrow::Cow<'_, #ryft::Effects> {

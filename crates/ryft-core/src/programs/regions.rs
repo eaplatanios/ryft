@@ -1052,6 +1052,17 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             .any(|(_, instruction)| instruction.operation().effects().has_accesses())
     }
 
+    /// Returns whether any [`Instruction`] in this [`Region`]'s complete attached region closure applies an
+    /// [`Operation`] that defers part of its reference discharge to programs that it traces later (refer to
+    /// [`Operation::defers_reference_discharge`]). Such a closure must be discharged even when
+    /// [`Self::contains_references_in_closure`] returns `false`. Every attached region is
+    /// traversed regardless of [`RegionRole`], and shared descendants are visited once.
+    #[inline]
+    pub fn defers_reference_discharge_in_closure(self) -> bool {
+        self.instructions_in_closure()
+            .any(|(_, instruction)| instruction.operation().defers_reference_discharge())
+    }
+
     /// Returns whether this [`Region`] or any region in its complete attached region closure has effects observable
     /// even when its outputs are unused. This includes reference accesses and explicitly declared effect classes;
     /// reference allocations and aliases alone do not make the result `true`.

@@ -399,6 +399,10 @@ trait Operation: Clone {
         false
     }
 
+    fn defers_reference_discharge(&self) -> bool {
+        false
+    }
+
     fn effects(&self) -> std::borrow::Cow<'_, Effects> {
         std::borrow::Cow::Owned(Effects::Pure)
     }
@@ -1341,6 +1345,10 @@ impl Operation for PrintOperation {
         output_index == 3
     }
 
+    fn defers_reference_discharge(&self) -> bool {
+        true
+    }
+
     fn effects(&self) -> std::borrow::Cow<'_, Effects> {
         std::borrow::Cow::Owned(Effects::Read)
     }
@@ -1794,6 +1802,9 @@ fn test_operation_generates_operation_forwarding() {
 
     assert_eq!(add.defined_type_identities().len(), 0);
     assert_eq!(print.defined_type_identities().len(), 1);
+
+    assert!(!add.defers_reference_discharge());
+    assert!(print.defers_reference_discharge());
 
     assert_eq!(add.effects().into_owned(), Effects::Pure);
     assert_eq!(print.effects().into_owned(), Effects::Read);

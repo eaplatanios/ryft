@@ -401,7 +401,7 @@ where
     let jacobian = Jacobian::new(input_types, output_types, values)?;
     let auxiliary = auxiliary.ok_or_else(|| {
         ProgramError::MalformedProgram(
-            "the forward-mode Jacobian computation did not evaluate its function".to_string(),
+            "the forward mode Jacobian computation did not evaluate its function".to_string(),
         )
     })?;
     Ok((jacobian, auxiliary))
@@ -648,7 +648,7 @@ where
     let jacobian = Jacobian::new(input_types, output_types, values)?;
     let auxiliary = auxiliary.ok_or_else(|| {
         ProgramError::MalformedProgram(
-            "the reverse-mode Jacobian computation did not evaluate its function".to_string(),
+            "the reverse mode Jacobian computation did not evaluate its function".to_string(),
         )
     })?;
     Ok((jacobian, auxiliary))
