@@ -586,8 +586,8 @@ impl OperationCodeGenerator {
     /// every family, because a policy names the reference universe that is being discharged rather than the universe
     /// that the values of the family belong to. Family-native and bare generic extension variants delegate to the
     /// discharge rules of their payloads, while member variants replay the complete enum through
-    /// `discharge_reference_free_operation`, which copies any attached regions unchanged and
-    /// rejects reference inputs and region closures that reach references.
+    /// `ReferenceDischargeContext::discharge_reference_free_operation`, which copies any attached
+    /// regions unchanged and rejects reference inputs and region closures that reach references.
     fn generate_reference_discharge_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -842,10 +842,10 @@ impl OperationCodeGenerator {
     /// while enums with an explicit constant type use the canonical batching policy that `BatchableType` selects for
     /// their primary operation type. Family-native variants delegate to the batching rules of their payloads, and mixed
     /// member variants delegate to the parent-universe rules of their payloads. Computational projected member variants
-    /// are batched through `batch_projected_operation`, which applies the member batching rule of the payload under the
-    /// projected batching policy. Structural projected member variants are instead bound once in the parent context
-    /// through `batch_replicated_projected_operation`, which requires the batching policy to implement
-    /// `ReplicatedBatchingPolicyProjection` for their member type.
+    /// are batched through `BatchingContext::batch_projected_operation`, which applies the member batching rule of the
+    /// payload under the projected batching policy. Structural projected member variants are instead bound once in the
+    /// parent context through `BatchingContext::batch_replicated_projected_operation`, which requires the batching
+    /// policy to implement `ReplicatedBatchingPolicyProjection` for their member type.
     fn generate_batching_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -992,9 +992,10 @@ impl OperationCodeGenerator {
     /// constant type, and to the enum itself as its operation family. Family-native variants delegate to the forward
     /// mode rules of their payloads, and computational member variants delegate to the parent-universe rules of their
     /// payloads. Structural member variants are constant with respect to their inputs. A structural projected member
-    /// is differentiated by `jvp_structural_operation`, which stages its primal with symbolic zero tangents, while a
-    /// structural mixed member is differentiated by `jvp_structural_mixed_operation`, which also stages one member zero
-    /// tangent per output, through `stage_member_zero_tangent` for each computational member universe of the enum.
+    /// is differentiated by `DifferentiationContext::jvp_structural_operation`, which stages its primal with symbolic
+    /// zero tangents, while a structural mixed member is differentiated by
+    /// `DifferentiationContext::jvp_structural_mixed_operation`, which also stages one member zero tangent per output,
+    /// through `DifferentiationContext::stage_member_zero_tangent` for each computational member universe of the enum.
     /// Higher-order rules request nested differentiation through their instruction-scoped driver, whose concrete
     /// implementation establishes the required `Program::jvp` and `Program::linearize` bounds at its construction site.
     fn generate_differentiation_dispatcher(&self) -> TokenStream {
@@ -1114,8 +1115,7 @@ impl OperationCodeGenerator {
                                     |context, primal_inputs, output_type| {
                                         #(
                                             if let ::std::option::Option::Some(tangent) =
-                                                #ryft::stage_member_zero_tangent::<#tangent_universes, _, _>(
-                                                    context,
+                                                context.stage_member_zero_tangent::<#tangent_universes>(
                                                     primal_inputs,
                                                     output_type,
                                                 )?
@@ -1161,9 +1161,10 @@ impl OperationCodeGenerator {
     /// constant type. Family-native variants delegate to the transposition rules of their payloads. Computational
     /// projected member variants delegate to `MemberTransposableOperation::transpose_in_parent`, which preserves
     /// access to cotangent accumulators that the value family of the member may not be able to represent. Mixed member
-    /// variants are transposed through `transpose_mixed_operation`, and structural projected member variants contribute
-    /// no cotangents. Higher-order rules request nested program transposition through their instruction-scoped driver,
-    /// whose concrete implementation establishes the required `Program::transpose_with_respect_to` bounds.
+    /// variants are transposed through `TranspositionContext::transpose_mixed_operation`, and structural projected
+    /// member variants contribute no cotangents. Higher-order rules request nested program transposition through
+    /// their instruction-scoped driver, whose concrete implementation establishes the required
+    /// `Program::transpose_with_respect_to` bounds.
     fn generate_transposition_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -3812,20 +3813,12 @@ mod tests {
                                 inputs,
                                 |context, primal_inputs, output_type| {
                                     if let ::std::option::Option::Some(tangent) =
-                                        ryft::stage_member_zero_tangent::<ArrayType, _, _>(
-                                            context,
-                                            primal_inputs,
-                                            output_type,
-                                        )?
+                                        context.stage_member_zero_tangent::<ArrayType>(primal_inputs, output_type)?
                                     {
                                         return ::std::result::Result::Ok(::std::option::Option::Some(tangent));
                                     }
                                     if let ::std::option::Option::Some(tangent) =
-                                        ryft::stage_member_zero_tangent::<TableType, _, _>(
-                                            context,
-                                            primal_inputs,
-                                            output_type,
-                                        )?
+                                        context.stage_member_zero_tangent::<TableType>(primal_inputs, output_type)?
                                     {
                                         return ::std::result::Result::Ok(::std::option::Option::Some(tangent));
                                     }
