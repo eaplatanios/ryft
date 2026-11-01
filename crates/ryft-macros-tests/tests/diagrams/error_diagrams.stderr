@@ -1,0 +1,23 @@
+error: the `mermaid` attribute does not accept arguments
+ --> tests/diagrams/error_diagrams.rs:3:11
+  |
+3 | #[mermaid(theme = "dark")]
+  |           ^^^^^^^^^^^^^^
+
+error: unterminated `mermaid` code fence
+ --> tests/diagrams/error_diagrams.rs:6:1
+  |
+6 | /// ```mermaid
+  | ^^^^^^^^^^^^^^
+
+error: code fences cannot be nested inside a `mermaid` diagram
+  --> tests/diagrams/error_diagrams.rs:12:1
+   |
+12 | /// ```text
+   | ^^^^^^^^^^^
+
+error: only literal documentation attributes may appear inside a `mermaid` diagram
+  --> tests/diagrams/error_diagrams.rs:18:1
+   |
+18 | #[allow(dead_code)]
+   | ^^^^^^^^^^^^^^^^^^^
