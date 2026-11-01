@@ -17,8 +17,7 @@ use crate::operations::{
     DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations,
-    DynamicBroadcastOperation,
+    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DynamicBroadcastOperation,
     DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
     DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations,
     ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation,
@@ -31,11 +30,11 @@ use crate::operations::{
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation,
-    ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation,
-    SinOperation, SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
-    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScanOperation, ScatterOperation, Select,
+    SelectOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
+    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
+    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
+    WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
 

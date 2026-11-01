@@ -16,7 +16,7 @@ use crate::contexts::{Context, ContextProjection, Domain, EagerContext, Projecte
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    ResidualZeroProvider, jvp_projected_operation,
+    ResidualZeroProvider,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -1414,7 +1414,7 @@ where
         };
         if is_static(&input_type) && is_static(&updates_type) {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-            return jvp_projected_operation(destinations, &operation, inputs);
+            return destinations.jvp_projected_operation(&operation, inputs);
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();

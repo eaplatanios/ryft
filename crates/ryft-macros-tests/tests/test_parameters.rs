@@ -165,6 +165,38 @@ fn test_struct_with_nested_tuples_and_options() {
         StructWithNestedOption::from_parameters(structure, [0usize; 10]),
         Err(ParameterError::UnusedParameters { paths: None }),
     );
+
+    #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
+    struct StructWithOptionalParameter<P: Parameter> {
+        required: P,
+        optional: Option<P>,
+    }
+
+    let mut value = StructWithOptionalParameter { required: 2usize, optional: Some(4usize) };
+    let structure = StructWithOptionalParameter { required: Placeholder, optional: Some(Placeholder) };
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&2usize, &4usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 2usize, &mut 4usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![2usize, 4usize]);
+    assert_eq!(value.named_parameters().map(|(_, value)| *value).collect::<Vec<_>>(), vec![2usize, 4usize]);
+    assert_eq!(value.named_parameters_mut().map(|(_, value)| *value).collect::<Vec<_>>(), vec![2usize, 4usize],);
+    assert_eq!(value.clone().into_named_parameters().map(|(_, value)| value).collect::<Vec<_>>(), vec![2usize, 4usize],);
+    assert_eq!(
+        StructWithOptionalParameter::from_parameters(structure, vec![3i64, 5i64]),
+        Ok(StructWithOptionalParameter { required: 3i64, optional: Some(5i64) }),
+    );
+
+    let value = StructWithOptionalParameter { required: 2usize, optional: None };
+    let structure = StructWithOptionalParameter { required: Placeholder, optional: None };
+    assert_eq!(value.parameter_count(), 1);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&2usize]);
+    assert_eq!(value.named_parameters().map(|(_, value)| *value).collect::<Vec<_>>(), vec![2usize]);
+    assert_eq!(
+        StructWithOptionalParameter::from_parameters(structure, vec![3i64]),
+        Ok(StructWithOptionalParameter { required: 3i64, optional: None }),
+    );
 }
 
 #[test]

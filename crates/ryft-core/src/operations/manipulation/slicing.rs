@@ -19,7 +19,7 @@ use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
     MemberDifferentiableOperation, MemberTransposableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -435,7 +435,7 @@ where
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-            return jvp_projected_operation(context, &operation, inputs);
+            return context.jvp_projected_operation(&operation, inputs);
         }
 
         let output_primal = context.primal().bind_array(self.clone(), std::slice::from_ref(input.primal()))?;
@@ -555,8 +555,7 @@ where
         }
 
         let operation: <O as OperationProjection<ArrayType>>::Projected = self.clone().into();
-        transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected, V, O>(
-            context,
+        context.transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected>(
             &operation,
             inputs,
             outputs,
@@ -1083,7 +1082,7 @@ where
         let input_type = <&ArrayType>::try_from(inputs[0].primal().r#type().as_ref())?.clone();
         if input_type.static_shape().is_some() || !inputs[0].tangent().is_zero() || inputs[1].tangent().is_zero() {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-            return jvp_projected_operation(context, &operation, inputs);
+            return context.jvp_projected_operation(&operation, inputs);
         }
 
         // Only the update tangent is live. For an input of shape `[n]`, its zero tangent still needs the runtime `n` as
@@ -1974,7 +1973,7 @@ where
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-            return jvp_projected_operation(context, &operation, inputs);
+            return context.jvp_projected_operation(&operation, inputs);
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -2096,8 +2095,7 @@ where
         }
 
         let operation: <O as OperationProjection<ArrayType>>::Projected = self.clone().into();
-        transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected, V, O>(
-            context,
+        context.transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected>(
             &operation,
             inputs,
             outputs,
@@ -3571,7 +3569,7 @@ where
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = (*self).into();
-            return jvp_projected_operation(context, &operation, inputs);
+            return context.jvp_projected_operation(&operation, inputs);
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();

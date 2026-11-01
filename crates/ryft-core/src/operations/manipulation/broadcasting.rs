@@ -17,7 +17,6 @@ use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::elementwise::reduce_broadcast_cotangent;
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableType, DifferentiationDual, TransposableOperation,
-    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -1150,8 +1149,7 @@ impl_differentiable_operation! {
                 BroadcastOperation::new(output_type, operation.output_axes().to_vec()).into();
 
             // Dimension inputs do not receive cotangents. Forward only the array inputs' handles.
-            transpose_projected_operation(
-                context,
+            context.transpose_projected_operation(
                 &projected_operation,
                 std::slice::from_ref(input),
                 outputs,

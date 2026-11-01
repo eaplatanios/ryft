@@ -1844,7 +1844,10 @@ dependencies = [
 name = "ryft-macros-tests"
 version = "0.0.0"
 dependencies = [
+ "indoc",
+ "pretty_assertions",
  "ryft",
+ "ryft-core",
  "trybuild",
 ]
 

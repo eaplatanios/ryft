@@ -14,7 +14,7 @@ use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
     MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::operations::{
     AddOperation, ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation,
@@ -596,8 +596,7 @@ where
             Self::DynamicSlice(operation) => {
                 operation.transpose_in_parent(context, driver, inputs, outputs, accumulators)
             }
-            operation => transpose_projected_operation::<ArrayType, ArrayOperation<A>, V, O>(
-                context,
+            operation => context.transpose_projected_operation::<ArrayType, ArrayOperation<A>>(
                 operation,
                 inputs,
                 outputs,

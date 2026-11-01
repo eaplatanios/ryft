@@ -301,6 +301,7 @@ mod tests {
     use quote::{ToTokens, quote};
 
     use crate::helpers::idents::IdentHelpers;
+    use crate::helpers::tokens::TokensHelpers;
 
     use super::GenericsHelpers;
 
@@ -445,7 +446,7 @@ mod tests {
         let t: syn::Ident = syn::parse_quote!(T);
         let p: syn::Ident = syn::parse_quote!(P);
         let generics = syn::parse2::<syn::DeriveInput>(quote!(
-            struct Dummy<T, U>
+            struct Dummy<T, U: AsRef<T>, V = T>
             where
                 Vec<T>: Into<U>,
                 U: From<T>;
@@ -455,6 +456,7 @@ mod tests {
         .with_renamed_param(&t, &p);
         assert!(generics.matches_any_param(&p));
         assert!(!generics.matches_any_param(&t));
+        assert_eq!(generics.params.to_compact_string(), "P,U:AsRef<P>,V=P");
         let where_clause = generics.where_clause.as_ref().expect("expected a where clause");
         assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&t)));
         assert!(where_clause.predicates.iter().any(|predicate| predicate.references_ident(&p)));
@@ -464,7 +466,7 @@ mod tests {
     fn test_generics_with_concrete_param() {
         let t: syn::Ident = syn::parse_quote!(T);
         let generics = syn::parse2::<syn::DeriveInput>(quote!(
-            struct Dummy<T, U>
+            struct Dummy<T, U: AsRef<T>>
             where
                 Vec<T>: Into<U>,
                 U: From<T>;
@@ -473,6 +475,7 @@ mod tests {
         .generics
         .with_concrete_param(&t, &syn::parse_quote!(ryft::Placeholder));
         assert!(!generics.matches_any_param(&t));
+        assert_eq!(generics.params.to_compact_string(), "U:AsRef<ryft::Placeholder>");
         let where_clause = generics.where_clause.as_ref().expect("expected a where clause");
         assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&t)));
     }

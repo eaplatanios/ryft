@@ -36,7 +36,7 @@ use crate::arrays::{
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    MemberBatchableOperation, batch_projected_operation,
+    MemberBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext};
 use crate::differentiation::{
@@ -1621,7 +1621,7 @@ where
         let batch_dimension =
             <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
         if extents.is_empty() && batch_dimension.value().is_some() {
-            return batch_projected_operation(context, self, inputs);
+            return context.batch_projected_operation(self, inputs);
         }
 
         // When all array inputs are invariant, bind the call once and keep its outputs replicated.

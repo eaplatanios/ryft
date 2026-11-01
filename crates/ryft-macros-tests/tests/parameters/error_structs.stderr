@@ -1,16 +1,16 @@
-error: found more than one generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute
+error: found more than one generic types bounded by `Parameter`; to use the ryft `#[derive(Parameterized)]` macro you must bound exactly one type parameter with the `Parameter` trait; not none and not more than one; the bound must be specified as `Parameter` or `ryft::Parameter` where `ryft` must be substituted for the custom ryft `crate` provided, if one was provided using the `#[ryft(crate = ...)]` attribute
  --> tests/parameters/error_structs.rs:4:36
   |
 4 | struct StructWithMultipleParameters<P: Parameter, V: Parameter> {
   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: identifier '__P' is reserved
+error: identifier `__P` is reserved
   --> tests/parameters/error_structs.rs:16:35
    |
 16 | struct StructWithInvalidTypeParam<__P: Parameter> {
    |                                   ^^^^^^^^^^^^^^
 
-error: identifier ''__p' is reserved
+error: identifier `'__p` is reserved
   --> tests/parameters/error_structs.rs:22:39
    |
 22 | struct StructWithInvalidLifetimeParam<'__p, P: Parameter> {
@@ -25,18 +25,17 @@ error[E0392]: type parameter `P` is never used
    = help: consider removing `P`, referring to it in a field, or using a marker such as `PhantomData`
 
 error[E0277]: the trait bound `StructWithUnusedParameterType<Placeholder>: Clone` is not satisfied
- --> tests/parameters/error_structs.rs:9:10
-  |
-9 | #[derive(Parameterized)]
-  |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `StructWithUnusedParameterType<Placeholder>`
-  |
-  = help: see issue #48214
-  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+  --> tests/parameters/error_structs.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `StructWithUnusedParameterType<Placeholder>`
+   |
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 help: consider annotating `StructWithUnusedParameterType<Placeholder>` with `#[derive(Clone)]`
-  |
-10+ #[derive(Clone)]
-11| struct StructWithUnusedParameterType<P: Parameter> {
-  |
+   |
+10 + #[derive(Clone)]
+11 | struct StructWithUnusedParameterType<P: Parameter> {
+   |
 
 error[E0283]: type annotations needed
   --> tests/parameters/error_structs.rs:10:8
@@ -44,16 +43,16 @@ error[E0283]: type annotations needed
 10 | struct StructWithUnusedParameterType<P: Parameter> {
    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot infer type for type parameter `P` declared on the struct `StructWithUnusedParameterType`
    |
-   = note: cannot satisfy `_: ryft::Parameter`
+   = note: the type must implement `ryft::Parameter`
    = help: the following types implement trait `ryft::Parameter`:
              ArrayBatch<V>
-             ArrayType
-             Atom<V>
-             AtomId
-             BatchAxis
-             BatchingTracer<C>
-             CaptureReference<T>
-             DevicePutTarget
+             ArrayIrBatch<V>
+             ArrayIrType
+             ArrayIrValue<A>
+             ArrayReference<A>
+             ArrayReferenceTransform
+             ArrayReferenceTransformIndex
+             ArraySliceAxis
            and $N others
 note: required by a bound in `StructWithUnusedParameterType`
   --> tests/parameters/error_structs.rs:10:41

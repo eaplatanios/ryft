@@ -27,7 +27,7 @@ use crate::programs::{
     OperationFormatter, OperationPayloadProjection, OperationProvider, OutputRegionProvenance, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceMemberType, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
-    Type, TypeError, Typed, Value, discharge_positional_region_operation,
+    Type, TypeError, Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -370,7 +370,7 @@ impl<
         // body's outputs as its own, which is the positionally forwarding shape that the shared structured rewrite
         // serves with no leading inputs. The captured reference state that the rewrite appends carries no derivative
         // values, so its inputs are not selected by the optimization barrier.
-        discharge_positional_region_operation(self, context, driver, inputs, 0, |appended_input_count, _| {
+        context.discharge_positional_region_operation(self, driver, inputs, 0, |appended_input_count, _| {
             Ok(self.with_remapped_optimization_barrier(|selected| {
                 selected.iter().copied().chain(std::iter::repeat_n(false, appended_input_count)).collect()
             }))

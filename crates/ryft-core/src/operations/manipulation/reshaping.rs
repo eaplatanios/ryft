@@ -16,7 +16,6 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment, TransposableOperation,
-    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -1103,8 +1102,7 @@ impl_differentiable_operation! {
                 .into();
 
             // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
-            transpose_projected_operation(
-                context,
+            context.transpose_projected_operation(
                 &projected_operation,
                 std::slice::from_ref(input),
                 outputs,

@@ -49,7 +49,6 @@ pub use assertions::{
     ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
     AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
 };
-pub use attention::{DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveMode, CollectiveOperations, CollectiveOptions,
     ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME, PARALLEL_ALL_TO_ALL_OPERATION_NAME,
@@ -144,7 +143,6 @@ pub use manipulation::{
     TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
     UpdateSliceOperation,
 };
-pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
     RngBitGenerator, RngBitGeneratorOperation,
@@ -167,10 +165,7 @@ pub use rounding::{
 };
 pub use sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
-    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap,
-    ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer, ShardingOperations, TracedShardMap, shard_map,
-    shard_map_in_context, shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes,
-    trace_shard_map_with_options,
+    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, ShardingOperations,
 };
 pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
@@ -234,9 +229,14 @@ pub use trigonometric::{
 /// operation while concrete values only validate it) must be required instead, so that heterogeneous values project it
 /// too. Type parameters that precede the universe must default to `Self` (e.g., a right input declared as
 /// `Rhs = Self`), and they resolve to the heterogeneous value in the implemented capability and to its projection in
-/// the delegated one. The generated code refers to the `ryft` crate, and a `crate = "path"` argument overrides that
-/// path (e.g., for crates that depend on `ryft-core` directly). Capabilities whose array IR implementations are
-/// irregular (e.g., [`Sort`] or [`Gather`]) keep handwritten implementations and use the bare attribute.
+/// the delegated one. The supertraits and `where` predicates of the capability (other than [`Capability`] itself) are
+/// restated as bounds of the generated implementation, with its universe parameter read as `Family`, so that the
+/// implementation applies exactly to the heterogeneous values that satisfy them. The generated functions keep the
+/// `#[cfg]` attributes of their capability functions. The generated code refers to the `ryft` crate, and a
+/// `crate = "path"` argument overrides that path (e.g., for crates that depend on `ryft-core` directly). Each family
+/// may be projected at most once. Capabilities whose array IR implementations are irregular (e.g., [`Sort`] or
+/// [`Gather`]) keep handwritten implementations and use the bare attribute. When the attribute reports errors,
+/// it still emits the annotated trait, so that its uses do not report additional errors.
 ///
 /// ```rust
 /// # extern crate ryft_core as ryft;

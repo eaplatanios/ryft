@@ -86,14 +86,6 @@ error: generic parameters may not be used in const operations
    |
    = note: type parameters may not be used in const expressions
 
-error[E0425]: cannot find type `P` in this scope
-  --> tests/parameters/error_self.rs:10:52
-   |
-10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
-   |                                   -                ^^^^ help: a type parameter with a similar name exists: `T`
-   |                                   |
-   |                                   similarly named type parameter `T` defined here
-
 error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
   --> tests/parameters/error_self.rs:9:10
    |
@@ -104,21 +96,15 @@ error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placehold
    |
    = note: expected struct `Generics<Placeholder, T>`
               found struct `Generics<P, T>`
-note: required for `Generics<Placeholder, T>` to implement `Trait`
-  --> tests/parameters/error_self.rs:19:44
-   |
-19 | impl<P: Parameter, T: Trait<Assoc = Self>> Trait for Generics<P, T> {
-   |                             ------------   ^^^^^     ^^^^^^^^^^^^^^
-   |                             |
-   |                             unsatisfied trait bound introduced here
 note: required for `Generics<Placeholder, T>` to implement `ParameterizedFamily<Placeholder>`
   --> tests/parameters/error_self.rs:9:10
    |
  9 | #[derive(Parameterized)]
    |          ^^^^^^^^^^^^^
-...
-13 |     <Self as Trait>::Assoc: Sized,
-   |                             ----- unsatisfied trait bound introduced in this `derive` macro
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                                            ------------ unsatisfied trait bound
+   = help: consider manually implementing `ParameterizedFamily<Placeholder>` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
@@ -131,6 +117,42 @@ error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placehold
    |
    = note: expected struct `Generics<Placeholder, T>`
               found struct `Generics<P, T>`
+note: required by a bound in `Generics`
+  --> tests/parameters/error_self.rs:10:44
+   |
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                                            ^^^^^^^^^^^^ required by this bound in `Generics`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
+  --> tests/parameters/error_self.rs:10:12
+   |
+ 9 | #[derive(Parameterized)]
+   |          ------------- found this type parameter
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Generics<Placeholder, T>`, found `Generics<__P, T>`
+   |
+   = note: expected struct `Generics<Placeholder, T>`
+              found struct `Generics<__P, T>`
+note: required for `Generics<Placeholder, T>` to implement `ParameterizedFamily<Placeholder>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                                            ------------ unsatisfied trait bound
+   = help: consider manually implementing `ParameterizedFamily<Placeholder>` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ expected `Generics<Placeholder, T>`, found `Generics<__P, T>`
+   |
+   = note: expected struct `Generics<Placeholder, T>`
+              found struct `Generics<__P, T>`
 note: required by a bound in `Generics`
   --> tests/parameters/error_self.rs:10:44
    |
@@ -161,7 +183,6 @@ help: the trait `Clone` is not implemented for `Struct<Placeholder>`
    |
 24 | pub struct Struct<P: Parameter> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: generic `Self` types are currently not permitted in anonymous constants
@@ -187,7 +208,6 @@ help: the trait `Clone` is not implemented for `Tuple<Placeholder>`
    |
 44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: generic `Self` types are currently not permitted in anonymous constants
@@ -225,7 +245,6 @@ help: the trait `Clone` is not implemented for `Enum<Placeholder>`
    |
 58 | pub enum Enum<P: Parameter> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types

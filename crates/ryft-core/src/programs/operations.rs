@@ -184,10 +184,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     heterogeneous-value generic. Heterogeneous families declare them explicitly because their stored constants
 ///     live in a member universe, so no single `Value<Type = T>` bound mentions the heterogeneous type the family's
 ///     instructions actually flow.
-///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T`
-///     from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
+///   - If the generic type parameters of the enum have exactly one distinct bound of the form `Value<Type = T>`,
+///     declared either inline or in a `where` clause whose bounded type is the parameter itself, the derivation infers
+///     `T` from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
 ///     ArrayType>`. Multiple generic parameters may use the same `T`. For example, `V: Value<Type = ArrayType>,
-///     C: Value<Type = ArrayType>` still infers `ArrayType`.
+///     C: Value<Type = ArrayType>` still infers `ArrayType`. Bounds on any other type (e.g., `Vec<V>: Value<Type =
+///     T>`) are not considered.
 ///   - If no `Value<Type = T>` bound is present, or if multiple distinct operation types are present (e.g., `Value<Type
 ///     = DataType>` and `Value<Type = ArrayType>`), the derivation macro cannot choose an operation type and reports a
 ///     compilation error. In those cases, the caller must split the enum by operation type or implement [`Operation`]
@@ -202,7 +204,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
 ///     implementation is generic over a runtime value `V` and an interpretation context. The generated implementations
 ///     require that context to be a [`Constant`](crate::Constant) provider that can lift captured constants from `C`
-///     into `V`.
+///     into `V`, and require `V` to satisfy every bound that the enum declares for `C`, including bounds on its
+///     associated types (e.g., `C::Item: Bound`).
 ///   - For enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as both the
 ///     runtime value type and the nested program constant type for direct program interpretation. Later value
 ///     parameters remain payload-specific metadata; when a dispatcher needs to instantiate a direct-linear operation
@@ -248,40 +251,40 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     through [`LiteralIdentity`](crate::LiteralIdentity)). Operation identity must be _faithful_, meaning that
 ///     payloads must compare every attribute that affects their semantics or lowering, because consumers such as eager
 ///     dispatch caches reuse compiled programs for equal operations.
-///   - `discharge` delegates native variants to the payload's own
+///   - `discharge` delegates native variants and bare generic extension variants to the payload's own
 ///     [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) implementation, and replays every
-///     member variant and every bare generic extension variant as the complete enum through
-///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation), which rewrites nothing and
-///     instead rejects an application that carries regions or receives a live reference handle as an input. The
-///     dispatcher stays generic over the [`ReferenceDischargePolicy`](crate::ReferenceDischargePolicy) it threads,
-///     because a policy names the reference universe being discharged rather than the element universe the family's
-///     values belong to. It also leaves the destination context's constant type free, unlike the interpretation and
-///     partial evaluation implementations, which pin it: no discharge rule reads a constant, and pinning it would
-///     exclude a capture-lifted program, whose constants name its caller's captures rather than carrying the family's
-///     values.
+///     member variant as the complete enum through
+///     [`discharge_reference_free_operation`](crate::ReferenceDischargeContext::discharge_reference_free_operation),
+///     which rewrites nothing and instead rejects an application that carries regions or receives a live reference
+///     handle as an input. The dispatcher stays generic over the
+///     [`ReferenceDischargePolicy`](crate::ReferenceDischargePolicy) it threads, because a policy names the reference
+///     universe being discharged rather than the element universe the family's values belong to. It also leaves the
+///     destination context's constant type free, unlike the interpretation and partial evaluation implementations,
+///     which pin it: no discharge rule reads a constant, and pinning it would exclude a capture-lifted program, whose
+///     constants name its caller's captures rather than carrying the family's values.
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
 ///     implementation and dispatches mixed variants in either role to the payload's parent-universe
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy
 ///     projection named by [`BatchingPolicyProjection`](crate::BatchingPolicyProjection): computational projected
 ///     variants apply the payload's member batching rule through
-///     [`batch_projected_operation`](crate::batch_projected_operation), while structural projected variants bind the
-///     payload once in the parent context through
-///     [`batch_replicated_projected_operation`](crate::batch_replicated_projected_operation). The structural path
-///     requires the family's policy to implement
+///     [`batch_projected_operation`](crate::BatchingContext::batch_projected_operation), while structural projected
+///     variants bind the payload once in the parent context through
+///     [`batch_replicated_projected_operation`](crate::BatchingContext::batch_replicated_projected_operation). The
+///     structural path requires the family's policy to implement
 ///     [`ReplicatedBatchingPolicyProjection`](crate::ReplicatedBatchingPolicyProjection) for the member type instead of
 ///     [`BatchingPolicyProjection`](crate::BatchingPolicyProjection), requires the payload to be region-free, and
 ///     reports default evidence; the payload family needs no batching rules or member policy of its own. A structural
 ///     role alone never implies replication, so a family whose policy does not implement the replicated projection
-///     fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
-///     generic over its array batching mode, while an explicitly declared family uses the canonical policy named
-///     by [`BatchableType`](crate::BatchableType).
+///     fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays generic
+///     over its batching policy (e.g., over every array batching mode that its payload rules support), while an
+///     explicitly declared family uses the canonical policy named by [`BatchableType`](crate::BatchableType).
 ///   - `differentiation` delegates native variants to the payload's own forward mode rule and computational member
 ///     variants to [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation), and generates the
 ///     structural arms described under [Variant Classes](#variant-classes) directly.
 ///   - `transposition` delegates native variants to the payload's own rule, mixed variants in either role to
-///     [`transpose_mixed_operation`](crate::transpose_mixed_operation), and computational projected variants to
-///     [`MemberTransposableOperation`](crate::MemberTransposableOperation). A structural projected variant contributes
-///     no cotangents.
+///     [`transpose_mixed_operation`](crate::TranspositionContext::transpose_mixed_operation), and computational
+///     projected variants to [`MemberTransposableOperation`](crate::MemberTransposableOperation). A structural
+///     projected variant contributes no cotangents.
 ///
 /// ## Variant Classes
 ///
@@ -314,8 +317,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     also supplies [`MemberTransposableOperation`](crate::MemberTransposableOperation), so its transpose rule can use
 ///     cotangent buffers in the enclosing family. A mixed payload supplies its parent-universe batching rule through
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation). Transposition never needs a mixed rule because
-///     [`transpose_mixed_operation`](crate::transpose_mixed_operation) delegates the instruction's `U`-typed data
-///     inputs, in input order, to the payload's ordinary homogeneous
+///     [`transpose_mixed_operation`](crate::TranspositionContext::transpose_mixed_operation) delegates the
+///     instruction's `U`-typed data inputs, in input order, to the payload's ordinary homogeneous
 ///     [`TransposableOperation`](crate::TransposableOperation) rule and gives every other input a structural zero
 ///     cotangent.
 ///   - A **structural** role declares that the payload is bookkeeping. There is nothing to differentiate (i.e., the
@@ -331,6 +334,11 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     Batching is the one transform the structural role does not cover for a mixed boundary, because a mixed signature
 ///     cannot be projected into one member kind. A structural mixed payload therefore still implements
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation), normally as a replicated-inputs-only rule.
+///     The generated forward mode arms delegate to
+///     [`jvp_structural_operation`](crate::DifferentiationContext::jvp_structural_operation) for structural projected
+///     members and to [`jvp_structural_mixed_operation`](crate::DifferentiationContext::jvp_structural_mixed_operation)
+///     for structural mixed members. Both stage the operation again without regions, and so structural payloads of
+///     either boundary must be region-free and are otherwise rejected with [`ProgramError::UnsupportedOperation`].
 ///
 /// ### Defaulting The Member Type
 ///
@@ -348,8 +356,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// Its generated transposition arm calls `transpose_in_parent` with the enclosing context, driver, and original
 /// accumulator handles. This lets an array member update a reference cotangent buffer even when its homogeneous
 /// type cannot represent references. The member rule can delegate to
-/// [`transpose_projected_operation`](crate::transpose_projected_operation) when it only needs homogeneous values.
-/// That adapter projects the inputs and forwards cotangent contributions to the original accumulators.
+/// [`transpose_projected_operation`](crate::TranspositionContext::transpose_projected_operation) when it only needs
+/// homogeneous values. That adapter projects the inputs and forwards cotangent contributions to the original
+/// accumulators.
 ///
 /// ### Suppressing The Owned Conversion
 ///
@@ -362,39 +371,41 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ## Generated Implementations
 ///
-/// The derived implementation generates:
+/// The derived implementation generates the following implementations, in this order:
 ///
+///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
+///     indentation, so that the enum display matches the canonical program rendering format, followed by the
+///     `PartialEq`, `Eq`, and `Hash` implementations of [`#[ryft(dispatch(identity))]`](#dispatchers) when selected.
 ///   - An [`Operation<Type = T>`](Operation) implementation whose semantic and rendering methods forward to the active
 ///     variant payload.
+///   - A [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) dispatcher, when selected through
+///     [`#[ryft(dispatch(...))]`](#dispatchers).
 ///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards native variants
 ///     directly and projects member variants into their native eager value family. Operation-specific eager semantics
 ///     still live on the payload implementations; the enum is only an adapter and dispatcher.
 ///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that forwards native
 ///     variants to their payload rules. Member variants use the enclosing operation's canonical fold-or-residualize
 ///     path, which also consults projected [`Operation::fold`] rules without a second partial-value protocol.
+///   - [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
+///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers, when selected through
+///     [`#[ryft(dispatch(...))]`](#dispatchers).
 ///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
 ///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
 ///     homogeneous operation-family projection.
 ///   - An [`OperationPayloadProjection`] implementation, which recognizes and constructs payloads without naming the
 ///     family that holds them, delegating through projected member variants. Refer to its documentation for which
 ///     payloads it exposes and for the construction precedence.
-///   - [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation),
-///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
-///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers selected through
-///     [`#[ryft(dispatch(...))]`](#dispatchers).
-///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
-///     indentation, so that the enum display matches the canonical program rendering format.
-///   - `From<Payload> for Enum` conversions for concrete payload variants.
-///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
-///     These conversions fail with `Error = TypeError`, reporting that the stored operation cannot be projected into
-///     the payload. The message names the stored operation's [`Operation::name`] and the statically expected payload
-///     type, each surrounded by backticks.
 ///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
 ///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
 ///     family-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
 ///     requires its operation family to provide guard requests, so this lets a family that stores no guard serve as a
 ///     context's family without a handwritten provider. A family with a native guard variant instead provides guards
 ///     through the blanket implementation over its generated `From<GuardOperation<T>>` conversion.
+///   - `From<Payload> for Enum` conversions for concrete payload variants.
+///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
+///     These conversions fail with `Error = TypeError`, reporting that the stored operation cannot be projected into
+///     the payload. The message names the stored operation's [`Operation::name`] and the statically expected payload
+///     type, each surrounded by backticks.
 ///
 /// ## Requirements And Limitations
 ///
@@ -413,9 +424,11 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     projected operation family. Several operations in the same member universe should first be collected into that
 ///     family rather than declared as separate outer variants. Mixed-boundary variants do not claim that projection,
 ///     so they may repeat a member type freely.
-///   - A payload type that [`OperationPayloadProjection::from_payload`] constructs (i.e., one that is `'static`
-///     independently of the enum's generic parameters) may be held by at most one family-native variant, so that
-///     construction is unambiguous.
+///   - A payload type may be held by at most one variant other than bare generic payload variants, because every such
+///     variant receives its own borrowed `TryFrom<&Enum>` conversion, which also keeps the payload construction of
+///     [`OperationPayloadProjection::from_payload`] unambiguous. Payload types are compared by their tokens, and so
+///     payload types that only coincide for some instantiation of the enum's generic parameters (e.g., `Payload<V>`
+///     and `Payload<C>`) are rejected by the compiler's coherence checks instead.
 ///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
