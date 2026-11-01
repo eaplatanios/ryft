@@ -263,7 +263,11 @@ impl CapabilityCodeGenerator {
                     projected_arguments.push(member.to_token_stream());
                 }
                 syn::GenericParam::Type(parameter)
-                    if index < universe && parameter.default.as_ref().is_some_and(|default| default.is_self()) =>
+                    if index < universe
+                        && parameter
+                            .default
+                            .as_ref()
+                            .is_some_and(|default| default.matches_ident(&SELF_TYPE.into())) =>
                 {
                     self_parameters.push(parameter.ident.clone());
                     implemented_arguments.push(value_type.to_token_stream());
@@ -392,13 +396,18 @@ impl CapabilityCodeGenerator {
             };
             let name = &name.ident;
             match input.ty.as_ref() {
-                syn::Type::Reference(reference) if reference.mutability.is_none() && reference.elem.is_self() => {
+                syn::Type::Reference(reference)
+                    if reference.mutability.is_none() && reference.elem.matches_ident(&SELF_TYPE.into()) =>
+                {
                     bindings.push(quote!(let #name = #projection(::core::clone::Clone::clone(#name))?;));
                     arguments.push(quote!(&#name));
                 }
                 syn::Type::Reference(reference)
                     if reference.mutability.is_none()
-                        && matches!(reference.elem.as_ref(), syn::Type::Slice(slice) if slice.elem.is_self()) =>
+                        && matches!(
+                            reference.elem.as_ref(),
+                            syn::Type::Slice(slice) if slice.elem.matches_ident(&SELF_TYPE.into()),
+                        ) =>
                 {
                     bindings.push(quote! {
                         let #name = #name
@@ -411,7 +420,7 @@ impl CapabilityCodeGenerator {
                 r#type
                     if single_type_argument(r#type, "Option").is_some_and(|argument| {
                         matches!(argument, syn::Type::Reference(reference)
-                            if reference.mutability.is_none() && reference.elem.is_self())
+                            if reference.mutability.is_none() && reference.elem.matches_ident(&SELF_TYPE.into()))
                     }) =>
                 {
                     bindings.push(quote! {
@@ -419,7 +428,7 @@ impl CapabilityCodeGenerator {
                     });
                     arguments.push(quote!(#name.as_ref()));
                 }
-                r#type if !r#type.mentions_self() => arguments.push(quote!(#name)),
+                r#type if !r#type.references_ident(&SELF_TYPE.into()) => arguments.push(quote!(#name)),
                 r#type => {
                     return Err(syn::Error::new_spanned(
                         r#type,
@@ -473,32 +482,13 @@ struct Projection {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Helper trait for checking whether [`syn::Type`]s refer to `Self`.
-trait SelfTypeHelpers {
-    /// Returns `true` if this type is exactly `Self`.
-    fn is_self(&self) -> bool;
-
-    /// Returns `true` if this type mentions `Self` anywhere (e.g., `Vec<Self>` or `Self::Item`).
-    fn mentions_self(&self) -> bool;
-}
-
-impl SelfTypeHelpers for syn::Type {
-    fn is_self(&self) -> bool {
-        self.matches_ident(&SELF_TYPE.into())
-    }
-
-    fn mentions_self(&self) -> bool {
-        self.references_ident(&SELF_TYPE.into())
-    }
-}
-
 /// Returns `true` if the provided type is `<Self as Capability>::Universe`, with any path to `Capability`.
 fn is_universe_default(r#type: &syn::Type) -> bool {
     let syn::Type::Path(syn::TypePath { qself: Some(qualified_self), path }) = r#type else {
         return false;
     };
     let segments = &path.segments;
-    qualified_self.ty.is_self()
+    qualified_self.ty.matches_ident(&SELF_TYPE.into())
         && qualified_self.position >= 1
         && qualified_self.position + 1 == segments.len()
         && segments[qualified_self.position - 1].ident == CAPABILITY_TRAIT
@@ -550,14 +540,16 @@ fn result_value_type(r#type: &syn::Type) -> Option<&syn::Type> {
 ///   - `ryft`: Root `ryft` library path used by the generated code.
 fn lift(r#type: &syn::Type, expression: TokenStream, member: &syn::Type, ryft: &syn::Path) -> syn::Result<TokenStream> {
     let from_projected = quote!(<Self as #ryft::ValueProjection<#member>>::from_projected);
-    if r#type.is_self() {
+    if r#type.matches_ident(&SELF_TYPE.into()) {
         return Ok(quote!(#from_projected(#expression)));
     }
-    if !r#type.mentions_self() {
+    if !r#type.references_ident(&SELF_TYPE.into()) {
         return Ok(expression);
     }
     match r#type {
-        r#type if single_type_argument(r#type, "Vec").is_some_and(|element| element.is_self()) => {
+        r#type
+            if single_type_argument(r#type, "Vec").is_some_and(|element| element.matches_ident(&SELF_TYPE.into())) =>
+        {
             Ok(quote!(#expression.into_iter().map(#from_projected).collect()))
         }
         syn::Type::Tuple(tuple) => {
@@ -993,21 +985,6 @@ mod tests {
             let result = generator.generate_projected_function(&function, &[], &[], &item, &member);
             assert_eq!(result.unwrap_err().to_string(), error);
         }
-    }
-
-    #[test]
-    fn test_self_type_helpers_is_self() {
-        assert!(syn::Type::is_self(&syn::parse_quote!(Self)));
-        assert!(!syn::Type::is_self(&syn::parse_quote!(Self::Item)));
-        assert!(!syn::Type::is_self(&syn::parse_quote!(Vec<Self>)));
-    }
-
-    #[test]
-    fn test_self_type_helpers_mentions_self() {
-        assert!(syn::Type::mentions_self(&syn::parse_quote!(Self)));
-        assert!(syn::Type::mentions_self(&syn::parse_quote!(Self::Item)));
-        assert!(syn::Type::mentions_self(&syn::parse_quote!((usize, Vec<Self>))));
-        assert!(!syn::Type::mentions_self(&syn::parse_quote!(Vec<usize>)));
     }
 
     #[test]
