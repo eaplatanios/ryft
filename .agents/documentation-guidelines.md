@@ -68,6 +68,10 @@ code comments. Preserve the documented contract, technical rationale, and links 
   write "The outputs must be unknown, because a known tangent would make the map affine." rather than "The outputs must
   be unknown: a known tangent would make the map affine."). The `# Parameters` bullet format, code, and labels inside
   tables and diagrams keep their colons.
+- Introduce parentheticals that restate or enumerate the preceding phrase with "i.e.," and parentheticals that list
+  non-exhaustive examples with "e.g.," (e.g., write "transform caching (i.e., `Transform` and `TransformCache`)" rather
+  than "transform caching (`Transform` and `TransformCache`)"). Never place parentheticals back to back. Name module
+  locations in the prose instead (e.g., "interpretation in `ryft_core::interpretation` via `Program::interpret`").
 - Do not hyphenate word pairs unnecessarily (e.g., write "structural zero tangent" and "zero leaf positions" rather
   than "structural-zero tangent" and "zero-leaf positions"). Always write "forward mode" and "reverse mode" without
   hyphens in documentation and code comments, including when they modify another word. Write composed and coordinated
