@@ -1115,21 +1115,18 @@ impl Display for RaggedDotDimensionNumbers {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`RaggedDotOperation`].
 pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 
-/// Primitive representing a grouped generalized dot with explicit group sizes.
-///
-/// Exactly one left-hand side dimension is ragged. Its role selects one of three modes:
+/// Operation type representing a grouped generalized dot product with explicit group sizes. Exactly one left-hand side
+/// dimension is _ragged_. Its role selects one of three modes:
 ///
 ///   - A non-contracting ragged dimension is partitioned into consecutive groups. The corresponding right-hand side
 ///     group dimension selects one right-hand side slice per group, and the grouped products are written back along the
 ///     left-hand side result dimension. An empty group contributes nothing and any uncovered suffix of that dimension
 ///     is zero.
-///   - A contracting ragged dimension partitions the paired contracting dimensions into consecutive groups. The
-///     output gains a leading group dimension, and an empty group produces a zero slice.
+///   - A contracting ragged dimension partitions the paired contracting dimensions into consecutive groups.
+///     The output gains a leading group dimension, and an empty group produces a zero slice.
 ///   - A batching ragged dimension has ordinary batched dot semantics. `group_sizes` participates in type inference
 ///     but its values do not affect the result.
 ///
@@ -1138,9 +1135,9 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// space.
 ///
 /// In non-contracting and contracting modes every size must be non-negative. The eager interpreter rejects negative
-/// metadata in those modes. The decomposition lowering of XLA additionally clamps signed negatives to zero before
-/// unsigned accumulation, so invalid runtime metadata cannot become a large interval. The instruction lowering passes
-/// metadata unchanged to `chlo.ragged_dot` and therefore relies on the contract that sizes are non-negative.
+/// metadata in those modes. The decomposition lowering of the XLA backend additionally clamps signed negatives to zero
+/// before unsigned accumulation, so invalid runtime metadata cannot become a large interval. The instruction lowering
+/// passes metadata unchanged to `chlo.ragged_dot` and therefore relies on the contract that sizes are non-negative.
 ///
 /// The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical left-hand side
 /// ragged extent, so a group that extends past that extent is clipped, and every later group is empty once its raw
@@ -1149,8 +1146,8 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// Grouped expansion modes require an element type that can represent zero. In particular, they reject `f8e8m0fnu`.
 /// Refer to [`RaggedDotDimensionNumbers`] for the dimension number contract.
 ///
-/// The operation is linear in either data input separately, while the group sizes are nondifferentiable metadata. For
-/// `y = ragged_dot(a, b, g)` with group sizes `g`, forward mode differentiation therefore computes
+/// The operation is linear in either data input separately, while the group sizes are nondifferentiable metadata.
+/// For `y = ragged_dot(a, b, g)` with group sizes `g`, forward mode differentiation therefore computes
 /// `ẏ = ragged_dot(ȧ, b, g) + ragged_dot(a, ḃ, g)`. Transposition is defined only in non-contracting mode, and it
 /// computes `ā` or `b̄` from the output cotangent `ȳ` with another grouped dot followed by the inverse permutation of
 /// its output axes.
@@ -1168,13 +1165,13 @@ pub struct RaggedDotOperation {
 }
 
 impl RaggedDotOperation {
-    /// Creates a grouped generalized dot.
+    /// Creates a new [`RaggedDotOperation`].
     #[inline]
     pub fn new(dimensions: RaggedDotDimensionNumbers) -> Self {
         Self { dimensions }
     }
 
-    /// Returns the grouped dot dimension number specification.
+    /// Returns the [`RaggedDotDimensionNumbers`] of this [`RaggedDotOperation`].
     #[inline]
     pub fn dimensions(&self) -> &RaggedDotDimensionNumbers {
         &self.dimensions
@@ -1182,6 +1179,7 @@ impl RaggedDotOperation {
 }
 
 impl Display for RaggedDotOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -1201,16 +1199,20 @@ impl Operation for RaggedDotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
+
         let lhs = &input_types[0];
         let rhs = &input_types[1];
         let group_sizes = &input_types[2];
         let dimensions = &self.dimensions;
+
         ArrayType::check_matching_manual_variation(RAGGED_DOT_OPERATION_NAME, &[lhs, rhs, group_sizes])?;
+
         if !group_sizes.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
                 "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have an integer data type",
             )));
         }
+
         if group_sizes.rank() == 0 {
             return Err(TypeError::invalid(format!(
                 "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have rank at least one",
@@ -1226,27 +1228,31 @@ impl Operation for RaggedDotOperation {
             let actual_prefix = Shape::new(group_sizes.shape().dimensions()[..group_sizes.rank() - 1].to_vec());
             if actual_prefix != expected_prefix {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` group sizes prefix must be `{expected_prefix}`, but got \
-                     `{actual_prefix}`",
+                    "`{RAGGED_DOT_OPERATION_NAME}` group sizes prefix must be `{expected_prefix}`, \
+                     but got `{actual_prefix}`",
                 )));
             }
         }
+
         let group_count = group_sizes.dimension(group_sizes.rank() - 1);
         if let Some(group_axis) = dimensions.rhs_group_dimension()
             && rhs.dimension(group_axis) != group_count
         {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_DOT_OPERATION_NAME}` right-hand side group dimension has extent {} but group sizes describe \
-                 {group_count}",
+                "`{}` right-hand side group dimension has extent {} but group sizes describe {}",
+                RAGGED_DOT_OPERATION_NAME,
                 rhs.dimension(group_axis),
+                group_count,
             )));
         }
+
         if mode != RaggedDotMode::Batch && lhs.data_type() == DataType::F8E8M0FNU {
             return Err(TypeError::invalid(format!(
                 "`{RAGGED_DOT_OPERATION_NAME}` does not support element data type `f8e8m0fnu` in grouped expansion \
                  modes because it cannot represent zero",
             )));
         }
+
         match mode {
             RaggedDotMode::NonContracting => {
                 let rhs_result = dimensions.dot_dimensions().rhs_result_dimensions(rhs.rank());
@@ -1260,14 +1266,18 @@ impl Operation for RaggedDotOperation {
             RaggedDotMode::Contracting => output = output.with_inserted_dimension(0, group_count)?,
             RaggedDotMode::Batch => {}
         }
+
         Ok(vec![output])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("dimensions", &self.dimensions))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for RaggedDotOperation
 where
