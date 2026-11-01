@@ -32,15 +32,15 @@ const TRANSPOSITION_DISPATCHER: Symbol = Symbol::new("transposition");
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 
-/// [`OperationCodeGenerator`]s are used to generate the implementations of the `#[derive(Operation)]` macro.
-/// Each one holds the normalized operation enum that [`OperationParser::normalize_input`] extracts from the provided
+/// [`OperationCodeGenerator`]s are used to generate the implementations of the `#[derive(Operation)]` macro. Each one
+/// holds the normalized operation enum that [`OperationParser::extract_code_generator`] extracts from the provided
 /// [`syn::DeriveInput`]. Refer to the documentation of the `Operation` trait in `ryft-core` for information on how to
 /// use that macro.
 ///
 /// Some of the generated implementations operate on programs whose operation family is this enum (e.g., interpretation
 /// and batching) and are therefore _program-shaped_. Program-shaped implementations have a single value space, and so
 /// they use the program-shaped generics, self type, and payload types, in which payload-specific value parameters are
-/// substituted with the constant parameter. Refer to [`OperationParser::normalize_input`] for more information.
+/// substituted with the constant parameter. Refer to [`OperationParser::extract_code_generator`] for more information.
 pub(crate) struct OperationCodeGenerator {
     /// [`syn::Path`] that represents the root `ryft` library path.
     /// Refer to [`OperationParser::ryft_crate`] for more information.
@@ -197,7 +197,7 @@ impl OperationCodeGenerator {
         if let Some(error) = parser.compile_error() {
             return error.into();
         }
-        let generator = parser.normalize_input(&input);
+        let generator = parser.extract_code_generator(&input);
         if let Some(error) = parser.compile_error() {
             return error.into();
         }
@@ -1685,11 +1685,9 @@ impl OperationParser {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Extracts the single [`syn::Type`] declared by a `#[ryft(type(T))]` or a `#[ryft(constant(C))]` attribute into
-    /// `declared_type`. The type is parsed locally (rather than through the shared `name = value` attribute grammar) so
-    /// that any complete Rust type, including generic, qualified, and tuple types, fits inside the parentheses.
+    /// `declared_type`. The type is parsed locally (rather than through the shared `name = value` attribute grammar)
+    /// so that any complete Rust type, including generic, qualified, and tuple types, fits inside the parentheses.
     ///
     /// # Parameters
     ///
@@ -1749,8 +1747,8 @@ impl OperationParser {
     }
 
     /// Extracts the [`Dispatchers`] selected by a `#[ryft(dispatch(...))]` attribute into
-    /// [`OperationParser::dispatchers`]. Dispatchers may be listed in any order, but by convention `identity` is listed
-    /// first.
+    /// [`OperationParser::dispatchers`]. Dispatchers may be listed in any order, but by convention `identity`
+    /// is listed first.
     fn extract_dispatch_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
         if self.dispatchers.is_some() {
             return Err(meta.error("duplicate ryft attribute `dispatch(...)`"));
@@ -1806,26 +1804,6 @@ impl OperationParser {
     ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
     ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        /// Extracts the inner type from a `Box<T>` type expression. This recognizes any type path whose final path
-        /// segment is `Box` with exactly one type argument (e.g., `Box<T>` or `std::boxed::Box<T>`) and returns that
-        /// type argument. For all other types, this function returns [`None`].
-        fn extract_box_type(ty: &syn::Type) -> Option<syn::Type> {
-            let syn::Type::Path(syn::TypePath { qself: None, path }) = ty else {
-                return None;
-            };
-            let segment = path.segments.last()?;
-            if segment.ident != "Box" {
-                return None;
-            }
-            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-                return None;
-            };
-            match arguments.args.iter().collect::<Vec<_>>().as_slice() {
-                [syn::GenericArgument::Type(inner_ty)] => Some(inner_ty.clone()),
-                _ => None,
-            }
-        }
-
         let (class, generate_from) = self.extract_variant_attributes(variant);
         let field = match &variant.fields {
             syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
@@ -1852,10 +1830,21 @@ impl OperationParser {
             .ty
             .ident()
             .is_some_and(|ident| generics.type_params().any(|parameter| parameter.ident == *ident));
-        let (payload_type, is_boxed) = match extract_box_type(&field.ty) {
-            Some(payload_type) => (payload_type, true),
-            None => (field.ty.clone(), false),
+
+        // Boxed payloads (i.e., type paths whose final segment is `Box` with exactly one type argument, like `Box<T>`
+        // or `std::boxed::Box<T>`) dispatch to the boxed type.
+        let (payload_type, is_boxed) = if let syn::Type::Path(syn::TypePath { qself: None, path }) = &field.ty
+            && let Some(segment) = path.segments.last()
+            && segment.ident == "Box"
+            && let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments
+            && arguments.args.len() == 1
+            && let Some(syn::GenericArgument::Type(payload_type)) = arguments.args.first()
+        {
+            (payload_type.clone(), true)
+        } else {
+            (field.ty.clone(), false)
         };
+
         Some(OperationVariant {
             ident: variant.ident.clone(),
             span: field.ty.span(),
@@ -1904,7 +1893,8 @@ impl OperationParser {
                     }
                 }
                 path if path == &STRUCTURAL_ROLE => Err(meta.error(
-                    "the `structural` operation variant class was replaced by the `projected(U, structural)` role form",
+                    "the `structural` operation variant class was replaced by the `projected(U, structural)` \
+                     role form",
                 )),
                 _ => Err(meta.error(format_args!(
                     "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, and \
@@ -1953,9 +1943,9 @@ impl OperationParser {
         }
     }
 
-    /// Normalizes the provided [`syn::DeriveInput`] into the [`OperationCodeGenerator`] from which all implementations
-    /// are generated. This function extracts the [`OperationVariant`]s, checks them for conflicts, and computes the
-    /// generics, the self types, and the payload types of the generated implementations.
+    /// Extracts the [`OperationCodeGenerator`] that generates all implementations for the provided
+    /// [`syn::DeriveInput`]. This function extracts the [`OperationVariant`]s, checks them for conflicts,
+    /// and computes the generics, the self types, and the payload types of the generated implementations.
     ///
     /// The implementations that operate on programs (i.e., interpretation, partial evaluation, reference discharge,
     /// batching, and differentiation) have a single value space. For enums whose constant type is inferred, the first
@@ -1967,7 +1957,7 @@ impl OperationParser {
     ///
     /// This function must only be called after [`OperationParser::extract_attributes`] has completed without errors,
     /// which guarantees that [`OperationParser::operation_type`] is set.
-    fn normalize_input(&mut self, input: &syn::DeriveInput) -> OperationCodeGenerator {
+    fn extract_code_generator(&mut self, input: &syn::DeriveInput) -> OperationCodeGenerator {
         // Variants whose markers fail to parse fall back to the family-native class, and so we only check for
         // conflicting variants if all variants were extracted without errors, to avoid follow-on errors.
         let mut variants = self.extract_variants(input);
@@ -2244,8 +2234,8 @@ impl OperationVariant {
 /// Semantic class of an [`OperationVariant`], which determines how the generated implementations dispatch to its
 /// payload. Member classes combine a _boundary shape_, which describes how the type boundary of the payload relates to
 /// the enclosing universe, with a _transform role_, which describes whether the payload carries real transform rules
-/// or is structural bookkeeping. Both member boundaries share the `class(U [, structural])` grammar, and so the role is
-/// a flag of each boundary rather than a separate class.
+/// or is structural bookkeeping. Both member boundaries share the `class(U [, structural])` grammar, and so the role
+/// is a flag of each boundary rather than a separate class.
 enum OperationVariantClass {
     /// Variant whose payload already uses the primary operation type and the semantic contracts of the enclosing
     /// operation family.
@@ -2286,8 +2276,8 @@ impl OperationVariantClass {
     /// # Parameters
     ///
     ///   - `meta`: Nested `#[ryft(...)]` meta item whose path is either `projected` or `mixed`.
-    ///   - `members`: [`OperationMember`]s declared by the enum, which are used to default and to validate the member
-    ///     type.
+    ///   - `members`: [`OperationMember`]s declared by the enum, which are used to default and to validate
+    ///     the member type.
     fn parse(meta: &syn::meta::ParseNestedMeta, members: &[OperationMember]) -> syn::Result<Self> {
         /// Returns the member type that an abbreviated `mixed` marker defaults to, which is the single computational
         /// member universe among the provided [`OperationMember`]s. Enums that declare no members, or that declare
@@ -2347,8 +2337,9 @@ impl OperationVariantClass {
                     return Err(syn::Error::new_spanned(
                         &member_type,
                         format_args!(
-                            "the `{class}` operation variant class declares member type `{}`, which the operation \
+                            "the `{}` operation variant class declares member type `{}`, which the operation \
                              family does not declare in `#[ryft(members(...))]`",
+                            class,
                             member_type.to_compact_string(),
                         ),
                     ));
@@ -2456,6 +2447,8 @@ fn is_unconditionally_static(ty: &syn::Type, generics: &syn::Generics) -> bool {
     !mentions(ty.to_token_stream(), &parameters)
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -2470,14 +2463,14 @@ mod tests {
         parser
     }
 
-    /// Parses the provided derive input and normalizes it into an [`OperationCodeGenerator`] like
+    /// Parses the provided derive input and extracts its [`OperationCodeGenerator`] like
     /// [`OperationCodeGenerator::generate_operation_impl`] does, asserting that no errors are reported along the way.
-    fn normalize(tokens: TokenStream) -> OperationCodeGenerator {
+    fn code_generator(tokens: TokenStream) -> OperationCodeGenerator {
         let mut input = syn::parse2(tokens).unwrap();
         replace_self_type(&mut input);
         let mut parser = OperationParser::new();
         parser.extract_attributes(&input);
-        let generator = parser.normalize_input(&input);
+        let generator = parser.extract_code_generator(&input);
         assert_eq!(errors(&parser), Vec::<String>::new());
         generator
     }
@@ -2860,7 +2853,7 @@ mod tests {
         replace_self_type(&mut input);
         let mut parser = OperationParser::new();
         parser.extract_attributes(&input);
-        parser.normalize_input(&input);
+        parser.extract_code_generator(&input);
 
         // Payload types may only repeat across bare generic extension variants, which receive no conversions, and
         // projected member types may not repeat at all. Payload types that differ only in their generic arguments are
@@ -2877,10 +2870,10 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_parser_normalize_input() {
+    fn test_operation_parser_extract_code_generator() {
         // Test normalizing an enum whose types are inferred, in which case value parameters after the first two are
         // substituted by the first one in the program-shaped generics, self type, and payload types.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V, C, Extension, F = V>
             where
                 V: Value<Type = DataType>,
@@ -2943,7 +2936,7 @@ mod tests {
 
         // Test normalizing an enum whose types are declared explicitly, which has no constant parameter and whose
         // projected member types add type conversion predicates.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), members(ArrayType), dispatch(batching))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
@@ -2990,7 +2983,7 @@ mod tests {
                 .collect()
         }
 
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = DataType>> {
                 Constant(ConstantOperation<V>),
             }
@@ -3009,7 +3002,7 @@ mod tests {
             ],
         );
 
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             #[ryft(dispatch(transposition, differentiation, batching, discharge, identity))]
             enum Operation<A: Value<Type = ArrayType>> {
@@ -3044,7 +3037,7 @@ mod tests {
     fn test_operation_code_generator_generate_identity_impls() {
         // The implementations are bounded by each distinct payload type rather than by the generic parameters, compare
         // mismatched variants as unequal, and hash the variant discriminant before the payload.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = DataType>, Extension> {
                 Zero(ZeroOperation<DataType>),
                 Tag(Box<TagOperation<DataType>>),
@@ -3102,7 +3095,7 @@ mod tests {
         );
 
         // A single-variant family has no mismatched-variant arm, which would otherwise be unreachable.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
@@ -3116,7 +3109,7 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_operation_dispatcher() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 Add(AddOperation<ArrayIrType>),
@@ -3298,7 +3291,7 @@ mod tests {
     fn test_operation_code_generator_generate_reference_discharge_dispatcher() {
         // Native and generic extension payloads delegate to their own discharge rules, while member payloads replay
         // the complete enum through the reference-free replay path.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
                 Add(AddOperation<ArrayIrType>),
@@ -3362,7 +3355,7 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_interpretation_dispatcher() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 Add(AddOperation<ArrayIrType>),
@@ -3441,7 +3434,7 @@ mod tests {
 
         // Test generating the dispatcher of an enum whose two inferred value parameters make the constant type the
         // value type of the interpretation context.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>, C: Value<Type = ArrayType>> {
                 Constant(ConstantOperation<V>),
             }
@@ -3460,7 +3453,7 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_partial_evaluation_dispatcher() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
                 Add(AddOperation<ArrayIrType>),
@@ -3522,7 +3515,7 @@ mod tests {
         // Test generating the dispatcher of an enum with an explicit constant type, which uses the canonical batching
         // policy of its primary type. Computational projected members apply their member batching rules under the
         // projected policy, while structural projected members are bound once under the replicated projection.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 Add(AddOperation<ArrayIrType>),
@@ -3620,7 +3613,7 @@ mod tests {
 
         // Test generating the dispatcher of an enum whose constant type is inferred, which stays generic over its
         // batching policy.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Constant(ConstantOperation<V>),
             }
@@ -3665,7 +3658,7 @@ mod tests {
     fn test_operation_code_generator_generate_differentiation_dispatcher() {
         // Native payloads use their own forward mode rules, computational member payloads use their parent-universe
         // rules, and structural projected payloads stage their primals with symbolic zero tangents.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 Add(AddOperation<ArrayIrType>),
@@ -3756,14 +3749,14 @@ mod tests {
     fn test_operation_code_generator_generate_differentiation_dispatcher_structural_mixed_members() {
         // Declaring the members of a family and abbreviating its mixed markers generates exactly the same code as
         // naming the member type on every marker.
-        let explicit = normalize(quote! {
+        let explicit = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(ArrayType, structural))]
                 Zero(ZeroOperation<ArrayType>),
             }
         });
-        let declared = normalize(quote! {
+        let declared = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), members(ArrayType, structural(DimensionType)))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(structural))]
@@ -3778,7 +3771,7 @@ mod tests {
         // A structural mixed payload stages one member zero tangent per output, in the computational member universe
         // that the output belongs to, and so it tries every such universe and needs a zero constructor and a type view
         // for each of them.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             #[ryft(members(ArrayType, TableType, structural(DimensionType)))]
             enum Operation<A: Value<Type = ArrayType>> {
@@ -3864,7 +3857,7 @@ mod tests {
         // Native payloads use their own transposition rules, computational projected payloads use their
         // parent-universe rules, structural projected payloads contribute no cotangents, and mixed payloads are
         // transposed through the shared mixed adapter.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 Add(AddOperation<ArrayIrType>),
@@ -3955,7 +3948,7 @@ mod tests {
 
         // Test generating the dispatcher of an enum with two inferred value parameters, which transposes over its
         // constant type instead of over a separate transposition value type.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>, C: Value<Type = ArrayType>> {
                 Constant(ConstantOperation<V>),
             }
@@ -3969,7 +3962,7 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_operation_projection_impl() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
                 Add(AddOperation<ArrayIrType>),
@@ -4006,7 +3999,7 @@ mod tests {
         // Mixed payloads project like native ones but are never constructed, native payloads are constructed before the
         // projected member even though the member is declared first, and the generic-dependent payload and the generic
         // extension neither project nor are constructed.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
                 #[ryft(projected(ArrayType))]
@@ -4089,7 +4082,7 @@ mod tests {
         // A family without a native guard variant rejects guard requests of its primary type under the bounds of its
         // generated `Operation` implementation.
         // A projected member guard belongs to the member universe, and so it does not count as a native guard.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue))]
             enum Operation {
                 Add(AddOperation<ArrayIrType>),
@@ -4125,13 +4118,13 @@ mod tests {
 
         // A family with a native guard variant, stored directly or boxed, provides guards through the blanket
         // supporting provider over its generated `From` conversion, and so it must not get a rejecting provider.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Guard(ryft::GuardOperation<ArrayType>),
             }
         });
         assert!(operation.generate_guard_provider_impl().is_none());
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Guard(Box<GuardOperation<ArrayType>>),
             }
@@ -4141,7 +4134,7 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_conversion_impls() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Zero(ZeroOperation<ArrayType>),
                 Constant(Box<ConstantOperation<V>>),
@@ -4193,7 +4186,7 @@ mod tests {
     fn test_operation_code_generator_constant_parameter_predicates() {
         // Every mention of the constant parameter is renamed, including mentions inside its bounds and in associated
         // type projections, while predicates that do not bound the parameter are not copied.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType> + PartialEq<V>, U>
             where
                 Wrapper<V>: Bound,
@@ -4221,7 +4214,7 @@ mod tests {
         );
 
         // Enums with an explicit constant type have no constant parameter whose bounds could be copied.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType> + Clone> {
                 Add(AddOperation<ArrayIrType>),
@@ -4232,7 +4225,7 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_tangent_universes() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue), members(ArrayType, structural(DimensionType), TableType))]
             enum Operation {
                 Add(AddOperation<ArrayIrType>),
@@ -4246,7 +4239,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["TableType", "ArrayType"],
         );
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue))]
             enum Operation {
                 Add(AddOperation<ArrayIrType>),
@@ -4287,7 +4280,7 @@ mod tests {
 
     #[test]
     fn test_operation_variant_receiver() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Zero(ZeroOperation<ArrayType>),
                 Constant(Box<ConstantOperation<V>>),
@@ -4299,7 +4292,7 @@ mod tests {
 
     #[test]
     fn test_operation_variant_construct() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Zero(ZeroOperation<ArrayType>),
                 Constant(Box<ConstantOperation<V>>),
@@ -4317,7 +4310,7 @@ mod tests {
 
     #[test]
     fn test_operation_variant_arm() {
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Constant(Box<ConstantOperation<V>>),
             }
@@ -4335,7 +4328,7 @@ mod tests {
     #[test]
     fn test_operation_variant_is_native_guard() {
         // The detection is syntactic and so it misses guards that are named through type aliases.
-        let operation = normalize(quote! {
+        let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue))]
             enum Operation {
                 Guard(ryft::GuardOperation<ArrayIrType>),
