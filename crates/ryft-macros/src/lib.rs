@@ -7,18 +7,19 @@ mod kernels;
 mod operations;
 mod parameters;
 
-use parameters::CodeGenerator;
+use operations::OperationCodeGenerator;
+use parameters::ParameterizedCodeGenerator;
 
 /// Generates a [`Parameter`] implementation for the container this macro is applied on.
 #[proc_macro_derive(Parameter)]
 pub fn derive_parameter(input: TokenStream) -> TokenStream {
-    CodeGenerator::generate_parameter_impl(input)
+    ParameterizedCodeGenerator::generate_parameter_impl(input)
 }
 
 /// Generates a [`Parameterized`] implementation for the container this macro is applied on.
 #[proc_macro_derive(Parameterized, attributes(ryft))]
 pub fn derive_parameterized(input: TokenStream) -> TokenStream {
-    CodeGenerator::generate_parameterized_impl(input)
+    ParameterizedCodeGenerator::generate_parameterized_impl(input)
 }
 
 // TODO(eaplatanios): Review this.
@@ -66,7 +67,7 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// and the requirements and limitations of the macro.
 #[proc_macro_derive(Operation, attributes(ryft))]
 pub fn derive_operation(input: TokenStream) -> TokenStream {
-    operations::generate_operation_impl(input)
+    OperationCodeGenerator::generate_operation_impl(input)
 }
 
 // TODO(eaplatanios): Review this.
