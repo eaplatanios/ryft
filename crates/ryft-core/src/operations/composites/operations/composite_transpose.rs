@@ -522,6 +522,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
+    #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        // A retained backward rule (and a deferred forward rule) is traced on demand, so only discharging the carrier
+        // can record that the programs traced for it later must be discharged as well.
+        matches!(self.rules, CompositeTransposeRules::Retained { discharged: false, .. })
+    }
+
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
@@ -1271,7 +1278,7 @@ mod tests {
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::references::{
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation,
+        ReferenceRead,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -1984,8 +1991,7 @@ mod tests {
         // A carrier with a retained backward rule holds no reference state of its own, so discharge only records that
         // the backward rule programs, which are traced lazily, must be discharged once they are traced. The backward
         // rule `ȳ ↦ 2ȳ` accumulates its result in a local reference, which its discharged specialization no longer
-        // allocates. Discharge returns a program that touches no reference untouched, so the carrier's tangent passes
-        // through a local reference first.
+        // allocates. The carrier defers its discharge, so a program that touches no reference is discharged anyway.
         let definition = CustomRuleRegistration::new(
             IrDefinition::new("doubled")
                 .with_vjp(
@@ -2001,9 +2007,8 @@ mod tests {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let mut builder = IrBuilder::new();
         let tangent = builder.add_input(scalar_type.clone());
-        let state = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![tangent], None).unwrap()[0];
-        let tangent = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
         let carrier = retained_carrier(definition.reference(), 0, vec![scalar_type.clone()], vec![scalar_type]);
+        assert!(carrier.defers_reference_discharge());
         let output = builder.add_instruction(carrier, Vec::new(), vec![tangent], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

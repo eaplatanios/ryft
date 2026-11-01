@@ -827,6 +827,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }))
     }
 
+    #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        // Retained rules are traced on demand, so only discharging the call can record that the rule programs traced
+        // for it later must be discharged as well. Attached rule regions are visible to discharge directly.
+        matches!(self.rules, CompositeRules::Retained { discharged: false, .. })
+    }
+
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
@@ -4244,6 +4251,43 @@ mod tests {
                                discharged, because its rule programs contain reference state and its definition has \
                                no reference discharge support",
         ));
+
+        // A call in a program that touches no reference defers its discharge, because only its discharge rule can
+        // record that the rule programs traced for it later must be discharged as well, so the program is discharged
+        // anyway.
+        let pure_primal = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let x = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let reference_free = ir_custom_rule_program(&supported, 0, pure_primal);
+        assert!(reference_free.instructions()[0].operation().defers_reference_discharge());
+        let discharged =
+            reference_free.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+        assert!(!discharged.instructions()[0].operation().defers_reference_discharge());
+        assert_eq!(
+            discharged.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = composite [name=\"doubled\", discharged=true] %0 [
+                    primal={
+                        lambda %0:f32[] .
+                        let %1:f32[] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(discharged.jvp().unwrap().to_string(), jvp.to_string());
     }
 
     #[test]

@@ -4184,7 +4184,11 @@ macro_rules! check_operation_type_inference {
             output_types = [$($output_type:expr),* $(,)?] $(,)?
         }
     ) => {
-        $crate::macros::checks::check_type_inference(&$operation, &[$($input_type),*], Ok(vec![$($output_type),*]))
+        {
+            // Binding the input types keeps a single cloned input type from reading as a needlessly cloned slice.
+            let input_types = [$($input_type),*];
+            $crate::macros::checks::check_type_inference(&$operation, &input_types, Ok(vec![$($output_type),*]))
+        }
     };
 
     // This internal branch checks a successful unary element type case in both the data type and array type universes.
@@ -4259,13 +4263,17 @@ macro_rules! check_operation_type_inference {
             error = $message:expr $(,)?
         }
     ) => {
-        $crate::macros::checks::check_type_inference(
-            &$operation,
-            &[$($input_type),*],
-            Err($crate::programs::types::TypeError::invalid(
-                ::core::convert::Into::<::std::string::String>::into($message),
-            )),
-        )
+        {
+            // Binding the input types keeps a single cloned input type from reading as a needlessly cloned slice.
+            let input_types = [$($input_type),*];
+            $crate::macros::checks::check_type_inference(
+                &$operation,
+                &input_types,
+                Err($crate::programs::types::TypeError::invalid(
+                    ::core::convert::Into::<::std::string::String>::into($message),
+                )),
+            )
+        }
     };
 
     // This internal branch checks a successful ordinary case by inferring with no attached regions and comparing the
@@ -4277,7 +4285,11 @@ macro_rules! check_operation_type_inference {
             output_types = [$($output_type:expr),* $(,)?] $(,)?
         }
     ) => {
-        $crate::macros::checks::check_type_inference(&$operation, &[$($input_type),*], Ok(vec![$($output_type),*]))
+        {
+            // Binding the input types keeps a single cloned input type from reading as a needlessly cloned slice.
+            let input_types = [$($input_type),*];
+            $crate::macros::checks::check_type_inference(&$operation, &input_types, Ok(vec![$($output_type),*]))
+        }
     };
 
     // This internal branch checks a rejected ordinary case against its complete `TypeError` message. It is distinct
@@ -4289,13 +4301,17 @@ macro_rules! check_operation_type_inference {
             error = $message:expr $(,)?
         }
     ) => {
-        $crate::macros::checks::check_type_inference(
-            &$operation,
-            &[$($input_type),*],
-            Err($crate::programs::types::TypeError::invalid(
-                ::core::convert::Into::<::std::string::String>::into($message),
-            )),
-        )
+        {
+            // Binding the input types keeps a single cloned input type from reading as a needlessly cloned slice.
+            let input_types = [$($input_type),*];
+            $crate::macros::checks::check_type_inference(
+                &$operation,
+                &input_types,
+                Err($crate::programs::types::TypeError::invalid(
+                    ::core::convert::Into::<::std::string::String>::into($message),
+                )),
+            )
+        }
     };
 }
 
