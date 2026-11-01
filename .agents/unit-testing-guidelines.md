@@ -6,7 +6,13 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 
 - Keep unit tests colocated in the owning module under `#[cfg(test)] mod tests`. Make colocated module tests primarily
   cover behavior implemented in that module; move incidental downstream behavior coverage to the operation, transform,
-  or helper module that owns it.
+  or helper module that owns it. When moving an implementation, move its owning tests and any exclusive fixtures with
+  it, and update their names and order to follow the destination API. Keep shared integration fixtures with their owner.
+- Order a module's unit tests by the production API surface they cover, following the production definitions' order.
+  Give each public function a primary test named `test_<owning_type>_<function>` (e.g.,
+  `test_program_discharge_references`). Place additional edge-case tests immediately after that primary test and suffix
+  their names with the behavior they cover. Do not replace API-oriented primary tests with broad scenario-oriented
+  tests, and do not combine several public functions into one test merely because they share setup.
 - Cover every new or changed behavior with deterministic tests and explicit assertions.
 - Name unit tests with a `test_...` prefix.
 - Use `pretty_assertions::assert_eq` when comparing rendered strings or structured values where readable diffs matter.
@@ -15,34 +21,40 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - For `Result` success paths, prefer `assert_eq!(operation(), Ok(expected))` when the expected value is stable.
 - For error paths, assert the concrete error variant and `ryft`-owned message text.
 - Await asynchronous transfer, copy, execution, or callback completion before asserting final state or output contents.
+- When replacing a directly tested helper with another helper, retain direct owner-module coverage for the replacement
+  instead of relying only on downstream tests that exercise it incidentally.
 - Reuse shared crate test helpers instead of recreating client, plugin, context, backend, or fixture setup.
 - Keep tests flat and readable; extract helpers only when they encode a repeated semantic testing contract.
 - When testing a later-stage validation error, keep earlier-stage fixtures well-formed unless malformed construction
   is the behavior under test.
 - Run scoped verification for the crate or module touched, using a 300-second timeout for local test commands unless the
   user asks for a longer run.
-
-## Reference Backends
-
-- Use `ryft_core::backends::scalars::Scalar` as the concrete eager value for scalar-universe coverage (i.e., programs 
-  typed by `DataType`) and `ryft_core::backends::arrays::Array` for array-universe coverage (i.e., programs typed by
-  `ArrayType`). Both store honestly typed payloads (`Array` is a row-major `Vec<Scalar>`), so value-level tests can and
-  should assert exact element data types, complex values, and exact low-precision floating-point encodings, and not
-  `f64` approximations of them.
-- In `ryft-xla`, import the reference array value as `use ryft_core::backends::arrays::Array as TestArray;` so that it
-  does not collide with the XLA buffer-backed `Array`. When both backends implement an operation, keep them value-level
-  consistent.
-- Use the `check_gradient!` macro from `ryft_core::macros` as the finite-difference oracle for gradient rules. You
-  must use `check_gradient!(@scalar, ...)` for `Scalar`-valued functions and `check_gradient!(@array, ...)` for
-  `Array`-valued functions, and `TestRegionOperation` for testing region-carrying program machinery.
+- Use `ryft_core::arrays::Array` as the concrete eager value for operation, program, and transform coverage.
+  Use rank-zero arrays when testing scalar-shaped behavior. Introduce a narrower test-only value family only when a
+  test genuinely verifies universe-neutral machinery and using arrays would obscure that contract. `Array` owns checked
+  physical bytes and exposes typed logical decoding, so value-level tests can and should assert exact element data
+  types, complex values, and exact low-precision floating-point encodings rather than `f64` approximations.
+- Use the `check_gradient!` macro from `ryft_core::macros` as the finite-difference oracle for array-valued gradient
+  rules, including functions over rank-zero arrays.
+- Use `TestRegionOperation` for tests that specifically isolate region-carrying program machinery.
+- Keep test-only instrumentation out of production types and functions. Prefer observing existing behavior through
+  test fixtures (e.g., counting operation queries) and inspecting actual caches in colocated tests instead of adding
+  conditional counter fields or increments to production analysis.
 
 ## Structure
 
 - Keep setup local and explicit. A single test may cover a normal path plus nearby edge cases when they share the same
   setup and read better together.
+- In a test that covers several related behavior groups, use concise comments to identify what each group verifies.
+  Explain the semantic contract or edge case rather than restating individual assertions.
 - Use `pub(crate) mod tests` only when the module intentionally exposes shared test helpers to sibling modules.
+  When only the module's own descendants (e.g., the submodules of a `mod.rs`) use its helpers, keep `mod tests`
+  private and mark the helpers `pub(super)`, which is the narrowest visibility that reaches those descendants.
 - Put local test helpers near the top of the test module, before the first `#[test]`.
 - Define test-only types inside the single test that uses them; keep module-level test types for shared test fixtures.
+- Inline a type alias used by only one test. When the same alias is used by multiple tests, define it once near the top
+  of the owning test module. Use a more specific name when `TestValue` or `TestOperation` would collide with another
+  test fixture in that module.
 - Prefer one focused test per behavior family. Avoid broad omnibus tests unless the setup cost is high and the behavior
   is naturally exercised as one scenario.
 - Prefer flat sequences of explicit assertions over local helper closures or loops. Compact table or array loops are
@@ -83,33 +95,58 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 
 ## Operations, Types, And Attributes
 
-- Create the smallest valid context/module/function/block that exercises the behavior under test.
-- Load MLIR dialects before constructing dialect-specific entities when the dialect is required for parsing,
-  construction, or verification.
-- Use default or unknown locations for ordinary operation tests. Use specific file locations only when location behavior
-  itself matters.
-- For operation constructor tests, verify the containing operation or module, then compare the complete rendered output
-  with `indoc!` and `pretty_assertions::assert_eq`.
-- Test operations individually where possible. Prefer full-string equality assertions over partial `.contains(...)`
-  checks for rendered IR.
-- Use our operation testing macros wherever possible/applicable: `check_operation_type_inference!`,
-  `check_operation_partial_evaluation!`, `check_operation_batching!`, `check_operation_differentiation!`,
-  and `check_operation_transposition!`.
-- Use `check_operation_type_inference!` for exact regionless operation type-inference cases. Keep explicit assertions
-  for field-level metadata projections and operations whose inference contract depends on attached region interfaces.
-- Use the `@elementwise @unary` and `@elementwise @binary` selectors of `check_operation_type_inference!` for
-  operation-owned element-data-type cases. Keep shared broadcasting, layout, and metadata behavior in the central
-  `ElementwiseOperation` tests, and keep specialized reduction-state behavior beside the operation that owns it.
-- Keep per-operation tests focused on semantics selected or implemented by that operation. Test shared declarative
-  macro rendering, arity validation, and generated formatting centrally rather than repeating those checks for every
-  macro-generated operation.
-- When testing operation accessors, assert operands, results, attributes, properties, and collection lengths before
-  inserting the operation into a final block if detached-operation behavior matters.
-- For wrapper hierarchies, cover construction, context ownership, accessor values, equality within one context,
-  inequality for different values, inequality across contexts, display/debug rendering, and upcast/downcast behavior.
-- For parsing APIs, include one valid parse and one invalid parse when the API exposes a fallible parser.
-- Dump-style tests may only assert that `dump()` runs without crashing when stderr capture is not available. Add a short
-  comment explaining that limitation.
+- For `ryft-core`:
+  - For simple operations, order primary tests as `test_<operation>`, `test_<operation>_type_inference`,
+    `test_<operation>_interpretation` using `Array` values, `test_<operation>_partial_evaluation`,
+    `test_<operation>_batching`, `test_<operation>_differentiation`, and `test_<operation>_transposition`, where those
+    behaviors apply. Use `operations/arithmetic.rs` as the reference layout. Keep substantial edge cases beside the
+    corresponding primary test, including specialized sharding behavior, dynamic-index transforms, backend kernels,
+    and nested transformation composition, and test independently useful public helper types separately.
+  - Use default or unknown locations for ordinary operation tests. Use specific file locations only when location
+    behavior itself matters.
+  - For operation constructor tests, verify the containing operation or module, then compare the complete rendered
+    output with `indoc!` and `pretty_assertions::assert_eq`.
+  - Test operations individually where possible. Prefer full-string equality assertions over partial `.contains(...)`
+    checks for rendered IR.
+  - When a test stages or transforms a program, assert its complete rendering (i.e., `program.to_string()` against an
+    `indoc!` string) rather than lists of operation names, individual instructions, or the payload of one found
+    instruction. The full rendering also pins types, shardings, and any dead or extra instructions that partial
+    checks miss.
+  - Use our operation testing macros wherever possible/applicable: `check_operation_type_inference!`,
+    `check_operation_partial_evaluation!`, `check_operation_batching!`, `check_operation_differentiation!`,
+    and `check_operation_transposition!`.
+  - Prefer context-recovering global transform functions such as `batch`, `jvp`, `vjp`, `linearize`, `jacfwd`,
+    `jacrev`, and `value_and_gradient` over equivalent explicit-context methods whenever the test inputs identify the
+    intended execution domain. Retain explicit contexts for custom domains, context-specific state, empty inputs,
+    direct operation rules, and program transformations.
+  - Use `check_operation_differentiation!` only when the operation's declared derivative must agree with a finite
+    difference estimate of its primal semantics. Keep explicit transform tests for gradient barriers, discrete outputs,
+    custom derivatives, and other intentionally overridden differentiation rules.
+  - Use `check_operation_type_inference!` for exact regionless operation type-inference cases. Keep explicit assertions
+    for field-level metadata projections and operations whose inference contract depends on attached region interfaces.
+  - Use the `@elementwise @unary` and `@elementwise @binary` selectors of `check_operation_type_inference!` for
+    operation-owned element-data-type cases. Keep shared broadcasting, layout, and metadata behavior in the central
+    `ElementwiseOperation` tests, and keep specialized reduction-state behavior beside the operation that owns it.
+  - Keep per-operation tests focused on semantics selected or implemented by that operation. Test shared declarative
+    macro rendering, arity validation, and generated formatting centrally rather than repeating those checks for every
+    macro-generated operation.
+  - When changing what `ryft-core` transforms (e.g., batching, differentiation, tracing) stage into programs (e.g.,
+    operand shapes, inserted or elided operations) also run the backend crate test suites (at least
+    `cargo test -p ryft-xla --lib`), not just `ryft-core`. Backend lowerings impose stricter contracts than `ryft-core`
+    type inference. For example, StableHLO elementwise operations require shape-congruent operands with no implicit
+    broadcasting, so an "optimization" that elides a staged `BroadcastInDim` can pass every `ryft-core` test and still
+    break XLA lowering.
+- For `ryft-mlir`:
+  - Create the smallest valid context/module/function/block that exercises the behavior under test.
+  - Load MLIR dialects before constructing dialect-specific entities when the dialect is required for parsing,
+    construction, or verification.
+  - When testing operation accessors, assert operands, results, attributes, properties, and collection lengths before
+    inserting the operation into a final block if detached-operation behavior matters.
+  - For wrapper hierarchies, cover construction, context ownership, accessor values, equality within one context,
+    inequality for different values, inequality across contexts, display/debug rendering, and upcast/downcast behavior.
+  - For parsing APIs, include one valid parse and one invalid parse when the API exposes a fallible parser.
+  - Dump-style tests may only assert that `dump()` runs without crashing when stderr capture is not available. Add a
+    short comment explaining that limitation.
 
 ## Backend And Platform Behavior
 
