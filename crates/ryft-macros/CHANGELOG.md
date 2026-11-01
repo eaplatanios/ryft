@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added the `#[capability]` attribute macro, which validates the conventions of capability traits and, for each
   `projection(Family => Member)` argument, implements the capability for values of the `Family` universe by
   projecting them onto their `Member` values.
+- Added the `#[mermaid]` attribute macro, which renders the [Mermaid](https://mermaid.js.org/) diagrams written in
+  `mermaid` code fences in rustdoc comments, choosing a light or dark diagram theme to match the rustdoc theme. It is
+  meant to be applied as `#[cfg_attr(doc, mermaid)]`. It loads a vendored Mermaid bundle that it writes into the
+  rustdoc output directory and falls back to a CDN when that bundle is unavailable.
 
 ### Fixed
 

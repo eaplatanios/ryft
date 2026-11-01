@@ -6,6 +6,7 @@ description = "Ryft procedural macros."
 keywords = ["ryft"]
 include = [
     "src/**/*",
+    "static/**/*",
     "Cargo.toml",
     "CHANGELOG.md",
     "README.md",
