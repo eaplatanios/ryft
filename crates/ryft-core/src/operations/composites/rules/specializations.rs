@@ -640,7 +640,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let leading_input_count = key.leading_input_types.len();
             let input_count = leading_input_count + key.input_tangent_types.len();
             let Some((inner, level)) = inner else {
-                let source_carrier = CompositeTransposeOperation::direct(
+                let source_carrier = CompositeTransposeOperation::for_backward_specialization(
                     self.clone(),
                     leading_input_count,
                     key.seed_extent_count,

@@ -207,11 +207,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Creates the source carrier from which the backward specializations of `rules` are derived, whose
-    /// transposition invokes the retained backward rule directly.
-    pub(in crate::operations::composites) fn direct(
+    /// Creates the source carrier from which the backward specializations of `rules` are derived,
+    /// whose transposition invokes the retained backward rule directly.
+    pub(in crate::operations::composites) fn for_backward_specialization(
         rules: S,
         leading_input_count: usize,
         seed_extent_count: usize,
@@ -235,8 +233,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns the number of leading known inputs of this carrier (i.e., any batching boundary inputs, the
-    /// non-differentiated inputs, the residuals, and the seed extents), which includes its
+    /// Returns the number of leading known inputs of this carrier (i.e., any batching boundary inputs,
+    /// the non-differentiated inputs, the residuals, and the seed extents), which includes its
     /// [`seed_extent_count`](Self::seed_extent_count) trailing seed extents.
     #[inline]
     pub fn leading_input_count(&self) -> usize {
@@ -262,8 +260,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         &self.output_tangent_types
     }
 
-    /// Returns the source of the retained backward rule of this carrier, or [`None`] when its backward rule is
-    /// attached.
+    /// Returns the source of the retained backward rule of this carrier, or [`None`] when its backward rule
+    /// is attached.
     #[inline]
     pub fn rules(&self) -> Option<&S> {
         match &self.rules {
@@ -330,8 +328,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns the input types of an attached backward region: the types of the leading inputs among `input_types`,
-    /// except for the seed extents, followed by the cotangent types of the outputs.
+    /// Returns the input types of an attached backward region (i.e., the types of the leading inputs among
+    /// `input_types`, except for the seed extents, followed by the cotangent types of the outputs).
     fn backward_input_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
         if self.leading_input_count > input_types.len() {
             return Err(TypeError::invalid(format!(
@@ -358,6 +356,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Clone
     for CompositeTransposeOperation<V, O, S>
 {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             leading_input_count: self.leading_input_count,
@@ -374,8 +373,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug
     for CompositeTransposeOperation<V, O, S>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // A retained backward rule is identified by the name of its definition, whose own rendering would include its
-        // rules.
+        // A retained backward rule is identified by the name of its definition, whose own rendering would include
+        // its rules.
         let mut debug = formatter.debug_struct("CompositeTransposeOperation");
         if let CompositeTransposeRules::Retained { rules, .. } = &self.rules {
             debug.field("name", &rules.name());
@@ -404,6 +403,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> PartialEq
     for CompositeTransposeOperation<V, O, S>
 {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.leading_input_count == other.leading_input_count
             && self.seed_extent_count == other.seed_extent_count
@@ -418,6 +418,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Eq for
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Hash
     for CompositeTransposeOperation<V, O, S>
 {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.leading_input_count.hash(state);
         self.seed_extent_count.hash(state);
@@ -478,6 +479,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             self.input_tangent_types.as_slice(),
             &input_types[self.leading_input_count..],
         ]);
+
         if let CompositeTransposeRules::Attached = self.rules {
             let backward = &region_interfaces[0];
             check_types!(@same, format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` backward rule input"), [
@@ -486,11 +488,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             ]);
 
             // Explicit dimension inputs retain their nominal identities even when their bounds prove an exact extent.
-            // Consequently, specializing `linear: f32[n]` to `f32[2]` can leave the backward region's
-            // `zero[n](extent)` output typed as `f32[n]`, with `n` now constrained to exactly 2. Require refinement in
-            // both directions to accept these equivalent representations without accepting a merely broader result.
-            // In particular, `f32[n]` with non-singleton bounds, a different extent, or unrelated non-exact identities
-            // still fail.
+            // Consequently, specializing `linear: f32[n]` to `f32[2]` can leave the backward region's `zero[n](extent)`
+            // output typed as `f32[n]`, with `n` now constrained to exactly 2. Require refinement in both directions to
+            // accept these equivalent representations without accepting a merely broader result. In particular,
+            // `f32[n]` with non-singleton bounds, a different extent, or unrelated non-exact identities still fail.
             let cotangent_types =
                 self.input_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
             if cotangent_types != backward.output_types()
@@ -505,6 +506,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 ]);
             }
         }
+
         Ok(self.output_tangent_types.clone())
     }
 
@@ -554,8 +556,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // The tangent types coincide with the types of the carrier's tangent inputs and outputs, so they are not
-        // rendered.
+        // The tangent types coincide with the types of the carrier's tangent inputs and outputs,
+        // so they are not rendered.
         let operation = OperationFormatter::new(formatter, indentation, COMPOSITE_TRANSPOSE_OPERATION_NAME)?;
         operation.bracketed(|operation| {
             if let CompositeTransposeRules::Retained { rules, .. } = &self.rules {
@@ -593,12 +595,12 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 }
 
-impl<C, P, V, O, S> ReferenceDischargeableOperation<C, P> for CompositeTransposeOperation<V, O, S>
+impl<V, O, S, C, P> ReferenceDischargeableOperation<C, P> for CompositeTransposeOperation<V, O, S>
 where
-    C: Context<Operation: From<CompositeTransposeOperation<V, O, S>>>,
-    P: ReferenceDischargePolicy<C>,
     V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
     S: CustomRuleSource<V, O>,
+    C: Context<Operation: From<CompositeTransposeOperation<V, O, S>>>,
+    P: ReferenceDischargePolicy<C>,
     CompositeTransposeOperation<V, O, S>: Operation<Type = C::Type>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -614,16 +616,18 @@ where
             CompositeTransposeRules::Attached => COMPOSITE_OPERATION_NAME,
             CompositeTransposeRules::Retained { rules, .. } => rules.name(),
         };
+
         if let Some(index) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
             let description = describe_composite(COMPOSITE_TRANSPOSE_OPERATION_NAME, name);
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{description} cannot discharge the reference state of its input {index}, because its rules receive \
-                     non-differentiated reference inputs by identity and cannot thread their state explicitly; pass \
-                     reference-free inputs or discharge external references first",
+                    "{description} cannot discharge the reference state of its input {index}, because its rules \
+                     receive non-differentiated reference inputs by identity and cannot thread their state explicitly; \
+                     pass reference-free inputs or discharge external references first",
                 ),
             });
         }
+
         match &self.rules {
             CompositeTransposeRules::Attached => discharge_local_reference_operation(self, context, driver, inputs),
             CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, deferred_forward, .. } => {
@@ -646,12 +650,13 @@ where
 }
 
 impl<
-    C: Domain<Type = V::Type>,
     V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
     O,
     S: CustomRuleSource<V, O>,
+    C: Domain<Type = V::Type>,
 > InterpretableOperation<C> for CompositeTransposeOperation<V, O, S>
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -668,13 +673,13 @@ impl<
     }
 }
 
+// A carrier always has an unknown tangent input when it is staged, and a retained backward rule's deferred work is
+// always residualized by the shared folding boundary, so the default rule suffices.
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
     PartiallyEvaluatableOperation<C> for CompositeTransposeOperation<C::Constant, C::Operation, S>
 where
     C::Operation: From<CompositeTransposeOperation<C::Constant, C::Operation, S>>,
 {
-    // A carrier always has an unknown tangent input when it is staged, and a retained backward rule's deferred work is
-    // always residualized by the shared folding boundary, so the default rule suffices.
 }
 
 impl<C, P, S> BatchableOperation<C, P> for CompositeTransposeOperation<C::Constant, C::Operation, S>
@@ -700,8 +705,8 @@ where
                 // keeping it avoids manufacturing a batch axis that its backward region does not observe. What makes
                 // this shortcut sound is the level being unnamed: a region's value can vary per batch item with no
                 // mapped input only by addressing the level by name (e.g., an `axis_index` or a collective over the
-                // level's axis). Any other carrier is rejected, because no forward program determines the batch axes of
-                // its outputs.
+                // level's axis). Any other carrier is rejected, because no forward program determines the batch axes
+                // of its outputs.
                 if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
                     let outputs = context.parent().bind(
                         self.clone(),
@@ -724,11 +729,11 @@ where
                 let message = format!("{description} source carriers are never batched");
                 return Err(ProgramError::MalformedProgram(message).into());
             }
-
-            // Transposing a deferred carrier replays the forward rule at the batching levels of the call from which it
-            // was staged, which its forward key records, while a level added to the carrier itself would also have to
-            // batch that replay over the carrier's leading inputs, whose batch axes no forward key describes.
             CompositeTransposeRules::Retained { deferred_forward: Some(_), rules, .. } => {
+                // Transposing a deferred carrier replays the forward rule at the batching levels of the call from which
+                // it was staged, which its forward key records, while a level added to the carrier itself would also
+                // have to batch that replay over the carrier's leading inputs, whose batch axes no forward key
+                // describes.
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
                         "{} defers its forward rule to the backward pass (refer to `with_deferred_forward`), so it \
@@ -741,8 +746,8 @@ where
             CompositeTransposeRules::Retained { rules, batching, discharged, .. } => (rules, batching, *discharged),
         };
 
-        // Without a forward program, the natural output layout is unknown, so every output is mapped at axis 0. The
-        // batched output types are those of an identity program over the current output types at that layout.
+        // Without a forward program, the natural output layout is unknown, so every output is mapped at axis `0`.
+        // The batched output types are those of an identity program over the current output types at that layout.
         let output_axes = vec![BatchAxis::new(0); self.output_tangent_types.len()];
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let identity_inputs =
@@ -795,6 +800,7 @@ where
             },
             marker: PhantomData,
         };
+
         let mut packed_inputs = boundary_inputs;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(carrier, Vec::new(), packed_inputs.as_slice())?;
@@ -810,6 +816,7 @@ where
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
     DifferentiableOperation<C> for CompositeTransposeOperation<C::Constant, C::Operation, S>
 {
+    #[inline]
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         _context: &DifferentiationContext<C, P>,
@@ -828,13 +835,13 @@ impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Co
 
 impl<V, O, S> TransposableOperation<V, O> for CompositeTransposeOperation<V, O, S>
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType + Eq + Hash>,
     O: Operation<Type = V::Type>
         + From<CompositeTransposeOperation<V, O>>
         + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     S: CustomRuleSpecializer<V, O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -856,6 +863,7 @@ where
                 ))
             })?);
         }
+
         let seed_extent_count = self.seed_extent_count;
         let (rules, batching, invokes_rule_directly, discharged, deferred_forward) = match &self.rules {
             CompositeTransposeRules::Attached => {
@@ -944,8 +952,8 @@ where
             } => (rules, batching, *invokes_rule_directly, *discharged, deferred_forward),
         };
 
-        // Even without leading inputs or live seeds, a retained rule can carry effects or deferred work. Its selected
-        // specialization must be traced before unused numerical work can be removed.
+        // Even without leading inputs or live seeds, a retained rule can carry effects or deferred work.
+        // Its selected specialization must be traced before unused numerical work can be removed.
         if invokes_rule_directly {
             let Some(vjp) = rules.native_definition().and_then(|definition| definition.vjp()) else {
                 return Err(ProgramError::UnsupportedOperation {
@@ -975,14 +983,14 @@ where
                     .collect::<Vec<_>>();
                 (Cow::Owned(inputs), Cow::Owned(accumulators))
             };
+
             let cotangents = match vjp.backward() {
                 CustomRuleVjpBackward::Accumulating(rule) => {
                     return Ok(rule.apply(context, &rule_inputs, outputs, &rule_accumulators)?);
                 }
-
-                // A pure rule receives materialized seeds. A zero seed whose type names runtime extents reads them
-                // from the leading inputs, including the seed extents that the rule itself never receives.
                 CustomRuleVjpBackward::Pure(rule) => {
+                    // A pure rule receives materialized seeds. A zero seed whose type names runtime extents reads them
+                    // from the leading inputs, including the seed extents that the rule itself never receives.
                     let seeds = outputs
                         .iter()
                         .map(|seed| {
@@ -994,10 +1002,9 @@ where
                         .map(MaybeZero::Value)
                         .collect::<Vec<_>>()
                 }
-
-                // A rule that receives structural zero seeds may also return structural zero cotangents, which
-                // contribute nothing to their destinations, so they stay structural zeros for the transposition.
                 CustomRuleVjpBackward::PureWithSymbolicZeros(rule) => {
+                    // A rule that receives structural zero seeds may also return structural zero cotangents, which
+                    // contribute nothing to their destinations, so they stay structural zeros for the transposition.
                     rule.apply(&**context, &leading_values[..rule_leading_input_count], outputs)?
                 }
             };
@@ -1019,6 +1026,7 @@ where
             for (accumulator, cotangent) in rule_accumulators[rule_leading_input_count..].iter().zip(cotangents) {
                 accumulator.accumulate(context, cotangent)?;
             }
+
             return Ok(());
         }
 
@@ -1036,14 +1044,16 @@ where
                     key.levels.iter().map(|level| level.boundary_input_count).sum::<usize>();
                 if call_input_count != call_boundary_input_count + key.input_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "{} has {call_input_count} call inputs but its deferred forward rule expects {} boundary \
-                         inputs and {} call inputs",
+                        "{} has {} call inputs but its deferred forward rule expects \
+                         {} boundary inputs and {} call inputs",
                         describe_composite(COMPOSITE_TRANSPOSE_OPERATION_NAME, rules.name()),
+                        call_input_count,
                         call_boundary_input_count,
                         key.input_types.len(),
                     ))
                     .into());
                 }
+
                 let rule_output_count = key.rule_output_count()?;
                 let forward = rules.forward_specialization(key.clone())?;
                 if !forward.program.effects().is_pure() {
@@ -1118,6 +1128,7 @@ where
                 }
             }
         }
+
         let (key, boundary_input_count) = match batching {
             None => (
                 CustomRuleBackwardSpecializationKey {
@@ -1159,8 +1170,8 @@ where
         };
         let specialization = rules.backward_specialization(key)?;
 
-        // The specialized program consumes the boundary inputs, then the live seeds, then the caller buffers, then the
-        // remaining known leading inputs, and returns the cotangents of the differentiated inputs with returned
+        // The specialized program consumes the boundary inputs, then the live seeds, then the caller buffers, then
+        // the remaining known leading inputs, and returns the cotangents of the differentiated inputs with returned
         // destinations, except for the structural zero cotangents, which contribute nothing to their destinations.
         let mut leading_values = leading_values.into_iter();
         let mut arguments = leading_values.by_ref().take(boundary_input_count).collect::<Vec<_>>();
@@ -1180,9 +1191,12 @@ where
                 accumulator.accumulate(context, MaybeZero::Value(cotangent))?;
             }
         }
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Backward rule of a [`CompositeTransposeOperation`], in the representation of the call that staged it.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -2208,7 +2222,7 @@ mod tests {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let carrier = CompositeTransposeOperation::direct(
+        let carrier = CompositeTransposeOperation::for_backward_specialization(
             definition.reference(),
             1,
             0,
