@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
 use crate::compilation::functions::{
-    CompilationStagingRequest, CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram,
-    LoweredFunction, ReferenceExecution, StagedFunction,
+    CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram, LoweredFunction,
+    ReferenceExecution, StagedFunction, trace_function,
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -174,16 +174,19 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         Ok(output_types)
     }
 
-    /// Traces the fallible function of `request`, with its explicit runtime captures and their symbolic references,
-    /// into a staged function. This is the only staging primitive. It applies [`Self::staged_input_types`] before
-    /// tracing and [`Self::staged_output_types`] after tracing, and retains the options of `request` in the returned
-    /// staged function.
+    /// Traces the fallible `function` into a staged function. `function` receives the symbolic references of
+    /// `captures`, tracers for those captures, and tracers for inputs of `input_types`, and returns its traced outputs.
+    /// This is the only staging primitive. It applies [`Self::staged_input_types`] before tracing and
+    /// [`Self::staged_output_types`] after tracing, and retains `options` in the returned staged function.
     ///
     /// Backends must not override this function (refer to the [`CompilationDomain`] documentation for why).
     #[inline]
     fn stage<F, Input, Output>(
         &self,
-        request: CompilationStagingRequest<Self, F, Input, Output>,
+        function: F,
+        captures: Vec<Self::Value>,
+        input_types: Input,
+        options: Self::Options,
     ) -> Result<StagedFunction<Self, Input, Output>, Self::Error>
     where
         Self: Sized,
@@ -204,7 +207,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
-        request.trace(self)
+        trace_function(self, function, captures, input_types, options)
     }
 
     /// Lowers a staged function into the program representation of this backend (i.e., [`Self::LoweredProgram`]).

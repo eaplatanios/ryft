@@ -36,9 +36,9 @@
 //!     [`CompiledFunctionDispatcher`] specializes on explicit static host parameters, the dynamic input's parameter
 //!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization traces, lowers,
 //!     and requests compilation; warm calls dispatch directly to the retained executable.
-//!   - Use [`stage`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
-//!     [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed.
-//!     Then continue with [`CompilationDomain::lower`] and [`CompilationDomain::compile`].
+//!   - Use [`stage`] for ordinary capture-free staging. Call [`CompilationDomain::stage`] directly when fallibility,
+//!     runtime captures, or symbolic capture references are needed. Then continue with [`CompilationDomain::lower`]
+//!     and [`CompilationDomain::compile`].
 //!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::call`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
 //!     [`ExecutableFunction::call_statefully`] or [`ExecutableFunction::call_statefully_async`] instead. Retained
@@ -146,8 +146,8 @@
 //! [`CompilationDomain`] functions accept [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
 //! implementations. These traits keep the structured input and output bounds of each stage in one place and expose
 //! only the operations that a backend needs to complete it. They are also required by a limitation of the Rust
-//! compiler, which [`CompilationDomain`] documents. Ordinary callers construct a [`CompilationStagingRequest`]
-//! or use [`stage`], while backend implementations name the request traits in their bounds and complete each stage
+//! compiler, which [`CompilationDomain`] documents. Ordinary callers use [`CompilationDomain::stage`] or [`stage`],
+//! while backend implementations name the request traits in their bounds and complete each stage
 //! through their `into_lowered`, `into_compiled`, or `reconstruct` functions.
 
 pub mod caching;
@@ -165,8 +165,7 @@ pub use contexts::{
 };
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
-    CompilationCall, CompilationStagingRequest, CompilationTracer, CompiledCallOperation, CompiledFunction,
-    CompiledFunctionDispatcher, ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey,
-    JitCacheStatistics, LoweredFunction, ReferenceExecution, StagedFunction, jit, jit_with_options,
-    jit_with_options_and_capacity, stage,
+    CompilationCall, CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher,
+    ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction,
+    ReferenceExecution, StagedFunction, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };

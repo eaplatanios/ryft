@@ -3,8 +3,7 @@
 //! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
 //! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
 //! structured signatures. [`StagedFunction`], [`LoweredFunction`], and [`CompilationCall`] implement the request
-//! traits through which a [`CompilationDomain`] completes lowering, compilation, and execution, while
-//! [`CompilationStagingRequest`] carries the inputs of [`CompilationDomain::stage`].
+//! traits through which a [`CompilationDomain`] completes lowering, compilation, and execution.
 //! [`CompiledFunctionDispatcher`] retains compiled specializations of one Rust closure, and [`jit`] and its variants
 //! construct it.
 
@@ -108,33 +107,15 @@ pub type FlatCompilationProgram<C> = Program<
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
 
-/// Complete typed request consumed by [`CompilationDomain::stage`].
-pub struct CompilationStagingRequest<C: CompilationDomain, F, Input, Output> {
-    /// Function being traced.
+/// Traces `function` into a staged function through the staging hooks of `domain`, implementing
+/// [`CompilationDomain::stage`] (refer to its documentation for the meaning of the arguments).
+pub(crate) fn trace_function<C, F, Input, Output>(
+    domain: &C,
     function: F,
-
-    /// Concrete runtime captures exposed symbolically while tracing.
     captures: Vec<C::Value>,
-
-    /// Structured abstract input signature.
     input_types: Input,
-
-    /// Options fixed before tracing begins.
     options: C::Options,
-
-    /// Staged output signature marker.
-    output: PhantomData<fn() -> Output>,
-}
-
-impl<C: CompilationDomain, F, Input, Output> CompilationStagingRequest<C, F, Input, Output> {
-    /// Creates a complete staging request.
-    #[inline]
-    pub fn new(function: F, captures: Vec<C::Value>, input_types: Input, options: C::Options) -> Self {
-        Self { function, captures, input_types, options, output: PhantomData }
-    }
-}
-
-impl<C, F, Input, Output> CompilationStagingRequest<C, F, Input, Output>
+) -> Result<StagedFunction<C, Input, Output>, C::Error>
 where
     C: CompilationDomain,
     F: FnOnce(
@@ -150,53 +131,48 @@ where
         Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Traces this request into a staged function through the staging hooks of `domain`. This implements
-    /// [`CompilationDomain::stage`].
-    pub(crate) fn trace(self, domain: &C) -> Result<StagedFunction<C, Input, Output>, C::Error> {
-        let Self { function, captures, input_types, options, .. } = self;
-        validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
-        let input_structure = input_types.parameter_structure();
-        let input_type_values = domain.staged_input_types(input_types.into_parameters().collect(), &options)?;
-        let input_types = Input::from_parameters(input_structure.clone(), input_type_values.iter().cloned())
-            .map_err(ProgramError::from)?;
-        let context = DomainTracingContext::<C, C::Value>::new();
-        let capture_table = context.captures().clone();
-        let builder = context.builder().clone();
-        let capture_references =
-            captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
-        let capture_tracers = capture_references
-            .iter()
-            .cloned()
-            .map(|capture| StagingContext::constant(&context, capture))
-            .collect::<Vec<_>>();
-        let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
-        let outputs = function(capture_references, capture_tracers, inputs)?;
-        check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
-        if let Some(error) = builder.borrow_mut().error.take() {
-            return Err(error.into());
-        }
-        let output_structure = outputs.parameter_structure();
-        let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-        let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-        let output_types = domain.staged_output_types(output_types, &options)?;
-        drop(outputs);
-        drop(context);
-        let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
-        let source_program = ClosedProgram::new(program, captures)?;
-        let source_program = source_program.without_unused_captures()?;
-        Ok(StagedFunction {
-            state: Arc::new(StagedFunctionState {
-                source_program,
-                input_types: input_type_values,
-                output_types,
-                output_structure,
-                options: Arc::new(options),
-                lifted_program: OnceLock::new(),
-            }),
-        })
+    validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
+    let input_structure = input_types.parameter_structure();
+    let input_type_values = domain.staged_input_types(input_types.into_parameters().collect(), &options)?;
+    let input_types = Input::from_parameters(input_structure.clone(), input_type_values.iter().cloned())
+        .map_err(ProgramError::from)?;
+    let context = DomainTracingContext::<C, C::Value>::new();
+    let capture_table = context.captures().clone();
+    let builder = context.builder().clone();
+    let capture_references =
+        captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
+    let capture_tracers = capture_references
+        .iter()
+        .cloned()
+        .map(|capture| StagingContext::constant(&context, capture))
+        .collect::<Vec<_>>();
+    let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
+    let outputs = function(capture_references, capture_tracers, inputs)?;
+    check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
+    if let Some(error) = builder.borrow_mut().error.take() {
+        return Err(error.into());
     }
+    let output_structure = outputs.parameter_structure();
+    let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+    let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+    let output_types = domain.staged_output_types(output_types, &options)?;
+    drop(outputs);
+    drop(context);
+    let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
+    let source_program = ClosedProgram::new(program, captures)?;
+    let source_program = source_program.without_unused_captures()?;
+    Ok(StagedFunction {
+        state: Arc::new(StagedFunctionState {
+            source_program,
+            input_types: input_type_values,
+            output_types,
+            output_structure,
+            options: Arc::new(options),
+            lifted_program: OnceLock::new(),
+        }),
+    })
 }
 
 /// Complete typed request consumed by [`CompilationDomain::call`].
@@ -1555,12 +1531,12 @@ where
                 .map_err(ProgramError::from)?;
         statistics.traces.fetch_add(1, Ordering::Relaxed);
         let tracing_start = Instant::now();
-        let staged = self.state.domain.stage(CompilationStagingRequest::new(
+        let staged = self.state.domain.stage(
             |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
             Vec::new(),
             input_types,
             self.state.options.clone(),
-        ));
+        );
         accumulate_duration(&statistics.tracing_nanoseconds, tracing_start.elapsed());
         let staged = staged?;
         statistics.lowerings.fetch_add(1, Ordering::Relaxed);
@@ -1696,9 +1672,8 @@ where
 
 /// Stages an infallible capture-free function through `domain`.
 ///
-/// This is the convenience form of [`CompilationDomain::stage`] for functions without runtime captures. Construct a
-/// [`CompilationStagingRequest`] and pass it to [`CompilationDomain::stage`] directly when the function is fallible or
-/// closes over runtime captures.
+/// This is the convenience form of [`CompilationDomain::stage`] for functions without runtime captures. Call
+/// [`CompilationDomain::stage`] directly when the function is fallible or closes over runtime captures.
 pub fn stage<C, F, Input, Output>(
     domain: &C,
     function: F,
@@ -1716,7 +1691,7 @@ where
         Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    domain.stage(CompilationStagingRequest::new(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options))
+    domain.stage(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
 }
 
 #[cfg(test)]
@@ -2048,13 +2023,12 @@ mod tests {
     #[test]
     fn test_compilation_staging_request_trace_propagates_closure_error() {
         let domain = TestDomain::new();
-        let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> =
-            domain.stage(CompilationStagingRequest::new(
-                |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
-                Vec::new(),
-                ArrayType::scalar(DataType::F64),
-                TestOptions::default(),
-            ));
+        let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> = domain.stage(
+            |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
+            Vec::new(),
+            ArrayType::scalar(DataType::F64),
+            TestOptions::default(),
+        );
 
         assert!(matches!(result, Err(ProgramError::InvalidArgument { message }) if message == "staging failed"));
     }
@@ -2063,12 +2037,12 @@ mod tests {
     fn test_compilation_staging_request_trace_prunes_unused_captures() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
-            .stage(CompilationStagingRequest::new(
+            .stage(
                 |_, _, input: CompilationTracer<TestDomain>| Ok(input),
                 vec![Array::scalar(7.0).unwrap()],
                 ArrayType::scalar(DataType::F64),
                 TestOptions::default(),
-            ))
+            )
             .unwrap();
 
         assert!(staged.source_program().captures().is_empty());
@@ -2191,12 +2165,12 @@ mod tests {
     fn test_compiled_function() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, (), ArrayType> = domain
-            .stage(CompilationStagingRequest::new(
+            .stage(
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
                 vec![Array::scalar(7.0).unwrap()],
                 (),
                 TestOptions::default(),
-            ))
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
@@ -2211,12 +2185,12 @@ mod tests {
     fn test_compiled_function_into_executable_function() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, (), ArrayType> = domain
-            .stage(CompilationStagingRequest::new(
+            .stage(
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
                 vec![Array::scalar(7.0).unwrap()],
                 (),
                 TestOptions::default(),
-            ))
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let executable = compiled.into_executable_function();
