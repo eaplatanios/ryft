@@ -31,8 +31,6 @@ const TRANSPOSITION_DISPATCHER: Symbol = Symbol::new("transposition");
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Generates the `#[derive(Operation)]` implementations for the provided input. This function also checks for any
 /// errors on the provided input and will generate a [`TokenStream`] that contains a call to [`compile_error!`] if any
 /// errors are encountered. Refer to the documentation of the `Operation` trait in `ryft-core` for information on how
@@ -160,6 +158,8 @@ struct OperationParser {
     errors: Vec<syn::Error>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl OperationParser {
     /// Creates a new [`OperationParser`] that has not extracted any information yet.
     fn new() -> Self {
@@ -242,7 +242,7 @@ impl OperationParser {
             (Some(_), Some(_)) => {}
             (None, None) => {
                 let mut operation_types = Vec::<syn::Type>::new();
-                for (_, operation_type) in value_bounds(&input.generics) {
+                for (_, operation_type) in value_parameters(&input.generics) {
                     if !operation_types.iter().any(|existing_type| existing_type.tokens_eq(&operation_type)) {
                         operation_types.push(operation_type);
                     }
@@ -564,22 +564,22 @@ impl OperationParser {
 
         // Enums with an explicit constant type have no generic program constant parameter. For all other enums, the
         // operation type was inferred from their `Value<Type = T>` parameters, and so there is at least one of them.
-        let mut value_parameters = value_bounds(&generics)
+        let mut operation_value_parameters = value_parameters(&generics)
             .into_iter()
             .filter(|(_, value_type)| value_type.tokens_eq(&operation_type))
             .map(|(parameter, _)| parameter.clone())
             .collect::<Vec<_>>();
-        value_parameters.dedup();
+        operation_value_parameters.dedup();
         let (program_constant_type, program_constant_parameter, has_separate_runtime_value_type) =
             match &self.program_constant_type {
                 Some(program_constant_type) => (program_constant_type.clone(), None, true),
                 None => {
-                    let parameter = value_parameters[0].clone();
-                    (syn::parse_quote!(#parameter), Some(parameter), value_parameters.len() == 1)
+                    let parameter = operation_value_parameters[0].clone();
+                    (syn::parse_quote!(#parameter), Some(parameter), operation_value_parameters.len() == 1)
                 }
             };
         let substituted_parameters = match &program_constant_parameter {
-            Some(_) => value_parameters.iter().skip(2).collect::<Vec<_>>(),
+            Some(_) => operation_value_parameters.iter().skip(2).collect::<Vec<_>>(),
             None => Vec::new(),
         };
         let program_constant_path = program_constant_parameter.clone().map(syn::Path::from);
@@ -1873,10 +1873,10 @@ impl OperationEnum {
 
     /// Generates the `OperationPayloadProjection` implementation. Projected member variants delegate to their member
     /// families in both directions, lifting constructed member operations through the `From<Member>` conversion of
-    /// the enum. Every other variant projects into its payload when the payload type is `'static` independently of the
-    /// generic parameters of the enum (refer to [`is_generic_independent`]), and such family-native variants are also
-    /// constructed from their payloads, before any projected member is tried. Mixed member variants are never
-    /// constructed, and generic extension variants are neither projected nor constructed.
+    /// the enum. Every other variant projects into its payload when the payload type is `'static` for every
+    /// instantiation of the generic parameters of the enum (refer to [`is_unconditionally_static`]), and such
+    /// family-native variants are also constructed from their payloads, before any projected member is tried. Mixed
+    /// member variants are never constructed, and generic extension variants are neither projected nor constructed.
     fn generate_payload_projection_impl(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let self_type = &self.self_type;
@@ -1908,7 +1908,7 @@ impl OperationEnum {
                         ::std::result::Result::Err(payload) => payload,
                     };
                 });
-            } else if is_generic_independent(payload_type, &self.generics) {
+            } else if is_unconditionally_static(payload_type, &self.generics) {
                 projection_arms.push(quote! {
                     Self::#variant_ident(operation) if payload == ::std::any::TypeId::of::<#payload_type>() => {
                         ::std::option::Option::Some(#receiver as &dyn ::std::any::Any)
@@ -2376,12 +2376,13 @@ impl OperationVariantClass {
     }
 }
 
-/// Returns the type `T` of every `Value<Type = T>` bound of the generic type parameters in the provided
-/// [`syn::Generics`], paired with the parameter that it bounds, in parameter declaration order. This includes both the
-/// inline parameter bounds and the `where` predicates whose bounded type is exactly the parameter. Given that
-/// procedural macros are executed before type checking and inference is performed by the Rust compiler, this function
-/// recognizes bounds by their final path segment being `Value` (e.g., `Value<Type = T>` or `ryft::Value<Type = T>`).
-fn value_bounds(generics: &syn::Generics) -> Vec<(&syn::Ident, syn::Type)> {
+/// Returns the generic type parameters in the provided [`syn::Generics`] that are bounded by `Value<Type = T>`, each
+/// paired with its type `T`, in parameter declaration order. Both inline parameter bounds and `where` predicates whose
+/// bounded type is exactly the parameter count, and a parameter with several such bounds appears once per bound. Given
+/// that procedural macros are executed before type checking and inference is performed by the Rust compiler, this
+/// function recognizes the bounds by their final path segment being `Value` (e.g., `Value<Type = T>` or
+/// `ryft::Value<Type = T>`).
+fn value_parameters(generics: &syn::Generics) -> Vec<(&syn::Ident, syn::Type)> {
     /// Returns the type `T` of the provided `Value<Type = T>` bound, or [`None`] if it is any other bound.
     fn value_bound_type(bound: &syn::TypeParamBound) -> Option<syn::Type> {
         let syn::TypeParamBound::Trait(bound) = bound else {
@@ -2427,11 +2428,13 @@ fn value_bounds(generics: &syn::Generics) -> Vec<(&syn::Ident, syn::Type)> {
         .collect()
 }
 
-/// Returns `true` if the provided [`syn::Type`] is `'static` independently of the provided [`syn::Generics`], which
-/// holds when it mentions none of their generic type parameters and no lifetime. This check is syntactic and therefore
-/// conservative. That is, every identifier that matches a type parameter counts as a mention, and so does every
-/// lifetime (including `'static`). Const parameters do not count, because they cannot make a type non-`'static`.
-fn is_generic_independent(ty: &syn::Type, generics: &syn::Generics) -> bool {
+/// Returns `true` if the provided [`syn::Type`] is `'static` for every instantiation of the provided [`syn::Generics`],
+/// which holds when it mentions none of their type parameters and no lifetime. Such types can be named in `'static`
+/// contexts, like `TypeId::of` and `downcast`, without any bounds on the generic parameters. This check is syntactic
+/// and therefore conservative. That is, every identifier that matches a type parameter counts as a mention, and so
+/// does every lifetime (including `'static`). Const parameters do not count, because they cannot make a type
+/// non-`'static`, even though types that mention them may differ across instantiations.
+fn is_unconditionally_static(ty: &syn::Type, generics: &syn::Generics) -> bool {
     fn mentions(tokens: TokenStream, parameters: &[&syn::Ident]) -> bool {
         tokens.into_iter().any(|token| match token {
             proc_macro2::TokenTree::Group(group) => mentions(group.stream(), parameters),
@@ -4506,7 +4509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_bounds() {
+    fn test_value_parameters() {
         let input: syn::DeriveInput = syn::parse_quote! {
             enum Operation<T, V: Clone + ryft::Value<Type = T>, W, X: Value<T>, Y: Value<Type = A, Other = B>>
             where
@@ -4515,7 +4518,7 @@ mod tests {
             {}
         };
         assert_eq!(
-            value_bounds(&input.generics)
+            value_parameters(&input.generics)
                 .into_iter()
                 .map(|(parameter, value_type)| (parameter.to_string(), value_type.to_compact_string()))
                 .collect::<Vec<_>>(),
@@ -4524,14 +4527,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_generic_independent() {
+    fn test_is_unconditionally_static() {
         let generics: syn::Generics = syn::parse_quote!(<'a, V: Value, const N: usize>);
-        assert!(is_generic_independent(&syn::parse_quote!(DotOperation), &generics));
-        assert!(is_generic_independent(&syn::parse_quote!(TagOperation<ArrayType>), &generics));
-        assert!(is_generic_independent(&syn::parse_quote!(FixedOperation<N>), &generics));
-        assert!(!is_generic_independent(&syn::parse_quote!(ScanOperation<V>), &generics));
-        assert!(!is_generic_independent(&syn::parse_quote!(Box<[(u8, fn(V))]>), &generics));
-        assert!(!is_generic_independent(&syn::parse_quote!(BorrowedOperation<'a>), &generics));
-        assert!(!is_generic_independent(&syn::parse_quote!(&'static str), &generics));
+        assert!(is_unconditionally_static(&syn::parse_quote!(DotOperation), &generics));
+        assert!(is_unconditionally_static(&syn::parse_quote!(TagOperation<ArrayType>), &generics));
+        assert!(is_unconditionally_static(&syn::parse_quote!(FixedOperation<N>), &generics));
+        assert!(!is_unconditionally_static(&syn::parse_quote!(ScanOperation<V>), &generics));
+        assert!(!is_unconditionally_static(&syn::parse_quote!(Box<[(u8, fn(V))]>), &generics));
+        assert!(!is_unconditionally_static(&syn::parse_quote!(BorrowedOperation<'a>), &generics));
+        assert!(!is_unconditionally_static(&syn::parse_quote!(&'static str), &generics));
     }
 }
