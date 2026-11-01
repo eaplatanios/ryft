@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the `erf` operation from the `chlo` dialect.
 - Added support for the `real_dynamic_slice` operation from the `stablehlo` dialect.
 - Added StableHLO mesh and sub-axis attribute wrappers.
+- Added StableHLO `exp2`, `log2`, and `fma` operation wrappers.
 - Added signless and unsigned integer `Context` constructors for widths `1`, `2`, `4`, `8`, `16`, `32`, `64`, and
   `128`, plus `bool_type` as an alias for `i1_type`.
 - Added the builtin `TokenTypeRef` and `Context::token_type` for the new builtin `token` type.
@@ -59,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Updated StableHLO `collective_broadcast` to accept multiple data tensors and optional dynamic roots. Both new
   collective root APIs exclude the root-index tensor from their inferred results.
 - Minor performance optimizations for some of the `shardy` dialect builders.
-- Upgraded to the LLVM, StableHLO (v1.20.0), Shardy, and Triton revisions pinned by OpenXLA commit
-  `eb6b90ed013f511eca088c52f541f3c0819f919e`.
+- Updated GPU target-attachment passes for LLVM's split native registration families while preserving bulk registration.
+- Upgraded to the LLVM, StableHLO (v1.24.0), Shardy, and Triton revisions pinned by OpenXLA commit
+  `f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163` and JAX commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`.
 
 ### Removed
 
@@ -70,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   have the MLIR `TokenProducerTrait` and consuming operations must have the `TokenConsumerTrait`).
 - Removed the EmitC `apply` operation wrapper following the upstream removal of the deprecated `emitc.apply`
   operation, whose functionality is covered by the existing `address_of` and `dereference` operation wrappers.
+- Removed Mosaic GPU `wait` and temporary `arrive_dyn_expect_tx_supported` wrappers removed by the pinned JAX revision.
 
 ## [0.0.2] - 2026-03-02
 

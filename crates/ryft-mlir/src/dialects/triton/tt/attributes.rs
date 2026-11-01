@@ -1,6 +1,8 @@
 use ryft_xla_sys::bindings::MlirAttribute;
 use ryft_xla_sys::mlir::dialects::triton::tt::{
-    MlirTritonTtEnumAttribute, mlirAttributeIsATritonTtEnumAttr, mlirTritonTtEnumAttrGet, mlirTritonTtEnumAttrGetValue,
+    MlirTritonTtEnumAttribute, mlirAttributeIsATritonTtCachePolicyAttr, mlirAttributeIsATritonTtEnumAttr,
+    mlirTritonTtCachePolicyAttrGet, mlirTritonTtCachePolicyAttrGetCacheModifier,
+    mlirTritonTtCachePolicyAttrGetEvictionPolicy, mlirTritonTtEnumAttrGet, mlirTritonTtEnumAttrGetValue,
 };
 
 use crate::{Attribute, Context, DialectHandle, Error, StringRef, mlir_subtype_trait_impls};
@@ -294,6 +296,75 @@ tt_enum_attribute!(
     },
 );
 
+/// Triton target-neutral cache hints for loads, stores, and descriptor loads.
+///
+/// Cache hints affect performance and do not change memory ordering. Target dialects may provide richer attributes.
+#[derive(Copy, Clone)]
+pub struct CachePolicyAttributeRef<'c, 't> {
+    /// Handle that represents this [`Attribute`] in the MLIR C API.
+    handle: MlirAttribute,
+
+    /// [`Context`] that owns this [`Attribute`].
+    context: &'c Context<'t>,
+}
+
+impl CachePolicyAttributeRef<'_, '_> {
+    /// Returns the cache modifier hint.
+    pub fn cache_modifier(&self) -> Result<CacheModifier, Error> {
+        let value = unsafe { StringRef::from_c_api(mlirTritonTtCachePolicyAttrGetCacheModifier(self.handle)) };
+        CacheModifier::from_str(value.as_str().map_err(|_| Error::invalid_argument("invalid Triton cache modifier"))?)
+            .ok_or_else(|| Error::invalid_argument("invalid Triton cache modifier"))
+    }
+
+    /// Returns the cache eviction hint.
+    pub fn eviction_policy(&self) -> Result<EvictionPolicy, Error> {
+        let value = unsafe { StringRef::from_c_api(mlirTritonTtCachePolicyAttrGetEvictionPolicy(self.handle)) };
+        EvictionPolicy::from_str(value.as_str().map_err(|_| Error::invalid_argument("invalid Triton eviction policy"))?)
+            .ok_or_else(|| Error::invalid_argument("invalid Triton eviction policy"))
+    }
+}
+
+impl<'c, 't> Attribute<'c, 't> for CachePolicyAttributeRef<'c, 't> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if !handle.ptr.is_null() && unsafe { mlirAttributeIsATritonTtCachePolicyAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected Triton cache policy attribute handle"))
+        }
+    }
+
+    unsafe fn to_c_api(&self) -> MlirAttribute {
+        self.handle
+    }
+
+    fn context(&self) -> &'c Context<'t> {
+        self.context
+    }
+}
+
+mlir_subtype_trait_impls!(CachePolicyAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
+
+impl<'t> Context<'t> {
+    /// Creates a target-neutral Triton cache policy owned by this [`Context`].
+    pub fn triton_tt_cache_policy_attribute<'c>(
+        &'c self,
+        cache_modifier: CacheModifier,
+        eviction_policy: EvictionPolicy,
+    ) -> Result<CachePolicyAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::triton_tt()?)?;
+        unsafe {
+            CachePolicyAttributeRef::from_c_api(
+                mlirTritonTtCachePolicyAttrGet(
+                    *self.handle.borrow_mut(),
+                    StringRef::from(cache_modifier.as_str()).to_c_api(),
+                    StringRef::from(eviction_policy.as_str()).to_c_api(),
+                ),
+                self,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -516,4 +587,32 @@ mod tests {
         E5M2,
         "0 : i32",
     );
+    #[test]
+    fn test_cache_policy_attribute() {
+        let context = Context::new();
+        let attribute = context
+            .triton_tt_cache_policy_attribute(CacheModifier::CacheAll, EvictionPolicy::EvictFirst)
+            .unwrap();
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.cache_modifier(), Ok(CacheModifier::CacheAll));
+        assert_eq!(attribute.eviction_policy(), Ok(EvictionPolicy::EvictFirst));
+        assert_eq!(attribute.to_string(), "#tt.cache_policy<cache_modifier = ca, eviction_policy = evict_first>");
+        test_attribute_casting(attribute);
+        assert_eq!(
+            attribute,
+            context
+                .triton_tt_cache_policy_attribute(CacheModifier::CacheAll, EvictionPolicy::EvictFirst)
+                .unwrap()
+        );
+        assert_ne!(
+            attribute,
+            context
+                .triton_tt_cache_policy_attribute(CacheModifier::CacheGlobal, EvictionPolicy::EvictFirst)
+                .unwrap()
+        );
+        assert!(matches!(
+            unsafe { CachePolicyAttributeRef::from_c_api(MlirAttribute { ptr: std::ptr::null() }, &context) },
+            Err(Error::InvalidArgument { message, .. }) if message == "expected Triton cache policy attribute handle",
+        ));
+    }
 }

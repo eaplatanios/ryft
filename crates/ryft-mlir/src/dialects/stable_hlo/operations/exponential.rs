@@ -303,6 +303,44 @@ pub fn exponential_minus_one<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locati
         })
 }
 
+/// StableHLO [`Operation`] that computes the base-2 exponential of each tensor element. Floating-point and
+/// complex elements use their corresponding mathematical operation. Quantized inputs are dequantized before the
+/// operation and the output is quantized again. The result has the same shape and baseline element type as the input.
+///
+/// # Example
+///
+/// ```mlir
+/// %result = stablehlo.exp2 %operand : tensor<2x2xf64>
+/// ```
+///
+/// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#exp2) for more information.
+pub trait Exp2Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
+
+mlir_op!(Exp2);
+mlir_op_trait!(Exp2, OneOperand);
+mlir_op_trait!(Exp2, OneResult);
+mlir_op_trait!(Exp2, ZeroRegions);
+mlir_op_trait!(Exp2, ZeroSuccessors);
+mlir_op_trait!(Exp2, @local HasAccuracy);
+
+/// Constructs a detached [`Exp2Operation`] at the specified [`Location`]. Refer to [`Exp2Operation`] for its
+/// semantics and [`Accuracy`] for the requested result accuracy.
+pub fn exp2<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+    input: V,
+    accuracy: Accuracy,
+    location: L,
+) -> Result<DetachedExp2Operation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
+    OperationBuilder::new("stablehlo.exp2", location)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::exp2`"))
+        })
+}
+
 /// StableHLO [`Operation`] that computes the logarithm of each element of a tensor.
 /// The specific semantics of this operation depend on the element type:
 ///
@@ -345,6 +383,44 @@ pub fn log<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::log`"))
+        })
+}
+
+/// StableHLO [`Operation`] that computes the base-2 logarithm of each tensor element. Floating-point and
+/// complex elements use their corresponding mathematical operation. Quantized inputs are dequantized before the
+/// operation and the output is quantized again. The result has the same shape and baseline element type as the input.
+///
+/// # Example
+///
+/// ```mlir
+/// %result = stablehlo.log2 %operand : tensor<2x2xf64>
+/// ```
+///
+/// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#log2) for more information.
+pub trait Log2Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
+
+mlir_op!(Log2);
+mlir_op_trait!(Log2, OneOperand);
+mlir_op_trait!(Log2, OneResult);
+mlir_op_trait!(Log2, ZeroRegions);
+mlir_op_trait!(Log2, ZeroSuccessors);
+mlir_op_trait!(Log2, @local HasAccuracy);
+
+/// Constructs a detached [`Log2Operation`] at the specified [`Location`]. Refer to [`Log2Operation`] for its
+/// semantics and [`Accuracy`] for the requested result accuracy.
+pub fn log2<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+    input: V,
+    accuracy: Accuracy,
+    location: L,
+) -> Result<DetachedLog2Operation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
+    OperationBuilder::new("stablehlo.log2", location)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::log2`"))
         })
 }
 
@@ -451,11 +527,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, Operation, Size};
+    use crate::{Block, Context, OneOperand, Operation, Size, Value};
 
     use super::{
-        Accuracy, HasAccuracy, PowerOperation, cbrt, exponential, exponential_minus_one, log, log_plus_one, logistic,
-        power, rsqrt, sqrt,
+        Accuracy, HasAccuracy, PowerOperation, cbrt, exp2, exponential, exponential_minus_one, log, log_plus_one, log2,
+        logistic, power, rsqrt, sqrt,
     };
 
     #[test]
@@ -751,6 +827,55 @@ mod tests {
     }
 
     #[test]
+    fn test_exp2() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let operation = exp2(input, Accuracy::Default, location).unwrap();
+                assert_eq!(operation.input().unwrap(), input);
+                assert_eq!(operation.accuracy().unwrap(), Accuracy::Default);
+                assert_eq!(operation.operand_count(), 1);
+                assert_eq!(operation.result_count(), 1);
+                assert_eq!(operation.result(0).unwrap().r#type().unwrap(), tensor_type);
+                assert_eq!(operation.attribute_count(), 1);
+                assert_eq!(operation.region_count(), 0);
+                let operation = block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "exp2_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @exp2_test(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.exp2 %arg0 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
     fn test_log() {
         let context = Context::new();
         let location = context.unknown_location();
@@ -807,6 +932,55 @@ mod tests {
                       >\
                     } : tensor<2x2xf32>
                     return %0 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_log2() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let operation = log2(input, Accuracy::Default, location).unwrap();
+                assert_eq!(operation.input().unwrap(), input);
+                assert_eq!(operation.accuracy().unwrap(), Accuracy::Default);
+                assert_eq!(operation.operand_count(), 1);
+                assert_eq!(operation.result_count(), 1);
+                assert_eq!(operation.result(0).unwrap().r#type().unwrap(), tensor_type);
+                assert_eq!(operation.attribute_count(), 1);
+                assert_eq!(operation.region_count(), 0);
+                let operation = block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "log2_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @log2_test(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.log2 %arg0 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
                   }
                 }
             "},

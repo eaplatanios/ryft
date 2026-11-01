@@ -8,7 +8,7 @@ abstractions, [`ryft-mlir`](../ryft-mlir) for MLIR bindings, and [`ryft-pjrt`](.
 interface. `ryft-xla` is where traced Ryft programs are lowered to [StableHLO](https://openxla.org/stablehlo),
 partitioned via [Shardy](https://github.com/openxla/shardy), and executed through PJRT.
 
-Note that this crate forwards the following feature flags directly to `ryft-pjrt`: `cuda-12`, `cuda-13`, `rocm-7`,
+Note that this crate forwards the following feature flags directly to `ryft-pjrt`: `cuda-12`, `cuda-13`, `rocm-10`,
 `tpu`, `neuron`, `metal`, and `mps`. For information on what those flags represent and guidance on how to use them,
 refer to [`crates/ryft-xla-sys/README.md`](../ryft-xla-sys/README.md).
 

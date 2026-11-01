@@ -1,8 +1,12 @@
 use std::sync::OnceLock;
 
-use ryft_xla_sys::bindings::mlirRegisterGPUPasses;
+use ryft_xla_sys::bindings::{
+    mlirRegisterGPUNVVMPasses, mlirRegisterGPUPasses, mlirRegisterGPUROCDLPasses, mlirRegisterGPUSPIRVPasses,
+    mlirRegisterGPUXeVMPasses,
+};
 
-use crate::{GLOBAL_REGISTRATION_MUTEX, mlir_pass};
+use crate::GLOBAL_REGISTRATION_MUTEX;
+use crate::macros::mlir_pass;
 
 /// Registers the MLIR `gpu` [`Dialect`](crate::Dialect) passes with the global registry.
 pub fn register_gpu_passes() {
@@ -10,7 +14,11 @@ pub fn register_gpu_passes() {
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| unsafe {
         let _guard = GLOBAL_REGISTRATION_MUTEX.lock();
-        mlirRegisterGPUPasses()
+        mlirRegisterGPUPasses();
+        mlirRegisterGPUNVVMPasses();
+        mlirRegisterGPUROCDLPasses();
+        mlirRegisterGPUSPIRVPasses();
+        mlirRegisterGPUXeVMPasses();
     });
 }
 
@@ -21,13 +29,15 @@ mlir_pass!(gpu_kernel_outlining_pass, GPUGpuKernelOutliningPass);
 mlir_pass!(gpu_launch_sink_index_computations_pass, GPUGpuLaunchSinkIndexComputationsPass);
 mlir_pass!(gpu_map_parallel_loops_pass, GPUGpuMapParallelLoopsPass);
 mlir_pass!(gpu_module_to_binary_pass, GPUGpuModuleToBinaryPass);
-mlir_pass!(gpu_nvvm_attach_target_pass, GPUGpuNVVMAttachTarget);
-mlir_pass!(gpu_rocdl_attach_target_pass, GPUGpuROCDLAttachTarget);
-mlir_pass!(gpu_spirv_attach_target_pass, GPUGpuSPIRVAttachTarget);
-mlir_pass!(gpu_xevm_attach_target_pass, GPUGpuXeVMAttachTarget);
+mlir_pass!(gpu_nvvm_attach_target_pass, GPUNVVMGpuNVVMAttachTarget);
+mlir_pass!(gpu_rocdl_attach_target_pass, GPUROCDLGpuROCDLAttachTarget);
+mlir_pass!(gpu_spirv_attach_target_pass, GPUSPIRVGpuSPIRVAttachTarget);
+mlir_pass!(gpu_xevm_attach_target_pass, GPUXeVMGpuXeVMAttachTarget);
 
 #[cfg(test)]
 mod tests {
+    use crate::Context;
+
     use super::*;
 
     #[test]
@@ -35,6 +45,14 @@ mod tests {
         // Verify that there are no segmentation faults, even when we try to register multiple times.
         register_gpu_passes();
         register_gpu_passes();
+        let context = Context::new();
+        let pass_manager = context.pass_manager().unwrap();
+        let mut manager = pass_manager.as_operation_pass_manager().unwrap();
+        assert_eq!(
+            manager
+                .parse_pass_pipeline("nvvm-attach-target,rocdl-attach-target,spirv-attach-target,xevm-attach-target"),
+            Ok(()),
+        );
         register_gpu_async_region_pass();
         register_gpu_async_region_pass();
         register_gpu_decompose_memrefs_pass();

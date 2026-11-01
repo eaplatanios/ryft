@@ -12,8 +12,8 @@
 use crate::dialects::mosaic::gpu::attributes::{
     AtomicOpType, AtomicOpTypeAttributeRef, CopyPartitionAttributeRef, Dimension, DimensionAttributeRef,
     MultimemLoadReductionType, MultimemLoadReductionTypeAttributeRef, OobFillMode, OobFillModeAttributeRef,
-    TiledLayoutAttributeRef, TmaReduction, TmaReductionAttributeRef, TmemLoadReduction, TmemLoadReductionAttributeRef,
-    WgStridedFragLayoutAttributeRef,
+    SmemAllocAttributeRef, TiledLayoutAttributeRef, TmaReduction, TmaReductionAttributeRef, TmemLoadReduction,
+    TmemLoadReductionAttributeRef, WgStridedFragLayoutAttributeRef,
 };
 use crate::macros::{mlir_op, mlir_op_trait};
 use crate::{
@@ -162,39 +162,6 @@ pub fn arrive_expect_tx<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
             operation
                 .cast()
                 .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::arrive_expect_tx`"))
-        })
-}
-
-/// Mosaic GPU [`Operation`] that waits for a barrier parity.
-pub trait WaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    /// Returns the barrier memref.
-    fn barrier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-        self.operand_value(0)
-    }
-
-    /// Returns the parity value.
-    fn parity(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-        self.operand_value(1)
-    }
-}
-
-mlir_op!(Wait);
-mlir_op_trait!(Wait, ZeroRegions);
-mlir_op_trait!(Wait, ZeroSuccessors);
-
-/// Constructs a new detached/owned [`WaitOperation`] at the specified [`Location`].
-pub fn wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
-    barrier: ValueRef<'v, 'c, 't>,
-    parity: ValueRef<'v, 'c, 't>,
-    location: L,
-) -> Result<DetachedWaitOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
-    OperationBuilder::new("mosaic_gpu.wait", location)
-        .add_operand(barrier)?
-        .add_operand(parity)?
-        .build()
-        .and_then(|operation| unsafe {
-            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::wait`"))
         })
 }
 
@@ -847,6 +814,9 @@ pub fn vector_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the [`Attribute`] that stores a Mosaic GPU layout.
 pub const NEW_LAYOUT_ATTRIBUTE: &str = "new_layout";
 
+/// Name of the [`Attribute`] restricting a layout cast to changes that are free at runtime.
+pub const STRICT_ATTRIBUTE: &str = "strict";
+
 /// Mosaic GPU [`Operation`] that casts a vector to a new fragment layout.
 pub trait LayoutCastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input vector.
@@ -862,6 +832,11 @@ pub trait LayoutCastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tiled layout when this operation casts to one.
     fn tiled_layout(&self) -> Result<Option<TiledLayoutAttributeRef<'c, 't>>, Error> {
         Ok(self.attribute(NEW_LAYOUT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()))
+    }
+
+    /// Returns whether this cast allows only layout changes that are free at runtime.
+    fn strict(&self) -> Result<BooleanAttributeRef<'c, 't>, Error> {
+        self.boolean_attribute(STRICT_ATTRIBUTE)
     }
 
     /// Returns the cast result.
@@ -880,13 +855,16 @@ mlir_op_trait!(LayoutCast, ZeroSuccessors);
 pub fn layout_cast<'v, 'c: 'v, 't: 'c, A: Attribute<'c, 't>, L: Location<'c, 't>>(
     x: ValueRef<'v, 'c, 't>,
     new_layout: A,
+    strict: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedLayoutCastOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.layout_cast", location)
         .add_operand(x)?
         .add_attribute(NEW_LAYOUT_ATTRIBUTE, new_layout)?
+        .add_attribute(STRICT_ATTRIBUTE, context.boolean_attribute(strict))?
         .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
@@ -1909,6 +1887,11 @@ pub trait TcGen05CommitArriveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't
         self.operand_value(0)
     }
 
+    /// Returns the predicate controlling whether this thread commits the arrival.
+    fn predicate(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
     /// Returns whether this commit-arrive operation is collective.
     fn collective(&self) -> Result<BooleanAttributeRef<'c, 't>, Error> {
         self.boolean_attribute(COLLECTIVE_TMEM_ATTRIBUTE)
@@ -1923,12 +1906,14 @@ mlir_op_trait!(TcGen05CommitArrive, ZeroSuccessors);
 pub fn tcgen05_commit_arrive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     barrier: ValueRef<'v, 'c, 't>,
     collective: bool,
+    predicate: ValueRef<'v, 'c, 't>,
     location: L,
 ) -> Result<DetachedTcGen05CommitArriveOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.tcgen05_commit_arrive", location)
         .add_operand(barrier)?
+        .add_operand(predicate)?
         .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
@@ -2351,16 +2336,342 @@ pub fn async_store_smem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     })
 }
 
-/// Name of the temporary upstream capability marker. New programs should not emit this operation.
-pub const ARRIVE_DYN_EXPECT_TX_SUPPORTED_OPERATION_NAME: &str = "mosaic_gpu.arrive_dyn_expect_tx_supported";
+/// Name of the [`Attribute`] containing the lower spatial window bounds for an im2col copy.
+pub const WINDOW_LOWER_BOUNDS_ATTRIBUTE: &str = "window_lower_bounds";
 
-/// Temporary upstream capability marker, exposed for inspecting existing IR only.
-pub trait ArriveDynExpectTxSupportedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
+/// Name of the [`Attribute`] containing the upper spatial window bounds for an im2col copy.
+pub const WINDOW_UPPER_BOUNDS_ATTRIBUTE: &str = "window_upper_bounds";
 
-mlir_op!(ArriveDynExpectTxSupported);
-mlir_op_trait!(ArriveDynExpectTxSupported, ZeroOperands);
-mlir_op_trait!(ArriveDynExpectTxSupported, ZeroRegions);
-mlir_op_trait!(ArriveDynExpectTxSupported, ZeroSuccessors);
+/// Name of the [`Attribute`] containing the spatial strides for an im2col copy.
+pub const WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
+
+/// Mosaic GPU [`Operation`] that asynchronously copies image windows from global memory into shared memory.
+///
+/// The channels-last source has rank three, four, or five. Each destination row contains one pixel from one window.
+/// The predicate controls scheduling, and the barrier tracks completion. Refer to the [Mosaic GPU definitions] for
+/// the bounds, alignment, and extent constraints.
+///
+/// # Example
+///
+/// ```mlir
+/// "mosaic_gpu.async_load_im2col"(%src, %dst, %barrier, %n, %x, %c, %filter, %predicate)
+///     <{operandSegmentSizes = array<i32: 1, 1, 1, 3, 1, 1>, window_lower_bounds = array<i64: 0>,
+///        window_upper_bounds = array<i64: 0>, window_strides = array<i64: 1>}> :
+///     (memref<1x8x4xf32>, memref<2x4xf32, #gpu.address_space<workgroup>>,
+///      memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, i32, i32, i32, i16, i1) -> ()
+/// ```
+///
+/// [Mosaic GPU definitions]: https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td
+pub trait AsyncLoadIm2colOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the channels-last source memref in global memory.
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the contiguous destination memref in shared memory.
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the completion barrier.
+    fn barrier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
+    }
+
+    /// Returns the source start indices, including batch and channel indices.
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?
+            .map(|index| self.operand_value(index))
+            .collect()
+    }
+
+    /// Returns the pixel offsets within each spatial window.
+    fn filter_offsets(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)?
+            .map(|index| self.operand_value(index))
+            .collect()
+    }
+
+    /// Returns the predicate controlling whether the copy is scheduled.
+    fn predicate(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 5)?;
+        if range.len() != 1 {
+            return Err(Error::invalid_argument("expected one `mosaic_gpu.async_load_im2col` predicate"));
+        }
+        self.operand_value(range.start)
+    }
+
+    /// Returns the lower spatial window bounds.
+    fn window_lower_bounds(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(WINDOW_LOWER_BOUNDS_ATTRIBUTE)
+    }
+
+    /// Returns the upper spatial window bounds.
+    fn window_upper_bounds(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(WINDOW_UPPER_BOUNDS_ATTRIBUTE)
+    }
+
+    /// Returns the spatial window strides.
+    fn window_strides(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(WINDOW_STRIDES_ATTRIBUTE)
+    }
+}
+
+mlir_op!(AsyncLoadIm2col);
+mlir_op_trait!(AsyncLoadIm2col, ZeroRegions);
+mlir_op_trait!(AsyncLoadIm2col, ZeroSuccessors);
+
+/// Constructs a detached [`AsyncLoadIm2colOperation`] with explicit window bounds and strides.
+///
+/// `indices` contains one `i32` value per source dimension, while `filter_offsets` contains one `i16` value per spatial
+/// dimension. The three window attribute slices have the same length as `filter_offsets`.
+pub fn async_load_im2col<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    destination: ValueRef<'v, 'c, 't>,
+    barrier: ValueRef<'v, 'c, 't>,
+    indices: &[ValueRef<'v, 'c, 't>],
+    filter_offsets: &[ValueRef<'v, 'c, 't>],
+    predicate: ValueRef<'v, 'c, 't>,
+    window_lower_bounds: &[i64],
+    window_upper_bounds: &[i64],
+    window_strides: &[i64],
+    location: L,
+) -> Result<DetachedAsyncLoadIm2colOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let spatial_rank = filter_offsets.len();
+    if indices.len() != spatial_rank + 2
+        || window_lower_bounds.len() != spatial_rank
+        || window_upper_bounds.len() != spatial_rank
+        || window_strides.len() != spatial_rank
+    {
+        return Err(Error::invalid_argument("inconsistent `mosaic_gpu.async_load_im2col` window dimensions"));
+    }
+    OperationBuilder::new("mosaic_gpu.async_load_im2col", location)
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_operand(barrier)?
+        .add_operands(indices)?
+        .add_operands(filter_offsets)?
+        .add_operand(predicate)?
+        .add_attribute(
+            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+            context.dense_i32_array_attribute(&[
+                1,
+                1,
+                1,
+                i32::try_from(indices.len()).map_err(|_| Error::invalid_argument("too many im2col indices"))?,
+                i32::try_from(spatial_rank).map_err(|_| Error::invalid_argument("too many im2col filter offsets"))?,
+                1,
+            ])?,
+        )?
+        .add_attribute(WINDOW_LOWER_BOUNDS_ATTRIBUTE, context.dense_i64_array_attribute(window_lower_bounds)?)?
+        .add_attribute(WINDOW_UPPER_BOUNDS_ATTRIBUTE, context.dense_i64_array_attribute(window_upper_bounds)?)?
+        .add_attribute(WINDOW_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(window_strides)?)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::async_load_im2col`"))
+        })
+}
+
+/// Name of the [`Attribute`] containing allocation metadata for each scoped buffer argument.
+pub const BUFFER_ATTRS_ATTRIBUTE: &str = "buffer_attrs";
+
+/// Mosaic GPU [`Operation`] that evaluates a region with scoped shared-memory allocations.
+///
+/// Each region argument is a statically shaped workgroup memref with matching [`SmemAllocAttributeRef`] metadata.
+/// The region may capture outer values and returns non-memref results through [`ReturnOperation`].
+/// Refer to the [Mosaic GPU definitions](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
+/// for the complete operation contract.
+///
+/// # Example
+///
+/// ```mlir
+/// "mosaic_gpu.run_scoped"() ({
+/// ^bb0(%buffer: memref<4xf32, #gpu.address_space<workgroup>>):
+///   mosaic_gpu.return
+/// }) <{buffer_attrs = [#mosaic_gpu.smem_alloc<alignment = 16>]}> : () -> ()
+/// ```
+pub trait RunScopedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the allocation metadata for the body arguments.
+    fn buffer_attributes(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        self.array_attribute(BUFFER_ATTRS_ATTRIBUTE)
+    }
+
+    /// Returns the single-block allocation region.
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
+    }
+}
+
+mlir_op!(RunScoped);
+mlir_op_trait!(RunScoped, ZeroOperands);
+mlir_op_trait!(RunScoped, OneRegion);
+mlir_op_trait!(RunScoped, ZeroSuccessors);
+
+/// Constructs a detached [`RunScopedOperation`] whose block arguments are scoped allocations.
+pub fn run_scoped<'c, 't: 'c, L: Location<'c, 't>>(
+    buffer_attributes: &[SmemAllocAttributeRef<'c, 't>],
+    result_types: &[TypeRef<'c, 't>],
+    body: DetachedRegion<'c, 't>,
+    location: L,
+) -> Result<DetachedRunScopedOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    OperationBuilder::new("mosaic_gpu.run_scoped", location)
+        .add_attribute(BUFFER_ATTRS_ATTRIBUTE, context.array_attribute(buffer_attributes))?
+        .add_results(result_types)?
+        .add_region(body)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::run_scoped`"))
+        })
+}
+
+/// Name of the [`Attribute`] specifying the minimum byte alignment of a shared-memory allocation.
+pub const ALIGNMENT_ATTRIBUTE: &str = "alignment";
+
+/// Mosaic GPU [`Operation`] that allocates a static shared-memory memref inside an [`AllocaScopeOperation`].
+///
+/// The allocation remains valid until its enclosing scope exits. The result must have workgroup memory space.
+/// Refer to the [Mosaic GPU definitions](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
+/// for the complete operation contract.
+///
+/// # Example
+///
+/// ```mlir
+/// %buffer = mosaic_gpu.alloc_smem <{alignment = 16 : i64}> : memref<4xf32, #gpu.address_space<workgroup>>
+/// ```
+pub trait AllocSmemOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the optional minimum byte alignment.
+    fn alignment(&self) -> Result<Option<IntegerAttributeRef<'c, 't>>, Error> {
+        self.attribute(ALIGNMENT_ATTRIBUTE)?
+            .map(|attribute| {
+                attribute.cast().ok_or_else(|| Error::invalid_argument("expected integer shared-memory alignment"))
+            })
+            .transpose()
+    }
+
+    /// Returns the allocated shared-memory memref.
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
+    }
+}
+
+mlir_op!(AllocSmem);
+mlir_op_trait!(AllocSmem, ZeroOperands);
+mlir_op_trait!(AllocSmem, OneResult);
+mlir_op_trait!(AllocSmem, ZeroRegions);
+mlir_op_trait!(AllocSmem, ZeroSuccessors);
+
+/// Constructs a detached [`AllocSmemOperation`] with optional byte alignment.
+pub fn alloc_smem<'c, 't: 'c, L: Location<'c, 't>>(
+    result_type: TypeRef<'c, 't>,
+    alignment: Option<u64>,
+    location: L,
+) -> Result<DetachedAllocSmemOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if alignment.is_some_and(|alignment| !alignment.is_power_of_two() || alignment > i64::MAX as u64) {
+        return Err(Error::invalid_argument("expected a positive power-of-two `i64` shared-memory alignment"));
+    }
+    let mut builder = OperationBuilder::new("mosaic_gpu.alloc_smem", location).add_result(result_type)?;
+    if let Some(alignment) = alignment {
+        builder = builder.add_attribute(
+            ALIGNMENT_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), alignment as i64),
+        )?;
+    }
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::alloc_smem`"))
+    })
+}
+
+/// Mosaic GPU [`Operation`] defining a region whose shared-memory allocations cannot escape.
+///
+/// The body has no arguments and terminates with [`AllocaScopeReturnOperation`]. Outer values may be captured and
+/// non-memref values may be returned. Allocations created by [`AllocSmemOperation`] live until the scope exits.
+/// Refer to the [Mosaic GPU definitions](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
+/// for the complete operation contract.
+///
+/// # Example
+///
+/// ```mlir
+/// "mosaic_gpu.alloca_scope"() ({
+///   mosaic_gpu.alloca_scope.return
+/// }) : () -> ()
+/// ```
+pub trait AllocaScopeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the single-block allocation region.
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
+    }
+}
+
+mlir_op!(AllocaScope);
+mlir_op_trait!(AllocaScope, ZeroOperands);
+mlir_op_trait!(AllocaScope, OneRegion);
+mlir_op_trait!(AllocaScope, ZeroSuccessors);
+
+/// Constructs a detached [`AllocaScopeOperation`] with the specified result types and body.
+pub fn alloca_scope<'c, 't: 'c, L: Location<'c, 't>>(
+    result_types: &[TypeRef<'c, 't>],
+    body: DetachedRegion<'c, 't>,
+    location: L,
+) -> Result<DetachedAllocaScopeOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    OperationBuilder::new("mosaic_gpu.alloca_scope", location)
+        .add_results(result_types)?
+        .add_region(body)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::alloca_scope`"))
+        })
+}
+
+/// Mosaic GPU terminator that returns non-memref values from an [`AllocaScopeOperation`].
+/// Refer to the [Mosaic GPU definitions](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
+/// for the complete operation contract.
+///
+/// # Example
+///
+/// ```mlir
+/// mosaic_gpu.alloca_scope.return %value : i32
+/// ```
+pub trait AllocaScopeReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the values yielded by this scope.
+    fn operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
+    }
+}
+
+mlir_op!(AllocaScopeReturn);
+mlir_op_trait!(AllocaScopeReturn, ZeroRegions);
+mlir_op_trait!(AllocaScopeReturn, ZeroSuccessors);
+
+/// Constructs a detached [`AllocaScopeReturnOperation`] yielding the specified values.
+pub fn alloca_scope_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    operands: &[ValueRef<'v, 'c, 't>],
+    location: L,
+) -> Result<DetachedAllocaScopeReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    OperationBuilder::new("mosaic_gpu.alloca_scope.return", location)
+        .add_operands(operands)?
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::alloca_scope_return`"))
+        })
+}
 
 #[cfg(test)]
 mod tests {
@@ -2520,46 +2831,6 @@ mod tests {
                 #gpu.address_space<workgroup>>, %arg1: i32) {
                     mosaic_gpu.arrive_expect_tx barrier(%arg0 : memref<!mosaic_gpu.barrier, \
                 #gpu.address_space<workgroup>>) %arg1
-                    return
-                  }
-                }
-            "},
-        );
-    }
-
-    #[test]
-    fn test_wait_operation() {
-        let context = Context::new();
-        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
-        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
-        let location = context.unknown_location();
-        let module = context.module(location).unwrap();
-        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
-        let barrier_memref = memref_type(
-            &context,
-            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
-            &[],
-            Some(workgroup),
-            location,
-        );
-        let predicate_type = context.signless_integer_type(1).as_ref();
-        let mut block = context.block(&[(barrier_memref, location), (predicate_type, location)]);
-        let barrier = block.argument(0).unwrap().as_ref();
-        let parity = block.argument(1).unwrap().as_ref();
-        let operation = wait(barrier, parity, location).unwrap();
-        assert_eq!(operation.barrier().unwrap(), barrier);
-        assert_eq!(operation.parity().unwrap(), parity);
-        block.append_operation(operation).unwrap();
-        append_void_function(&module, "wait", &[barrier_memref, predicate_type], block, location);
-        assert!(module.verify().unwrap());
-        assert_eq!(
-            module.to_string(),
-            indoc! {"
-                module {
-                  func.func @wait(%arg0: memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, %arg1: \
-                i1) {
-                    mosaic_gpu.wait barrier(%arg0 : memref<!mosaic_gpu.barrier, \
-                #gpu.address_space<workgroup>>) parity(%arg1 : i1)
                     return
                   }
                 }
@@ -2961,10 +3232,11 @@ mod tests {
             .unwrap();
         let mut block = context.block(&[(vector, location)]);
         let value = block.argument(0).unwrap().as_ref();
-        let operation = layout_cast(value, layout, vector, location).unwrap();
+        let operation = layout_cast(value, layout, true, vector, location).unwrap();
         assert_eq!(operation.x().unwrap(), value);
         assert_eq!(operation.strided_layout().unwrap(), Some(layout));
         assert!(operation.tiled_layout().unwrap().is_none());
+        assert!(operation.strict().unwrap().value());
         assert_eq!(LayoutCastOperation::result(&operation).unwrap().r#type().unwrap(), vector);
         block.append_operation(operation).unwrap();
         append_void_function(&module, "layout_cast", &[vector], block, location);
@@ -2974,8 +3246,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @layout_cast(%arg0: vector<4xf32>) {
-                    %0 = mosaic_gpu.layout_cast x(%arg0 : vector<4xf32>) {new_layout = \
-                #mosaic_gpu.WGStridedFragLayout<[4], 1>}
+                    %0 = mosaic_gpu.layout_cast x(%arg0 : vector<4xf32>) <{new_layout = \
+                #mosaic_gpu.WGStridedFragLayout<[4], 1>, strict = true}>
                     return
                   }
                 }
@@ -3725,22 +3997,25 @@ mod tests {
             Some(workgroup),
             location,
         );
-        let mut block = context.block(&[(barrier_type, location)]);
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let mut block = context.block(&[(barrier_type, location), (predicate_type, location)]);
         let barrier = block.argument(0).unwrap().as_ref();
-        let operation = tcgen05_commit_arrive(barrier, true, location).unwrap();
+        let predicate = block.argument(1).unwrap().as_ref();
+        let operation = tcgen05_commit_arrive(barrier, true, predicate, location).unwrap();
         assert_eq!(operation.barrier().unwrap(), barrier);
         assert!(operation.collective().unwrap().value());
+        assert_eq!(operation.predicate().unwrap(), predicate);
         block.append_operation(operation).unwrap();
-        append_void_function(&module, "tcgen05_commit_arrive", &[barrier_type], block, location);
+        append_void_function(&module, "tcgen05_commit_arrive", &[barrier_type, predicate_type], block, location);
         assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
                 module {
                   func.func @tcgen05_commit_arrive(%arg0: memref<!mosaic_gpu.barrier, \
-                #gpu.address_space<workgroup>>) {
-                    \"mosaic_gpu.tcgen05_commit_arrive\"(%arg0) <{collective = true}> : \
-                (memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>) -> ()
+                #gpu.address_space<workgroup>>, %arg1: i1) {
+                    \"mosaic_gpu.tcgen05_commit_arrive\"(%arg0, %arg1) <{collective = true}> : \
+                (memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, i1) -> ()
                     return
                   }
                 }
@@ -3896,8 +4171,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @vector_concat(%arg0: vector<2xf32>) {
-                    %0 = mosaic_gpu.vector_concat(%arg0, %arg0 : vector<2xf32>, vector<2xf32>) {dimension = 0 \
-                : i32} -> vector<4xf32>
+                    %0 = mosaic_gpu.vector_concat(%arg0, %arg0 : vector<2xf32>, vector<2xf32>) <{dimension = 0 \
+                : i32}> -> vector<4xf32>
                     return
                   }
                 }
@@ -4044,16 +4319,146 @@ mod tests {
     }
 
     #[test]
-    fn test_arrive_dyn_expect_tx_supported_operation() {
+    fn test_async_load_im2col_operation() {
         let context = Context::new();
         context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
-        // This temporary upstream marker has no public constructor. Its wrapper still supports inspecting
-        // existing IR, so construct the fixture through the generic builder.
-        let operation = OperationBuilder::new(ARRIVE_DYN_EXPECT_TX_SUPPORTED_OPERATION_NAME, location).build().unwrap();
-        let operation = unsafe { operation.cast::<DetachedArriveDynExpectTxSupportedOperation>() }.unwrap();
-        assert_eq!(operation.operand_count(), 0);
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[1, 8, 4], None, location);
+        let destination_type =
+            memref_type(&context, context.float32_type().as_ref(), &[2, 4], Some(workgroup), location);
+        let barrier_type = memref_type(
+            &context,
+            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
+            &[],
+            Some(workgroup),
+            location,
+        );
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let offset_type = context.signless_integer_type(16).as_ref();
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let argument_types = [source_type, destination_type, barrier_type, integer_type, offset_type, predicate_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let source = block.argument(0).unwrap().as_ref();
+        let destination = block.argument(1).unwrap().as_ref();
+        let barrier = block.argument(2).unwrap().as_ref();
+        let index = block.argument(3).unwrap().as_ref();
+        let offset = block.argument(4).unwrap().as_ref();
+        let predicate = block.argument(5).unwrap().as_ref();
+        let operation = async_load_im2col(
+            source,
+            destination,
+            barrier,
+            &[index, index, index],
+            &[offset],
+            predicate,
+            &[0],
+            &[0],
+            &[1],
+            location,
+        )
+        .unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.destination().unwrap(), destination);
+        assert_eq!(operation.barrier().unwrap(), barrier);
+        assert_eq!(operation.indices().unwrap(), vec![index, index, index]);
+        assert_eq!(operation.filter_offsets().unwrap(), vec![offset]);
+        assert_eq!(operation.predicate().unwrap(), predicate);
+        assert_eq!(operation.window_lower_bounds().unwrap(), context.dense_i64_array_attribute(&[0]).unwrap());
+        assert_eq!(operation.window_upper_bounds().unwrap(), context.dense_i64_array_attribute(&[0]).unwrap());
+        assert_eq!(operation.window_strides().unwrap(), context.dense_i64_array_attribute(&[1]).unwrap());
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "im2col", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @im2col(%arg0: memref<1x8x4xf32>, %arg1: memref<2x4xf32, #gpu.address_space<workgroup>>, \
+                %arg2: memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, %arg3: i32, %arg4: i16, %arg5: i1) {
+                    \"mosaic_gpu.async_load_im2col\"(%arg0, %arg1, %arg2, %arg3, %arg3, %arg3, %arg4, %arg5) \
+                <{operandSegmentSizes = array<i32: 1, 1, 1, 3, 1, 1>, window_lower_bounds = array<i64: 0>, \
+                window_strides = array<i64: 1>, window_upper_bounds = array<i64: 0>}> : (memref<1x8x4xf32>, \
+                memref<2x4xf32, #gpu.address_space<workgroup>>, \
+                memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, \
+                i32, i32, i32, i16, i1) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_run_scoped_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let buffer_type = memref_type(&context, context.float32_type().as_ref(), &[4], Some(workgroup), location);
+        let allocation = context.mosaic_gpu_smem_alloc_attribute(Some(16)).unwrap();
+        let mut body = context.block(&[(buffer_type, location)]);
+        body.append_operation(r#return(&[], location).unwrap()).unwrap();
+        let operation = run_scoped(&[allocation], &[], body.try_into().unwrap(), location).unwrap();
+        assert_eq!(operation.buffer_attributes().unwrap(), context.array_attribute(&[allocation]));
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 1);
+        module.body().unwrap().append_operation(operation).unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  \"mosaic_gpu.run_scoped\"() ({
+                  ^bb0(%arg0: memref<4xf32, #gpu.address_space<workgroup>>):
+                    mosaic_gpu.return
+                  }) <{buffer_attrs = [#mosaic_gpu.smem_alloc<alignment = 16>]}> : () -> ()
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_alloc_smem_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let buffer_type = memref_type(&context, context.float32_type().as_ref(), &[4], Some(workgroup), location);
+        let operation = alloc_smem(buffer_type, Some(16), location).unwrap();
+        assert_eq!(operation.alignment().unwrap().unwrap().signless_value(), 16);
+        assert_eq!(AllocSmemOperation::result(&operation).unwrap().r#type().unwrap(), buffer_type);
+        let mut body = context.block(&[] as &[(TypeRef, crate::UnknownLocationRef)]);
+        body.append_operation(operation).unwrap();
+        body.append_operation(alloca_scope_return(&[], location).unwrap()).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(alloca_scope(&[], body.try_into().unwrap(), location).unwrap())
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  \"mosaic_gpu.alloca_scope\"() ({
+                    %0 = mosaic_gpu.alloc_smem <{alignment = 16 : i64}> : memref<4xf32, #gpu.address_space<workgroup>>
+                    mosaic_gpu.alloca_scope.return
+                  }) : () -> ()
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_alloca_scope_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let mut body = context.block(&[] as &[(TypeRef, crate::UnknownLocationRef)]);
+        body.append_operation(alloca_scope_return(&[], location).unwrap()).unwrap();
+        let operation = alloca_scope(&[], body.try_into().unwrap(), location).unwrap();
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 1);
         assert_eq!(operation.result_count(), 0);
         module.body().unwrap().append_operation(operation).unwrap();
         assert!(module.verify().unwrap());
@@ -4061,7 +4466,41 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  \"mosaic_gpu.arrive_dyn_expect_tx_supported\"() : () -> ()
+                  \"mosaic_gpu.alloca_scope\"() ({
+                    mosaic_gpu.alloca_scope.return
+                  }) : () -> ()
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_alloca_scope_return_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let mut block = context.block(&[(integer_type, location)]);
+        let argument = block.argument(0).unwrap().as_ref();
+        let operation = alloca_scope_return(&[argument], location).unwrap();
+        assert_eq!(AllocaScopeReturnOperation::operands(&operation).unwrap(), vec![argument]);
+        let mut body = context.block(&[] as &[(TypeRef, crate::UnknownLocationRef)]);
+        body.append_operation(operation).unwrap();
+        block
+            .append_operation(alloca_scope(&[integer_type], body.try_into().unwrap(), location).unwrap())
+            .unwrap();
+        append_void_function(&module, "scope_return", &[integer_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @scope_return(%arg0: i32) {
+                    %0 = \"mosaic_gpu.alloca_scope\"() ({
+                      mosaic_gpu.alloca_scope.return %arg0 : i32
+                    }) : () -> i32
+                    return
+                  }
                 }
             "},
         );
