@@ -668,7 +668,7 @@ impl<
     ) -> Result<Vec<C::Value>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "{} has no forward program to execute; it supports only reverse-mode differentiation (e.g., `vjp`, \
+                "{} has no forward program to execute; it supports only reverse mode differentiation (e.g., `vjp`, \
                  `value_and_gradient`, or `jacobian_reverse`)",
                 self.description(),
             ),
@@ -828,7 +828,7 @@ impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Co
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "{} has no forward-mode (i.e., JVP) rule; it supports only reverse-mode differentiation",
+                "{} has no forward mode (i.e., JVP) rule; it supports only reverse mode differentiation",
                 self.description(),
             ),
         }
@@ -1058,7 +1058,7 @@ where
                 }
 
                 let rule_output_count = key.rule_output_count()?;
-                let forward = rules.forward_specialization(key.clone())?;
+                let forward = rules.forward_specialization(key.as_ref().clone())?;
                 if !forward.program.effects().is_pure() {
                     let description = describe_composite(COMPOSITE_OPERATION_NAME, rules.name());
                     return Err(ProgramError::UnsupportedOperation {
@@ -1233,8 +1233,6 @@ pub(super) enum CompositeTransposeRules<T, S> {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1254,6 +1252,7 @@ mod tests {
         CotangentDestinationKind, DifferentiationRule, TransposedProgram, TransposedProgramCotangent,
         TranspositionDriver,
     };
+    use crate::macros::check_operation_type_inference;
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::composites::operations::composite::{CompositeJvpRule, CompositeOperation};
     use crate::operations::composites::operations::tests::{
@@ -1270,13 +1269,17 @@ mod tests {
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::manipulation::padding::PadOperation;
     use crate::operations::manipulation::slicing::Slice;
-    use crate::operations::references::ReferenceAddUpdateOperation;
-    use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
-    use crate::programs::{
-        AtomId, EffectClasses, FlatProgram, MaybeZero, Program, ProgramBuilder, RegionDataFlow, RegionDriver,
-        RegionInterface, RegionRef, RegionSlot, ValueProjection,
+    use crate::operations::references::{
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation,
     };
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::programs::{
+        AtomId, EffectClasses, FlatProgram, MaybeZero, Program, ProgramBuilder, ReferenceType, RegionDataFlow,
+        RegionDriver, RegionInterface, RegionRef, RegionSlot, ValueProjection,
+    };
+    use crate::tests::hash_of;
     use crate::tracing::{Trace, TracingContext};
 
     use super::*;
@@ -1287,16 +1290,11 @@ mod tests {
     /// Reverse mode carrier of a composite call in the array IR operation family.
     type ArrayIrCompositeTranspose = CompositeTransposeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Reverse mode carrier of a composite call in the array operation family converted into the array IR operation
-    /// family, whose retained backward rule becomes a lifted rule of its definition.
-    type ArrayIrCompositeTransposeConversion = CompositeConversion<
-        ArrayIrCompositeTranspose,
-        CompositeTransposeOperation<
-            ArrayIrValue<Array>,
-            ArrayIrOperation<Array>,
-            LiftedCustomRules<Array, ArrayOperation<Array>>,
-        >,
-    >;
+    /// Registration of a definition with retained rules in the array IR family.
+    type IrRegistration = CustomRuleRegistration<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Program builder in the array IR family.
+    type IrBuilder = ProgramBuilder<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Test-only transposition driver exposing one attached region, used to invoke the transposition rule of a carrier
     /// with an attached backward rule directly on the backward region that it replays.
@@ -1351,12 +1349,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Registration of a retained-rule definition in the array IR family.
-    type IrRegistration = CustomRuleRegistration<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-    /// Program builder in the array IR family.
-    type IrBuilder = ProgramBuilder<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
     /// Returns a reverse mode carrier of `definition`, as reverse mode linearization of a call would stage it, whose
     /// first `leading_input_count` inputs are known.
     fn retained_carrier(
@@ -1373,11 +1365,11 @@ mod tests {
         ))
     }
 
-    /// Returns a definition whose backward rule increments the known leading reference by one exactly when its
-    /// differentiated input's cotangent is ignored and its output seed is a structural zero, so the effect exists only
-    /// in that specialization.
-    fn ignored_zero_effect_definition() -> IrRegistration {
-        CustomRuleRegistration::new(IrDefinition::new("ignored_zero_effect").with_accumulating_vjp(
+    /// Returns a carrier over a known reference and a scalar tangent whose backward rule increments the reference by
+    /// one exactly when its differentiated input's cotangent is ignored and its output seed is a structural zero, so
+    /// the effect exists only in that specialization.
+    fn ignored_zero_effect_carrier() -> ArrayIrOperation<Array> {
+        let definition = CustomRuleRegistration::new(IrDefinition::new("ignored_zero_effect").with_accumulating_vjp(
             |_| unreachable!("the tests construct the carrier directly"),
             |context, inputs, seeds, accumulators| {
                 if !accumulators[1].is_needed() && matches!(&seeds[0], MaybeZero::Zero(_)) {
@@ -1391,23 +1383,19 @@ mod tests {
                 }
                 Ok(())
             },
-        ))
-    }
-
-    /// Returns the carrier of [`ignored_zero_effect_definition`] over a known reference and a scalar tangent.
-    fn ignored_zero_effect_carrier() -> ArrayIrOperation<Array> {
+        ));
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        retained_carrier(ignored_zero_effect_definition().reference(), 1, vec![scalar_type.clone()], vec![scalar_type])
+        retained_carrier(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type])
     }
 
-    /// Log of what the backward rule of a [`slice_at_one_definition`] observed on each invocation: the type of its
-    /// differentiated input, whether its seed is a structural zero, and the kind of its cotangent destination.
+    /// Log of what the backward rule of a [`slice_at_one_definition`] observed on each invocation, namely the type of
+    /// its differentiated input, whether its seed is a structural zero, and the kind of its cotangent destination.
     type SliceAtOneObservations = Arc<Mutex<Vec<(ArrayType, bool, CotangentDestinationKind)>>>;
 
     /// Returns a definition whose backward rule adds the output seed to the element at index 1 of its single
     /// differentiated input's cotangent, logging what it observes on each invocation in `observations`. A caller buffer
-    /// receives a slice update without any full-sized temporary, while a returned cotangent is padded to the input
-    /// extent.
+    /// receives a slice update without any temporary of the full input extent, while a returned cotangent is padded to
+    /// that extent.
     fn slice_at_one_definition(observations: &SliceAtOneObservations) -> IrRegistration {
         let observations = observations.clone();
         CustomRuleRegistration::new(IrDefinition::new("slice_at_one").with_accumulating_vjp(
@@ -1472,21 +1460,20 @@ mod tests {
 
     #[test]
     fn test_composite_transpose() {
+        // A carrier with an attached backward rule attaches that rule as its only region. It is a deferred rule region
+        // whose own effects decide whether transposition must run it, so the carrier itself declares no effects.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let tangent_types = format!("{:?}", vec![scalar_type.clone()]);
-
-        // A carrier with an attached backward rule attaches that rule as its only, deferred rule region, whose own
-        // effects decide whether transposition must run it (and whether the carrier's application carries deferred
-        // work).
         let carrier =
             ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type.clone()]);
         assert_eq!(carrier.name(), COMPOSITE_TRANSPOSE_OPERATION_NAME);
         assert_eq!(carrier.leading_input_count(), 1);
+        assert_eq!(carrier.seed_extent_count(), 0);
         assert_eq!(carrier.input_tangent_types(), std::slice::from_ref(&scalar_type));
         assert_eq!(carrier.output_tangent_types(), std::slice::from_ref(&scalar_type));
         assert_eq!(carrier.rules(), None);
         assert_eq!(carrier.region_slots(), &[RegionSlot::deferred_rule("backward")]);
-        assert!(!carrier.effects().summary().has_deferred_work());
+        assert_eq!(carrier.effects().as_ref(), Effects::empty());
         assert_eq!(carrier.to_string(), "composite_transpose [leading_input_count=1]");
         assert_eq!(
             format!("{carrier:?}"),
@@ -1495,21 +1482,43 @@ mod tests {
                  input_tangent_types: {tangent_types}, output_tangent_types: {tangent_types} }}",
             ),
         );
-        let attached = carrier;
 
-        // A carrier with a retained backward rule attaches no region and carries deferred work until transposition
-        // replaces it with the specialized backward program.
+        // Carriers with attached backward rules are equal, and hash equally, exactly when their boundaries are equal.
+        let twin =
+            ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type.clone()]);
+        assert_eq!(carrier, twin);
+        assert_eq!(hash_of(&carrier), hash_of(&twin));
+        let other_boundary =
+            ArrayCompositeTranspose::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type]);
+        assert_ne!(carrier, other_boundary);
+        let map = HashMap::from([(carrier.clone(), "carrier")]);
+        assert_eq!(map.get(&twin), Some(&"carrier"));
+        assert_eq!(map.get(&other_boundary), None);
+    }
+
+    #[test]
+    fn test_composite_transpose_retained_rules() {
+        // A carrier with a retained backward rule attaches no region and renders the name of its definition. It
+        // declares deferred work, so shared transform boundaries retain it until transposition replaces it with the
+        // specialized backward program.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let tangent_types = format!("{:?}", vec![scalar_type.clone()]);
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
-        let carrier = CompositeTransposeOperation::new(
+        let carrier = ArrayCompositeTranspose::new(
             definition.reference(),
             1,
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
+        assert_eq!(carrier.name(), COMPOSITE_TRANSPOSE_OPERATION_NAME);
+        assert_eq!(carrier.leading_input_count(), 1);
+        assert_eq!(carrier.seed_extent_count(), 0);
+        assert_eq!(carrier.input_tangent_types(), std::slice::from_ref(&scalar_type));
+        assert_eq!(carrier.output_tangent_types(), std::slice::from_ref(&scalar_type));
         assert_eq!(carrier.rules(), Some(&definition.reference()));
         assert!(carrier.region_slots().is_empty());
-        assert!(carrier.effects().summary().has_deferred_work());
+        assert_eq!(carrier.effects().as_ref(), &Effects::empty().clone().with_deferred_work());
         assert_eq!(carrier.to_string(), "composite_transpose [name=\"cube\", leading_input_count=1]");
         assert_eq!(
             format!("{carrier:?}"),
@@ -1520,28 +1529,84 @@ mod tests {
             ),
         );
 
-        assert_eq!(attached, attached.clone());
-        assert_eq!(carrier, carrier.clone());
-        assert_ne!(attached, carrier);
-        let twin = CompositeTransposeOperation::new(
-            CustomRuleRegistration::new(cube_definition(&counters, false, true)).reference(),
+        // The source carrier from which backward specializations are derived invokes the backward rule directly. Its
+        // trailing seed extents are leading inputs that the backward rule never receives.
+        let source = ArrayCompositeTranspose::for_backward_specialization(
+            definition.reference(),
+            2,
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+            false,
+        );
+        assert_eq!(source.leading_input_count(), 2);
+        assert_eq!(source.seed_extent_count(), 1);
+        assert_eq!(source.rules(), Some(&definition.reference()));
+        assert_eq!(
+            source.to_string(),
+            "composite_transpose [name=\"cube\", leading_input_count=2, seed_extent_count=1, direct=true]",
+        );
+        assert_eq!(
+            format!("{source:?}"),
+            format!(
+                "CompositeTransposeOperation {{ name: \"cube\", leading_input_count: 2, seed_extent_count: 1, \
+                 input_tangent_types: {tangent_types}, output_tangent_types: {tangent_types}, batching: None, \
+                 invokes_rule_directly: true, discharged: false }}",
+            ),
+        );
+
+        // Equality and hashing use the identity of the definition allocation, so an equally named definition is a
+        // different rule set even though it renders identically. The representation and the boundary are part of the
+        // identity as well.
+        let same = ArrayCompositeTranspose::new(
+            definition.reference(),
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
+        assert_eq!(carrier, same);
+        assert_eq!(hash_of(&carrier), hash_of(&same));
+        let twin_definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
+        let twin = ArrayCompositeTranspose::new(
+            twin_definition.reference(),
             1,
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
         assert_ne!(carrier, twin);
-        let other_boundary =
-            CompositeTransposeOperation::new(definition.reference(), 2, vec![scalar_type.clone()], vec![scalar_type]);
+        assert_eq!(carrier.to_string(), twin.to_string());
+        let other_boundary = ArrayCompositeTranspose::new(
+            definition.reference(),
+            2,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
         assert_ne!(carrier, other_boundary);
-        let map = HashMap::from([(attached.clone(), "attached"), (carrier.clone(), "retained")]);
-        assert_eq!(map.get(&attached.clone()), Some(&"attached"));
-        assert_eq!(map.get(&carrier.clone()), Some(&"retained"));
+        assert_ne!(carrier, source);
+        let attached = ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type]);
+        assert_ne!(carrier, attached);
+        let map = HashMap::from([(carrier.clone(), "retained"), (attached.clone(), "attached")]);
+        assert_eq!(map.get(&same), Some(&"retained"));
+        assert_eq!(map.get(&attached), Some(&"attached"));
         assert_eq!(map.get(&twin), None);
         assert_eq!(map.get(&other_boundary), None);
+        assert_eq!(map.get(&source), None);
+        assert_eq!(counters.counts(), (0, 0, 0));
     }
 
     #[test]
     fn test_composite_transpose_into_family() {
+        // Carrier in the array operation family converted into the array IR operation family, whose retained backward
+        // rule becomes a lifted rule of its definition.
+        type Conversion = CompositeConversion<
+            ArrayIrCompositeTranspose,
+            CompositeTransposeOperation<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                LiftedCustomRules<Array, ArrayOperation<Array>>,
+            >,
+        >;
+
         // A carrier with a retained backward rule follows its program into a containing family with the source that the
         // conversion derives from its rules, converting its tangent types.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1554,7 +1619,7 @@ mod tests {
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
-        let converted: ArrayIrCompositeTransposeConversion = carrier.clone().into_family(LiftedCustomRules::Member);
+        let converted: Conversion = carrier.clone().into_family(LiftedCustomRules::Member);
         let CompositeConversion::Retained(converted) = converted else {
             panic!("a carrier with a retained backward rule should keep it");
         };
@@ -1568,8 +1633,7 @@ mod tests {
         // A carrier with an attached backward rule carries no source, so the conversion never derives one and the
         // carrier converts with the source type of the family's native carriers instead.
         let attached = ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type]);
-        let converted: ArrayIrCompositeTransposeConversion =
-            attached.into_family(|_| unreachable!("attached backward rules carry no source"));
+        let converted: Conversion = attached.into_family(|_| unreachable!("attached backward rules carry no source"));
         assert_eq!(
             converted,
             CompositeConversion::Attached(ArrayIrCompositeTranspose::from_backward_region(
@@ -1602,6 +1666,24 @@ mod tests {
         assert_eq!(
             carrier.infer_output_types(&input_types, std::slice::from_ref(&backward)),
             Ok(vec![tangent_type.clone()]),
+        );
+
+        // The backward region's inputs exist only when the carrier has all of its leading inputs and when its seed
+        // extents, which the region never receives, are among those leading inputs.
+        assert_eq!(
+            carrier.infer_region_input_types(&[], std::slice::from_ref(&backward)),
+            Err(TypeError::invalid("`composite_transpose` leading input count 1 exceeds input count 0")),
+        );
+        assert_eq!(
+            ArrayCompositeTranspose::from_parts(
+                CompositeTransposeRules::Attached,
+                0,
+                1,
+                vec![tangent_type.clone()],
+                vec![tangent_type.clone()],
+            )
+            .infer_region_input_types(std::slice::from_ref(&tangent_type), std::slice::from_ref(&backward)),
+            Err(TypeError::invalid("`composite_transpose` seed extent count 1 exceeds leading input count 0")),
         );
 
         // The carrier requires exactly its backward region, its leading inputs, and its declared tangent inputs.
@@ -1671,7 +1753,7 @@ mod tests {
         assert_eq!(infer(&carrier, &vector, ArrayType::new_static(DataType::F32, [3])), mismatch("f32[3]"));
         assert_eq!(infer(&carrier, &vector, ArrayType::new_static(DataType::F64, [2])), mismatch("f64[2]"));
 
-        // Equal bounds do not equate unrelated identities or erase a repeated-axis relationship.
+        // Equal bounds do not equate unrelated identities or erase a repeated axis relationship.
         let square = ArrayType::new(DataType::F32, Shape::new(vec![broad.clone().into(), broad.clone().into()]));
         let carrier = ArrayCompositeTranspose::from_backward_region(0, vec![square.clone()], vec![scalar.clone()]);
         assert_eq!(
@@ -1697,30 +1779,35 @@ mod tests {
     #[test]
     fn test_composite_transpose_type_inference_retained_rules() {
         // A carrier takes its known leading inputs followed by the tangents of the differentiated inputs, and it
-        // returns the output tangents. It has no regions.
+        // returns the output tangents. It has no regions, and inferring its types never traces its backward rule.
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let carrier = CompositeTransposeOperation::new(
+        let carrier = ArrayCompositeTranspose::new(
             definition.reference(),
             1,
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
-        assert_eq!(
-            carrier.infer_output_types(&[scalar_type.clone(), scalar_type.clone()], &[]),
-            Ok(vec![scalar_type.clone()]),
+        check_operation_type_inference!(
+            operation = carrier.clone(),
+            cases = [
+                {
+                    input_types = [scalar_type.clone(), scalar_type.clone()],
+                    output_types = [scalar_type.clone()],
+                },
+                {
+                    input_types = [scalar_type.clone()],
+                    error = "expected 2 inputs but got 1",
+                },
+                {
+                    input_types = [scalar_type.clone(), ArrayType::scalar(DataType::F32)],
+                    error = "`composite_transpose` tangent input type signature mismatch: expected [f64[]] but got \
+                             [f32[]]",
+                },
+            ],
         );
-        assert_eq!(
-            carrier.infer_output_types(&[scalar_type.clone()], &[]),
-            Err(TypeError::invalid("expected 2 inputs but got 1")),
-        );
-        assert_eq!(
-            carrier.infer_output_types(&[scalar_type.clone(), ArrayType::scalar(DataType::F32)], &[]),
-            Err(TypeError::invalid(
-                "`composite_transpose` tangent input type signature mismatch: expected [f64[]] but got [f32[]]",
-            )),
-        );
+        assert_eq!(carrier.infer_region_input_types(&[scalar_type.clone(), scalar_type.clone()], &[]), Ok(Vec::new()));
         let region = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type.clone()], EffectClasses::NONE);
         assert_eq!(
             carrier.infer_output_types(&[scalar_type.clone(), scalar_type], std::slice::from_ref(&region)),
@@ -1731,12 +1818,255 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_region_data_flow() {
+        // The backward region is deferred transformation work rather than an ordinary computation, so it declares no
+        // data flow between the carrier's boundary and the region.
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = ArrayCompositeTranspose::from_backward_region(0, vec![scalar.clone()], vec![scalar]);
-        // The backward region is deferred transformation work rather than a declared ordinary computation source.
         assert!(matches!(operation.region_data_flow(), RegionDataFlow::Opaque));
-        assert_eq!(operation.region_slots(), &[RegionSlot::deferred_rule("backward")]);
         assert_eq!(operation.output_region_provenance(0), Vec::new());
+    }
+
+    #[test]
+    fn test_composite_transpose_rename_type_identities() {
+        // Renaming type identities renames the tangent types of a carrier in both representations, so specializations
+        // of a retained backward rule use the renamed boundary.
+        let original = DimensionVariable::new("original", DimensionBounds::new(2, Some(6)).unwrap());
+        let relocated = DimensionVariable::new("relocated", DimensionBounds::new(2, Some(6)).unwrap());
+        let original_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(original.clone())]));
+        let relocated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(relocated.clone())]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(original, relocated).unwrap();
+        assert_eq!(
+            ArrayCompositeTranspose::from_backward_region(1, vec![original_type.clone()], vec![scalar_type.clone()])
+                .rename_type_identities(&renaming),
+            Ok(ArrayCompositeTranspose::from_backward_region(
+                1,
+                vec![relocated_type.clone()],
+                vec![scalar_type.clone()]
+            )),
+        );
+
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
+        assert_eq!(
+            ArrayCompositeTranspose::new(definition.reference(), 1, vec![scalar_type.clone()], vec![original_type])
+                .rename_type_identities(&renaming),
+            Ok(ArrayCompositeTranspose::new(definition.reference(), 1, vec![scalar_type], vec![relocated_type])),
+        );
+        assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_composite_transpose_reference_discharge() {
+        // An attached backward region discharges its local reference state in place, so the carrier keeps its backward
+        // rule `ȳ ↦ 3ȳ` while the rewritten region no longer allocates the reference in which it stores its result.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut backward = IrBuilder::new();
+        let seed = backward.add_input(scalar_type.clone());
+        let three = backward.add_constant(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+        let scaled = backward
+            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![three, seed], None)
+            .unwrap()[0];
+        let reference =
+            backward.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scaled], None).unwrap()[0];
+        let output = backward
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let backward = backward
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = IrBuilder::new();
+        let backward = builder.import_program(backward);
+        let tangent = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                ArrayIrCompositeTranspose::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type]),
+                vec![backward],
+                vec![tangent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap()
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = composite_transpose [leading_input_count=0] %0 [
+                    backward={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 3.0
+                            %2:f32[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = const 3.0
+                    %2:f32[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0f32).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_transpose_reference_discharge_rejects_reference_inputs() {
+        // The backward rule receives the leading reference inputs of the carrier by identity and cannot thread their
+        // state explicitly, so discharge rejects a carrier with a reference input and names that limitation.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut backward = IrBuilder::new();
+        backward.add_input(reference_type.clone());
+        let seed = backward.add_input(scalar_type.clone());
+        let backward = backward
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![seed],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = IrBuilder::new();
+        let backward = builder.import_program(backward);
+        let reference = builder.add_input(reference_type);
+        let tangent = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                ArrayIrCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type]),
+                vec![backward],
+                vec![reference, tangent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.discharge_references(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`composite_transpose` cannot discharge the reference state of its input 0, because its \
+                               rules receive non-differentiated reference inputs by identity and cannot thread their \
+                               state explicitly; pass reference-free inputs or discharge external references first",
+        ));
+    }
+
+    #[test]
+    fn test_composite_transpose_reference_discharge_retained_rules() {
+        // A carrier with a retained backward rule holds no reference state of its own, so discharge only records that
+        // the backward rule programs, which are traced lazily, must be discharged once they are traced. The backward
+        // rule `ȳ ↦ 2ȳ` accumulates its result in a local reference, which its discharged specialization no longer
+        // allocates. Discharge returns a program that touches no reference untouched, so the carrier's tangent passes
+        // through a local reference first.
+        let definition = CustomRuleRegistration::new(
+            IrDefinition::new("doubled")
+                .with_vjp(
+                    |_| unreachable!("the test constructs the carrier directly"),
+                    |_, seeds| {
+                        let state = seeds[0].reference_new()?;
+                        state.add_update(&seeds[0])?;
+                        Ok(vec![state.read()?])
+                    },
+                )
+                .with_reference_discharge(),
+        );
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut builder = IrBuilder::new();
+        let tangent = builder.add_input(scalar_type.clone());
+        let state = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![tangent], None).unwrap()[0];
+        let tangent = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let carrier = retained_carrier(definition.reference(), 0, vec![scalar_type.clone()], vec![scalar_type]);
+        let output = builder.add_instruction(carrier, Vec::new(), vec![tangent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap()
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = composite_transpose [name=\"doubled\", leading_input_count=0, discharged=true] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = add %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0f32).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_transpose_reference_discharge_retained_rules_rejects_reference_inputs() {
+        // A retained backward rule receives the leading reference inputs of the carrier by identity as well, so
+        // discharge rejects them and names the definition.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
+        let mut builder = IrBuilder::new();
+        let reference = builder.add_input(reference_type);
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        builder
+            .add_instruction(ignored_zero_effect_carrier(), Vec::new(), vec![reference, tangent], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            program.discharge_references(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`composite_transpose` `ignored_zero_effect` cannot discharge the reference state of its \
+                               input 0, because its rules receive non-differentiated reference inputs by identity and \
+                               cannot thread their state explicitly; pass reference-free inputs or discharge external \
+                               references first",
+        ));
     }
 
     #[test]
@@ -1746,7 +2076,7 @@ mod tests {
             attached_carrier_program().interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
             Err(ProgramError::UnsupportedOperation {
                 message: "`composite_transpose` has no forward program to execute; it supports only \
-                          reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)"
+                          reverse mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)"
                     .to_string(),
             }),
         );
@@ -1754,7 +2084,8 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_interpretation_retained_rules() {
-        // The carrier has no forward program, so ordinary execution and forward mode reject it.
+        // The carrier has no forward program, so eager execution rejects it before its backward rule can run any of its
+        // effects.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert!(matches!(
@@ -1765,7 +2096,7 @@ mod tests {
             ),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`composite_transpose` `ignored_zero_effect` has no forward program to execute; it \
-                               supports only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                               supports only reverse mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
                                `jacobian_reverse`)",
         ));
         assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
@@ -1773,16 +2104,16 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_partial_evaluation() {
-        // A carrier must survive partial evaluation as one unknown-producing instruction. Splitting or folding it would
-        // separate the backward region from the leading inputs that parameterize it, so the default opaque rule is the
-        // correct behavior here.
+        // A carrier must survive partial evaluation as one instruction with unknown outputs. Splitting or folding it
+        // would separate the backward region from the leading inputs that parameterize it, so the default opaque rule
+        // is the correct behavior here.
         let r#type = ArrayType::scalar(DataType::F64);
         let evaluation = attached_carrier_program()
             .partially_evaluate(&[PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type)])
             .unwrap();
-        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
-            evaluation.program.to_string(),
+            evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = composite_transpose [leading_input_count=1] %0 %1 [
@@ -1799,19 +2130,31 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_partial_evaluation_retained_rules_disconnected() {
+    fn test_composite_transpose_partial_evaluation_retained_rules() {
+        // A carrier with an unknown tangent is residualized unchanged. Its retained backward rule is deferred work, so
+        // the carrier survives the simplification of the residual program even though its output is unused. Partial
+        // evaluation never runs the backward rule, whose effect runs only when the residual program is transposed.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
-        let context =
-            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
-        let tangent = context.unknown_input(ArrayType::scalar(DataType::F64).into(), 0);
-        context
-            .residualize(
-                ignored_zero_effect_carrier(),
+        let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let mut builder = IrBuilder::new();
+        let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
+        let tangent = builder.add_input(tangent_type.clone());
+        builder
+            .add_instruction(ignored_zero_effect_carrier(), Vec::new(), vec![reference, tangent], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 Vec::new(),
-                &[PartialEvaluationValue::known(ArrayIrValue::Reference(stash.clone())), tangent],
+                vec![Placeholder, Placeholder],
+                Vec::new(),
             )
             .unwrap();
-        let evaluation = context.into_evaluation(Vec::new()).unwrap();
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(ArrayIrValue::Reference(stash.clone())),
+                PartialValue::Unknown(tangent_type),
+            ])
+            .unwrap();
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {"
@@ -1839,7 +2182,9 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_partial_evaluation_retained_rules_known_computation() {
+    fn test_composite_transpose_partial_evaluation_retained_rules_known_inputs() {
+        // A composite call without rules is a plain computation over its region, whose reference input must be one of
+        // its leading non-differentiated inputs. A carrier in that region makes the call carry deferred work.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
         let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
@@ -1855,8 +2200,6 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        // A composite call without rules is a plain region-carrying computation whose reference input must be one of
-        // its leading non-differentiated inputs.
         let call = CompositeOperation::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::from_rule_regions(
             CompositeJvpRule::Absent,
             false,
@@ -2007,7 +2350,7 @@ mod tests {
             Ok(vec![Array::vector(vec![2f64, 16f64, 54f64]).unwrap()]),
         );
 
-        // A replicated tangent input receives the sum of its per-item cotangents.
+        // A replicated tangent input receives the sum of the cotangents of all batch items.
         let batched = reverse
             .tangent()
             .batched(
@@ -2143,7 +2486,7 @@ mod tests {
     fn test_composite_transpose_batching_retained_rules_caller_buffers() {
         // `x ↦ x[1]` over `f64[4]`, whose accumulating backward rule adds its seed to only the affected entry of a
         // caller buffer. Batching the linearization batches the carrier, and transposing it with a caller buffer
-        // destination batches the buffer-updating specialization, so each item's row receives its own seed.
+        // destination batches the specialization that updates the buffer, so each item's row receives its own seed.
         let element = |x: &IrTracer| -> Result<IrTracer, ProgramError> {
             Ok(ValueProjection::<ArrayType>::into_projected(x.clone())?.slice(&[1], &[2usize], &[1])?.into_value())
         };
@@ -2341,39 +2684,63 @@ mod tests {
 
     #[test]
     fn test_composite_transpose_differentiation() {
-        // A carrier has no forward program, so forward mode rejects it whether its backward rule is attached or
-        // retained.
+        // A carrier has no forward program, so forward mode rejects it.
         assert!(matches!(
             attached_carrier_program().jvp(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`composite_transpose` has no forward-mode (i.e., JVP) rule; it supports only \
-                               reverse-mode differentiation",
+                if message == "`composite_transpose` has no forward mode (i.e., JVP) rule; it supports only \
+                               reverse mode differentiation",
         ));
+    }
+
+    #[test]
+    fn test_composite_transpose_differentiation_retained_rules() {
+        // Forward mode rejects a carrier with a retained backward rule by the name of its definition, before tracing
+        // any rule.
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let carrier = CompositeTransposeOperation::new(
+        let carrier = ArrayCompositeTranspose::new(
             definition.reference(),
             1,
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type)];
-        let outputs = builder.add_instruction(carrier, Vec::new(), inputs, None).unwrap().to_vec();
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let residual = builder.add_input(scalar_type.clone());
+        let tangent = builder.add_input(scalar_type);
+        let output = builder.add_instruction(carrier, Vec::new(), vec![residual, tangent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
         assert!(matches!(
             program.jvp(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`composite_transpose` `cube` has no forward-mode (i.e., JVP) rule; it supports only \
-                               reverse-mode differentiation",
+                if message == "`composite_transpose` `cube` has no forward mode (i.e., JVP) rule; it supports only \
+                               reverse mode differentiation",
         ));
         assert_eq!(counters.counts(), (0, 0, 0));
     }
 
     #[test]
     fn test_composite_transpose_transposition() {
+        // Transposition replays the attached backward region `(r, ȳ) ↦ ȳ r` inline into the pullback, on the known
+        // leading inputs followed by the output cotangents.
+        let pullback = attached_carrier_program().transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![Array::scalar(3.0f64).unwrap(), Array::scalar(2.0f64).unwrap()]),
+            Ok(vec![Array::scalar(6.0f64).unwrap()]),
+        );
+
         let r#type = ArrayType::scalar(DataType::F64);
         let backward = scalar_multiply_program();
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
@@ -2402,60 +2769,186 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_transposition_known_input_cotangents() {
-        // The backward region of a carrier returns one cotangent per differentiated input, in input order after the
-        // leading inputs. Leading inputs are fixed primal parameters rather than linear inputs, and a *known*
-        // differentiated input is not being differentiated, so both receive structural zeros while the replayed
-        // region's cotangents are assigned only to the unknown linear inputs.
-        let r#type = ArrayType::scalar(DataType::F64);
-        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let residual = transpose_builder.add_input(r#type.clone());
-        let output_cotangent = transpose_builder.add_input(r#type.clone());
-        let first_input_cotangent = transpose_builder
-            .add_instruction(MulOperation::new(), Vec::new(), vec![residual, output_cotangent], None)
-            .unwrap()[0];
-        let transpose = transpose_builder
-            .build::<Vec<Array>, Vec<Array>>(
-                vec![first_input_cotangent, output_cotangent],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
+    fn test_composite_transpose_transposition_unrequested_backward_effects() {
+        // The backward region asserts a dimension bound even though no cotangent is requested. The carrier has no
+        // forward program whose effects could keep this assertion alive, so the region's own effects make the unused
+        // carrier carry deferred work, which simplification keeps and transposition runs.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut backward = IrBuilder::new();
+        let seed = backward.add_input(scalar_type.clone());
+        let invalid_extent = backward.add_constant(Array::scalar(-1i32).unwrap().into());
+        backward
+            .add_instruction(
+                DimensionFromScalarOperation::new(
+                    DimensionVariable::new("extent", DimensionBounds::new(0, None).unwrap()).into(),
+                ),
+                Vec::new(),
+                vec![invalid_extent],
+                None,
             )
             .unwrap();
-        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let residual = context.input(r#type.clone());
-        let known_linear = context.input(r#type.clone());
-        let output_cotangent = context.input(r#type.clone());
-
-        let linear_types = vec![r#type.clone(), r#type.clone()];
-        let cotangents = {
-            let mut rule_context = TranspositionContext::new(context.clone());
-            let rule_inputs = &[
-                PartialValue::Known(residual),
-                PartialValue::Unknown(r#type.clone()),
-                PartialValue::Known(known_linear),
-            ];
-            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
-            ArrayCompositeTranspose::from_backward_region(1, linear_types, vec![r#type.clone()])
-                .transpose(
-                    &mut rule_context,
-                    &driver,
-                    rule_inputs,
-                    &[MaybeZero::Value(output_cotangent)],
-                    &accumulators,
-                )
-                .unwrap();
-            rule_context.take_cotangents(&accumulators).unwrap()
-        };
-
-        assert_eq!(cotangents.len(), 3);
-        assert!(cotangents[0].is_zero());
-        assert!(matches!(cotangents[1], MaybeZero::Value(_)));
-        assert!(cotangents[2].is_zero());
+        let backward = backward
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![seed],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = IrBuilder::new();
+        let input = builder.add_input(scalar_type.clone());
+        let backward = builder.import_program(backward);
+        builder
+            .add_instruction(
+                ArrayIrCompositeTranspose::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type]),
+                vec![backward],
+                vec![input],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        assert!(program.entry_region_ref().effects().has_deferred_work());
+        for program in [program.clone(), program.simplified().unwrap()] {
+            let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+            assert_eq!(
+                transposed.to_string(),
+                indoc! {"
+                    lambda  .
+                    let %0:f32[] = zero [type=f32[]]
+                        %1:i32[] = const -1
+                        %2:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %1
+                    in ()
+                "}
+                .trim_end(),
+            );
+            assert!(matches!(
+                transposed.interpret(Vec::new()),
+                Err(ProgramError::Concretization { message })
+                    if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range",
+            ));
+        }
     }
 
     #[test]
-    fn test_composite_transpose_transposition_structural_zero_outputs() {
+    fn test_composite_transpose_transposition_unrequested_backward_deferred_work() {
+        // The backward programs below defer work by applying a carrier with a retained backward rule whose selected
+        // specialization updates the known reference, either directly or through a nested attached carrier.
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
+        let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let attached_carrier =
+            ArrayIrOperation::<Array>::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
+                1,
+                vec![tangent_type.clone()],
+                vec![tangent_type.clone()],
+            ));
+
+        // Builds a backward program over `(reference, seed)` that returns its seed after the instructions that
+        // `populate` appends.
+        let backward = |populate: &dyn Fn(&mut IrBuilder, AtomId, AtomId)| {
+            let mut builder = IrBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let seed = builder.add_input(tangent_type.clone());
+            populate(&mut builder, reference, seed);
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![seed],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let deferred_work = |builder: &mut IrBuilder, reference: AtomId, seed: AtomId| {
+            builder
+                .add_instruction(ignored_zero_effect_carrier(), Vec::new(), vec![reference, seed], None)
+                .unwrap();
+        };
+
+        // Builds a program over `(reference, tangent)` that applies a carrier with an attached backward rule, with the
+        // reference as its leading input, whose backward program is `backward`.
+        let attached_carrier_program =
+            |backward: Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<_>, Vec<_>>| {
+                let mut builder = IrBuilder::new();
+                let backward = builder.import_program(backward);
+                let reference = builder.add_input(reference_type.clone());
+                let tangent = builder.add_input(tangent_type.clone());
+                let output = builder
+                    .add_instruction(attached_carrier.clone(), vec![backward], vec![reference, tangent], None)
+                    .unwrap()[0];
+                builder
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        vec![output],
+                        vec![Placeholder, Placeholder],
+                        vec![Placeholder],
+                    )
+                    .unwrap()
+            };
+
+        // The backward program is a deferred rule of the carrier, so its deferred work makes the forward program carry
+        // an obligation. Transposition selects it, and its deferred work must be staged even though the ignored
+        // destination makes every accumulator unneeded, which would otherwise let the attached carrier skip its
+        // backward program.
+        let program = attached_carrier_program(backward(&deferred_work));
+        assert!(program.entry_region_ref().effects().has_deferred_work());
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %1 %0
+                in ()
+            "}
+            .trim_end(),
+        );
+
+        // A nested attached carrier whose backward program has deferred work is itself an obligation, so the selected
+        // backward program is replayed and stages that carrier into the pullback, where it remains an obligation of any
+        // later transposition (rather than disappearing with the unneeded accumulators).
+        let program = attached_carrier_program(backward(&|builder, reference, seed| {
+            let nested = builder.import_program(backward(&deferred_work));
+            builder
+                .add_instruction(attached_carrier.clone(), vec![nested], vec![reference, seed], None)
+                .unwrap();
+        }));
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:f64[] = composite_transpose [leading_input_count=1] %1 %0 [
+                    backward={
+                        lambda %0:ref<f64[]>, %1:f64[] .
+                        let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %0 %1
+                        in (%1)
+                    },
+                ]
+                in ()
+            "}
+            .trim_end(),
+        );
+
+        // A nested attached carrier with a pure backward program is no obligation, so the backward program is skipped.
+        let program = attached_carrier_program(backward(&|builder, reference, seed| {
+            let nested = builder.import_program(backward(&|_, _, _| {}));
+            builder
+                .add_instruction(attached_carrier.clone(), vec![nested], vec![reference, seed], None)
+                .unwrap();
+        }));
+        assert!(!program.entry_region_ref().effects().has_deferred_work());
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                in ()
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_composite_transpose_transposition_structural_zero_cotangents() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let primal_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
@@ -2464,8 +2957,9 @@ mod tests {
         let cotangent_type = primal_type.cotangent().unwrap();
         assert_ne!(tangent_type, cotangent_type);
 
-        // A canonical `zero` transpose-region output is already typed in the linear input's cotangent space.
-        // Recovering its structural zero must retain that type instead of dualizing its sharding a second time.
+        // A canonical `zero` output of the backward region is already typed in the cotangent space of its
+        // differentiated input. Recovering its structural zero must retain that type instead of dualizing its sharding
+        // a second time.
         let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         transpose_builder.add_input(cotangent_type.clone());
         let zero = transpose_builder
@@ -2492,7 +2986,7 @@ mod tests {
                 .unwrap();
             rule_context.take_cotangents(&accumulators).unwrap()
         };
-        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
+        assert_eq!(cotangents, vec![MaybeZero::Zero(cotangent_type.clone())]);
 
         // `zero_like` is equally structural even though it consumes an exemplar input. Opaque region replay must
         // recognize it instead of turning the result into a live zero-valued tracer.
@@ -2509,7 +3003,7 @@ mod tests {
         let output_cotangent = context.input(cotangent_type.clone());
         let cotangents = {
             let mut rule_context = TranspositionContext::new(context.clone());
-            let rule_inputs = &[PartialValue::Unknown(primal_type.tangent().unwrap())];
+            let rule_inputs = &[PartialValue::Unknown(tangent_type.clone())];
             let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             ArrayCompositeTranspose::from_backward_region(0, vec![tangent_type.clone()], vec![tangent_type])
                 .transpose(
@@ -2522,39 +3016,45 @@ mod tests {
                 .unwrap();
             rule_context.take_cotangents(&accumulators).unwrap()
         };
-        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
+        assert_eq!(cotangents, vec![MaybeZero::Zero(cotangent_type)]);
     }
 
     #[test]
-    fn test_composite_transpose_transposition_dynamic_structural_zero() {
-        // An attached backward region returns a canonical zero built from its retained dimension. Its dynamic type
-        // does not require accumulating the zero as a live value or returning it across the transposed boundary.
-        type IrValue = ArrayIrValue<Array>;
-        type IrOperation = ArrayIrOperation<Array>;
+    fn test_composite_transpose_transposition_structural_zero_cotangents_dynamic_extent() {
+        // The backward region returns a canonical zero built from its leading dimension input. Its dynamic type does
+        // not require accumulating the zero as a live value or returning it across the transposed boundary.
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent_type.simplified_dimension()]));
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut backward = ProgramBuilder::<IrValue, IrOperation>::new();
+        let mut backward = IrBuilder::new();
         let extent = backward.add_input(extent_type.clone().into());
         backward.add_input(scalar_type.clone().into());
         let zero = backward
             .add_instruction(ZeroOperation::new(input_type.clone()), Vec::new(), vec![extent], None)
             .unwrap()[0];
         let backward = backward
-            .build::<Vec<IrValue>, Vec<IrValue>>(vec![zero], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![zero],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
             .unwrap();
-        let mut builder = ProgramBuilder::<IrValue, IrOperation>::new();
+        let mut builder = IrBuilder::new();
         let extent = builder.add_input(extent_type.into());
         let tangent = builder.add_input(input_type.clone().into());
         let backward = builder.import_program(backward);
-        let carrier = CompositeTransposeOperation::<IrValue, IrOperation>::from_backward_region(
+        let carrier = ArrayIrCompositeTranspose::from_backward_region(
             1,
             vec![input_type.clone().into()],
             vec![scalar_type.clone().into()],
         );
         let output = builder.add_instruction(carrier, vec![backward], vec![extent, tangent], None).unwrap()[0];
         let program = builder
-            .build::<Vec<IrValue>, Vec<IrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
             .unwrap();
         let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
@@ -2563,72 +3063,64 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:dimension<extent ∈ [1, 8)> .
                 let %2:f32[extent] = zero [type=f32[extent]] %1
-                in ()"},
+                in ()
+            "}
+            .trim_end(),
         );
         assert_eq!(
-            transposed.assemble_cotangents(&[input_type.clone().into()], Vec::<IrValue>::new()),
+            transposed.assemble_cotangents(&[input_type.clone().into()], Vec::<ArrayIrValue<Array>>::new()),
             Ok(vec![Some(MaybeZero::Zero(ArrayIrType::Array(input_type)))]),
         );
     }
 
     #[test]
-    fn test_composite_transpose_transposition_unrequested_backward_effects() {
-        // The backward rule asserts a dimension bound even though its contribution is unused. Its forward call has
-        // no computation region, so ordinary forward-effect summaries cannot keep this assertion alive.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let seed = backward.add_input(scalar_type.clone());
-        let invalid_extent = backward.add_constant(Array::scalar(-1i32).unwrap().into());
-        backward
-            .add_instruction(
-                DimensionFromScalarOperation::new(
-                    DimensionVariable::new("extent", DimensionBounds::new(0, None).unwrap()).into(),
-                ),
-                Vec::new(),
-                vec![invalid_extent],
-                None,
-            )
-            .unwrap();
+    fn test_composite_transpose_transposition_known_tangent_inputs() {
+        // The backward region returns one cotangent per differentiated input, in input order after the leading inputs.
+        // A known differentiated input is not being differentiated, so the replayed region's cotangents reach only the
+        // unknown ones. Here, the backward region maps `(r, ȳ)` to `(r ȳ, ȳ)` and only the first differentiated input
+        // is unknown, so the pullback returns `r ȳ` alone.
+        let r#type = ArrayType::scalar(DataType::F64);
+        let mut backward = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let residual = backward.add_input(r#type.clone());
+        let seed = backward.add_input(r#type.clone());
+        let product = backward.add_instruction(MulOperation::new(), Vec::new(), vec![residual, seed], None).unwrap()[0];
         let backward = backward
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![seed],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Array>, Vec<Array>>(vec![product, seed], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(scalar_type.clone());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let backward = builder.import_program(backward);
-        builder
+        let residual = builder.add_input(r#type.clone());
+        let unknown_tangent = builder.add_input(r#type.clone());
+        let known_tangent = builder.add_input(r#type.clone());
+        let output = builder
             .add_instruction(
-                ArrayIrCompositeTranspose::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type]),
+                ArrayCompositeTranspose::from_backward_region(1, vec![r#type.clone(), r#type.clone()], vec![r#type]),
                 vec![backward],
-                vec![input],
+                vec![residual, unknown_tangent, known_tangent],
                 None,
             )
-            .unwrap();
+            .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        // The unused carrier declares deferred work, so simplification keeps it and its backward effects still run.
-        for program in [program.clone(), program.simplified().unwrap()] {
-            let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
-            assert_eq!(
-                transposed.to_string(),
-                indoc! {"
-                    lambda  .
-                    let %0:f32[] = zero [type=f32[]]
-                        %1:i32[] = const -1
-                        %2:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %1
-                    in ()
-                "}
-                .trim_end(),
-            );
-            assert!(transposed.input_ids().is_empty());
-            assert!(transposed.output_ids().is_empty());
-            assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::Concretization { message })
-                if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range"));
-        }
+        let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = mul %1 %0
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![
+                Array::scalar(3.0f64).unwrap(),
+                Array::scalar(2.0f64).unwrap(),
+                Array::scalar(5.0f64).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(6.0f64).unwrap()]),
+        );
     }
 
     #[test]
@@ -2746,7 +3238,9 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_transposition_retained_rules_disconnected() {
+    fn test_composite_transpose_transposition_retained_rules_unrequested_backward_effects() {
+        // The backward rule updates the known reference only in its specialization for an ignored destination and a
+        // structural zero seed, which is the one that transposition selects for an unused carrier output.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let mut builder = IrBuilder::new();
         let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
@@ -2782,7 +3276,9 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_transposition_retained_rules_condition() {
+    fn test_composite_transpose_transposition_retained_rules_unrequested_backward_effects_in_condition() {
+        // A carrier in a condition branch keeps its deferred work through partial evaluation with known inputs, and
+        // the pullback runs its selected backward effect only when that branch is taken.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
         let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
@@ -2880,287 +3376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_transposition_retained_rules_in_attached_backward_rule() {
-        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
-        let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
-        let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let attached_carrier =
-            ArrayIrOperation::<Array>::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
-                1,
-                vec![tangent_type.clone()],
-                vec![tangent_type.clone()],
-            ));
-
-        // Builds a backward program over `(reference, seed)` that returns its seed after the instructions that
-        // `populate` appends.
-        let backward = |populate: &dyn Fn(&mut IrBuilder, AtomId, AtomId)| {
-            let mut builder = IrBuilder::new();
-            let reference = builder.add_input(reference_type.clone());
-            let seed = builder.add_input(tangent_type.clone());
-            populate(&mut builder, reference, seed);
-            builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![seed],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap()
-        };
-        let deferred_work = |builder: &mut IrBuilder, reference: AtomId, seed: AtomId| {
-            builder
-                .add_instruction(ignored_zero_effect_carrier(), Vec::new(), vec![reference, seed], None)
-                .unwrap();
-        };
-
-        // Builds a program over `(reference, tangent)` that applies a carrier with an attached backward rule, with the
-        // reference as its leading input, whose backward program is `backward`.
-        let attached_carrier_program =
-            |backward: Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<_>, Vec<_>>| {
-                let mut builder = IrBuilder::new();
-                let backward = builder.import_program(backward);
-                let reference = builder.add_input(reference_type.clone());
-                let tangent = builder.add_input(tangent_type.clone());
-                let output = builder
-                    .add_instruction(attached_carrier.clone(), vec![backward], vec![reference, tangent], None)
-                    .unwrap()[0];
-                builder
-                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                        vec![output],
-                        vec![Placeholder, Placeholder],
-                        vec![Placeholder],
-                    )
-                    .unwrap()
-            };
-
-        // The backward program is a deferred rule of the carrier, so its deferred work makes the forward program carry
-        // an obligation. Transposition selects it, and its deferred work must be staged even though the ignored
-        // destination makes every accumulator unneeded, which would otherwise let the attached carrier skip its
-        // backward program.
-        let program = attached_carrier_program(backward(&deferred_work));
-        assert!(program.entry_region_ref().effects().has_deferred_work());
-        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:ref<f64[]> .
-                let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %1 %0
-                in ()
-            "}
-            .trim_end(),
-        );
-
-        // A nested attached carrier whose backward program has deferred work is itself an obligation, so the selected
-        // backward program is replayed and stages that carrier into the pullback, where it remains an obligation of any
-        // later transposition (rather than disappearing with the unneeded accumulators).
-        let program = attached_carrier_program(backward(&|builder, reference, seed| {
-            let nested = builder.import_program(backward(&deferred_work));
-            builder
-                .add_instruction(attached_carrier.clone(), vec![nested], vec![reference, seed], None)
-                .unwrap();
-        }));
-        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:ref<f64[]> .
-                let %2:f64[] = composite_transpose [leading_input_count=1] %1 %0 [
-                    backward={
-                        lambda %0:ref<f64[]>, %1:f64[] .
-                        let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %0 %1
-                        in (%1)
-                    },
-                ]
-                in ()
-            "}
-            .trim_end(),
-        );
-
-        // A nested attached carrier with a pure backward program is no obligation, so the backward program is skipped.
-        let program = attached_carrier_program(backward(&|builder, reference, seed| {
-            let nested = builder.import_program(backward(&|_, _, _| {}));
-            builder
-                .add_instruction(attached_carrier.clone(), vec![nested], vec![reference, seed], None)
-                .unwrap();
-        }));
-        assert!(!program.entry_region_ref().effects().has_deferred_work());
-        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:ref<f64[]> .
-                in ()
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_composite_transpose_transposition_retained_rules_effectful_buffered_zero_seed() {
-        // The backward rule records a reference effect whenever its differentiated input's cotangent goes to a caller
-        // buffer, including for a structural zero seed that contributes nothing to that buffer.
-        let definition = CustomRuleRegistration::new(IrDefinition::new("buffered_zero_effect").with_accumulating_vjp(
-            |_| unreachable!("the tests construct the carrier directly"),
-            |context, inputs, seeds, accumulators| {
-                if accumulators[1].reference(context)?.is_some() && matches!(&seeds[0], MaybeZero::Zero(_)) {
-                    let stash = inputs[0].as_known().unwrap().clone();
-                    let increment = context.lift(ArrayIrValue::Array(Array::scalar(1.0f64)?))?;
-                    context.bind(
-                        ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                        Vec::new(),
-                        &[stash, increment],
-                    )?;
-                }
-                Ok(())
-            },
-        ));
-        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
-        let mut builder = IrBuilder::new();
-        let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
-        let tangent = builder.add_input(scalar_type.clone());
-        let carrier = retained_carrier(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
-        builder.add_instruction(carrier, Vec::new(), vec![reference, tangent], None).unwrap();
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                Vec::new(),
-                vec![Placeholder, Placeholder],
-                Vec::new(),
-            )
-            .unwrap();
-        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Reference]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:ref<f64[]>, %1:ref<f64[]> .
-                let %2:f64[] = const 1.0
-                    () = reference_add_update %1 %2
-                in ()
-            "}
-            .trim_end(),
-        );
-        let buffer = ArrayReference::new(Array::scalar(5.0f64).unwrap());
-        assert_eq!(
-            transposed.interpret(vec![ArrayIrValue::Reference(buffer.clone()), ArrayIrValue::Reference(stash.clone())]),
-            Ok(Vec::new()),
-        );
-        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
-        assert_eq!(buffer.read(), Ok(Array::scalar(5.0f64).unwrap()));
-
-        // The returned specialization of the same rule records no effect.
-        let returned = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Return]).unwrap();
-        assert_eq!(
-            returned.interpret(vec![ArrayIrValue::Reference(stash.clone())]),
-            Ok(vec![Array::scalar(0.0f64).unwrap().into()]),
-        );
-        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
-    }
-
-    #[test]
-    fn test_composite_transpose_transposition_retained_rules_zero_seeds() {
-        // The duplicating rule `x ↦ (x, x)` saves no residuals and returns the cotangent `ȳ₁` of its second output,
-        // which the caller leaves unused, so its seed is a structural zero.
-        let duplicate_program = |definition: &CustomRuleRegistration<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-                                 r#type: &ArrayIrType| {
-            let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let input = primal.add_input(r#type.clone());
-            let primal = primal
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![input, input],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
-                .unwrap();
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let primal = builder.import_program(primal);
-            let input = builder.add_input(r#type.clone());
-            let operation = ArrayIrOperation::Composite(CompositeOperation::new(definition.reference()));
-            let output = builder.add_instruction(operation, vec![primal], vec![input], None).unwrap()[0];
-            builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap()
-        };
-        let renderings = |program: &ConvertedProgram| {
-            let reverse = program
-                .entry_region_ref()
-                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
-                .unwrap();
-            let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
-            (reverse.primal().to_string(), reverse.tangent().to_string(), pullback.to_string())
-        };
-
-        // A rule that receives materialized seeds sees a zero of the dynamically shaped output. No known leading input
-        // carries its runtime extent, so the carrier receives that extent as a seed extent, which is read from the
-        // primal output and which the rule never sees.
-        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
-        let r#type: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into();
-        let definition = CustomRuleRegistration::new(IrDefinition::new("duplicate").with_vjp(
-            |primals| Ok((vec![primals[0].clone(), primals[0].clone()], Vec::new())),
-            |leading_inputs, seeds| {
-                assert!(leading_inputs.is_empty());
-                Ok(vec![seeds[1].clone()])
-            },
-        ));
-        assert_eq!(
-            renderings(&duplicate_program(&definition, &r#type)),
-            (
-                indoc! {"
-                    lambda %0:f32[n] .
-                    let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                    in (%0, %1)
-                "}
-                .trim_end()
-                .to_string(),
-                indoc! {"
-                    lambda %0:f32[n], %1:dimension<n ∈ [1, 8)> .
-                    let %2:f32[n], %3:f32[n] = composite_transpose [name=\"duplicate\", leading_input_count=1, \
-                    seed_extent_count=1] %1 %0
-                    in (%2)
-                "}
-                .trim_end()
-                .to_string(),
-                indoc! {"
-                    lambda %0:f32[n], %1:dimension<n ∈ [1, 8)> .
-                    let %2:f32[n] = zero [type=f32[n]] %1
-                    in (%2)
-                "}
-                .trim_end()
-                .to_string(),
-            ),
-        );
-
-        // A rule that receives structural zero seeds sees the unused output's seed as a `MaybeZero::Zero` leaf.
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let definition = CustomRuleRegistration::new(IrDefinition::new("duplicate").with_symbolic_zero_vjp(
-            |primals| Ok((vec![primals[0].clone(), primals[0].clone()], Vec::new())),
-            {
-                let observed = observed.clone();
-                move |_, seeds| {
-                    observed.lock().unwrap().push(seeds.iter().map(MaybeZero::is_zero).collect::<Vec<_>>());
-                    let MaybeZero::Value(seed) = &seeds[0] else {
-                        return Err(ProgramError::InvalidArgument { message: "unexpected zero seed".to_string() });
-                    };
-                    Ok(vec![MaybeZero::Value(seed.clone())])
-                }
-            },
-        ));
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        assert_eq!(
-            renderings(&duplicate_program(&definition, &scalar_type)).2,
-            indoc! {"
-                lambda %0:f32[] .
-                in (%0)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(*observed.lock().unwrap(), vec![vec![false, true]]);
-    }
-
-    #[test]
-    fn test_composite_transpose_transposition_retained_rules_zero_seeds_without_leading_inputs() {
+    fn test_composite_transpose_transposition_retained_rules_unrequested_backward_effects_without_leading_inputs() {
         // The selected backward rule asserts a bound even though it receives no residuals or live seeds and no input
         // cotangent is requested. The existing transposition context is sufficient to stage its effect.
         let definition = CustomRuleRegistration::new(IrDefinition::new("zero_seed_assertion").with_accumulating_vjp(
@@ -3225,7 +3441,211 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transpose_transposition_retained_rules_after_un_projection() {
+    fn test_composite_transpose_transposition_retained_rules_zero_seeds() {
+        // The duplicating rule `x ↦ (x, x)` saves no residuals and returns the cotangent `ȳ₁` of its second output,
+        // which the caller leaves unused, so its seed is a structural zero.
+        let duplicate_program = |definition: &IrRegistration, r#type: &ArrayIrType| {
+            let mut primal = IrBuilder::new();
+            let input = primal.add_input(r#type.clone());
+            let primal = primal
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![input, input],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap();
+            let mut builder = IrBuilder::new();
+            let primal = builder.import_program(primal);
+            let input = builder.add_input(r#type.clone());
+            let operation = ArrayIrOperation::Composite(CompositeOperation::new(definition.reference()));
+            let output = builder.add_instruction(operation, vec![primal], vec![input], None).unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let renderings = |program: &ConvertedProgram| {
+            let reverse = program
+                .entry_region_ref()
+                .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
+                .unwrap();
+            let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+            (reverse.primal().to_string(), reverse.tangent().to_string(), pullback.to_string())
+        };
+
+        // A rule that receives materialized seeds sees a zero of the dynamically shaped output. No known leading input
+        // carries its runtime extent, so the carrier receives that extent as a seed extent, which is read from the
+        // primal output and which the rule never sees.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
+        let r#type: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into();
+        let definition = || {
+            IrDefinition::new("duplicate").with_vjp(
+                |primals| Ok((vec![primals[0].clone(), primals[0].clone()], Vec::new())),
+                |leading_inputs, seeds| {
+                    assert!(leading_inputs.is_empty());
+                    Ok(vec![seeds[1].clone()])
+                },
+            )
+        };
+        let deferred_definition = CustomRuleRegistration::new(definition().with_deferred_forward_rule());
+        let definition = CustomRuleRegistration::new(definition());
+        assert_eq!(
+            renderings(&duplicate_program(&definition, &r#type)),
+            (
+                indoc! {"
+                    lambda %0:f32[n] .
+                    let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                    in (%0, %1)
+                "}
+                .trim_end()
+                .to_string(),
+                indoc! {"
+                    lambda %0:f32[n], %1:dimension<n ∈ [1, 8)> .
+                    let %2:f32[n], %3:f32[n] = composite_transpose [name=\"duplicate\", leading_input_count=1, \
+                    seed_extent_count=1] %1 %0
+                    in (%2)
+                "}
+                .trim_end()
+                .to_string(),
+                indoc! {"
+                    lambda %0:f32[n], %1:dimension<n ∈ [1, 8)> .
+                    let %2:f32[n] = zero [type=f32[n]] %1
+                    in (%2)
+                "}
+                .trim_end()
+                .to_string(),
+            ),
+        );
+
+        // A call that defers its forward rule passes its own input to its carrier in place of the residuals, followed
+        // by the seed extent. Transposition replays the forward rule, which recovers no residuals here, and keeps the
+        // seed extent after them, so the zero seed still reads its runtime extent.
+        assert_eq!(
+            renderings(&duplicate_program(&deferred_definition, &r#type)),
+            (
+                indoc! {"
+                    lambda %0:f32[n] .
+                    let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                    in (%0, %0, %1)
+                "}
+                .trim_end()
+                .to_string(),
+                indoc! {"
+                    lambda %0:f32[n], %1:f32[n], %2:dimension<n ∈ [1, 8)> .
+                    let %3:f32[n], %4:f32[n] = composite_transpose [
+                        name=\"duplicate\",
+                        leading_input_count=2,
+                        seed_extent_count=1,
+                        deferred_forward=true,
+                    ] %1 %2 %0
+                    in (%3)
+                "}
+                .trim_end()
+                .to_string(),
+                indoc! {"
+                    lambda %0:f32[n], %1:f32[n], %2:dimension<n ∈ [1, 8)> .
+                    let %3:f32[n] = zero [type=f32[n]] %2
+                    in (%3)
+                "}
+                .trim_end()
+                .to_string(),
+            ),
+        );
+
+        // A rule that receives structural zero seeds sees the unused output's seed as a `MaybeZero::Zero` leaf.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let definition = CustomRuleRegistration::new(IrDefinition::new("duplicate").with_symbolic_zero_vjp(
+            |primals| Ok((vec![primals[0].clone(), primals[0].clone()], Vec::new())),
+            {
+                let observed = observed.clone();
+                move |_, seeds| {
+                    observed.lock().unwrap().push(seeds.iter().map(MaybeZero::is_zero).collect::<Vec<_>>());
+                    let MaybeZero::Value(seed) = &seeds[0] else {
+                        return Err(ProgramError::InvalidArgument { message: "unexpected zero seed".to_string() });
+                    };
+                    Ok(vec![MaybeZero::Value(seed.clone())])
+                }
+            },
+        ));
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        assert_eq!(
+            renderings(&duplicate_program(&definition, &scalar_type)).2,
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(*observed.lock().unwrap(), vec![vec![false, true]]);
+    }
+
+    #[test]
+    fn test_composite_transpose_transposition_retained_rules_zero_seeds_caller_buffer() {
+        // The carrier's output is unused, so its seed is a structural zero. The backward rule records a reference
+        // effect whenever its differentiated input's cotangent goes to a caller buffer, including for a zero seed that
+        // contributes nothing to that buffer, so the buffered specialization keeps the effect.
+        let definition = CustomRuleRegistration::new(IrDefinition::new("buffered_zero_effect").with_accumulating_vjp(
+            |_| unreachable!("the tests construct the carrier directly"),
+            |context, inputs, seeds, accumulators| {
+                if accumulators[1].reference(context)?.is_some() && matches!(&seeds[0], MaybeZero::Zero(_)) {
+                    let stash = inputs[0].as_known().unwrap().clone();
+                    let increment = context.lift(ArrayIrValue::Array(Array::scalar(1.0f64)?))?;
+                    context.bind(
+                        ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                        Vec::new(),
+                        &[stash, increment],
+                    )?;
+                }
+                Ok(())
+            },
+        ));
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let mut builder = IrBuilder::new();
+        let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
+        let tangent = builder.add_input(scalar_type.clone());
+        let carrier = retained_carrier(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
+        builder.add_instruction(carrier, Vec::new(), vec![reference, tangent], None).unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Reference]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]>, %1:ref<f64[]> .
+                let %2:f64[] = const 1.0
+                    () = reference_add_update %1 %2
+                in ()
+            "}
+            .trim_end(),
+        );
+        let buffer = ArrayReference::new(Array::scalar(5.0f64).unwrap());
+        assert_eq!(
+            transposed.interpret(vec![ArrayIrValue::Reference(buffer.clone()), ArrayIrValue::Reference(stash.clone())]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
+        assert_eq!(buffer.read(), Ok(Array::scalar(5.0f64).unwrap()));
+
+        // The returned specialization of the same rule records no effect.
+        let returned = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Return]).unwrap();
+        assert_eq!(
+            returned.interpret(vec![ArrayIrValue::Reference(stash.clone())]),
+            Ok(vec![Array::scalar(0.0f64).unwrap().into()]),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_composite_transpose_transposition_retained_rules_program_conversion() {
         /// Array-member carrier payload retaining a definition declared in the array IR family.
         #[derive(Clone, Debug)]
         struct MemberCarrier {
@@ -3275,8 +3695,18 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // This canonical conversion changes the stored value and type families as well as the operation payload. It
-        // carries a definition already typed over array IR values; it does not make a Rust closure family-polymorphic.
+        // carries a definition that is already typed over array IR values, rather than making a Rust closure generic
+        // over operation families.
         let converted = member.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+        assert_eq!(
+            converted.to_string(),
+            indoc! {"
+                lambda %0:f64[4] .
+                let %1:f64[1] = composite_transpose [name=\"slice_at_one\", leading_input_count=0] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
         let ArrayIrOperation::CompositeTranspose(operation) = converted.instructions()[0].operation() else {
             unreachable!()
         };
