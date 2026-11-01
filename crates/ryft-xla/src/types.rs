@@ -1,15 +1,15 @@
-use ryft_core::types::data_types::{DataType, DataTypeError};
-use ryft_core::types::layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
+use ryft_core::{DataType, DataTypeError, Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 use ryft_pjrt::{
     BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
     TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
 };
 
-use crate::pjrt::{FromPjrt, ToPjrt};
+use crate::{FromPjrt, ToPjrt};
 
 impl ToPjrt for TileDimension {
     type Output = PjrtTileDimension;
 
+    #[inline]
     fn to_pjrt(&self) -> PjrtTileDimension {
         match self {
             TileDimension::Sized(size) => PjrtTileDimension::sized(*size),
@@ -21,6 +21,7 @@ impl ToPjrt for TileDimension {
 impl FromPjrt<PjrtTileDimension> for TileDimension {
     type Output = Self;
 
+    #[inline]
     fn from_pjrt(value: PjrtTileDimension) -> Self {
         match value.size() {
             Some(size) => Self::Sized(size),
@@ -32,6 +33,7 @@ impl FromPjrt<PjrtTileDimension> for TileDimension {
 impl ToPjrt for Tile {
     type Output = PjrtTile;
 
+    #[inline]
     fn to_pjrt(&self) -> PjrtTile {
         PjrtTile { dimensions: self.dimensions().iter().map(ToPjrt::to_pjrt).collect() }
     }
@@ -40,6 +42,7 @@ impl ToPjrt for Tile {
 impl FromPjrt<PjrtTile> for Tile {
     type Output = Self;
 
+    #[inline]
     fn from_pjrt(value: PjrtTile) -> Self {
         Self::new(value.dimensions.into_iter().map(TileDimension::from_pjrt).collect())
     }
@@ -48,6 +51,7 @@ impl FromPjrt<PjrtTile> for Tile {
 impl ToPjrt for TiledLayout {
     type Output = Result<PjrtTiledLayout, LayoutError>;
 
+    #[inline]
     fn to_pjrt(&self) -> Result<PjrtTiledLayout, LayoutError> {
         Ok(PjrtTiledLayout::new(
             self.minor_to_major()
@@ -56,7 +60,7 @@ impl ToPjrt for TiledLayout {
                 .map(|dimension| {
                     u64::try_from(dimension).map_err(|_| LayoutError::InvalidLayout {
                         message: format!(
-                            "invalid minor-to-major dimension index for PJRT: '{dimension}' is out of range",
+                            "invalid minor-to-major dimension index for PJRT: `{dimension}` is out of range",
                         ),
                     })
                 })
@@ -69,6 +73,7 @@ impl ToPjrt for TiledLayout {
 impl FromPjrt<PjrtTiledLayout> for TiledLayout {
     type Output = Result<Self, LayoutError>;
 
+    #[inline]
     fn from_pjrt(value: PjrtTiledLayout) -> Result<Self, LayoutError> {
         Ok(Self::new(
             value
@@ -78,7 +83,7 @@ impl FromPjrt<PjrtTiledLayout> for TiledLayout {
                 .map(|dimension| {
                     usize::try_from(dimension).map_err(|_| LayoutError::InvalidLayout {
                         message: format!(
-                            "invalid minor-to-major dimension index from PJRT: '{dimension}' is out of range",
+                            "invalid minor-to-major dimension index from PJRT: `{dimension}` is out of range",
                         ),
                     })
                 })
@@ -91,6 +96,7 @@ impl FromPjrt<PjrtTiledLayout> for TiledLayout {
 impl ToPjrt for StridedLayout {
     type Output = Result<PjrtStridedLayout, LayoutError>;
 
+    #[inline]
     fn to_pjrt(&self) -> Result<PjrtStridedLayout, LayoutError> {
         Ok(PjrtStridedLayout::new(
             self.strides()
@@ -98,7 +104,7 @@ impl ToPjrt for StridedLayout {
                 .copied()
                 .map(|stride| {
                     i64::try_from(stride).map_err(|_| LayoutError::InvalidLayout {
-                        message: format!("invalid stride for PJRT: '{stride}' is out of range"),
+                        message: format!("invalid stride for PJRT: `{stride}` is out of range"),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -109,6 +115,7 @@ impl ToPjrt for StridedLayout {
 impl FromPjrt<PjrtStridedLayout> for StridedLayout {
     type Output = Result<Self, LayoutError>;
 
+    #[inline]
     fn from_pjrt(value: PjrtStridedLayout) -> Result<Self, LayoutError> {
         Ok(Self::new(
             value
@@ -117,7 +124,7 @@ impl FromPjrt<PjrtStridedLayout> for StridedLayout {
                 .copied()
                 .map(|stride| {
                     isize::try_from(stride).map_err(|_| LayoutError::InvalidLayout {
-                        message: format!("invalid stride from PJRT: '{stride}' is out of range"),
+                        message: format!("invalid stride from PJRT: `{stride}` is out of range"),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -128,6 +135,7 @@ impl FromPjrt<PjrtStridedLayout> for StridedLayout {
 impl ToPjrt for Layout {
     type Output = Result<PjrtLayout, LayoutError>;
 
+    #[inline]
     fn to_pjrt(&self) -> Result<PjrtLayout, LayoutError> {
         match self {
             Layout::Tiled(layout) => Ok(PjrtLayout::Tiled(layout.to_pjrt()?)),
@@ -139,6 +147,7 @@ impl ToPjrt for Layout {
 impl FromPjrt<PjrtLayout> for Layout {
     type Output = Result<Self, LayoutError>;
 
+    #[inline]
     fn from_pjrt(value: PjrtLayout) -> Result<Self, LayoutError> {
         match value {
             PjrtLayout::Tiled(layout) => Ok(Self::Tiled(TiledLayout::from_pjrt(layout)?)),
@@ -150,9 +159,13 @@ impl FromPjrt<PjrtLayout> for Layout {
 impl ToPjrt for DataType {
     type Output = BufferType;
 
+    #[inline]
     fn to_pjrt(&self) -> BufferType {
         match self {
             DataType::Token => BufferType::Token,
+            // PJRT has no zero-information buffer type. The predicate buffer is a private physical carrier; logical
+            // `Zero` metadata is retained by Ryft and therefore intentionally does not round-trip through `BufferType`.
+            DataType::Zero => BufferType::Predicate,
             DataType::Boolean => BufferType::Predicate,
             DataType::I1 => BufferType::I1,
             DataType::I2 => BufferType::I2,
@@ -169,8 +182,8 @@ impl ToPjrt for DataType {
             DataType::U32 => BufferType::U32,
             DataType::U64 => BufferType::U64,
             DataType::F4E2M1FN => BufferType::F4E2M1FN,
-            DataType::F6E3M2FN => BufferType::F6E3M2FN,
             DataType::F6E2M3FN => BufferType::F6E2M3FN,
+            DataType::F6E3M2FN => BufferType::F6E3M2FN,
             DataType::F8E3M4 => BufferType::F8E3M4,
             DataType::F8E4M3 => BufferType::F8E4M3,
             DataType::F8E4M3FN => BufferType::F8E4M3FN,
@@ -192,10 +205,11 @@ impl ToPjrt for DataType {
 impl FromPjrt<BufferType> for DataType {
     type Output = Result<Self, DataTypeError>;
 
+    #[inline]
     fn from_pjrt(value: BufferType) -> Result<Self, DataTypeError> {
         match value {
             BufferType::Invalid => Err(DataTypeError::InvalidDataType {
-                message: format!("invalid data type from PJRT: '{value}'"),
+                message: format!("invalid data type from PJRT: `{value}`"),
                 backtrace: std::backtrace::Backtrace::capture().to_string(),
             }),
             BufferType::Token => Ok(Self::Token),
@@ -215,8 +229,8 @@ impl FromPjrt<BufferType> for DataType {
             BufferType::U32 => Ok(Self::U32),
             BufferType::U64 => Ok(Self::U64),
             BufferType::F4E2M1FN => Ok(Self::F4E2M1FN),
-            BufferType::F6E3M2FN => Ok(Self::F6E3M2FN),
             BufferType::F6E2M3FN => Ok(Self::F6E2M3FN),
+            BufferType::F6E3M2FN => Ok(Self::F6E3M2FN),
             BufferType::F8E3M4 => Ok(Self::F8E3M4),
             BufferType::F8E4M3 => Ok(Self::F8E4M3),
             BufferType::F8E4M3FN => Ok(Self::F8E4M3FN),
@@ -244,8 +258,7 @@ mod tests {
         TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
     };
 
-    use ryft_core::types::data_types::{DataType, DataTypeError};
-    use ryft_core::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
+    use ryft_core::{DataType, DataTypeError, Layout, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
 
@@ -288,8 +301,13 @@ mod tests {
     fn test_data_type_from_and_to_pjrt_buffer_type() {
         assert!(matches!(
             DataType::from_pjrt(BufferType::Invalid),
-            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: 'invalid'",
+            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: `invalid`",
         ));
+
+        // Zero-space values have no PJRT type and use a predicate carrier. One-bit integer types retain their
+        // native PJRT representations independently of the carrier selected by an executable.
+        assert_eq!(DataType::Zero.to_pjrt(), BufferType::Predicate);
+        assert_eq!(DataType::from_pjrt(BufferType::Predicate), Ok(DataType::Boolean));
         for &(data_type, buffer_type) in &[
             (DataType::Token, BufferType::Token),
             (DataType::Boolean, BufferType::Predicate),
@@ -308,8 +326,8 @@ mod tests {
             (DataType::U32, BufferType::U32),
             (DataType::U64, BufferType::U64),
             (DataType::F4E2M1FN, BufferType::F4E2M1FN),
-            (DataType::F6E3M2FN, BufferType::F6E3M2FN),
             (DataType::F6E2M3FN, BufferType::F6E2M3FN),
+            (DataType::F6E3M2FN, BufferType::F6E3M2FN),
             (DataType::F8E3M4, BufferType::F8E3M4),
             (DataType::F8E4M3, BufferType::F8E4M3),
             (DataType::F8E4M3FN, BufferType::F8E4M3FN),

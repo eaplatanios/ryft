@@ -1,9 +1,27 @@
+use ryft_core::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
+use ryft_pjrt::Device as PjrtDevice;
 
-use ryft_core::sharding::{DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
+use crate::{FromPjrt, ToMlir};
 
-use crate::mlir::ToMlir;
+impl FromPjrt<PjrtDevice<'_>> for Device {
+    type Output = Result<Self, ryft_pjrt::Error>;
+
+    #[inline]
+    fn from_pjrt(value: PjrtDevice<'_>) -> Self::Output {
+        Self::from_pjrt(&value)
+    }
+}
+
+impl FromPjrt<&PjrtDevice<'_>> for Device {
+    type Output = Result<Self, ryft_pjrt::Error>;
+
+    #[inline]
+    fn from_pjrt(value: &PjrtDevice<'_>) -> Self::Output {
+        Ok(Self::new(value.id()?, value.process_index()?))
+    }
+}
 
 /// Canonical symbol name used for emitted Shardy [`LogicalMesh`] declarations and references.
 pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
@@ -11,8 +29,6 @@ pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
 impl ToMlir for LogicalMesh {
     type Output<'c, 't: 'c> = shardy::DetachedMeshOperation<'c, 't>;
 
-    /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`LogicalMesh`].
-    /// The mesh in the returned operation will be named `"mesh"`.
     #[inline]
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
@@ -32,8 +48,6 @@ impl ToMlir for LogicalMesh {
 impl ToMlir for DeviceMesh {
     type Output<'c, 't: 'c> = shardy::DetachedMeshOperation<'c, 't>;
 
-    /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`DeviceMesh`].
-    /// The mesh in the returned operation will be named `"mesh"`.
     #[inline]
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
@@ -46,8 +60,6 @@ impl ToMlir for DeviceMesh {
 impl ToMlir for Sharding {
     type Output<'c, 't: 'c> = shardy::TensorShardingAttributeRef<'c, 't>;
 
-    /// Creates a new [`shardy::TensorShardingAttributeRef`] that corresponds to this [`Sharding`].
-    /// The returned attribute uses the canonical `@mesh` symbol name in the MLIR context associated with `location`.
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
         location: L,
@@ -95,20 +107,16 @@ impl ToMlir for Sharding {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_mlir::{Block, Context as MlirContext};
 
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Device};
+    use crate::tests::{device_mesh_2x2, logical_mesh_3x2x1};
 
     use super::*;
 
     #[test]
     fn test_logical_mesh_to_shardy() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
+        let mesh = logical_mesh_3x2x1();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();
         assert_eq!(
@@ -118,19 +126,13 @@ mod tests {
                 .append_operation(mesh.to_mlir(context.unknown_location()).unwrap())
                 .unwrap()
                 .to_string(),
-            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=3, \"z\"=1]>"),
+            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=3, \"y\"=2, \"z\"=1]>"),
         );
     }
 
     #[test]
     fn test_device_mesh_to_shardy() {
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let devices = vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1), Device::new(3, 1)];
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let mesh = device_mesh_2x2();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();
         assert_eq!(
@@ -151,12 +153,10 @@ mod tests {
             MeshAxis::new("y", 6, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::with_unreduced_axes(
-            mesh,
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            ["y"],
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["y"])
+            .unwrap();
         let context = MlirContext::new();
         assert_eq!(
             sharding.to_mlir(context.unknown_location()).unwrap().to_string(),
