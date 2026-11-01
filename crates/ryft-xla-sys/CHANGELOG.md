@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`, together with their LLVM, StableHLO, Shardy, and Triton pins.
   Native builds now use Bazel 8.8.2, CCCL 3.4.0 and XLA's pinned ROCm 10.0.0 multiarch distribution.
 - Updated the ROCm plugin feature, artifact names, environment variables and path accessor to ROCm 10.
+- Removed the obsolete `enable_libnvjitlink_support` Bazel flag following XLA's unconditional nvJitLink support.
 - Synchronized XLA Protobuf fields, enums and optional-presence semantics, including BLASLt algorithm configurations,
   target-machine options, GPU device metadata, memory statistics, compiler variants and profiler multipass settings.
 - Replaced the LLVM dialect token type C++ bindings (`mlirTypeIsALlvmTokenType` and `mlirLlvmTokenTypeGet`) with
