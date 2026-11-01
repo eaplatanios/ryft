@@ -204,8 +204,6 @@ impl OperationCodeGenerator {
         generator.generate().into()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Generates all implementations for this [`OperationCodeGenerator`], including the dispatchers that are selected
     /// through `#[ryft(dispatch(...))]`, wrapped in a single `const` block. The implementations are generated in the
     /// order in which `ryft` places the implementations of an operation: the formatting and identity implementations,
@@ -302,6 +300,7 @@ impl OperationCodeGenerator {
         quote! {
             #[automatically_derived]
             impl #partial_eq_impl_generics ::std::cmp::PartialEq for #self_type #partial_eq_where_clause {
+                #[inline]
                 fn eq(&self, other: &Self) -> bool {
                     match (self, other) {
                         #((Self::#variant_idents(left), Self::#variant_idents(right)) => left == right,)*
@@ -315,6 +314,7 @@ impl OperationCodeGenerator {
 
             #[automatically_derived]
             impl #hash_impl_generics ::std::hash::Hash for #self_type #hash_where_clause {
+                #[inline]
                 fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
                     ::std::hash::Hash::hash(&::std::mem::discriminant(self), state);
                     match self {
@@ -329,8 +329,8 @@ impl OperationCodeGenerator {
     /// Functions whose results depend on the instruction boundary (e.g., output type inference) use the contract of
     /// the universe that the payload of each variant defines. That is, family-native payloads are called directly,
     /// projected member payloads are called through the `ryft` support functions that project the boundary into their
-    /// member type and lift the results back, and mixed member payloads are called through `MemberOperation`. All other
-    /// functions (e.g., rendering) are forwarded to the payload of every variant directly.
+    /// member type and lift the results back, and mixed member payloads are called through `MemberOperation`.
+    /// All other functions (e.g., rendering) are forwarded to the payload of every variant directly.
     fn generate_operation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -435,20 +435,24 @@ impl OperationCodeGenerator {
             impl #impl_generics #ryft::Operation for #self_type #where_clause {
                 type Type = #operation_type;
 
+                #[inline]
                 fn name(&self) -> &'static str {
                     match self { #(#name_arms)* }
                 }
 
+                #[inline]
                 fn defined_type_identities(
                     &self,
                 ) -> ::std::borrow::Cow<'_, [<#operation_type as #ryft::Type>::Identity]> {
                     match self { #(#defined_type_identity_arms)* }
                 }
 
+                #[inline]
                 fn region_slots(&self) -> &'static [#ryft::RegionSlot] {
                     match self { #(#region_slot_arms)* }
                 }
 
+                #[inline]
                 fn validate_region_interfaces(
                     &self,
                     region_interfaces: &[#ryft::RegionInterface<#operation_type>],
@@ -456,6 +460,7 @@ impl OperationCodeGenerator {
                     match self { #(#region_interface_validation_arms)* }
                 }
 
+                #[inline]
                 fn infer_region_input_types(
                     &self,
                     input_types: &[#operation_type],
@@ -467,6 +472,7 @@ impl OperationCodeGenerator {
                     match self { #(#region_input_type_arms)* }
                 }
 
+                #[inline]
                 fn infer_output_types(
                     &self,
                     input_types: &[#operation_type],
@@ -475,6 +481,7 @@ impl OperationCodeGenerator {
                     match self { #(#output_type_arms)* }
                 }
 
+                #[inline]
                 fn fold(
                     &self,
                     input_types: &[#operation_type],
@@ -486,6 +493,7 @@ impl OperationCodeGenerator {
                     match self { #(#fold_arms)* }
                 }
 
+                #[inline]
                 fn input_region_provenance(
                     &self,
                     region_index: usize,
@@ -494,6 +502,7 @@ impl OperationCodeGenerator {
                     match self { #(#input_region_provenance_arms)* }
                 }
 
+                #[inline]
                 fn output_region_provenance(
                     &self,
                     output_index: usize,
@@ -501,10 +510,12 @@ impl OperationCodeGenerator {
                     match self { #(#output_region_provenance_arms)* }
                 }
 
+                #[inline]
                 fn region_data_flow(&self) -> #ryft::RegionDataFlow<'_> {
                     match self { #(#region_data_flow_arms)* }
                 }
 
+                #[inline]
                 fn prune_boundary(
                     &self,
                     input_types: &[#operation_type],
@@ -517,18 +528,22 @@ impl OperationCodeGenerator {
                     match self { #(#prune_boundary_arms)* }
                 }
 
+                #[inline]
                 fn is_zero(&self, output_index: usize) -> bool {
                     match self { #(#is_zero_arms)* }
                 }
 
+                #[inline]
                 fn region_capture_input_count(&self, region_index: usize) -> ::std::option::Option<usize> {
                     match self { #(#region_capture_input_count_arms)* }
                 }
 
+                #[inline]
                 fn reference_output_identity_input(&self, output_index: usize) -> ::std::option::Option<usize> {
                     match self { #(#reference_output_identity_input_arms)* }
                 }
 
+                #[inline]
                 fn allows_reference_access_through_region_input(
                     &self,
                     region_index: usize,
@@ -537,14 +552,17 @@ impl OperationCodeGenerator {
                     match self { #(#allows_reference_access_through_region_input_arms)* }
                 }
 
+                #[inline]
                 fn defers_reference_discharge(&self) -> bool {
                     match self { #(#defers_reference_discharge_arms)* }
                 }
 
+                #[inline]
                 fn effects(&self) -> ::std::borrow::Cow<'_, #ryft::Effects> {
                     match self { #(#effects_arms)* }
                 }
 
+                #[inline]
                 fn rename_type_identities(
                     &self,
                     renaming: &#ryft::TypeIdentityRenaming<<#operation_type as #ryft::Type>::Identity>,
@@ -552,6 +570,7 @@ impl OperationCodeGenerator {
                     match self { #(#type_identity_renaming_arms)* }
                 }
 
+                #[inline]
                 fn render(
                     &self,
                     formatter: &mut ::std::fmt::Formatter<'_>,
@@ -567,8 +586,8 @@ impl OperationCodeGenerator {
     /// every family, because a policy names the reference universe that is being discharged rather than the universe
     /// that the values of the family belong to. Family-native and bare generic extension variants delegate to the
     /// discharge rules of their payloads, while member variants replay the complete enum through
-    /// `discharge_reference_free_operation`, which copies any attached regions unchanged and rejects reference inputs
-    /// and region closures that reach references.
+    /// `discharge_reference_free_operation`, which copies any attached regions unchanged and
+    /// rejects reference inputs and region closures that reach references.
     fn generate_reference_discharge_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -622,6 +641,7 @@ impl OperationCodeGenerator {
                 for #self_type
             #where_clause
             {
+                #[inline]
                 fn discharge_references<
                     __D: #ryft::ReferenceDischargeDriver<__ParentContext, __ReferenceDischargePolicy>,
                 >(
@@ -640,10 +660,10 @@ impl OperationCodeGenerator {
     }
 
     /// Generates the `InterpretableOperation` dispatcher, which is generic over the interpretation context.
-    /// Family-native variants delegate to the interpretation rules of their payloads and mixed member variants delegate
-    /// to the parent-universe rules of their payloads. Projected member variants are interpreted through
-    /// `interpret_projected_operation`, which projects their inputs into an eager context of their member universe and
-    /// lifts their outputs back.
+    /// Family-native variants delegate to the interpretation rules of their payloads and mixed member variants
+    /// delegate to the parent-universe rules of their payloads. Projected member variants are interpreted through
+    /// `interpret_projected_operation`, which projects their inputs into an eager context of their member universe
+    /// and lifts their outputs back.
     ///
     /// The context value type is the constant type for enums with two or more `Value<Type = T>` parameters. Otherwise,
     /// it is a distinct runtime value type, named by a generated `__InterpretationValue` type parameter that inherits
@@ -744,6 +764,7 @@ impl OperationCodeGenerator {
         quote! {
             #[automatically_derived]
             impl #impl_generics #ryft::InterpretableOperation<__Context> for #self_type #where_clause {
+                #[inline]
                 fn interpret<__D: #ryft::InterpretationDriver<__Context>>(
                     &self,
                     context: &__Context,
@@ -759,8 +780,8 @@ impl OperationCodeGenerator {
     /// Generates the `PartiallyEvaluatableOperation` dispatcher, which is generic over the partial evaluation context.
     /// Family-native variants delegate to the partial evaluation rules of their payloads. Bare generic extension and
     /// member variants instead use the canonical fold-or-residualize path of the complete enum, because a member
-    /// payload's own partial evaluation rule belongs to its native context and cannot consume the partial values of
-    /// the enclosing family without a separate parent-boundary contract.
+    /// payload's own partial evaluation rule belongs to its native context and cannot consume the partial values
+    /// of the enclosing family without a separate parent-boundary contract.
     fn generate_partial_evaluation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -803,6 +824,7 @@ impl OperationCodeGenerator {
         quote! {
             #[automatically_derived]
             impl #impl_generics #ryft::PartiallyEvaluatableOperation<__Context> for #self_type #where_clause {
+                #[inline]
                 fn partially_evaluate<__D: #ryft::PartialEvaluationDriver<__Context>>(
                     &self,
                     context: &#ryft::PartialEvaluationContext<__Context>,
@@ -903,9 +925,9 @@ impl OperationCodeGenerator {
                             #policy: #ryft::BatchingPolicyProjection<__ParentContext, #member_type>
                         });
 
-                        // We state the domain of the projected context as an assumption, so that the elaboration of the
-                        // `Operation<Type = C::Type>` super-trait of the payload rule predicate normalizes through the
-                        // parameter environment instead of re-evaluating the `Domain` implementation of
+                        // We state the domain of the projected context as an assumption, so that the elaboration
+                        // of the `Operation<Type = C::Type>` super-trait of the payload rule predicate normalizes
+                        // through the parameter environment instead of re-evaluating the `Domain` implementation of
                         // `ProjectedContext`, whose `DomainProjection` bound would recurse through the
                         // `OperationProjection` implementation of this family.
                         where_clause.predicates.push(syn::parse_quote! {
@@ -952,6 +974,7 @@ impl OperationCodeGenerator {
         quote! {
             #[automatically_derived]
             impl #impl_generics #ryft::BatchableOperation<__ParentContext, #policy> for #self_type #where_clause {
+                #[inline]
                 fn batch<__D: #ryft::BatchingDriver<__ParentContext, #policy>>(
                     &self,
                     context: &#ryft::BatchingContext<__ParentContext, #policy>,
@@ -964,17 +987,16 @@ impl OperationCodeGenerator {
         }
     }
 
-    /// Generates the `DifferentiableOperation` dispatcher, which implements both `jvp` and `jvp_for_transpose`. The
-    /// dispatcher is generic over a differentiation context that is pinned to the primary operation type, to the
+    /// Generates the `DifferentiableOperation` dispatcher, which implements both `jvp` and `jvp_for_transpose`.
+    /// The dispatcher is generic over a differentiation context that is pinned to the primary operation type, to the
     /// constant type, and to the enum itself as its operation family. Family-native variants delegate to the forward
     /// mode rules of their payloads, and computational member variants delegate to the parent-universe rules of their
-    /// payloads. Structural member variants are constant with respect to their inputs. A structural projected member is
-    /// differentiated by `jvp_structural_operation`, which stages its primal with symbolic zero tangents, while a
+    /// payloads. Structural member variants are constant with respect to their inputs. A structural projected member
+    /// is differentiated by `jvp_structural_operation`, which stages its primal with symbolic zero tangents, while a
     /// structural mixed member is differentiated by `jvp_structural_mixed_operation`, which also stages one member zero
     /// tangent per output, through `stage_member_zero_tangent` for each computational member universe of the enum.
-    /// Higher-order rules request nested differentiation through
-    /// their instruction-scoped driver, whose concrete implementation establishes the required `Program::jvp` and
-    /// `Program::linearize` bounds at its construction site.
+    /// Higher-order rules request nested differentiation through their instruction-scoped driver, whose concrete
+    /// implementation establishes the required `Program::jvp` and `Program::linearize` bounds at its construction site.
     fn generate_differentiation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -1066,7 +1088,6 @@ impl OperationCodeGenerator {
                 let arms = self.variants.iter().map(|variant| {
                     let payload_type = &variant.program_payload_type;
                     let receiver = variant.receiver();
-
                     match &variant.class {
                         OperationVariantClass::FamilyNative => variant.arm(quote! {
                             <#payload_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::
@@ -1082,8 +1103,8 @@ impl OperationCodeGenerator {
                         }
 
                         // Each output's zero tangent is staged in the computational member universe that the output
-                        // belongs to, and an output outside every such universe (e.g., a structural member output) has
-                        // a zero differential space and so it receives a symbolic zero tangent instead.
+                        // belongs to, and an output outside every such universe (e.g., a structural member output)
+                        // has a zero differential space and so it receives a symbolic zero tangent instead.
                         OperationVariantClass::MixedMember { member_type, structural: true } => {
                             let tangent_universes = self.tangent_universes(member_type);
                             variant.wildcard_arm(quote! {
@@ -1111,6 +1132,7 @@ impl OperationCodeGenerator {
                     }
                 });
                 quote! {
+                    #[inline]
                     fn #function<
                         __D: #ryft::DifferentiationDriver<__DifferentiationContext>,
                         __Policy: #ryft::DifferentiationPolicy<__DifferentiationContext>,
@@ -1138,8 +1160,8 @@ impl OperationCodeGenerator {
     /// [`OperationCodeGenerator::has_separate_runtime_value_type`]) transpose over a generated `__TranspositionValue`
     /// parameter that inherits the bounds of the constant parameter, while all other enums transpose over their
     /// constant type. Family-native variants delegate to the transposition rules of their payloads. Computational
-    /// projected member variants delegate to `MemberTransposableOperation::transpose_in_parent`, which preserves access
-    /// to cotangent accumulators that the value family of the member may not be able to represent. Mixed member
+    /// projected member variants delegate to `MemberTransposableOperation::transpose_in_parent`, which preserves
+    /// access to cotangent accumulators that the value family of the member may not be able to represent. Mixed member
     /// variants are transposed through `transpose_mixed_operation`, and structural projected member variants contribute
     /// no cotangents. Higher-order rules request nested program transposition through their instruction-scoped driver,
     /// whose concrete implementation establishes the required `Program::transpose_with_respect_to` bounds.
@@ -1242,6 +1264,7 @@ impl OperationCodeGenerator {
         quote! {
             #[automatically_derived]
             impl #impl_generics #ryft::TransposableOperation<#value_type, #self_type> for #self_type #where_clause {
+                #[inline]
                 fn transpose<__D: #ryft::TranspositionDriver<#value_type, #self_type>>(
                     &self,
                     context: &mut #ryft::TranspositionContext<#value_type, #self_type>,
@@ -1273,12 +1296,13 @@ impl OperationCodeGenerator {
         })
     }
 
-    /// Generates the `OperationPayloadProjection` implementation. Projected member variants delegate to their member
-    /// families in both directions, lifting constructed member operations through the `From<Member>` conversion of
-    /// the enum. Every other variant projects into its payload when the payload type is `'static` for every
-    /// instantiation of the generic parameters of the enum (refer to [`is_unconditionally_static`]), and such
-    /// family-native variants are also constructed from their payloads, before any projected member is tried. Mixed
-    /// member variants are never constructed, and generic extension variants are neither projected nor constructed.
+    /// Generates the `OperationPayloadProjection` implementation. Projected member variants delegate to their
+    /// member families in both directions, lifting constructed member operations through the `From<Member>`
+    /// conversion of the enum. Every other variant projects into its payload when the payload type is `'static`
+    /// for every instantiation of the generic parameters of the enum (refer to [`is_unconditionally_static`]), and
+    /// such family-native variants are also constructed from their payloads, before any projected member is tried.
+    /// Mixed member variants are never constructed, and generic extension variants are neither projected nor
+    /// constructed.
     fn generate_payload_projection_impl(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let self_type = &self.self_type;
@@ -1334,6 +1358,7 @@ impl OperationCodeGenerator {
             #[automatically_derived]
             impl #impl_generics #ryft::OperationPayloadProjection for #self_type #where_clause {
                 #[allow(unreachable_patterns)]
+                #[inline]
                 fn project_payload(
                     &self,
                     payload: ::std::any::TypeId,
@@ -1344,6 +1369,7 @@ impl OperationCodeGenerator {
                     }
                 }
 
+                #[inline]
                 fn from_payload(
                     payload: #ryft::ErasedOperation,
                 ) -> ::std::result::Result<Self, #ryft::ErasedOperation> {
@@ -1357,15 +1383,15 @@ impl OperationCodeGenerator {
 
     /// Generates the `OperationProvider` implementation that rejects every `GuardOperation` request of the primary
     /// operation type with `GuardOperation::unsupported_error`, or returns [`None`] when a variant stores a native
-    /// guard (refer to [`OperationVariant::is_native_guard`]). Every `Context` requires its operation family to provide
-    /// guard requests, and so a family that stores no guard needs this provider to be usable as the family of a
-    /// context at all. A family that stores a native guard instead converts it through the generated
-    /// `From<GuardOperation<T>>` implementation, which the blanket supporting provider of `ryft-core` turns into an
-    /// accepting provider.
+    /// guard (refer to [`OperationVariant::is_native_guard`]). Every `Context` requires its operation family to
+    /// provide guard requests, and so a family that stores no guard needs this provider to be usable as the family
+    /// of a context at all. A family that stores a native guard instead converts it through the generated
+    /// `From<GuardOperation<T>>` implementation, which the blanket supporting provider of `ryft-core`
+    /// turns into an accepting provider.
     ///
     /// The two implementations never overlap. The blanket implementation requires `Enum: From<GuardOperation<T>>`,
-    /// which only the deriving crate can implement for its own enum, and so the compiler proves that it does not hold
-    /// whenever no such conversion exists. A family that stores no native guard but handwrites that conversion
+    /// which only the deriving crate can implement for its own enum, and so the compiler proves that it does not
+    /// hold whenever no such conversion exists. A family that stores no native guard but handwrites that conversion
     /// therefore fails to compile with a conflicting implementations error (E0119), instead of silently rejecting
     /// guards that it could represent.
     fn generate_guard_provider_impl(&self) -> Option<TokenStream> {
@@ -1418,11 +1444,12 @@ impl OperationCodeGenerator {
         let operation = variant.construct(quote!(operation));
         let receiver = variant.receiver();
 
-        // Only the implementation headers are spanned at the variant, so that conflicting implementations (e.g., of a
-        // payload type that is held by several variants) point at it. The bodies keep the call site span, so that
+        // Only the implementation headers are spanned at the variant, so that conflicting implementations (e.g., of
+        // a payload type that is held by several variants) point at it. The bodies keep the call site span, so that
         // lints on generated code (e.g., the unreachable fallback arm of a single variant enum) are not reported in
         // user code.
         let from_body = quote! {
+            #[inline]
             fn from(operation: #payload_type) -> Self {
                 #operation
             }
@@ -1430,6 +1457,7 @@ impl OperationCodeGenerator {
         let try_from_body = quote! {
             type Error = #ryft::TypeError;
 
+            #[inline]
             fn try_from(value: &'__operation #self_type) -> ::std::result::Result<Self, #ryft::TypeError> {
                 match value {
                     #enum_ident::#variant_ident(operation) => ::std::result::Result::Ok(#receiver),
@@ -1464,8 +1492,8 @@ impl OperationCodeGenerator {
     /// Returns the `where` predicates that copy the declared bounds of [`OperationCodeGenerator::constant_parameter`]
     /// (i.e., both its inline bounds and the `where` predicates whose bounded type references it) onto the provided
     /// generated type parameter, renaming every mention of the constant parameter in them. That way, a generated
-    /// runtime value type inherits the capability requirements that the enum declares for its constant parameter. This
-    /// function returns no predicates for enums that declare an explicit constant type.
+    /// runtime value type inherits the capability requirements that the enum declares for its constant parameter.
+    /// This function returns no predicates for enums that declare an explicit constant type.
     fn constant_parameter_predicates(&self, value_parameter: &syn::Ident) -> Vec<syn::WherePredicate> {
         let Some(parameter) = &self.constant_parameter else {
             return Vec::new();
@@ -1626,6 +1654,7 @@ impl OperationParser {
         if !self.errors.is_empty() {
             return;
         }
+
         match (&self.operation_type, &self.constant_type) {
             (Some(_), Some(_)) => {}
             (None, None) => {
@@ -1644,8 +1673,8 @@ impl OperationParser {
                     ),
                     _ => self.add_error(
                         &input.generics,
-                        "could not infer a unique operation type because multiple distinct `Value<Type = T>` bounds \
-                         are present",
+                        "could not infer a unique operation type because multiple distinct `Value<Type = T>` \
+                         bounds are present",
                     ),
                 }
             }
@@ -1655,6 +1684,8 @@ impl OperationParser {
             ),
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Extracts the single [`syn::Type`] declared by a `#[ryft(type(T))]` or a `#[ryft(constant(C))]` attribute into
     /// `declared_type`. The type is parsed locally (rather than through the shared `name = value` attribute grammar) so
