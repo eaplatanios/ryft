@@ -39,7 +39,7 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// Default number of structured compilation events retained for diagnostics.
 const DEFAULT_EVENT_CAPACITY: usize = 0;
 
-/// Cache tier or lifecycle stage that produced a [`CompilationEvent`].
+/// Cache tier or lifecycle phase that produced a [`CompilationEvent`].
 ///
 /// Events are emitted only by [`CompilationContext`], so the variants cover exactly the tiers that the shared cache of
 /// compiled programs coordinates.
@@ -111,7 +111,7 @@ pub enum CompilationMissReason {
 /// Structured diagnostic event for one compilation lifecycle or cache operation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CompilationEvent {
-    /// Lifecycle stage or cache tier that emitted this event.
+    /// Lifecycle phase or cache tier that emitted this event.
     pub level: CompilationCacheLevel,
 
     /// Result of the operation.

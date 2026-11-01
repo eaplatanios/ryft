@@ -15,18 +15,18 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, AttachedRegions,
     BatchingError, CallRequest, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
-    CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
+    CompilationRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
     DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize,
     DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass,
-    EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh, LoweringRequest, Memory,
-    MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
-    Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
+    EmptyRegionDriver, ExternalReferenceBinding, FlatCompilationProgram, InterpretableOperation, Layout, LogicalMesh,
+    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
+    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
     ReferenceReplacementPreparation, ReferenceSource, RegionDriver, RegionKey, RegionRef, ScatterMode,
     ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, SpecializationCache,
-    SpecializationCacheEntry, SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain,
-    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
-    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
+    SpecializationCacheEntry, SpecializationCacheStatistics, StatefulCompilationDomain, StaticShape, StridedLayout,
+    Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
+    Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array, ProjectedContext};
@@ -3904,6 +3904,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         input_types: Vec<ArrayIrType>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
+        let input_types = apply_input_shardings(input_types, options)?;
         let Some(bucketing) = options.input_bound_bucketing else {
             let input_types: Arc<[ArrayIrType]> = input_types.into();
             return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
@@ -3969,62 +3970,6 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types.into()))
     }
 
-    fn stage<Request>(
-        &self,
-        mut request: Request,
-    ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
-    where
-        Request: StageRequest<Self>,
-    {
-        if let Some(in_shardings) = request.options().in_shardings.clone() {
-            if request.input_types().parameters().any(|r#type| r#type.is_reference()) {
-                return Err(XlaDomainError::UnsupportedReferenceAbi {
-                    reason: "external reference inputs do not support explicit input shardings".to_string(),
-                });
-            }
-            let input_types = apply_signature_shardings(
-                request.input_types().parameters().cloned().collect(),
-                Some(in_shardings.as_slice()),
-                "in",
-            )?;
-            request.replace_input_types(input_types)?;
-        }
-        let staged = request.trace(|options, output_types| {
-            // A reference-typed output is rejected below with a diagnostic derived from the traced program, which the
-            // signature normalization cannot see, so it passes through here unsharded instead of failing the array
-            // projection that the sharding override performs.
-            if output_types.iter().any(|r#type| r#type.is_reference()) {
-                return Ok(output_types);
-            }
-            apply_signature_shardings(output_types, options.out_shardings.as_deref(), "out")
-        })?;
-        // The stateful XLA ABI opens and commits external input references and has no protocol for turning a
-        // backend-created array into a host reference with persistent identity, nor for handing an entering reference
-        // back through an output, so every reference-typed output is rejected. The retained reference analysis of the
-        // capture-lifted program distinguishes the escaping local allocation from the forwarded external reference.
-        if let Some(output_index) = staged.output_types().iter().position(|r#type| r#type.is_reference()) {
-            let capture_count = staged.source_program().captures().len();
-            let analysis = staged.lifted_program()?.reference_analysis(capture_count).map_err(ProgramError::from)?;
-            let root = analysis.output_roots().get(output_index).copied().flatten();
-            let reason = match root.map(|root| analysis.external_source(root)) {
-                Some(Some(source)) => format!(
-                    "output {output_index} forwards the external reference bound at {source}, and the stateful XLA \
-                     ABI does not return forwarded references; read the reference after the call instead",
-                ),
-                Some(None) => format!(
-                    "output {output_index} is a reference allocated inside the program and cannot be returned \
-                     through the stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
-                ),
-                None => format!(
-                    "output {output_index} is a reference whose root the reference analysis attributes to neither an \
-                     input nor an allocation, and the stateful XLA ABI cannot return it",
-                ),
-            };
-            return Err(XlaDomainError::UnsupportedReferenceAbi { reason });
-        }
-        Ok(staged)
-    }
-
     fn lower<Request>(
         &self,
         staged: Request,
@@ -4032,14 +3977,27 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     where
         Request: LoweringRequest<Self>,
     {
+        let staged_input_types = staged.staged().input_types();
+        if apply_input_shardings(staged_input_types.to_vec(), staged.staged().options())? != staged_input_types {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: "staged input types do not carry the shardings requested by `in_shardings`; apply them to the \
+                         input types before staging (e.g., with `with_input_shardings`)"
+                    .to_string(),
+            });
+        }
         let lifted_program = staged.lifted_program()?;
-        let program = self.lower_xla_program(
-            &lifted_program,
-            staged.staged().source_program().captures().len(),
-            staged.staged().options(),
-        )?;
+        let capture_count = staged.staged().source_program().captures().len();
+        validate_reference_outputs(&lifted_program, capture_count, staged.staged().output_types())?;
+        let program = self.lower_xla_program(&lifted_program, capture_count, staged.staged().options())?;
         let output_types = program.output_types().to_vec();
-        validate_output_types(staged.staged().output_types(), &output_types)?;
+        // Lowering applies the output sharding overrides to the program outputs, so the traced output types of the
+        // staged function are checked against the lowered ones with those same overrides applied.
+        let declared_output_types = apply_signature_shardings(
+            staged.staged().output_types().to_vec(),
+            staged.staged().options().out_shardings.as_deref(),
+            "out",
+        )?;
+        validate_output_types(&declared_output_types, &output_types)?;
         Ok(staged.into_lowered(program, output_types.into_iter().map(Into::into).collect()))
     }
 
@@ -4048,7 +4006,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         lowered: Request,
     ) -> Result<ryft_core::compilation::CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
     where
-        Request: CompileRequest<Self>,
+        Request: CompilationRequest<Self>,
     {
         // Cheap clone: the lowered program is a bundle of `Arc` handles. The snapshot outlives `compile_request`,
         // which consumes the request, so the resolved program can be cross-checked below even on cache hits.
@@ -5406,6 +5364,76 @@ pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) 
         }
         .into())
     }
+}
+
+/// Returns `input_types` with the input sharding overrides of `options` (i.e., [`XlaOptions::in_shardings`]) applied,
+/// or `input_types` unchanged when `options` has none. The overrides must be applied before tracing, because tracers
+/// carry their input types and sharding-aware operations read them. Retained dispatch applies them through
+/// [`CompilationDomain::dispatch_signature`], the staging entry points of this crate apply them through
+/// [`with_input_shardings`], and lowering rejects staged functions whose input types do not carry them. External
+/// reference inputs are rejected when overrides are present, because holder state derives its effective sharding from
+/// the compiled reference ABI.
+fn apply_input_shardings(
+    input_types: Vec<ArrayIrType>,
+    options: &XlaOptions,
+) -> Result<Vec<ArrayIrType>, XlaDomainError> {
+    let Some(in_shardings) = options.in_shardings.as_deref() else {
+        return Ok(input_types);
+    };
+    if input_types.iter().any(|r#type| r#type.is_reference()) {
+        return Err(XlaDomainError::UnsupportedReferenceAbi {
+            reason: "external reference inputs do not support explicit input shardings".to_string(),
+        });
+    }
+    apply_signature_shardings(input_types, Some(in_shardings), "in")
+}
+
+/// Returns the structured `input_types` with the input sharding overrides of `options` applied (refer to
+/// [`apply_input_shardings`]). Call this before [`CompilationDomain::stage`] when staging with options that may
+/// carry input sharding overrides.
+pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
+    input_types: In,
+    options: &XlaOptions,
+) -> Result<In, XlaDomainError> {
+    if options.in_shardings.is_none() {
+        return Ok(input_types);
+    }
+    let input_structure = input_types.parameter_structure();
+    let input_types = apply_input_shardings(input_types.into_parameters().collect(), options)?;
+    Ok(In::from_parameters(input_structure, input_types).map_err(ProgramError::from)?)
+}
+
+/// Rejects every reference-typed output of a capture-lifted program before lowering it into an executable. The stateful
+/// XLA ABI opens and commits external input references and has no protocol for turning a backend-created array into a
+/// host reference with persistent identity, nor for handing an entering reference back through an output. The
+/// retained reference analysis of the capture-lifted program distinguishes the escaping local allocation from the
+/// forwarded external reference. References returned by nested calls inside a program never cross that ABI, so only
+/// the outputs of the lowered program itself are checked.
+fn validate_reference_outputs(
+    program: &FlatCompilationProgram<XlaDomain<'_>>,
+    capture_count: usize,
+    output_types: &[ArrayIrType],
+) -> Result<(), XlaDomainError> {
+    let Some(output_index) = output_types.iter().position(|r#type| r#type.is_reference()) else {
+        return Ok(());
+    };
+    let analysis = program.reference_analysis(capture_count).map_err(ProgramError::from)?;
+    let root = analysis.output_roots().get(output_index).copied().flatten();
+    let reason = match root.map(|root| analysis.external_source(root)) {
+        Some(Some(source)) => format!(
+            "output {output_index} forwards the external reference bound at {source}, and the stateful XLA ABI does \
+             not return forwarded references; read the reference after the call instead",
+        ),
+        Some(None) => format!(
+            "output {output_index} is a reference allocated inside the program and cannot be returned through the \
+             stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
+        ),
+        None => format!(
+            "output {output_index} is a reference whose root the reference analysis attributes to neither an input \
+             nor an allocation, and the stateful XLA ABI cannot return it",
+        ),
+    };
+    Err(XlaDomainError::UnsupportedReferenceAbi { reason })
 }
 
 fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), XlaDomainError> {
@@ -6944,11 +6972,11 @@ mod tests {
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
         Assert, AssertOperation, Atan2Operation, AtomId, AttachedRegions, AxisIndexOperation, BatchAxis,
         BatchableOperation, BatchingContext, CaptureReference, Cast, CastOperation, CollectiveOptions,
-        CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
-        CompiledFunctionDispatcher, CompositeJvpRule, CompositeOperation, ConcatenateOperation, ConditionOperation,
-        ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
-        CustomCallOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+        CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher, CompositeJvpRule,
+        CompositeOperation, ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation, Dimension,
+        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation,
         DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
         DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
@@ -6962,8 +6990,8 @@ mod tests {
         ReferenceWrite, ReferenceWriteOperation, Reshape, ReshapeOperation, RngBitGeneratorOperation,
         ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
         ScatterOptions, SelectOperation, ShardMap, ShardMapOperation, Sharding, ShardingDimension, SliceOperation,
-        SortDirection, SortOperation, StagingContext, StaticShape, SubOperation, TracingContext, Value, WhileOperation,
-        ZeroOperation, batch, jit_with_options, shard_map,
+        SortDirection, SortOperation, StagedFunction, StagingContext, StaticShape, SubOperation, TracingContext, Value,
+        WhileOperation, ZeroOperation, batch, jit_with_options, shard_map,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -12524,7 +12552,11 @@ mod tests {
                 scaled_scale_type,
             );
             let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-            assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
+            // cuDNN accepts the NVFP4 and `f8e4m3fn` MXFP8 pairs, which lower to the block-scaled-dot custom call, but
+            // not `f8e5m2` on both sides, which keeps the composite.
+            let uses_custom_call = scaled_element_type != DataType::F8E5M2;
+            assert_eq!(lowered.stable_hlo().contains("stablehlo.custom_call @__op$block_scaled_dot"), uses_custom_call);
+            assert_eq!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""), !uses_custom_call);
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
             let compiled = domain.compile_xla_program(&lowered).unwrap();
@@ -13575,8 +13607,6 @@ mod tests {
 
     #[test]
     fn test_xla_persistent_executable_round_trip_preserves_invocation_and_analysis() {
-        use ryft_core::StagedFunction;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -13604,12 +13634,12 @@ mod tests {
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
         let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> = domain
-            .stage(CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+            .stage::<_, ArrayIrType, ArrayIrType>(
                 add_capture,
                 vec![XlaValue::Array(capture.clone())],
                 ArrayIrType::Array(input_type.clone()),
                 XlaOptions::new(mesh.clone()).with_donate(true),
-            ))
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let compiled_analysis = domain.analyze(compiled.executable_function()).unwrap();
@@ -14235,7 +14265,8 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
         // Reference inputs are structurally valid for stateful staging, but user-provided input sharding overrides
-        // are not: holder state derives its effective sharding from the compiled reference ABI.
+        // are not: holder state derives its effective sharding from the compiled reference ABI. Lowering rejects the
+        // overrides for staged functions whose input types did not receive them.
         fn forward<'c>(
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
@@ -14245,21 +14276,21 @@ mod tests {
         }
         assert!(matches!(
             domain
-                .stage(
-                    CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                .stage::<_, ArrayIrType, ArrayIrType>(
                         forward,
                         Vec::new(),
                         reference_type.clone(),
                         XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
-                    ),
-                )
+                    )
+                .and_then(|staged| domain.lower(staged))
                 .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "external reference inputs do not support explicit input shardings",
         ));
 
-        // A reference output with `out_shardings` is likewise rejected, by the reference-output contract rather than
-        // by the output override, which never runs on a reference type.
+        // A reference output with `out_shardings` stages successfully and is rejected when lowered, by the
+        // reference-output contract of the ABI rather than by the output override, which never runs on a reference
+        // type.
         fn allocate<'c>(
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
@@ -14269,14 +14300,13 @@ mod tests {
         }
         assert!(matches!(
             domain
-                .stage(
-                    CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                .stage::<_, ArrayIrType, ArrayIrType>(
                         allocate,
                         Vec::new(),
                         ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
                         XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
-                    ),
-                )
+                    )
+                .and_then(|staged| domain.lower(staged))
                 .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
@@ -14284,23 +14314,59 @@ mod tests {
                               reference",
         ));
 
-        // Forwarding an external reference through an output is rejected by the same contract, because the ABI has no
-        // protocol for handing an entering reference back through an output either.
+        // Forwarding an external reference through an output is rejected by the same contract when lowered, because
+        // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
             domain
-                .stage(
-                    CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                .stage::<_, ArrayIrType, ArrayIrType>(
                         forward,
                         Vec::new(),
                         reference_type,
                         XlaOptions::new(mesh.clone()),
-                    ),
-                )
+                    )
+                .and_then(|staged| domain.lower(staged))
                 .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
                               does not return forwarded references; read the reference after the call instead",
         ));
+    }
+
+    #[test]
+    fn test_lower_requires_staged_input_types_to_carry_input_shardings() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let options = XlaOptions::new(mesh.clone())
+            .with_in_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
+
+        fn forward<'c>(
+            _: Vec<XlaConstant>,
+            _: Vec<CompilationTracer<XlaDomain<'c>>>,
+            input: CompilationTracer<XlaDomain<'c>>,
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            Ok(input)
+        }
+
+        // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
+        // did not receive the requested input shardings before staging.
+        let staged = domain
+            .stage::<_, ArrayIrType, ArrayIrType>(forward, Vec::new(), scalar_type.clone(), options.clone())
+            .unwrap();
+        assert!(matches!(
+            domain.lower(staged).map(|_| ()),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "staged input types do not carry the shardings requested by `in_shardings`; apply them \
+                              to the input types before staging (e.g., with `with_input_shardings`)",
+        ));
+
+        let input_types = with_input_shardings(scalar_type, &options).unwrap();
+        let staged = domain.stage::<_, ArrayIrType, ArrayIrType>(forward, Vec::new(), input_types, options).unwrap();
+        assert!(domain.lower(staged).is_ok());
     }
 
     #[test]
@@ -16417,7 +16483,7 @@ mod tests {
     }
 
     /// Measures eager dispatch overhead for `.tasks/plan_eager_dispatch_front_cache.md`. Compares repeated eager `add`
-    /// calls against a warm jitted function over the same input, and then times each stage of the eager dispatch path
+    /// calls against a warm jitted function over the same input, and then times each step of the eager dispatch path
     /// (tracing, lowering, compilation-key construction, compile-cache lookup, and execution) in isolation.
     #[test]
     #[ignore = "phase 0 baseline measurement"]

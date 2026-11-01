@@ -15,18 +15,19 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, CollectiveOptions, Compare, ComparisonDirection, Condition,
-    ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionBounds,
-    DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers, DynamicSlice,
-    DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather,
-    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter,
-    Placeholder, ProgramBuilder, ProgramError, Reduce, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding,
-    ShardingDimension, Value, ValueProjection, ZeroLike, shard_map,
+    BatchAxis, BatchingContext, BatchingTracer, BlockScaleFormat, BlockScaledDotConfiguration, BlockScaledDotInputs,
+    CollectiveOptions, Compare, ComparisonDirection, Condition, ConvertElementTypeOperation, DataType, Device,
+    DeviceMesh, Differentiate, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
+    DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext,
+    LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll,
+    ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ProjectedContext,
+    Reduce, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension, Value, ValueProjection,
+    ZeroLike, block_scaled_dot, differentiate_at, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
-use ryft_xla::{FromPjrt, XlaArray, XlaSession};
+use ryft_xla::{FromPjrt, XlaArray, XlaDomain, XlaSession};
 
 #[path = "differential_testing/collectives.rs"]
 mod collectives;
@@ -98,6 +99,7 @@ fn registry() -> Vec<DifferentialCase> {
             collective: false,
         },
         DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul, collective: false },
+        DifferentialCase { case_id: "block_scaled_dot", emit: emit_block_scaled_dot, collective: false },
         DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention, collective: false },
         DifferentialCase { case_id: "negative_dynamic_slice", emit: emit_negative_dynamic_slice, collective: false },
         DifferentialCase {
@@ -608,6 +610,96 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
     })
 }
 
+/// Returns the shared `block_scaled_dot` inputs of the JAX registry, whose quantized arithmetic is exact in both
+/// frameworks. The NVFP4 left input clips at its global scale `2^-9`, and every MXFP8 block contains `4`, whose power of
+/// two scale is the same under the OCP and JAX scale rounding.
+fn block_scaled_dot_inputs() -> Result<[Array; 6], ProgramError> {
+    let values = |shape: &[usize], value: &dyn Fn(usize) -> f64| {
+        let count = shape.iter().product::<usize>();
+        let values = (0..count).map(|index| value(index) as f32).collect::<Vec<_>>();
+        Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape.to_vec()), &values)
+    };
+    let modulo = |value: usize, modulus: usize| (value % modulus) as f64;
+    let mx = |seed: &dyn Fn(usize, usize) -> f64, stride: usize| {
+        values(&[32, 32], &|index| {
+            let (row, column) = (index / 32, index % 32);
+            if column == (stride * row) % 32 { 4.0 } else { seed(row, column) }
+        })
+    };
+    Ok([
+        values(&[2, 4, 32], &|index| modulo(index * 7, 13) - 6.0)?,
+        values(&[2, 32, 8], &|index| (modulo(index * 5, 11) - 5.0) / 2.0)?,
+        values(&[2, 4, 8], &|index| (modulo(index * 3, 5) - 2.0) / 2.0)?,
+        mx(&|row, column| (modulo(row * 7 + column * 3, 7) - 3.0) / 2.0, 3)?,
+        mx(&|row, column| (modulo(row * 5 + column, 5) - 2.0) / 2.0, 5)?,
+        mx(&|row, column| (modulo(row + 2 * column, 9) - 4.0) / 4.0, 7)?,
+    ])
+}
+
+/// Emits `block_scaled_dot` values and gradients for the default NVFP4 and MXFP8 configurations, which match
+/// `jax.nn.scaled_dot_general`, plus the StableHLO of the staged NVFP4 training step.
+fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let [nvfp4_lhs, nvfp4_rhs, nvfp4_seed, mxfp8_lhs, mxfp8_rhs, mxfp8_seed] = block_scaled_dot_inputs()?;
+    let nvfp4_dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
+    let nvfp4 = BlockScaledDotConfiguration::new(nvfp4_dimensions, BlockScaleFormat::nvfp4());
+    let mxfp8 = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), BlockScaleFormat::mxfp8());
+    let lhs_global_scale = Array::scalar(2.0f32.powi(-9))?;
+    let values = |value: Array| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
+    let mut observations = BTreeMap::new();
+    for (names, configuration, lhs, rhs, seed, global_scale) in [
+        (
+            ["nvfp4_output", "nvfp4_lhs_gradient", "nvfp4_rhs_gradient"],
+            nvfp4.clone(),
+            nvfp4_lhs,
+            nvfp4_rhs,
+            nvfp4_seed,
+            Some(lhs_global_scale),
+        ),
+        (["mxfp8_output", "mxfp8_lhs_gradient", "mxfp8_rhs_gradient"], mxfp8, mxfp8_lhs, mxfp8_rhs, mxfp8_seed, None),
+    ] {
+        let function = block_scaled_dot::<EagerContext<Array, ArrayOperation<Array>>>(configuration)?;
+        let (output, (lhs_gradient, rhs_gradient)) = match global_scale {
+            Some(global_scale) => {
+                let (output, pullback) =
+                    differentiate_at((lhs, rhs)).with_captures(global_scale).vjp(|(lhs, rhs), scale| {
+                        function.call(BlockScaledDotInputs::new(lhs, rhs).with_lhs_global_scale(scale))
+                    })?;
+                (output, pullback.apply_materialized(seed)?)
+            }
+            None => {
+                let (output, pullback) = differentiate_at((lhs, rhs))
+                    .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))?;
+                (output, pullback.apply_materialized(seed)?)
+            }
+        };
+        for (name, value) in names.into_iter().zip([output, lhs_gradient, rhs_gradient]) {
+            observations.insert(name, values(value));
+        }
+    }
+    let function = block_scaled_dot::<ProjectedContext<XlaDomain<'static>, ArrayType>>(nvfp4)?;
+    let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
+        move |(lhs, rhs, seed): (XlaArrayTracer, XlaArrayTracer, XlaArrayTracer)| {
+            let (output, pullback) = differentiate_at((lhs, rhs))
+                .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))
+                .unwrap();
+            let (lhs_gradient, rhs_gradient) = pullback.apply_materialized(seed).unwrap();
+            (output, lhs_gradient, rhs_gradient)
+        },
+        (
+            ArrayType::new_static(DataType::F32, [2, 4, 32]),
+            ArrayType::new_static(DataType::F32, [2, 32, 8]),
+            ArrayType::new_static(DataType::F32, [2, 4, 8]),
+        ),
+    )?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "block_scaled_dot".into(),
+        observations,
+        staging: None,
+        stablehlo: Some(traced.to_mlir_module("main")?),
+    })
+}
+
 /// Emits the portable rank-three MQA attention surface plus its semantic StableHLO composition.
 fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error>> {
     let query_type = ArrayType::new_static(DataType::F32, [2, 2, 1]);
@@ -972,6 +1064,7 @@ mod tests {
                 "pswapaxes",
                 "data_dependent_prefix_take",
                 "scaled_dot_and_matmul",
+                "block_scaled_dot",
                 "dot_product_attention",
                 "negative_dynamic_slice",
                 "condition_varying_predicate_gradient",

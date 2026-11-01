@@ -79,7 +79,7 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(
             [
                 (case.case_id, case.relationship, bool(case.collectives), bool(case.stablehlo_patterns))
-                for case in cases[:8]
+                for case in cases[:9]
             ],
             [
                 ("grouped_shape_changing_collectives", "parity", True, False),
@@ -87,16 +87,17 @@ class DifferentialTestingTest(unittest.TestCase):
                 ("pswapaxes", "parity", True, False),
                 ("data_dependent_prefix_take", "ryft_exceeds_jax", False, False),
                 ("scaled_dot_and_matmul", "parity", False, True),
+                ("block_scaled_dot", "parity", False, True),
                 ("dot_product_attention", "parity", False, True),
                 ("negative_dynamic_slice", "parity", False, True),
                 ("condition_varying_predicate_gradient", "ryft_exceeds_jax", False, False),
             ],
         )
         self.assertEqual(len({case.case_id for case in cases}), len(cases))
-        self.assertTrue(cases[8:])
+        self.assertTrue(cases[9:])
         self.assertTrue(all(
             case.reference is not None and case.suite in ("collectives", *differential_testing.CUDA_SUITES)
-            for case in cases[8:]
+            for case in cases[9:]
         ))
 
     def test_observation_schema(self) -> None:
@@ -148,6 +149,16 @@ class DifferentialTestingTest(unittest.TestCase):
                 parse_observation(
                     {"schema": SCHEMA, "case_id": "case", "observations": {"output": [[value]]}}
                 )
+        with self.assertRaisesRegex(ValueError, "observations.output.*must be representable as f32"):
+            parse_observation({"schema": SCHEMA, "case_id": "case", "observations": {"output": [[1e300]]}})
+
+    def test_parse_observation_rounds_to_f32(self) -> None:
+        # The shortest `f32` decimal and the exact decimal of the same `f32` value parse to the same observation.
+        for value in (-2.4882812, -2.48828125):
+            observation = parse_observation(
+                {"schema": SCHEMA, "case_id": "case", "observations": {"output": [[value]]}}
+            )
+            self.assertEqual(observation.observations, {"output": ((-2.48828125,),)})
 
     def test_collective_stablehlo_projection(self) -> None:
         self.assertEqual(project_collective_stablehlo(GROUPED_STABLEHLO), GROUPED_COLLECTIVES)

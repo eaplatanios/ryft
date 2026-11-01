@@ -2,8 +2,8 @@
 //!
 //! This module wraps the backend-neutral lifecycle from [`ryft_core::compilation`] with XLA-flavored handles and entry
 //! points. [`jitted`] is the retained `jax.jit` analogue: it specializes on runtime-derived abstract signatures and
-//! dispatches warm calls through cached compiled functions. [`compile`] instead traces and compiles exactly one
-//! explicit abstract signature into a [`CompiledXlaFunction`]. [`stage`] is the trace-only counterpart: it returns a
+//! dispatches warm calls through cached compiled functions. [`compile`] instead stages and compiles exactly one
+//! explicit abstract signature into a [`CompiledXlaFunction`]. [`stage`] is the staging-only counterpart: it returns a
 //! [`StagedXlaFunction`] that can be embedded into outer traces via [`StagedXlaFunction::call`] and compiled later, so
 //! functions that are only ever composed into larger programs never pay for their own executable. Staged functions
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
@@ -85,17 +85,16 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, CompilationDomain, CompilationStagingRequest,
-    CompiledFunction, CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh,
-    DifferentiableType, DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics,
-    Parameterized, ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution,
-    ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection,
-    jit_with_options as core_jit_with_options,
+    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, CompilationDomain, CompiledFunction,
+    CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh, DifferentiableType,
+    DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics, Parameterized,
+    ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution, ReverseModeDifferentiate,
+    StagedFunction, Tracer, Typed, Value, ValueProjection, jit_with_options as core_jit_with_options,
 };
 use ryft_pjrt::Execution;
 
 use crate::experimental::XlaDomainError;
-use crate::experimental::domains::XlaCompiledProgram;
+use crate::experimental::domains::{XlaCompiledProgram, with_input_shardings};
 use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::{
     AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, XlaArray, XlaDomain, XlaOptions, XlaValue,
@@ -204,7 +203,7 @@ where
 /// Retained array-only XLA JIT dispatcher with explicit host-side static parameters.
 ///
 /// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
-/// traces, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
+/// stages, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
 /// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
 pub struct JittedXlaFunction<
     'c,
@@ -670,12 +669,9 @@ where
     Out::To<XlaStatefulCompileTracer<'c>>:
         Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
 {
-    let staged = domain.stage(CompilationStagingRequest::new(
-        |_, capture_tracers, inputs| function(capture_tracers, inputs),
-        captures,
-        input_types,
-        options,
-    ))?;
+    let input_types = with_input_shardings(input_types, &options)?;
+    let staged =
+        domain.stage(|_, capture_tracers, inputs| function(capture_tracers, inputs), captures, input_types, options)?;
     let lowered = domain.lower(staged)?;
     Ok(StatefulCompiledXlaFunction { function: domain.compile(lowered)? })
 }
@@ -832,7 +828,7 @@ where
 }
 
 impl<'c> XlaDomain<'c> {
-    /// Lowers and compiles an XLA function staged with options retained before tracing.
+    /// Lowers and compiles a staged XLA function using the options that it retained when it was staged.
     pub fn compile_staged_function<In, Out>(
         &self,
         staged: StagedXlaFunction<'c, In, Out>,
@@ -1596,7 +1592,7 @@ where
 /// Traces `function` into a staged program and returns a [`StagedXlaFunction`] handle, without compiling a PJRT
 /// executable.
 ///
-/// This is the trace-only counterpart of [`compile`]: use it for functions that are composed into larger programs
+/// This is the staging-only counterpart of [`compile`]: use it for functions that are composed into larger programs
 /// via [`StagedXlaFunction::call`] rather than executed directly, so no executable is built for them. Compile the
 /// staged handle later with [`XlaDomain::compile_staged_function`] when direct execution is needed. `options` are
 /// applied to the abstract input signature before tracing and retained for subsequent lowering and compilation.
@@ -1725,7 +1721,8 @@ where
         let inputs = project_tracers::<In>(inputs)?;
         lift_tracers::<Out>(function(capture_references, capture_tracers, inputs)?)
     };
-    let function = domain.stage(CompilationStagingRequest::new(function, captures, input_types, options))?;
+    let input_types = with_input_shardings(input_types, &options)?;
+    let function = domain.stage(function, captures, input_types, options)?;
     Ok(StagedXlaFunction { function })
 }
 
@@ -1792,18 +1789,18 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Atan2, AttachedRegions, Broadcast, CaptureReference, Compare,
-        ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind,
-        Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
-        Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div, DomainTracer, DomainTracingContext,
-        Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate,
-        Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
-        ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
-        ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
-        Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StopGradient,
-        StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
-        ZeroLike, differentiate_at,
+        ComparisonDirection, CompilationDomain, Condition, ConstrainSharding, Context, ConvertElementType, Cos,
+        CotangentDestinationKind, Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh,
+        DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div,
+        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
+        Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis,
+        MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError,
+        ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard,
+        ScanOperation, Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
+        StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -3099,6 +3096,141 @@ mod tests {
             XlaDomainError::UnsupportedReferenceAbi { reason }
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
                               does not return forwarded references; read the reference after the call instead",
+        ));
+    }
+
+    #[test]
+    fn test_stateful_compilation_stages_reference_outputs_and_rejects_them_when_lowered() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaSession::new(&client).domain();
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+
+        fn allocate_reference<'c>(
+            _: Vec<XlaConstant>,
+            _: Vec<XlaStatefulCompileTracer<'c>>,
+            input: XlaStatefulCompileTracer<'c>,
+        ) -> Result<XlaStatefulCompileTracer<'c>, XlaDomainError> {
+            input.reference_new().map_err(Into::into)
+        }
+
+        // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
+        // stages successfully and is rejected when it is lowered on its own.
+        let staged = domain
+            .stage::<_, ArrayIrType, ArrayIrType>(
+                allocate_reference,
+                Vec::new(),
+                ArrayIrType::Array(array_type),
+                XlaOptions::new(mesh),
+            )
+            .unwrap();
+        let error = domain.lower(staged).err().unwrap();
+        assert!(matches!(
+            error,
+            XlaDomainError::UnsupportedReferenceAbi { reason }
+                if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
+                              stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
+        ));
+    }
+
+    #[test]
+    fn test_stateful_compilation_forwards_references_through_nested_calls() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaSession::new(&client).domain();
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+
+        fn forward<'c>(
+            _: Vec<XlaConstant>,
+            _: Vec<XlaStatefulCompileTracer<'c>>,
+            input: XlaStatefulCompileTracer<'c>,
+        ) -> Result<XlaStatefulCompileTracer<'c>, XlaDomainError> {
+            Ok(input)
+        }
+
+        // A nested call may return the external reference that it receives, because that reference never crosses the
+        // ABI as an output of the enclosing program.
+        let inner = domain
+            .stage::<_, ArrayIrType, ArrayIrType>(
+                forward,
+                Vec::new(),
+                reference_type.clone(),
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap();
+        let outer = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            move |reference| inner.call(reference)?.read().map_err(Into::into),
+            reference_type,
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+        );
+        let output = outer
+            .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+            .unwrap();
+        let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
+        assert_eq!(read_f32_array(&client, &output), vec![7.0]);
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![7.0]);
+    }
+
+    #[test]
+    fn test_stateful_compilation_rejects_nested_calls_that_return_allocated_references() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaSession::new(&client).domain();
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+
+        fn allocate_reference<'c>(
+            _: Vec<XlaConstant>,
+            _: Vec<XlaStatefulCompileTracer<'c>>,
+            input: XlaStatefulCompileTracer<'c>,
+        ) -> Result<XlaStatefulCompileTracer<'c>, XlaDomainError> {
+            input.reference_new().map_err(Into::into)
+        }
+
+        // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
+        // call is rejected with a diagnostic that names the offending output.
+        let inner = domain
+            .stage::<_, ArrayIrType, ArrayIrType>(
+                allocate_reference,
+                Vec::new(),
+                ArrayIrType::Array(array_type.clone()),
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap();
+        let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            move |input| inner.call(input)?.freeze().map_err(Into::into),
+            ArrayIrType::Array(array_type),
+            &domain,
+            XlaOptions::new(mesh),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message })
+                if message == "output 0 of the called function is a reference that the function allocates itself, \
+                               which a nested call cannot return; allocate the reference in the caller and pass it to \
+                               the function instead",
         ));
     }
 

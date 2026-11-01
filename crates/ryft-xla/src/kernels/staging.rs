@@ -1362,8 +1362,7 @@ pub(crate) mod tests {
     /// Compiles derivative-only scalar programs through the existing XLA domain and waits for concrete results.
     fn execute_derivative(program: &FlatXlaProgram, inputs: &[f32]) -> Vec<f32> {
         use ryft_core::{
-            ArrayType, CompilationDomain, CompilationStagingRequest, CompilationTracer, Device, DeviceMesh,
-            LogicalMesh, StagedFunction,
+            ArrayType, CompilationDomain, CompilationTracer, Device, DeviceMesh, LogicalMesh, StagedFunction,
         };
 
         use crate::experimental::domains::{XlaDomain, XlaOptions};
@@ -1384,13 +1383,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let request = CompilationStagingRequest::<_, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
-            |_, _, inputs| replay(program, inputs),
-            vec![],
-            program.input_types(),
-            XlaOptions::new(mesh.clone()),
-        );
-        let staged: StagedFunction<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>> = domain.stage(request).unwrap();
+        let staged: StagedFunction<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>> = domain
+            .stage(|_, _, inputs| replay(program, inputs), vec![], program.input_types(), XlaOptions::new(mesh.clone()))
+            .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let inputs = inputs
             .iter()

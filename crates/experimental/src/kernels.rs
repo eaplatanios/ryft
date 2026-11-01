@@ -1260,8 +1260,8 @@ mod cutile {
     use sha2::{Digest, Sha256};
 
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, CompilationDomain,
-        CompilationStagingRequest, ConstantOperation, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
+        AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, CompilationDomain, ConstantOperation,
+        Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
     };
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
@@ -1374,14 +1374,14 @@ mod cutile {
         let producer = XlaSession::new(client);
         let domain = producer.domain();
         let staged = domain
-            .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+            .stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
                 |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
                     Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
                 },
                 vec![],
                 case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
                 ryft_xla::XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
-            ))
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let executable_bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
@@ -1710,9 +1710,8 @@ mod tuning {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, CompilationCall, CompilationDomain, CompilationStagingRequest, CompilationTracer, Device,
-        DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution,
-        StatefulCompilationDomain,
+        ArrayIrType, CompilationCall, CompilationDomain, CompilationTracer, Device, DeviceMesh, ExecutableFunction,
+        LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution, StatefulCompilationDomain,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{
@@ -1757,14 +1756,14 @@ mod tuning {
             let binding = self.bindings.iter().find(|(candidate, _)| candidate == schedule).unwrap().1.clone();
             let staged = self
                 .domain
-                .stage(CompilationStagingRequest::<_, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+                .stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
                     |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
                         Ok(stage_kernel(inputs[0].context(), &self.case.definition, &inputs)?)
                     },
                     vec![],
                     self.case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
                     XlaOptions::new(self.mesh.clone()).with_kernel_compiler(binding),
-                ))
+                )
                 .map_err(error)?;
             // The existing lower/compile path performs real adapter admission before artifact lookup.
             let compiled = self.domain.compile(self.domain.lower(staged).map_err(error)?).map_err(error)?;
@@ -2264,8 +2263,7 @@ mod triton {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ArrayIrType, CompilationCacheDomain, CompilationDomain, CompilationStagingRequest, Device, DeviceMesh,
-        LogicalMesh, MeshAxis, MeshAxisType,
+        ArrayIrType, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule};
     use ryft_triton::kernels::{Compiler, Options, Target};
@@ -2310,14 +2308,14 @@ mod triton {
         let producer = XlaSession::new(client);
         let domain = producer.domain();
         let staged = domain
-            .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+            .stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
                 |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
                     Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
                 },
                 vec![],
                 case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
                 XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
-            ))
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();

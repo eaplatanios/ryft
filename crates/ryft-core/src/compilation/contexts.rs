@@ -1,15 +1,17 @@
 use std::hash::Hash;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::captures::CaptureConstant;
+use crate::captures::{CaptureConstant, CapturingContext, ClosedProgram};
 use crate::compilation::functions::{
     CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram, LoweredFunction,
-    ReferenceExecution, StagedFunction, trace_function,
+    ReferenceExecution, StagedFunction,
 };
 use crate::contexts::{Domain, StagingContext};
+use crate::macros::check_builders;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::ProgramError;
-use crate::tracing::DomainTracingContext;
+use crate::programs::{ProgramError, Typed, validate_reference_boundary};
+use crate::tracing::{DomainTracingContext, Tracer};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -87,14 +89,14 @@ pub trait CallRequest<C: CompilationDomain>: Sized {
 }
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
-/// Compilation is deliberately split into four semantic stages:
+/// Compilation is deliberately split into four phases:
 ///
-///   1. [`Self::stage`] traces a closure using options fixed before tracing.
+///   1. [`Self::stage`] traces a closure into a [`StagedFunction`] that retains the options for the later phases.
 ///   2. [`Self::lower`] transforms the staged artifact into [`Self::LoweredProgram`].
 ///   3. [`Self::compile`] transforms the lowered artifact into [`Self::CompiledProgram`].
 ///   4. [`Self::call`] executes an [`ExecutableFunction`] against structured runtime inputs.
 ///
-/// The domain performs every stage, while staged, lowered, compiled, and executable functions remain passive values.
+/// The domain performs every phase, while staged, lowered, compiled, and executable functions remain passive values.
 /// Lowering, compilation, and execution are implemented entirely by the backend, including any validation, caching, or
 /// runtime conversion that the backend chooses to apply. Staging is implemented by core, because only core can trace
 /// Rust closures, and it traces exactly the input types that it receives. Backends apply options that change input
@@ -106,8 +108,8 @@ pub trait CallRequest<C: CompilationDomain>: Sized {
 /// [`Self::lower`], [`Self::compile`], and [`Self::call`] accept [`LoweringRequest`], [`CompilationRequest`], and
 /// [`CallRequest`] implementations rather than the concrete [`StagedFunction`], [`LoweredFunction`], and
 /// [`CompilationCall`](super::functions::CompilationCall) types. Each request trait carries the structured input and
-/// output bounds of its stage as bounds on its associated types and exposes only the operations that a backend needs
-/// to complete that stage.
+/// output bounds of its phase as bounds on its associated types and exposes only the operations that a backend needs
+/// to complete that phase.
 ///
 /// The request traits also work around a limitation of the Rust compiler (as of version 1.99), and so they cannot be
 /// replaced by explicit bounds on the concrete types. When a trait function bounds an associated type of one of its
@@ -183,7 +185,35 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
-        trace_function(function, captures, input_types, options)
+        validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
+        let input_structure = input_types.parameter_structure();
+        let input_type_values = input_types.parameters().cloned().collect::<Vec<_>>();
+        let context = DomainTracingContext::<Self, Self::Value>::new();
+        let capture_table = context.captures().clone();
+        let builder = context.builder().clone();
+        let capture_references =
+            captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
+        let capture_tracers = capture_references
+            .iter()
+            .cloned()
+            .map(|capture| StagingContext::constant(&context, capture))
+            .collect::<Vec<_>>();
+        let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
+        let outputs = function(capture_references, capture_tracers, inputs)?;
+        check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
+        if let Some(error) = builder.borrow_mut().error.take() {
+            return Err(error.into());
+        }
+        let output_structure = outputs.parameter_structure();
+        let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+        drop(outputs);
+        drop(context);
+        let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
+        let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
+        Ok(StagedFunction::new(source_program, input_type_values, output_types, output_structure, options))
     }
 
     /// Lowers a staged function into the program representation of this backend (i.e., [`Self::LoweredProgram`]).

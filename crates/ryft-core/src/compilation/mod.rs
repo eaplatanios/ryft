@@ -1,6 +1,6 @@
 //! Contains backend-neutral machinery for _Just-In-Time (JIT) compilation_.
 //!
-//! This module supplies the common JIT lifecycle shared by compiler backends. Core traces typed Ryft programs, manages
+//! This module supplies the common JIT lifecycle shared by compiler backends. Core stages typed Ryft programs, manages
 //! runtime captures and structured signatures, coordinates specialization and executable caches, and validates calls.
 //! A backend supplies target-specific options, lowering, executable compilation, and execution through
 //! [`CompilationDomain`]s. Backends opt into exact cache identity and serialization through
@@ -9,7 +9,7 @@
 //!
 //! # Retained JIT Lifecycle
 //!
-//! A warm call follows the cache-hit edge directly to execution. A cold call traces and lowers once in the producing
+//! A warm call follows the cache-hit edge directly to execution. A cold call stages and lowers once in the producing
 //! thread, delegates backend artifact reuse to the shared compilation context, publishes the executable, and then
 //! executes it. Refer to [`CompiledFunctionDispatcher`] for a rendered diagram of this dispatch loop.
 //!
@@ -34,7 +34,7 @@
 //!   - Use [`jit`], [`jit_with_options`], or [`jit_with_options_and_capacity`] for a retained JIT dispatcher over a
 //!     fallible closure, which returns its outputs wrapped in [`Ok`] when it cannot fail. A
 //!     [`CompiledFunctionDispatcher`] specializes on explicit static host parameters, the dynamic input's parameter
-//!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization traces, lowers,
+//!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization stages, lowers,
 //!     and requests compilation; warm calls dispatch directly to the retained executable.
 //!   - Use [`stage`] for ordinary capture-free staging. Call [`CompilationDomain::stage`] directly when fallibility,
 //!     runtime captures, or symbolic capture references are needed. Then continue with [`CompilationDomain::lower`]
@@ -98,15 +98,15 @@
 //! [`CompiledFunctionDispatcher`] keeps one bounded LRU cache of compiled specializations, built on the general
 //! [`SpecializationCache`](crate::SpecializationCache) primitive and keyed by the static parameters, the input
 //! parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained executable, while a
-//! miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the resulting executable.
-//! Tracing and lowering are cheap relative to backend compilation, so there are no intermediate tracing or lowering
-//! caches. After an eviction or failure, the miss path simply reruns those stages, and the shared
+//! miss stages the Rust closure, lowers the staged source, requests compilation, and inserts the resulting executable.
+//! Staging and lowering are cheap relative to backend compilation, so there are no intermediate staging or lowering
+//! caches. After an eviction or failure, the miss path simply reruns those phases, and the shared
 //! [`CompilationContext`] below still deduplicates the expensive backend compilation.
 //!
 //! That argument does not carry over to eager (i.e., operation-by-operation) dispatch, where a compiled program is
 //! reused for every application of the same operation and the relevant comparison is with _executing_ one small
 //! operation rather than with compiling it. Backends that execute eager operations through compiled programs therefore
-//! key applications of operations directly to compiled programs in front of tracing and lowering, using the operation's
+//! key applications of operations directly to compiled programs in front of staging and lowering, using the operation's
 //! identity (refer to the `#[ryft(dispatch(identity))]` attribute of `#[derive(Operation)]`) together with the input
 //! types, like JAX's `(primitive, params)` dispatch cache. For example, the XLA backend keeps such a cache in each of
 //! its sessions.
@@ -145,10 +145,10 @@
 //! the input types that it receives. Backends apply options that change input types before staging (e.g., in
 //! [`CompilationDomain::dispatch_signature`]) and options that change output types during lowering. The remaining
 //! [`CompilationDomain`] functions accept [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
-//! implementations. These traits keep the structured input and output bounds of each stage in one place and expose
+//! implementations. These traits keep the structured input and output bounds of each phase in one place and expose
 //! only the operations that a backend needs to complete it. They are also required by a limitation of the Rust
 //! compiler, which [`CompilationDomain`] documents. Ordinary callers use [`CompilationDomain::stage`] or [`stage`],
-//! while backend implementations name the request traits in their bounds and complete each stage
+//! while backend implementations name the request traits in their bounds and complete each phase
 //! through their `into_lowered`, `into_compiled`, or `reconstruct` functions.
 
 pub mod caching;

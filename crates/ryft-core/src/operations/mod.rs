@@ -146,7 +146,11 @@ pub use manipulation::{
     TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
     UpdateSliceOperation,
 };
-pub use quantization::{BlockDequantize, BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
+pub use quantization::{
+    BlockDequantize, BlockQuantize, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,
+    BlockScaledDotInputs, BlockScaledGlobalScaling, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation,
+    block_scaled_dot,
+};
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
     RngBitGenerator, RngBitGeneratorOperation,

@@ -244,20 +244,22 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if let Some(operation) = scaled_dot {
-                let (composition_input_types, composition_output_types) = scaled_dot_composition_types(
+                // Calls that lower to the block-scaled-dot custom call need no composition.
+                if let Some((composition_input_types, composition_output_types)) = scaled_dot_composition_types(
                     operation,
                     input_types.as_slice(),
                     output_types.as_slice(),
                     target_platform,
-                )?;
-                map.register(
-                    scaled_dot_composition_key(
-                        operation,
-                        composition_input_types.as_slice(),
-                        composition_output_types.as_slice(),
-                    )?,
-                    || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
-                )?;
+                )? {
+                    map.register(
+                        scaled_dot_composition_key(
+                            operation,
+                            composition_input_types.as_slice(),
+                            composition_output_types.as_slice(),
+                        )?,
+                        || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
+                    )?;
+                }
             } else if let Some(operation) = attention.filter(|operation| operation.configuration().dropout().is_none())
             {
                 map.register(

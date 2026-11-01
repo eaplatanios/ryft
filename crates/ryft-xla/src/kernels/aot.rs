@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain,
-    CompilationStagingRequest, CompilationTracer, DeviceMesh,
+    AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer,
+    DeviceMesh,
 };
 use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
@@ -133,15 +133,14 @@ impl KernelAotBundle {
         let facts = XlaKernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged =
-            domain.stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
-                |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
-                    Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
-                },
-                vec![],
-                definition.operation().input_types(),
-                options,
-            ))?;
+        let staged = domain.stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
+                Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
+            },
+            vec![],
+            definition.operation().input_types(),
+            options,
+        )?;
         let lowered = domain.lower(staged)?;
         let stable_hlo = lowered.lowered_program().stable_hlo().to_owned();
         let lowering_duration = start.elapsed();
@@ -432,7 +431,7 @@ pub(crate) mod tests {
             vec![]
         };
         let staged = domain
-            .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+            .stage::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
                 |_, captures: Vec<CompilationTracer<XlaDomain<'c>>>, inputs| {
                     // Returning the capture retains a real capture slot without introducing unrelated operations.
                     Ok(if captures.is_empty() { inputs } else { captures })
@@ -440,7 +439,7 @@ pub(crate) mod tests {
                 captures,
                 vec![ArrayIrType::Array(r#type)],
                 XlaOptions::new(mesh.clone()),
-            ))
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let mut bundle = bundle();

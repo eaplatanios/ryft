@@ -12,7 +12,6 @@
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,13 +22,13 @@ use crate::compilation::contexts::{
     CallRequest, CompilationDomain, CompilationRequest, LoweringRequest, StatefulCompilationDomain,
 };
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::macros::{check_builders, check_count};
+use crate::macros::check_count;
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
     AttachedRegions, Operation, Program, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
-    Value, validate_reference_boundary,
+    Value,
 };
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
@@ -106,70 +105,6 @@ pub type FlatCompilationProgram<C> = Program<
 
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
-
-/// Traces `function` into a staged function, implementing [`CompilationDomain::stage`] (refer to its documentation for
-/// the meaning of the arguments).
-pub(crate) fn trace_function<C, F, Input, Output>(
-    function: F,
-    captures: Vec<C::Value>,
-    input_types: Input,
-    options: C::Options,
-) -> Result<StagedFunction<C, Input, Output>, C::Error>
-where
-    C: CompilationDomain,
-    F: FnOnce(
-        Vec<C::Constant>,
-        Vec<CompilationTracer<C>>,
-        Input::To<CompilationTracer<C>>,
-    ) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
-    Output::To<CompilationTracer<C>>:
-        Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
-    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-{
-    validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
-    let input_structure = input_types.parameter_structure();
-    let input_type_values = input_types.parameters().cloned().collect::<Vec<_>>();
-    let context = DomainTracingContext::<C, C::Value>::new();
-    let capture_table = context.captures().clone();
-    let builder = context.builder().clone();
-    let capture_references =
-        captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
-    let capture_tracers = capture_references
-        .iter()
-        .cloned()
-        .map(|capture| StagingContext::constant(&context, capture))
-        .collect::<Vec<_>>();
-    let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
-    let outputs = function(capture_references, capture_tracers, inputs)?;
-    check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
-    if let Some(error) = builder.borrow_mut().error.take() {
-        return Err(error.into());
-    }
-    let output_structure = outputs.parameter_structure();
-    let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-    let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-    drop(outputs);
-    drop(context);
-    let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
-    let source_program = ClosedProgram::new(program, captures)?;
-    let source_program = source_program.without_unused_captures()?;
-    Ok(StagedFunction {
-        state: Arc::new(StagedFunctionState {
-            source_program,
-            input_types: input_type_values,
-            output_types,
-            output_structure,
-            options: Arc::new(options),
-            lifted_program: OnceLock::new(),
-        }),
-    })
-}
 
 /// Complete typed request consumed by [`CompilationDomain::call`].
 pub struct CompilationCall<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
@@ -319,7 +254,7 @@ struct StagedFunctionState<
     /// Output parameter structure used to reconstruct structured values.
     output_structure: Output::ParameterStructure,
 
-    /// Options applied before tracing and retained for lowering and compilation.
+    /// Options retained for lowering and compilation.
     options: Arc<C::Options>,
 
     /// Memoized source program with captures lifted into leading flat inputs.
@@ -347,6 +282,33 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
+    /// Creates a staged function from its traced source program, its flat public input and output types, its output
+    /// structure, and the options that it retains for lowering and compilation.
+    pub(super) fn new(
+        source_program: ClosedProgram<
+            C::Value,
+            C::Constant,
+            C::Operation,
+            Input::To<C::Constant>,
+            Output::To<C::Constant>,
+        >,
+        input_types: Vec<C::Type>,
+        output_types: Vec<C::Type>,
+        output_structure: Output::ParameterStructure,
+        options: C::Options,
+    ) -> Self {
+        Self {
+            state: Arc::new(StagedFunctionState {
+                source_program,
+                input_types,
+                output_types,
+                output_structure,
+                options: Arc::new(options),
+                lifted_program: OnceLock::new(),
+            }),
+        }
+    }
+
     /// Returns the source program and its runtime captures.
     #[inline]
     pub fn source_program(
@@ -1134,10 +1096,10 @@ where
 /// Unlike [`CompiledFunction`], which represents one executable that is already specialized, a
 /// `CompiledFunctionDispatcher` holds no program of its own. It is a retained dispatcher over a Rust closure that
 /// produces one program, and one function around that program, per specialization from explicit static host
-/// parameters and dynamic runtime inputs. Its first call for a specialization traces, lowers, and requests
+/// parameters and dynamic runtime inputs. Its first call for a specialization stages, lowers, and requests
 /// compilation, and later calls with the same static values, input parameter structure, and dispatch key dispatch
-/// directly to the retained executable. Domain staging may normalize distinct runtime signatures to the same staged
-/// signature, which can produce harmless duplicate dispatch specializations.
+/// directly to the retained executable. Domain dispatch signatures may normalize distinct runtime signatures to the
+/// same staged signature, which can produce harmless duplicate dispatch specializations.
 ///
 /// Tracing executes Rust host code only on a specialization miss. Host side effects inside `function` therefore run
 /// once per retained specialization rather than once per runtime call, and observable work for every call must be
@@ -1159,7 +1121,7 @@ where
 /// domain, closure, static parameters, and domain artifact types are thread-safe, because [`Send`] and [`Sync`] derive
 /// structurally from those field types. Recursive dispatch on one thread of the specialization currently being
 /// produced is rejected with an error. Concurrent cold misses for one specialization on different threads instead
-/// deliberately duplicate the frontend work, because tracing and lowering are cheap and inserts are idempotent, while
+/// deliberately duplicate the frontend work, because staging and lowering are cheap and inserts are idempotent, while
 /// the shared [`CompilationContext`](super::caching::CompilationContext) of the domain still coordinates the expensive
 /// backend compilation.
 ///
@@ -1173,7 +1135,7 @@ where
 ///   key --> frontend_cache["Per-Function Bounded Specialization Cache"]
 ///   frontend_cache -->|"hit"| executable["Shared &lt;code&gt;ExecutableFunction&lt;/code&gt;"]
 ///   frontend_cache -->|"miss"| closure["Invoke Rust Closure"]
-///   closure -->|"trace"| staged["&lt;code&gt;StagedFunction&lt;/code&gt; and Closed Source Program"]
+///   closure -->|"stage"| staged["&lt;code&gt;StagedFunction&lt;/code&gt; and Closed Source Program"]
 ///   staged -->|"lower"| lowered["&lt;code&gt;LoweredFunction&lt;/code&gt; and Backend Lowered Program"]
 ///   staged -.->|"&lt;code&gt;call&lt;/code&gt; inside an outer trace"| nested["Nested Call Operation"]
 ///   lowered --> compilation_context["Shared &lt;code&gt;CompilationContext&lt;/code&gt;"]
@@ -1183,7 +1145,7 @@ where
 ///   executable -->|"call"| outputs["Structured Runtime Outputs"]
 /// ```
 ///
-/// The cache hit edge skips tracing, lowering, and compilation. The dotted edge is the alternative staging path, along
+/// The cache hit edge skips staging, lowering, and compilation. The dotted edge is the alternative staging path, along
 /// which a staged function becomes a nested call boundary instead of continuing immediately toward an executable.
 #[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompiledFunctionDispatcher<
@@ -1282,10 +1244,11 @@ where
         }
     }
 
-    /// Returns this dispatcher with the types at which its runtime inputs are staged (i.e., traced, keyed, and
-    /// compiled) declared in the structure of its inputs, as JAX's `abstracted_axes` does. A `Some` leaf stages its
-    /// input at that type instead of at the input's own type, so that one specialization serves every runtime input
-    /// whose type refines it, and a `None` leaf keeps its input exact (as in [`Parameterized::replace_parameters`]).
+    /// Returns this dispatcher with the types at which its runtime inputs are staged (which also determine their
+    /// dispatch keys and compiled signatures) declared in the structure of its inputs, as JAX's `abstracted_axes`
+    /// does. A `Some` leaf stages its input at that type instead of at the input's own type, so that one
+    /// specialization serves every runtime input whose type refines it, and a `None` leaf keeps its input exact (as in
+    /// [`Parameterized::replace_parameters`]).
     /// For example, declaring `Some(dimension<n ∈ [1, 9)>)` for a first-class dimension input reuses one
     /// specialization for every extent from 1 to 8. Inputs declared with one shared identity (e.g., two `dimension<n>`
     /// inputs, or a `dimension<n>` input and an `f32[n]` input) must agree at runtime. Every call validates its inputs
@@ -1695,6 +1658,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pretty_assertions::assert_eq;

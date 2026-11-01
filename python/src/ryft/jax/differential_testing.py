@@ -20,6 +20,7 @@ import re
 import signal
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -106,7 +107,12 @@ def _required_string(value: Any, path: str) -> str:
 
 
 def _parse_observations(value: Any) -> dict[str, tuple[tuple[float, ...], ...]]:
-    """Parses named floating-point observations from one record payload."""
+    """Parses named floating-point observations from one record payload.
+
+    Observations are `f32` values, so parsing rounds them to `f32`. The Rust emitter writes the shortest decimal that
+    identifies each `f32`, which can differ from the exact decimal that the JAX emitter writes for the same value (e.g.,
+    `-2.4882812` and `-2.48828125`), and rounding makes both compare equal.
+    """
 
     observations = _required_mapping(value, "observations")
     parsed: dict[str, tuple[tuple[float, ...], ...]] = {}
@@ -128,7 +134,15 @@ def _parse_observations(value: Any) -> dict[str, tuple[tuple[float, ...], ...]]:
                     raise ValueError(
                         f"field 'observations.{name}[{execution_index}][{value_index}]' must be finite"
                     )
-                values.append(float(element))
+                try:
+                    rounded = struct.unpack("f", struct.pack("f", float(element)))[0]
+                except OverflowError:
+                    rounded = math.inf
+                if not math.isfinite(rounded):
+                    raise ValueError(
+                        f"field 'observations.{name}[{execution_index}][{value_index}]' must be representable as f32"
+                    )
+                values.append(rounded)
             parsed_executions.append(tuple(values))
         parsed[name] = tuple(parsed_executions)
     return parsed

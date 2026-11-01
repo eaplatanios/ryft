@@ -345,6 +345,82 @@ def _build_scaled_dot_and_matmul(jax: Any, jax_numpy: Any, numpy: Any) -> Differ
     )
 
 
+def _block_scaled_dot_inputs(numpy: Any) -> dict[str, Any]:
+    """Returns the shared `block_scaled_dot` inputs, whose quantized arithmetic is exact in both frameworks.
+
+    The NVFP4 left input clips at its global scale `2^-9` (i.e., above `2^-9 · 6 · 448 = 5.25`). Every MXFP8 block,
+    along any axis that either rule quantizes, contains `4`, whose power of two scale is the same under the OCP and
+    JAX scale rounding.
+    """
+
+    def values(shape: tuple[int, ...], value: Callable[[int], float]) -> Any:
+        return numpy.array([value(index) for index in range(int(numpy.prod(shape)))], dtype=numpy.float32).reshape(
+            shape
+        )
+
+    def mx(seed: Callable[[int, int], float], stride: int) -> Any:
+        def value(index: int) -> float:
+            row, column = divmod(index, 32)
+            return 4.0 if column == (stride * row) % 32 else seed(row, column)
+
+        return values((32, 32), value)
+
+    return {
+        "nvfp4_lhs": values((2, 4, 32), lambda index: float((index * 7) % 13 - 6)),
+        "nvfp4_rhs": values((2, 32, 8), lambda index: ((index * 5) % 11 - 5) / 2),
+        "nvfp4_seed": values((2, 4, 8), lambda index: ((index * 3) % 5 - 2) / 2),
+        "mxfp8_lhs": mx(lambda row, column: ((row * 7 + column * 3) % 7 - 3) / 2, 3),
+        "mxfp8_rhs": mx(lambda row, column: ((row * 5 + column) % 5 - 2) / 2, 5),
+        "mxfp8_seed": mx(lambda row, column: ((row + 2 * column) % 9 - 4) / 4, 7),
+    }
+
+
+def _build_block_scaled_dot(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds `jax.nn.scaled_dot_general` values and gradients for NVFP4 and MXFP8 configurations."""
+
+    inputs = {name: jax_numpy.asarray(value) for name, value in _block_scaled_dot_inputs(numpy).items()}
+    nvfp4 = jax.nn.get_scaled_dot_general_config("nvfp4")
+    nvfp4_lhs = jax.nn.get_scaled_dot_general_config("nvfp4", jax_numpy.array([2.0**-9], dtype=jax_numpy.float32))
+    mxfp8 = jax.nn.get_scaled_dot_general_config("mxfp8")
+
+    def nvfp4_dot(lhs: Any, rhs: Any) -> Any:
+        return jax.nn.scaled_dot_general(
+            lhs,
+            rhs,
+            (((2,), (1,)), ((0,), (0,))),
+            preferred_element_type=jax_numpy.float32,
+            configs=[nvfp4_lhs, nvfp4, nvfp4],
+        )
+
+    def mxfp8_dot(lhs: Any, rhs: Any) -> Any:
+        return jax.nn.scaled_dot_general(
+            lhs,
+            rhs,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jax_numpy.float32,
+            configs=[mxfp8, mxfp8, mxfp8],
+        )
+
+    def training(lhs: Any, rhs: Any, seed: Any) -> Any:
+        output, pullback = jax.vjp(nvfp4_dot, lhs, rhs)
+        return (output, *pullback(seed))
+
+    observations = {}
+    for name, function in (("nvfp4", nvfp4_dot), ("mxfp8", mxfp8_dot)):
+        output, pullback = jax.vjp(function, inputs[f"{name}_lhs"], inputs[f"{name}_rhs"])
+        lhs_gradient, rhs_gradient = pullback(inputs[f"{name}_seed"])
+        observations[f"{name}_output"] = _single_observation_values(output, numpy)
+        observations[f"{name}_lhs_gradient"] = _single_observation_values(lhs_gradient, numpy)
+        observations[f"{name}_rhs_gradient"] = _single_observation_values(rhs_gradient, numpy)
+    module = jax.jit(training).lower(inputs["nvfp4_lhs"], inputs["nvfp4_rhs"], inputs["nvfp4_seed"])
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="block_scaled_dot",
+        observations=observations,
+        stablehlo=str(module.compiler_ir("stablehlo")),
+    )
+
+
 def _build_dot_product_attention(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
     """Builds portable rank-three MQA attention with every structural option represented."""
 
@@ -496,6 +572,12 @@ DIFFERENTIAL_CASES = (
         "parity",
         _build_scaled_dot_and_matmul,
         stablehlo_patterns=('stablehlo.composite "xla.scaled_dot"', "dimension_numbers", "preferred_element_type"),
+    ),
+    DifferentialCase(
+        "block_scaled_dot",
+        "parity",
+        _build_block_scaled_dot,
+        stablehlo_patterns=("f4E2M1FN", "f8E4M3FN", "stablehlo.dot_general"),
     ),
     DifferentialCase(
         "dot_product_attention",
