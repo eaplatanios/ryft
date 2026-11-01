@@ -292,7 +292,7 @@ impl BufferType {
             "f64" => Ok(Self::F64),
             "c64" => Ok(Self::C64),
             "c128" => Ok(Self::C128),
-            _ => Err(Error::invalid_argument(format!("invalid buffer type '{value}'"))),
+            _ => Err(Error::invalid_argument(format!("invalid buffer type `{value}`"))),
         }
     }
 
@@ -796,7 +796,7 @@ impl Layout {
         /// matching closing `')'` is found.
         fn parse_parenthesized(characters: &mut Peekable<Chars>, context: &str) -> Result<String, Error> {
             if characters.next() != Some('(') {
-                return Err(Error::invalid_argument(format!("expected '(' while parsing {context}")));
+                return Err(Error::invalid_argument(format!("expected `(` while parsing {context}")));
             }
 
             let mut content = String::new();
@@ -836,7 +836,7 @@ impl Layout {
                         stride
                             .trim()
                             .parse::<i64>()
-                            .map_err(|error| Error::invalid_argument(format!("invalid stride '{stride}': {error}")))
+                            .map_err(|error| Error::invalid_argument(format!("invalid stride `{stride}`: {error}")))
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
@@ -856,11 +856,11 @@ impl Layout {
                     .map(|dimension| {
                         let dimension = dimension.trim();
                         let dimension = dimension.parse::<i64>().map_err(|error| {
-                            Error::invalid_argument(format!("invalid dimension index '{dimension}': {error}"))
+                            Error::invalid_argument(format!("invalid dimension index `{dimension}`: {error}"))
                         })?;
                         if dimension < 0 {
                             Err(Error::invalid_argument(format!(
-                                "invalid dimension index '{dimension}': expected non-negative value",
+                                "invalid dimension index `{dimension}`: expected non-negative value",
                             )))
                         } else {
                             Ok(dimension as u64)
@@ -888,12 +888,12 @@ impl Layout {
                                         } else {
                                             let dimension = dimension.parse::<i64>().map_err(|error| {
                                                 Error::invalid_argument(format!(
-                                                    "invalid tile dimension '{dimension}': {error}",
+                                                    "invalid tile dimension `{dimension}`: {error}",
                                                 ))
                                             })?;
                                             if dimension < 0 {
                                                 Err(Error::invalid_argument(format!(
-                                                    "invalid tile dimension '{dimension}': \
+                                                    "invalid tile dimension `{dimension}`: \
                                                       expected non-negative value or '*'",
                                                 )))
                                             } else {
@@ -919,7 +919,7 @@ impl Layout {
                                 parse_parenthesized(&mut characters, "split config")?;
                             }
                             if !has_split_group {
-                                return Err(Error::invalid_argument("expected '(' while parsing split config"));
+                                return Err(Error::invalid_argument("expected `(` while parsing split config"));
                             }
                         } else {
                             parse_parenthesized(&mut characters, "layout property")?;
@@ -932,7 +932,7 @@ impl Layout {
                         // We simply skip whitespace characters to match XLA's permissive parsing of layouts.
                     }
                     _ => {
-                        return Err(Error::invalid_argument(format!("unsupported layout property '{property}'")));
+                        return Err(Error::invalid_argument(format!("unsupported layout property `{property}`")));
                     }
                 }
             }
@@ -950,7 +950,7 @@ impl Layout {
                 .map(|dimension| {
                     if dimension < 0 {
                         Err(Error::invalid_argument(format!(
-                            "invalid dimension index '{dimension}': expected non-negative value",
+                            "invalid dimension index `{dimension}`: expected non-negative value",
                         )))
                     } else {
                         Ok(dimension as u64)
@@ -968,7 +968,7 @@ impl Layout {
                             i64::MIN => Ok(TileDimension::combined()),
                             value if value >= 0 => Ok(TileDimension::sized(value as usize)),
                             value => Err(Error::invalid_argument(format!(
-                                "invalid tile dimension '{value}': expected non-negative value or '*'",
+                                "invalid tile dimension `{value}`: expected non-negative value or `*`",
                             ))),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -989,7 +989,7 @@ impl Layout {
                     .map(|dimension| {
                         i64::try_from(dimension).map_err(|_| {
                             Error::invalid_argument(format!(
-                                "invalid dimension index '{dimension}': expected a `u64` value",
+                                "invalid dimension index `{dimension}`: expected a `u64` value",
                             ))
                         })
                     })
@@ -1732,11 +1732,11 @@ impl BufferSpecification<Vec<u64>> {
             .find(']')
             .map(|index| index + opening_bracket_index + 1)
             .ok_or_else(|| {
-                Error::invalid_argument(format!("buffer specification dimensions list is missing closing ']': {value}"))
+                Error::invalid_argument(format!("buffer specification dimensions list is missing closing `]`: {value}"))
             })?;
         let element_type = BufferType::from_str(&value[..opening_bracket_index]).map_err(|_| {
             let element_type = value[..opening_bracket_index].trim();
-            Error::invalid_argument(format!("invalid buffer specification element type '{element_type}'"))
+            Error::invalid_argument(format!("invalid buffer specification element type `{element_type}`"))
         })?;
 
         let dimensions = &value[(opening_bracket_index + 1)..closing_bracket_index];
@@ -1752,12 +1752,12 @@ impl BufferSpecification<Vec<u64>> {
                     } else if let Some(dimension_upper_bound) = dimension.strip_prefix("<=") {
                         dimension_upper_bound.trim().parse::<u64>().map_err(|error| {
                             Error::invalid_argument(format!(
-                                "invalid dynamic dimension upper bound '{dimension_upper_bound}': {error}",
+                                "invalid dynamic dimension upper bound `{dimension_upper_bound}`: {error}",
                             ))
                         })
                     } else {
                         dimension.trim().parse::<u64>().map_err(|error| {
-                            Error::invalid_argument(format!("invalid dimension size '{dimension}': {error}"))
+                            Error::invalid_argument(format!("invalid dimension size `{dimension}`: {error}"))
                         })
                     }
                 })
@@ -1789,7 +1789,7 @@ impl BufferSpecification<Vec<u64>> {
                         Ok(0_u64)
                     } else if *dimension < 0 {
                         Err(Error::invalid_argument(format!(
-                            "invalid shape dimension '{dimension}': expected non-negative value",
+                            "invalid shape dimension `{dimension}`: expected non-negative value",
                         )))
                     } else {
                         Ok(*dimension as u64)
@@ -3871,17 +3871,17 @@ mod tests {
 
         assert!(matches!(
             Layout::from_str("{1,0:Q(123)}"),
-            Err(Error::InvalidArgument { message, .. }) if message == "unsupported layout property 'Q'",
+            Err(Error::InvalidArgument { message, .. }) if message == "unsupported layout property `Q`",
         ));
         assert!(matches!(
             Layout::from_str("{-1,0}"),
             Err(Error::InvalidArgument { message, .. })
-                if message == "invalid dimension index '-1': expected non-negative value",
+                if message == "invalid dimension index `-1`: expected non-negative value",
         ));
         assert!(matches!(
             Layout::from_proto(crate::protos::Layout { minor_to_major: vec![-1, 0], ..Default::default() }),
             Err(Error::InvalidArgument { message, .. })
-                if message == "invalid dimension index '-1': expected non-negative value",
+                if message == "invalid dimension index `-1`: expected non-negative value",
         ));
 
         // Test creating an invalid `Layout`.

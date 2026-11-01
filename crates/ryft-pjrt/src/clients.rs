@@ -90,7 +90,7 @@ impl<'s> Client<'s> {
         self.attributes()?
             .get(name)
             .cloned()
-            .ok_or_else(|| Error::not_found(format!("no attribute named '{name}' found in this PJRT client")))
+            .ok_or_else(|| Error::not_found(format!("no attribute named `{name}` found in this PJRT client")))
     }
 
     /// Returns the PJRT attributes associated with this [`Client`] (e.g., the version of the XLA compiler that it was
@@ -204,7 +204,7 @@ impl<'s> Client<'s> {
         )
         .and_then(|handle| {
             if handle.is_null() {
-                Err(Error::not_found(format!("device with ID '{id}' not found")))
+                Err(Error::not_found(format!("device with ID `{id}` not found")))
             } else {
                 unsafe { Device::from_c_api(handle, self.api()) }
             }
@@ -242,7 +242,7 @@ impl<'s> Client<'s> {
         )
         .and_then(|handle| {
             if handle.is_null() {
-                Err(Error::not_found(format!("device with ID '{id}' not found in addressable devices")))
+                Err(Error::not_found(format!("device with ID `{id}` not found in addressable devices")))
             } else {
                 unsafe { Device::from_c_api(handle, self.api()) }
             }
@@ -549,7 +549,7 @@ impl GpuClientOptions {
             values.push(NamedValue::new("node_id", node_id as i64));
         }
         if let Some(node_count) = self.node_count {
-            values.push(NamedValue::new("node_count", node_count as i64));
+            values.push(NamedValue::new("num_nodes", node_count as i64));
         }
         if let Some(partition_index) = self.partition_index {
             values.push(NamedValue::new("partition_index", partition_index as i64));
@@ -1349,7 +1349,7 @@ mod tests {
                 .unwrap()
                 .get(key)
                 .cloned()
-                .ok_or_else(|| Error::not_found(format!("key '{}' not found", String::from_utf8_lossy(key))))
+                .ok_or_else(|| Error::not_found(format!("key `{}` not found", String::from_utf8_lossy(key))))
         }
     }
 
@@ -1530,8 +1530,8 @@ mod tests {
                 NamedValue::new("enable_mock_nccl", true),
                 NamedValue::new("memory_fraction", 0.5),
                 NamedValue::new("mock_gpu_topology", "2x3x4"),
-                NamedValue::new("node_count", 4),
                 NamedValue::new("node_id", 2),
+                NamedValue::new("num_nodes", 4),
                 NamedValue::new("partition_index", 1),
                 NamedValue::new("platform_name", "cuda"),
                 NamedValue::new("preallocate", true),

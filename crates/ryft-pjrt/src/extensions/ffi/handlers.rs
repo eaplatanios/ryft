@@ -120,7 +120,7 @@ impl FfiInput<'_> {
                     }
                     Ok(Self::Buffer { buffer: FfiBuffer::from_c_api(buffer)? })
                 }
-                _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI input type '{}'", r#type))),
+                _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI input type `{}`", r#type))),
             }
         }
     }
@@ -144,7 +144,7 @@ impl FfiOutput<'_> {
                     }
                     Ok(Self::Buffer { buffer: FfiBuffer::from_c_api(buffer)? })
                 }
-                _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI output type '{}'", r#type))),
+                _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI output type `{}`", r#type))),
             }
         }
     }

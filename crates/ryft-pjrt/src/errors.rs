@@ -16,7 +16,7 @@ use crate::{Api, Version, invoke_pjrt_api_error_fn, invoke_pjrt_api_void_fn, str
 /// only currently supported in unstable Rust.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
-    #[error("error while loading a PJRT plugin from '{path}': {error}")]
+    #[error("error while loading a PJRT plugin from `{path}`: {error}")]
     PluginLoadingError { path: String, error: String, backtrace: String },
 
     #[error("the loaded PJRT plugin version is not supported by ryft; {message}")]
@@ -651,7 +651,7 @@ mod tests {
         assert!(debug.starts_with("InvalidArgument { message: \"bad input\", payload: [], backtrace: \""));
 
         let error = Error::plugin_loading_error("/path", "err");
-        assert_eq!(format!("{error}"), "error while loading a PJRT plugin from '/path': err");
+        assert_eq!(format!("{error}"), "error while loading a PJRT plugin from `/path`: err");
         let debug = format!("{error:?}");
         assert!(debug.starts_with("PluginLoadingError { path: \"/path\", error: \"err\", backtrace: \""));
     }

@@ -83,7 +83,7 @@ pub trait GetTupleElementOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn index(&self) -> Result<usize, Error> {
         usize::try_from(self.integer_attribute(GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE)?.signless_value()).map_err(|_| {
             Error::invalid_argument(format!(
-                "invalid '{GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE}' attribute in `stable_hlo::get_tuple_element`"
+                "invalid `{GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE}` attribute in `stable_hlo::get_tuple_element`"
             ))
         })
     }
