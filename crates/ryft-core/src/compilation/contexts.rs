@@ -3,15 +3,127 @@ use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
 use crate::compilation::functions::{
-    CallRequest, CompileRequest, CompiledFunction, ExecutableFunction, LoweredFunction, LoweringRequest,
-    ReferenceExecution, StageRequest, StagedFunction,
+    CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram, LoweredFunction,
+    ReferenceExecution, StagedFunction,
 };
 use crate::contexts::{Domain, StagingContext};
-use crate::parameters::Parameterized;
+use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::ProgramError;
 use crate::tracing::DomainTracingContext;
 
 // TODO(eaplatanios): Review from here onwards.
+
+/// Staging request consumed by [`CompilationDomain::stage`]. Callers construct requests with
+/// [`CompilationStagingRequest::new`](super::functions::CompilationStagingRequest::new). Refer to the
+/// [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete types.
+pub trait StagingRequest<C: CompilationDomain>: Sized
+where
+    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    /// Structured abstract input type.
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>>;
+
+    /// Structured abstract output type.
+    type Output: Parameterized<
+            C::Type,
+            Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
+            To<CompilationTracer<C>>: Parameterized<
+                CompilationTracer<C>,
+                To<C::Type> = Self::Output,
+                To<C::Constant> = <Self::Output as Parameterized<C::Type>>::To<C::Constant>,
+            >,
+        >;
+
+    /// Returns the structured abstract input signature.
+    fn input_types(&self) -> &Self::Input;
+
+    /// Returns the fixed compilation options.
+    fn options(&self) -> &C::Options;
+
+    /// Replaces the flat input signature while preserving its parameter structure.
+    fn replace_input_types(&mut self, input_types: Vec<C::Type>) -> Result<(), C::Error>;
+
+    /// Traces this request and normalizes the effective flat output signature.
+    fn trace<NormalizeOutput>(
+        self,
+        normalize_output_types: NormalizeOutput,
+    ) -> Result<StagedFunction<C, Self::Input, Self::Output>, C::Error>
+    where
+        NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>;
+}
+
+/// Lowering request consumed by [`CompilationDomain::lower`] and implemented by [`StagedFunction`]. Refer to the
+/// [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete types.
+pub trait LoweringRequest<C: CompilationDomain>: Sized {
+    /// Structured abstract input type.
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
+
+    /// Structured abstract output type.
+    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
+
+    /// Returns the staged artifact.
+    fn staged(&self) -> &StagedFunction<C, Self::Input, Self::Output>;
+
+    /// Opens runtime captures as leading flat inputs.
+    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError>;
+
+    /// Assembles the backend-established lowering.
+    fn into_lowered(
+        self,
+        program: C::LoweredProgram,
+        output_types: Vec<C::Type>,
+    ) -> LoweredFunction<C, Self::Input, Self::Output>;
+}
+
+/// Compilation request consumed by [`CompilationDomain::compile`] and implemented by [`LoweredFunction`]. Refer to
+/// the [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete
+/// types.
+pub trait CompilationRequest<C: CompilationDomain>: Sized {
+    /// Structured abstract input type.
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
+
+    /// Structured abstract output type.
+    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
+
+    /// Returns the lowered artifact.
+    fn lowered(&self) -> &LoweredFunction<C, Self::Input, Self::Output>;
+
+    /// Assembles the backend-established compiled artifact.
+    fn into_compiled(
+        self,
+        program: Arc<C::CompiledProgram>,
+        output_types: Vec<C::Type>,
+    ) -> CompiledFunction<C, Self::Input, Self::Output>;
+}
+
+/// Execution request consumed by [`CompilationDomain::call`] and implemented by
+/// [`CompilationCall`](super::functions::CompilationCall). Refer to the [`CompilationDomain`] documentation for why the
+/// domain functions accept request traits rather than concrete types.
+pub trait CallRequest<C: CompilationDomain>: Sized {
+    /// Structured abstract input type.
+    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
+
+    /// Structured abstract output type.
+    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
+
+    /// Structured runtime output type.
+    type RuntimeOutput;
+
+    /// Returns the executable artifact.
+    fn executable(&self) -> &ExecutableFunction<C, Self::Input, Self::Output>;
+
+    /// Returns flat public runtime inputs, excluding captures.
+    fn inputs(&self) -> &[C::Value];
+
+    /// Consumes the request and prepends runtime captures to its flat inputs.
+    fn into_arguments(self) -> Vec<C::Value>;
+
+    /// Reconstructs structured runtime outputs.
+    fn reconstruct(
+        executable: &ExecutableFunction<C, Self::Input, Self::Output>,
+        outputs: Vec<C::Value>,
+    ) -> Result<Self::RuntimeOutput, C::Error>;
+}
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four semantic stages:
@@ -24,6 +136,22 @@ use crate::tracing::DomainTracingContext;
 /// The domain performs every stage, while staged, lowered, compiled, and executable functions remain passive values.
 /// Each stage is implemented entirely by the backend, including any validation, caching, or runtime conversion that
 /// the backend chooses to apply.
+///
+/// # Request Traits
+///
+/// The stage functions accept [`StagingRequest`], [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
+/// implementations rather than the concrete
+/// [`CompilationStagingRequest`](super::functions::CompilationStagingRequest), [`StagedFunction`],
+/// [`LoweredFunction`], and [`CompilationCall`](super::functions::CompilationCall) types. Each request trait carries
+/// the structured input and output bounds of its stage as bounds on its associated types and exposes only the
+/// operations that a backend needs to complete that stage.
+///
+/// The request traits also work around a limitation of the Rust compiler (as of version 1.99), and so they cannot be
+/// replaced by explicit bounds on the concrete types. When a trait function bounds an associated type of one of its
+/// generic parameters through a trait whose arguments mention an associated type of `Self` (e.g.,
+/// `Input: Parameterized<Self::Type, Family: ParameterizedFamily<Self::Constant>>`), implementations of that function
+/// for concrete domains fail to compile with an unsatisfied `Input: Parameterized<...>` bound (E0277), even when they
+/// repeat the bound verbatim. Bounds on the associated types of a request trait are not affected.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-defined key for one input specialization of a retained Just-In-Time (JIT) dispatcher.
     type DispatchKey: Clone + Eq + Hash;
@@ -65,7 +193,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         request: Request,
     ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
     where
-        Request: StageRequest<Self>,
+        Request: StagingRequest<Self>,
         Self: Sized,
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>;
@@ -90,7 +218,7 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
     where
         Self: Sized,
-        Request: CompileRequest<Self>;
+        Request: CompilationRequest<Self>;
 
     /// Executes a compiled function on structured runtime inputs and returns its structured outputs. Callers
     /// typically use [`ExecutableFunction::call`] rather than calling this function directly.

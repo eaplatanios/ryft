@@ -141,12 +141,12 @@
 //! analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when staged
 //! functions must compose inside other traces.
 //!
-//! The generic [`CompilationDomain`] methods use [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
-//! [`CallRequest`] as typed backend extension witnesses. These traits keep the structured input and output bounds
-//! in one place and expose only the artifact operations that a backend needs for each transition. Ordinary callers
-//! construct a [`CompilationStagingRequest`] or use [`stage`], while backend implementations name the witness traits
-//! in their bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or
-//! `reconstruct` functions.
+//! The [`CompilationDomain`] functions accept [`StagingRequest`], [`LoweringRequest`], [`CompilationRequest`], and
+//! [`CallRequest`] implementations. These traits keep the structured input and output bounds of each stage in one
+//! place and expose only the operations that a backend needs to complete it. They are also required by a limitation of
+//! the Rust compiler, which [`CompilationDomain`] documents. Ordinary callers construct a [`CompilationStagingRequest`]
+//! or use [`stage`], while backend implementations name the request traits in their bounds and complete each stage
+//! through their `trace`, `into_lowered`, `into_compiled`, or `reconstruct` functions
 
 pub mod caching;
 pub mod contexts;
@@ -157,11 +157,14 @@ pub use caching::{
     CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
     CompilationMissReason, DiskCache,
 };
-pub use contexts::{AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, StatefulCompilationDomain};
+pub use contexts::{
+    AnalyzableCompilationDomain, CallRequest, CompilationCacheDomain, CompilationDomain, CompilationRequest,
+    LoweringRequest, StagingRequest, StatefulCompilationDomain,
+};
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
-    CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FlatCompilationProgram,
-    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, LoweringRequest, ReferenceExecution, StageRequest,
-    StagedFunction, jit, jit_with_options, jit_with_options_and_capacity, stage,
+    CompilationCall, CompilationStagingRequest, CompilationTracer, CompiledCallOperation, CompiledFunction,
+    CompiledFunctionDispatcher, ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey,
+    JitCacheStatistics, LoweredFunction, ReferenceExecution, StagedFunction, jit, jit_with_options,
+    jit_with_options_and_capacity, stage,
 };

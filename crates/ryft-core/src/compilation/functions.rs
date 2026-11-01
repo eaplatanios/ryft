@@ -1,9 +1,9 @@
-//! Typed compilation lifecycle handles, backend extension requests, and retained JIT dispatch.
+//! Typed compilation lifecycle handles, backend requests, and retained JIT dispatch.
 //!
 //! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
 //! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
-//! structured signatures. The request traits ([`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
-//! [`CallRequest`]) are the typed witnesses through which a [`CompilationDomain`] completes each transition.
+//! structured signatures. [`CompilationStagingRequest`], [`StagedFunction`], [`LoweredFunction`], and
+//! [`CompilationCall`] implement the request traits through which a [`CompilationDomain`] completes each stage.
 //! [`CompiledFunctionDispatcher`] retains compiled specializations of one Rust closure, and [`jit`] and its variants
 //! construct it.
 
@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
 use crate::compilation::caching::accumulate_duration;
-use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
+use crate::compilation::contexts::{
+    CallRequest, CompilationDomain, CompilationRequest, LoweringRequest, StagingRequest, StatefulCompilationDomain,
+};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
@@ -131,47 +133,7 @@ impl<C: CompilationDomain, F, Input, Output> CompilationStagingRequest<C, F, Inp
     }
 }
 
-/// Typed staging-request behavior used by [`CompilationDomain::stage`].
-///
-/// This trait encapsulates the structured generic bounds so concrete domains can implement staging without refining
-/// the trait method's requirements. Construct requests with [`CompilationStagingRequest::new`].
-pub trait StageRequest<C: CompilationDomain>: Sized
-where
-    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-{
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<
-            C::Type,
-            Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
-            To<CompilationTracer<C>>: Parameterized<
-                CompilationTracer<C>,
-                To<C::Type> = Self::Output,
-                To<C::Constant> = <Self::Output as Parameterized<C::Type>>::To<C::Constant>,
-            >,
-        >;
-
-    /// Returns the structured abstract input signature.
-    fn input_types(&self) -> &Self::Input;
-
-    /// Returns the fixed compilation options.
-    fn options(&self) -> &C::Options;
-
-    /// Replaces the flat input signature while preserving its parameter structure.
-    fn replace_input_types(&mut self, input_types: Vec<C::Type>) -> Result<(), C::Error>;
-
-    /// Traces this request and normalizes the effective flat output signature.
-    fn trace<NormalizeOutput>(
-        self,
-        normalize_output_types: NormalizeOutput,
-    ) -> Result<StagedFunction<C, Self::Input, Self::Output>, C::Error>
-    where
-        NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>;
-}
-
-impl<C, F, Input, Output> StageRequest<C> for CompilationStagingRequest<C, F, Input, Output>
+impl<C, F, Input, Output> StagingRequest<C> for CompilationStagingRequest<C, F, Input, Output>
 where
     C: CompilationDomain,
     F: FnOnce(
@@ -224,47 +186,6 @@ where
     }
 }
 
-/// Typed staged-artifact behavior used by [`CompilationDomain::lower`].
-pub trait LoweringRequest<C: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Returns the staged artifact.
-    fn staged(&self) -> &StagedFunction<C, Self::Input, Self::Output>;
-
-    /// Opens runtime captures as leading flat inputs.
-    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError>;
-
-    /// Assembles the backend-established lowering.
-    fn into_lowered(
-        self,
-        program: C::LoweredProgram,
-        output_types: Vec<C::Type>,
-    ) -> LoweredFunction<C, Self::Input, Self::Output>;
-}
-
-/// Typed lowered-artifact behavior used by [`CompilationDomain::compile`].
-pub trait CompileRequest<C: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Returns the lowered artifact.
-    fn lowered(&self) -> &LoweredFunction<C, Self::Input, Self::Output>;
-
-    /// Assembles the backend-established compiled artifact.
-    fn into_compiled(
-        self,
-        program: Arc<C::CompiledProgram>,
-        output_types: Vec<C::Type>,
-    ) -> CompiledFunction<C, Self::Input, Self::Output>;
-}
-
 /// Complete typed request consumed by [`CompilationDomain::call`].
 pub struct CompilationCall<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
     /// Executable being invoked.
@@ -285,33 +206,6 @@ where
     pub fn new(executable: &ExecutableFunction<C, Input, Output>, inputs: Input::To<C::Value>) -> Self {
         Self { executable: executable.clone(), inputs: inputs.into_parameters().collect() }
     }
-}
-
-/// Typed execution-request behavior used by [`CompilationDomain::call`].
-pub trait CallRequest<C: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
-
-    /// Structured runtime output type.
-    type RuntimeOutput;
-
-    /// Returns the executable artifact.
-    fn executable(&self) -> &ExecutableFunction<C, Self::Input, Self::Output>;
-
-    /// Returns flat public runtime inputs, excluding captures.
-    fn inputs(&self) -> &[C::Value];
-
-    /// Consumes the request and prepends runtime captures to its flat inputs.
-    fn into_arguments(self) -> Vec<C::Value>;
-
-    /// Reconstructs structured runtime outputs.
-    fn reconstruct(
-        executable: &ExecutableFunction<C, Self::Input, Self::Output>,
-        outputs: Vec<C::Value>,
-    ) -> Result<Self::RuntimeOutput, C::Error>;
 }
 
 /// Completion-bearing result of one externally stateful compiled invocation.
@@ -757,7 +651,7 @@ where
     }
 }
 
-impl<C, Input, Output> CompileRequest<C> for LoweredFunction<C, Input, Output>
+impl<C, Input, Output> CompilationRequest<C> for LoweredFunction<C, Input, Output>
 where
     C: CompilationDomain,
     Input: Parameterized<C::Type>,
@@ -1940,7 +1834,7 @@ mod tests {
             mut request: Request,
         ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
         where
-            Request: StageRequest<Self>,
+            Request: StagingRequest<Self>,
         {
             if let Some(input_type) = &request.options().staged_input_type {
                 request
@@ -1979,7 +1873,7 @@ mod tests {
             lowered: Request,
         ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
         where
-            Request: CompileRequest<Self>,
+            Request: CompilationRequest<Self>,
         {
             self.cache.compile_request(
                 self,
@@ -2103,7 +1997,7 @@ mod tests {
             request: Request,
         ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, ProgramError>
         where
-            Request: StageRequest<Self>,
+            Request: StagingRequest<Self>,
         {
             request.trace(|_, output_types| Ok(output_types))
         }
@@ -2125,7 +2019,7 @@ mod tests {
             lowered: Request,
         ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, ProgramError>
         where
-            Request: CompileRequest<Self>,
+            Request: CompilationRequest<Self>,
         {
             self.compilations.fetch_add(1, Ordering::Relaxed);
             let program = lowered.lowered().lowered_program().clone();

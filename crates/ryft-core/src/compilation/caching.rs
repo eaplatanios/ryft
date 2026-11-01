@@ -25,11 +25,11 @@ use flate2::write::GzEncoder;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 
-use crate::compilation::contexts::CompilationCacheDomain;
+use crate::compilation::contexts::{CompilationCacheDomain, CompilationRequest};
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
 };
-use crate::compilation::functions::{CompileRequest, CompiledFunction};
+use crate::compilation::functions::CompiledFunction;
 use crate::programs::{ProgramError, Type};
 
 /// Default capacity of the in-memory tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`] when
@@ -650,7 +650,7 @@ impl<C: CompilationCacheDomain> CompilationContext<C> {
         output_types: OutputTypes,
     ) -> Result<CompiledFunction<C, Request::Input, Request::Output>, C::Error>
     where
-        Request: CompileRequest<C>,
+        Request: CompilationRequest<C>,
         Produce: FnOnce(&C::LoweredProgram) -> Result<C::CompiledProgram, C::Error>,
         OutputTypes: FnOnce(&C::CompiledProgram) -> Vec<C::Type>,
     {
@@ -1772,10 +1772,8 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::contexts::CompilationDomain;
-    use crate::compilation::functions::{
-        CallRequest, CompilationTracer, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, stage,
-    };
+    use crate::compilation::contexts::{CallRequest, CompilationDomain, LoweringRequest, StagingRequest};
+    use crate::compilation::functions::{CompilationTracer, LoweredFunction, StagedFunction, stage};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 
@@ -1824,7 +1822,7 @@ mod tests {
             request: Request,
         ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
         where
-            Request: StageRequest<Self>,
+            Request: StagingRequest<Self>,
         {
             request.trace(|_, output_types| Ok(output_types))
         }
@@ -1845,7 +1843,7 @@ mod tests {
             lowered: Request,
         ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
         where
-            Request: CompileRequest<Self>,
+            Request: CompilationRequest<Self>,
         {
             Ok(lowered.into_compiled(Arc::new(TestCompiledProgram(0)), Vec::new()))
         }
