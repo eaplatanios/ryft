@@ -1,0 +1,448 @@
+use std::fmt::Display;
+use std::marker::PhantomData;
+
+use ryft_macros::capability;
+
+use crate::arrays::{
+    Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+    dispatch_on_array_element_type,
+};
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::operations::{Capability, ElementwiseOperation};
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::{
+    Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
+
+/// Canonical operation name for [`OneLikeOperation`].
+pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
+
+/// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _one_ value
+/// with the same [`Type`] as that input.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OneLikeOperation<T: Type>(PhantomData<fn() -> T>);
+
+impl<T: Type> Copy for OneLikeOperation<T> {}
+
+impl<T: Type> OneLikeOperation<T> {
+    /// Constructs a new [`OneLikeOperation`].
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type> Display for OneLikeOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(ONE_LIKE_OPERATION_NAME)
+    }
+}
+
+impl<T: Type> Operation for OneLikeOperation<T> {
+    type Type = T;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        ONE_LIKE_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        input_types[0].validate_one()?;
+        Ok(vec![input_types[0].clone()])
+    }
+}
+
+impl ElementwiseOperation for OneLikeOperation<ArrayType> {
+    #[inline]
+    fn input_count(&self) -> usize {
+        1
+    }
+}
+
+impl<C: Domain> InterpretableOperation<C> for OneLikeOperation<C::Type>
+where
+    C::Value: OneLike,
+{
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].one_like()?])
+    }
+}
+
+impl<C: Context<Operation: From<OneLikeOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
+    for OneLikeOperation<C::Type>
+{
+}
+
+impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
+
+impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(_: OneLikeOperation<ArrayIrType>) -> Self {
+        // The exemplar supplies the complete output shape, including runtime extents, so the homogeneous member already
+        // represents dynamic arrays. Projecting that member also rejects dimension and reference inputs.
+        Self::Array(ArrayOperation::OneLike(OneLikeOperation::new()))
+    }
+}
+
+/// Represents the ability to construct a _one_ value with the same type as an exemplar. [`OneLike`] is the
+/// value-driven counterpart to [`One`](super::One) and supplies [`OneLikeOperation`]'s interpretation capability.
+/// For arrays, the result preserves the exemplar's element data type, runtime shape, memory placement, layout, and
+/// sharding. Its elements are ones regardless of the exemplar's values; complex elements have a zero imaginary part.
+/// Empty arrays remain empty, but their element data type must still support one.
+///
+/// A staged call retains the exemplar as an input so that dynamic extents are read at execution time. It does not
+/// replace dynamic dimensions with their allocation bounds. The exemplar's numerical values have no effect on the
+/// result, so differentiation returns zero for its tangent or cotangent.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, OneLike};
+/// let input = Array::vector(vec![2.0f32, -3.0]).unwrap();
+/// assert_eq!(input.one_like(), Ok(Array::vector(vec![1.0f32, 1.0]).unwrap()));
+/// ```
+#[capability]
+pub trait OneLike<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Returns a _one_ value with the same type and runtime shape as `self`. Returns an error if its element
+    /// data type cannot represent one, including when the exemplar is empty.
+    fn one_like(&self) -> Result<Self, ProgramError>;
+}
+
+impl OneLike for Array {
+    fn one_like(&self) -> Result<Self, ProgramError> {
+        let data_type = self.r#type().data_type();
+        match data_type {
+            DataType::Token | DataType::Zero => {
+                Err(TypeError::invalid(format!("data type `{data_type}` cannot represent one")).into())
+            }
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = Element::from_unsigned(1)?;
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element))
+            }),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType> + OneLike> OneLike for ArrayIrValue<A> {
+    #[inline]
+    fn one_like(&self) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Array(input.one_like()?))
+    }
+}
+
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<OneLikeOperation<T>>>>>
+    OneLike<T> for V
+{
+    #[inline]
+    fn one_like(&self) -> Result<Self, ProgramError> {
+        let operation = OneLikeOperation::new();
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use half::{bf16, f16};
+    use indoc::indoc;
+    use num_complex::Complex;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
+        Sharding, StridedLayout, f8e8m0fnu,
+    };
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::differentiate_at;
+    use crate::interpretation::InterpretableOperation;
+    use crate::macros::{check_operation_transposition, check_operation_type_inference};
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::tracing::TracingContext;
+
+    use super::*;
+
+    #[test]
+    fn test_one_like() {
+        // Verify the operation's identity and rendering.
+        let operation = OneLikeOperation::<ArrayType>::new();
+        assert_eq!(format!("{operation}"), ONE_LIKE_OPERATION_NAME);
+
+        // Verify the operation's textual form when it appears in a program.
+        let mut builder = ProgramBuilder::<Array, OneLikeOperation<ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = one_like %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_one_like_type_inference() {
+        check_operation_type_inference!(
+            operation = OneLikeOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                output_types = [ArrayType::new_static(DataType::F32, [2])],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_one_like_type_inference_mixed() {
+        let operation = ArrayIrOperation::<Array>::from(OneLikeOperation::<ArrayIrType>::new());
+        assert!(matches!(operation, ArrayIrOperation::Array(ArrayOperation::OneLike(_))));
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+        assert_eq!(operation.infer_output_types(&[r#type.clone().into()], &[]), Ok(vec![r#type.into()]));
+        assert_eq!(
+            operation.infer_output_types(&[DimensionType::from(size).into()], &[]),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+    }
+
+    #[test]
+    fn test_one_like_interpretation() {
+        let operation = OneLikeOperation::<ArrayType>::new();
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.5).unwrap()],
+            ),
+            Ok(vec![Array::scalar(1.0).unwrap()]),
+        );
+        let input = Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap();
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[input],
+            ),
+            Err(ProgramError::Type(TypeError::invalid("data type `zero` cannot represent one"))),
+        );
+
+        // Verify value-driven one synthesis across representative rank-zero array data-type families.
+        for (input, expected) in [
+            (Array::scalar(false).unwrap(), Array::scalar(true).unwrap()),
+            (Array::scalar(5i32).unwrap(), Array::scalar(1i32).unwrap()),
+            (Array::scalar(5u32).unwrap(), Array::scalar(1u32).unwrap()),
+            (Array::scalar(bf16::from_f32(5.0)).unwrap(), Array::scalar(bf16::ONE).unwrap()),
+            (Array::scalar(f16::from_f32(5.0)).unwrap(), Array::scalar(f16::ONE).unwrap()),
+            (Array::scalar(3.0f32).unwrap(), Array::scalar(1.0f32).unwrap()),
+            (Array::scalar(7.0f64).unwrap(), Array::scalar(1.0f64).unwrap()),
+        ] {
+            assert_eq!(input.one_like(), Ok(expected));
+        }
+
+        let input = Array::vector(vec![1.5f32, -2.5]).unwrap();
+        let output = input.one_like().unwrap();
+        assert_eq!(output.elements::<f32>(), Ok(vec![1.0, 1.0]));
+        assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
+
+        // Complex identity values preserve physical layout and memory, including for empty arrays.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let r#type = ArrayType::new_static(DataType::C64, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![16])))
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let input = Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 2]).unwrap();
+        assert_eq!(input.one_like(), Ok(Array::from_elements(r#type, &[Complex::new(1.0f32, 0.0); 2]).unwrap()));
+        let empty = Array::from_elements::<Complex<f32>>(ArrayType::new_static(DataType::C64, [0]), &[]).unwrap();
+        assert_eq!(empty.one_like(), Ok(empty.clone()));
+
+        // `f8e8m0fnu` represents exact one even though it has no zero encoding.
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::F8E8M0FNU, [2]),
+            &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
+        )
+        .unwrap();
+        assert_eq!(input.one_like().unwrap().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
+
+        // Types without a multiplicative identity report exact errors instead of returning their exemplar.
+        let token = Array::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap();
+        assert_eq!(
+            token.one_like(),
+            Err(ProgramError::Type(TypeError::invalid("data type `token` cannot represent one"))),
+        );
+        let zero = Array::new(ArrayType::new_static(DataType::Zero, [2]), Vec::new()).unwrap();
+        assert_eq!(
+            zero.one_like(),
+            Err(ProgramError::Type(TypeError::invalid("data type `zero` cannot represent one"))),
+        );
+    }
+
+    #[test]
+    fn test_one_like_interpretation_mixed() {
+        let input = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[2.0f32, 3.0]).unwrap(),
+        );
+        let expected = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.0f32, 1.0]).unwrap(),
+        );
+        assert_eq!(input.one_like(), Ok(expected));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.one_like(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
+    fn test_one_like_partial_evaluation() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let input =
+            PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5]).unwrap()));
+        let output = input.one_like().unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![1.0f32, 1.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_one_like_batching() {
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let input = BatchingTracer::new(
+            context,
+            ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]).unwrap(), BatchAxis::replicated()).unwrap(),
+        );
+        let output = input.one_like().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::vector(vec![1.0f32, 1.0]).unwrap());
+
+        // A nonleading mapped axis remains mapped rather than turning the result into a replicated constant.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let r#type = ArrayType::new_static(DataType::C64, [2, 3]);
+        let input = BatchingTracer::new(
+            context,
+            ArrayBatch::new(
+                Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 6]).unwrap(),
+                BatchAxis::new(1),
+            )
+            .unwrap(),
+        );
+        let output = input.one_like().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(output.batch().value(), &Array::from_elements(r#type, &[Complex::new(1.0f32, 0.0); 6]).unwrap());
+    }
+
+    #[test]
+    fn test_one_like_differentiation() {
+        // Dense forward mode differentiation batches the constant rule while constructing the identity Jacobian.
+        let jacobian = differentiate_at(Array::scalar(2.0).unwrap())
+            .jacobian_forward(|input| Ok(input.clone() + input.one_like()?))
+            .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().to_f64s(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_one_like_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = OneLikeOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_one_like_staging() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]));
+        let output = input.one_like().unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = one_like %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_one_like_staging_mixed() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let input = context.input(r#type.clone().into());
+        let output = input.one_like().unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(r#type));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [instruction] = program.instructions() else {
+            panic!("expected one exemplar-based one instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::OneLike(_))));
+        assert_eq!(instruction.inputs(), &[input.atom_id().unwrap()]);
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[2.0f32, 3.0]).unwrap(),
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.0f32, 1.0]).unwrap(),
+            )]),
+        );
+        // Runtime zero is a valid extent even though the exemplar's signature is dynamic.
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
+            )]),
+        );
+    }
+}

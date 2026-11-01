@@ -1,0 +1,1392 @@
+//! Extensible caching for structural transforms of sealed [`Region`]s.
+//!
+//! A callee [`Program`] interned into many programs is linearized, transposed, or otherwise structurally transformed
+//! once rather than once per program that interned it, because the derived result is retained on the sealed region
+//! itself and every program sharing that region shares the derivation. This is shown in the following example:
+//!
+//! ```
+//! # use std::convert::Infallible;
+//! # use std::sync::Arc;
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, Operation, Placeholder, ProgramBuilder, Region, Transform,
+//! #     TransformArtifact, Value,
+//! # };
+//!
+//! // A zero-sized marker names one retained derivation family and owns its own per-region namespace.
+//! struct IdentityCopy;
+//!
+//! impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for IdentityCopy {
+//!     type Arguments = usize;
+//!     type Artifact = TransformArtifact<V, O, usize>;
+//!
+//!     const DEFAULT_CACHE_CAPACITY: usize = 2;
+//! }
+//!
+//! # let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+//! # let input = builder.add_input(ArrayType::scalar(DataType::F64));
+//! # let program = builder
+//! #     .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
+//! #     .unwrap();
+//!
+//! let region = program.entry_region_ref();
+//! let artifact = region
+//!     .transform::<IdentityCopy, _, Infallible>(0, |region, arguments| {
+//!         Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], *arguments))
+//!     })
+//!     .unwrap();
+//! assert_eq!(artifact.metadata(), &0);
+//!
+//! // The second request for the same marker and arguments serves the retained artifact instead of re-deriving it.
+//! let repeated = region
+//!     .transform::<IdentityCopy, _, Infallible>(0, |region, arguments| {
+//!         Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], *arguments))
+//!     })
+//!     .unwrap();
+//! assert!(Arc::ptr_eq(&artifact.programs()[0], &repeated.programs()[0]));
+//! ```
+//!
+//! [`Transform`] describes one retained specialization family within a type-level source universe. It selects
+//! the complete [`Transform::Arguments`] key, the cheaply cloned [`Transform::Artifact`], and a default capacity.
+//! [`TransformCache`] is a zero-cost alias for the corresponding [`SpecializationCache`]. Production remains with
+//! the owner.
+//!
+//! Readers new to regions, arenas, and sealing should start with the documentation of the
+//! [`regions`](crate::programs::regions) module, because every rule stated here is phrased in terms of a
+//! sealed region's complete reachable contents. Two terms recur throughout. A _marker_ is the type that implements
+//! [`Transform`] and names one derivation family. A _namespace_ is the per-region bounded cache owned by one marker
+//! type, where the marker's [`TypeId`] identifies the namespace and the transform's arguments identify entries
+//! within it.
+//!
+//! # Using Region Transforms
+//!
+//! [`RegionRef::transform`] is the safe public extension point for region-owned structural transforms. The transform
+//! marker namespaces an independently bounded cache attached to the sealed region, and its arguments select one entry
+//! in that namespace. The returned [`TransformArtifact`] contains concrete programs over the region's value and
+//! operation universe plus static metadata. Programs may therefore retain non-`'static` backend lifetimes even though
+//! the erased arguments and metadata must be `'static`.
+//!
+//! ## Region Reuse Contract
+//!
+//! A region derivation must be a deterministic structural function of the region's complete reachable contents and its
+//! arguments. Arguments must contain every semantic input not represented by that graph. Metadata must not retain the
+//! source region, program, transform-cache state, live context, runtime values, or invocation-specific residuals. The
+//! derivation callback is the uncached kernel and must have stable semantics for every use of one marker type.
+//!
+//! A transform whose result depends on live [`Context`](crate::Context) state has no complete key here and must not be
+//! cached against a region alone. _Partial evaluation_ is the canonical exclusion: its partition carries known outputs
+//! that are values of the live parent context (i.e., concrete constants under an eager parent and tracers staged into
+//! the parent's trace under a staging one), so one region together with one known-ness mask does not determine one
+//! artifact. That is what keeps the `condition`, `scan`, and `while` known-ness splits, for example, out of every
+//! region namespace.
+//!
+//! The cache is shared by content-preserving copies of a sealed region and replaced whenever construction or rewriting
+//! changes the complete reachable contents. External transforms never adopt or invalidate cache provenance directly.
+//! On same-thread recursive production of one marker and argument value, the callback runs without publishing so
+//! recursive structural transformation never waits or deadlocks. Errors and panics retain nothing and retry later.
+//!
+//! # Design And Soundness
+//!
+//! Retained Just-In-Time (JIT) compilation dispatch and region transformation share this cache vocabulary without
+//! pretending to share a source, artifact representation, validation policy, or reentrancy behavior. [`Transform`]'s
+//! own documentation carries the diagram relating the two owners to the descriptor, the typed alias, and their
+//! artifacts.
+//!
+//! ## Cache Provenance
+//!
+//! The [`regions`](crate::programs::regions) module owns provenance, and two rules keep a cache from outliving the
+//! complete reachable contents it was derived from:
+//!
+//!   - every construction of a region with rewritten contents mints a fresh cache (i.e., type-identity renaming,
+//!     operation mapping, value un-projection, boundary rebuilds, and program simplification all reach it), and every
+//!     in-place rewrite of a region's contents detaches the cache derived from its previous contents; and
+//!   - sealing a region into an arena mints a fresh cache whenever that region attaches at least one descendant,
+//!     because an attached [`RegionId`](crate::RegionId) means nothing until an arena files a body under it. A region
+//!     carried into a different arena would otherwise keep transforms derived from whatever descendants its previous
+//!     arena happened to hold at those identifiers, which is a wrong derived program rather than a missed reuse
+//!     opportunity. A region that attaches nothing has no such dependency and keeps its cache, which is what preserves
+//!     the common leaf-callee sharing.
+//!
+//! The second rule is deliberately conservative, so the internal paths that re-seal a region while provably preserving
+//! its complete reachable closure opt out of it. Those are the closure-copying imports (i.e.,
+//! [`ProgramBuilder::import_region`](crate::ProgramBuilder::import_region) and the callee interning built on it), the
+//! faithful whole-arena rebuilds in
+//! [`ClosedProgram::without_unused_captures`](crate::ClosedProgram::without_unused_captures) and
+//! [`ClosedProgram::to_program_with_lifted_captures`](crate::ClosedProgram::to_program_with_lifted_captures), the
+//! entry-boundary projections [`Program::filtered`] and [`Program::into_filtered`], which carry the descendant closure
+//! over verbatim, and program simplification, which additionally re-adopts each source cache in the one case where the
+//! rebuild is provably the identity on the region's contents. [`RegionRef::to_program`] re-adopts the promoted entry's
+//! cache the same way. Renumbering attached identifiers is always tolerated as long as the renumbering preserves the
+//! complete reachable graph's topology, which is why importing and compaction keep retained transforms valid.
+//!
+//! ## Namespace Storage And Thread Safety
+//!
+//! Each region allocates only one small shared cache handle; the registry map inside it is empty, and therefore
+//! allocation-free, until the first transform request. Every marker receives its own bounded namespace, so keys and
+//! eviction in one transform cannot
+//! affect another. Registry and namespace locks protect only bookkeeping (i.e., derivation, rechecking, formatting,
+//! and caller-owned destruction run after those locks are released).
+//!
+//! Thread safety remains conditional on contents. A typed [`TransformCache`] is `Send` and `Sync` exactly when its
+//! arguments and artifacts are. A region registry preserves the same rule for its concrete program universe, while
+//! requiring erased arguments and metadata to be `'static + Send + Sync`. The region handle states that rule directly
+//! (i.e., it is `Send` and `Sync` exactly when its retained programs are) rather than leaving it to structural
+//! auto-trait derivation, whose region-to-program-to-region round trip is too deep for downstream auto-trait checks.
+//! Different threads may derive one cold specialization concurrently under [`SpecializationCache`]'s deliberate
+//! last-writer-wins policy.
+//!
+//! ## Ownership-Cycle Prevention
+//!
+//! Content-preserving program materialization can copy the source region's cache handle. Before a derived artifact is
+//! published, [`RegionRef::transform`] detaches every returned region whose cache is pointer-identical to the source
+//! root. This prevents a region-owned artifact from retaining its own cache state. Unrelated descendant cache handles
+//! remain shared. Opaque metadata cannot be inspected, so it must never retain the source region, source program, or
+//! cache state.
+//!
+//! Detaching only the self-identical caches is sufficient under the region reuse contract stated above, and only under
+//! it. A contract-abiding derivation is a structural function of the source region's complete reachable contents, so
+//! its programs can reach nothing but strict descendants of the source region, copies of the source region itself
+//! (which the preceding paragraph's sanitization detaches), and freshly built regions (which carry fresh caches). "Is
+//! a strict descendant of" is acyclic over a sealed arena, so a descendant's cache can never already hold an artifact
+//! whose programs carry the source root, which rules out the remaining shape of the hazard: a two-region cycle in
+//! which one region's retained artifact holds the other region's cache and that artifact in turn holds the first
+//! region's cache.
+//!
+//! That acyclicity argument is contingent on the contract rather than enforced by the type system. A contract-violating
+//! derivation that embeds programs built from regions unrelated to its source can construct exactly that cycle. Two
+//! markers whose derivations each embed the other source region's [`RegionRef::to_program`] result, for example, build
+//! a strong [`Arc`] cycle that sanitization cannot observe, because sanitization detaches only caches that are
+//! pointer-identical to the source root. The consequence of such a violation is unreclaimable retained state, that is,
+//! a leak, never a wrong derived program.
+//!
+//! ## Debug-Assertion Recheck
+//!
+//! With debug assertions enabled, a hit is re-derived and compared with the retained program rendering and metadata.
+//! This detects only semantics represented by [`Value`] rendering, [`Operation::render`], and metadata equality.
+//! Because a fresh derivation error is propagated, a hit that succeeds in an optimized build can fail in a
+//! debug-assertion build. The complete re-derivation and comparison path is compiled out when debug assertions are
+//! disabled.
+
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, Weak};
+
+use dyn_eq::DynEq;
+use dyn_hash::DynHash;
+
+use crate::parameters::Parameter;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::{Region, RegionRef};
+use crate::programs::types::{Type, Typed};
+use crate::programs::values::Value;
+use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry};
+
+/// Describes a family of retained specializations within `Source`. `Source` is a type-level coherence and
+/// documentation parameter. It is not stored or invoked by a cache. For example, structural region markers implement
+/// `Transform<Region<V, O>>`, while retained Just-In-Time (JIT) compilation specialization uses a private source token
+/// describing its domain and function signature. Also, equal [`Arguments`](Self::Arguments) must make retained
+/// artifacts interchangeable within one owning cache. Any fixed semantics absent from the arguments, such as a retained
+/// closure or immutable options, must be fixed by that cache's owner.
+///
+/// # Type Relationships
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TB
+///   descriptor["&lt;code&gt;Transform&lt;/code&gt; Descriptor"]
+///   arguments["&lt;code&gt;Arguments&lt;/code&gt;"]
+///   artifact["&lt;code&gt;Artifact&lt;/code&gt;"]
+///   capacity["&lt;code&gt;DEFAULT_CACHE_CAPACITY&lt;/code&gt;"]
+///   typed_cache["&lt;code&gt;TransformCache&lt;/code&gt; Alias"]
+///   specialization["&lt;code&gt;SpecializationCache&lt;/code&gt;"]
+///   region_owner["&lt;code&gt;RegionRef&lt;/code&gt;"]
+///   registry["Per-Region Namespace Registry"]
+///   region_artifact["&lt;code&gt;Program&lt;/code&gt; Bundle and Metadata"]
+///   dispatcher["&lt;code&gt;JittedFunction&lt;/code&gt;"]
+///   executable["&lt;code&gt;ExecutableFunction&lt;/code&gt;"]
+///   backend["&lt;code&gt;CompilationContext&lt;/code&gt; on a Miss"]
+///   descriptor --> arguments
+///   descriptor --> artifact
+///   descriptor --> capacity
+///   typed_cache --> specialization
+///   region_owner --> registry
+///   registry --> specialization
+///   registry --> region_artifact
+///   dispatcher --> typed_cache
+///   typed_cache --> executable
+///   dispatcher --> backend
+/// ```
+#[cfg_attr(doc, ryft_macros::mermaid)]
+pub trait Transform<Source> {
+    /// Complete equality and hash identity of one specialization within the owning transform cache.
+    type Arguments: Clone + Eq + Hash;
+
+    /// Cheaply cloneable artifact retained for one [`Self::Arguments`] instance.
+    type Artifact: Clone;
+
+    /// Default number of [`Self::Artifact`]s retained by one transform owner or region namespace.
+    const DEFAULT_CACHE_CAPACITY: usize;
+}
+
+/// Typed [`SpecializationCache`] selected by [`Transform`] `T` for `Source`. This is an alias rather than a forwarding
+/// wrapper, so that it exposes the exact [`SpecializationCache`] entry, statistics, invalidation, synchronization,
+/// panic, and destructor behavior. Construct it with `SpecializationCache::new(T::DEFAULT_CACHE_CAPACITY)` when the
+/// descriptor default applies, or with an explicit owner-configured capacity.
+///
+/// ```
+/// # use std::convert::Infallible;
+/// # use ryft_core::programs::transforms::{Transform, TransformCache};
+///
+/// struct Source;
+/// struct Square;
+///
+/// impl Transform<Source> for Square {
+///     type Arguments = u32;
+///     type Artifact = u32;
+///
+///     const DEFAULT_CACHE_CAPACITY: usize = 4;
+/// }
+///
+/// let cache = TransformCache::<Square, Source>::new(<Square as Transform<Source>>::DEFAULT_CACHE_CAPACITY);
+/// assert_eq!(cache.get_or_try_insert_with(3, || Ok::<_, Infallible>(9)).unwrap(), 9);
+/// assert_eq!(cache.get_or_try_insert_with(3, || Ok::<_, Infallible>(99)).unwrap(), 9);
+/// ```
+pub type TransformCache<T, Source> =
+    SpecializationCache<<T as Transform<Source>>::Arguments, <T as Transform<Source>>::Artifact>;
+
+/// Structural [`Program`]s and static metadata retained for one [`Region`]-transform specialization. Program order is
+/// determined by the transform. Users should generally prefer a transform-specific wrapper when one exists rather than
+/// depending directly on a built-in marker's raw layout. `Metadata` must be small, owned, and independent of runtime
+/// invocation state. It must not retain the source region, source program, cache state, live context, backend buffer,
+/// or invocation-specific residual value.
+pub struct TransformArtifact<V: Typed + Parameter, O, Metadata> {
+    /// Transformed [`Program`]s in [`Transform`]-defined order.
+    programs: Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>,
+
+    /// [`Transform`]-specific metadata associated with this [`TransformArtifact`].
+    metadata: Metadata,
+}
+
+impl<V: Typed + Parameter, O, Metadata> TransformArtifact<V, O, Metadata> {
+    /// Creates a new [`TransformArtifact`].
+    #[inline]
+    pub fn new(programs: Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>, metadata: Metadata) -> Self {
+        Self { programs, metadata }
+    }
+
+    /// Returns the transformed [`Program`]s in [`Transform`]-defined order.
+    #[inline]
+    pub fn programs(&self) -> &[Arc<Program<V, O, Vec<V>, Vec<V>>>] {
+        &self.programs
+    }
+
+    /// Returns the [`Transform`]-specific metadata associated with this [`TransformArtifact`].
+    #[inline]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Consumes this [`TransformArtifact`] and returns its transformed [`Program`]s and metadata.
+    #[inline]
+    pub fn into_parts(self) -> (Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>, Metadata) {
+        (self.programs, self.metadata)
+    }
+}
+
+impl<V: Typed + Parameter, O, Metadata: Clone> Clone for TransformArtifact<V, O, Metadata> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { programs: self.programs.clone(), metadata: self.metadata.clone() }
+    }
+}
+
+impl<V: Typed + Parameter, O, Metadata: Debug> Debug for TransformArtifact<V, O, Metadata> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransformArtifact")
+            .field("program_count", &self.programs.len())
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+/// Object-safe equality, hashing, and debugging contract for erased [`Region`] [`Transform`] arguments.
+trait ErasedTransformArgumentsValue: Debug + Send + Sync + DynEq + DynHash {}
+
+impl<T: 'static + Debug + Eq + Hash + Send + Sync> ErasedTransformArgumentsValue for T {}
+
+dyn_eq::eq_trait_object!(ErasedTransformArgumentsValue);
+dyn_hash::hash_trait_object!(ErasedTransformArgumentsValue);
+
+/// Cloneable type-erased key used inside a [`Transform`] marker's namespace.
+#[derive(Clone)]
+pub(crate) struct ErasedTransformArguments(Arc<dyn ErasedTransformArgumentsValue>);
+
+impl ErasedTransformArguments {
+    /// Creates a new [`ErasedTransformArguments`] wrapping the provided arguments value and erasing its type.
+    #[inline]
+    fn new<A: 'static + ErasedTransformArgumentsValue>(arguments: A) -> Self {
+        Self(Arc::new(arguments))
+    }
+}
+
+impl Debug for ErasedTransformArguments {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl PartialEq for ErasedTransformArguments {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref() == other.0.as_ref()
+    }
+}
+
+impl Eq for ErasedTransformArguments {}
+
+impl Hash for ErasedTransformArguments {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// Internal storage form of a [`TransformArtifact`] with its `Metadata` type erased. A [`Region`]'s registry must
+/// retain artifacts for marker types defined outside this crate, each choosing its own `Metadata` type, while all
+/// namespaces of one region share a single stored value type. This type is that common representation, and it erases
+/// as little as possible: the transformed programs stay concretely typed in `V` and `O` (they may carry non-`'static`
+/// backend lifetimes and therefore can never live behind [`Any`]), and only the metadata, which
+/// [`RegionRef::transform`] already requires to be `'static + Send + Sync`, is erased behind [`Any`].
+///
+/// [`Self::new`] erases a sanitized public artifact, and [`Self::typed`] reconstructs it. The reconstruction downcast
+/// cannot fail for a well-formed marker as coherence admits one [`Transform<Region<V, O>>`](Transform) implementation
+/// per marker type, and that implementation fixes one `Metadata` type per region universe, and so a downcast mismatch
+/// is an internal invariant violation and panics.
+pub(crate) struct ErasedTransformArtifact<V: Typed + Parameter, O> {
+    /// Transformed [`Program`]s in [`Transform`]-defined order, concretely typed so that non-`'static` `V` and `O`
+    /// lifetimes are preserved.
+    programs: Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>,
+
+    /// Type-erased `'static` metadata, recovered by [`Self::typed`].
+    metadata: Arc<dyn Any + Send + Sync>,
+
+    /// Concrete metadata type name, retained because [`Any`] cannot name its erased type. It is used only by the
+    /// non-semantic [`Debug`] summary and by the invariant-violation panic in [`Self::typed`].
+    metadata_type_name: &'static str,
+}
+
+impl<V: Typed + Parameter, O> ErasedTransformArtifact<V, O> {
+    /// Creates a new [`ErasedTransformArtifact`] by erasing the type of the provided [`TransformArtifact`].
+    fn new<Metadata: Send + Sync + 'static>(artifact: TransformArtifact<V, O, Metadata>) -> Self {
+        let (programs, metadata) = artifact.into_parts();
+        Self { programs, metadata: Arc::new(metadata), metadata_type_name: std::any::type_name::<Metadata>() }
+    }
+
+    /// Reconstructs a typed [`TransformArtifact`] from this [`ErasedTransformArtifact`], panicking only if a marker
+    /// violated its coherent artifact layout.
+    fn typed<Metadata: Clone + Send + Sync + 'static>(&self) -> TransformArtifact<V, O, Metadata> {
+        let metadata = self.metadata.downcast_ref::<Metadata>().unwrap_or_else(|| {
+            panic!(
+                "region transform cache metadata type mismatch: retained `{}` but requested `{}`",
+                self.metadata_type_name,
+                std::any::type_name::<Metadata>(),
+            )
+        });
+        TransformArtifact::new(self.programs.clone(), metadata.clone())
+    }
+}
+
+impl<V: Typed + Parameter, O> Clone for ErasedTransformArtifact<V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            programs: self.programs.clone(),
+            metadata: self.metadata.clone(),
+            metadata_type_name: self.metadata_type_name,
+        }
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for ErasedTransformArtifact<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ErasedTransformArtifact")
+            .field("program_count", &self.programs.len())
+            .field("metadata_type", &self.metadata_type_name)
+            .finish()
+    }
+}
+
+/// Marker-namespace registry of one sealed [`Region`]'s transform cache: one independently bounded cache per marker
+/// [`TypeId`]. An empty [`HashMap`] allocates nothing and the [`Mutex`] is inline, so an untouched registry costs
+/// only its few words inside the shared allocation every sealed region already pays.
+pub(crate) type RegionTransformRegistry<V, O> =
+    Mutex<HashMap<TypeId, Arc<SpecializationCache<ErasedTransformArguments, ErasedTransformArtifact<V, O>>>>>;
+
+/// Cache of the structural [`Transform`] artifacts derived from one sealed [`Region`], shared by every
+/// content-identical copy of that region. Internally, it holds one independently bounded [`SpecializationCache`] per
+/// transform marker type (the marker's [`TypeId`] keys the registry map and the transform's arguments key the entries
+/// within each cache), so one transform's keys and eviction can never affect another's. The handle's [`Arc`] identity
+/// is the region-content identity: construction and rewriting code in [`regions`](crate::programs::regions) mints a
+/// fresh handle whenever a region's complete reachable contents change and preserves the handle across
+/// content-preserving copies, while artifact sanitization compares handles by pointer. External transforms
+/// never touch that provenance; they can only request typed artifacts through [`RegionRef::transform`], and external
+/// callers observe the identity only through the opaque [`RegionContentIdentity`] returned by [`Self::identity`].
+pub(crate) struct RegionTransformCache<V: Typed + Parameter, O> {
+    /// Shared state carried by content-preserving [`Region`] copies.
+    pub(crate) state: Arc<RegionTransformRegistry<V, O>>,
+}
+
+impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
+    /// Creates a new empty [`RegionTransformCache`].
+    pub(crate) fn new() -> Self {
+        Self { state: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Returns `true` if this [`RegionTransformCache`] and `other` share the same [`Region`]-content identity.
+    #[inline]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Returns the public [`RegionContentIdentity`] of the [`Region`] contents that share this
+    /// [`RegionTransformCache`], consistent with [`Self::ptr_eq`].
+    #[inline]
+    pub(crate) fn identity(&self) -> RegionContentIdentity<V, O> {
+        RegionContentIdentity { registry: Arc::downgrade(&self.state) }
+    }
+
+    /// Returns the [`SpecializationCache`] (i.e., namespace) for [`Transform`] `T`, creating it with `capacity`
+    /// if it does not exist yet.
+    fn namespace<T: 'static>(
+        &self,
+        capacity: usize,
+    ) -> Arc<SpecializationCache<ErasedTransformArguments, ErasedTransformArtifact<V, O>>> {
+        let registry = self.state.as_ref();
+        if let Some(namespace) = registry
+            .lock()
+            .expect("region transform registry mutex is poisoned")
+            .get(&TypeId::of::<T>())
+            .cloned()
+        {
+            return namespace;
+        }
+
+        // A losing candidate is always a freshly built empty cache, so dropping it can never run caller-defined
+        // metadata destructors. The explicit drop placed after the guard is released is still worth keeping, for two
+        // reasons: (1) it holds the uniform discipline that no cache structure is ever dropped while the registry lock
+        // is held, and (2) it keeps candidate construction and destruction visibly outside the critical section so that
+        // a later `entry().or_insert_with(...)` rewrite, which would construct and drop under the lock, is not mistaken
+        // for an equivalent simplification.
+        let mut candidate = Some(Arc::new(SpecializationCache::new(capacity)));
+        let namespace = {
+            let mut registry = registry.lock().expect("region transform registry mutex is poisoned");
+            if let Some(namespace) = registry.get(&TypeId::of::<T>()) {
+                Arc::clone(namespace)
+            } else {
+                let namespace = candidate.take().unwrap();
+                registry.insert(TypeId::of::<T>(), Arc::clone(&namespace));
+                namespace
+            }
+        };
+        drop(candidate);
+        namespace
+    }
+}
+
+// SAFETY: The registry behind `state` is built only from `Arc`, `Mutex`, `HashMap`, `TypeId`, `SpecializationCache`,
+// `LruCache`, erased `Send + Sync` arguments and metadata, and `&'static str` names, so it is thread-safe exactly when
+// the `Program<V, O, Vec<V>, Vec<V>>` values that it retains are both `Send` and `Sync` (an `Arc<Program<...>>` is
+// `Send` only if the program is also `Sync`). Apart from the transform caches of their own regions, which are
+// thread-safe by these same implementations, such programs own exactly the following leaf data: constants of type `V`,
+// variable types `V::Type`, type identities `<V::Type as Type>::Identity`, and operations `O`. All other fields are
+// thread-safe concrete bookkeeping (e.g., identifiers, effect summaries, and provenance). The unit test
+// `test_region_transform_cache_is_send_and_sync` proves for generic `V` and `O` that these leaf bounds make the
+// registry `Send` and `Sync`, so a future non-thread-safe field anywhere in that structure fails to compile there
+// instead of silently becoming unsound here.
+//
+// The structural derivation that these implementations replace is correct but too deep to remain usable. Proving that
+// a `Region` is `Send` or `Sync` walks a round trip of more than twenty nested types, most of them standard-library and
+// `lru` wrappers, from the region through this cache and the retained programs back to the region, and operation
+// payloads that nest regions of other operation families repeat that round trip. Auto-trait checks on downstream types
+// that nest concrete operation families (e.g., the auto-trait implementations that rustdoc synthesizes for `ryft-xla`
+// compiled functions) then exceed the default recursion limit (E0275). The bounds deliberately name only leaves rather
+// than `Program<V, O, Vec<V>, Vec<V>>: Send + Sync`. A program bound would re-enter the region cycle through a
+// where-clause, which the trait solver fails to close when `V` and `O` are still inference variables (e.g., while
+// checking closures that capture composites), whereas leaf bounds terminate immediately.
+unsafe impl<V, O> Send for RegionTransformCache<V, O>
+where
+    V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,
+    O: Send + Sync,
+{
+}
+
+// SAFETY: Refer to the safety argument of the `Send` implementation above. Sharing this handle across threads shares
+// the same `Arc`-backed registry that sending it does, so the same bounds are required and sufficient.
+unsafe impl<V, O> Sync for RegionTransformCache<V, O>
+where
+    V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,
+    O: Send + Sync,
+{
+}
+
+impl<V: Typed + Parameter, O> Clone for RegionTransformCache<V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { state: self.state.clone() }
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (namespace_count, artifact_count) = {
+            let registry = self.state.lock().expect("region transform registry mutex is poisoned");
+            (registry.len(), registry.values().map(|namespace| namespace.len()).sum::<usize>())
+        };
+        formatter
+            .debug_struct("RegionTransformCache")
+            .field("namespace_count", &namespace_count)
+            .field("artifact_count", &artifact_count)
+            .finish()
+    }
+}
+
+/// Opaque identity of the complete reachable contents of one sealed [`Region`], obtained through
+/// [`Region::content_identity`] or [`RegionRef::content_identity`]. The complete reachable contents of a region are its
+/// own body together with the bodies of every region reachable through its instructions. Comparing or hashing these
+/// handles lets callers key structures derived from a region (e.g., caches of compiled or analyzed programs) in
+/// constant time, without walking or rendering region bodies.
+///
+/// # Contract
+///
+///   - Equality and hashing are consistent, meaning that equal handles always produce equal hashes.
+///   - Content-preserving copies of a sealed region share its identity (e.g., clones of its [`Program`] and
+///     [`RegionRef::to_program`] materializations), while constructions or rewrites that change a region's complete
+///     reachable contents mint a new one.
+///   - The identity is conservative, meaning that equal handles imply equal contents, but two independently
+///     constructed programs with equal contents may compare unequal. Callers must therefore only use it where a
+///     spurious inequality is harmless, such as a missed cache hit.
+///   - The identity is process-local and is valid only for comparing regions of live programs. It is neither a
+///     persistent semantic key (e.g., it cannot be serialized or compared across processes) nor a type identity.
+///   - A handle may outlive the program it was taken from. It then compares equal only to handles taken from the same
+///     region (including its content-preserving copies), never to handles of regions constructed afterwards, and it
+///     does not keep the region or anything derived from it alive.
+pub struct RegionContentIdentity<V: Typed + Parameter, O> {
+    /// Weak reference to the shared state of the [`RegionTransformCache`] whose [`Arc`] identity is the region-content
+    /// identity. The weak reference keeps the allocation, and therefore its address, reserved so that no later region
+    /// can reuse it while this handle lives, but it lets the retained transform artifacts be dropped with their region.
+    /// It is never upgraded: only its address is compared and hashed.
+    registry: Weak<RegionTransformRegistry<V, O>>,
+}
+
+impl<V: Typed + Parameter, O> Clone for RegionContentIdentity<V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { registry: self.registry.clone() }
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for RegionContentIdentity<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RegionContentIdentity")
+            .field(&Weak::as_ptr(&self.registry).cast::<()>())
+            .finish()
+    }
+}
+
+impl<V: Typed + Parameter, O> PartialEq for RegionContentIdentity<V, O> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.registry, &other.registry)
+    }
+}
+
+impl<V: Typed + Parameter, O> Eq for RegionContentIdentity<V, O> {}
+
+impl<V: Typed + Parameter, O> Hash for RegionContentIdentity<V, O> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hashing the address that `Weak::ptr_eq` compares keeps hashing consistent with equality.
+        Weak::as_ptr(&self.registry).cast::<()>().hash(state);
+    }
+}
+
+impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
+    /// Returns the [`TransformArtifact`] retained for a structural transform of type `T` with the provided arguments,
+    /// deriving and retaining it on a cache miss. The marker `T` owns an independent bounded namespace on this sealed
+    /// region. `arguments` must contain every semantic derivation input not represented by the complete reachable
+    /// region graph. `derive_fn` is the uncached deterministic kernel and must have stable semantics for every use of
+    /// `T`. It must not recursively request the same marker and arguments itself. If recursion occurs indirectly, this
+    /// function will derive that nested request uncached and publish only the outer artifact.
+    ///
+    /// Failed and panicking derivations retain nothing. A successful artifact is sanitized before the exact same
+    /// instance is published and returned. With debug assertions enabled, a hit re-runs `derive_fn`, sanitizes the
+    /// fresh artifact, and compares it with the retained programs and metadata; optimized builds compile that work out.
+    ///
+    /// # Lifetime Requirements
+    ///
+    /// [`Transform`] itself permits marker and argument types that borrow data, but this region-owned cache does not.
+    /// Its registry uses the marker's [`TypeId`] as a namespace and type-erases retained arguments, so both `T` and
+    /// `T::Arguments` must be `'static`. Put borrowed key data in an owned type such as [`String`] or [`Arc<str>`]
+    /// before requesting a retained transform.
+    ///
+    /// The following implementation is a valid [`Transform`] descriptor, but its borrowed marker and arguments cannot
+    /// be retained by this method:
+    ///
+    /// ```compile_fail
+    /// # use std::convert::Infallible;
+    /// # use std::marker::PhantomData;
+    /// # use std::sync::Arc;
+    /// #
+    /// # use ryft_core::programs::transforms::{Transform, TransformArtifact};
+    /// # use ryft_core::{Array, ArrayOperation, Operation, Region, RegionRef, Value};
+    ///
+    /// struct BorrowedTransform<'a>(PhantomData<&'a str>);
+    ///
+    /// impl<'a, V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for BorrowedTransform<'a> {
+    ///     type Arguments = &'a str;
+    ///     type Artifact = TransformArtifact<V, O, ()>;
+    ///
+    ///     const DEFAULT_CACHE_CAPACITY: usize = 1;
+    /// }
+    ///
+    /// # fn cache_borrowed_arguments<'a>(
+    /// #     region: RegionRef<'_, Array, ArrayOperation<Array>>,
+    /// #     arguments: &'a str,
+    /// # ) {
+    /// let _ = region.transform::<BorrowedTransform<'a>, _, Infallible>(arguments, |region, _| {
+    ///     Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], ()))
+    /// });
+    /// # }
+    /// ```
+    ///
+    /// ```mermaid
+    /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+    /// flowchart LR
+    ///   request["&lt;code&gt;RegionRef&lt;/code&gt; and &lt;code&gt;Arguments&lt;/code&gt;"] --> namespace["Marker Namespace"]
+    ///   namespace -->|"hit"| retained["Retained &lt;code&gt;TransformArtifact&lt;/code&gt;"]
+    ///   namespace -->|"miss"| derive["Uncached Derivation"]
+    ///   derive --> sanitize["Detach Source Cache Identity"]
+    ///   sanitize --> publish["Publish and Return &lt;code&gt;TransformArtifact&lt;/code&gt;"]
+    /// ```
+    #[cfg_attr(doc, ryft_macros::mermaid)]
+    pub fn transform<
+        T: 'static
+            + Transform<
+                Region<V, O>,
+                Arguments: 'static + Debug + Send + Sync,
+                Artifact = TransformArtifact<V, O, Metadata>,
+            >,
+        Metadata: 'static + Clone + Debug + PartialEq + Send + Sync,
+        Error,
+    >(
+        self,
+        arguments: T::Arguments,
+        derive_fn: impl FnOnce(Self, &T::Arguments) -> Result<TransformArtifact<V, O, Metadata>, Error>,
+    ) -> Result<TransformArtifact<V, O, Metadata>, Error> {
+        let namespace = self.transform_cache().namespace::<T>(T::DEFAULT_CACHE_CAPACITY);
+        let erased_arguments = ErasedTransformArguments::new(arguments.clone());
+        match namespace.try_entry(erased_arguments) {
+            Ok(SpecializationCacheEntry::Occupied(cached)) => {
+                let cached = cached.typed::<Metadata>();
+                #[cfg(debug_assertions)]
+                {
+                    let fresh = self.sanitize_transform_artifact(derive_fn(self, &arguments)?);
+                    let cached_programs = cached.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    let fresh_programs = fresh.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    if cached_programs != fresh_programs || cached.metadata != fresh.metadata {
+                        // Pair the two renderings position by position as indexed blocks of real lines. Formatting
+                        // the two `Vec<String>`s instead would escape every newline in every program and leave the
+                        // diagnostic unreadable.
+                        let mut programs = String::new();
+                        for index in 0..cached_programs.len().max(fresh_programs.len()) {
+                            for (label, renderings) in [("cached", &cached_programs), ("fresh", &fresh_programs)] {
+                                let rendering = renderings.get(index).map_or("<absent>", String::as_str);
+                                programs.push_str(&format!("--- {label} program {index} ---\n{rendering}\n"));
+                            }
+                        }
+                        panic!(
+                            "nondeterministic transform rule detected for `{}` with arguments `{:?}`: re-derivation \
+                             produced a different artifact than the region cache retained, but region transforms must \
+                             be deterministic structural functions of their complete reachable contents and \
+                             arguments\n\ncached metadata: {:?}\nderived metadata: {:?}\n\n{}",
+                            std::any::type_name::<T>(),
+                            arguments,
+                            cached.metadata,
+                            fresh.metadata,
+                            programs,
+                        );
+                    }
+                }
+                Ok(cached)
+            }
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                let artifact = self.sanitize_transform_artifact(derive_fn(self, &arguments)?);
+                Ok(producer.insert(ErasedTransformArtifact::new(artifact)).typed::<Metadata>())
+            }
+            Err(ReentrantSpecializationError) => Ok(self.sanitize_transform_artifact(derive_fn(self, &arguments)?)),
+        }
+    }
+
+    /// Detaches this source cache identity from every program in `artifact` before it can be retained or returned.
+    fn sanitize_transform_artifact<Metadata>(
+        self,
+        mut artifact: TransformArtifact<V, O, Metadata>,
+    ) -> TransformArtifact<V, O, Metadata> {
+        for program in &mut artifact.programs {
+            Arc::make_mut(program).detach_transform_cache(self.transform_cache());
+        }
+        artifact
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+    use std::hash::{Hash, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Arc, Barrier};
+
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::parameters::Placeholder;
+    use crate::programs::regions::RegionSlot;
+    use crate::programs::{Operation, ProgramBuilder, Region, RegionId, RegionRef, Value};
+    use crate::specialization::SpecializationCacheStatistics;
+    use crate::tests::{IdentityTransform, TestRegionOperation, hash_of};
+
+    use super::*;
+
+    /// Argument key whose constant hash proves equality, rather than hash alone, selects artifacts.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CollisionKey(usize);
+
+    impl Hash for CollisionKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            0usize.hash(state);
+        }
+    }
+
+    /// Two-entry transform namespace used by the generic cache tests.
+    struct TestTransform;
+
+    impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for TestTransform {
+        type Arguments = CollisionKey;
+        type Artifact = TransformArtifact<V, O, usize>;
+
+        const DEFAULT_CACHE_CAPACITY: usize = 2;
+    }
+
+    /// Independently bounded one-entry namespace with the same argument and artifact layouts.
+    struct OtherTransform;
+
+    impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for OtherTransform {
+        type Arguments = CollisionKey;
+        type Artifact = TransformArtifact<V, O, usize>;
+
+        const DEFAULT_CACHE_CAPACITY: usize = 1;
+    }
+
+    fn identity_program() -> Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    fn derive_test_artifact(
+        region: RegionRef<'_, Array, TestRegionOperation>,
+        key: &CollisionKey,
+    ) -> Result<TransformArtifact<Array, TestRegionOperation, usize>, Infallible> {
+        Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], key.0))
+    }
+
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => payload.downcast::<&'static str>().map(|message| (*message).to_string()).unwrap(),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn transform_recheck_message(
+        arguments: &CollisionKey,
+        cached_metadata: usize,
+        derived_metadata: usize,
+        cached_programs: &[String],
+        derived_programs: &[String],
+    ) -> String {
+        let mut programs = String::new();
+        for index in 0..cached_programs.len().max(derived_programs.len()) {
+            for (label, renderings) in [("cached", cached_programs), ("fresh", derived_programs)] {
+                let rendering = renderings.get(index).map_or("<absent>", String::as_str);
+                programs.push_str(&format!("--- {label} program {index} ---\n{rendering}\n"));
+            }
+        }
+        format!(
+            "nondeterministic transform rule detected for `{}` with arguments `{:?}`: re-derivation produced a \
+             different artifact than the region cache retained, but region transforms must be deterministic \
+             structural functions of their complete reachable contents and arguments\n\ncached metadata: \
+             {:?}\nderived metadata: {:?}\n\n{}",
+            std::any::type_name::<TestTransform>(),
+            arguments,
+            cached_metadata,
+            derived_metadata,
+            programs,
+        )
+    }
+
+    #[test]
+    fn test_transform_artifact_new_accessors_clone_into_parts_and_debug() {
+        let program = Arc::new(identity_program());
+        let artifact = TransformArtifact::new(vec![program.clone()], 7usize);
+        assert_eq!(artifact.programs().len(), 1);
+        assert!(Arc::ptr_eq(&artifact.programs()[0], &program));
+        assert_eq!(artifact.metadata(), &7);
+        assert_eq!(format!("{artifact:?}"), "TransformArtifact { program_count: 1, metadata: 7 }");
+        let cloned = artifact.clone();
+        assert_eq!(cloned.programs().len(), 1);
+        assert!(Arc::ptr_eq(&cloned.programs()[0], &program));
+        assert_eq!(cloned.metadata(), &7);
+        let (programs, metadata) = artifact.into_parts();
+        assert_eq!(programs.len(), 1);
+        assert!(Arc::ptr_eq(&programs[0], &program));
+        assert_eq!(metadata, 7);
+    }
+
+    #[test]
+    fn test_erased_transform_arguments_equality_hash_clone_and_debug() {
+        let first = ErasedTransformArguments::new(CollisionKey(1));
+        let equal = ErasedTransformArguments::new(CollisionKey(1));
+        let different = ErasedTransformArguments::new(CollisionKey(2));
+        let other_type = ErasedTransformArguments::new(1usize);
+        assert_eq!(first, first.clone());
+        assert_eq!(first, equal);
+        assert_ne!(first, different);
+        assert_ne!(first, other_type);
+        assert_eq!(format!("{first:?}"), "CollisionKey(1)");
+        let entries = HashMap::from([(first, "retained")]);
+        assert_eq!(entries.get(&equal), Some(&"retained"));
+        assert_eq!(entries.get(&different), None);
+    }
+
+    #[test]
+    fn test_erased_transform_artifact_new_typed_clone_and_debug() {
+        let program = Arc::new(identity_program());
+        let erased = ErasedTransformArtifact::<Array, TestRegionOperation>::new(TransformArtifact::new(
+            vec![program.clone()],
+            7usize,
+        ));
+        assert_eq!(format!("{erased:?}"), "ErasedTransformArtifact { program_count: 1, metadata_type: \"usize\" }",);
+        let cloned = erased.clone();
+        let typed = cloned.typed::<usize>();
+        assert_eq!(typed.programs().len(), 1);
+        assert!(Arc::ptr_eq(&typed.programs()[0], &program));
+        assert_eq!(typed.metadata(), &7);
+    }
+
+    #[test]
+    fn test_erased_transform_artifact_typed_rejects_metadata_type_mismatch() {
+        let erased = ErasedTransformArtifact::<Array, TestRegionOperation>::new(TransformArtifact::new(
+            vec![Arc::new(identity_program())],
+            7usize,
+        ));
+        let panicked = catch_unwind(AssertUnwindSafe(|| erased.typed::<u32>())).unwrap_err();
+        assert_eq!(
+            panic_message(panicked),
+            "region transform cache metadata type mismatch: retained `usize` but requested `u32`",
+        );
+    }
+
+    #[test]
+    fn test_region_transform_cache_new_clone_pointer_identity_and_debug() {
+        let cache = RegionTransformCache::<Array, TestRegionOperation>::new();
+        let cloned = cache.clone();
+        let independent = RegionTransformCache::<Array, TestRegionOperation>::new();
+        assert!(cache.ptr_eq(&cache));
+        assert!(cache.ptr_eq(&cloned));
+        assert!(!cache.ptr_eq(&independent));
+        assert_eq!(format!("{cache:?}"), "RegionTransformCache { namespace_count: 0, artifact_count: 0 }");
+    }
+
+    #[test]
+    fn test_region_transform_cache_identity() {
+        let cache = RegionTransformCache::<Array, TestRegionOperation>::new();
+        let identity = cache.identity();
+        let independent = RegionTransformCache::<Array, TestRegionOperation>::new().identity();
+        assert_eq!(identity, identity.clone());
+        assert_eq!(identity, cache.clone().identity());
+        assert_ne!(identity, independent);
+        assert_eq!(hash_of(&identity), hash_of(&identity.clone()));
+        assert_eq!(hash_of(&identity), hash_of(&cache.identity()));
+        let identities = HashMap::from([(identity.clone(), "cache")]);
+        assert_eq!(identities.get(&cache.identity()), Some(&"cache"));
+        assert_eq!(identities.get(&independent), None);
+        assert_eq!(
+            format!("{identity:?}"),
+            format!("RegionContentIdentity({:?})", Arc::as_ptr(&cache.state).cast::<()>()),
+        );
+    }
+
+    #[test]
+    fn test_region_transform_cache_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        // Type-checking this generic body proves the safety argument of the handwritten `Send` and `Sync`
+        // implementations for `RegionTransformCache`: the registry is thread-safe whenever the leaf data of its
+        // retained programs is.
+        fn assert_registry_is_send_and_sync<
+            V: Send + Sync + Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Parameter,
+            O: Send + Sync,
+        >() {
+            assert_send_sync::<RegionTransformRegistry<V, O>>();
+        }
+
+        assert_registry_is_send_and_sync::<Array, TestRegionOperation>();
+        assert_send_sync::<RegionTransformCache<Array, TestRegionOperation>>();
+        assert_send_sync::<RegionContentIdentity<Array, TestRegionOperation>>();
+    }
+
+    #[test]
+    fn test_region_transform_cache_debug_does_not_format_payloads() {
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        struct PanickingDebugKey;
+
+        impl Debug for PanickingDebugKey {
+            fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("argument formatting must not run")
+            }
+        }
+
+        struct PanickingDebugTransform;
+
+        impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for PanickingDebugTransform {
+            type Arguments = PanickingDebugKey;
+            type Artifact = TransformArtifact<V, O, PanickingDebugKey>;
+
+            const DEFAULT_CACHE_CAPACITY: usize = 1;
+        }
+
+        let program = identity_program();
+        program
+            .entry_region_ref()
+            .transform::<PanickingDebugTransform, _, Infallible>(PanickingDebugKey, |region, _| {
+                Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], PanickingDebugKey))
+            })
+            .unwrap();
+
+        assert_eq!(
+            format!("{:?}", program.entry_region().transform_cache()),
+            "RegionTransformCache { namespace_count: 1, artifact_count: 1 }",
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_namespaces_are_lazy_and_collision_safe() {
+        let program = identity_program();
+        assert!(!program.entry_region().transform_cache().has_namespaces());
+
+        let first = program
+            .entry_region_ref()
+            .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
+            .unwrap();
+        assert!(program.entry_region().transform_cache().has_namespaces());
+        let repeated = program
+            .entry_region_ref()
+            .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.programs()[0], &repeated.programs()[0]));
+
+        let collision = program
+            .entry_region_ref()
+            .transform::<TestTransform, _, Infallible>(CollisionKey(1), derive_test_artifact)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first.programs()[0], &collision.programs()[0]));
+        assert_eq!(collision.metadata(), &1);
+
+        assert_eq!(
+            program.entry_region_ref().transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_namespaces_are_independent_and_bounded() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+
+        let first = region.transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        let second = region.transform::<TestTransform, _, Infallible>(CollisionKey(1), derive_test_artifact).unwrap();
+        let first_repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&first.programs()[0], &first_repeated.programs()[0]));
+
+        let other = region.transform::<OtherTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        assert!(!Arc::ptr_eq(&first.programs()[0], &other.programs()[0]));
+
+        let third = region.transform::<TestTransform, _, Infallible>(CollisionKey(2), derive_test_artifact).unwrap();
+        assert_eq!(third.metadata(), &2);
+        let second_after_eviction =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(1), derive_test_artifact).unwrap();
+        assert!(!Arc::ptr_eq(&second.programs()[0], &second_after_eviction.programs()[0]));
+        let other_repeated =
+            region.transform::<OtherTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&other.programs()[0], &other_repeated.programs()[0]));
+
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 4,
+                productions: 4,
+                abandoned_productions: 0,
+                evictions: 2,
+            }),
+        );
+        assert_eq!(
+            region.transform_statistics::<OtherTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 1,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_derivation_errors_are_not_retained() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+
+        assert!(matches!(
+            region.transform::<TestTransform, _, _>(CollisionKey(10), |_, _| {
+                Err::<TransformArtifact<Array, TestRegionOperation, usize>, _>("derivation failed")
+            }),
+            Err(message) if message == "derivation failed",
+        ));
+        let recovered =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(10), derive_test_artifact).unwrap();
+        assert_eq!(recovered.metadata(), &10);
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 0,
+                misses: 2,
+                productions: 1,
+                abandoned_productions: 1,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_derivation_panics_are_not_retained() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(11), |_, _| panic!("derivation panicked"))
+        }))
+        .unwrap_err();
+        assert_eq!(panic_message(panicked), "derivation panicked");
+        let recovered =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(11), derive_test_artifact).unwrap();
+        assert_eq!(recovered.metadata(), &11);
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 0,
+                misses: 2,
+                productions: 1,
+                abandoned_productions: 1,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_same_key_reentrancy_derives_uncached_and_publishes_outer_artifact() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+        let derivations = Cell::new(0);
+        let recursive = region
+            .transform::<TestTransform, _, Infallible>(CollisionKey(12), |region, arguments| {
+                derivations.set(derivations.get() + 1);
+                let nested =
+                    region.transform::<TestTransform, _, Infallible>(arguments.clone(), |region, arguments| {
+                        derivations.set(derivations.get() + 1);
+                        derive_test_artifact(region, arguments)
+                    })?;
+                assert_eq!(nested.metadata(), &12);
+                derive_test_artifact(region, arguments)
+            })
+            .unwrap();
+        assert_eq!(recursive.metadata(), &12);
+        assert_eq!(derivations.get(), 2);
+        let repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(12), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&recursive.programs()[0], &repeated.programs()[0]));
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 2,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_different_key_reentrancy_retains_both_artifacts() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+        let nested_program = RefCell::new(None);
+        let outer = region
+            .transform::<TestTransform, _, Infallible>(CollisionKey(20), |region, arguments| {
+                let nested =
+                    region.transform::<TestTransform, _, Infallible>(CollisionKey(21), derive_test_artifact)?;
+                assert_eq!(nested.metadata(), &21);
+                nested_program.replace(Some(nested.programs()[0].clone()));
+                derive_test_artifact(region, arguments)
+            })
+            .unwrap();
+        assert_eq!(outer.metadata(), &20);
+
+        let outer_repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(20), derive_test_artifact).unwrap();
+        let nested_repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(21), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&outer.programs()[0], &outer_repeated.programs()[0]));
+        assert!(Arc::ptr_eq(nested_program.borrow().as_ref().unwrap(), &nested_repeated.programs()[0]));
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 2,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_namespace_creation_is_concurrent() {
+        let program = Arc::new(identity_program());
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let program = program.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    program
+                        .entry_region_ref()
+                        .transform::<TestTransform, _, Infallible>(CollisionKey(index), derive_test_artifact)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().programs().len(), 1);
+        }
+        assert_eq!(
+            program.entry_region_ref().transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 0,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+        assert_eq!(
+            format!("{:?}", program.entry_region().transform_cache()),
+            "RegionTransformCache { namespace_count: 1, artifact_count: 2 }",
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_sanitization_detaches_source_cache() {
+        let source = identity_program();
+        let source_cache = source.entry_region().transform_cache().downgrade();
+        let artifact = source.entry_region_ref().retained_identity_transform();
+        assert!(!source.entry_region().transform_cache().ptr_eq(&artifact.entry_region().transform_cache));
+        drop(source);
+        assert!(!source_cache.is_alive());
+        assert_eq!(artifact.output_types(), &[ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_region_ref_transform_sanitization_preserves_descendant_caches() {
+        let leaf = identity_program();
+        let leaf_retained = leaf.entry_region_ref().retained_identity_transform();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let leaf = builder.import_program(leaf);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![leaf],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let transformed = program.entry_region_ref().retained_identity_transform();
+        assert!(!program.entry_region().transform_cache().ptr_eq(&transformed.entry_region().transform_cache));
+        let transformed_leaf = transformed.region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
+        assert!(Arc::ptr_eq(&leaf_retained, &transformed_leaf));
+    }
+
+    #[test]
+    fn test_region_ref_transform_supports_generic_value_and_operation_families() {
+        fn transform_generic_universe<V: Value, O: Operation<Type = V::Type>>(
+            region: RegionRef<V, O>,
+        ) -> TransformArtifact<V, O, ()> {
+            region
+                .transform::<IdentityTransform, _, Infallible>((), |region, _| {
+                    Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], ()))
+                })
+                .unwrap()
+        }
+
+        let program = identity_program();
+        let artifact = transform_generic_universe(program.entry_region_ref());
+        assert_eq!(artifact.programs().len(), 1);
+        assert_eq!(artifact.metadata(), &());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_detects_different_program_count() {
+        let program = identity_program();
+        let derived_program = program.entry_region_ref().to_program().to_string();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
+            CollisionKey(6),
+            TransformArtifact::new(Vec::new(), 6),
+        );
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            program
+                .entry_region_ref()
+                .transform::<TestTransform, _, Infallible>(CollisionKey(6), derive_test_artifact)
+        }))
+        .unwrap_err();
+        assert_eq!(panic_message(panicked), transform_recheck_message(&CollisionKey(6), 6, 6, &[], &[derived_program]),);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_detects_different_program_rendering() {
+        let program = identity_program();
+        let derived_program = program.entry_region_ref().to_program().to_string();
+        let mut different_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        different_builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = different_builder.add_constant(Array::scalar(1.0).unwrap());
+        let different = different_builder.build(vec![constant], vec![Placeholder], vec![Placeholder]).unwrap();
+        let cached_program = different.to_string();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
+            CollisionKey(7),
+            TransformArtifact::new(vec![Arc::new(different)], 7),
+        );
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            program
+                .entry_region_ref()
+                .transform::<TestTransform, _, Infallible>(CollisionKey(7), derive_test_artifact)
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic_message(panicked),
+            transform_recheck_message(&CollisionKey(7), 7, 7, &[cached_program], &[derived_program]),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_detects_different_metadata() {
+        let program = identity_program();
+        let program_rendering = program.entry_region_ref().to_program().to_string();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
+            CollisionKey(8),
+            TransformArtifact::new(vec![Arc::new(program.entry_region_ref().to_program())], 9),
+        );
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            program
+                .entry_region_ref()
+                .transform::<TestTransform, _, Infallible>(CollisionKey(8), derive_test_artifact)
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic_message(panicked),
+            transform_recheck_message(&CollisionKey(8), 9, 8, &[program_rendering.clone()], &[program_rendering],),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_propagates_derivation_error() {
+        let program = identity_program();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
+            CollisionKey(9),
+            TransformArtifact::new(vec![Arc::new(program.entry_region_ref().to_program())], 9),
+        );
+
+        assert!(matches!(
+            program.entry_region_ref().transform::<TestTransform, _, _>(CollisionKey(9), |_, _| {
+                Err::<TransformArtifact<Array, TestRegionOperation, usize>, _>("re-derivation failed")
+            }),
+            Err(message) if message == "re-derivation failed",
+        ));
+        assert_eq!(
+            program.entry_region_ref().transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 1,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_sanitizes_fresh_artifact_before_comparison() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+        let retained =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(10), derive_test_artifact).unwrap();
+        let repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(10), derive_test_artifact).unwrap();
+
+        assert!(Arc::ptr_eq(&retained.programs()[0], &repeated.programs()[0]));
+        assert!(
+            !program
+                .entry_region()
+                .transform_cache()
+                .ptr_eq(&repeated.programs()[0].entry_region().transform_cache)
+        );
+    }
+}

@@ -1,0 +1,4602 @@
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
+use std::num::FpCategory;
+
+// The external element types are re-exported so that element vocabulary (including the
+// `dispatch_on_array_element_type!` macro in the sibling `macros` module) can name every
+// array element type through one `$crate`-addressable path.
+pub use half::{bf16, f16};
+pub use num_complex::Complex;
+
+use crate::arrays::addressing::ArrayAddressing;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
+use crate::programs::{ProgramError, TypeError};
+
+/// Value type with exactly one portable array-element byte encoding. [`ArrayElement`] pairs each supported Rust type
+/// with the one [`DataType`] it represents (e.g., [`f32`] with [`DataType::F32`]) and pins the exact bytes that one
+/// value of that type contributes to physical array storage, so that typed Rust slices convert to and from stored array
+/// bytes deterministically on every platform:
+///
+///   - Booleans encode as one byte holding `0` or `1`.
+///   - Sub-byte integers (i.e., [`i1`], [`i2`], [`i4`], [`u1`], [`u2`], and [`u4`]) encode as two's complement in the
+///     low bits of one byte, with all higher bits set to zero.
+///   - Integers encode as their little-endian two's-complement bytes.
+///   - Low-precision floating-point values (e.g., [`f8e4m3fn`] and [`f4e2m1fn`]) encode as their one-byte sign,
+///     exponent, and mantissa bit patterns, which occupy only the low bits of that byte for the four- and six-bit
+///     formats, with all higher bits set to zero.
+///   - Floating-point values (i.e., [`bf16`], [`f16`](struct@f16), [`f32`], and [`f64`]) encode as their little-endian
+///     IEEE bit patterns, preserving signed zeros and NaN payload bits exactly.
+///   - [`Complex`] values encode their real component immediately followed by their imaginary component.
+///
+/// For example, `-2i32` always encodes as `[254, 255, 255, 255]` and `Complex::new(1.5f32, -2.0)` always encodes as
+/// `[0, 0, 192, 63, 0, 0, 0, 192]`, regardless of the host's native endianness. The compile-time [`DataType`] pairing
+/// makes mismatched conversions fail before any bytes move: decoding an `f32[2]` array as [`i32`] values is an error
+/// even though both encodings are four bytes wide.
+///
+/// The trait is sealed because its encodings define the array storage format itself and a foreign implementation could
+/// write bytes that the checked storage boundary rejects, or worse, reinterprets with a different meaning. Sub-byte
+/// integers, which have no corresponding Rust type of their own, are represented by the checked [`i1`], [`i2`], [`i4`],
+/// [`u1`], [`u2`], and [`u4`] newtypes, which own the two's-complement-in-the-low-bits encoding described above (the
+/// padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also
+/// use). Low-precision floating-point formats are likewise represented by the conversion-only [`f4e2m1fn`],
+/// [`f6e2m3fn`], [`f6e3m2fn`], [`f8e3m4`], [`f8e4m3`], [`f8e4m3fn`], [`f8e4m3fnuz`], [`f8e4m3b11fnuz`], [`f8e5m2`],
+/// [`f8e5m2fnuz`], and [`f8e8m0fnu`] newtypes, whose exact bit layouts follow the
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html) data-type standard and whose
+/// rounding conversions to and from [`f32`] and [`f64`] follow [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes),
+/// the reference implementation of these formats.
+///
+/// # Conversions
+///
+/// [`ArrayElement`] also owns the element interchange contract that all array casting is built on. Rather than defining
+/// one conversion per ordered pair of element types, every element type declares how to build itself from each of the
+/// following four _interchange categories_, and which category carries it as a source:
+///
+///   - Signed integers are carried by [`i64`] and conversion is handled by [`Self::from_signed`].
+///   - Unsigned integers and Booleans are carried by [`u64`] and conversion is handled by [`Self::from_unsigned`].
+///   - Real floating-point values are carried by [`f64`] and conversion is handled by [`Self::from_real`].
+///   - Complex values are carried by [`Complex<f64>`] and conversion is handled by [`Self::from_complex`].
+///
+/// ## Losslessness
+///
+/// Routing through a category carrier never loses information, because each carrier is an exact superset of every
+/// source type in its category: every signed integer element type (i.e., [`i1`] through [`i64`]) is exactly
+/// representable in [`i64`], every unsigned integer element type (i.e., [`u1`] through [`u64`]) and [`bool`] is exactly
+/// representable in [`u64`], every real floating-point element type (i.e., the sub-byte and one-byte formats, [`bf16`],
+/// [`f16`](struct@f16), [`f32`], and [`f64`]) widens to [`f64`] exactly because widening between IEEE binary formats
+/// with strictly more exponent and mantissa bits is exact, and both complex element types are exactly representable in
+/// [`Complex<f64>`]. The destination therefore always receives the exact source value and performs the single rounding,
+/// truncation, or saturation step itself, so a routed conversion is bit-identical to a handwritten direct conversion
+/// between the same pair of element types. Narrow floating-point destinations preserve sticky rounding information when
+/// an implementation needs a smaller intermediate significand, so intermediate rounding cannot turn a value near a
+/// destination midpoint into an incorrect tie.
+///
+/// ## Cost
+///
+/// [`ArrayElement::convert_to`] is generic in the destination element type, so the compiler monomorphizes it once per
+/// `(source, destination)` pair actually used and then inlines both halves. What remains after inlining is the widening
+/// no-op into the carrier followed by the destination's own direct conversion (i.e., exactly the instructions a
+/// handwritten pairwise conversion would emit). The routing therefore costs nothing at run time while keeping the
+/// source at four constructors plus one routing per element type instead of one body per ordered pair, which for the
+/// 32 element types below is 160 entry points instead of 1,024 pairwise bodies.
+pub trait ArrayElement: private::Codec {
+    /// Returns the [`DataType`] represented by this element type.
+    #[inline]
+    fn data_type() -> DataType {
+        <Self as private::Codec>::DATA_TYPE
+    }
+
+    /// Writes this element's portable representation to an exactly sized byte slice.
+    #[inline]
+    fn encode(self, bytes: &mut [u8]) {
+        debug_assert_eq!(bytes.len(), <Self as private::Codec>::BYTE_COUNT);
+        <Self as private::Codec>::encode_unchecked(self, bytes);
+    }
+
+    /// Decodes one element from a byte slice whose length matches its portable representation.
+    #[inline]
+    fn decode(bytes: &[u8]) -> Self {
+        debug_assert_eq!(bytes.len(), <Self as private::Codec>::BYTE_COUNT);
+        <Self as private::Codec>::decode_unchecked(bytes)
+    }
+
+    /// Converts one value carried by the signed integer interchange category into this [`ArrayElement`] type.
+    /// The carrier holds the source value exactly, so this performs the conversion's only inexact step: integer
+    /// destinations narrow with two's-complement truncation, floating-point destinations round to nearest, and
+    /// Boolean destinations test for a nonzero value.
+    fn from_signed(value: i64) -> Result<Self, ProgramError>;
+
+    /// Converts one value carried by the unsigned integer interchange category, which also carries [`bool`] (i.e.,
+    /// `false` as `0` and `true` as `1`), into this element type. The carrier holds the source value exactly, so this
+    /// performs the conversion's only inexact step.
+    fn from_unsigned(value: u64) -> Result<Self, ProgramError>;
+
+    /// Converts one value carried by the real floating-point interchange category into this [`ArrayElement`] type.
+    /// The carrier holds the source value exactly, so this performs the conversion's only inexact step: floating-point
+    /// destinations round to nearest and saturate or fail according to their own format contract. Conversion to
+    /// [`f8e8m0fnu`] maps zero to NaN even though its checked literal constructor rejects zero. Conversion to the
+    /// microscaling formats [`f4e2m1fn`], [`f6e2m3fn`], and [`f6e3m2fn`] maps NaN to the positive maximum finite
+    /// value, and saturates infinite inputs to the finite bound with the same sign. Their checked literal constructors
+    /// still reject NaN. Integer destinations truncate toward zero and saturate to their logical bounds, with NaN
+    /// converted to zero.
+    fn from_real(value: f64) -> Result<Self, ProgramError>;
+
+    /// Converts one value carried by the complex interchange category into this [`ArrayElement`] type. The default
+    /// projects the value onto its real component and discards the imaginary one, which is the conversion contract for
+    /// every destination that cannot hold an imaginary part; the complex and Boolean element types override it to keep
+    /// both components.
+    fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+        Self::from_real(value.re)
+    }
+
+    /// Returns a zero value of this type, using `false` for Boolean elements and positive zero for each floating-point
+    /// component. Returns an error for types which cannot represent zero (e.g., [`f8e8m0fnu`]).
+    #[inline]
+    fn zero() -> Result<Self, ProgramError> {
+        Self::from_unsigned(0)
+    }
+
+    /// Returns a one value of this type, using `true` for Boolean elements and a zero imaginary component for complex
+    /// elements. Integer elements use the same two's-complement narrowing as [`from_unsigned`](Self::from_unsigned), so
+    /// [`i1`] uses its all-ones encoding, representing `-1`. The result is fallible to share the conversion contract.
+    #[inline]
+    fn one() -> Result<Self, ProgramError> {
+        Self::from_unsigned(1)
+    }
+
+    /// Returns the identity used to initialize a minimum reduction (i.e., the largest integer, `true` for Boolean
+    /// elements, or positive infinity for floating-point elements). Formats without infinity use their largest finite
+    /// value. Complex elements use positive infinity in both components to bound their lexicographic ordering.
+    fn min_identity() -> Self;
+
+    /// Returns the identity used to initialize a maximum reduction (i.e., the smallest integer, `false` for Boolean
+    /// elements, or negative infinity for floating-point elements). Formats without infinity use their smallest finite
+    /// value. Complex elements use negative infinity in both components to bound their lexicographic ordering.
+    fn max_identity() -> Self;
+
+    /// Returns the smaller of `self` and `other`, preserving the selected value's exact encoding. Integers use their
+    /// ordinary ordering, and Booleans order `false` below `true`. Real floating-point values propagate NaN values
+    /// (preferring `self` when both are NaN-valued), order negative zero below positive zero, and preserve `self` on
+    /// exact ties. Unlike the primitive floating-point `min` functions, a single NaN value is never discarded. Complex
+    /// values compare real components first, and then imaginary components when the real components are equal. They
+    /// select `other` on ties or when the deciding comparison is unordered because of a NaN.
+    fn min(&self, other: &Self) -> Self;
+
+    /// Returns the larger of `self` and `other`, preserving the selected value's exact encoding. Uses the same
+    /// ordering, NaN value propagation, and tie-breaking rules as [`min`](Self::min), including the distinct rules
+    /// for complex values.
+    fn max(&self, other: &Self) -> Self;
+
+    /// Negates this element. Integers wrap in their declared bit width, including unsigned integers and the minimum
+    /// signed value. Floating-point results use the element format's rounding and representability rules. Boolean
+    /// elements use logical negation, flipping `true` and `false`. Elements of type [`f8e8m0fnu`] return an error.
+    fn neg(self) -> Result<Self, ProgramError>;
+
+    /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
+    /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
+    /// construction, and so the result is bit-identical to a handwritten direct conversion from `Self` to `Output`.
+    /// Refer to the trait documentation's [Conversions](ArrayElement#conversions) section. Because this function is
+    /// generic in `Output`, the compiler monomorphizes it per `(Self, Output)` pair and inlines both halves, leaving
+    /// a widening no-op followed by `Output`'s direct conversion (i.e., the same code a pairwise implementation would
+    /// produce).
+    fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError>;
+}
+
+/// [`ArrayElement`] type that supports arithmetic operations across both real and complex numbers.
+pub trait NumericArrayElement: ArrayElement {
+    /// Element type returned by [`abs`](Self::abs). Complex elements use their real component type,
+    /// and all other elements use `Self`, including types for which absolute value is not supported.
+    type Magnitude: RealArrayElement;
+
+    /// Adds `rhs` to this element. Integers wrap in their declared bit width. Floating-point and complex elements use
+    /// their ordinary arithmetic, with low-precision results rounded to the destination format. Returns an error for
+    /// unrepresentable low-precision results.
+    fn add(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Subtracts `rhs` from this element, with the same wrapping, rounding, and error rules as [`add`](Self::add).
+    fn sub(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Multiplies this element by `rhs`, with the same wrapping, rounding, and error rules as [`add`](Self::add).
+    fn mul(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Divides this element by `rhs`. Integer division truncates toward zero, returns all-one bits for a zero divisor,
+    /// and wraps signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination
+    /// format's rounding and representability rules. Complex division uses a ratio-based formula to avoid squaring the
+    /// denominator, with explicit recovery for zero divisors and infinite inputs when both result components would
+    /// otherwise be NaN. Intermediate overflow can still produce NaN components.
+    fn div(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Returns this element's absolute value or complex magnitude. Signed integers wrap in their declared bit width,
+    /// so the minimum signed value remains negative. Real floating-point values clear the sign, and complex values
+    /// return their Euclidean magnitude in [`Magnitude`](Self::Magnitude). Returns an error for unsigned integer and
+    /// [`i1`] elements, or a result that the element format cannot represent.
+    fn abs(self) -> Result<Self::Magnitude, ProgramError>;
+
+    /// Returns the sign of this element. Signed integers produce `-1`, `0`, or `1`. Real floating-point values preserve
+    /// zeros and NaNs, including their exact encodings, and otherwise produce `-1` or `1`. Complex values preserve zero
+    /// and otherwise divide by their Euclidean magnitude, using ordinary floating-point arithmetic for infinite and NaN
+    /// components. Unsigned integer elements return an error.
+    fn sign(self) -> Result<Self, ProgramError>;
+}
+
+/// [`RealArrayElement`] type that supports arithmetic operations that are specific to real-valued numbers.
+pub trait RealArrayElement: NumericArrayElement {
+    /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return the dividend.
+    /// The minimum signed integer modulo `-1` is zero. Real floating-point results have the dividend's sign and use the
+    /// destination format's rounding and representability rules.
+    fn rem(self, rhs: Self) -> Result<Self, ProgramError>;
+}
+
+/// [`NumericArrayElement`] type that supports transcendental arithmetic operations on real floating-point and complex
+/// values. Integer and Boolean elements do not implement this trait. Native real elements compute in their own
+/// precision, half-precision elements compute in `f32`, and smaller formats compute in `f64` with results rounded back
+/// to the original element format. [`log_add_exp`](Self::log_add_exp) instead uses `f32` for all formats narrower than
+/// `f32`, and the error function uses a separate double-precision approximation. Complex functions use their component
+/// precision and principal branches where applicable. Results remain fallible because some formats cannot represent
+/// zero or NaN.
+pub trait FloatingPointArrayElement: NumericArrayElement {
+    /// Raises this element to `exponent`. Real inputs use real floating-point power semantics. Complex inputs use
+    /// the principal complex power, whose branch is determined by the principal logarithm.
+    fn pow(self, exponent: Self) -> Result<Self, ProgramError>;
+
+    /// Computes the principal square root. Negative real inputs produce NaN when representable. Complex inputs use
+    /// the principal branch and retain the imaginary component's sign on the negative real axis. Scaling avoids
+    /// overflow when finite complex components have an unrepresentable magnitude.
+    fn sqrt(self) -> Result<Self, ProgramError>;
+
+    /// Computes the reciprocal of the principal square root, with the same branch as [`sqrt`](Self::sqrt).
+    /// Real zero produces a signed infinity before conversion to the destination format. Complex zero produces
+    /// an infinite real component and a NaN imaginary component; infinite components otherwise produce signed zeros.
+    fn rsqrt(self) -> Result<Self, ProgramError>;
+
+    /// Computes the sine, with real arguments measured in radians. Complex arguments use the analytic continuation;
+    /// purely imaginary arguments retain a zero real component even when the imaginary component overflows.
+    fn sin(self) -> Result<Self, ProgramError>;
+
+    /// Computes the cosine, with real arguments measured in radians. Complex arguments use the analytic continuation;
+    /// purely imaginary arguments retain a zero imaginary component even when the real component overflows.
+    fn cos(self) -> Result<Self, ProgramError>;
+
+    /// Computes the tangent, with real arguments measured in radians and complex arguments using the analytic
+    /// continuation. Nonfinite real inputs produce NaN before conversion to the destination format.
+    fn tan(self) -> Result<Self, ProgramError>;
+
+    /// Computes the hyperbolic tangent, using its analytic continuation for complex elements.
+    fn tanh(self) -> Result<Self, ProgramError>;
+
+    /// Computes the four-quadrant angle `atan2(self, x)` in radians for real elements, using signed zeros to select
+    /// the axis and branch. For complex elements, evaluates `-i * log((x + i * self) / sqrt(x*x + self*self))`
+    /// with principal logarithm and square root branches.
+    ///
+    /// # Parameters
+    ///
+    ///   - `x`: Horizontal coordinate for real inputs, or the second argument of the complex continuation.
+    fn atan2(self, x: Self) -> Result<Self, ProgramError>;
+
+    /// Computes the natural exponential. Real overflow and underflow follow the destination format's conversion
+    /// rules. Complex elements compute `exp(real) * (cos(imaginary) + i * sin(imaginary))`.
+    fn exp(self) -> Result<Self, ProgramError>;
+
+    /// Computes `exp(self) - 1` without subtracting one from a rounded exponential, preserving accuracy near zero.
+    /// Complex elements preserve small real and imaginary components with the analytic continuation of this function.
+    fn exp_m1(self) -> Result<Self, ProgramError>;
+
+    /// Computes the natural logarithm. Real zero produces negative infinity and negative inputs produce NaN when
+    /// representable. Complex elements use the principal logarithm, with a branch cut along the negative real axis.
+    /// Real outputs use numerical conversion, so an unrepresentable zero becomes NaN for [`f8e8m0fnu`].
+    fn log(self) -> Result<Self, ProgramError>;
+
+    /// Computes `log(1 + self)` without first rounding `1 + self`, preserving accuracy near zero. Real inputs below
+    /// `-1` produce NaN and `-1` produces negative infinity. Complex inputs use the principal logarithm branch.
+    fn ln_1p(self) -> Result<Self, ProgramError>;
+
+    /// Computes `log(exp(self) + exp(other))` without forming the potentially overflowing exponentials. Equal-sign
+    /// infinities return that infinity, opposite-sign infinities return positive infinity, and NaNs propagate,
+    /// subject to the destination format's representability rules. Complex inputs factor out the one `p` with the
+    /// larger real component, as `p + ln_1p(exp(q - p))` (which keeps small corrections exact), and form the ratio
+    /// `exp(q - p)` by rotating by `p`'s phase rather than by subtracting the imaginary components from each other
+    /// (which keeps both phases exact even when their magnitudes differ widely). Complex outputs have imaginary parts
+    /// in `[-π, π]`, reduced through `atan2` when they leave that range. Real formats narrower than `f32` compute the
+    /// composition in `f32` before conversion.
+    fn log_add_exp(self, other: Self) -> Result<Self, ProgramError>;
+
+    /// Computes the logistic function `1 / (1 + exp(-self))`, extended to complex elements by the same expression.
+    /// Intermediate exponentials use the working precision described by this trait; the result is then converted
+    /// to the destination format, which can fail when the format cannot represent zero or NaN.
+    fn logistic(self) -> Result<Self, ProgramError>;
+}
+
+/// [`NumericArrayElement`] type that supports functions specific to real-valued floating-point elements. This trait
+/// combines [`FloatingPointArrayElement`] with [`RealArrayElement`], excluding both complex elements and integers.
+/// Functions use the working precision described by [`FloatingPointArrayElement`], except for [`erf`](Self::erf).
+/// Rounding functions convert their outputs numerically using [`ArrayElement::from_real`]. Other functions use the
+/// result conversion described by [`FloatingPointArrayElement`].
+pub trait RealFloatingPointArrayElement: FloatingPointArrayElement + RealArrayElement {
+    /// Rounds toward negative infinity, preserving already integral values, signed zeros, infinities, and NaNs
+    /// subject to conversion back to the destination format. An unrepresentable zero becomes NaN for [`f8e8m0fnu`].
+    fn floor(self) -> Result<Self, ProgramError>;
+
+    /// Rounds toward positive infinity, with the same conversion behavior as [`floor`](Self::floor).
+    fn ceil(self) -> Result<Self, ProgramError>;
+
+    /// Rounds to the nearest integer, resolving exact half-way cases toward the even integer. Preserves signed
+    /// zero when the rounded value is zero, subject to the destination format's representation. An unrepresentable
+    /// zero becomes NaN for [`f8e8m0fnu`].
+    fn round(self) -> Result<Self, ProgramError>;
+
+    /// Computes the Gauss error function `2 / sqrt(pi) * integral_0^self exp(-t*t) dt`. Uses a double-precision
+    /// rational approximation before converting to the destination format. Preserves signed zero and maps
+    /// negative and positive infinity to `-1` and `1`, respectively.
+    fn erf(self) -> Result<Self, ProgramError>;
+}
+
+mod private {
+    use crate::arrays::types::data::DataType;
+
+    /// Private implementation contract that seals and implements [`super::ArrayElement`].
+    pub trait Codec: Copy {
+        /// [`DataType`] represented by this Rust value.
+        const DATA_TYPE: DataType;
+
+        /// Number of bytes in this value's portable representation.
+        const BYTE_COUNT: usize;
+
+        /// Writes this value's portable representation to an exactly sized byte slice.
+        fn encode_unchecked(self, bytes: &mut [u8]);
+
+        /// Decodes one value from a byte slice whose length matches its representation.
+        fn decode_unchecked(bytes: &[u8]) -> Self;
+    }
+}
+
+impl private::Codec for bool {
+    const DATA_TYPE: DataType = DataType::Boolean;
+    const BYTE_COUNT: usize = 1;
+
+    #[inline]
+    fn encode_unchecked(self, bytes: &mut [u8]) {
+        bytes[0] = u8::from(self);
+    }
+
+    #[inline]
+    fn decode_unchecked(bytes: &[u8]) -> Self {
+        bytes[0] != 0
+    }
+}
+
+/// Checked signed 1-bit integer array element representing [`DataType::I1`] values in the range `-1..=0`. The value is
+/// stored as two's complement in the low bit of one storage byte, with all higher bits set to zero, so `-1` is stored
+/// as the byte `0x01`. The wrapped native value stays sign-extended, so [`i1::value`] returns `-1` rather than `1` for
+/// that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct i1(i8);
+
+/// Checked signed 2-bit integer array element representing [`DataType::I2`] values in the range `-2..=1`. The value is
+/// stored as two's complement in the low two bits of one storage byte, with all higher bits set to zero, so `-1` is
+/// stored as the byte `0x03`. The wrapped native value stays sign-extended, so [`i2::value`] returns `-1` rather than
+/// `3` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct i2(i8);
+
+/// Checked signed 4-bit integer array element representing [`DataType::I4`] values in the range `-8..=7`. The value is
+/// stored as two's complement in the low four bits of one storage byte, with all higher bits set to zero, so `-1` is
+/// stored as the byte `0x0f`. The wrapped native value stays sign-extended, so [`i4::value`] returns `-1` rather than
+/// `15` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct i4(i8);
+
+// Implements the checked element API and the sealed codec for a signed sub-byte integer newtype that wraps its
+// sign-extended native `i8` value and stores it as two's complement in the low `$bit_count` bits of one storage byte.
+macro_rules! impl_codec_for_signed_sub_byte_integer_type {
+    ($type:ident, $data_type:ident, $bit_count:literal) => {
+        impl $type {
+            /// Smallest representable value.
+            pub const MIN: Self = Self(-(1i8 << ($bit_count - 1)));
+
+            /// Largest representable value.
+            pub const MAX: Self = Self((1i8 << ($bit_count - 1)) - 1);
+
+            /// Bit mask selecting the storage bits that hold the two's complement value.
+            const BIT_MASK: u8 = (1u8 << $bit_count) - 1;
+
+            /// Creates a new element holding `value`, which must lie within the representable range.
+            pub fn new(value: i8) -> Result<Self, TypeError> {
+                if !(Self::MIN.0..=Self::MAX.0).contains(&value) {
+                    return Err(TypeError::invalid(format!(
+                        "value {} is out of range for {} array elements",
+                        value,
+                        DataType::$data_type,
+                    )));
+                }
+                Ok(Self(value))
+            }
+
+            /// Returns the sign-extended native value of this element.
+            #[inline]
+            pub fn value(self) -> i8 {
+                self.0
+            }
+
+            /// Creates a new element from one storage byte whose low bits hold a two's complement value.
+            /// All higher bits must be zero.
+            pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
+                if bits & !Self::BIT_MASK != 0 {
+                    return Err(TypeError::invalid(format!(
+                        "byte {:#04x} is not a valid `{}` array-element encoding",
+                        bits,
+                        DataType::$data_type,
+                    )));
+                }
+
+                // Shift the value up to the sign bit and back down again to sign-extend it arithmetically.
+                Ok(Self(((bits << (8 - $bit_count)) as i8) >> (8 - $bit_count)))
+            }
+
+            /// Returns this element's storage byte, holding its two's complement value in the low bits with all higher
+            /// bits set to zero.
+            #[inline]
+            pub fn to_bits(self) -> u8 {
+                self.0 as u8 & Self::BIT_MASK
+            }
+        }
+
+        impl Display for $type {
+            #[inline]
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = DataType::$data_type;
+            const BYTE_COUNT: usize = 1;
+
+            #[inline]
+            fn encode_unchecked(self, bytes: &mut [u8]) {
+                bytes[0] = self.to_bits();
+            }
+
+            #[inline]
+            fn decode_unchecked(bytes: &[u8]) -> Self {
+                // Storage bytes are validated before they are decoded, so their high bits are known to be zero.
+                Self::from_bits(bytes[0]).unwrap()
+            }
+        }
+    };
+}
+
+impl_codec_for_signed_sub_byte_integer_type!(i1, I1, 1);
+impl_codec_for_signed_sub_byte_integer_type!(i2, I2, 2);
+impl_codec_for_signed_sub_byte_integer_type!(i4, I4, 4);
+
+// Implements the sealed codec for integer primitives using their exact little-endian two's-complement bit patterns.
+macro_rules! impl_codec_for_integer_type {
+    ($type:ty, $data_type:ident) => {
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = DataType::$data_type;
+            const BYTE_COUNT: usize = size_of::<Self>();
+
+            #[inline]
+            fn encode_unchecked(self, bytes: &mut [u8]) {
+                bytes.copy_from_slice(&self.to_le_bytes());
+            }
+
+            #[inline]
+            fn decode_unchecked(bytes: &[u8]) -> Self {
+                Self::from_le_bytes(bytes.try_into().unwrap())
+            }
+        }
+    };
+}
+
+impl_codec_for_integer_type!(i8, I8);
+impl_codec_for_integer_type!(i16, I16);
+impl_codec_for_integer_type!(i32, I32);
+impl_codec_for_integer_type!(i64, I64);
+
+/// Checked unsigned 1-bit integer array element representing [`DataType::U1`] values in the range `0..=1`. The value
+/// is stored in the low bit of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
+/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct u1(u8);
+
+/// Checked unsigned 2-bit integer array element representing [`DataType::U2`] values in the range `0..=3`. The value is
+/// stored in the low two bits of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
+/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct u2(u8);
+
+/// Checked unsigned 4-bit integer array element representing [`DataType::U4`] values in the range `0..=15`.
+/// The value is stored in the low four bits of one storage byte, with all higher bits set to zero. This unpacked
+/// one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct u4(u8);
+
+// Implements the checked element API and the sealed codec for an unsigned sub-byte integer newtype that wraps its
+// native `u8` value and stores it in the low `$bit_count` bits of one storage byte.
+macro_rules! impl_unsigned_sub_byte_array_element {
+    ($type:ident, $data_type:ident, $bit_count:literal) => {
+        impl $type {
+            /// Smallest representable value.
+            pub const MIN: Self = Self(0);
+
+            /// Largest representable value.
+            pub const MAX: Self = Self(Self::BIT_MASK);
+
+            /// Bit mask selecting the storage bits that hold the value.
+            const BIT_MASK: u8 = (1u8 << $bit_count) - 1;
+
+            /// Creates a new element holding `value`, which must lie within the representable range.
+            pub fn new(value: u8) -> Result<Self, TypeError> {
+                if value > Self::MAX.0 {
+                    return Err(TypeError::invalid(format!(
+                        "value {} is out of range for {} array elements",
+                        value,
+                        DataType::$data_type,
+                    )));
+                }
+                Ok(Self(value))
+            }
+
+            /// Returns the native value of this element.
+            #[inline]
+            pub fn value(self) -> u8 {
+                self.0
+            }
+
+            /// Creates a new element from one storage byte whose low bits hold the value. All higher bits must be zero.
+            pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
+                if bits & !Self::BIT_MASK != 0 {
+                    return Err(TypeError::invalid(format!(
+                        "byte {:#04x} is not a valid `{}` array-element encoding",
+                        bits,
+                        DataType::$data_type,
+                    )));
+                }
+                Ok(Self(bits))
+            }
+
+            /// Returns this element's storage byte, holding its value in the low bits with all higher bits set to zero.
+            #[inline]
+            pub fn to_bits(self) -> u8 {
+                self.0
+            }
+        }
+
+        impl Display for $type {
+            #[inline]
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = DataType::$data_type;
+            const BYTE_COUNT: usize = 1;
+
+            #[inline]
+            fn encode_unchecked(self, bytes: &mut [u8]) {
+                bytes[0] = self.to_bits();
+            }
+
+            #[inline]
+            fn decode_unchecked(bytes: &[u8]) -> Self {
+                // Storage bytes are validated before they are decoded, so their high bits are known to be zero.
+                Self::from_bits(bytes[0]).unwrap()
+            }
+        }
+    };
+}
+
+impl_unsigned_sub_byte_array_element!(u1, U1, 1);
+impl_unsigned_sub_byte_array_element!(u2, U2, 2);
+impl_unsigned_sub_byte_array_element!(u4, U4, 4);
+
+impl_codec_for_integer_type!(u8, U8);
+impl_codec_for_integer_type!(u16, U16);
+impl_codec_for_integer_type!(u32, U32);
+impl_codec_for_integer_type!(u64, U64);
+
+/// Special-value policy of a low-precision floating-point format. The class fixes which bit patterns a format reserves
+/// for infinities and NaNs, whether it has a negative zero, and how a conversion whose rounded result falls beyond the
+/// format's finite range is resolved.
+#[derive(Copy, Clone, Debug)]
+enum LowPrecisionFloatingPointFormatClass {
+    /// IEEE-style format that reserves its all-ones exponent field. It represents a signed infinity with a zero
+    /// mantissa, and a signed NaN with a nonzero mantissa. Overflowing conversions produce a signed infinity.
+    Ieee,
+
+    /// Finite format whose only reserved pattern is the all-ones exponent and mantissa, denoting a signed NaN, so it
+    /// has no infinities. Overflowing conversions produce that NaN, carrying the input's sign.
+    SignedNan,
+
+    /// Finite format whose only reserved pattern is the sign-bit-only encoding that would otherwise be negative zero,
+    /// denoting one unsigned NaN, so it has neither infinities nor a negative zero. Overflowing conversions produce
+    /// that NaN.
+    UnsignedNan,
+
+    /// Finite format in which every bit pattern denotes a finite value, leaving room for neither infinities nor NaNs.
+    /// Overflowing conversions saturate to the signed largest finite value and NaN inputs are rejected.
+    NoNan,
+
+    /// Sign-less format whose whole storage byte is an exponent field, so every encoding but the reserved `0xff` NaN
+    /// denotes a positive power of two and the format has no zero, no negative value, and no infinity. Negative and
+    /// overflowing conversions produce that NaN and zero inputs are rejected.
+    ExponentOnly,
+}
+
+/// Descriptor of a low-precision floating-point format, driving the shared decoding and rounding engine behind every
+/// low-precision floating-point element type in this module. A [`LowPrecisionFloatingPointFormat`] lays out one storage
+/// byte as an optional sign bit above `exponent_bits` exponent bits above `mantissa_bits` mantissa bits. A zero
+/// exponent field denotes a subnormal value `2^(1 - bias) * mantissa / 2^m` and any other exponent field `e` denotes
+/// `2^(e - bias) * (1 + mantissa / 2^m)`, where `m` is `mantissa_bits`. The [`LowPrecisionFloatingPointFormatClass`]
+/// then reinterprets the format's reserved patterns as infinities or NaNs.
+#[derive(Copy, Clone, Debug)]
+struct LowPrecisionFloatingPointFormat {
+    /// [`DataType`] whose element encoding this [`LowPrecisionFloatingPointFormat`] describes.
+    data_type: DataType,
+
+    /// Number of exponent bits of this [`LowPrecisionFloatingPointFormat`].
+    exponent_bits: u32,
+
+    /// Number of mantissa bits of this [`LowPrecisionFloatingPointFormat`].
+    mantissa_bits: u32,
+
+    /// Amount subtracted from a stored exponent field to obtain the exponent it represents.
+    bias: i32,
+
+    /// [`LowPrecisionFloatingPointFormatClass`] of this [`LowPrecisionFloatingPointFormat`].
+    class: LowPrecisionFloatingPointFormatClass,
+}
+
+impl LowPrecisionFloatingPointFormat {
+    /// Bit mask selecting the sign bit, which is always zero for the sign-less
+    /// [`LowPrecisionFloatingPointFormatClass::ExponentOnly`] format.
+    const fn sign_mask(self) -> u8 {
+        match self.class {
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => 0,
+            _ => 1 << (self.exponent_bits + self.mantissa_bits),
+        }
+    }
+
+    /// Bit mask selecting the magnitude bits, namely the exponent and mantissa fields.
+    const fn magnitude_mask(self) -> u8 {
+        match self.class {
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => u8::MAX,
+            _ => self.sign_mask() - 1,
+        }
+    }
+
+    /// Bit mask selecting every storage-byte bit that belongs to this format. Bits outside the mask must be zero,
+    /// which only constrains the four- and six-bit formats.
+    const fn bit_mask(self) -> u8 {
+        self.sign_mask() | self.magnitude_mask()
+    }
+
+    /// Largest magnitude encoding that denotes a finite value. The encoding one past it is either reserved for a
+    /// special value or outside the format, and evaluating the format's formula there yields the virtual overflow
+    /// candidate that anchors rounding at the top of the range.
+    const fn max_finite_magnitude(self) -> u8 {
+        match self.class {
+            LowPrecisionFloatingPointFormatClass::Ieee => {
+                // The whole all-ones exponent field is reserved for infinities and NaNs.
+                self.magnitude_mask() - (1 << self.mantissa_bits)
+            }
+            LowPrecisionFloatingPointFormatClass::SignedNan => {
+                // Only the all-ones exponent and mantissa pattern is reserved, for the canonical NaN.
+                self.magnitude_mask() - 1
+            }
+            LowPrecisionFloatingPointFormatClass::UnsignedNan | LowPrecisionFloatingPointFormatClass::NoNan => {
+                // The reserved NaN pattern carries the sign bit, so every magnitude encoding is finite.
+                self.magnitude_mask()
+            }
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => {
+                // Only `0xff` is reserved, for the single NaN.
+                u8::MAX - 1
+            }
+        }
+    }
+
+    /// Encoding of the smallest representable value, which is the most negative finite value for every signed format
+    /// and the smallest positive power of two for the sign-less [`LowPrecisionFloatingPointFormatClass::ExponentOnly`]
+    /// format.
+    const fn min_bits(self) -> u8 {
+        match self.class {
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => 0,
+            _ => self.max_finite_magnitude() | self.sign_mask(),
+        }
+    }
+
+    /// Encoding whose exponent field is all ones and whose mantissa is zero, which denotes an infinity in the
+    /// [`LowPrecisionFloatingPointFormatClass::Ieee`] formats.
+    const fn infinity_bits(self, negative: bool) -> u8 {
+        let exponent = (((1u16 << self.exponent_bits) - 1) << self.mantissa_bits) as u8;
+        exponent | if negative { self.sign_mask() } else { 0 }
+    }
+
+    /// Canonical quiet-NaN encoding of this format, or `None` for the microscaling formats, which have no NaN
+    /// encoding. The sign is honored only by the classes whose NaN encodings carry a sign bit.
+    const fn nan_bits(self, negative: bool) -> Option<u8> {
+        match self.class {
+            LowPrecisionFloatingPointFormatClass::Ieee => {
+                // A canonical quiet NaN sets the most significant mantissa bit under an all-ones exponent field.
+                Some(self.infinity_bits(negative) | 1 << (self.mantissa_bits - 1))
+            }
+            LowPrecisionFloatingPointFormatClass::SignedNan => {
+                Some(self.magnitude_mask() | if negative { self.sign_mask() } else { 0 })
+            }
+            LowPrecisionFloatingPointFormatClass::UnsignedNan => Some(self.sign_mask()),
+            LowPrecisionFloatingPointFormatClass::NoNan => None,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => Some(u8::MAX),
+        }
+    }
+
+    /// Applies a sign to one finite magnitude encoding. The `fnuz` formats have no negative zero, so a negative zero
+    /// collapses onto positive zero there instead of onto their NaN, which is the sign-bit-only encoding.
+    fn signed_bits(self, magnitude: u8, negative: bool) -> u8 {
+        let unsigned_zero = magnitude == 0 && matches!(self.class, LowPrecisionFloatingPointFormatClass::UnsignedNan);
+        magnitude | if negative && !unsigned_zero { self.sign_mask() } else { 0 }
+    }
+
+    /// Encoding produced by a conversion whose rounded result falls beyond this format's finite range, following the
+    /// overflow policy of its [`LowPrecisionFloatingPointFormatClass`].
+    fn overflow_bits(self, negative: bool) -> u8 {
+        match self.class {
+            LowPrecisionFloatingPointFormatClass::Ieee => self.infinity_bits(negative),
+            LowPrecisionFloatingPointFormatClass::NoNan => self.signed_bits(self.max_finite_magnitude(), negative),
+            _ => {
+                // The remaining classes have no infinity encoding, so an overflow lands on their canonical NaN,
+                // which every one of them has.
+                self.nan_bits(negative).unwrap()
+            }
+        }
+    }
+
+    /// Encoding of the value nearest to one finite nonzero `magnitude`, with `negative` applied to the result.
+    /// Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate one step
+    /// past its largest finite magnitude. Ties choose the even encoding except for exponent-only values, whose
+    /// one-bit significand rounds a tie up to the next power of two. Results beyond the finite range follow this
+    /// format's [`LowPrecisionFloatingPointFormatClass`]. Exponent-only values use their special minimum-boundary rule.
+    fn nearest_bits(self, magnitude: f64, negative: bool) -> u8 {
+        if matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
+            // The minimum exponent is the boundary inherited from an `F32` subnormal. Positive inputs through the
+            // minimum map to it and every input above it but below the next power of two maps to that next power.
+            if magnitude <= self.decode_magnitude(0) {
+                return 0;
+            }
+            if magnitude < self.decode_magnitude(1) {
+                return 1;
+            }
+        }
+
+        // An input above the virtual overflow candidate is unambiguously an overflow. Resolving it before the scan
+        // also keeps the distance comparisons below meaningful, because the distances from every candidate round to
+        // the same value once the input is astronomically larger than this format's whole range.
+        let max_finite_magnitude = u16::from(self.max_finite_magnitude());
+        if magnitude > self.decode_magnitude(max_finite_magnitude + 1) {
+            return self.overflow_bits(negative);
+        }
+
+        let mut nearest = 0;
+        let mut nearest_distance = f64::INFINITY;
+        for candidate in 0..=max_finite_magnitude + 1 {
+            let distance = (self.decode_magnitude(candidate) - magnitude).abs();
+
+            // Candidate values increase strictly with their encoding, so at most two can be equidistant. Most
+            // formats choose the even encoding. Exponent-only rounding instead carries the implicit one-bit
+            // significand into the next exponent, independently of exponent-encoding parity.
+            let ties_up = matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly);
+            if distance < nearest_distance || (distance == nearest_distance && (ties_up || candidate % 2 == 0)) {
+                nearest = candidate;
+                nearest_distance = distance;
+            }
+        }
+
+        if nearest > max_finite_magnitude {
+            return self.overflow_bits(negative);
+        }
+
+        // A nonzero input can still round down onto the zero encoding, which the `fnuz` formats leave unsigned.
+        self.signed_bits(nearest as u8, negative)
+    }
+
+    /// Exact value denoted by one magnitude encoding, evaluated purely from this format's exponent and
+    /// mantissa formula. Reserved special-value patterns are not recognized, so passing one magnitude past
+    /// [`LowPrecisionFloatingPointFormat::max_finite_magnitude`] yields the virtual overflow candidate
+    /// used while rounding.
+    fn decode_magnitude(self, magnitude: u16) -> f64 {
+        let mantissa_scale = f64::from(1u32 << self.mantissa_bits);
+        let mantissa = f64::from(u32::from(magnitude) & ((1u32 << self.mantissa_bits) - 1));
+        let exponent = i32::from(magnitude >> self.mantissa_bits);
+        if exponent == 0 && !matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
+            // A zero-exponent field denotes a subnormal value, whose implicit leading mantissa bit is zero.
+            return 2f64.powi(1 - self.bias) * mantissa / mantissa_scale;
+        }
+        2f64.powi(exponent - self.bias) * (1.0 + mantissa / mantissa_scale)
+    }
+
+    /// Encodes the value nearest to `value` in this [`LowPrecisionFloatingPointFormat`], rounding to nearest with
+    /// exact ties broken toward the even encoding, or upward for exponent-only values. Special inputs and values whose
+    /// rounded result falls beyond the finite range follow the policies of this format's
+    /// [`LowPrecisionFloatingPointFormatClass`], including its special minimum-boundary rule for exponent-only values.
+    fn encode(self, value: f64) -> Result<u8, TypeError> {
+        let negative = value.is_sign_negative();
+        let exponent_only = matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly);
+        match value.classify() {
+            FpCategory::Nan => self
+                .nan_bits(negative)
+                .ok_or_else(|| TypeError::invalid(format!("data type `{}` cannot represent NaN", self.data_type))),
+            FpCategory::Zero if exponent_only => {
+                Err(TypeError::invalid(format!("data type `{}` cannot represent zero", self.data_type)))
+            }
+            FpCategory::Zero => Ok(self.signed_bits(0, negative)),
+            FpCategory::Infinite => Ok(self.overflow_bits(negative)),
+            FpCategory::Normal | FpCategory::Subnormal if negative && exponent_only => {
+                // A sign-less format has no negative value to round to, so negative inputs collapse onto its NaN.
+                Ok(self.nan_bits(negative).unwrap())
+            }
+            FpCategory::Normal | FpCategory::Subnormal => Ok(self.nearest_bits(value.abs(), negative)),
+        }
+    }
+
+    /// Decodes the exact value denoted by one storage byte in this [`LowPrecisionFloatingPointFormat`].
+    /// Bits outside this format's encoding are ignored.
+    fn decode(self, bits: u8) -> f64 {
+        let bits = bits & self.bit_mask();
+        let negative = bits & self.sign_mask() != 0;
+        let magnitude = bits & self.magnitude_mask();
+        let mantissa = magnitude & ((1u8 << self.mantissa_bits) - 1);
+        let exponent = u16::from(magnitude >> self.mantissa_bits);
+        let is_special = match self.class {
+            LowPrecisionFloatingPointFormatClass::Ieee => exponent == (1u16 << self.exponent_bits) - 1,
+            LowPrecisionFloatingPointFormatClass::SignedNan => magnitude == self.magnitude_mask(),
+            LowPrecisionFloatingPointFormatClass::UnsignedNan => negative && magnitude == 0,
+            LowPrecisionFloatingPointFormatClass::NoNan => false,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => bits == u8::MAX,
+        };
+        if is_special {
+            return match self.class {
+                LowPrecisionFloatingPointFormatClass::Ieee if mantissa == 0 && negative => f64::NEG_INFINITY,
+                LowPrecisionFloatingPointFormatClass::Ieee if mantissa == 0 && !negative => f64::INFINITY,
+                LowPrecisionFloatingPointFormatClass::Ieee | LowPrecisionFloatingPointFormatClass::SignedNan
+                    if negative =>
+                {
+                    // Only the classes whose NaN encodings carry a sign bit have a negative NaN to decode.
+                    -f64::NAN
+                }
+                _ => f64::NAN,
+            };
+        }
+        let value = self.decode_magnitude(u16::from(magnitude));
+        if negative { -value } else { value }
+    }
+}
+
+/// Conversion-only 4-bit floating-point array element representing [`DataType::F4E2M1FN`] values. Values occupy the low
+/// four bits of one storage byte, laid out as one sign bit, two exponent bits, and one mantissa bit with exponent bias
+/// 1, and all higher bits of the byte are zero. Every encoding denotes a finite value. The largest finite value is `6`,
+/// the smallest positive normal value is `1`, the smallest positive subnormal value is `0.5`, and negative zero is
+/// `0x08`. This microscaling format has no infinity and no NaN encoding, so infinities and values that round beyond
+/// `6` saturate to `±6`, while NaN inputs are rejected with a [`TypeError`]. Conversions round to nearest with ties
+/// to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float4_e2m1fn).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f4e2m1fn(u8);
+
+/// Conversion-only 6-bit floating-point array element representing [`DataType::F6E2M3FN`] values. Values occupy the low
+/// six bits of one storage byte, laid out as one sign bit, two exponent bits, and three mantissa bits with exponent
+/// bias 1, and all higher bits of the byte are zero. Every encoding denotes a finite value. The largest finite value
+/// is `7.5`, the smallest positive normal value is `1`, the smallest positive subnormal value is `0.125`, and negative
+/// zero is `0x20`. This microscaling format has no infinity and no NaN encoding, so infinities and values that round
+/// beyond `7.5` saturate to `±7.5`, while NaN inputs are rejected with a [`TypeError`]. Conversions round to nearest
+/// with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float6_e2m3fn).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f6e2m3fn(u8);
+
+/// Conversion-only 6-bit floating-point array element representing [`DataType::F6E3M2FN`] values. Values occupy the low
+/// six bits of one storage byte, laid out as one sign bit, three exponent bits, and two mantissa bits with exponent
+/// bias 3, and all higher bits of the byte are zero. Every encoding denotes a finite value. The largest finite value
+/// is `28`, the smallest positive normal value is `0.25`, the smallest positive subnormal value is `0.0625`, and
+/// negative zero is `0x20`. This microscaling format has no infinity and no NaN encoding, so infinities and values
+/// that round beyond `28` saturate to `±28`, while NaN inputs are rejected with a [`TypeError`]. Conversions round
+/// to nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float6_e3m2fn).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f6e3m2fn(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E3M4`] values. Values fill one storage
+/// byte laid out as one sign bit, three exponent bits, and four mantissa bits with exponent bias 3. The largest finite
+/// value is `15.5`, the smallest positive normal value is `2^-2`, the smallest positive subnormal value is `2^-6`, and
+/// negative zero is `0x80`. This IEEE-style format reserves its all-ones exponent field. `0x70` and `0xf0` are the
+/// infinities, and any nonzero mantissa under that exponent is a NaN, whose canonical quiet encoding is `0x78` (`0xf8`
+/// when negative). Infinities and values that round beyond `15.5` therefore convert to `±∞`. Conversions round to
+/// nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e3m4).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e3m4(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3`] values. Values fill one storage
+/// byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 7. The largest finite
+/// value is `240`, the smallest positive normal value is `2^-6`, the smallest positive subnormal value is `2^-9`, and
+/// negative zero is `0x80`. This IEEE-style format reserves its all-ones exponent field. `0x78` and `0xf8` are the
+/// infinities, and any nonzero mantissa under that exponent is a NaN, whose canonical quiet encoding is `0x7c` (`0xfc`
+/// when negative). Infinities and values that round beyond `240` therefore convert to `±∞`. Conversions round to
+/// nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e4m3(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3FN`] values. Values fill one
+/// storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 7. The largest
+/// finite value is `448`, the smallest positive normal value is `2^-6`, the smallest positive subnormal value is
+/// `2^-9`, and negative zero is `0x80`. The format is finite. It has no infinity encoding, and its single NaN is the
+/// all-ones exponent and mantissa pattern `0x7f` (`0xff` when negative). Infinities and values that round beyond `448`,
+/// meaning past the midpoint `464` between `448` and the next formula step `480`, therefore convert to that NaN,
+/// carrying the input's sign. Conversions round to nearest with ties to even, following
+/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3fn).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e4m3fn(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3FNUZ`] values. Values fill one
+/// storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 8. The largest
+/// finite value is `240`, the smallest positive normal value is `2^-7`, and the smallest positive subnormal value is
+/// `2^-10`. The format is finite with unsigned zero. It has no infinity encoding and no negative zero, because `0x80`,
+/// the pattern that would be negative zero, is its single NaN. Negative zero inputs therefore encode as positive zero,
+/// while infinities and values that round beyond `240` convert to that NaN. Conversions round to nearest with ties to
+/// even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3fnuz).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e4m3fnuz(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3B11FNUZ`] values. Values fill one
+/// storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 11, which
+/// trades range for precision near zero relative to [`f8e4m3fnuz`]. The largest finite value is `30`, the smallest
+/// positive normal value is `2^-10`, and the smallest positive subnormal value is `2^-13`. The format is finite with
+/// unsigned zero. It has no infinity encoding and no negative zero, because `0x80`, the pattern that would be negative
+/// zero, is its single NaN. Negative zero inputs therefore encode as positive zero, while infinities and values that
+/// round beyond `30` convert to that NaN. Conversions round to nearest with ties to even, following
+/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3b11fnuz).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e4m3b11fnuz(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E5M2`] values. Values fill one storage
+/// byte laid out as one sign bit, five exponent bits, and two mantissa bits with exponent bias 15, which is the
+/// truncation of [`f16`](struct@f16) to eight bits. The largest finite value is `57344`, the smallest positive normal
+/// value is `2^-14`, the smallest positive subnormal value is `2^-16`, and negative zero is `0x80`. This IEEE-style
+/// format reserves its all-ones exponent field. `0x7c` and `0xfc` are the infinities, and any nonzero mantissa under
+/// that exponent is a NaN, whose canonical quiet encoding is `0x7e` (`0xfe` when negative). Infinities and values that
+/// round beyond `57344` therefore convert to `±∞`. Conversions round to nearest with ties to even, following
+/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e5m2).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e5m2(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E5M2FNUZ`] values. Values fill one
+/// storage byte laid out as one sign bit, five exponent bits, and two mantissa bits with exponent bias 16. The largest
+/// finite value is `57344`, the smallest positive normal value is `2^-15`, and the smallest positive subnormal value is
+/// `2^-17`. The format is finite with unsigned zero: it has no infinity encoding and no negative zero, because `0x80`,
+/// the pattern that would be negative zero, is its single NaN. Negative zero inputs therefore encode as positive zero,
+/// while infinities and values that round beyond `57344` convert to that NaN. Conversions round to nearest with ties to
+/// even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e5m2fnuz).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e5m2fnuz(u8);
+
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E8M0FNU`] values, the block scale
+/// factors of the microscaling formats. The whole storage byte is an eight-bit exponent field with bias 127 and there
+/// are no sign or mantissa bits, so every encoding `e` in `0x00..=0xfe` denotes exactly `2^(e - 127)`, spanning
+/// `2^-127` through `2^127`, and `0xff` is the single NaN. The format has no zero, no negative value, and no infinity,
+/// so [`f8e8m0fnu::MIN`] is the smallest positive value `2^-127` rather than a negative one, zero inputs are rejected
+/// with a [`TypeError`], and negative, infinite, and overflowing inputs convert to NaN. Conversions round to nearest
+/// with exact ties rounded upward: `1.5` rounds to `2`, `3` to `4`, and `6` to `8`. The implicit one-bit significand
+/// carries into the next exponent at a tie; the parity of the encoded exponent does not select the rounding direction.
+/// At the minimum boundary, every positive input at most `2^-127` becomes `2^-127`, and every input strictly between
+/// `2^-127` and `2^-126` becomes `2^-126`. This boundary follows the underlying exponent extraction, rather than the
+/// arithmetic midpoint between these two smallest values.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+pub struct f8e8m0fnu(u8);
+
+// Implements the shared conversion API and the numeric comparison semantics of a low-precision floating-point newtype
+// that wraps its storage byte, driving every conversion through the shared `FloatFormat` engine.
+macro_rules! impl_low_precision_floating_point_type {
+    ($type:ident, $data_type:ident, $class:ident, $exponent_bits:literal, $mantissa_bits:literal, $bias:literal) => {
+        impl $type {
+            /// Format descriptor driving every conversion of this element type.
+            const FORMAT: LowPrecisionFloatingPointFormat = LowPrecisionFloatingPointFormat {
+                data_type: DataType::$data_type,
+                exponent_bits: $exponent_bits,
+                mantissa_bits: $mantissa_bits,
+                bias: $bias,
+                class: LowPrecisionFloatingPointFormatClass::$class,
+            };
+
+            /// Smallest representable value.
+            pub const MIN: Self = Self(Self::FORMAT.min_bits());
+
+            /// Largest representable finite value.
+            pub const MAX: Self = Self(Self::FORMAT.max_finite_magnitude());
+
+            /// Returns this element's storage byte.
+            #[inline]
+            pub fn to_bits(self) -> u8 {
+                self.0
+            }
+
+            /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding except
+            /// for [`f8e8m0fnu`], which rounds ties upward and uses the minimum-boundary rule described on its type.
+            /// Returns an error only when this format has no encoding for the input at all, namely a NaN input
+            /// to a microscaling format or a zero input to [`f8e8m0fnu`].
+            #[inline]
+            pub fn from_f32(value: f32) -> Result<Self, TypeError> {
+                // Widening to `f64` is exact, so the `f64` conversion performs the only rounding step.
+                Self::from_f64(f64::from(value))
+            }
+
+            /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding except
+            /// for [`f8e8m0fnu`], which rounds ties upward and uses the minimum-boundary rule described on its type.
+            /// Returns an error only when this format has no encoding for the input at all, namely a NaN input to a
+            /// microscaling format or a zero input to [`f8e8m0fnu`].
+            #[inline]
+            pub fn from_f64(value: f64) -> Result<Self, TypeError> {
+                Self::FORMAT.encode(value).map(Self)
+            }
+
+            /// Returns this element's exact value as an [`f32`] value.
+            #[inline]
+            pub fn to_f32(self) -> f32 {
+                self.to_f64() as f32
+            }
+
+            /// Returns this element's exact value as an [`f64`] value.
+            #[inline]
+            pub fn to_f64(self) -> f64 {
+                Self::FORMAT.decode(self.0)
+            }
+        }
+
+        impl Display for $type {
+            #[inline]
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.to_f64())
+            }
+        }
+
+        impl PartialEq for $type {
+            #[inline]
+            fn eq(&self, other: &Self) -> bool {
+                self.to_f64() == other.to_f64()
+            }
+        }
+
+        impl PartialOrd for $type {
+            #[inline]
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                self.to_f64().partial_cmp(&other.to_f64())
+            }
+        }
+    };
+}
+
+// Implements the NaN vocabulary of a low-precision floating-point newtype whose format reserves a NaN encoding.
+macro_rules! impl_nan_for_low_precision_floating_point_type {
+    ($type:ident) => {
+        impl $type {
+            /// Canonical NaN value of this format.
+            pub const NAN: Self = Self(match Self::FORMAT.nan_bits(false) {
+                Some(bits) => bits,
+                // This constant is only generated for formats that reserve a NaN encoding.
+                None => unreachable!(),
+            });
+
+            /// Returns whether this element is NaN.
+            #[inline]
+            pub fn is_nan(self) -> bool {
+                self.to_f64().is_nan()
+            }
+        }
+    };
+}
+
+// Implements the infinity vocabulary of an IEEE-style low-precision floating-point newtype.
+macro_rules! impl_infinities_for_low_precision_floating_point_type {
+    ($type:ident) => {
+        impl $type {
+            /// Positive infinity value of this format.
+            pub const INFINITY: Self = Self(Self::FORMAT.infinity_bits(false));
+
+            /// Negative infinity value of this format.
+            pub const NEG_INFINITY: Self = Self(Self::FORMAT.infinity_bits(true));
+        }
+    };
+}
+
+// Implements the storage-byte constructor and the sealed codec for a low-precision floating-point newtype whose
+// encoding fills a whole storage byte, so that every byte is a valid encoding.
+macro_rules! impl_codec_for_byte_low_precision_floating_point_type {
+    ($type:ident) => {
+        impl $type {
+            /// Creates a new element from its storage byte. Every byte encodes a value of this format.
+            #[inline]
+            pub fn from_bits(bits: u8) -> Self {
+                Self(bits)
+            }
+        }
+
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = Self::FORMAT.data_type;
+            const BYTE_COUNT: usize = 1;
+
+            #[inline]
+            fn encode_unchecked(self, bytes: &mut [u8]) {
+                bytes[0] = self.to_bits();
+            }
+
+            #[inline]
+            fn decode_unchecked(bytes: &[u8]) -> Self {
+                Self::from_bits(bytes[0])
+            }
+        }
+    };
+}
+
+// Implements the checked storage-byte constructor and the sealed codec for a low-precision floating-point newtype
+// whose encoding occupies only the low bits of a storage byte, requiring all higher bits to be zero.
+macro_rules! impl_codec_for_sub_byte_low_precision_floating_point_type {
+    ($type:ident) => {
+        impl $type {
+            /// Creates a new element from one storage byte whose low bits hold its encoding.
+            /// All higher bits must be zero.
+            pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
+                if bits & !Self::FORMAT.bit_mask() != 0 {
+                    return Err(TypeError::invalid(format!(
+                        "byte {bits:#04x} is not a valid `{}` array-element encoding",
+                        Self::FORMAT.data_type,
+                    )));
+                }
+                Ok(Self(bits))
+            }
+        }
+
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = Self::FORMAT.data_type;
+            const BYTE_COUNT: usize = 1;
+
+            #[inline]
+            fn encode_unchecked(self, bytes: &mut [u8]) {
+                bytes[0] = self.to_bits();
+            }
+
+            #[inline]
+            fn decode_unchecked(bytes: &[u8]) -> Self {
+                // Storage bytes are validated before they are decoded, so their high bits are known to be zero.
+                Self::from_bits(bytes[0]).unwrap()
+            }
+        }
+    };
+}
+
+impl_low_precision_floating_point_type!(f4e2m1fn, F4E2M1FN, NoNan, 2, 1, 1);
+impl_codec_for_sub_byte_low_precision_floating_point_type!(f4e2m1fn);
+
+impl_low_precision_floating_point_type!(f6e2m3fn, F6E2M3FN, NoNan, 2, 3, 1);
+impl_codec_for_sub_byte_low_precision_floating_point_type!(f6e2m3fn);
+
+impl_low_precision_floating_point_type!(f6e3m2fn, F6E3M2FN, NoNan, 3, 2, 3);
+impl_codec_for_sub_byte_low_precision_floating_point_type!(f6e3m2fn);
+
+impl_low_precision_floating_point_type!(f8e3m4, F8E3M4, Ieee, 3, 4, 3);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e3m4);
+impl_nan_for_low_precision_floating_point_type!(f8e3m4);
+impl_infinities_for_low_precision_floating_point_type!(f8e3m4);
+
+impl_low_precision_floating_point_type!(f8e4m3, F8E4M3, Ieee, 4, 3, 7);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3);
+impl_infinities_for_low_precision_floating_point_type!(f8e4m3);
+
+impl_low_precision_floating_point_type!(f8e4m3fn, F8E4M3FN, SignedNan, 4, 3, 7);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3fn);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3fn);
+
+impl_low_precision_floating_point_type!(f8e4m3fnuz, F8E4M3FNUZ, UnsignedNan, 4, 3, 8);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3fnuz);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3fnuz);
+
+impl_low_precision_floating_point_type!(f8e4m3b11fnuz, F8E4M3B11FNUZ, UnsignedNan, 4, 3, 11);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3b11fnuz);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3b11fnuz);
+
+impl_low_precision_floating_point_type!(f8e5m2, F8E5M2, Ieee, 5, 2, 15);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e5m2);
+impl_nan_for_low_precision_floating_point_type!(f8e5m2);
+impl_infinities_for_low_precision_floating_point_type!(f8e5m2);
+
+impl_low_precision_floating_point_type!(f8e5m2fnuz, F8E5M2FNUZ, UnsignedNan, 5, 2, 16);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e5m2fnuz);
+impl_nan_for_low_precision_floating_point_type!(f8e5m2fnuz);
+
+impl_low_precision_floating_point_type!(f8e8m0fnu, F8E8M0FNU, ExponentOnly, 8, 0, 127);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e8m0fnu);
+impl_nan_for_low_precision_floating_point_type!(f8e8m0fnu);
+
+// Implements the sealed codec for real floating-point primitives while preserving their exact payload bits.
+macro_rules! impl_codec_for_floating_point_type {
+    ($type:ty, $bits:ty, $data_type:ident) => {
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = DataType::$data_type;
+            const BYTE_COUNT: usize = size_of::<$bits>();
+
+            #[inline]
+            fn encode_unchecked(self, bytes: &mut [u8]) {
+                bytes.copy_from_slice(&self.to_bits().to_le_bytes());
+            }
+
+            #[inline]
+            fn decode_unchecked(bytes: &[u8]) -> Self {
+                Self::from_bits(<$bits>::from_le_bytes(bytes.try_into().unwrap()))
+            }
+        }
+    };
+}
+
+impl_codec_for_floating_point_type!(bf16, u16, BF16);
+impl_codec_for_floating_point_type!(f16, u16, F16);
+impl_codec_for_floating_point_type!(f32, u32, F32);
+impl_codec_for_floating_point_type!(f64, u64, F64);
+
+impl private::Codec for Complex<f32> {
+    const DATA_TYPE: DataType = DataType::C64;
+    const BYTE_COUNT: usize = 8;
+
+    #[inline]
+    fn encode_unchecked(self, bytes: &mut [u8]) {
+        self.re.encode(&mut bytes[..4]);
+        self.im.encode(&mut bytes[4..]);
+    }
+
+    #[inline]
+    fn decode_unchecked(bytes: &[u8]) -> Self {
+        Self::new(f32::decode(&bytes[..4]), f32::decode(&bytes[4..]))
+    }
+}
+
+impl private::Codec for Complex<f64> {
+    const DATA_TYPE: DataType = DataType::C128;
+    const BYTE_COUNT: usize = 16;
+
+    #[inline]
+    fn encode_unchecked(self, bytes: &mut [u8]) {
+        self.re.encode(&mut bytes[..8]);
+        self.im.encode(&mut bytes[8..]);
+    }
+
+    #[inline]
+    fn decode_unchecked(bytes: &[u8]) -> Self {
+        Self::new(f64::decode(&bytes[..8]), f64::decode(&bytes[8..]))
+    }
+}
+
+// The element interchange implementations below complete `ArrayElement` for every element type. Each one declares
+// how the type is built from the four interchange carriers and which carrier it widens into as a source, per the
+// `Conversions` section of the trait's documentation.
+
+// The Boolean element type carries `false` as `0` and `true` as `1`, and reads back as "the value is nonzero" from
+// every category. Complex sources are true when either component is nonzero, so the imaginary part is not discarded.
+impl ArrayElement for bool {
+    #[inline]
+    fn from_signed(value: i64) -> Result<Self, ProgramError> {
+        Ok(value != 0)
+    }
+
+    #[inline]
+    fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+        Ok(value != 0)
+    }
+
+    #[inline]
+    fn from_real(value: f64) -> Result<Self, ProgramError> {
+        Ok(value != 0.0)
+    }
+
+    #[inline]
+    fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+        Ok(value.re != 0.0 || value.im != 0.0)
+    }
+
+    #[inline]
+    fn min_identity() -> Self {
+        true
+    }
+
+    #[inline]
+    fn max_identity() -> Self {
+        false
+    }
+
+    #[inline]
+    fn min(&self, other: &Self) -> Self {
+        Ord::min(*self, *other)
+    }
+
+    #[inline]
+    fn max(&self, other: &Self) -> Self {
+        Ord::max(*self, *other)
+    }
+
+    #[inline]
+    fn neg(self) -> Result<Self, ProgramError> {
+        Ok(!self)
+    }
+
+    #[inline]
+    fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+        Output::from_unsigned(u64::from(self))
+    }
+}
+
+// Implements the interchange contract for the checked signed sub-byte integer element types. Integer inputs narrow
+// modularly into the declared bit width, real inputs saturate to the logical range, and conversions out widen the
+// sign-extended native value exactly into `i64`.
+macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                let value = (value as i8).clamp(Self::MIN.value(), Self::MAX.value());
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::MAX
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::MIN
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                Ord::min(*self, *other)
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                Ord::max(*self, *other)
+            }
+
+            #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_neg() & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_signed(i64::from(self.value()))
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_add(rhs.to_bits()) & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_sub(rhs.to_bits()) & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_mul(rhs.to_bits()) & bit_mask).unwrap())
+            }
+
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                // Integer array arithmetic is total (i.e., zero divisors produce all-one bits and overflow wraps).
+                if rhs.value() == 0 {
+                    return Self::from_signed(-1);
+                }
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_div(rhs.value()) as u8 & bit_mask).unwrap())
+            }
+
+            fn abs(self) -> Result<Self, ProgramError> {
+                if Self::data_type() == DataType::I1 {
+                    return Err(TypeError::invalid(
+                        "cannot compute the absolute value of a scalar of data type `i1`".to_string(),
+                    )
+                    .into());
+                }
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_abs() as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn sign(self) -> Result<Self, ProgramError> {
+                Ok(Self::new(self.value().signum()).unwrap())
+            }
+        }
+
+        impl RealArrayElement for $type {
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Ok(self);
+                }
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_rem(rhs.value()) as u8 & bit_mask).unwrap())
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_signed_sub_byte_integer_types!(i1, i2, i4);
+
+// Implements the interchange contract for the checked unsigned sub-byte integer element types. Integer inputs narrow
+// modularly into the declared bit width, real inputs saturate to the logical range, and conversions out widen the
+// native value exactly into `u64`.
+macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits((value as u8).min(Self::MAX.to_bits())).unwrap())
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::MAX
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::MIN
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                Ord::min(*self, *other)
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                Ord::max(*self, *other)
+            }
+
+            #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_neg() & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_unsigned(u64::from(self.value()))
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_add(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_sub(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_mul(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
+            }
+
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Ok(Self::MAX);
+                }
+                Ok(Self::new(self.value() / rhs.value()).unwrap())
+            }
+
+            fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+                Err(TypeError::invalid(format!(
+                    "cannot compute the absolute value of a scalar of data type `{}`",
+                    Self::data_type(),
+                ))
+                .into())
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                Err(TypeError::invalid(format!(
+                    "cannot compute the sign of a scalar of data type `{}`",
+                    Self::data_type(),
+                ))
+                .into())
+            }
+        }
+
+        impl RealArrayElement for $type {
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Ok(self);
+                }
+                Ok(Self::new(self.value() % rhs.value()).unwrap())
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_unsigned_sub_byte_integer_types!(u1, u2, u4);
+
+// Implements the interchange contract for native integer element types. Conversions into them use Rust's `as`
+// semantics, which are also the reference backend's C-style narrowing and truncation contract, while conversions
+// out of them widen exactly into `$carrier`, the carrier of the `$route` category.
+macro_rules! impl_array_element_for_integer_types {
+    ($kind:ident, $carrier:ty, $route:ident, $($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::MAX
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::MIN
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                Ord::min(*self, *other)
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                Ord::max(*self, *other)
+            }
+
+            #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_neg())
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::$route(self as $carrier)
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_add(rhs))
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_sub(rhs))
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_mul(rhs))
+            }
+
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs == 0 {
+                    return Ok(!0);
+                }
+                Ok(self.wrapping_div(rhs))
+            }
+
+            impl_array_element_for_integer_types!(@$kind);
+        }
+
+        impl RealArrayElement for $type {
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs == 0 {
+                    return Ok(self);
+                }
+                Ok(self.wrapping_rem(rhs))
+            }
+        }
+    )+};
+
+    // Implements signed integer magnitude and sign with the primitive wrapping contract.
+    (@signed) => {
+            #[inline]
+            fn abs(self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_abs())
+            }
+
+            #[inline]
+            fn sign(self) -> Result<Self, ProgramError> {
+                Ok(self.signum())
+            }
+    };
+
+    // Rejects magnitude and sign for unsigned integer elements.
+    (@unsigned) => {
+        fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+            Err(TypeError::invalid(format!(
+                "cannot compute the absolute value of a scalar of data type `{}`",
+                Self::data_type(),
+            ))
+            .into())
+        }
+
+        fn sign(self) -> Result<Self, ProgramError> {
+            Err(TypeError::invalid(format!("cannot compute the sign of a scalar of data type `{}`", Self::data_type()))
+                .into())
+        }
+    };
+}
+
+impl_array_element_for_integer_types!(signed, i64, from_signed, i8, i16, i32, i64);
+impl_array_element_for_integer_types!(unsigned, u64, from_unsigned, u8, u16, u32, u64);
+
+// Implements the real floating-point math families through the working precision and exact re-encoding contract of
+// each element family. Half precision uses `f32`, native primitive types use themselves, and low-precision formats
+// use `f64`, matching the scalar reference semantics.
+macro_rules! impl_floating_point_array_element_for_real_floating_point_types {
+    // Implements a low-precision format through its checked `f64` conversion contract.
+    (@low $type:ty) => {
+        impl_floating_point_array_element_for_real_floating_point_types!(@impl
+            $type,
+            f64,
+            |value: $type| value.to_f64(),
+            |value| Ok(<$type>::from_f64(value)?),
+            |value: $type| value.to_f64(),
+            |value| Ok(<$type>::from_f64(value)?),
+        );
+    };
+
+    // Implements a half-precision format through its native `f32` arithmetic and `f64` error-function path.
+    (@half $type:ty) => {
+        impl_floating_point_array_element_for_real_floating_point_types!(@impl
+            $type,
+            f32,
+            <$type>::to_f32,
+            |value| Ok(<$type>::from_f32(value)),
+            <$type>::to_f64,
+            |value| Ok(<$type>::from_f64(value)),
+        );
+    };
+
+    // Implements a native floating-point type without changing working precision.
+    (@native $type:ty) => {
+        impl_floating_point_array_element_for_real_floating_point_types!(@impl
+            $type,
+            $type,
+            |value| value,
+            Ok,
+            |value: $type| value as f64,
+            |value| Ok(value as $type),
+        );
+    };
+
+    // Generates the implementations after the element family's conversion functions have been selected.
+    (@impl $type:ty, $work:ty, $decode:expr, $encode:expr, $to_f64:expr, $from_f64:expr $(,)?) => {
+        impl FloatingPointArrayElement for $type {
+            #[inline]
+            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::powf(($decode)(self), ($decode)(exponent)))
+            }
+
+            #[inline]
+            fn sqrt(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::sqrt(($decode)(self)))
+            }
+
+            #[inline]
+            fn rsqrt(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::recip(<$work>::sqrt(($decode)(self))))
+            }
+
+            #[inline]
+            fn sin(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::sin(($decode)(self)))
+            }
+
+            #[inline]
+            fn cos(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::cos(($decode)(self)))
+            }
+
+            #[inline]
+            fn tan(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::tan(($decode)(self)))
+            }
+
+            #[inline]
+            fn tanh(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::tanh(($decode)(self)))
+            }
+
+            #[inline]
+            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::atan2(($decode)(self), ($decode)(x)))
+            }
+
+            #[inline]
+            fn exp(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::exp(($decode)(self)))
+            }
+
+            #[inline]
+            fn exp_m1(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::exp_m1(($decode)(self)) as f64)
+            }
+
+            #[inline]
+            fn log(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::ln(($decode)(self)) as f64)
+            }
+
+            #[inline]
+            fn ln_1p(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::ln_1p(($decode)(self)) as f64)
+            }
+
+            fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
+                // Widen narrow formats for the whole composition, so unsigned or finite-only intermediate
+                // encodings cannot turn its subtraction and negation into invalid values.
+                let left = ($to_f64)(self);
+                let right = ($to_f64)(other);
+                let output = if Self::data_type() == DataType::F64 {
+                    let difference = left - right;
+                    if difference.is_nan() {
+                        left + right
+                    } else {
+                        left.max(right) + (-difference.abs()).exp().ln_1p()
+                    }
+                } else {
+                    let left = left as f32;
+                    let right = right as f32;
+                    let difference = left - right;
+                    (if difference.is_nan() {
+                        left + right
+                    } else {
+                        left.max(right) + (-difference.abs()).exp().ln_1p()
+                    }) as f64
+                };
+                Self::from_real(output)
+            }
+
+            #[inline]
+            fn logistic(self) -> Result<Self, ProgramError> {
+                let input = ($decode)(self);
+                ($encode)(if input >= 0.0 {
+                    <$work>::recip(<$work>::exp(-input) + 1.0)
+                } else {
+                    let exponential = <$work>::exp(input);
+                    exponential / (1.0 + exponential)
+                })
+            }
+        }
+
+        // Rounded working values widen exactly to `f64`. Numerical conversion, unlike checked literal
+        // construction, maps a zero result to NaN when the destination is the exponent-only format.
+        impl RealFloatingPointArrayElement for $type {
+            #[inline]
+            fn floor(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::floor(($decode)(self)) as f64)
+            }
+
+            #[inline]
+            fn ceil(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::ceil(($decode)(self)) as f64)
+            }
+
+            #[inline]
+            fn round(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::round_ties_even(($decode)(self)) as f64)
+            }
+
+            #[inline]
+            fn erf(self) -> Result<Self, ProgramError> {
+                // Computes the Gauss error function `erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt` in double precision. This is
+                // the rational Chebyshev approximation from FDLIBM 5.3 (i.e., `s_erf.c`, developed at SunSoft and also
+                // used by musl), split by argument magnitude: a short odd series below `2⁻²⁸`, a primary rational
+                // approximation on `|x| < 0.84375`, a rational correction around `erf(1)` on `[0.84375, 1.25)`, two
+                // rational tail regimes evaluated through the complementary function `1 − erfc(x)` on `[1.25, 6)`, and
+                // saturation to `±1` for `|x| ≥ 6` (where `1 − erf(|x|) < 2⁻⁵⁶` is not representable next to one). The
+                // expected accuracy is about 1 ulp in double precision. NaN inputs propagate and the sign symmetry
+                // `erf(−x) = −erf(x)` is exact, including for signed zeros. All polynomial coefficient arrays below
+                // list the FDLIBM constants from the highest-degree term down to the constant term.
+
+                /// `erf(1)` rounded toward zero, used as the base value of the `[0.84375, 1.25)` regime.
+                const ERX: f64 = 8.450629115104675e-01;
+
+                /// Coefficient of the short odd series below `2⁻²⁸`, equal to `8 · (2/√π − 1)`.
+                const EFX8: f64 = 1.0270333367641007;
+
+                /// Numerator coefficients of the primary regime `erf(x) = x + x · PP(x²)/QQ(x²)` on `|x| < 0.84375`.
+                const PP: [f64; 5] = [
+                    -2.3763016656650163e-05,
+                    -0.005770270296489442,
+                    -0.02848174957559851,
+                    -0.3250421072470015,
+                    0.12837916709551256,
+                ];
+
+                /// Denominator coefficients of the primary regime on `|x| < 0.84375`.
+                const QQ: [f64; 6] = [
+                    -3.960228278775368e-06,
+                    0.00013249473800432164,
+                    0.005081306281875766,
+                    0.0650222499887673,
+                    0.39791722395915535,
+                    1.0,
+                ];
+
+                /// Numerator coefficients of `erf(x) = sign(x) · (ERX + PA(|x|−1)/QA(|x|−1))` on `[0.84375, 1.25)`.
+                #[allow(clippy::approx_constant, reason = "the fitted coefficient near 1/π is not that constant")]
+                const PA: [f64; 7] = [
+                    -0.002166375594868791,
+                    0.035478304325618236,
+                    -0.11089469428239668,
+                    0.31834661990116175,
+                    -0.3722078760357013,
+                    0.41485611868374833,
+                    -0.0023621185607526594,
+                ];
+
+                /// Denominator coefficients of the `[0.84375, 1.25)` regime.
+                const QA: [f64; 7] = [
+                    0.011984499846799107,
+                    0.01363708391202905,
+                    0.12617121980876164,
+                    0.07182865441419627,
+                    0.540397917702171,
+                    0.10642088040084423,
+                    1.0,
+                ];
+
+                /// Numerator coefficients of the complementary tail on `[1.25, 1/0.35)`, in the variable `1/x²`.
+                const RA: [f64; 8] = [
+                    -9.814329344169145,
+                    -81.2874355063066,
+                    -184.60509290671104,
+                    -162.39666946257347,
+                    -62.375332450326006,
+                    -10.558626225323291,
+                    -0.6938585727071818,
+                    -0.009864944034847148,
+                ];
+
+                /// Denominator coefficients of the complementary tail on `[1.25, 1/0.35)`, in the variable `1/x²`.
+                const SA: [f64; 9] = [
+                    -0.0604244152148581,
+                    6.570249770319282,
+                    108.63500554177944,
+                    429.00814002756783,
+                    645.3872717332679,
+                    434.56587747522923,
+                    137.65775414351904,
+                    19.651271667439257,
+                    1.0,
+                ];
+
+                /// Numerator coefficients of the complementary tail on `[1/0.35, 6)`, in the variable `1/x²`.
+                const RB: [f64; 7] = [
+                    -483.5191916086514,
+                    -1025.0951316110772,
+                    -637.5664433683896,
+                    -160.63638485582192,
+                    -17.757954917754752,
+                    -0.799283237680523,
+                    -0.0098649429247001,
+                ];
+
+                /// Denominator coefficients of the complementary tail on `[1/0.35, 6)`, in the variable `1/x²`.
+                const SB: [f64; 8] = [
+                    -22.44095244658582,
+                    474.52854120695537,
+                    2553.0504064331644,
+                    3199.8582195085955,
+                    1536.729586084437,
+                    325.7925129965739,
+                    30.33806074348246,
+                    1.0,
+                ];
+
+                /// Evaluates a polynomial at `x` using Horner's scheme, with coefficients ordered from the
+                /// highest-degree term down to the constant term.
+                fn evaluate_polynomial(x: f64, coefficients: &[f64]) -> f64 {
+                    coefficients.iter().fold(0.0, |accumulator, coefficient| accumulator * x + coefficient)
+                }
+
+                let x = ($to_f64)(self);
+                if x.is_nan() {
+                    return ($from_f64)(x);
+                }
+
+                let negative = x.is_sign_negative();
+                let magnitude = x.abs();
+
+                if magnitude < 0.84375 {
+                    if magnitude < 3.725290298461914e-09 {
+                        // For |x| < 2⁻²⁸, evaluate the leading odd term `x · 2/√π` in a scaled form
+                        // that avoids intermediate underflow and preserves signed zeros.
+                        return ($from_f64)(0.125 * (8.0 * x + EFX8 * x));
+                    }
+                    let squared = x * x;
+                    return ($from_f64)(x + x * (evaluate_polynomial(squared, &PP) / evaluate_polynomial(squared, &QQ)));
+                }
+
+                if magnitude < 1.25 {
+                    let shifted = magnitude - 1.0;
+                    let correction = evaluate_polynomial(shifted, &PA) / evaluate_polynomial(shifted, &QA);
+                    return ($from_f64)(if negative { -ERX - correction } else { ERX + correction });
+                }
+
+                if magnitude >= 6.0 {
+                    // Covers |x| ≥ 6 and infinities: 1 − erf(6) < 2⁻⁵⁶ already rounds to zero next to one.
+                    return ($from_f64)(if negative { -1.0 } else { 1.0 });
+                }
+
+                // On [1.25, 6) the error function is evaluated through its complement as `erf(x) = sign(x) · (1 −
+                // erfc(|x|))` with `erfc(y) = exp(−z² − 0.5625) · exp((z − y)(z + y) + R(1/y²)/S(1/y²)) / y`, where
+                // `z` is `y` with the low half of its mantissa cleared so that `z²` is exact and the argument reduction
+                // stays accurate.
+                let inverse_squared = 1.0 / (magnitude * magnitude);
+                let quotient = if magnitude < 1.0 / 0.35 {
+                    evaluate_polynomial(inverse_squared, &RA) / evaluate_polynomial(inverse_squared, &SA)
+                } else {
+                    evaluate_polynomial(inverse_squared, &RB) / evaluate_polynomial(inverse_squared, &SB)
+                };
+                let truncated = f64::from_bits(magnitude.to_bits() & 0xffff_ffff_0000_0000);
+                let complement = (-truncated * truncated - 0.5625).exp()
+                    * ((truncated - magnitude) * (truncated + magnitude) + quotient).exp()
+                    / magnitude;
+                ($from_f64)(if negative { complement - 1.0 } else { 1.0 - complement })
+            }
+        }
+    };
+}
+
+// Implements the analytic continuations shared by complex element types. Sine and cosine use `expm1`-based
+// hyperbolic components so purely imaginary extreme inputs preserve their non-NaN real/imaginary zero component.
+macro_rules! impl_floating_point_array_element_for_complex_floating_point_types {
+    ($component:ty) => {
+        impl FloatingPointArrayElement for Complex<$component> {
+            #[inline]
+            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
+                Ok(Complex::powc(self, exponent))
+            }
+
+            #[inline]
+            fn sqrt(self) -> Result<Self, ProgramError> {
+                // Scale before taking the magnitude as even finite components can have an overflowing norm.
+                if self.im.is_infinite() {
+                    return Ok(Complex::new(<$component>::INFINITY, self.im));
+                }
+
+                if self.re == <$component>::INFINITY {
+                    return Ok(Complex::new(
+                        self.re,
+                        if self.im.is_nan() { self.im } else { (0.0 as $component).copysign(self.im) },
+                    ));
+                }
+
+                if self.re == <$component>::NEG_INFINITY {
+                    return Ok(Complex::new(
+                        if self.im.is_nan() { self.im } else { 0.0 },
+                        <$component>::INFINITY.copysign(self.im),
+                    ));
+                }
+
+                if self.re.is_nan() || self.im.is_nan() {
+                    return Ok(Complex::new(<$component>::NAN, <$component>::NAN));
+                }
+
+                let scale = self.re.abs().max(self.im.abs());
+                if scale == 0.0 {
+                    return Ok(Complex::new(0.0, 0.0));
+                }
+
+                let real = self.re / scale;
+                let imaginary = self.im / scale;
+                let magnitude = scale.sqrt() * ((real.hypot(imaginary) + real.abs()) / 2.0).sqrt();
+                if self.re >= 0.0 {
+                    Ok(Complex::new(magnitude, self.im / (2.0 * magnitude)))
+                } else {
+                    Ok(Complex::new(self.im.abs() / (2.0 * magnitude), magnitude.copysign(self.im)))
+                }
+            }
+
+            #[inline]
+            fn rsqrt(self) -> Result<Self, ProgramError> {
+                // Handle exceptional inputs before division so their defined zeros do not become NaNs.
+                if self.re == 0.0 && self.im == 0.0 {
+                    return Ok(Complex::new(<$component>::INFINITY, <$component>::NAN));
+                }
+
+                if self.re.is_infinite() || (self.im.is_infinite() && self.re.is_nan()) {
+                    return Ok(Complex::new(
+                        (0.0 as $component).copysign(self.re),
+                        -(0.0 as $component).copysign(self.im),
+                    ));
+                }
+
+                NumericArrayElement::div(Complex::new(1.0, 0.0), FloatingPointArrayElement::sqrt(self)?)
+            }
+
+            fn sin(self) -> Result<Self, ProgramError> {
+                // Scale each component before forming the growing exponential: the hyperbolic factor
+                // alone can overflow even when multiplication by the trigonometric factor remains finite.
+                if self.im.abs() > 20.0 {
+                    let half_exponential = (self.im.abs() / 2.0).exp();
+                    let component = |factor: $component| {
+                        if factor == 0.0 {
+                            factor
+                        } else if half_exponential.is_infinite() {
+                            (self.im.abs() + factor.abs().ln() - std::f64::consts::LN_2 as $component)
+                                .exp()
+                                .copysign(factor)
+                        } else {
+                            ((factor * half_exponential) * 0.5) * half_exponential
+                        }
+                    };
+                    return Ok(Complex::new(
+                        if self.re == 0.0 { 0.0 } else { component(self.re.sin()) },
+                        component(self.re.cos() * self.im.signum()),
+                    ));
+                }
+
+                let expm1_imaginary = self.im.exp_m1();
+                let expm1_negative_imaginary = (-self.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let imaginary = self.re.cos() * sinh_imaginary;
+                Ok(Complex::new(if self.re == 0.0 { 0.0 } else { self.re.sin() * cosh_imaginary }, imaginary))
+            }
+
+            fn cos(self) -> Result<Self, ProgramError> {
+                // Scale each component before forming the growing exponential: the hyperbolic factor
+                // alone can overflow even when multiplication by the trigonometric factor remains finite.
+                if self.im.abs() > 20.0 {
+                    let half_exponential = (self.im.abs() / 2.0).exp();
+                    let component = |factor: $component| {
+                        if factor == 0.0 {
+                            factor
+                        } else if half_exponential.is_infinite() {
+                            (self.im.abs() + factor.abs().ln() - std::f64::consts::LN_2 as $component)
+                                .exp()
+                                .copysign(factor)
+                        } else {
+                            ((factor * half_exponential) * 0.5) * half_exponential
+                        }
+                    };
+                    return Ok(Complex::new(
+                        component(self.re.cos()),
+                        if self.re == 0.0 { 0.0 } else { component(-self.re.sin() * self.im.signum()) },
+                    ));
+                }
+
+                let expm1_imaginary = self.im.exp_m1();
+                let expm1_negative_imaginary = (-self.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                Ok(Complex::new(
+                    self.re.cos() * cosh_imaginary,
+                    if self.re == 0.0 { 0.0 } else { -self.re.sin() * sinh_imaginary },
+                ))
+            }
+
+            #[inline]
+            fn tan(self) -> Result<Self, ProgramError> {
+                // Rotate `tan(z) = -i · tanh(i · z)` to reuse the stable hyperbolic implementation without
+                // overflowing `sinh(2 · im(z)) / cosh(2 · im(z))` for large imaginary components.
+                let hyperbolic = FloatingPointArrayElement::tanh(Complex::new(-self.im, self.re))?;
+                Ok(Complex::new(hyperbolic.im, -hyperbolic.re))
+            }
+
+            #[inline]
+            fn tanh(self) -> Result<Self, ProgramError> {
+                // Normalize by the growing exponential away from the imaginary axis. Its reciprocal decays to zero
+                // without overflowing. Near the imaginary axis, retain the small real component and avoid doubling
+                // the imaginary argument, which can itself overflow.
+                if self.re.is_infinite() {
+                    return Ok(Complex::new(self.re.signum(), (0.0 as $component).copysign(self.im)));
+                }
+                if self.re.abs() > 1.0 {
+                    let exponential = (-2.0 * self.re.abs()).exp();
+                    let (sine, cosine) = self.im.sin_cos();
+                    let denominator =
+                        1.0 + 2.0 * exponential * (cosine * cosine - sine * sine) + exponential * exponential;
+                    return Ok(Complex::new(
+                        ((1.0 - exponential * exponential) / denominator).copysign(self.re),
+                        (2.0 * exponential) * (2.0 * sine * cosine) / denominator,
+                    ));
+                }
+                let sinh_real = self.re.sinh();
+                let (sine, cosine) = self.im.sin_cos();
+                let denominator = sinh_real * sinh_real + cosine * cosine;
+                Ok(Complex::new(sinh_real * self.re.cosh() / denominator, sine * cosine / denominator))
+            }
+
+            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + self * self).sqrt();
+                Ok(-imaginary_unit * NumericArrayElement::div(x + imaginary_unit * self, radius)?.ln())
+            }
+
+            #[inline]
+            fn exp(self) -> Result<Self, ProgramError> {
+                Ok(Complex::exp(self))
+            }
+
+            fn exp_m1(self) -> Result<Self, ProgramError> {
+                let (sine, cosine) = self.im.sin_cos();
+                let half_sine = (self.im / 2.0).sin();
+
+                // `cos(b) - 1 = -2 sin(b / 2)²` retains the real correction when `cos(b)` rounds to one.
+                Ok(Complex::new(self.re.exp_m1() * cosine - 2.0 * half_sine * half_sine, self.re.exp() * sine))
+            }
+
+            #[inline]
+            fn log(self) -> Result<Self, ProgramError> {
+                Ok(Complex::ln(self))
+            }
+
+            fn ln_1p(self) -> Result<Self, ProgramError> {
+                if self.re.is_nan() || self.im.is_nan() {
+                    return Ok(Complex::new(<$component>::NAN, <$component>::NAN));
+                }
+
+                let shifted_real = 1.0 + self.re;
+
+                // Near zero, form `|1 + z|² - 1` without rounding away the real component. Away from
+                // zero, scale the magnitude before taking its logarithm to avoid overflow and underflow.
+                let real = if self.re.abs() < 0.5 && self.im.abs() < 0.5 {
+                    0.5 * (self.re * (2.0 + self.re) + self.im * self.im).ln_1p()
+                } else {
+                    let scale = shifted_real.abs().max(self.im.abs());
+                    if scale == 0.0 || scale.is_infinite() {
+                        scale.ln()
+                    } else {
+                        scale.ln() + (shifted_real / scale).hypot(self.im / scale).ln()
+                    }
+                };
+
+                Ok(Complex::new(real, self.im.atan2(shifted_real)))
+            }
+
+            fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
+                // Factor out the argument `p` with the larger real component, so that `log_add_exp(p, q)` is
+                // `p + ln_1p(exp(q - p))` and keeps `ln_1p`'s accuracy for small corrections. The ratio `exp(q - p)`
+                // is formed as `exp(q - re(p)) · exp(-i im(p))`, which rotates by `p`'s phase instead of subtracting
+                // the imaginary components from each other, since that subtraction loses phase when their magnitudes
+                // differ.
+                let (larger, smaller) = if self.re > other.re || (self.re == other.re && self.im > other.im) {
+                    (self, other)
+                } else {
+                    (other, self)
+                };
+                let rotation = Complex::new(larger.im.cos(), larger.im.sin());
+                let ratio = (smaller - Complex::new(larger.re, 0.0)).exp() * rotation.conj();
+                let correction = FloatingPointArrayElement::ln_1p(ratio)?;
+
+                // A principal phase is kept as the plain sum, which preserves tiny corrections. Any other phase is
+                // reduced through `atan2` of the rotated sum, whose sine and cosine reduce even huge arguments exactly,
+                // unlike a floating-point remainder by `2π`.
+                let imaginary = larger.im + correction.im;
+                let pi = std::f64::consts::PI as $component;
+                let imaginary = if (-pi..=pi).contains(&imaginary) {
+                    imaginary
+                } else {
+                    let unit = rotation * (ratio + 1.0);
+                    unit.im.atan2(unit.re)
+                };
+                Ok(Complex::new(larger.re + correction.re, imaginary))
+            }
+
+            #[inline]
+            fn logistic(self) -> Result<Self, ProgramError> {
+                Ok(if self.re >= 0.0 {
+                    Complex::inv(&(Complex::exp(-self) + 1.0))
+                } else {
+                    let exponential = Complex::exp(self);
+                    exponential / (exponential + 1.0)
+                })
+            }
+        }
+    };
+}
+
+// Implements the interchange contract for the low-precision floating-point element types. Conversions into them go
+// through each format's rounding contract, with zero converted to NaN for the exponent-only format. Literal zero
+// construction retains its checked contract, and conversions out of these types widen exactly into `f64`.
+macro_rules! impl_array_element_for_low_precision_floating_point_types {
+    ($($type:ty => ($min_identity:expr, $max_identity:expr)),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Self::from_real(integer_to_f64_round_to_odd(value.unsigned_abs()).copysign(value as f64))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Self::from_real(integer_to_f64_round_to_odd(value))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                // Numerical conversion maps an unrepresentable zero to this format's NaN. Constructing an additive
+                // identity remains checked because returning NaN would violate the zero capability's contract.
+                let value = if Self::data_type() == DataType::F8E8M0FNU && value == 0.0 { f64::NAN } else { value };
+
+                // Microscaling formats have no NaN encoding. Select a deterministic finite result rather than
+                // inheriting target-dependent native conversion behavior for an unrepresentable special value.
+                if matches!(Self::data_type(), DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN)
+                    && value.is_nan()
+                {
+                    return Ok(Self::MAX);
+                }
+                Ok(Self::from_f64(value)?)
+            }
+
+            #[inline]
+            fn zero() -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(0.0)?)
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                $min_identity
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                $max_identity
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                let lhs = self.to_f64();
+                let rhs = other.to_f64();
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Greater {
+                    *other
+                } else {
+                    *self
+                }
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                let lhs = self.to_f64();
+                let rhs = other.to_f64();
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Less {
+                    *other
+                } else {
+                    *self
+                }
+            }
+
+            fn neg(self) -> Result<Self, ProgramError> {
+                if Self::data_type() == DataType::F8E8M0FNU {
+                    return Err(TypeError::invalid(
+                        "cannot negate a scalar of data type `f8e8m0fnu`".to_string(),
+                    ).into());
+                }
+                Ok(Self::from_f64(-self.to_f64())?)
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_real(self.to_f64())
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() + rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() - rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() * rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() / rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn abs(self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64().abs())?)
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                let value = self.to_f64();
+                if value.is_nan() || value == 0.0 { Ok(self) } else { Self::from_real(value.signum()) }
+            }
+        }
+
+        impl RealArrayElement for $type {
+            #[inline]
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() % rhs.to_f64())?)
+            }
+        }
+
+        impl_floating_point_array_element_for_real_floating_point_types!(@low $type);
+    )+};
+}
+
+impl_array_element_for_low_precision_floating_point_types!(
+    f4e2m1fn => (f4e2m1fn::MAX, f4e2m1fn::MIN),
+    f6e2m3fn => (f6e2m3fn::MAX, f6e2m3fn::MIN),
+    f6e3m2fn => (f6e3m2fn::MAX, f6e3m2fn::MIN),
+    f8e3m4 => (f8e3m4::INFINITY, f8e3m4::NEG_INFINITY),
+    f8e4m3 => (f8e4m3::INFINITY, f8e4m3::NEG_INFINITY),
+    f8e4m3fn => (f8e4m3fn::MAX, f8e4m3fn::MIN),
+    f8e4m3fnuz => (f8e4m3fnuz::MAX, f8e4m3fnuz::MIN),
+    f8e4m3b11fnuz => (f8e4m3b11fnuz::MAX, f8e4m3b11fnuz::MIN),
+    f8e5m2 => (f8e5m2::INFINITY, f8e5m2::NEG_INFINITY),
+    f8e5m2fnuz => (f8e5m2fnuz::MAX, f8e5m2fnuz::MIN),
+    f8e8m0fnu => (f8e8m0fnu::MAX, f8e8m0fnu::MIN),
+);
+
+// Implements the interchange contract for the native and half-precision real floating-point element types,
+// whose widening into `f64` (i.e., `$to_real`) is exact for every one of them.
+macro_rules! impl_array_element_for_floating_point_type {
+    (
+        $precision:ident,
+        $type:ty, $from_signed:expr,
+        $from_unsigned:expr,
+        $from_real:expr,
+        $to_real:expr,
+        $abs:expr $(,)?
+    ) => {
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok($from_signed(value))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok($from_unsigned(value))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok($from_real(value))
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::INFINITY
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::NEG_INFINITY
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                let lhs = $to_real(*self);
+                let rhs = $to_real(*other);
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Greater {
+                    *other
+                } else {
+                    *self
+                }
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                let lhs = $to_real(*self);
+                let rhs = $to_real(*other);
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Less {
+                    *other
+                } else {
+                    *self
+                }
+            }
+
+            #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(-self)
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_real($to_real(self))
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self + rhs)
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self - rhs)
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self * rhs)
+            }
+
+            #[inline]
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self / rhs)
+            }
+
+            #[inline]
+            fn abs(self) -> Result<Self, ProgramError> {
+                Ok($abs(self))
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                let value = $to_real(self);
+                if value.is_nan() || value == 0.0 { Ok(self) } else { Self::from_real(value.signum()) }
+            }
+        }
+
+        impl RealArrayElement for $type {
+            #[inline]
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self % rhs)
+            }
+        }
+
+        impl_floating_point_array_element_for_real_floating_point_types!(@$precision $type);
+    };
+}
+
+impl_array_element_for_floating_point_type!(
+    half,
+    bf16,
+    |value: i64| bf16::from_f64(half_conversion_input(
+        integer_to_f64_round_to_odd(value.unsigned_abs()).copysign(value as f64),
+    )),
+    |value: u64| bf16::from_f64(half_conversion_input(integer_to_f64_round_to_odd(value))),
+    |value: f64| bf16::from_f64(half_conversion_input(value)),
+    bf16::to_f64,
+    |value: bf16| bf16::from_f32(value.to_f32().abs()),
+);
+
+impl_array_element_for_floating_point_type!(
+    half,
+    f16,
+    |value: i64| f16::from_f64(value as f64),
+    |value: u64| f16::from_f64(value as f64),
+    |value: f64| f16::from_f64(half_conversion_input(value)),
+    f16::to_f64,
+    |value: f16| f16::from_f32(value.to_f32().abs()),
+);
+
+impl_array_element_for_floating_point_type!(
+    native,
+    f32,
+    |value: i64| value as f32,
+    |value: u64| value as f32,
+    |value: f64| value as f32,
+    f64::from,
+    f32::abs,
+);
+
+impl_array_element_for_floating_point_type!(
+    native,
+    f64,
+    |value: i64| value as f64,
+    |value: u64| value as f64,
+    |value| value,
+    |value| value,
+    f64::abs,
+);
+
+/// Converts an unsigned integer into an intermediate `f64` using round-to-odd. When low bits must be discarded,
+/// truncates the significand and records any nonzero discarded bits in its least significant bit. Subsequent rounding
+/// to a floating-point format with fewer than 52 significand bits therefore preserves the original integer's position
+/// relative to every destination midpoint, avoiding double rounding through an ordinary nearest-rounded `f64`.
+fn integer_to_f64_round_to_odd(value: u64) -> f64 {
+    let shift = 11u32.saturating_sub(value.leading_zeros());
+    let discarded = value & ((1u64 << shift) - 1);
+    let significand = (value >> shift) | u64::from(discarded != 0);
+    (significand as f64) * ((1u64 << shift) as f64)
+}
+
+/// Preserves sticky rounding information across the `half` crate's truncation of the low 32 `f64` mantissa bits.
+/// The retained 21-bit significand is wider than both `f16` and `bf16`, so round-to-odd preserves their nearest-even
+/// results, including sub-normals. NaN payloads may be canonicalized by the destination conversion.
+fn half_conversion_input(value: f64) -> f64 {
+    let bits = value.to_bits();
+    f64::from_bits((bits & !u64::from(u32::MAX)) | (u64::from(bits as u32 != 0) << 32))
+}
+
+// Implements the interchange contract for the complex element types, which place a real source in the real component
+// and preserve both components of a complex source.
+macro_rules! impl_array_element_for_complex_types {
+    ($($component:ty),+ $(,)?) => {$(
+        impl ArrayElement for Complex<$component> {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+                Ok(Self::new(value.re as $component, value.im as $component))
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::new(<$component>::INFINITY, <$component>::INFINITY)
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::new(<$component>::NEG_INFINITY, <$component>::NEG_INFINITY)
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                let select_self = if self.re == other.re { self.im < other.im } else { self.re < other.re };
+                if select_self { *self } else { *other }
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                let select_self = if self.re == other.re { self.im > other.im } else { self.re > other.re };
+                if select_self { *self } else { *other }
+            }
+
+            #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(-self)
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_complex(Complex::new(self.re as f64, self.im as f64))
+            }
+        }
+
+        impl NumericArrayElement for Complex<$component> {
+            type Magnitude = $component;
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self + rhs)
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self - rhs)
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self * rhs)
+            }
+
+            #[inline]
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                // Smith's ratio-based formula avoids forming the denominator's squared magnitude. Keep the operation
+                // order aligned with XLA's `ElementalIrEmitter::EmitComplexDivide`, including its finite overflow
+                // behavior; an additional rescaling would change the results at extreme magnitudes.
+                let result = if rhs.re.abs() < rhs.im.abs() {
+                    let ratio = rhs.re / rhs.im;
+                    let denominator = rhs.im + ratio * rhs.re;
+                    Self::new((ratio * self.re + self.im) / denominator, (ratio * self.im - self.re) / denominator)
+                } else {
+                    let ratio = rhs.im / rhs.re;
+                    let denominator = rhs.re + ratio * rhs.im;
+                    Self::new((ratio * self.im + self.re) / denominator, (self.im - ratio * self.re) / denominator)
+                };
+
+                // Recover exceptional cases only when both components are NaN. A single NaN component is part of
+                // the result and must not trigger recovery. The order below also determines how mixed NaN/Inf
+                // inputs and signed-zero denominators are handled.
+                if result.re.is_nan() && result.im.is_nan() {
+                    if rhs.re == 0.0 && rhs.im == 0.0 && (!self.re.is_nan() || !self.im.is_nan()) {
+                        let infinity = <$component>::INFINITY.copysign(rhs.re);
+                        return Ok(Self::new(infinity * self.re, infinity * self.im));
+                    }
+                    if (self.re.is_infinite() || self.im.is_infinite()) && rhs.re.is_finite() && rhs.im.is_finite() {
+                        let real = (if self.re.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(self.re);
+                        let imaginary = (if self.im.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(self.im);
+                        return Ok(Self::new(
+                            <$component>::INFINITY * (real * rhs.re + imaginary * rhs.im),
+                            <$component>::INFINITY * (imaginary * rhs.re - real * rhs.im),
+                        ));
+                    }
+                    if (rhs.re.is_infinite() || rhs.im.is_infinite()) && self.re.is_finite() && self.im.is_finite() {
+                        let real = (if rhs.re.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(rhs.re);
+                        let imaginary = (if rhs.im.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(rhs.im);
+                        return Ok(Self::new(
+                            0.0 * (self.re * real + self.im * imaginary),
+                            0.0 * (self.im * real - self.re * imaginary),
+                        ));
+                    }
+                }
+                Ok(result)
+            }
+
+            #[inline]
+            fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+                Ok(self.norm())
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                let norm = self.norm();
+                Ok(if norm == 0.0 { self } else { self / norm })
+            }
+        }
+
+        impl_floating_point_array_element_for_complex_floating_point_types!($component);
+    )+};
+}
+
+impl_array_element_for_complex_types!(f32, f64);
+
+/// Encodes `elements`, provided in logical row-major order, into a new physical storage buffer for `r#type`. A missing
+/// [`Layout`](crate::arrays::Layout) means dense row-major storage, while explicit strided and tiled layouts determine
+/// where each element is written. Bytes that no logical element occupies, namely layout holes and tile padding, are
+/// initialized to zero.
+///
+/// # Parameters
+///
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
+///   - `elements`: Elements of the array provided in row-major order. Their type must represent `r#type`'s
+///     [`DataType`], and their count must equal the array's logical element count.
+pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> Result<Vec<u8>, ProgramError> {
+    if r#type.data_type() != T::DATA_TYPE {
+        return Err(TypeError::invalid(format!(
+            "cannot encode `{}` values as array elements of data type `{}`",
+            T::DATA_TYPE,
+            r#type.data_type(),
+        ))
+        .into());
+    }
+    let addressing = ArrayAddressing::new(r#type.clone())?;
+    if elements.len() != addressing.element_count() {
+        return Err(TypeError::invalid(format!(
+            "array type `{}` requires {} logical elements but got {}",
+            r#type,
+            addressing.element_count(),
+            elements.len(),
+        ))
+        .into());
+    }
+    debug_assert_eq!(T::BYTE_COUNT, addressing.element_byte_width());
+
+    // Starting from zero establishes the required contents of layout holes and tile padding without tracking them
+    // separately from the element ranges that are written below.
+    let mut storage = vec![0; addressing.storage_byte_len()];
+    if addressing.is_dense_row_major() {
+        // Dense row-major storage has the same ordering as `elements`, so it needs no per-element address lookup.
+        for (element, bytes) in elements.iter().zip(storage.chunks_exact_mut(T::BYTE_COUNT)) {
+            element.encode(bytes);
+        }
+    } else {
+        // Explicit layouts scatter each logical row-major element into its physical storage range.
+        for (index, element) in elements.iter().enumerate() {
+            element.encode(&mut storage[addressing.byte_range_for_flat_index(index)]);
+        }
+    }
+
+    Ok(storage)
+}
+
+/// Validates the provided logical element bytes and places them into a new physical storage buffer for `r#type`. The
+/// input is the row-major concatenation of the element encodings alone, without layout holes or tile padding. The
+/// [`Layout`](crate::arrays::Layout) of the provided [`ArrayType`] determines where each element is written, and all
+/// unoccupied storage bytes are initialized to zero.
+///
+/// # Parameters
+///
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
+///   - `bytes`: Concatenated logical element byte encodings provided in row-major order.
+pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let addressing = ArrayAddressing::new(r#type.clone())?;
+    if bytes.len() != addressing.logical_byte_len() {
+        return Err(TypeError::invalid(format!(
+            "array type `{}` requires {} logical element bytes but got {}",
+            r#type,
+            addressing.logical_byte_len(),
+            bytes.len(),
+        ))
+        .into());
+    }
+
+    let element_byte_width = addressing.element_byte_width();
+    let storage = if addressing.is_dense_row_major() {
+        // Logical and physical order coincide, and dense storage contains no holes or padding to initialize.
+        bytes.to_vec()
+    } else {
+        // Zero initialization establishes all unoccupied storage bytes before logical elements are scattered in place.
+        let mut storage = vec![0; addressing.storage_byte_len()];
+        for element in 0..addressing.element_count() {
+            let logical_start = element * element_byte_width;
+            let logical_range = logical_start..logical_start + element_byte_width;
+            storage[addressing.byte_range_for_flat_index(element)].copy_from_slice(&bytes[logical_range]);
+        }
+        storage
+    };
+
+    // The scattered storage has the layout's length and zero holes by construction, so validating it checks exactly the
+    // portable element encodings, reported by logical element index.
+    addressing.validate_storage_bytes(&storage)?;
+    Ok(storage)
+}
+
+/// Validates physical array storage and decodes its elements as `T` in logical row-major order. Physical layout order,
+/// holes, and tile padding are not exposed in the returned vector.
+///
+/// # Parameters
+///
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
+///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
+pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<T>, ProgramError> {
+    if r#type.data_type() != T::DATA_TYPE {
+        return Err(TypeError::invalid(format!(
+            "cannot decode array elements of data type `{}` as `{}` values",
+            r#type.data_type(),
+            T::DATA_TYPE,
+        ))
+        .into());
+    }
+    let addressing = ArrayAddressing::new(r#type.clone())?;
+
+    // Validation makes every subsequent codec call infallible and rejects nonzero holes or tile padding.
+    addressing.validate_storage_bytes(bytes)?;
+    debug_assert_eq!(T::BYTE_COUNT, addressing.element_byte_width());
+    if addressing.is_dense_row_major() {
+        // Dense storage can be decoded sequentially without consulting the addressing descriptor per element.
+        return Ok(bytes.chunks_exact(T::BYTE_COUNT).map(T::decode).collect());
+    }
+
+    // Gather explicit physical layouts back into logical row-major order.
+    Ok((0..addressing.element_count())
+        .map(|element| T::decode(&bytes[addressing.byte_range_for_flat_index(element)]))
+        .collect())
+}
+
+/// Validates physical array storage and returns its encoded elements as contiguous logical row-major bytes. Layout
+/// holes and tile padding must contain zero and are omitted from the returned representation.
+///
+/// # Parameters
+///
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
+///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
+pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let addressing = ArrayAddressing::new(r#type.clone())?;
+
+    // Validate before dropping physical-layout information so malformed element encodings and nonzero padding cannot
+    // be hidden by the logical projection.
+    addressing.validate_storage_bytes(bytes)?;
+    if addressing.is_dense_row_major() {
+        // Dense physical storage is already the requested contiguous logical representation.
+        return Ok(bytes.to_vec());
+    }
+
+    // Gather only logical element ranges, deliberately omitting holes and tile padding.
+    let mut logical_bytes = Vec::with_capacity(addressing.logical_byte_len());
+    for element in 0..addressing.element_count() {
+        logical_bytes.extend_from_slice(&bytes[addressing.byte_range_for_flat_index(element)]);
+    }
+
+    Ok(logical_bytes)
+}
+
+/// Validates one element's data-type-specific bit representation. A sub-byte element occupies the low
+/// [`bit_width`](DataType::bit_width) bits of one storage byte, as two's complement for the [`i1`], [`i2`], and [`i4`]
+/// element types in this module, so all of its higher bits must be zero. A Boolean occupies a whole byte whose only
+/// valid encodings are `0` and `1`.
+pub(crate) fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> Result<(), ProgramError> {
+    let valid = match (data_type, data_type.bit_width()) {
+        (DataType::Boolean, _) => matches!(bytes, [0 | 1]),
+        (_, bit_width @ 1..8) => bytes[0] >> bit_width == 0,
+        _ => true,
+    };
+    if !valid {
+        return Err(TypeError::invalid(format!(
+            "array element {element} has invalid `{data_type}` byte encoding {bytes:?}",
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use approx::{assert_abs_diff_eq, assert_relative_eq};
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::types::dimensions::{Dimension, Shape};
+    use crate::arrays::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
+    use crate::programs::ProgramError;
+
+    use super::*;
+
+    #[test]
+    fn test_array_element_conversions() {
+        // Signed sub-byte destinations narrow modularly into their declared bit width, and real inputs truncate
+        // toward zero and saturate at the logical bounds.
+        assert_eq!(i4::from_signed(-3), Ok(i4::new(-3).unwrap()));
+        assert_eq!(i4::from_signed(23), Ok(i4::new(7).unwrap()));
+        assert_eq!(i4::from_unsigned(9), Ok(i4::new(-7).unwrap()));
+        assert_eq!(i4::from_real(-2.9), Ok(i4::new(-2).unwrap()));
+        assert_eq!(i4::from_real(20.0), Ok(i4::MAX));
+        assert_eq!(i4::from_real(-20.0), Ok(i4::MIN));
+        assert_eq!(i1::from_real(1.0), Ok(i1::MAX));
+        assert_eq!(i2::from_real(f64::INFINITY), Ok(i2::MAX));
+        assert_eq!(i2::from_real(f64::NEG_INFINITY), Ok(i2::MIN));
+        assert_eq!(i4::from_real(f64::NAN), Ok(i4::new(0).unwrap()));
+        assert_eq!(u2::from_signed(-1), Ok(u2::new(3).unwrap()));
+        assert_eq!(u2::from_unsigned(5), Ok(u2::new(1).unwrap()));
+        assert_eq!(u2::from_real(3.7), Ok(u2::new(3).unwrap()));
+        assert_eq!(u2::from_real(4.0), Ok(u2::MAX));
+        assert_eq!(u1::from_real(2.0), Ok(u1::MAX));
+        assert_eq!(u4::from_real(f64::INFINITY), Ok(u4::MAX));
+        assert_eq!(u4::from_real(f64::NEG_INFINITY), Ok(u4::MIN));
+        assert_eq!(u4::from_real(f64::NAN), Ok(u4::MIN));
+
+        // Native integer destinations follow Rust's `as` contract: integer inputs narrow with two's-complement
+        // truncation, and real inputs truncate toward zero.
+        assert_eq!(i8::from_signed(300), Ok(44));
+        assert_eq!(u8::from_signed(-1), Ok(255));
+        assert_eq!(i32::from_real(-1.9), Ok(-1));
+
+        // Floating-point destinations round to nearest with exact ties toward the even encoding: 2049 sits exactly
+        // between the representable `f16` values 2048 and 2050.
+        assert_eq!(f16::from_signed(2049).map(f16::to_f64), Ok(2048.0));
+        assert_eq!(bf16::from_real(1.5).map(bf16::to_f64), Ok(1.5));
+        assert_eq!(f8e4m3fn::from_real(0.3).map(f8e4m3fn::to_f64), Ok(0.3125));
+        assert_eq!(f8e4m3fn::from_unsigned(3).map(f8e4m3fn::to_f64), Ok(3.0));
+
+        // Complex destinations place every real-category input in their real component.
+        assert_eq!(Complex::<f32>::from_real(2.5), Ok(Complex::new(2.5, 0.0)));
+        assert_eq!(Complex::<f64>::from_signed(-3), Ok(Complex::new(-3.0, 0.0)));
+
+        // Boolean destinations test for a nonzero value, so even NaN converts to `true` because it is not zero.
+        assert_eq!(bool::from_signed(-5), Ok(true));
+        assert_eq!(bool::from_unsigned(0), Ok(false));
+        assert_eq!(bool::from_real(0.5), Ok(true));
+        assert_eq!(bool::from_real(f64::NAN), Ok(true));
+
+        // `convert_to` routes each source through its own category's carrier, covering all four categories.
+        assert_eq!(i32::convert_to::<f16>(-7).map(f16::to_f64), Ok(-7.0));
+        assert_eq!(u4::convert_to::<i2>(u4::new(5).unwrap()), Ok(i2::new(1).unwrap()));
+        assert_eq!(f64::convert_to::<u8>(200.9), Ok(200));
+        assert_eq!(bool::convert_to::<bf16>(true).map(bf16::to_f64), Ok(1.0));
+    }
+
+    #[test]
+    fn test_array_element_conversion_losslessness() {
+        // Identity conversions are exact for every category, including the extremes of the widest carriers, because
+        // each carrier holds every source value of its category exactly.
+        assert_eq!(u64::convert_to::<u64>(u64::MAX), Ok(u64::MAX));
+        assert_eq!(i64::convert_to::<i64>(i64::MIN), Ok(i64::MIN));
+        assert_eq!(i4::convert_to::<i4>(i4::new(-8).unwrap()), Ok(i4::new(-8).unwrap()));
+        assert_eq!(bool::convert_to::<bool>(true), Ok(true));
+        assert_eq!(Complex::<f32>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)));
+
+        // Integer-to-integer routing never touches a float: values above 2^53 that `f64` cannot represent survive
+        // exactly, including exact two's-complement truncation of the low bits.
+        let large = (1_i64 << 60) + 1;
+        assert_eq!(i64::convert_to::<i64>(large), Ok(large));
+        assert_eq!(u64::convert_to::<u32>(0xFFFF_FFFF_0000_0001), Ok(1));
+
+        // The destination performs the conversion's only rounding step directly on the exact `u64` carrier value, so
+        // no double rounding is possible: this value rounds differently through an intermediate `f64`.
+        let value = (1_u64 << 63) + (1_u64 << 39) + 1;
+        assert_ne!((value as f64) as f32, value as f32);
+        assert_eq!(u64::convert_to::<f32>(value), Ok(value as f32));
+
+        // The low bits beyond the half crate's retained significand still distinguish a midpoint from its neighbors.
+        let midpoint = 1.0f64 + 1.0 / 256.0;
+        assert_eq!(bf16::from_real(midpoint.next_down()).unwrap().to_bits(), 0x3f80);
+        assert_eq!(bf16::from_real(midpoint).unwrap().to_bits(), 0x3f80);
+        assert_eq!(bf16::from_real(midpoint.next_up()).unwrap().to_bits(), 0x3f81);
+        let midpoint = 1.0f64 + 1.0 / 2048.0;
+        assert_eq!(f16::from_real(midpoint.next_down()).unwrap().to_bits(), 0x3c00);
+        assert_eq!(f16::from_real(midpoint).unwrap().to_bits(), 0x3c00);
+        assert_eq!(f16::from_real(midpoint.next_up()).unwrap().to_bits(), 0x3c01);
+        let midpoint = 2.0f64.powi(-134);
+        assert_eq!(bf16::from_real(midpoint).unwrap().to_bits(), 0);
+        assert_eq!(bf16::from_real(midpoint.next_up()).unwrap().to_bits(), 1);
+        let midpoint = 2.0f64.powi(-25);
+        assert_eq!(f16::from_real(midpoint).unwrap().to_bits(), 0);
+        assert_eq!(f16::from_real(midpoint.next_up()).unwrap().to_bits(), 1);
+
+        // Large integer values immediately around a BF16 midpoint must retain their discarded low bits.
+        let midpoint = (1_u64 << 60) + (1_u64 << 52);
+        assert_eq!(bf16::from_unsigned(midpoint - 1).unwrap().to_bits(), 0x5d80);
+        assert_eq!(bf16::from_unsigned(midpoint).unwrap().to_bits(), 0x5d80);
+        assert_eq!(bf16::from_unsigned(midpoint + 1).unwrap().to_bits(), 0x5d81);
+        assert_eq!(bf16::from_signed(-(midpoint as i64) - 1).unwrap().to_bits(), 0xdd81);
+        assert_eq!(bf16::from_signed(i64::MIN).unwrap().to_bits(), 0xdf00);
+        assert_eq!(bf16::from_unsigned(u64::MAX).unwrap().to_bits(), 0x5f80);
+
+        // The exponent-only format has the same hazard at the arithmetic midpoint of neighboring powers of two.
+        let midpoint = 3_u64 << 60;
+        assert_eq!(f8e8m0fnu::from_unsigned(midpoint - 1).unwrap().to_bits(), 0xbc);
+        assert_eq!(f8e8m0fnu::from_unsigned(midpoint).unwrap().to_bits(), 0xbd);
+        assert_eq!(f8e8m0fnu::from_unsigned(midpoint + 1).unwrap().to_bits(), 0xbd);
+
+        // Widening a low-precision float into `f64` is exact, so casting out and back is the identity.
+        let element = f8e4m3fn::from_real(0.3125).unwrap();
+        assert_eq!(f8e4m3fn::convert_to::<f64>(element), Ok(0.3125));
+        assert_eq!(f64::convert_to::<f8e4m3fn>(0.3125), Ok(element));
+    }
+
+    #[test]
+    fn test_array_element_conversion_overflow_semantics() {
+        // Overflowing conversions follow each floating-point format's own class: IEEE-style formats produce signed
+        // infinities, `fn`/`fnuz` formats produce their NaN, and microscaling formats saturate to their finite range.
+        assert_eq!(f8e5m2::from_real(1e6).map(f8e5m2::to_f64), Ok(f64::INFINITY));
+        assert_eq!(f8e5m2::from_real(-1e6).map(f8e5m2::to_f64), Ok(f64::NEG_INFINITY));
+        assert!(f8e4m3fn::from_real(1e6).unwrap().is_nan());
+        assert!(f8e4m3fnuz::from_real(1e6).unwrap().is_nan());
+        assert_eq!(f4e2m1fn::from_real(1e6).map(f4e2m1fn::to_f64), Ok(6.0));
+        assert_eq!(f4e2m1fn::from_real(-1e6).map(f4e2m1fn::to_f64), Ok(-6.0));
+
+        // Microscaling conversion canonicalizes NaN to positive maximum and saturates signed infinities.
+        assert_eq!(f4e2m1fn::from_real(f64::NAN), Ok(f4e2m1fn::MAX));
+        assert_eq!(f4e2m1fn::from_real(-f64::NAN), Ok(f4e2m1fn::MAX));
+        assert_eq!(f4e2m1fn::from_real(f64::INFINITY), Ok(f4e2m1fn::MAX));
+        assert_eq!(f4e2m1fn::from_real(f64::NEG_INFINITY), Ok(f4e2m1fn::MIN));
+        assert_eq!(f6e2m3fn::from_real(f64::NAN), Ok(f6e2m3fn::MAX));
+        assert_eq!(f6e2m3fn::from_real(-f64::NAN), Ok(f6e2m3fn::MAX));
+        assert_eq!(f6e2m3fn::from_real(f64::INFINITY), Ok(f6e2m3fn::MAX));
+        assert_eq!(f6e2m3fn::from_real(f64::NEG_INFINITY), Ok(f6e2m3fn::MIN));
+        assert_eq!(f6e3m2fn::from_real(f64::NAN), Ok(f6e3m2fn::MAX));
+        assert_eq!(f6e3m2fn::from_real(-f64::NAN), Ok(f6e3m2fn::MAX));
+        assert_eq!(f6e3m2fn::from_real(f64::INFINITY), Ok(f6e3m2fn::MAX));
+        assert_eq!(f6e3m2fn::from_real(f64::NEG_INFINITY), Ok(f6e3m2fn::MIN));
+        // Numerical conversion can return a NaN encoding even though constructing an additive identity cannot.
+        assert_eq!(f8e8m0fnu::from_real(0.0).unwrap().to_bits(), 0xff);
+        assert_eq!(f8e8m0fnu::from_real(-0.0).unwrap().to_bits(), 0xff);
+        assert_eq!(f8e8m0fnu::from_signed(0).unwrap().to_bits(), 0xff);
+        assert_eq!(f8e8m0fnu::from_unsigned(0).unwrap().to_bits(), 0xff);
+
+        // Real inputs into native integer destinations saturate at the destination's bounds, and NaN collapses to
+        // zero, matching Rust's `as` contract.
+        assert_eq!(i8::from_real(1e10), Ok(127));
+        assert_eq!(i8::from_real(-1e10), Ok(-128));
+        assert_eq!(u8::from_real(-5.0), Ok(0));
+        assert_eq!(i8::from_real(f64::NAN), Ok(0));
+    }
+
+    #[test]
+    fn test_array_element_complex_conversions() {
+        // Every destination that cannot hold an imaginary part projects a complex input onto its real component and
+        // discards the imaginary one.
+        assert_eq!(f32::from_complex(Complex::new(3.5, -2.0)), Ok(3.5));
+        assert_eq!(i8::from_complex(Complex::new(2.9, 7.0)), Ok(2));
+        assert_eq!(Complex::<f64>::convert_to::<f32>(Complex::new(1.5, 2.5)), Ok(1.5));
+
+        // Complex destinations preserve both components, and the Boolean destination tests both, so a purely
+        // imaginary value still converts to `true`.
+        assert_eq!(Complex::<f64>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)),);
+        assert_eq!(bool::from_complex(Complex::new(0.0, 2.0)), Ok(true));
+        assert_eq!(bool::from_complex(Complex::new(0.0, 0.0)), Ok(false));
+    }
+
+    #[test]
+    fn test_array_element_zero() {
+        assert_eq!(bool::zero(), Ok(false));
+        assert_eq!(i1::zero(), Ok(i1::from_bits(0).unwrap()));
+        assert_eq!(i2::zero(), Ok(i2::from_bits(0).unwrap()));
+        assert_eq!(i4::zero(), Ok(i4::from_bits(0).unwrap()));
+        assert_eq!(u1::zero(), Ok(u1::from_bits(0).unwrap()));
+        assert_eq!(u2::zero(), Ok(u2::from_bits(0).unwrap()));
+        assert_eq!(u4::zero(), Ok(u4::from_bits(0).unwrap()));
+        assert_eq!(i8::zero(), Ok(0));
+        assert_eq!(i16::zero(), Ok(0));
+        assert_eq!(i32::zero(), Ok(0));
+        assert_eq!(i64::zero(), Ok(0));
+        assert_eq!(u8::zero(), Ok(0));
+        assert_eq!(u16::zero(), Ok(0));
+        assert_eq!(u32::zero(), Ok(0));
+        assert_eq!(u64::zero(), Ok(0));
+
+        // Check exact floating-point encodings, including positive zero.
+        assert_eq!(f4e2m1fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f6e2m3fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f6e3m2fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e3m4::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3fnuz::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3b11fnuz::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e5m2::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e5m2fnuz::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(bf16::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f16::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f32::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f64::zero().unwrap().to_bits(), 0x0);
+        let complex = Complex::<f32>::zero().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x0);
+        assert_eq!(complex.im.to_bits(), 0);
+        let complex = Complex::<f64>::zero().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x0);
+        assert_eq!(complex.im.to_bits(), 0);
+        assert!(matches!(
+            f8e8m0fnu::zero(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_one() {
+        assert_eq!(bool::one(), Ok(true));
+        assert_eq!(i1::one(), Ok(i1::from_bits(1).unwrap()));
+        assert_eq!(i2::one(), Ok(i2::from_bits(1).unwrap()));
+        assert_eq!(i4::one(), Ok(i4::from_bits(1).unwrap()));
+        assert_eq!(u1::one(), Ok(u1::from_bits(1).unwrap()));
+        assert_eq!(u2::one(), Ok(u2::from_bits(1).unwrap()));
+        assert_eq!(u4::one(), Ok(u4::from_bits(1).unwrap()));
+        assert_eq!(i8::one(), Ok(1));
+        assert_eq!(i16::one(), Ok(1));
+        assert_eq!(i32::one(), Ok(1));
+        assert_eq!(i64::one(), Ok(1));
+        assert_eq!(u8::one(), Ok(1));
+        assert_eq!(u16::one(), Ok(1));
+        assert_eq!(u32::one(), Ok(1));
+        assert_eq!(u64::one(), Ok(1));
+
+        // Check exact floating-point encodings, including positive zero.
+        assert_eq!(f4e2m1fn::one().unwrap().to_bits(), 0x2);
+        assert_eq!(f6e2m3fn::one().unwrap().to_bits(), 0x8);
+        assert_eq!(f6e3m2fn::one().unwrap().to_bits(), 0xc);
+        assert_eq!(f8e3m4::one().unwrap().to_bits(), 0x30);
+        assert_eq!(f8e4m3::one().unwrap().to_bits(), 0x38);
+        assert_eq!(f8e4m3fn::one().unwrap().to_bits(), 0x38);
+        assert_eq!(f8e4m3fnuz::one().unwrap().to_bits(), 0x40);
+        assert_eq!(f8e4m3b11fnuz::one().unwrap().to_bits(), 0x58);
+        assert_eq!(f8e5m2::one().unwrap().to_bits(), 0x3c);
+        assert_eq!(f8e5m2fnuz::one().unwrap().to_bits(), 0x40);
+        assert_eq!(f8e8m0fnu::one().unwrap().to_bits(), 0x7f);
+        assert_eq!(bf16::one().unwrap().to_bits(), 0x3f80);
+        assert_eq!(f16::one().unwrap().to_bits(), 0x3c00);
+        assert_eq!(f32::one().unwrap().to_bits(), 0x3f800000);
+        assert_eq!(f64::one().unwrap().to_bits(), 0x3ff0000000000000);
+        let complex = Complex::<f32>::one().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x3f800000);
+        assert_eq!(complex.im.to_bits(), 0);
+        let complex = Complex::<f64>::one().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x3ff0000000000000);
+        assert_eq!(complex.im.to_bits(), 0);
+    }
+
+    #[test]
+    fn test_array_element_min_identity() {
+        // Minimum reductions start from the upper bound, including `true` for Boolean conjunction.
+        assert_eq!(bool::min_identity(), true);
+        assert_eq!(i1::min_identity(), i1::MAX);
+        assert_eq!(i2::min_identity(), i2::MAX);
+        assert_eq!(i4::min_identity(), i4::MAX);
+        assert_eq!(i8::min_identity(), i8::MAX);
+        assert_eq!(i16::min_identity(), i16::MAX);
+        assert_eq!(i32::min_identity(), i32::MAX);
+        assert_eq!(i64::min_identity(), i64::MAX);
+        assert_eq!(u1::min_identity(), u1::MAX);
+        assert_eq!(u2::min_identity(), u2::MAX);
+        assert_eq!(u4::min_identity(), u4::MAX);
+        assert_eq!(u8::min_identity(), u8::MAX);
+        assert_eq!(u16::min_identity(), u16::MAX);
+        assert_eq!(u32::min_identity(), u32::MAX);
+        assert_eq!(u64::min_identity(), u64::MAX);
+
+        // Floating-point formats use positive infinity when available and their largest finite encoding otherwise.
+        assert_eq!(f4e2m1fn::min_identity().to_bits(), 0x07);
+        assert_eq!(f6e2m3fn::min_identity().to_bits(), 0x1f);
+        assert_eq!(f6e3m2fn::min_identity().to_bits(), 0x1f);
+        assert_eq!(f8e3m4::min_identity().to_bits(), 0x70);
+        assert_eq!(f8e4m3::min_identity().to_bits(), 0x78);
+        assert_eq!(f8e4m3fn::min_identity().to_bits(), 0x7e);
+        assert_eq!(f8e4m3fnuz::min_identity().to_bits(), 0x7f);
+        assert_eq!(f8e4m3b11fnuz::min_identity().to_bits(), 0x7f);
+        assert_eq!(f8e5m2::min_identity().to_bits(), 0x7c);
+        assert_eq!(f8e5m2fnuz::min_identity().to_bits(), 0x7f);
+        assert_eq!(f8e8m0fnu::min_identity().to_bits(), 0xfe);
+        assert_eq!(bf16::min_identity().to_bits(), 0x7f80);
+        assert_eq!(f16::min_identity().to_bits(), 0x7c00);
+        assert_eq!(f32::min_identity(), f32::INFINITY);
+        assert_eq!(f64::min_identity(), f64::INFINITY);
+
+        // Both components must bound lexicographic comparisons, including ties at an infinite real component.
+        let complex32 = Complex::<f32>::min_identity();
+        assert_eq!(complex32.re, f32::INFINITY);
+        assert_eq!(complex32.im, f32::INFINITY);
+        let complex64 = Complex::<f64>::min_identity();
+        assert_eq!(complex64.re, f64::INFINITY);
+        assert_eq!(complex64.im, f64::INFINITY);
+    }
+
+    #[test]
+    fn test_array_element_max_identity() {
+        // Maximum reductions start from the lower bound, including `false` for Boolean disjunction.
+        assert_eq!(bool::max_identity(), false);
+        assert_eq!(i1::max_identity(), i1::MIN);
+        assert_eq!(i2::max_identity(), i2::MIN);
+        assert_eq!(i4::max_identity(), i4::MIN);
+        assert_eq!(i8::max_identity(), i8::MIN);
+        assert_eq!(i16::max_identity(), i16::MIN);
+        assert_eq!(i32::max_identity(), i32::MIN);
+        assert_eq!(i64::max_identity(), i64::MIN);
+        assert_eq!(u1::max_identity(), u1::MIN);
+        assert_eq!(u2::max_identity(), u2::MIN);
+        assert_eq!(u4::max_identity(), u4::MIN);
+        assert_eq!(u8::max_identity(), u8::MIN);
+        assert_eq!(u16::max_identity(), u16::MIN);
+        assert_eq!(u32::max_identity(), u32::MIN);
+        assert_eq!(u64::max_identity(), u64::MIN);
+
+        // Signed floating-point formats use negative infinity or their lowest finite encoding.
+        assert_eq!(f4e2m1fn::max_identity().to_bits(), 0x0f);
+        assert_eq!(f6e2m3fn::max_identity().to_bits(), 0x3f);
+        assert_eq!(f6e3m2fn::max_identity().to_bits(), 0x3f);
+        assert_eq!(f8e3m4::max_identity().to_bits(), 0xf0);
+        assert_eq!(f8e4m3::max_identity().to_bits(), 0xf8);
+        assert_eq!(f8e4m3fn::max_identity().to_bits(), 0xfe);
+        assert_eq!(f8e4m3fnuz::max_identity().to_bits(), 0xff);
+        assert_eq!(f8e4m3b11fnuz::max_identity().to_bits(), 0xff);
+        assert_eq!(f8e5m2::max_identity().to_bits(), 0xfc);
+        assert_eq!(f8e5m2fnuz::max_identity().to_bits(), 0xff);
+        assert_eq!(bf16::max_identity().to_bits(), 0xff80);
+        assert_eq!(f16::max_identity().to_bits(), 0xfc00);
+        assert_eq!(f32::max_identity(), f32::NEG_INFINITY);
+        assert_eq!(f64::max_identity(), f64::NEG_INFINITY);
+
+        // The positive-only format has neither zero nor negative values; its lower bound is 2^-127.
+        assert_eq!(f8e8m0fnu::max_identity().to_bits(), 0x00);
+        assert_eq!(f8e8m0fnu::max_identity().to_f64(), 2f64.powi(-127));
+
+        let complex32 = Complex::<f32>::max_identity();
+        assert_eq!(complex32.re, f32::NEG_INFINITY);
+        assert_eq!(complex32.im, f32::NEG_INFINITY);
+        let complex64 = Complex::<f64>::max_identity();
+        assert_eq!(complex64.re, f64::NEG_INFINITY);
+        assert_eq!(complex64.im, f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_array_element_min() {
+        // Ordered elements include Booleans and sub-byte integers.
+        assert_eq!(ArrayElement::min(&false, &true), false);
+        assert_eq!(ArrayElement::min(&-3i32, &2), -3);
+        assert_eq!(
+            ArrayElement::min(&i4::from_bits(13).unwrap(), &i4::from_bits(2).unwrap()),
+            i4::from_bits(13).unwrap(),
+        );
+        assert_eq!(ArrayElement::min(&f8e8m0fnu::MIN, &f8e8m0fnu::MAX).to_bits(), 0x00);
+
+        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either argument order.
+        let nan = f32::from_bits(0x7fc0_1234);
+        let other_nan = f32::from_bits(0x7fc0_5678);
+        assert_eq!(ArrayElement::min(&nan, &1.0).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::min(&1.0, &nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::min(&nan, &other_nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::min(&-0.0f32, &0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(ArrayElement::min(&0.0f32, &-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(ArrayElement::min(&f16::from_f32(-0.0), &f16::ZERO).to_bits(), f16::from_f32(-0.0).to_bits());
+
+        // Complex selection is lexicographic, and ties or unordered deciding comparisons select `other`.
+        assert_eq!(ArrayElement::min(&Complex::new(1.0f32, 1.0), &Complex::new(1.0, 2.0)), Complex::new(1.0, 1.0));
+        assert_eq!(ArrayElement::min(&Complex::new(nan, 1.0), &Complex::new(2.0, 3.0)), Complex::new(2.0, 3.0));
+        assert_eq!(
+            ArrayElement::min(&Complex::new(1.0f32, -0.0), &Complex::new(1.0, 0.0)).im.to_bits(),
+            0.0f32.to_bits(),
+        );
+    }
+
+    #[test]
+    fn test_array_element_max() {
+        // Ordered elements include Booleans and sub-byte integers.
+        assert_eq!(ArrayElement::max(&false, &true), true);
+        assert_eq!(ArrayElement::max(&-3i32, &2), 2);
+        assert_eq!(
+            ArrayElement::max(&i4::from_bits(13).unwrap(), &i4::from_bits(2).unwrap()),
+            i4::from_bits(2).unwrap(),
+        );
+        assert_eq!(ArrayElement::max(&f8e8m0fnu::MIN, &f8e8m0fnu::MAX).to_bits(), 0xfe);
+
+        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either argument order.
+        let nan = f32::from_bits(0x7fc0_1234);
+        let other_nan = f32::from_bits(0x7fc0_5678);
+        assert_eq!(ArrayElement::max(&nan, &1.0).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::max(&1.0, &nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::max(&nan, &other_nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::max(&-0.0f32, &0.0).to_bits(), (0.0f32).to_bits());
+        assert_eq!(ArrayElement::max(&0.0f32, &-0.0).to_bits(), (0.0f32).to_bits());
+        assert_eq!(ArrayElement::max(&f16::from_f32(-0.0), &f16::ZERO).to_bits(), f16::from_f32(0.0).to_bits());
+
+        // Complex selection is lexicographic, and ties or unordered deciding comparisons select `other`.
+        assert_eq!(ArrayElement::max(&Complex::new(1.0f32, 1.0), &Complex::new(1.0, 2.0)), Complex::new(1.0, 2.0));
+        assert_eq!(ArrayElement::max(&Complex::new(nan, 1.0), &Complex::new(2.0, 3.0)), Complex::new(2.0, 3.0));
+        assert_eq!(
+            ArrayElement::max(&Complex::new(1.0f32, -0.0), &Complex::new(1.0, 0.0)).im.to_bits(),
+            0.0f32.to_bits(),
+        );
+    }
+
+    #[test]
+    fn test_array_element_neg() {
+        assert_eq!(ArrayElement::neg(false), Ok(true));
+        assert_eq!(ArrayElement::neg(true), Ok(false));
+
+        // Integer negation wraps in the declared width, including unsigned and one-bit elements.
+        assert_eq!(ArrayElement::neg(i8::MIN), Ok(i8::MIN));
+        assert_eq!(ArrayElement::neg(1u64), Ok(u64::MAX));
+        assert_eq!(ArrayElement::neg(i1::MIN), Ok(i1::MIN));
+        assert_eq!(ArrayElement::neg(i4::new(3).unwrap()), Ok(i4::new(-3).unwrap()));
+        assert_eq!(ArrayElement::neg(u2::new(1).unwrap()), Ok(u2::MAX));
+        assert_eq!(ArrayElement::neg(0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(ArrayElement::neg(f16::from_f32(1.5)), Ok(f16::from_f32(-1.5)));
+        assert_eq!(ArrayElement::neg(f4e2m1fn::from_f64(1.5).unwrap()).unwrap().to_bits(), 0xb);
+        assert_eq!(ArrayElement::neg(Complex::new(1.0f64, -2.0)), Ok(Complex::new(-1.0, 2.0)));
+        assert!(matches!(
+            ArrayElement::neg(f8e8m0fnu::one().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot negate a scalar of data type `f8e8m0fnu`",
+        ));
+    }
+
+    #[test]
+    fn test_numeric_array_element_add() {
+        assert_eq!(NumericArrayElement::add(i64::MAX, 1), Ok(i64::MIN));
+        assert_eq!(NumericArrayElement::add(u8::MAX, 1), Ok(0));
+        assert_eq!(NumericArrayElement::add(i4::MAX, i4::one().unwrap()), Ok(i4::MIN));
+        assert_eq!(NumericArrayElement::add(u1::MAX, u1::MAX), Ok(u1::MIN));
+        assert_eq!(NumericArrayElement::add(1.5f64, 2.0), Ok(3.5));
+        assert_eq!(
+            NumericArrayElement::add(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)),
+            Ok(Complex::new(4.0, -2.0))
+        );
+
+        // Half and sub-byte floating-point sums round ties to the even destination encoding.
+        assert_eq!(NumericArrayElement::add(bf16::ONE, bf16::from_f32(1.0 / 256.0)).unwrap().to_bits(), 0x3f80);
+        assert_eq!(
+            NumericArrayElement::add(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::one().unwrap())
+                .unwrap()
+                .to_bits(),
+            0x4,
+        );
+    }
+
+    #[test]
+    fn test_numeric_array_element_sub() {
+        assert_eq!(NumericArrayElement::sub(i16::MIN, 1), Ok(i16::MAX));
+        assert_eq!(NumericArrayElement::sub(0u32, 1), Ok(u32::MAX));
+        assert_eq!(NumericArrayElement::sub(i2::MIN, i2::one().unwrap()), Ok(i2::MAX));
+        assert_eq!(NumericArrayElement::sub(u4::MIN, u4::one().unwrap()), Ok(u4::MAX));
+        assert_eq!(NumericArrayElement::sub(1.5f32, 2.0), Ok(-0.5));
+        assert_eq!(
+            NumericArrayElement::sub(Complex::new(1.0f64, 2.0), Complex::new(3.0, -4.0)),
+            Ok(Complex::new(-2.0, 6.0))
+        );
+        assert_eq!(
+            NumericArrayElement::sub(f4e2m1fn::from_f64(3.0).unwrap(), f4e2m1fn::from_f64(0.5).unwrap())
+                .unwrap()
+                .to_bits(),
+            0x4,
+        );
+        assert!(matches!(
+            NumericArrayElement::sub(f8e8m0fnu::one().unwrap(), f8e8m0fnu::one().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+    }
+
+    #[test]
+    fn test_numeric_array_element_mul() {
+        assert_eq!(NumericArrayElement::mul(i32::MAX, 2), Ok(-2));
+        assert_eq!(NumericArrayElement::mul(u16::MAX, 2), Ok(u16::MAX - 1));
+        assert_eq!(NumericArrayElement::mul(i4::new(3).unwrap(), i4::new(3).unwrap()), Ok(i4::new(-7).unwrap()));
+        assert_eq!(NumericArrayElement::mul(u2::MAX, u2::MAX), Ok(u2::one().unwrap()));
+        assert_eq!(NumericArrayElement::mul(1.5f64, 2.0), Ok(3.0));
+        assert_eq!(
+            NumericArrayElement::mul(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)),
+            Ok(Complex::new(11.0, 2.0))
+        );
+        assert_eq!(
+            NumericArrayElement::mul(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::from_f64(1.5).unwrap())
+                .unwrap()
+                .to_bits(),
+            0x4,
+        );
+    }
+
+    #[test]
+    fn test_numeric_array_element_div() {
+        // Integer division truncates toward zero, returns all-one bits for zero divisors, and wraps overflow.
+        assert_eq!(NumericArrayElement::div(-7i32, 2), Ok(-3));
+        assert_eq!(NumericArrayElement::div(7u64, 2), Ok(3));
+        assert_eq!(NumericArrayElement::div(i4::new(-7).unwrap(), i4::new(2).unwrap()), Ok(i4::new(-3).unwrap()));
+        assert_eq!(NumericArrayElement::div(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::new(3).unwrap()));
+        assert_eq!(NumericArrayElement::div(1u8, 0), Ok(u8::MAX));
+        assert_eq!(NumericArrayElement::div(1i32, 0), Ok(-1));
+        assert_eq!(NumericArrayElement::div(i8::MIN, -1), Ok(i8::MIN));
+        assert_eq!(NumericArrayElement::div(i1::MIN, i1::MIN), Ok(i1::MIN));
+        assert_eq!(NumericArrayElement::div(i4::one().unwrap(), i4::zero().unwrap()), Ok(i4::new(-1).unwrap()));
+        assert_eq!(NumericArrayElement::div(u4::one().unwrap(), u4::zero().unwrap()), Ok(u4::MAX));
+        assert_eq!(NumericArrayElement::div(1.0f32, 0.0), Ok(f32::INFINITY));
+        assert_eq!(NumericArrayElement::div(f16::from_f32(3.0), f16::from_f32(2.0)), Ok(f16::from_f32(1.5)));
+        assert_eq!(
+            NumericArrayElement::div(f4e2m1fn::one().unwrap(), f4e2m1fn::from_f64(3.0).unwrap())
+                .unwrap()
+                .to_bits(),
+            0x1,
+        );
+
+        // Large and small finite denominators avoid the overflow/underflow of the squared-magnitude formula.
+        // Expectations follow XLA's `ElementalIrEmitter::EmitComplexDivide`, including its remaining overflow cases.
+        let large = 2.0f32.powi(100);
+        let small = 2.0f32.powi(-100);
+        for (lhs, rhs, expected) in [
+            ((1.0, 0.0), (large, 0.0), (small, 0.0)),
+            ((1.0, 0.0), (0.0, large), (0.0, -small)),
+            ((1.0, 0.0), (small, 0.0), (large, 0.0)),
+            ((1.0, 0.0), (0.0, small), (0.0, -large)),
+            ((large, large), (large, large), (1.0, 0.0)),
+            ((small, small), (small, small), (1.0, 0.0)),
+            ((f32::MAX, f32::MAX), (f32::MAX, f32::MAX), (f32::NAN, 0.0)),
+            ((-0.0, 0.0), (1.0, 0.0), (0.0, 0.0)),
+            ((0.0, -0.0), (1.0, 0.0), (0.0, -0.0)),
+            ((1.0, 2.0), (0.0, 0.0), (f32::INFINITY, f32::INFINITY)),
+            ((1.0, 2.0), (-0.0, 0.0), (f32::NEG_INFINITY, f32::NEG_INFINITY)),
+            ((1.0, 0.0), (0.0, 0.0), (f32::INFINITY, f32::NAN)),
+            ((0.0, 0.0), (0.0, 0.0), (f32::NAN, f32::NAN)),
+            ((f32::INFINITY, f32::INFINITY), (1.0, 0.0), (f32::INFINITY, f32::INFINITY)),
+            ((f32::INFINITY, 0.0), (1.0, 1.0), (f32::INFINITY, f32::NEG_INFINITY)),
+            ((1.0, 2.0), (f32::INFINITY, f32::INFINITY), (0.0, 0.0)),
+            ((1.0, 2.0), (f32::NEG_INFINITY, f32::INFINITY), (0.0, -0.0)),
+            ((1.0, 2.0), (f32::INFINITY, 0.0), (0.0, 0.0)),
+            ((f32::INFINITY, f32::INFINITY), (f32::INFINITY, 0.0), (f32::NAN, f32::NAN)),
+            ((1.0, 2.0), (f32::NAN, 1.0), (f32::NAN, f32::NAN)),
+            ((f32::NAN, 2.0), (0.0, 0.0), (f32::NAN, f32::INFINITY)),
+            ((f32::INFINITY, f32::NAN), (1.0, 1.0), (f32::INFINITY, f32::NEG_INFINITY)),
+            ((1.0, 2.0), (f32::INFINITY, f32::NAN), (0.0, 0.0)),
+        ] {
+            // Compare zero signs exactly, but do not impose a NaN sign or payload on the backend contract.
+            let actual = NumericArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
+            if expected.0.is_nan() {
+                assert!(actual.re.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.re.to_bits(), expected.0.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+            if expected.1.is_nan() {
+                assert!(actual.im.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.im.to_bits(), expected.1.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+        }
+        let large = 2.0f64.powi(700);
+        let small = 2.0f64.powi(-700);
+        for (lhs, rhs, expected) in [
+            ((1.0, 0.0), (large, 0.0), (small, 0.0)),
+            ((1.0, 0.0), (0.0, large), (0.0, -small)),
+            ((1.0, 0.0), (small, 0.0), (large, 0.0)),
+            ((1.0, 0.0), (0.0, small), (0.0, -large)),
+            ((large, large), (large, large), (1.0, 0.0)),
+            ((small, small), (small, small), (1.0, 0.0)),
+            ((f64::MAX, f64::MAX), (f64::MAX, f64::MAX), (f64::NAN, 0.0)),
+            ((-0.0, 0.0), (1.0, 0.0), (0.0, 0.0)),
+            ((0.0, -0.0), (1.0, 0.0), (0.0, -0.0)),
+            ((1.0, 2.0), (0.0, 0.0), (f64::INFINITY, f64::INFINITY)),
+            ((1.0, 2.0), (-0.0, 0.0), (f64::NEG_INFINITY, f64::NEG_INFINITY)),
+            ((1.0, 0.0), (0.0, 0.0), (f64::INFINITY, f64::NAN)),
+            ((0.0, 0.0), (0.0, 0.0), (f64::NAN, f64::NAN)),
+            ((f64::INFINITY, f64::INFINITY), (1.0, 0.0), (f64::INFINITY, f64::INFINITY)),
+            ((f64::INFINITY, 0.0), (1.0, 1.0), (f64::INFINITY, f64::NEG_INFINITY)),
+            ((1.0, 2.0), (f64::INFINITY, f64::INFINITY), (0.0, 0.0)),
+            ((1.0, 2.0), (f64::NEG_INFINITY, f64::INFINITY), (0.0, -0.0)),
+            ((1.0, 2.0), (f64::INFINITY, 0.0), (0.0, 0.0)),
+            ((f64::INFINITY, f64::INFINITY), (f64::INFINITY, 0.0), (f64::NAN, f64::NAN)),
+            ((1.0, 2.0), (f64::NAN, 1.0), (f64::NAN, f64::NAN)),
+            ((f64::NAN, 2.0), (0.0, 0.0), (f64::NAN, f64::INFINITY)),
+            ((f64::INFINITY, f64::NAN), (1.0, 1.0), (f64::INFINITY, f64::NEG_INFINITY)),
+            ((1.0, 2.0), (f64::INFINITY, f64::NAN), (0.0, 0.0)),
+        ] {
+            // Compare zero signs exactly, but do not impose a NaN sign or payload on the backend contract.
+            let actual = NumericArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
+            if expected.0.is_nan() {
+                assert!(actual.re.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.re.to_bits(), expected.0.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+            if expected.1.is_nan() {
+                assert!(actual.im.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.im.to_bits(), expected.1.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_real_array_element_rem() {
+        // Remainders follow the dividend's sign; the signed minimum divided by -1 has remainder zero.
+        assert_eq!(RealArrayElement::rem(-7i64, 2), Ok(-1));
+        assert_eq!(RealArrayElement::rem(i64::MIN, -1), Ok(0));
+        assert_eq!(RealArrayElement::rem(7u32, 2), Ok(1));
+        assert_eq!(RealArrayElement::rem(i4::MIN, i4::new(-1).unwrap()), Ok(i4::zero().unwrap()));
+        assert_eq!(RealArrayElement::rem(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::one().unwrap()));
+        assert_eq!(RealArrayElement::rem(-3.5f64, 2.0), Ok(-1.5));
+        assert_eq!(RealArrayElement::rem(-0.0f32, 2.0).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(
+            RealArrayElement::rem(f4e2m1fn::from_f64(-3.0).unwrap(), f4e2m1fn::from_f64(2.0).unwrap())
+                .unwrap()
+                .to_bits(),
+            0xa,
+        );
+        assert_eq!(RealArrayElement::rem(1i32, 0), Ok(1));
+        assert_eq!(RealArrayElement::rem(3u64, 0), Ok(3));
+        assert_eq!(RealArrayElement::rem(i4::MIN, i4::zero().unwrap()), Ok(i4::MIN));
+        assert_eq!(RealArrayElement::rem(u4::MAX, u4::zero().unwrap()), Ok(u4::MAX));
+        assert!(matches!(
+            RealArrayElement::rem(f4e2m1fn::one().unwrap(), f4e2m1fn::zero().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f4e2m1fn` cannot represent NaN",
+        ));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_pow() {
+        assert_eq!(FloatingPointArrayElement::pow(2.0f64, 3.0), Ok(8.0));
+        assert_eq!(FloatingPointArrayElement::pow(-2.0f32, 3.0), Ok(-8.0));
+        assert_eq!(FloatingPointArrayElement::pow(0.0f64, -1.0), Ok(f64::INFINITY));
+        assert!(FloatingPointArrayElement::pow(-1.0f64, 0.5).unwrap().is_nan());
+        let result = FloatingPointArrayElement::pow(Complex::new(-1.0f64, 0.0), Complex::new(0.5, 0.0)).unwrap();
+        assert_abs_diff_eq!(result.re, 0.0, epsilon = 1e-15);
+        assert_eq!(result.im, 1.0);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_sqrt() {
+        assert_eq!(FloatingPointArrayElement::sqrt(4.0f64), Ok(2.0));
+        assert_eq!(FloatingPointArrayElement::sqrt(f16::from_f32(4.0)), Ok(f16::from_f32(2.0)));
+        assert_eq!(FloatingPointArrayElement::sqrt(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert!(FloatingPointArrayElement::sqrt(-1.0f64).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::sqrt(Complex::new(-4.0f32, 0.0)), Ok(Complex::new(0.0, 2.0)));
+        assert!(matches!(
+            FloatingPointArrayElement::sqrt(f4e2m1fn::from_f64(-1.0).unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f4e2m1fn` cannot represent NaN",
+        ));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_sqrt_complex_extremes() {
+        // These expected values are independently evaluated roots, not calls to the implementation's kernel.
+        let output = FloatingPointArrayElement::sqrt(Complex::new(f64::MAX, f64::MAX)).unwrap();
+        assert_relative_eq!(output.re, 1.4730945569055655e154, epsilon = 0.0, max_relative = 1e-15);
+        assert_relative_eq!(output.im, 6.101757441282702e153, epsilon = 0.0, max_relative = 1e-15);
+        let output = FloatingPointArrayElement::sqrt(Complex::new(f32::MAX, f32::MAX)).unwrap();
+        assert_relative_eq!(output.re, 2.0267144e19, epsilon = 0.0, max_relative = 1e-6);
+        assert_relative_eq!(output.im, 8.3949256e18, epsilon = 0.0, max_relative = 1e-6);
+        let output = FloatingPointArrayElement::sqrt(Complex::new(f64::from_bits(1), 0.0)).unwrap();
+        assert_eq!(output, Complex::new(2.2227587494850775e-162, 0.0));
+        assert_eq!(
+            FloatingPointArrayElement::sqrt(Complex::new(f64::INFINITY, 1.0)),
+            Ok(Complex::new(f64::INFINITY, 0.0)),
+        );
+        assert_eq!(
+            FloatingPointArrayElement::sqrt(Complex::new(f64::NEG_INFINITY, -1.0)),
+            Ok(Complex::new(0.0, f64::NEG_INFINITY)),
+        );
+        assert_eq!(
+            FloatingPointArrayElement::sqrt(Complex::new(f64::NAN, f64::INFINITY)),
+            Ok(Complex::new(f64::INFINITY, f64::INFINITY)),
+        );
+        let output = FloatingPointArrayElement::sqrt(Complex::new(-4.0f64, -0.0)).unwrap();
+        assert_eq!(output, Complex::new(0.0, -2.0));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_rsqrt() {
+        assert_eq!(FloatingPointArrayElement::rsqrt(4.0f32), Ok(0.5));
+        assert_eq!(FloatingPointArrayElement::rsqrt(0.0f64), Ok(f64::INFINITY));
+        assert_eq!(FloatingPointArrayElement::rsqrt(-0.0f64), Ok(f64::NEG_INFINITY));
+        assert_eq!(FloatingPointArrayElement::rsqrt(f64::INFINITY), Ok(0.0));
+        assert!(FloatingPointArrayElement::rsqrt(-1.0f32).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::rsqrt(Complex::new(-4.0f64, 0.0)), Ok(Complex::new(0.0, -0.5)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_rsqrt_complex_extremes() {
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::MAX, f64::MAX)).unwrap();
+        assert_relative_eq!(output.re, 5.79428785879352e-155, epsilon = 0.0, max_relative = 1e-15);
+        assert_relative_eq!(output.im, -2.400072615406037e-155, epsilon = 0.0, max_relative = 1e-15);
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f32::MAX, f32::MAX)).unwrap();
+        assert_relative_eq!(output.re, 4.211513e-20, epsilon = 0.0, max_relative = 1e-6);
+        assert_relative_eq!(output.im, -1.7444658e-20, epsilon = 0.0, max_relative = 1e-6);
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::from_bits(1), 0.0)).unwrap();
+        assert_eq!(output, Complex::new(4.4989137945431964e161, 0.0));
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::INFINITY, 1.0)).unwrap();
+        assert_eq!(output.re.to_bits(), 0f64.to_bits());
+        assert_eq!(output.im.to_bits(), (-0f64).to_bits());
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::NEG_INFINITY, -1.0)).unwrap();
+        assert_eq!(output.re.to_bits(), (-0f64).to_bits());
+        assert_eq!(output.im.to_bits(), 0f64.to_bits());
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(0.0f64, 0.0)).unwrap();
+        assert_eq!(output.re, f64::INFINITY);
+        assert!(output.im.is_nan());
+    }
+
+    #[test]
+    fn test_floating_point_array_element_sin() {
+        assert_eq!(FloatingPointArrayElement::sin(0.0f64), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::sin(std::f64::consts::FRAC_PI_2), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::sin(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(FloatingPointArrayElement::sin(f16::ZERO), Ok(f16::ZERO));
+        assert!(FloatingPointArrayElement::sin(f64::INFINITY).unwrap().is_nan());
+        // Purely imaginary inputs retain a zero real component even when the imaginary result overflows.
+        assert_eq!(FloatingPointArrayElement::sin(Complex::new(0.0f64, 1000.0)), Ok(Complex::new(0.0, f64::INFINITY)),);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_sin_complex_large_imaginary() {
+        // These independently rounded values remain finite beyond the range of the unscaled exponential.
+        let output = FloatingPointArrayElement::sin(Complex::new(-0f64, 710.0)).unwrap();
+        assert_eq!(output.re.to_bits(), 0f64.to_bits());
+        assert_relative_eq!(output.im, 1.1169973830808555e308, epsilon = 0.0, max_relative = 2e-15);
+        let output = FloatingPointArrayElement::sin(Complex::new(0f32, -89.0)).unwrap();
+        assert_eq!(output.re, 0.0);
+        assert_relative_eq!(output.im, -2.2448064e38, epsilon = 0.0, max_relative = 2e-7);
+
+        // A tiny real component can keep one output finite even when the hyperbolic factor overflows.
+        let output = FloatingPointArrayElement::sin(Complex::new(1e-300f64, 1400.0)).unwrap();
+        assert_relative_eq!(output.re, 5.143333304259946e307, epsilon = 0.0, max_relative = 2e-15);
+        assert_eq!(output.im, f64::INFINITY);
+        let output = FloatingPointArrayElement::sin(Complex::new(f64::from_bits(1), 1430.0)).unwrap();
+        assert_relative_eq!(output.re, 2.7155873871042953e297, epsilon = 0.0, max_relative = 2e-13);
+        assert_eq!(output.im, f64::INFINITY);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_cos() {
+        assert_eq!(FloatingPointArrayElement::cos(0.0f32), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::cos(std::f64::consts::PI), Ok(-1.0));
+        assert_eq!(FloatingPointArrayElement::cos(bf16::ZERO), Ok(bf16::ONE));
+        assert_eq!(FloatingPointArrayElement::cos(f4e2m1fn::zero().unwrap()), f4e2m1fn::one());
+        assert!(FloatingPointArrayElement::cos(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::cos(Complex::new(0.0f32, 1000.0)), Ok(Complex::new(f32::INFINITY, 0.0)),);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_cos_complex_large_imaginary() {
+        let output = FloatingPointArrayElement::cos(Complex::new(-0f64, 710.0)).unwrap();
+        assert_relative_eq!(output.re, 1.1169973830808555e308, epsilon = 0.0, max_relative = 2e-15);
+        assert_eq!(output.im.to_bits(), 0f64.to_bits());
+        let output = FloatingPointArrayElement::cos(Complex::new(0f32, 89.0)).unwrap();
+        assert_relative_eq!(output.re, 2.2448064e38, epsilon = 0.0, max_relative = 2e-7);
+        assert_eq!(output.im, 0.0);
+        let output = FloatingPointArrayElement::cos(Complex::new(1e-300f64, 1400.0)).unwrap();
+        assert_eq!(output.re, f64::INFINITY);
+        assert_relative_eq!(output.im, -5.143333304259946e307, epsilon = 0.0, max_relative = 2e-15);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_tan() {
+        assert_eq!(FloatingPointArrayElement::tan(0.0f64), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::tan(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_abs_diff_eq!(
+            FloatingPointArrayElement::tan(std::f64::consts::FRAC_PI_4).unwrap(),
+            1.0,
+            epsilon = f64::EPSILON,
+        );
+        assert_eq!(FloatingPointArrayElement::tan(f16::ZERO), Ok(f16::ZERO));
+        assert_eq!(FloatingPointArrayElement::tan(f4e2m1fn::zero().unwrap()), f4e2m1fn::zero());
+        assert!(FloatingPointArrayElement::tan(f64::INFINITY).unwrap().is_nan());
+        let result = FloatingPointArrayElement::tan(Complex::new(0.0f64, 1.0)).unwrap();
+        assert_eq!(result.re, 0.0);
+        assert_abs_diff_eq!(result.im, 0.7615941559557649, epsilon = f64::EPSILON);
+
+        // Large imaginary components saturate without overflowing, and real-axis signed zeros retain their signs.
+        for imaginary in [1000.0f64, -1000.0, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = FloatingPointArrayElement::tan(Complex::new(0.7f64, imaginary)).unwrap();
+            assert_eq!(result.re, 0.0);
+            assert_eq!(result.im, imaginary.signum());
+        }
+        for real in [0.0f64, -0.0f64] {
+            for imaginary in [0.0f64, -0.0f64] {
+                let result = FloatingPointArrayElement::tan(Complex::new(real, imaginary)).unwrap();
+                assert_eq!(result.re.to_bits(), real.to_bits());
+                assert_eq!(result.im.to_bits(), imaginary.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn test_floating_point_array_element_tanh() {
+        assert_eq!(FloatingPointArrayElement::tanh(0.0f32), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::tanh(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(FloatingPointArrayElement::tanh(f64::INFINITY), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::tanh(f32::NEG_INFINITY), Ok(-1.0));
+        assert!(FloatingPointArrayElement::tanh(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(0.0f32, 0.0)), Ok(Complex::new(0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_tanh_complex() {
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(400f64, 1.0)), Ok(Complex::new(1.0, 0.0)));
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(-100f32, 1.0)), Ok(Complex::new(-1.0, 0.0)));
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(f64::INFINITY, 1.0)), Ok(Complex::new(1.0, 0.0)),);
+        assert_eq!(
+            FloatingPointArrayElement::tanh(Complex::new(f32::NEG_INFINITY, f32::NAN)),
+            Ok(Complex::new(-1.0, 0.0)),
+        );
+
+        // The unscaled branch retains inputs whose cubic correction is too small to represent.
+        assert_eq!(
+            FloatingPointArrayElement::tanh(Complex::new(1e-200f64, -1e-200)),
+            Ok(Complex::new(1e-200, -1e-200)),
+        );
+        let output = FloatingPointArrayElement::tanh(Complex::new(2f64, 1.0)).unwrap();
+        assert_relative_eq!(output.re, 1.0147936161466335, epsilon = 0.0, max_relative = 2e-15);
+        assert_relative_eq!(output.im, 0.03381282607989669, epsilon = 0.0, max_relative = 2e-15);
+        // Finite imaginary arguments must not overflow merely because a double-angle identity is used.
+        let output = FloatingPointArrayElement::tanh(Complex::new(0.5f64, 1e308)).unwrap();
+        assert_relative_eq!(output.re, 0.5512345821481115, epsilon = 0.0, max_relative = 2e-15);
+        assert_relative_eq!(output.im, -0.3791059869481058, epsilon = 0.0, max_relative = 2e-15);
+        let output = FloatingPointArrayElement::tanh(Complex::new(2f64, f64::INFINITY)).unwrap();
+        assert!(output.re.is_nan());
+        assert!(output.im.is_nan());
+        let output = FloatingPointArrayElement::tanh(Complex::new(f64::NAN, 1.0)).unwrap();
+        assert!(output.re.is_nan());
+        assert!(output.im.is_nan());
+    }
+
+    #[test]
+    fn test_floating_point_array_element_atan2() {
+        assert_eq!(FloatingPointArrayElement::atan2(1.0f64, 0.0), Ok(std::f64::consts::FRAC_PI_2));
+        assert_abs_diff_eq!(
+            FloatingPointArrayElement::atan2(-0.0f32, -1.0).unwrap(),
+            -std::f32::consts::PI,
+            epsilon = f32::EPSILON * 2.0,
+        );
+        assert!(FloatingPointArrayElement::atan2(f64::NAN, 1.0).unwrap().is_nan());
+        let result = FloatingPointArrayElement::atan2(Complex::new(1.0f64, 0.0), Complex::new(0.0, 0.0)).unwrap();
+        assert_eq!(result.re, std::f64::consts::FRAC_PI_2);
+        assert_eq!(result.im, 0.0);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_exp() {
+        assert_eq!(FloatingPointArrayElement::exp(0.0f64), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::exp(f16::ZERO), Ok(f16::ONE));
+        assert_eq!(FloatingPointArrayElement::exp(f4e2m1fn::one().unwrap()).unwrap().to_bits(), 0x5);
+        assert_eq!(FloatingPointArrayElement::exp(f32::NEG_INFINITY), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::exp(f64::INFINITY), Ok(f64::INFINITY));
+        assert!(FloatingPointArrayElement::exp(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::exp(Complex::new(0.0f32, 0.0)), Ok(Complex::new(1.0, 0.0)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_log() {
+        assert_eq!(FloatingPointArrayElement::log(1.0f32), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::log(0.0f64), Ok(f64::NEG_INFINITY));
+        assert!(FloatingPointArrayElement::log(-1.0f64).unwrap().is_nan());
+        assert_eq!(
+            FloatingPointArrayElement::log(Complex::new(-1.0f64, 0.0)),
+            Ok(Complex::new(0.0, std::f64::consts::PI)),
+        );
+        // Numerical conversion represents an unencodable zero output as NaN.
+        assert!(FloatingPointArrayElement::log(f8e8m0fnu::one().unwrap()).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_floating_point_array_element_ln_1p() {
+        // Small arguments retain information that forming 1 + x would lose.
+        assert_eq!(FloatingPointArrayElement::ln_1p(1e-20f64), Ok(1e-20));
+        assert_eq!(FloatingPointArrayElement::ln_1p(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(FloatingPointArrayElement::ln_1p(-1.0f64), Ok(f64::NEG_INFINITY));
+        assert!(FloatingPointArrayElement::ln_1p(-2.0f64).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::ln_1p(f64::INFINITY), Ok(f64::INFINITY));
+        // Preserve tiny components and the two sides of the principal branch cut.
+        let output = FloatingPointArrayElement::ln_1p(Complex::new(1e-20f64, 1e-20)).unwrap();
+        assert_eq!(output, Complex::new(1e-20, 1e-20));
+        assert_eq!(
+            FloatingPointArrayElement::ln_1p(Complex::new(-2.0f64, -0.0)),
+            Ok(Complex::new(0.0, -std::f64::consts::PI)),
+        );
+        let output = FloatingPointArrayElement::ln_1p(Complex::new(f64::NAN, 0.0)).unwrap();
+        assert!(output.re.is_nan() && output.im.is_nan());
+        let output = FloatingPointArrayElement::ln_1p(Complex::new(f64::INFINITY, f64::NAN)).unwrap();
+        assert!(output.re.is_nan() && output.im.is_nan());
+        let output = FloatingPointArrayElement::ln_1p(Complex::new(f64::MAX, f64::MAX)).unwrap();
+        assert!(output.re.is_finite());
+        assert_eq!(output.im, std::f64::consts::FRAC_PI_4);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_log_add_exp() {
+        assert_eq!(FloatingPointArrayElement::log_add_exp(0.0f64, 0.0), Ok(std::f64::consts::LN_2));
+        assert_eq!(FloatingPointArrayElement::log_add_exp(1000.0f64, -1000.0), Ok(1000.0));
+        assert_eq!(FloatingPointArrayElement::log_add_exp(f64::INFINITY, f64::INFINITY), Ok(f64::INFINITY));
+        assert_eq!(FloatingPointArrayElement::log_add_exp(f64::NEG_INFINITY, f64::NEG_INFINITY), Ok(f64::NEG_INFINITY),);
+        assert_eq!(FloatingPointArrayElement::log_add_exp(f32::NEG_INFINITY, 2.0), Ok(2.0));
+        assert!(FloatingPointArrayElement::log_add_exp(f64::NAN, 1.0).unwrap().is_nan());
+        assert!(FloatingPointArrayElement::log_add_exp(1.0f64, f64::NAN).unwrap().is_nan());
+
+        // Narrow formats round the final composition, not its intermediate values.
+        assert_eq!(
+            FloatingPointArrayElement::log_add_exp(f8e8m0fnu::from_bits(127), f8e8m0fnu::from_bits(126)),
+            Ok(f8e8m0fnu::from_bits(127)),
+        );
+        assert_eq!(
+            FloatingPointArrayElement::log_add_exp(f16::from_f32(-5.0), f16::from_f32(-5.0)),
+            Ok(f16::from_f32(-4.3085938)),
+        );
+
+        let output = FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 4.0), Complex::new(0.0, 4.0)).unwrap();
+        assert!((output.re - std::f64::consts::LN_2).abs() < 1e-15);
+        assert!((output.im - (4.0 - 2.0 * std::f64::consts::PI)).abs() < 1e-15);
+
+        // A small correction stays exact, like `ln_1p(exp(-40))` for real inputs.
+        let output =
+            FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 0.0), Complex::new(-40.0, 0.0)).unwrap();
+        assert_eq!(output, Complex::new((-40.0f64).exp().ln_1p(), 0.0));
+
+        // Phases outside the principal branch are reduced exactly, even for huge arguments.
+        let output =
+            FloatingPointArrayElement::log_add_exp(Complex::new(1.0f64, 1e16), Complex::new(f64::NEG_INFINITY, 0.0))
+                .unwrap();
+        assert_eq!(output, Complex::new(1.0, 1e16f64.sin().atan2(1e16f64.cos())));
+
+        // The shift is real, so neither phase is rounded against the other: `exp(1e16 i)` and `exp(i)` keep their exact
+        // phases, where the lexicographic `max + ln_1p(exp(min - max))` form would subtract `1e16 - 1`, which rounds
+        // to a multiple of two and so shifts the smaller argument's phase by a full radian.
+        let (first, second) = (Complex::new(0.0f64, 1e16), Complex::new(-1.0f64, 1.0));
+        let output = FloatingPointArrayElement::log_add_exp(first, second).unwrap();
+        let expected = (first.exp() + second.exp()).ln();
+        assert!((output - expected).norm() < 1e-15, "expected {expected} but got {output}");
+        let output =
+            FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 1e-20), Complex::new(0.0, 1e-20)).unwrap();
+        assert_eq!(output.im, 1e-20);
+        let output =
+            FloatingPointArrayElement::log_add_exp(Complex::new(f64::MAX, 0.0), Complex::new(f64::MAX, 0.0)).unwrap();
+        assert_eq!(output, Complex::new(f64::MAX, 0.0));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_logistic() {
+        assert_eq!(FloatingPointArrayElement::logistic(0.0f64), Ok(0.5));
+        assert_eq!(FloatingPointArrayElement::logistic(bf16::ZERO), Ok(bf16::from_f32(0.5)));
+        assert_eq!(FloatingPointArrayElement::logistic(f32::INFINITY), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::logistic(f64::NEG_INFINITY), Ok(0.0));
+        assert!(FloatingPointArrayElement::logistic(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::logistic(Complex::new(0.0f64, 0.0)), Ok(Complex::new(0.5, 0.0)));
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_floor() {
+        assert_eq!(RealFloatingPointArrayElement::floor(1.5f64), Ok(1.0));
+        assert_eq!(RealFloatingPointArrayElement::floor(-1.5f32), Ok(-2.0));
+        assert_eq!(RealFloatingPointArrayElement::floor(f16::from_f32(-1.5)), Ok(f16::from_f32(-2.0)));
+        assert_eq!(RealFloatingPointArrayElement::floor(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::floor(f64::INFINITY), Ok(f64::INFINITY));
+        assert!(RealFloatingPointArrayElement::floor(f64::NAN).unwrap().is_nan());
+        assert_eq!(RealFloatingPointArrayElement::floor(f8e8m0fnu::from_f64(0.25).unwrap()).unwrap().to_bits(), 0xff,);
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_ceil() {
+        assert_eq!(RealFloatingPointArrayElement::ceil(1.5f32), Ok(2.0));
+        assert_eq!(RealFloatingPointArrayElement::ceil(-1.5f64), Ok(-1.0));
+        assert_eq!(RealFloatingPointArrayElement::ceil(bf16::from_f32(1.5)), Ok(bf16::from_f32(2.0)));
+        assert_eq!(RealFloatingPointArrayElement::ceil(-0.5f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::ceil(f64::NEG_INFINITY), Ok(f64::NEG_INFINITY));
+        assert!(RealFloatingPointArrayElement::ceil(f64::NAN).unwrap().is_nan());
+        assert_eq!(
+            RealFloatingPointArrayElement::ceil(f8e8m0fnu::from_f64(0.25).unwrap()),
+            Ok(f8e8m0fnu::from_f64(1.0).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_round() {
+        // Ties choose the even integer in both directions, retaining negative zero.
+        assert_eq!(RealFloatingPointArrayElement::round(1.5f64), Ok(2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(2.5f32), Ok(2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(-1.5f64), Ok(-2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(-2.5f32), Ok(-2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(-0.5f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::round(f4e2m1fn::from_f64(1.5).unwrap()).unwrap().to_bits(), 0x4);
+        assert_eq!(RealFloatingPointArrayElement::round(f64::INFINITY), Ok(f64::INFINITY));
+        assert!(RealFloatingPointArrayElement::round(f64::NAN).unwrap().is_nan());
+        assert_eq!(RealFloatingPointArrayElement::round(f8e8m0fnu::from_f64(0.5).unwrap()).unwrap().to_bits(), 0xff,);
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_erf() {
+        // Fixed points, non-finite values, and signed zero retain their scalar semantics.
+        assert_eq!(RealFloatingPointArrayElement::erf(0.0f64), Ok(0.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::erf(f64::INFINITY), Ok(1.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(f64::NEG_INFINITY), Ok(-1.0));
+        assert!(RealFloatingPointArrayElement::erf(f64::NAN).unwrap().is_nan());
+
+        // Known values cover the small series, both central rational approximations, both complementary tail
+        // intervals, and saturation. The tiny input uses an exact rounded expectation rather than absolute tolerance.
+        assert_eq!(RealFloatingPointArrayElement::erf(1e-12f64), Ok(1.1283791670955126e-12));
+        assert_eq!(RealFloatingPointArrayElement::erf(0.5f64), Ok(0.5204998778130465));
+        assert_eq!(RealFloatingPointArrayElement::erf(1.0f64), Ok(0.8427007929497149));
+        assert_eq!(RealFloatingPointArrayElement::erf(2.0f64), Ok(0.9953222650189527));
+        assert_eq!(RealFloatingPointArrayElement::erf(3.0f64), Ok(0.9999779095030014));
+        assert_eq!(RealFloatingPointArrayElement::erf(4.0f64), Ok(0.9999999845827421));
+        assert_eq!(RealFloatingPointArrayElement::erf(6.5f64), Ok(1.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(-6.5f64), Ok(-1.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(-1.0f32), Ok(-0.8427008));
+    }
+
+    #[test]
+    fn test_sub_byte_integer_construction() {
+        assert_eq!(i1::new(-1).map(i1::value), Ok(-1));
+        assert_eq!(i1::new(0).map(i1::value), Ok(0));
+        assert_eq!(i2::new(-2).map(i2::value), Ok(-2));
+        assert_eq!(i2::new(1).map(i2::value), Ok(1));
+        assert_eq!(i4::new(-8).map(i4::value), Ok(-8));
+        assert_eq!(i4::new(7).map(i4::value), Ok(7));
+        assert_eq!(u1::new(0).map(u1::value), Ok(0));
+        assert_eq!(u1::new(1).map(u1::value), Ok(1));
+        assert_eq!(u2::new(0).map(u2::value), Ok(0));
+        assert_eq!(u2::new(3).map(u2::value), Ok(3));
+        assert_eq!(u4::new(0).map(u4::value), Ok(0));
+        assert_eq!(u4::new(15).map(u4::value), Ok(15));
+        assert!(matches!(
+            i1::new(1),
+            Err(TypeError::Invalid { message }) if message == "value 1 is out of range for i1 array elements",
+        ));
+        assert!(matches!(
+            i2::new(-3),
+            Err(TypeError::Invalid { message }) if message == "value -3 is out of range for i2 array elements",
+        ));
+        assert!(matches!(
+            i4::new(8),
+            Err(TypeError::Invalid { message }) if message == "value 8 is out of range for i4 array elements",
+        ));
+        assert!(matches!(
+            i4::new(-9),
+            Err(TypeError::Invalid { message }) if message == "value -9 is out of range for i4 array elements",
+        ));
+        assert!(matches!(
+            u1::new(2),
+            Err(TypeError::Invalid { message }) if message == "value 2 is out of range for u1 array elements",
+        ));
+        assert!(matches!(
+            u2::new(4),
+            Err(TypeError::Invalid { message }) if message == "value 4 is out of range for u2 array elements",
+        ));
+        assert!(matches!(
+            u4::new(16),
+            Err(TypeError::Invalid { message }) if message == "value 16 is out of range for u4 array elements",
+        ));
+    }
+
+    #[test]
+    fn test_sub_byte_integer_bit_encodings() {
+        assert_eq!(i1::new(-1).unwrap().to_bits(), 0x01);
+        assert_eq!(i1::new(0).unwrap().to_bits(), 0x00);
+        assert_eq!(i2::new(-2).unwrap().to_bits(), 0x02);
+        assert_eq!(i2::new(-1).unwrap().to_bits(), 0x03);
+        assert_eq!(i2::new(1).unwrap().to_bits(), 0x01);
+        assert_eq!(i4::new(-8).unwrap().to_bits(), 0x08);
+        assert_eq!(i4::new(-1).unwrap().to_bits(), 0x0f);
+        assert_eq!(i4::new(7).unwrap().to_bits(), 0x07);
+        assert_eq!(u1::new(1).unwrap().to_bits(), 0x01);
+        assert_eq!(u2::new(3).unwrap().to_bits(), 0x03);
+        assert_eq!(u4::new(15).unwrap().to_bits(), 0x0f);
+
+        assert_eq!(i1::from_bits(0x01).map(i1::value), Ok(-1));
+        assert_eq!(i2::from_bits(0x03).map(i2::value), Ok(-1));
+        assert_eq!(i4::from_bits(0x0f).map(i4::value), Ok(-1));
+        assert_eq!(i4::from_bits(0x08).map(i4::value), Ok(-8));
+        assert_eq!(u4::from_bits(0x0f).map(u4::value), Ok(15));
+
+        // Every valid bit pattern of every format round-trips through the storage-byte representation.
+        for bits in 0..=0x01u8 {
+            assert_eq!(i1::from_bits(bits).map(i1::to_bits), Ok(bits));
+            assert_eq!(u1::from_bits(bits).map(u1::to_bits), Ok(bits));
+        }
+        for bits in 0..=0x03u8 {
+            assert_eq!(i2::from_bits(bits).map(i2::to_bits), Ok(bits));
+            assert_eq!(u2::from_bits(bits).map(u2::to_bits), Ok(bits));
+        }
+        for bits in 0..=0x0fu8 {
+            assert_eq!(i4::from_bits(bits).map(i4::to_bits), Ok(bits));
+            assert_eq!(u4::from_bits(bits).map(u4::to_bits), Ok(bits));
+        }
+
+        assert!(matches!(
+            i1::from_bits(0x02),
+            Err(TypeError::Invalid { message }) if message == "byte 0x02 is not a valid `i1` array-element encoding",
+        ));
+        assert!(matches!(
+            u1::from_bits(0x02),
+            Err(TypeError::Invalid { message }) if message == "byte 0x02 is not a valid `u1` array-element encoding",
+        ));
+        assert!(matches!(
+            i2::from_bits(0x04),
+            Err(TypeError::Invalid { message }) if message == "byte 0x04 is not a valid `i2` array-element encoding",
+        ));
+        assert!(matches!(
+            u2::from_bits(0xff),
+            Err(TypeError::Invalid { message }) if message == "byte 0xff is not a valid `u2` array-element encoding",
+        ));
+        assert!(matches!(
+            i4::from_bits(0x10),
+            Err(TypeError::Invalid { message }) if message == "byte 0x10 is not a valid `i4` array-element encoding",
+        ));
+        assert!(matches!(
+            u4::from_bits(0x10),
+            Err(TypeError::Invalid { message }) if message == "byte 0x10 is not a valid `u4` array-element encoding",
+        ));
+    }
+
+    #[test]
+    fn test_sub_byte_integer_limits_display_ordering_and_hashing() {
+        assert_eq!((i1::MIN.value(), i1::MAX.value()), (-1, 0));
+        assert_eq!((i2::MIN.value(), i2::MAX.value()), (-2, 1));
+        assert_eq!((i4::MIN.value(), i4::MAX.value()), (-8, 7));
+        assert_eq!((u1::MIN.value(), u1::MAX.value()), (0, 1));
+        assert_eq!((u2::MIN.value(), u2::MAX.value()), (0, 3));
+        assert_eq!((u4::MIN.value(), u4::MAX.value()), (0, 15));
+
+        assert_eq!(i1::MIN.to_string(), "-1");
+        assert_eq!(i2::new(-2).unwrap().to_string(), "-2");
+        assert_eq!(i4::new(-8).unwrap().to_string(), "-8");
+        assert_eq!(i4::MAX.to_string(), "7");
+        assert_eq!(u1::MAX.to_string(), "1");
+        assert_eq!(u2::new(2).unwrap().to_string(), "2");
+        assert_eq!(u4::MAX.to_string(), "15");
+
+        assert!(i4::new(-8).unwrap() < i4::new(7).unwrap());
+        assert!(i4::new(-1).unwrap() < i4::new(0).unwrap());
+        assert!(i1::MIN < i1::MAX);
+        assert!(u4::new(1).unwrap() < u4::MAX);
+
+        // Derived hashing is consistent with equality, so elements work as map keys.
+        let names = HashMap::from([(i4::MIN, "min"), (i4::MAX, "max")]);
+        assert_eq!(names.get(&i4::new(-8).unwrap()), Some(&"min"));
+        assert_eq!(names.get(&i4::new(7).unwrap()), Some(&"max"));
+        assert_eq!(names.get(&i4::new(0).unwrap()), None);
+    }
+
+    #[test]
+    fn test_low_precision_floating_point_number_decoding() {
+        // Golden decodes pin each format's extremes (i.e., largest finite, smallest normal, and smallest subnormal)
+        // and its reserved special-value encodings.
+        assert_eq!(f4e2m1fn::from_bits(0x07).map(f4e2m1fn::to_f64), Ok(6.0));
+        assert_eq!(f4e2m1fn::from_bits(0x0f).map(f4e2m1fn::to_f64), Ok(-6.0));
+        assert_eq!(f4e2m1fn::from_bits(0x02).map(f4e2m1fn::to_f64), Ok(1.0));
+        assert_eq!(f4e2m1fn::from_bits(0x01).map(f4e2m1fn::to_f64), Ok(0.5));
+        assert_eq!((f4e2m1fn::MAX.to_bits(), f4e2m1fn::MIN.to_bits()), (0x07, 0x0f));
+
+        assert_eq!(f6e2m3fn::from_bits(0x1f).map(f6e2m3fn::to_f64), Ok(7.5));
+        assert_eq!(f6e2m3fn::from_bits(0x3f).map(f6e2m3fn::to_f64), Ok(-7.5));
+        assert_eq!(f6e2m3fn::from_bits(0x08).map(f6e2m3fn::to_f64), Ok(1.0));
+        assert_eq!(f6e2m3fn::from_bits(0x01).map(f6e2m3fn::to_f64), Ok(0.125));
+        assert_eq!((f6e2m3fn::MAX.to_bits(), f6e2m3fn::MIN.to_bits()), (0x1f, 0x3f));
+
+        assert_eq!(f6e3m2fn::from_bits(0x1f).map(f6e3m2fn::to_f64), Ok(28.0));
+        assert_eq!(f6e3m2fn::from_bits(0x3f).map(f6e3m2fn::to_f64), Ok(-28.0));
+        assert_eq!(f6e3m2fn::from_bits(0x04).map(f6e3m2fn::to_f64), Ok(0.25));
+        assert_eq!(f6e3m2fn::from_bits(0x01).map(f6e3m2fn::to_f64), Ok(0.0625));
+        assert_eq!((f6e3m2fn::MAX.to_bits(), f6e3m2fn::MIN.to_bits()), (0x1f, 0x3f));
+
+        assert_eq!(f8e3m4::from_bits(0x6f).to_f64(), 15.5);
+        assert_eq!(f8e3m4::from_bits(0xef).to_f64(), -15.5);
+        assert_eq!(f8e3m4::from_bits(0x10).to_f64(), 2f64.powi(-2));
+        assert_eq!(f8e3m4::from_bits(0x01).to_f64(), 2f64.powi(-6));
+        assert_eq!(f8e3m4::from_bits(0x70).to_f64(), f64::INFINITY);
+        assert_eq!(f8e3m4::from_bits(0xf0).to_f64(), f64::NEG_INFINITY);
+        assert!(f8e3m4::from_bits(0x71).to_f64().is_nan());
+        assert!(f8e3m4::from_bits(0x78).to_f64().is_nan());
+        assert_eq!((f8e3m4::MAX.to_bits(), f8e3m4::MIN.to_bits()), (0x6f, 0xef));
+
+        assert_eq!(f8e4m3::from_bits(0x77).to_f64(), 240.0);
+        assert_eq!(f8e4m3::from_bits(0xf7).to_f64(), -240.0);
+        assert_eq!(f8e4m3::from_bits(0x08).to_f64(), 2f64.powi(-6));
+        assert_eq!(f8e4m3::from_bits(0x01).to_f64(), 2f64.powi(-9));
+        assert_eq!(f8e4m3::from_bits(0x78).to_f64(), f64::INFINITY);
+        assert_eq!(f8e4m3::from_bits(0xf8).to_f64(), f64::NEG_INFINITY);
+        assert!(f8e4m3::from_bits(0x79).to_f64().is_nan());
+        assert!(f8e4m3::from_bits(0x7c).to_f64().is_nan());
+        assert_eq!((f8e4m3::MAX.to_bits(), f8e4m3::MIN.to_bits()), (0x77, 0xf7));
+
+        assert_eq!(f8e4m3fn::from_bits(0x7e).to_f64(), 448.0);
+        assert_eq!(f8e4m3fn::from_bits(0xfe).to_f64(), -448.0);
+        assert_eq!(f8e4m3fn::from_bits(0x08).to_f64(), 2f64.powi(-6));
+        assert_eq!(f8e4m3fn::from_bits(0x01).to_f64(), 2f64.powi(-9));
+        assert!(f8e4m3fn::from_bits(0x7f).to_f64().is_nan());
+        assert!(f8e4m3fn::from_bits(0xff).to_f64().is_nan());
+        assert_eq!((f8e4m3fn::MAX.to_bits(), f8e4m3fn::MIN.to_bits()), (0x7e, 0xfe));
+
+        assert_eq!(f8e4m3fnuz::from_bits(0x7f).to_f64(), 240.0);
+        assert_eq!(f8e4m3fnuz::from_bits(0xff).to_f64(), -240.0);
+        assert_eq!(f8e4m3fnuz::from_bits(0x08).to_f64(), 2f64.powi(-7));
+        assert_eq!(f8e4m3fnuz::from_bits(0x01).to_f64(), 2f64.powi(-10));
+        assert!(f8e4m3fnuz::from_bits(0x80).to_f64().is_nan());
+        assert_eq!((f8e4m3fnuz::MAX.to_bits(), f8e4m3fnuz::MIN.to_bits()), (0x7f, 0xff));
+
+        assert_eq!(f8e4m3b11fnuz::from_bits(0x7f).to_f64(), 30.0);
+        assert_eq!(f8e4m3b11fnuz::from_bits(0xff).to_f64(), -30.0);
+        assert_eq!(f8e4m3b11fnuz::from_bits(0x08).to_f64(), 2f64.powi(-10));
+        assert_eq!(f8e4m3b11fnuz::from_bits(0x01).to_f64(), 2f64.powi(-13));
+        assert!(f8e4m3b11fnuz::from_bits(0x80).to_f64().is_nan());
+        assert_eq!((f8e4m3b11fnuz::MAX.to_bits(), f8e4m3b11fnuz::MIN.to_bits()), (0x7f, 0xff));
+
+        assert_eq!(f8e5m2::from_bits(0x7b).to_f64(), 57344.0);
+        assert_eq!(f8e5m2::from_bits(0xfb).to_f64(), -57344.0);
+        assert_eq!(f8e5m2::from_bits(0x04).to_f64(), 2f64.powi(-14));
+        assert_eq!(f8e5m2::from_bits(0x01).to_f64(), 2f64.powi(-16));
+        assert_eq!(f8e5m2::from_bits(0x01).to_f32(), 2f32.powi(-16));
+        assert_eq!(f8e5m2::from_bits(0x7c).to_f64(), f64::INFINITY);
+        assert_eq!(f8e5m2::from_bits(0xfc).to_f64(), f64::NEG_INFINITY);
+        assert!(f8e5m2::from_bits(0x7d).to_f64().is_nan());
+        assert!(f8e5m2::from_bits(0x7e).to_f64().is_nan());
+        assert_eq!((f8e5m2::MAX.to_bits(), f8e5m2::MIN.to_bits()), (0x7b, 0xfb));
+
+        assert_eq!(f8e5m2fnuz::from_bits(0x7f).to_f64(), 57344.0);
+        assert_eq!(f8e5m2fnuz::from_bits(0xff).to_f64(), -57344.0);
+        assert_eq!(f8e5m2fnuz::from_bits(0x04).to_f64(), 2f64.powi(-15));
+        assert_eq!(f8e5m2fnuz::from_bits(0x01).to_f64(), 2f64.powi(-17));
+        assert!(f8e5m2fnuz::from_bits(0x80).to_f64().is_nan());
+        assert_eq!((f8e5m2fnuz::MAX.to_bits(), f8e5m2fnuz::MIN.to_bits()), (0x7f, 0xff));
+
+        assert_eq!(f8e8m0fnu::from_bits(0x7f).to_f64(), 1.0);
+        assert_eq!(f8e8m0fnu::from_bits(0x80).to_f64(), 2.0);
+        assert_eq!(f8e8m0fnu::from_bits(0xfe).to_f64(), 2f64.powi(127));
+        assert_eq!(f8e8m0fnu::from_bits(0x00).to_f64(), 2f64.powi(-127));
+        assert_eq!(f8e8m0fnu::from_bits(0x00).to_f32(), 2f32.powi(-127));
+        assert!(f8e8m0fnu::from_bits(0xff).to_f64().is_nan());
+        assert_eq!((f8e8m0fnu::MAX.to_bits(), f8e8m0fnu::MIN.to_bits()), (0xfe, 0x00));
+
+        // Every format with a sign bit decodes its two zero encodings to the two signed zeros.
+        assert_eq!(f4e2m1fn::from_bits(0x08).unwrap().to_f64(), 0.0);
+        assert!(f4e2m1fn::from_bits(0x08).unwrap().to_f64().is_sign_negative());
+        assert_eq!(f6e2m3fn::from_bits(0x20).unwrap().to_f64(), 0.0);
+        assert!(f6e2m3fn::from_bits(0x20).unwrap().to_f64().is_sign_negative());
+        assert_eq!(f8e4m3fn::from_bits(0x00).to_f64(), 0.0);
+        assert!(f8e4m3fn::from_bits(0x00).to_f64().is_sign_positive());
+        assert!(f8e4m3fn::from_bits(0x80).to_f64().is_sign_negative());
+    }
+
+    #[test]
+    fn test_low_precision_floating_point_number_encoding_round_trips() {
+        // Asserts that every valid encoding of a low-precision floating-point format round-trips through `to_f64` and
+        // `from_f64`, that its NaN encodings collapse onto the canonical positive and negative NaN encodings passed as
+        // `$nan_bits`, and that decoded values increase strictly across the format's finite magnitude encodings, which
+        // run  from zero through `$max_finite_magnitude`.
+        macro_rules! assert_roundtrips {
+            (
+                $type:ident,
+                $from_bits:expr,
+                $bit_count:literal,
+                $max_finite_magnitude:literal,
+                $nan_bits:expr $(,)?
+            ) => {{
+                let from_bits: fn(u8) -> $type = $from_bits;
+                let nan_bits: Option<(u8, u8)> = $nan_bits;
+                for bits in 0..(1u16 << $bit_count) {
+                    let bits = bits as u8;
+                    let value = from_bits(bits).to_f64();
+                    let expected = match nan_bits {
+                        Some((positive, negative)) if value.is_nan() => {
+                            if value.is_sign_negative() {
+                                negative
+                            } else {
+                                positive
+                            }
+                        }
+                        _ => bits,
+                    };
+                    assert_eq!($type::from_f64(value).map($type::to_bits), Ok(expected), "encoding {bits:#04x}");
+                }
+                let mut previous = f64::NEG_INFINITY;
+                for magnitude in 0..=$max_finite_magnitude {
+                    let value = from_bits(magnitude).to_f64();
+                    assert!(value > previous, "encoding {magnitude:#04x} decodes to {value}");
+                    previous = value;
+                }
+            }};
+        }
+
+        assert_roundtrips!(f4e2m1fn, |bits| f4e2m1fn::from_bits(bits).unwrap(), 4, 0x07, None);
+        assert_roundtrips!(f6e2m3fn, |bits| f6e2m3fn::from_bits(bits).unwrap(), 6, 0x1f, None);
+        assert_roundtrips!(f6e3m2fn, |bits| f6e3m2fn::from_bits(bits).unwrap(), 6, 0x1f, None);
+        assert_roundtrips!(f8e3m4, f8e3m4::from_bits, 8, 0x6f, Some((0x78, 0xf8)));
+        assert_roundtrips!(f8e4m3, f8e4m3::from_bits, 8, 0x77, Some((0x7c, 0xfc)));
+        assert_roundtrips!(f8e4m3fn, f8e4m3fn::from_bits, 8, 0x7e, Some((0x7f, 0xff)));
+        assert_roundtrips!(f8e4m3fnuz, f8e4m3fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
+        assert_roundtrips!(f8e4m3b11fnuz, f8e4m3b11fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
+        assert_roundtrips!(f8e5m2, f8e5m2::from_bits, 8, 0x7b, Some((0x7e, 0xfe)));
+        assert_roundtrips!(f8e5m2fnuz, f8e5m2fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
+        assert_roundtrips!(f8e8m0fnu, f8e8m0fnu::from_bits, 8, 0xfe, Some((0xff, 0xff)));
+    }
+
+    #[test]
+    fn test_low_precision_floating_point_number_checked_bit_encodings() {
+        assert_eq!(f4e2m1fn::from_bits(0x0f).map(f4e2m1fn::to_bits), Ok(0x0f));
+        assert_eq!(f6e2m3fn::from_bits(0x3f).map(f6e2m3fn::to_bits), Ok(0x3f));
+        assert_eq!(f6e3m2fn::from_bits(0x3f).map(f6e3m2fn::to_bits), Ok(0x3f));
+        assert!(matches!(
+            f4e2m1fn::from_bits(0x10),
+            Err(TypeError::Invalid { message })
+                if message == "byte 0x10 is not a valid `f4e2m1fn` array-element encoding",
+        ));
+        assert!(matches!(
+            f6e2m3fn::from_bits(0x40),
+            Err(TypeError::Invalid { message })
+                if message == "byte 0x40 is not a valid `f6e2m3fn` array-element encoding",
+        ));
+        assert!(matches!(
+            f6e3m2fn::from_bits(0xff),
+            Err(TypeError::Invalid { message })
+                if message == "byte 0xff is not a valid `f6e3m2fn` array-element encoding",
+        ));
+    }
+
+    #[test]
+    fn test_low_precision_floating_point_number_rounding() {
+        // The microscaling formats have no infinity and no NaN, so overflowing inputs saturate and NaN is rejected.
+        assert_eq!(f4e2m1fn::from_f64(7.0).map(f4e2m1fn::to_f64), Ok(6.0));
+        assert_eq!(f4e2m1fn::from_f64(1e10).map(f4e2m1fn::to_f64), Ok(6.0));
+        assert_eq!(f4e2m1fn::from_f64(f64::MAX).map(f4e2m1fn::to_bits), Ok(0x07));
+        assert_eq!(f4e2m1fn::from_f64(f64::MIN).map(f4e2m1fn::to_bits), Ok(0x0f));
+        assert_eq!(f4e2m1fn::from_f64(f64::INFINITY).map(f4e2m1fn::to_bits), Ok(0x07));
+        assert_eq!(f4e2m1fn::from_f64(f64::NEG_INFINITY).map(f4e2m1fn::to_f64), Ok(-6.0));
+        assert_eq!(f4e2m1fn::from_f64(f64::NEG_INFINITY).map(f4e2m1fn::to_bits), Ok(0x0f));
+        // 0.25 lies halfway between 0 and 0.5, and 0.75 halfway between 0.5 and 1, so both round to an even encoding.
+        assert_eq!(f4e2m1fn::from_f64(0.25).map(f4e2m1fn::to_bits), Ok(0x00));
+        assert_eq!(f4e2m1fn::from_f64(0.75).map(f4e2m1fn::to_bits), Ok(0x02));
+        assert_eq!(f4e2m1fn::from_f64(-0.75).map(f4e2m1fn::to_f64), Ok(-1.0));
+        assert_eq!(f4e2m1fn::from_f64(-1e-30).map(f4e2m1fn::to_bits), Ok(0x08));
+        assert_eq!(f6e3m2fn::from_f64(-1e-30).map(f6e3m2fn::to_bits), Ok(0x20));
+        assert!(matches!(
+            f4e2m1fn::from_f64(f64::NAN),
+            Err(TypeError::Invalid { message }) if message == "data type `f4e2m1fn` cannot represent NaN",
+        ));
+        assert_eq!(f6e2m3fn::from_f64(100.0).map(f6e2m3fn::to_f64), Ok(7.5));
+        assert_eq!(f6e2m3fn::from_f64(7.75).map(f6e2m3fn::to_bits), Ok(0x1f));
+        assert_eq!(f6e2m3fn::from_f64(-7.75).map(f6e2m3fn::to_bits), Ok(0x3f));
+        // 1.0625 lies halfway between the neighboring values 1 and 1.125, so the even encoding wins.
+        assert_eq!(f6e2m3fn::from_f64(1.0625).map(f6e2m3fn::to_bits), Ok(0x08));
+        assert!(matches!(
+            f6e2m3fn::from_f32(f32::NAN),
+            Err(TypeError::Invalid { message }) if message == "data type `f6e2m3fn` cannot represent NaN",
+        ));
+        assert_eq!(f6e3m2fn::from_f64(100.0).map(f6e3m2fn::to_f64), Ok(28.0));
+        assert_eq!(f6e3m2fn::from_f64(30.0).map(f6e3m2fn::to_bits), Ok(0x1f));
+        assert_eq!(f6e3m2fn::from_f64(-30.0).map(f6e3m2fn::to_bits), Ok(0x3f));
+        // 1.125 lies halfway between the neighboring values 1 and 1.25, so the even encoding wins.
+        assert_eq!(f6e3m2fn::from_f64(1.125).map(f6e3m2fn::to_bits), Ok(0x0c));
+        assert!(matches!(
+            f6e3m2fn::from_f64(f64::NAN),
+            Err(TypeError::Invalid { message }) if message == "data type `f6e3m2fn` cannot represent NaN",
+        ));
+
+        // Rounding ties choose the even encoding, which at the overflow boundary can be either the largest finite
+        // value or the virtual candidate one step past it.
+        assert_eq!(f8e3m4::from_f64(15.7).map(f8e3m4::to_f64), Ok(15.5));
+        assert_eq!(f8e3m4::from_f64(15.75).map(f8e3m4::to_bits), Ok(0x70));
+
+        assert_eq!(f8e4m3::from_f64(247.0).map(f8e4m3::to_bits), Ok(0x77));
+        assert_eq!(f8e4m3::from_f64(248.0).map(f8e4m3::to_bits), Ok(0x78));
+
+        assert_eq!(f8e4m3fn::from_f64(464.0).map(f8e4m3fn::to_bits), Ok(0x7e));
+        assert_eq!(f8e4m3fn::from_f64(465.0).map(f8e4m3fn::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3fn::from_f64(-465.0).map(f8e4m3fn::to_bits), Ok(0xff));
+        // 21 lies halfway between the neighboring values 20 and 22, so the even mantissa wins.
+        assert_eq!(f8e4m3fn::from_f64(20.0).map(f8e4m3fn::to_bits), Ok(0x5a));
+        assert_eq!(f8e4m3fn::from_f64(22.0).map(f8e4m3fn::to_bits), Ok(0x5b));
+        assert_eq!(f8e4m3fn::from_f64(21.0).map(f8e4m3fn::to_bits), Ok(0x5a));
+        assert_eq!(f8e4m3fn::from_f64(20.9).map(f8e4m3fn::to_f64), Ok(20.0));
+        assert_eq!(f8e4m3fn::from_f64(21.1).map(f8e4m3fn::to_f64), Ok(22.0));
+
+        assert_eq!(f8e4m3fnuz::from_f64(247.0).map(f8e4m3fnuz::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3fnuz::from_f64(248.0).map(f8e4m3fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3fnuz::from_f64(-0.0).map(f8e4m3fnuz::to_bits), Ok(0x00));
+        assert_eq!(f8e4m3fnuz::from_f64(f64::NEG_INFINITY).map(f8e4m3fnuz::to_bits), Ok(0x80));
+
+        assert_eq!(f8e4m3b11fnuz::from_f64(30.9).map(f8e4m3b11fnuz::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3b11fnuz::from_f64(31.0).map(f8e4m3b11fnuz::to_bits), Ok(0x80));
+
+        assert_eq!(f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
+        assert_eq!(f8e5m2::from_f64(61440.0).map(f8e5m2::to_bits), Ok(0x7c));
+        assert_eq!(f8e5m2::from_f64(f64::MAX).map(f8e5m2::to_bits), Ok(0x7c));
+        assert_eq!(f8e5m2::from_f64(-61440.0).map(f8e5m2::to_bits), Ok(0xfc));
+        assert_eq!(f8e5m2::from_f64(f64::INFINITY).map(f8e5m2::to_bits), Ok(0x7c));
+
+        assert_eq!(f8e5m2fnuz::from_f64(61439.0).map(f8e5m2fnuz::to_bits), Ok(0x7f));
+        assert_eq!(f8e5m2fnuz::from_f64(61440.0).map(f8e5m2fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e5m2fnuz::from_f64(-0.0).map(f8e5m2fnuz::to_bits), Ok(0x00));
+
+        // An input that underflows keeps its sign, except in the `fnuz` formats, whose sign-bit-only encoding is NaN
+        // rather than a negative zero.
+        assert_eq!(f8e4m3fn::from_f64(-1e-30).map(f8e4m3fn::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3fn::from_f64(1e-30).map(f8e4m3fn::to_bits), Ok(0x00));
+        assert_eq!(f8e5m2::from_f64(-1e-30).map(f8e5m2::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3fnuz::from_f64(-1e-30).map(f8e4m3fnuz::to_bits), Ok(0x00));
+        assert_eq!(f8e4m3b11fnuz::from_f64(-1e-30).map(f8e4m3b11fnuz::to_bits), Ok(0x00));
+        assert_eq!(f8e5m2fnuz::from_f64(-1e-30).map(f8e5m2fnuz::to_bits), Ok(0x00));
+
+        // Inputs far above a format's range overflow just like inputs just past its rounding boundary.
+        assert_eq!(f8e4m3fn::from_f64(f64::MAX).map(f8e4m3fn::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3fn::from_f64(f64::MIN).map(f8e4m3fn::to_bits), Ok(0xff));
+        assert_eq!(f8e4m3::from_f64(f64::MAX).map(f8e4m3::to_bits), Ok(0x78));
+        assert_eq!(f8e3m4::from_f64(f64::MAX).map(f8e3m4::to_bits), Ok(0x70));
+        assert_eq!(f8e4m3fnuz::from_f64(f64::MAX).map(f8e4m3fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3b11fnuz::from_f64(f64::MAX).map(f8e4m3b11fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e5m2fnuz::from_f64(f64::MAX).map(f8e5m2fnuz::to_bits), Ok(0x80));
+
+        // Widening an `f32` input to `f64` is exact, so both conversions round identically.
+        assert_eq!(f8e4m3fn::from_f32(21.0).map(f8e4m3fn::to_bits), f8e4m3fn::from_f64(21.0).map(f8e4m3fn::to_bits));
+        assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits));
+        assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
+        assert_eq!(f8e3m4::from_f32(15.75).map(f8e3m4::to_bits), Ok(0x70));
+
+        assert_eq!(f8e8m0fnu::from_f64(1.0).map(f8e8m0fnu::to_bits), Ok(0x7f));
+        assert_eq!(f8e8m0fnu::from_f64(2.0).map(f8e8m0fnu::to_bits), Ok(0x80));
+
+        // Consecutive powers of two have one-bit significands, so every exact tie rounds upward.
+        assert_eq!(f8e8m0fnu::from_f64(1.5).map(f8e8m0fnu::to_bits), Ok(0x80));
+        assert_eq!(f8e8m0fnu::from_f64(3.0f64.next_down()).map(f8e8m0fnu::to_f64), Ok(2.0));
+        assert_eq!(f8e8m0fnu::from_f64(3.0).map(f8e8m0fnu::to_f64), Ok(4.0));
+        assert_eq!(f8e8m0fnu::from_f64(3.0f64.next_up()).map(f8e8m0fnu::to_f64), Ok(4.0));
+        assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_bits), Ok(0x82));
+        assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_f64), Ok(8.0));
+
+        // The minimum exponent follows a distinct boundary instead of using the arithmetic midpoint.
+        let minimum = 2f64.powi(-127);
+        assert_eq!(f8e8m0fnu::from_f64(minimum / 2.0).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(minimum.next_down()).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(minimum).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(minimum.next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64((minimum * 2.0).next_down()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64(minimum * 2.0).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f32((minimum as f32).next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64(1.5 * 2f64.powi(127)).map(f8e8m0fnu::to_bits), Ok(0xff));
+        assert_eq!(f8e8m0fnu::from_f32(1.5).map(f8e8m0fnu::to_bits), Ok(0x80));
+
+        // Negative, infinite, and overflowing inputs have no encoding other than the single NaN.
+        assert_eq!(f8e8m0fnu::from_f64(-1.0).map(f8e8m0fnu::to_bits), Ok(0xff));
+        assert_eq!(f8e8m0fnu::from_f64(f64::MAX).map(f8e8m0fnu::to_bits), Ok(0xff));
+        assert_eq!(f8e8m0fnu::from_f64(f64::INFINITY).map(f8e8m0fnu::to_bits), Ok(0xff));
+        assert_eq!(f8e8m0fnu::from_f64(f64::NEG_INFINITY).map(f8e8m0fnu::to_bits), Ok(0xff));
+        assert_eq!(f8e8m0fnu::from_f64(f64::NAN).map(f8e8m0fnu::to_bits), Ok(0xff));
+        assert!(matches!(
+            f8e8m0fnu::from_f64(0.0),
+            Err(TypeError::Invalid { message }) if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+        assert!(matches!(
+            f8e8m0fnu::from_f64(-0.0),
+            Err(TypeError::Invalid { message }) if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+    }
+
+    #[test]
+    fn test_low_precision_floating_point_number_special_values() {
+        assert_eq!(f8e3m4::NAN.to_bits(), 0x78);
+        assert_eq!(f8e4m3::NAN.to_bits(), 0x7c);
+        assert_eq!(f8e4m3fn::NAN.to_bits(), 0x7f);
+        assert_eq!(f8e4m3fnuz::NAN.to_bits(), 0x80);
+        assert_eq!(f8e4m3b11fnuz::NAN.to_bits(), 0x80);
+        assert_eq!(f8e5m2::NAN.to_bits(), 0x7e);
+        assert_eq!(f8e5m2fnuz::NAN.to_bits(), 0x80);
+        assert_eq!(f8e8m0fnu::NAN.to_bits(), 0xff);
+        assert!(f8e3m4::NAN.is_nan());
+        assert!(f8e4m3::NAN.is_nan());
+        assert!(f8e4m3fn::NAN.is_nan());
+        assert!(f8e4m3fnuz::NAN.is_nan());
+        assert!(f8e4m3b11fnuz::NAN.is_nan());
+        assert!(f8e5m2::NAN.is_nan());
+        assert!(f8e5m2fnuz::NAN.is_nan());
+        assert!(f8e8m0fnu::NAN.is_nan());
+        assert!(!f8e4m3fn::MAX.is_nan());
+        assert!(!f8e5m2::INFINITY.is_nan());
+
+        assert_eq!((f8e3m4::INFINITY.to_bits(), f8e3m4::NEG_INFINITY.to_bits()), (0x70, 0xf0));
+        assert_eq!((f8e4m3::INFINITY.to_bits(), f8e4m3::NEG_INFINITY.to_bits()), (0x78, 0xf8));
+        assert_eq!((f8e5m2::INFINITY.to_bits(), f8e5m2::NEG_INFINITY.to_bits()), (0x7c, 0xfc));
+        assert_eq!(f8e5m2::INFINITY.to_f64(), f64::INFINITY);
+        assert_eq!(f8e5m2::NEG_INFINITY.to_f64(), f64::NEG_INFINITY);
+
+        // Comparisons are numeric, so the two signed zeros compare equal even though their encodings differ, and NaN
+        // is unequal to itself and unordered against everything.
+        assert_eq!(f8e4m3fn::from_f64(0.0), f8e4m3fn::from_f64(-0.0));
+        assert_eq!(
+            (f8e4m3fn::from_f64(0.0).map(f8e4m3fn::to_bits), f8e4m3fn::from_f64(-0.0).map(f8e4m3fn::to_bits)),
+            (Ok(0x00), Ok(0x80)),
+        );
+        assert!(f8e4m3fn::NAN != f8e4m3fn::NAN);
+        assert_eq!(f8e4m3fn::NAN.partial_cmp(&f8e4m3fn::MAX), None);
+        assert_eq!(f8e4m3fn::MIN.partial_cmp(&f8e4m3fn::MAX), Some(Ordering::Less));
+        assert!(f8e4m3fn::MIN < f8e4m3fn::MAX);
+        assert!(f8e5m2::NEG_INFINITY < f8e5m2::MIN);
+        assert!(f8e5m2::MAX < f8e5m2::INFINITY);
+        assert!(f8e8m0fnu::MIN < f8e8m0fnu::MAX);
+        assert!(f4e2m1fn::MIN < f4e2m1fn::MAX);
+
+        assert_eq!(f8e4m3fn::MAX.to_string(), "448");
+        assert_eq!(f8e4m3fn::MIN.to_string(), "-448");
+        assert_eq!(f8e5m2::INFINITY.to_string(), "inf");
+        assert_eq!(f8e4m3::NAN.to_string(), "NaN");
+        assert_eq!(f8e8m0fnu::from_bits(0x7f).to_string(), "1");
+        assert_eq!(f4e2m1fn::from_bits(0x03).map(|element| element.to_string()), Ok("1.5".to_string()));
+    }
+
+    #[test]
+    fn test_encode_and_decode_elements() {
+        let booleans = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
+        let boolean_bytes = encode_elements(&booleans, &[false, true]).unwrap();
+        assert_eq!(boolean_bytes, [0, 1]);
+        assert_eq!(decode_elements::<bool>(&booleans, &boolean_bytes), Ok(vec![false, true]));
+
+        let r#type = ArrayType::new(DataType::I4, Shape::new(vec![Dimension::Static(4)]));
+        let elements = [-8, -1, 0, 7].map(|value| i4::new(value).unwrap());
+        let bytes = encode_elements(&r#type, &elements).unwrap();
+        assert_eq!(bytes, [0x08, 0x0f, 0x00, 0x07]);
+        assert_eq!(ArrayAddressing::new(r#type.clone()).unwrap().validate_storage_bytes(&bytes), Ok(()));
+        let decoded = decode_elements::<i4>(&r#type, &bytes).unwrap();
+        assert_eq!(decoded, elements.to_vec());
+        assert_eq!(decoded.into_iter().map(i4::value).collect::<Vec<_>>(), [-8, -1, 0, 7]);
+
+        let integers = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
+        let integer_bytes = encode_elements(&integers, &[1i32, -2]).unwrap();
+        assert_eq!(integer_bytes, [1, 0, 0, 0, 254, 255, 255, 255]);
+        assert_eq!(decode_elements::<i32>(&integers, &integer_bytes), Ok(vec![1, -2]));
+
+        // Floating-point payloads round-trip bit-exactly, including signed zeros and NaN payload bits.
+        let floats = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let float_values = [f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_1234)];
+        let float_bytes = encode_elements(&floats, &float_values).unwrap();
+        assert_eq!(float_bytes, [0, 0, 0, 128, 52, 18, 192, 127]);
+        let decoded = decode_elements::<f32>(&floats, &float_bytes).unwrap();
+        assert_eq!(decoded.into_iter().map(f32::to_bits).collect::<Vec<_>>(), [0x8000_0000, 0x7fc0_1234]);
+
+        let complex = ArrayType::scalar(DataType::C64);
+        let complex_bytes = encode_elements(&complex, &[Complex::new(1.5f32, -2.0)]).unwrap();
+        assert_eq!(complex_bytes, [0, 0, 192, 63, 0, 0, 0, 192]);
+        assert_eq!(decode_elements::<Complex<f32>>(&complex, &complex_bytes), Ok(vec![Complex::new(1.5, -2.0)]));
+
+        let r#type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(4)]));
+        let elements = [-448.0, -0.5, 0.0, 448.0].map(|value| f8e4m3fn::from_f64(value).unwrap());
+        let bytes = encode_elements(&r#type, &elements).unwrap();
+        assert_eq!(bytes, [0xfe, 0xb0, 0x00, 0x7e]);
+        assert_eq!(ArrayAddressing::new(r#type.clone()).unwrap().validate_storage_bytes(&bytes), Ok(()));
+        let decoded = decode_elements::<f8e4m3fn>(&r#type, &bytes).unwrap();
+        assert_eq!(decoded, elements.to_vec());
+        assert_eq!(decoded.into_iter().map(f8e4m3fn::to_f64).collect::<Vec<_>>(), [-448.0, -0.5, 0.0, 448.0]);
+
+        // The four- and six-bit formats occupy only the low bits of their storage bytes.
+        let narrow = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2)]));
+        let narrow_elements = [-6.0, 1.5].map(|value| f4e2m1fn::from_f64(value).unwrap());
+        let narrow_bytes = encode_elements(&narrow, &narrow_elements).unwrap();
+        assert_eq!(narrow_bytes, [0x0f, 0x03]);
+        assert_eq!(ArrayAddressing::new(narrow.clone()).unwrap().validate_storage_bytes(&narrow_bytes), Ok(()));
+        assert_eq!(decode_elements::<f4e2m1fn>(&narrow, &narrow_bytes), Ok(narrow_elements.to_vec()));
+    }
+
+    #[test]
+    fn test_encode_and_decode_elements_with_layouts() {
+        let shape = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
+        let values = [1u8, 2, 3, 4, 5, 6];
+
+        // Layout-free arrays use dense row-major physical storage.
+        let dense = ArrayType::new(DataType::U8, shape.clone());
+        let dense_bytes = encode_elements(&dense, &values).unwrap();
+        assert_eq!(dense_bytes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dense_bytes.len(), ArrayAddressing::new(dense.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&dense, &dense_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&dense, &dense_bytes), Ok(values.to_vec()));
+
+        // Explicit strided and tiled layouts that reproduce dense row-major storage follow the same bulk paths.
+        let dense_strided =
+            ArrayType::new(DataType::U8, shape.clone()).with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])));
+        let dense_strided_bytes = encode_elements(&dense_strided, &values).unwrap();
+        assert_eq!(dense_strided_bytes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dense_strided_bytes.len(), ArrayAddressing::new(dense_strided.clone()).unwrap().storage_byte_len(),);
+        assert_eq!(decode_elements::<u8>(&dense_strided, &dense_strided_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&dense_strided, &dense_strided_bytes), Ok(values.to_vec()));
+
+        let dense_tiled = ArrayType::new(DataType::U8, shape.clone())
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new())));
+        let dense_tiled_bytes = encode_elements(&dense_tiled, &values).unwrap();
+        assert_eq!(dense_tiled_bytes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dense_tiled_bytes.len(), ArrayAddressing::new(dense_tiled.clone()).unwrap().storage_byte_len(),);
+        assert_eq!(decode_elements::<u8>(&dense_tiled, &dense_tiled_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&dense_tiled, &dense_tiled_bytes), Ok(values.to_vec()));
+
+        // A positive outer stride leaves a zero-valued hole between the two logical rows.
+        let strided =
+            ArrayType::new(DataType::U8, shape.clone()).with_layout(Layout::Strided(StridedLayout::new(vec![4, 1])));
+        let strided_bytes = encode_elements(&strided, &values).unwrap();
+        assert_eq!(strided_bytes, [1, 2, 3, 0, 4, 5, 6]);
+        assert_eq!(strided_bytes.len(), ArrayAddressing::new(strided.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&strided, &strided_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&strided, &strided_bytes), Ok(values.to_vec()));
+
+        // A negative outer stride reverses the physical row order while preserving logical row-major decoding.
+        let reversed =
+            ArrayType::new(DataType::U8, shape.clone()).with_layout(Layout::Strided(StridedLayout::new(vec![-4, 1])));
+        let reversed_bytes = encode_elements(&reversed, &values).unwrap();
+        assert_eq!(reversed_bytes, [4, 5, 6, 0, 1, 2, 3]);
+        assert_eq!(reversed_bytes.len(), ArrayAddressing::new(reversed.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&reversed, &reversed_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&reversed, &reversed_bytes), Ok(values.to_vec()));
+
+        // A tiled permutation stores the first logical axis as the physically minor dimension.
+        let permuted = ArrayType::new(DataType::U8, shape.clone())
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let permuted_bytes = encode_elements(&permuted, &values).unwrap();
+        assert_eq!(permuted_bytes, [1, 4, 2, 5, 3, 6]);
+        assert_eq!(permuted_bytes.len(), ArrayAddressing::new(permuted.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&permuted, &permuted_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&permuted, &permuted_bytes), Ok(values.to_vec()));
+
+        // A 2-by-2 tile pads the final logical column with zero-valued physical elements.
+        let padded = ArrayType::new(DataType::U8, shape).with_layout(Layout::Tiled(TiledLayout::new(
+            vec![1, 0],
+            vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
+        )));
+        let padded_bytes = encode_elements(&padded, &values).unwrap();
+        assert_eq!(padded_bytes, [1, 2, 4, 5, 3, 0, 6, 0]);
+        assert_eq!(padded_bytes.len(), ArrayAddressing::new(padded.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&padded, &padded_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&padded, &padded_bytes), Ok(values.to_vec()));
+    }
+
+    #[test]
+    fn test_encode_logical_bytes_and_elements_validate_encodings() {
+        // The encoders validate every element encoding against its data type and reject inputs whose element type or
+        // count disagrees with the array type; payload-free element types encode to no bytes at all.
+        let booleans = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
+        assert_eq!(encode_logical_bytes(&booleans, &[0, 1]), Ok(vec![0, 1]));
+        assert!(matches!(
+            encode_logical_bytes(&booleans, &[0, 2]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 1 has invalid `bool` byte encoding [2]",
+        ));
+
+        let narrow = ArrayType::scalar(DataType::I2);
+        assert_eq!(encode_logical_bytes(&narrow, &[0b11]), Ok(vec![0b11]));
+        assert!(matches!(
+            encode_logical_bytes(&narrow, &[0b100]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 0 has invalid `i2` byte encoding [4]",
+        ));
+        let low_precision = ArrayType::scalar(DataType::F4E2M1FN);
+        assert_eq!(encode_logical_bytes(&low_precision, &[0b1111]), Ok(vec![0b1111]));
+        assert!(matches!(
+            encode_logical_bytes(&low_precision, &[0b1_0000]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 0 has invalid `f4e2m1fn` byte encoding [16]",
+        ));
+        let six_bit = ArrayType::scalar(DataType::F6E2M3FN);
+        assert_eq!(encode_logical_bytes(&six_bit, &[0b11_1111]), Ok(vec![0b11_1111]));
+        assert!(matches!(
+            encode_logical_bytes(&six_bit, &[0b100_0000]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 0 has invalid `f6e2m3fn` byte encoding [64]",
+        ));
+
+        assert!(matches!(
+            encode_elements(&booleans, &[0u8, 1]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot encode `u8` values as array elements of data type `bool`",
+        ));
+        assert!(matches!(
+            encode_elements(&booleans, &[true]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array type `bool[2]` requires 2 logical elements but got 1",
+        ));
+
+        let payload_free = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(usize::MAX)]));
+        assert_eq!(encode_logical_bytes(&payload_free, &[]), Ok(Vec::new()));
+    }
+}

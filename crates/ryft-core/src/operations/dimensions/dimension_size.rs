@@ -1,0 +1,753 @@
+use std::fmt::Display;
+
+use ryft_macros::{Parameter, capability};
+
+use crate::arrays::{
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionError,
+    DimensionType, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
+};
+use crate::axes::Axis;
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_dischargeable_operation,
+};
+use crate::operations::{Capability, ConstantOperation, DimensionConstant};
+use crate::parameters::Parameter;
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::{
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
+
+/// Canonical operation name for [`DimensionSizeOperation`].
+pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
+
+/// Array-to-dimension operation used by [`DimensionSize`]. Refer to the documentation of [`DimensionSize`]
+/// for semantic details and an example.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct DimensionSizeOperation {
+    /// Normalized non-negative input axis.
+    axis: usize,
+
+    /// Declared selected [`Dimension`] against which later inference inputs are checked as refinements.
+    input_dimension: Dimension,
+
+    /// Output [`DimensionType`] of this [`Operation`].
+    output_type: DimensionType,
+}
+
+impl DimensionSizeOperation {
+    /// Creates a new [`DimensionSizeOperation`] that reads the `axis` size of `input_type`-typed inputs.
+    pub fn new<A: Into<Axis>>(input_type: &ArrayType, axis: A) -> Result<Self, TypeError> {
+        let axis = axis.into();
+        let position = axis.normalize(input_type.rank()).map_err(|_| {
+            TypeError::invalid(format!(
+                "`{}` axis {} is out of bounds for rank {}",
+                DIMENSION_SIZE_OPERATION_NAME,
+                axis,
+                input_type.rank(),
+            ))
+        })?;
+
+        let input_dimension = input_type.shape().dimensions()[position].clone();
+        let minimum_extent = input_dimension.bounds().lower();
+        if minimum_extent > MAX_DIMENSION_EXTENT {
+            return Err(DimensionError::ExtentExceedsBackendWidth {
+                value: minimum_extent,
+                maximum: MAX_DIMENSION_EXTENT,
+            }
+            .into());
+        }
+
+        // A static axis has a static size, while reading a dynamic axis defines that axis's variable.
+        let output_type = DimensionType::from(input_dimension.clone());
+        Ok(Self { axis: position, input_dimension, output_type })
+    }
+
+    /// Returns the normalized non-negative input axis of this [`DimensionSizeOperation`].
+    #[inline]
+    pub fn axis(&self) -> usize {
+        self.axis
+    }
+
+    /// Returns the declared selected input [`Dimension`] of this [`DimensionSizeOperation`].
+    #[inline]
+    pub fn input_dimension(&self) -> &Dimension {
+        &self.input_dimension
+    }
+
+    /// Returns the output [`DimensionType`] of this [`DimensionSizeOperation`].
+    #[inline]
+    pub fn output_type(&self) -> &DimensionType {
+        &self.output_type
+    }
+
+    /// Validates the provided input [`ArrayIrType`] against this operation's selected declared axis.
+    fn validate_input_type(&self, input_type: &ArrayIrType) -> Result<(), TypeError> {
+        let input_type = <&ArrayType>::try_from(input_type)?;
+        let actual_dimension = input_type.shape().dimensions().get(self.axis).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "`{}` axis {} is out of bounds for rank {}",
+                DIMENSION_SIZE_OPERATION_NAME,
+                self.axis,
+                input_type.rank(),
+            ))
+        })?;
+
+        let minimum_extent = actual_dimension.bounds().lower();
+        if minimum_extent > MAX_DIMENSION_EXTENT {
+            return Err(DimensionError::ExtentExceedsBackendWidth {
+                value: minimum_extent,
+                maximum: MAX_DIMENSION_EXTENT,
+            }
+            .into());
+        }
+
+        if self.input_dimension.is_refined_by(actual_dimension) {
+            return Ok(());
+        }
+
+        if let (Dimension::Dynamic(variable), Dimension::Static(extent)) = (&self.input_dimension, actual_dimension)
+            && !variable.bounds().contains(*extent)
+        {
+            return Err(DimensionError::BindingOutOfBounds {
+                variable: variable.to_string(),
+                value: *extent,
+                bounds: variable.bounds(),
+            }
+            .into());
+        }
+
+        Err(TypeError::invalid(format!(
+            "`{}` input axis {} dimension `{}` does not refine declared dimension `{}`",
+            DIMENSION_SIZE_OPERATION_NAME, self.axis, actual_dimension, self.input_dimension,
+        )))
+    }
+}
+
+impl Display for DimensionSizeOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for DimensionSizeOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        DIMENSION_SIZE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        self.validate_input_type(&input_types[0])?;
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
+        let actual_dimension = &input_type.shape().dimensions()[self.axis];
+
+        // Dimension variables have immutable bounds. A static refinement of the axis therefore makes the size static,
+        // while a narrower dynamic refinement defines a new identity with those bounds, which program replay relates
+        // to the original definition before validating downstream uses.
+        let output_type = match actual_dimension {
+            Dimension::Static(_) => DimensionType::from(actual_dimension.clone()),
+            Dimension::Dynamic(_) if actual_dimension.bounds() == self.output_type.bounds() => self.output_type.clone(),
+            Dimension::Dynamic(_) => {
+                DimensionType::new(self.output_type.dimension().to_string(), actual_dimension.bounds())
+            }
+        };
+
+        Ok(vec![output_type.into()])
+    }
+
+    #[inline]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
+        Ok(Self {
+            axis: self.axis,
+            input_dimension: self.input_dimension.rename_type_identities(renaming),
+            output_type: self.output_type.rename_identities(renaming)?,
+        })
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, DIMENSION_SIZE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("axis", self.axis))
+    }
+}
+
+impl_reference_dischargeable_operation!(@reference_free DimensionSizeOperation);
+
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DimensionSizeOperation
+where
+    C::Value: DimensionSize<C::Value>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let input_type = inputs[0].r#type();
+        self.validate_input_type(input_type.as_ref())?;
+        Ok(vec![inputs[0].dimension_size(self.axis)?])
+    }
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> PartiallyEvaluatableOperation<C>
+    for DimensionSizeOperation
+{
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionSizeOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        _driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // A rectangular array has the same per-item axis extent for every item, even when its batch axis is mapped.
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
+        self.validate_input_type(&input.unbatched_type())?;
+        let input_type = input.value().r#type();
+        let batched_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let packed_axis = match input.batch_axis().axis() {
+            Some(batch_axis) => {
+                let batch_axis = batch_axis.normalize(batched_type.rank())?;
+                if self.axis() < batch_axis { self.axis() } else { self.axis() + 1 }
+            }
+            None => self.axis(),
+        };
+        let operation = Self::new(batched_type, packed_axis)?;
+        Ok(context
+            .parent()
+            .bind(operation, Vec::new(), std::slice::from_ref(input.value()))?
+            .into_iter()
+            .map(ArrayIrBatch::replicated)
+            .collect::<Vec<_>>())
+    }
+}
+
+impl_non_differentiable_operation!(DimensionSizeOperation);
+impl_non_transposable_operation!(DimensionSizeOperation);
+
+/// Reads the runtime extent of one array axis.
+///
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
+/// selected by `Output` (e.g., a materialized array backend can return its host extent, while an array IR program value
+/// returns a dimension value that can be passed explicitly to shape-carrying operations and combined with other
+/// dimension operations). A program output is not an integer array; convert it to ordinary scalar data explicitly when
+/// a numerical computation needs the extent as data.
+///
+/// In an array IR trace, the capability works both on the outer array member and on a [`ProjectedValue<ArrayType, V>`].
+/// The projected form stages into and returns the parent array IR carrier, allowing an array operation output to feed
+/// shape computation without exposing an adapter conversion in user code.
+///
+/// Negative axes index from the final array axis. The representation of the output depends on whether the type
+/// already pins the extent. A dynamic selected axis stages a [`DimensionSizeOperation`] read that preserves the
+/// axis's [`DimensionVariable`]. A static selected axis is folded: its extent is known from the type, so staging
+/// implementations return a dimension literal through [`DimensionConstant`] instead of reading it back from the array,
+/// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
+/// implementations return the host extent either way.
+///
+/// During batching, each item shares the array axis extent, so the resulting dimension remains replicated.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values (including the projected array members of array IR values) implement this capability for [`ArrayType`] and
+/// array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayIrValue, DimensionSize, ProgramError};
+/// # fn main() -> Result<(), ProgramError> {
+/// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]).unwrap());
+/// let columns = array.dimension_size(-1)?;
+/// let ArrayIrValue::Dimension(columns) = columns else {
+///     unreachable!("`dimension_size` always returns a dimension member");
+/// };
+/// assert_eq!(columns.extent(), 3);
+/// # Ok(())
+/// # }
+/// ```
+#[capability]
+pub trait DimensionSize<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Returns the runtime extent of `axis` in the representation selected by `Output`.
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Output, ProgramError>;
+}
+
+impl<
+    V: Value<
+            Dispatch = ValueDomainDispatch,
+            Type = ArrayIrType,
+            Domain: Context<
+                Type = ArrayIrType,
+                Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+            >,
+        >,
+> DimensionSize<V, ArrayIrType> for V
+{
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
+        let r#type = self.r#type();
+        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+
+        // Constructing the operation first validates and normalizes `axis`. A statically known extent is then folded
+        // into a literal rather than read back from the array.
+        let operation = DimensionSizeOperation::new(input_type, axis)?;
+
+        if let Dimension::Static(extent) = operation.input_dimension() {
+            return self.domain().dimension_constant(*extent);
+        }
+
+        Ok(self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+    }
+}
+
+impl DimensionSize<usize, ArrayType> for Array {
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
+        let axis = axis.into();
+        let position = axis.normalize(self.r#type().rank()).map_err(|_| {
+            TypeError::invalid(format!(
+                "`{}` axis {} is out of bounds for rank {}",
+                DIMENSION_SIZE_OPERATION_NAME,
+                axis,
+                self.r#type().rank(),
+            ))
+        })?;
+        let r#type = self.r#type();
+        let dimension = &r#type.shape().dimensions()[position];
+        dimension.value().ok_or_else(|| {
+            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}"))
+                .into()
+        })
+    }
+}
+
+impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize<Self, ArrayIrType> for ArrayIrValue<A> {
+    fn dimension_size<I: Into<Axis>>(&self, axis: I) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let input_type = array.r#type();
+        let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
+        let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
+        Ok(Self::Dimension(DimensionValue::new(operation.output_type().clone(), extent)?))
+    }
+}
+
+impl<
+    V: Value<
+            Dispatch = ValueDomainDispatch,
+            Type = ArrayIrType,
+            Domain: Context<
+                Type = ArrayIrType,
+                Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+            >,
+        >,
+> DimensionSize<V, ArrayType> for ProjectedValue<ArrayType, V>
+{
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
+        // The projected view stages into and returns the parent array IR carrier, folding static axes exactly like the
+        // array IR implementation above.
+        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
+        if let Dimension::Static(extent) = operation.input_dimension() {
+            return self.value().domain().dimension_constant(*extent);
+        }
+        Ok(self.value().domain().bind(operation, Vec::new(), std::slice::from_ref(self.value()))?.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
+    };
+    use crate::batching::{BatchAxis, BatchingTracer};
+    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::macros::check_operation_type_inference;
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::programs::{
+        EffectClasses, EmptyRegionDriver, Operation, ProgramBuilder, RegionInterface, TypeIdentityRenaming,
+        ValueProjection,
+    };
+    use crate::tracing::TracingContext;
+
+    use super::*;
+
+    #[test]
+    fn test_dimension_size() {
+        let bounds = DimensionBounds::new(2, Some(8)).unwrap();
+        let variable = DimensionVariable::new("extent", bounds);
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let operation = DimensionSizeOperation::new(&dynamic_type, -1).unwrap();
+
+        // Dynamic axes preserve their identity and normalize negative axis indices.
+        assert_eq!(operation.axis(), 0);
+        assert_eq!(operation.input_dimension(), &Dimension::Dynamic(variable.clone()));
+        assert_eq!(operation.output_type().variable(), Some(&variable));
+        assert_eq!(operation.to_string(), "dimension_size [axis=0]");
+
+        // Static axes produce a fresh exact-bounds dimension.
+        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let static_operation = DimensionSizeOperation::new(&static_type, 0).unwrap();
+        assert_eq!(static_operation.input_dimension(), &Dimension::Static(3));
+        assert_eq!(static_operation.output_type().bounds(), DimensionBounds::new(3, Some(4)).unwrap());
+        assert_ne!(static_operation.output_type().variable(), operation.output_type().variable());
+
+        assert_eq!(
+            DimensionSizeOperation::new(&static_type, 1),
+            Err(TypeError::invalid("`dimension_size` axis 1 is out of bounds for rank 1")),
+        );
+
+        assert_eq!(
+            DimensionSizeOperation::new(&static_type, -2),
+            Err(TypeError::invalid("`dimension_size` axis -2 is out of bounds for rank 1")),
+        );
+
+        if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let unrepresentable_type =
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(unrepresentable)]));
+            let expected = Err(DimensionError::ExtentExceedsBackendWidth {
+                value: unrepresentable,
+                maximum: MAX_DIMENSION_EXTENT,
+            }
+            .into());
+            assert_eq!(DimensionSizeOperation::new(&unrepresentable_type, 0), expected);
+            let unrepresentable_variable =
+                DimensionVariable::new("unrepresentable", DimensionBounds::at_least(unrepresentable));
+            let unrepresentable_dynamic_type =
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(unrepresentable_variable)]));
+            assert_eq!(
+                DimensionSizeOperation::new(&unrepresentable_dynamic_type, 0),
+                Err(DimensionError::ExtentExceedsBackendWidth {
+                    value: unrepresentable,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }
+                .into()),
+            );
+        }
+
+        let input_type = dynamic_type;
+        let (output_types, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |array| {
+                let projected = ValueProjection::<ArrayType>::into_projected(array.clone())?;
+                Ok((array.dimension_size(0)?, projected.dimension_size(0)?))
+            },
+            ArrayIrType::from(input_type.clone()),
+        )
+        .unwrap();
+        let (ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)) = output_types else {
+            panic!("expected two dimension output types");
+        };
+        assert_eq!(first.variable(), Some(&variable));
+        assert_eq!(second.variable(), Some(&variable));
+        assert!(program.type_identity_signature().internal_identities().is_empty());
+
+        let [first_instruction, second_instruction] = program.instructions() else {
+            panic!("expected two dimension-size instructions");
+        };
+        assert_eq!(first_instruction.inputs(), program.input_ids());
+        assert_eq!(second_instruction.inputs(), program.input_ids());
+        assert!(first_instruction.regions().is_empty());
+        assert!(second_instruction.regions().is_empty());
+        assert!(matches!(first_instruction.operation(), ArrayIrOperation::DimensionSize(_),));
+        assert!(matches!(second_instruction.operation(), ArrayIrOperation::DimensionSize(_),));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[extent] .
+                let %1:dimension<extent ∈ [2, 8)> = dimension_size [axis=0] %0
+                    %2:dimension<extent ∈ [2, 8)> = dimension_size [axis=0] %0
+                in (%1, %2)"},
+        );
+    }
+
+    #[test]
+    fn test_dimension_size_static_axes() {
+        // A dynamic axis is read back from the array and keeps its dimension identity, while a static axis is folded
+        // into a literal instead of a read, so the trace carries no `dimension_size` whose output the type already
+        // knows.
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = context.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
+                .into(),
+        );
+        let dynamic = array.dimension_size(0).unwrap();
+        let r#static = array.dimension_size(-1).unwrap();
+        assert!(
+            matches!(dynamic.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.variable() == Some(&items))
+        );
+        assert!(matches!(r#static.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.extent() == Some(3)));
+        let builder = context.builder().borrow();
+        let [read, literal] = builder.instructions() else {
+            panic!("expected one dimension read followed by one dimension literal");
+        };
+        assert!(matches!(read.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert!(matches!(literal.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(literal.inputs().is_empty());
+    }
+
+    #[test]
+    fn test_dimension_size_type_inference() {
+        let bounds = DimensionBounds::new(2, Some(8)).unwrap();
+        let variable = DimensionVariable::new("extent", bounds);
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let operation = DimensionSizeOperation::new(&dynamic_type, -1).unwrap();
+
+        let dimension_type = DimensionType::new("other", bounds);
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [dynamic_type.clone().into()],
+                    output_types = [operation.output_type().clone().into()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [dimension_type.clone().into()],
+                    error = "expected array type but got dimension type",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32).into()],
+                    error = "`dimension_size` axis 0 is out of bounds for rank 0",
+                },
+                {
+                    input_types = [ArrayType::new(
+                        DataType::F32,
+                        Shape::new(vec![dimension_type.dimension().clone()]),
+                    ).into()],
+                    error = "`dimension_size` input axis 0 dimension `other` does not refine declared \
+                             dimension `extent`",
+                },
+            ],
+        );
+
+        let refined_output = operation
+            .infer_output_types(&[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(5)])).into()], &[])
+            .unwrap();
+        let refined_output = <&DimensionType>::try_from(&refined_output[0]).unwrap();
+        assert_eq!(refined_output.extent(), Some(5));
+        assert_ne!(refined_output.variable(), Some(&variable));
+
+        assert_eq!(
+            operation.infer_output_types(
+                &[dynamic_type.into()],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(9)])).into()],
+                &[]
+            ),
+            Err(DimensionError::BindingOutOfBounds { variable: "extent".to_string(), value: 9, bounds }.into()),
+        );
+
+        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        check_operation_type_inference!(
+            operation = DimensionSizeOperation::new(&static_type, 0).unwrap(),
+            cases = [{
+                input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into()],
+                error = "`dimension_size` input axis 0 dimension `4` does not refine declared dimension `3`",
+            }],
+        );
+
+        if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let unrepresentable_type =
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(unrepresentable)]));
+            assert_eq!(
+                operation.infer_output_types(&[unrepresentable_type.into()], &[]),
+                Err(DimensionError::ExtentExceedsBackendWidth {
+                    value: unrepresentable,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }
+                .into()),
+            );
+        }
+    }
+
+    #[test]
+    fn test_dimension_size_rename_type_identities() {
+        let bounds = DimensionBounds::new(2, Some(8)).unwrap();
+        let variable = DimensionVariable::new("extent", bounds);
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let operation = DimensionSizeOperation::new(&dynamic_type, -1).unwrap();
+
+        // Renaming preserves the relationship between the selected dynamic input dimension and the output.
+        let renamed = DimensionVariable::new("renamed", bounds);
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(variable, renamed.clone()).unwrap();
+        let renamed_operation = operation.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed_operation.input_dimension(), &Dimension::Dynamic(renamed.clone()));
+        assert_eq!(renamed_operation.output_type().variable(), Some(&renamed));
+    }
+
+    #[test]
+    fn test_dimension_size_rename_type_identities_splice() {
+        let bounds = DimensionBounds::new(2, Some(8)).unwrap();
+        let variable = DimensionVariable::new("extent", bounds);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |array| {
+                let projected = ValueProjection::<ArrayType>::into_projected(array.clone())?;
+                Ok((array.dimension_size(0)?, projected.dimension_size(0)?))
+            },
+            ArrayIrType::from(input_type.clone()),
+        )
+        .unwrap();
+
+        // Relocation preserves both explicit reader edges and their shared forwarded identity.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let outputs = builder.splice_program(&program, &[input]).unwrap();
+        let imported = builder
+            .build::<ArrayIrValue<Array>, (ArrayIrValue<Array>, ArrayIrValue<Array>)>(
+                outputs,
+                Placeholder,
+                (Placeholder, Placeholder),
+            )
+            .unwrap();
+        assert!(imported.type_identity_signature().internal_identities().is_empty());
+        let output_types = imported.output_types();
+        let [ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)] = output_types.as_slice() else {
+            panic!("expected two imported dimension output types");
+        };
+        assert_eq!(first.variable(), Some(&variable));
+        assert_eq!(second.variable(), Some(&variable));
+        assert_eq!(imported.instructions().len(), 2);
+        assert_eq!(imported.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_dimension_size_interpretation() {
+        let bounds = DimensionBounds::new(2, Some(8)).unwrap();
+        let variable = DimensionVariable::new("extent", bounds);
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let operation = DimensionSizeOperation::new(&dynamic_type, -1).unwrap();
+
+        // Eager execution reads shape metadata without consuming or copying the array payload.
+        let dimension_type = DimensionType::new("other", bounds);
+        let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]).unwrap();
+        assert_eq!(reference_array.dimension_size(-1), Ok(3));
+        let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap());
+        let payload = ValueProjection::<ArrayType>::projected(&array).unwrap().storage_bytes().as_ptr();
+        let output = array.dimension_size(-1).unwrap();
+        let ArrayIrValue::Dimension(output) = output else {
+            panic!("expected one dimension output");
+        };
+        assert_eq!(output.extent(), 3);
+        assert_eq!(ValueProjection::<ArrayType>::projected(&array).unwrap().storage_bytes().as_ptr(), payload,);
+
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        assert_eq!(
+            dimension.dimension_size(0),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // A dynamic staged declaration executes against its compatible concrete static refinement.
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let output = context
+            .bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap())])
+            .unwrap();
+        let [ArrayIrValue::Dimension(output)] = output.as_slice() else {
+            panic!("expected one dimension output");
+        };
+        assert_eq!(output.extent(), 5);
+        let input_type = dynamic_type;
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |array| {
+                let projected = ValueProjection::<ArrayType>::into_projected(array.clone())?;
+                Ok((array.dimension_size(0)?, projected.dimension_size(0)?))
+            },
+            ArrayIrType::from(input_type.clone()),
+        )
+        .unwrap();
+        let concrete = ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap());
+        let (first, second) = program.interpret(concrete).unwrap();
+        let (ArrayIrValue::Dimension(first), ArrayIrValue::Dimension(second)) = (first, second) else {
+            panic!("expected two concrete dimension outputs");
+        };
+        assert_eq!(first.extent(), 5);
+        assert_eq!(second.extent(), 5);
+    }
+
+    #[test]
+    fn test_dimension_size_partial_evaluation() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |array| array.dimension_size(0),
+            ArrayIrType::from(input_type.clone()),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+
+        let known = program
+            .partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap()))])
+            .unwrap();
+        assert!(known.program().instructions().is_empty());
+        let [PartialEvaluationOutput::Known(ArrayIrValue::Dimension(output))] = known.outputs() else {
+            panic!("expected one known dimension output");
+        };
+        assert_eq!(output.extent(), 5);
+
+        let unknown = program.partially_evaluate(&[PartialValue::Unknown(input_type.into())]).unwrap();
+        assert_eq!(unknown.program().instructions().len(), 1);
+        assert_eq!(unknown.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        let outputs = unknown
+            .program()
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap())])
+            .unwrap();
+        let [ArrayIrValue::Dimension(output)] = outputs.as_slice() else {
+            panic!("expected one residual dimension output");
+        };
+        assert_eq!(output.extent(), 5);
+    }
+
+    #[test]
+    fn test_dimension_size_batching() -> Result<(), ProgramError> {
+        // A rectangular mapped array still has one shared extent for its per-item axis.
+        let eager = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), BatchAxis::new(0))?;
+        let output = BatchingTracer::new(eager, input).dimension_size(0)?.into_batch();
+        assert_eq!(output, ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3)?)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_dimension_size_batching_validates_selected_axis() -> Result<(), ProgramError> {
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), BatchAxis::new(0))?;
+        let operation = DimensionSizeOperation::new(&ArrayType::new_static(DataType::F32, [3, 4]), 1)?;
+        assert_eq!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
+            Err(TypeError::invalid("`dimension_size` axis 1 is out of bounds for rank 1").into()),
+        );
+        Ok(())
+    }
+}

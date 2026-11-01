@@ -1,0 +1,5157 @@
+//! Operations that compute elementwise arithmetic on numeric values. Each operation is defined by an [`Operation`] type
+//! (e.g., [`AddOperation`]) together with a value capability trait (e.g., [`Add`]) whose functions apply it to eager
+//! [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending on the
+//! value it runs on. The operations fall into three groups:
+//!
+//!   - **Sign and Magnitude:** [`Sign`] maps a value to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
+//!     value), [`Neg`] negates it, and [`Abs`] computes its absolute value (i.e., the real magnitude `|z|` for a complex
+//!     value).
+//!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`SaturatingSub`], [`Mul`], and [`Div`] compute sums, differences,
+//!     products, and quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated
+//!     division, like [`std::ops::Rem`]).
+//!   - **Powers and Roots:** [`Pow`] raises one value to the power of another (i.e., the principal value
+//!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal
+//!     square roots.
+//!
+//! Binary operations promote their element types and broadcast their shapes before applying the corresponding
+//! elementwise arithmetic. Backend operations such as StableHLO's [`add`](https://openxla.org/stablehlo/spec#add)
+//! require these input types and shapes to have already been aligned. Array inputs that carry partial sums over
+//! unreduced mesh axes are accepted only where the output remains a valid partial sum: negation preserves them, sums
+//! and differences require both inputs to be unreduced over the same axes, products permit one unreduced input when the
+//! other is reduced over those same axes, and division permits an unreduced numerator with a denominator reduced over
+//! those axes. Every other operation rejects such inputs. Refer to the documentation of each operation for the element
+//! types it supports. [`Neg`], [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the fallible counterparts of the
+//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Ordinary integer
+//! arithmetic wraps at the element width for eager arrays and reports overflow for host primitives. Saturating
+//! subtraction instead clamps integer arrays and host integers to their numeric bounds.
+//!
+//! Negation, addition, and subtraction are linear. Multiplication is linear in either input when the other one is
+//! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
+//! [`Sign`] is piecewise constant and has zero derivatives. Saturating subtraction has discrete integer outputs with
+//! structural-zero tangents. The remaining operations are nonlinear, so reverse mode differentiation transposes their
+//! linearizations instead.
+//!
+//! # Example
+//!
+//! ```rust
+//! # use ryft_core::{Add, Array, ProgramError, Sqrt};
+//! # fn main() -> Result<(), ProgramError> {
+//! let input = Array::vector(vec![0.0f64, 3.0, 8.0])?;
+//! let output = input.add(&Array::scalar(1.0f64)?)?.sqrt()?;
+//! assert_eq!(output.elements::<f64>()?, vec![1.0, 2.0, 3.0]);
+//! # Ok(())
+//! # }
+//! ```
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use crate::arrays::{
+    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, Broadcastable,
+    DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, FloatingPointArrayElement,
+    NumericArrayElement, RealArrayElement, i1, i2, i4, u1, u2, u4,
+};
+use crate::contexts::StagingContext;
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
+use crate::macros::{
+    check_count, check_types, define_elementwise_capability, define_elementwise_operation,
+    dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
+    impl_differentiable_operation, impl_parameterwise_operator, impl_tracer_operator,
+};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
+use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
+use crate::operations::constants::one_like::OneLike;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
+use crate::operations::exponential::Log;
+use crate::operations::rounding::Floor;
+use crate::operations::{Accuracy, Capability};
+use crate::programs::{
+    MaybeZero, Operation, OperationFoldOutput, OperationProvider, ProgramError, RegionInterface, Type, TypeError,
+    Typed, Value,
+};
+use crate::tracing::{Tracer, TracingContext};
+
+/// Canonical operation name for [`SignOperation`].
+pub const SIGN_OPERATION_NAME: &str = "sign";
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that computes the elementwise sign of one value while preserving its array metadata. Matching
+    /// the input constraints of StableHLO's [`sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
+    /// floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token, and structural-zero
+    /// inputs are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to `-1`, `0`, or `1`,
+    /// floating-point values map to `-1.0` or `1.0` away from zero while signed zeros and NaNs pass through unchanged,
+    /// and complex values map to `z / |z|`, with `0` mapping to `0`. Inputs that still carry partial sums are rejected
+    /// because the sign of a partial sum is not the sign of the total.
+    SignOperation,
+    SIGN_OPERATION_NAME,
+    Sign,
+    sign,
+    infer_data_types = |input_types: &[DataType]| {
+        let input_type = input_types[0];
+        if input_type.is_signed() || input_type.is_floating_point() || input_type.is_complex() {
+            Ok(vec![input_type])
+        } else {
+            Err(TypeError::invalid(format!("cannot compute the sign of a value of data type `{input_type}`")))
+        }
+    },
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_elementwise_operation!(@constant SignOperation);
+
+define_elementwise_capability!(
+    @unary
+    /// Value capability for elementwise signs, preserving floating-point signed zeros and NaNs. Eager values compute
+    /// directly while contextual values bind [`SignOperation`]. Failures are returned as [`ProgramError`]s.
+    Sign,
+    /// Computes [`SignOperation`] elementwise for this value.
+    sign,
+    SignOperation,
+);
+
+impl Sign for Array {
+    fn sign(&self) -> Result<Self, ProgramError> {
+        SignOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
+        if Self::element_count(self.r#type().as_ref())? == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
+        }
+        let data_type = self.r#type().data_type();
+        if data_type.is_signed() {
+            dispatch_on_array_element_type!(@signed data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as NumericArrayElement>::sign(value)
+                })
+            })
+        } else if data_type.is_complex() {
+            dispatch_on_array_element_type!(@complex data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as NumericArrayElement>::sign(value)
+                })
+            })
+        } else {
+            dispatch_on_array_element_type!(@float data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as NumericArrayElement>::sign(value)
+                })
+            })
+        }
+    }
+}
+
+/// Implements [`Sign`] for one host primitive type.
+macro_rules! impl_sign_for_primitive {
+    // Signed integer primitives use the ordinary integer signum, which cannot fail.
+    (@signed $type:ty) => {
+        impl Sign for $type {
+            #[inline]
+            fn sign(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::signum(*self))
+            }
+        }
+    };
+
+    // Floating-point primitives mirror the reference backends. Signed zeros and NaNs are preserved,
+    // and every other value maps to `1.0` or `-1.0`.
+    (@float $type:ty) => {
+        impl Sign for $type {
+            #[inline]
+            fn sign(&self) -> Result<Self, ProgramError> {
+                Ok(if self.is_nan() || *self == 0.0 { *self } else { <$type>::signum(*self) })
+            }
+        }
+    };
+}
+
+impl_sign_for_primitive!(@signed i8);
+impl_sign_for_primitive!(@signed i16);
+impl_sign_for_primitive!(@signed i32);
+impl_sign_for_primitive!(@signed i64);
+impl_sign_for_primitive!(@signed i128);
+impl_sign_for_primitive!(@signed isize);
+impl_sign_for_primitive!(@float f32);
+impl_sign_for_primitive!(@float f64);
+
+/// Canonical operation name for [`NegOperation`].
+pub const NEG_OPERATION_NAME: &str = "neg";
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array metadata
+    /// and reduction state. Unsigned integers wrap at their element width. Boolean, token, structural-zero, and the
+    /// unsigned floating-point type [`DataType::F8E8M0FNU`] are rejected.
+    NegOperation,
+    NEG_OPERATION_NAME,
+    Neg,
+    neg,
+    infer_data_types = |input_types: &[DataType]| {
+        check_types!(@numeric, NEG_OPERATION_NAME, input_types);
+        let input_type = input_types[0];
+        if input_type == DataType::F8E8M0FNU {
+            return Err(TypeError::invalid(format!(
+                "`{NEG_OPERATION_NAME}` does not support input data type `{input_type}`",
+            )));
+        }
+        Ok(vec![input_type])
+    },
+);
+
+impl_differentiable_elementwise_operation! {
+    @linear
+    NegOperation,
+    rule = [@negative],
+}
+
+define_elementwise_capability!(
+    @unary
+    /// Value capability for elementwise negation. Eager values compute directly while contextual values bind
+    /// [`NegOperation`]. Failures are returned as [`ProgramError`]s.
+    Neg,
+    /// Negates `self`.
+    neg,
+    NegOperation,
+);
+
+impl Neg for Array {
+    fn neg(&self) -> Result<Self, ProgramError> {
+        NegOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
+        if Self::element_count(self.r#type().as_ref())? == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
+        }
+        let data_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
+        })
+    }
+}
+
+impl std::ops::Neg for Array {
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self::Output {
+        Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl_tracer_operator!(@unary std::ops::Neg, neg, Neg, neg);
+impl_parameterwise_operator!(@unary Neg, neg);
+
+/// Implements [`Neg`] for one host primitive type.
+macro_rules! impl_neg_for_primitive {
+    // Signed integer primitives use checked negation so that the `MIN` overflow reports an error instead of
+    // wrapping like the XLA-mirroring reference backends do on devices.
+    (@signed $type:ty) => {
+        impl Neg for $type {
+            #[inline]
+            fn neg(&self) -> Result<Self, ProgramError> {
+                self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", NEG_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 negation, which cannot fail.
+    (@float $type:ty) => {
+        impl Neg for $type {
+            #[inline]
+            fn neg(&self) -> Result<Self, ProgramError> {
+                Ok(-*self)
+            }
+        }
+    };
+}
+
+impl_neg_for_primitive!(@signed i8);
+impl_neg_for_primitive!(@signed i16);
+impl_neg_for_primitive!(@signed i32);
+impl_neg_for_primitive!(@signed i64);
+impl_neg_for_primitive!(@signed i128);
+impl_neg_for_primitive!(@signed isize);
+impl_neg_for_primitive!(@float f32);
+impl_neg_for_primitive!(@float f64);
+
+/// Canonical operation name for [`AbsOperation`].
+pub const ABS_OPERATION_NAME: &str = "abs";
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that computes the elementwise absolute value of a value (i.e., `x ↦ |x|` and the magnitude `|z|`
+    /// for complex inputs with a real result) while preserving all other type metadata. Inputs that still represent
+    /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial
+    /// sum semantics. Matching the input constraints of StableHLO's [`abs`](https://openxla.org/stablehlo/spec#abs),
+    /// signed-integer (including the sub-byte [`DataType::I2`] and [`DataType::I4`] types, with the minimum value
+    /// wrapping to itself), floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token,
+    /// structural-zero, and single-bit [`DataType::I1`] inputs (whose only negative value `-1` has no representable
+    /// absolute value) are rejected.
+    AbsOperation,
+    ABS_OPERATION_NAME,
+    Abs,
+    abs,
+    infer_data_types = |input_types: &[DataType]| {
+        let input_type = input_types[0];
+        let output_type = if input_type == DataType::C64 {
+            DataType::F32
+        } else if input_type == DataType::C128 {
+            DataType::F64
+        } else if (input_type.is_signed() && input_type != DataType::I1) || input_type.is_floating_point() {
+            input_type
+        } else {
+            return Err(TypeError::invalid(format!(
+                "cannot compute the absolute value of a value of data type `{input_type}`",
+            )));
+        };
+        Ok(vec![output_type])
+    },
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_operation! {
+    <T> AbsOperation<T>,
+    jvp<C>
+    where
+        T: Type,
+        C::Type: DifferentiableType,
+        C::Value: ZeroLike
+            + OneLike
+            + Neg
+            + Mul
+            + Div
+            + Abs
+            + Complex
+            + Conjugate
+            + Imaginary
+            + Real
+            + Compare<C::Value>
+            + Select
+            + ElementwiseDerivativeAlignment<C::Type>,
+    {
+        |_operation, context, _driver, inputs| {
+            // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ map
+            // with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`. At the
+            // complex origin, replace the zero denominator with one so the zero numerator yields zero. These
+            // conventions keep the rule finite and stable under higher-order transforms. A structural zero
+            // tangent stays symbolic, retyped to the real output's tangent type.
+            check_count!("input", inputs, 1, ProgramError);
+            let input = &inputs[0];
+            let primal = input.primal().abs()?;
+            let primal_tangent_type = primal.r#type().tangent()?;
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal_tangent_type),
+                MaybeZero::Value(_) if primal_tangent_type.is_zero_space() => {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "`{}` output type `{}` has no tangent space",
+                            ABS_OPERATION_NAME,
+                            primal.r#type(),
+                        ),
+                    }
+                    .into());
+                }
+                MaybeZero::Value(tangent) => {
+                    let primal = context.primal_to_tangent(primal.clone())?;
+                    let input_primal = context.primal_to_tangent(input.primal().clone())?;
+                    if input.primal().r#type().is_complex() {
+                        let denominator = primal.align_tangent(&primal_tangent_type, &primal)?;
+                        let zero = denominator.zero_like()?;
+                        let one = denominator.one_like()?;
+                        let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
+                        let denominator = denominator_is_zero.select(&one, &denominator)?;
+
+                        // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
+                        // algebraically equivalent but can overflow even when the final directional derivative is
+                        // finite.
+                        let conjugate = input_primal.conjugate()?;
+                        let real = conjugate.real()?.div(&denominator)?;
+                        let imaginary = conjugate.imaginary()?.div(&denominator)?;
+                        let coefficient = real.complex(&imaginary)?;
+                        let input_tangent_type = input.primal().r#type().tangent()?;
+                        let tangent = tangent.align_tangent(&input_tangent_type, &input_primal)?;
+                        MaybeZero::Value(
+                            tangent.mul(&coefficient)?.real()?.align_tangent(&primal_tangent_type, &primal)?,
+                        )
+                    } else {
+                        let input = input_primal.align_tangent(&primal_tangent_type, &primal)?;
+                        let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
+                        let zero = input.zero_like()?;
+                        let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
+                        MaybeZero::Value(non_negative.select(&tangent, &tangent.neg()?)?)
+                    }
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @unary
+    /// Value capability for elementwise absolute values, returning real magnitudes for complex inputs. Eager values
+    /// compute directly while contextual values bind [`AbsOperation`]. Failures are returned as [`ProgramError`]s.
+    Abs,
+    /// Computes elementwise absolute values, returning real magnitudes for complex inputs.
+    /// Unsupported input types, such as Boolean arrays, return a [`ProgramError`].
+    abs,
+    AbsOperation,
+);
+
+impl Abs for Array {
+    fn abs(&self) -> Result<Self, ProgramError> {
+        let output_type =
+            AbsOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?.remove(0);
+        if Self::element_count(&output_type)? == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let input_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric input_type, |Element| {
+            self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
+                <Element as NumericArrayElement>::abs(value)
+            })
+        })
+    }
+}
+
+/// Implements [`Abs`] for one host primitive type.
+macro_rules! impl_abs_for_primitive {
+    // Signed integer primitives use checked absolute values so that the `MIN` overflow reports an error instead of
+    // wrapping like the XLA-mirroring reference backends do on devices.
+    (@signed $type:ty) => {
+        impl Abs for $type {
+            #[inline]
+            fn abs(&self) -> Result<Self, ProgramError> {
+                self.checked_abs().ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", ABS_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Unsigned integer primitives are their own absolute values.
+    (@unsigned $type:ty) => {
+        impl Abs for $type {
+            #[inline]
+            fn abs(&self) -> Result<Self, ProgramError> {
+                Ok(*self)
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 absolute values, which cannot fail.
+    (@float $type:ty) => {
+        impl Abs for $type {
+            #[inline]
+            fn abs(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::abs(*self))
+            }
+        }
+    };
+}
+
+impl_abs_for_primitive!(@signed i8);
+impl_abs_for_primitive!(@signed i16);
+impl_abs_for_primitive!(@signed i32);
+impl_abs_for_primitive!(@signed i64);
+impl_abs_for_primitive!(@signed i128);
+impl_abs_for_primitive!(@signed isize);
+impl_abs_for_primitive!(@unsigned u8);
+impl_abs_for_primitive!(@unsigned u16);
+impl_abs_for_primitive!(@unsigned u32);
+impl_abs_for_primitive!(@unsigned u64);
+impl_abs_for_primitive!(@unsigned u128);
+impl_abs_for_primitive!(@unsigned usize);
+impl_abs_for_primitive!(@float f32);
+impl_abs_for_primitive!(@float f64);
+
+/// Canonical operation name for [`AddOperation`].
+pub const ADD_OPERATION_NAME: &str = "add";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that adds two numeric values elementwise, promoting their element [`DataType`]s and broadcasting
+    /// their [`Shape`](crate::arrays::Shape)s. Array inputs that carry partial sums must both be unreduced over exactly
+    /// the same mesh axes. Mixing an unreduced input with an already reduced input would duplicate the reduced
+    /// contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
+    AddOperation,
+    ADD_OPERATION_NAME,
+    Add,
+    add,
+    check_data_types = [@numeric],
+    check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+);
+
+impl_differentiable_elementwise_operation! {
+    @linear
+    AddOperation,
+    rule = [@positive, @positive],
+}
+
+impl<T: Type, O: Operation<Type = T> + From<AddOperation<T>>> OperationProvider<T, AddOperation<T>> for O {
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: AddOperation<T>, input_types: &[&T]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(Self::from(request))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    type Operation = Self;
+
+    #[inline]
+    fn provide(_request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        // The array IR family adds arrays only, so the provider rejects every other member kind before constructing
+        // the array member rather than leaving the mismatch to that member's input projection.
+        check_count!("input", input_types, 2, ProgramError);
+        for (index, input_type) in input_types.iter().enumerate() {
+            if !matches!(input_type, ArrayIrType::Array(_)) {
+                return Err(TypeError::invalid(format!(
+                    "`{ADD_OPERATION_NAME}` input {index} must be an array but got type `{input_type}`",
+                ))
+                .into());
+            }
+        }
+        Ok(Self::Array(ArrayOperation::Add(AddOperation::new())))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: AddOperation<ArrayType>) -> Self {
+        Self::Array(ArrayOperation::Add(operation))
+    }
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for elementwise addition. Eager values compute directly while contextual values bind
+    /// [`AddOperation`]. Failures are returned as [`ProgramError`]s.
+    Add,
+    /// Adds `right` to this value.
+    add(right),
+    AddOperation,
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    Add,
+    add,
+    operation = "add",
+    inputs = @numeric,
+    checks = [@same_unreduced_axes, @same_reduced_axes],
+    |left, right| NumericArrayElement::add(left, right),
+);
+
+impl std::ops::Add for Array {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, right: Self) -> Self::Output {
+        Add::add(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl_tracer_operator!(@binary std::ops::Add, add, Add, add);
+impl_parameterwise_operator!(@binary Add, add);
+
+/// Implements [`Add`] for one host primitive type.
+macro_rules! impl_add_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Add for $type {
+            #[inline]
+            fn add(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_add(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", ADD_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Add for $type {
+            #[inline]
+            fn add(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self + *right)
+            }
+        }
+    };
+}
+
+impl_add_for_primitive!(@integer i8);
+impl_add_for_primitive!(@integer i16);
+impl_add_for_primitive!(@integer i32);
+impl_add_for_primitive!(@integer i64);
+impl_add_for_primitive!(@integer i128);
+impl_add_for_primitive!(@integer isize);
+impl_add_for_primitive!(@integer u8);
+impl_add_for_primitive!(@integer u16);
+impl_add_for_primitive!(@integer u32);
+impl_add_for_primitive!(@integer u64);
+impl_add_for_primitive!(@integer u128);
+impl_add_for_primitive!(@integer usize);
+impl_add_for_primitive!(@float f32);
+impl_add_for_primitive!(@float f64);
+
+/// Canonical operation name for [`SubOperation`].
+pub const SUB_OPERATION_NAME: &str = "sub";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that subtracts two numeric values elementwise, promoting their element types and broadcasting
+    /// their shapes. Array inputs that carry partial sums must both be unreduced over exactly the same mesh axes
+    /// (subtraction is linear, so the difference of two partial sums over the same axes is another valid partial sum).
+    /// Mixing an unreduced input with an already reduced input would duplicate the reduced contribution when the result
+    /// is subsequently reduced. Their reduced-axis markers must likewise agree.
+    SubOperation,
+    SUB_OPERATION_NAME,
+    Sub,
+    sub,
+    check_data_types = [@numeric],
+    check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+);
+
+impl_differentiable_elementwise_operation! {
+    @linear
+    SubOperation,
+    rule = [@positive, @negative],
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for elementwise subtraction. Eager values compute directly while contextual values bind
+    /// [`SubOperation`]. Failures are returned as [`ProgramError`]s.
+    Sub,
+    /// Subtracts `right` from this value.
+    sub(right),
+    SubOperation,
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    Sub,
+    sub,
+    operation = "sub",
+    inputs = @numeric,
+    checks = [@same_unreduced_axes, @same_reduced_axes],
+    |left, right| NumericArrayElement::sub(left, right),
+);
+
+impl std::ops::Sub for Array {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, right: Self) -> Self::Output {
+        Sub::sub(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl_tracer_operator!(@binary std::ops::Sub, sub, Sub, sub);
+impl_parameterwise_operator!(@binary Sub, sub);
+
+/// Implements [`Sub`] for one host primitive type.
+macro_rules! impl_sub_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Sub for $type {
+            #[inline]
+            fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_sub(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", SUB_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Sub for $type {
+            #[inline]
+            fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self - *right)
+            }
+        }
+    };
+}
+
+impl_sub_for_primitive!(@integer i8);
+impl_sub_for_primitive!(@integer i16);
+impl_sub_for_primitive!(@integer i32);
+impl_sub_for_primitive!(@integer i64);
+impl_sub_for_primitive!(@integer i128);
+impl_sub_for_primitive!(@integer isize);
+impl_sub_for_primitive!(@integer u8);
+impl_sub_for_primitive!(@integer u16);
+impl_sub_for_primitive!(@integer u32);
+impl_sub_for_primitive!(@integer u64);
+impl_sub_for_primitive!(@integer u128);
+impl_sub_for_primitive!(@integer usize);
+impl_sub_for_primitive!(@float f32);
+impl_sub_for_primitive!(@float f64);
+
+/// Canonical operation name for [`SaturatingSubOperation`].
+pub const SATURATING_SUB_OPERATION_NAME: &str = "saturating_sub";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that subtracts integer values elementwise, saturating at the result element type's numeric bounds.
+    /// Array inputs promote to a common integer element type and broadcast their shapes before subtraction. Signed
+    /// results clamp to their minimum or maximum representable value, and unsigned results clamp at zero. Input types
+    /// whose promotion produces a floating-point type are rejected, as are unreduced partial sums and mismatched
+    /// reduced-axis markers. First-class dimensions use the same operation in their own universe and clamp at zero.
+    SaturatingSubOperation,
+    SATURATING_SUB_OPERATION_NAME,
+    SaturatingSub,
+    saturating_sub,
+    infer_data_types = |input_types: &[DataType]| {
+        let output_type = input_types[0].broadcast(&input_types[1]).map_err(|_| {
+            TypeError::invalid(format!("`{SATURATING_SUB_OPERATION_NAME}` input types are not broadcast-compatible"))
+        })?;
+        if !output_type.is_integer() {
+            return Err(TypeError::invalid(format!(
+                "`{SATURATING_SUB_OPERATION_NAME}` requires an integer result data type",
+            )));
+        }
+        Ok(vec![output_type])
+    },
+    check_data_types = [@integer],
+    check_array_types = [@no_unreduced, @same_reduced_axes],
+);
+
+impl Operation for SaturatingSubOperation<DimensionType> {
+    type Type = DimensionType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        SATURATING_SUB_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[DimensionType],
+        region_interfaces: &[RegionInterface<DimensionType>],
+    ) -> Result<Vec<DimensionType>, TypeError> {
+        // Non-negative dimension subtraction saturates without runtime assertions.
+        // The stateless operation infers every bound from its input types.
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let [left, right] = input_types else { unreachable!() };
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+        let bounds = if left.extent() == Some(0) || right.extent() == Some(0) {
+            // Preserve the complete input bounds for identity folds, including an unbounded upper endpoint.
+            left.bounds()
+        } else {
+            DimensionBounds::new(
+                left_lower.saturating_sub(right_maximum),
+                left_maximum.saturating_sub(right_lower).checked_add(1),
+            )?
+        };
+        Ok(vec![match bounds.extent() {
+            Some(extent) => DimensionType::from(Dimension::Static(extent)),
+            None => DimensionType::new(format!("max(0, {} - {})", left.dimension(), right.dimension()), bounds),
+        }])
+    }
+
+    fn fold(
+        &self,
+        input_types: &[DimensionType],
+        region_interfaces: &[RegionInterface<DimensionType>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        input_types.iter().try_for_each(|input| input.bounds().representable_extent_range().map(|_| ()))?;
+        Ok((input_types[0].extent() == Some(0) || input_types[1].extent() == Some(0))
+            .then(|| vec![OperationFoldOutput::Input(0)]))
+    }
+}
+
+// Integer arrays and first-class dimensions have trivial differential spaces. Reuse the shared discrete-operation
+// rule so primal evaluation is preserved and tangents stay structural zeros without staging tangent arithmetic.
+impl_differentiable_elementwise_operation!(@non_differentiable SaturatingSubOperation);
+
+impl<A: Value<Type = ArrayType>> From<SaturatingSubOperation<DimensionType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: SaturatingSubOperation<DimensionType>) -> Self {
+        Self::Dimension(DimensionOperation::SaturatingSub(operation))
+    }
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for integer subtraction that saturates at the numeric bounds instead of overflowing. Array
+    /// values broadcast and promote their inputs to an integer result type before applying saturation. First-class
+    /// [`DimensionValue`]s clamp at zero while retaining inferred extent bounds, and host integer primitives use
+    /// their own numeric bounds. Floating-point, complex, and Boolean values are unsupported. Integer values have
+    /// structural-zero tangents and cotangents. Differentiation replays the primal subtraction without staging
+    /// tangent arithmetic; direct primitive transposition is unsupported.
+    ///
+    /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array values
+    /// implement this capability for [`ArrayType`] and [`ArrayIrType`], first-class dimensions implement it for
+    /// [`DimensionType`], and host integers use their own universes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DimensionValue, ProgramError, SaturatingSub};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// assert_eq!(Array::scalar(-120i8)?.saturating_sub(&Array::scalar(20i8)?)?, Array::scalar(i8::MIN)?);
+    /// assert_eq!(DimensionValue::constant(3)?.saturating_sub(&DimensionValue::constant(7)?)?.extent(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    SaturatingSub,
+    /// Subtracts `right` from this value, saturating at its numeric bounds.
+    saturating_sub(right),
+    SaturatingSubOperation,
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    SaturatingSub,
+    saturating_sub,
+    operation = SATURATING_SUB_OPERATION_NAME,
+    inputs = @integer,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |left, right| SaturatingSub::saturating_sub(&left, &right),
+);
+
+/// Implements [`SaturatingSub`] for one host integer primitive or checked sub-byte integer element.
+macro_rules! impl_saturating_sub_for_primitive {
+    // Sub-byte integers saturate in their host carrier, then clamp to their logical element width before encoding.
+    (@sub_byte $type:ty) => {
+        impl SaturatingSub for $type {
+            #[inline]
+            fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(Self::new(self.value().saturating_sub(right.value()).clamp(Self::MIN.value(), Self::MAX.value()))
+                    .unwrap())
+            }
+        }
+    };
+
+    // Host integers saturate at their own numeric bounds and cannot fail.
+    ($type:ty) => {
+        impl SaturatingSub for $type {
+            #[inline]
+            fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(<$type>::saturating_sub(*self, *right))
+            }
+        }
+    };
+}
+
+impl_saturating_sub_for_primitive!(i8);
+impl_saturating_sub_for_primitive!(i16);
+impl_saturating_sub_for_primitive!(i32);
+impl_saturating_sub_for_primitive!(i64);
+impl_saturating_sub_for_primitive!(i128);
+impl_saturating_sub_for_primitive!(isize);
+impl_saturating_sub_for_primitive!(u8);
+impl_saturating_sub_for_primitive!(u16);
+impl_saturating_sub_for_primitive!(u32);
+impl_saturating_sub_for_primitive!(u64);
+impl_saturating_sub_for_primitive!(u128);
+impl_saturating_sub_for_primitive!(usize);
+impl_saturating_sub_for_primitive!(@sub_byte i1);
+impl_saturating_sub_for_primitive!(@sub_byte i2);
+impl_saturating_sub_for_primitive!(@sub_byte i4);
+impl_saturating_sub_for_primitive!(@sub_byte u1);
+impl_saturating_sub_for_primitive!(@sub_byte u2);
+impl_saturating_sub_for_primitive!(@sub_byte u4);
+
+impl SaturatingSub for DimensionValue {
+    fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+        let inputs = [self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = SaturatingSubOperation::<DimensionType>::new().infer_output_types(&inputs, &[])?.remove(0);
+        Ok(Self::new(output_type, self.extent().saturating_sub(right.extent()))?)
+    }
+}
+
+/// Canonical operation name for [`MulOperation`].
+pub const MUL_OPERATION_NAME: &str = "mul";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting
+    /// their shapes. Its bilinear reduction-state rule permits one unreduced input only when the other input is reduced
+    /// over exactly the same mesh axes.
+    MulOperation,
+    MUL_OPERATION_NAME,
+    Mul,
+    mul,
+    infer_array_types = |input_types: &[ArrayType]| {
+        // Multiplication is bilinear, so its output sharding combines the inputs' unreduced/reduced state by the
+        // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
+        // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
+        // and the recomputed state is reattached afterward.
+        let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
+        let output = MulOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
+        let left_unreduced = input_types[0].unreduced_axes();
+        let left_reduced = input_types[0].reduced_axes();
+        let right_unreduced = input_types[1].unreduced_axes();
+        let right_reduced = input_types[1].reduced_axes();
+
+        // An input unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of two
+        // partial sums is not a partial sum, so at most one input may be unreduced. The other must then be reduced over
+        // exactly those axes, and the product stays unreduced over them (its matching reduced marker is consumed when
+        // the reduced set is computed below).
+        let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
+            (false, false) => {
+                return Err(TypeError::invalid(format!(
+                    "`{MUL_OPERATION_NAME}` cannot multiply two inputs that are both unreduced",
+                )));
+            }
+            (false, true) => {
+                if left_unreduced != right_reduced {
+                    return Err(TypeError::invalid(format!(
+                        "`{MUL_OPERATION_NAME}` requires the second input to be reduced over the axes \
+                         the first is unreduced over",
+                    )));
+                }
+                left_unreduced.clone()
+            }
+            (true, false) => {
+                if right_unreduced != left_reduced {
+                    return Err(TypeError::invalid(format!(
+                        "`{MUL_OPERATION_NAME}` requires the first input to be reduced over the axes \
+                         the second is unreduced over",
+                    )));
+                }
+                right_unreduced.clone()
+            }
+            (true, true) => BTreeSet::new(),
+        };
+
+        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
+        // partial-sum-times-reduced case above. A one-sided marker without a matching unreduced input would incorrectly
+        // propagate reduction state from only one input.
+        let mut output_reduced = if left_reduced == right_reduced {
+            left_reduced.clone()
+        } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
+            right_reduced.clone()
+        } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
+            left_reduced.clone()
+        } else {
+            return Err(TypeError::invalid(format!(
+                "`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes",
+            )));
+        };
+        output_reduced.retain(|axis| !output_unreduced.contains(axis));
+
+        // A non-empty result reduction state means some input was sharded, so the broadcast output (already stripped of
+        // reduction axes) carries a sharding onto which the recomputed state is reattached. Otherwise, it is already
+        // correct as is.
+        if output_unreduced.is_empty() && output_reduced.is_empty() {
+            return Ok(vec![output]);
+        }
+        let sharding = output.sharding().unwrap();
+        let rebuilt = sharding
+            .clone()
+            .with_unreduced_axes(output_unreduced)
+            .map_err(|error| TypeError::invalid(error.to_string()))?
+            .with_reduced_axes(output_reduced)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError::invalid(error.to_string()))?])
+    },
+    check_data_types = [@numeric],
+);
+
+impl_differentiable_elementwise_operation! {
+    @binary
+    MulOperation,
+    jvp<C> where C::Value: Mul {
+        |(_, left_tangent), (right, _)| right.mul(&left_tangent)?;
+        |(left, _), (_, right_tangent)| left.mul(&right_tangent)?;
+    },
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<MulOperation<V::Type>>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+    {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
+            // Transposition accepts exactly one linear input and scales its output cotangent by the other, known input.
+            // The contribution is unbroadcast to the linear input's exact cotangent type, while the known input
+            // receives a structural zero.
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+
+            let (linear, known) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
+                (true, false) => (0, 1),
+                (false, true) => (1, 0),
+                (left_linear, right_linear) => return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "operation `{}` does not support transposition for input pattern [left = {}, right = {}]",
+                        MUL_OPERATION_NAME,
+                        if left_linear { "linear" } else { "known" },
+                        if right_linear { "linear" } else { "known" },
+                    ),
+                }.into()),
+            };
+
+            let target = inputs[linear].r#type().cotangent()?;
+            let contribution = match &outputs[0] {
+                MaybeZero::Zero(_) => MaybeZero::Zero(target),
+                MaybeZero::Value(cotangent) => {
+                    if target.is_zero_space() {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "linear input `{}` of operation `{}` has no cotangent space",
+                                if linear == 0 { "left" } else { "right" },
+                                MUL_OPERATION_NAME,
+                            ),
+                        }.into());
+                    }
+
+                    // The coefficient is a primal value. Keep its reduction state when multiplying the dual
+                    // cotangent. Broadcasting and promotion happen in multiplication's own inference.
+                    let coefficient = inputs[known].as_known().unwrap();
+                    let mut contribution = context.stage_operation(
+                        MulOperation::new(),
+                        Vec::new(),
+                        &[coefficient.clone(), cotangent.clone()],
+                    )?;
+                    check_count!("output", contribution, 1, ProgramError);
+                    MaybeZero::Value(contribution.remove(0).unalign_cotangent(&target)?)
+                }
+            };
+
+            accumulators[linear].accumulate(context, contribution)
+        }
+    },
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for elementwise multiplication. Eager values compute directly while contextual values bind
+    /// [`MulOperation`]. Failures are returned as [`ProgramError`]s.
+    Mul,
+    /// Multiplies `self` by `right`.
+    mul(right),
+    MulOperation,
+);
+
+impl Mul for Array {
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+        // Multiplication combines reduction states bilinearly rather than requiring congruent input metadata. Use the
+        // operation's inference before evaluating elements so empty inputs obey the same contract.
+        let output_type = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
+            .remove(0);
+        if Self::element_count(&output_type)? == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let data_type = output_type.data_type();
+        let left = self.promoted_to(data_type)?;
+        let right = right.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            left.map_element_pairs::<Element, Element>(&right, output_type, NumericArrayElement::mul)
+        })
+    }
+}
+
+impl std::ops::Mul for Array {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, right: Self) -> Self::Output {
+        Mul::mul(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Mul<f64> for Array {
+    type Output = Self;
+
+    fn mul(self, right: f64) -> Self::Output {
+        // Scales every element by `right`, converting `right` into this array's element data type first so that scaling
+        // preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
+        let data_type = self.r#type().data_type();
+        let factor = dispatch_on_array_element_type!(data_type, |Element| {
+            Self::scalar(Element::from_real(right).unwrap_or_else(|error| panic!("{error}"))).unwrap()
+        });
+        Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl_tracer_operator!(@binary std::ops::Mul, mul, Mul, mul);
+impl_parameterwise_operator!(@binary Mul, mul);
+
+/// Implements [`Mul`] for one host primitive type.
+macro_rules! impl_mul_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Mul for $type {
+            #[inline]
+            fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_mul(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", MUL_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Mul for $type {
+            #[inline]
+            fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self * *right)
+            }
+        }
+    };
+}
+
+impl_mul_for_primitive!(@integer i8);
+impl_mul_for_primitive!(@integer i16);
+impl_mul_for_primitive!(@integer i32);
+impl_mul_for_primitive!(@integer i64);
+impl_mul_for_primitive!(@integer i128);
+impl_mul_for_primitive!(@integer isize);
+impl_mul_for_primitive!(@integer u8);
+impl_mul_for_primitive!(@integer u16);
+impl_mul_for_primitive!(@integer u32);
+impl_mul_for_primitive!(@integer u64);
+impl_mul_for_primitive!(@integer u128);
+impl_mul_for_primitive!(@integer usize);
+impl_mul_for_primitive!(@float f32);
+impl_mul_for_primitive!(@float f64);
+
+/// Canonical operation name for [`DivOperation`].
+pub const DIV_OPERATION_NAME: &str = "div";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that divides two numeric values elementwise, promoting their element types and broadcasting their
+    /// shapes. Integer division truncates toward zero. A zero integer divisor produces `-1` for signed integers or
+    /// the maximum value for unsigned integers; signed minimum divided by `-1` wraps to itself. A numerator carrying
+    /// partial sums requires a denominator reduced over exactly those axes. Otherwise, reduced-axis markers must agree.
+    /// Denominators carrying partial sums are rejected.
+    DivOperation,
+    DIV_OPERATION_NAME,
+    Div,
+    div,
+    infer_array_types = |input_types: &[ArrayType]| {
+        // Division is linear only in its numerator. A partial sum can be divided by a value reduced
+        // over the same axes; the denominator itself must never carry partial sums.
+        let numerator = &input_types[0];
+        let denominator = &input_types[1];
+        if !denominator.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!("`{DIV_OPERATION_NAME}` denominator must not be unreduced")));
+        }
+        let unreduced = numerator.unreduced_axes();
+        if unreduced.is_empty() {
+            check_types!(@same_reduced_axes, DIV_OPERATION_NAME, input_types);
+            return Ok(vec![DivOperation::<ArrayType>::new().infer_elementwise_broadcast_type(input_types)?]);
+        }
+        if unreduced != denominator.reduced_axes() {
+            return Err(TypeError::invalid(format!(
+                "`{DIV_OPERATION_NAME}` requires the denominator to be reduced over the axes the numerator \
+                 is unreduced over",
+            )));
+        }
+        if !numerator.reduced_axes().is_empty() && numerator.reduced_axes() != denominator.reduced_axes() {
+            return Err(TypeError::invalid(format!(
+                "`{DIV_OPERATION_NAME}` inputs must be reduced over the same axes",
+            )));
+        }
+        let stripped = [numerator.without_reduction_axes(), denominator.without_reduction_axes()];
+        let output = DivOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
+
+        // Non-empty reduction state guarantees that broadcasting retained a mesh.
+        let sharding = output.sharding().unwrap().clone()
+            .with_unreduced_axes(unreduced.clone())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(vec![output.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
+    },
+    check_data_types = [@numeric],
+);
+
+impl_differentiable_elementwise_operation! {
+    @binary
+    DivOperation,
+    jvp<C>
+    where
+        C::Value: Neg + Mul + Div,
+    {
+        |(_, left_tangent), (right, _)| left_tangent.div(&right)?;
+        |(left, _), (right, right_tangent)| {
+            let coefficient = left.div(&right.mul(&right)?)?.neg()?;
+            coefficient.mul(&right_tangent)?
+        };
+    },
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<DivOperation<V::Type>>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+    {
+        // Transposition accepts a linear numerator and a known denominator.
+        [numerator = @linear, denominator = @known] =>
+            |output_cotangent| output_cotangent.binary(&denominator, DivOperation::new());
+    },
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for elementwise division. Eager values compute directly while contextual values bind
+    /// [`DivOperation`]. Failures are returned as [`ProgramError`]s.
+    Div,
+    /// Divides this value by `right`.
+    div(right),
+    DivOperation,
+);
+
+impl Div for Array {
+    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+        let output_type = DivOperation::<ArrayType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
+            .remove(0);
+        if Self::element_count(&output_type)? == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let data_type = output_type.data_type();
+        let left = self.promoted_to(data_type)?;
+        let right = right.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            left.map_element_pairs::<Element, Element>(&right, output_type, NumericArrayElement::div)
+        })
+    }
+}
+
+impl std::ops::Div for Array {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, right: Self) -> Self::Output {
+        Div::div(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl_tracer_operator!(@binary std::ops::Div, div, Div, div);
+impl_parameterwise_operator!(@binary Div, div);
+
+/// Implements [`Div`] for one host primitive type.
+macro_rules! impl_div_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Div for $type {
+            #[inline]
+            fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!(
+                        "`{}` divisor is zero or the output does not fit in `{}`",
+                        DIV_OPERATION_NAME,
+                        stringify!($type),
+                    ),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Div for $type {
+            #[inline]
+            fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self / *right)
+            }
+        }
+    };
+}
+
+impl_div_for_primitive!(@integer i8);
+impl_div_for_primitive!(@integer i16);
+impl_div_for_primitive!(@integer i32);
+impl_div_for_primitive!(@integer i64);
+impl_div_for_primitive!(@integer i128);
+impl_div_for_primitive!(@integer isize);
+impl_div_for_primitive!(@integer u8);
+impl_div_for_primitive!(@integer u16);
+impl_div_for_primitive!(@integer u32);
+impl_div_for_primitive!(@integer u64);
+impl_div_for_primitive!(@integer u128);
+impl_div_for_primitive!(@integer usize);
+impl_div_for_primitive!(@float f32);
+impl_div_for_primitive!(@float f64);
+
+/// Canonical operation name for [`RemOperation`].
+pub const REM_OPERATION_NAME: &str = "rem";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that computes the elementwise remainder of a dividend (its left input) and a divisor (its right
+    /// input), promoting their element types and broadcasting their shapes. For finite inputs with a nonzero divisor,
+    /// the output takes the sign of the dividend and has magnitude less than the divisor's (i.e., truncation semantics,
+    /// matching [`std::ops::Rem`]). Integer arrays return the dividend for a zero divisor and zero for the minimum
+    /// signed value divided by `-1`. Floating-point exceptional inputs follow IEEE arithmetic. Only integer and
+    /// floating-point inputs are supported. Array inputs that still carry partial sums are rejected, and their
+    /// reduced-axis markers must agree.
+    RemOperation,
+    REM_OPERATION_NAME,
+    Rem,
+    rem,
+    check_data_types = [@numeric @real],
+    check_array_types = [@no_unreduced, @same_reduced_axes],
+);
+
+impl_differentiable_elementwise_operation! {
+    @binary
+    RemOperation,
+    jvp<C>
+    where
+        C::Value: Neg
+            + Mul
+            + Div
+            + Abs
+            + Sign
+            + Floor,
+    {
+        // `d(rem(x, y)) = dx - trunc(x / y) · dy` away from the discontinuities, using the sign and floor
+        // of the floating-point quotient to choose its truncated value.
+        |(_, left_tangent), (_, _)| left_tangent;
+        |(left, _), (right, right_tangent)| {
+            let quotient = left.div(&right)?;
+            let truncated_quotient = quotient.sign()?.mul(&quotient.abs()?.floor()?)?;
+            truncated_quotient.mul(&right_tangent)?.neg()?
+        };
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for elementwise remainders with the sign of the dividend. Eager values compute directly while
+    /// contextual values bind [`RemOperation`]. Failures are returned as [`ProgramError`]s.
+    Rem,
+    /// Computes the remainder of dividing this value (the dividend) by `right` (the divisor), with the result taking
+    /// the sign of the dividend.
+    rem(right),
+    RemOperation,
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    Rem,
+    rem,
+    operation = "rem",
+    inputs = @numeric @real,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |left, right| RealArrayElement::rem(left, right),
+);
+
+impl std::ops::Rem for Array {
+    type Output = Self;
+
+    #[inline]
+    fn rem(self, right: Self) -> Self::Output {
+        Rem::rem(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl_tracer_operator!(@binary std::ops::Rem, rem, Rem, rem);
+impl_parameterwise_operator!(@binary Rem, rem);
+
+/// Implements [`Rem`] for one host primitive type.
+macro_rules! impl_rem_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Rem for $type {
+            #[inline]
+            fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_rem(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!(
+                        "`{}` divisor is zero or the output does not fit in `{}`",
+                        REM_OPERATION_NAME,
+                        stringify!($type),
+                    ),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Rem for $type {
+            #[inline]
+            fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self % *right)
+            }
+        }
+    };
+}
+
+impl_rem_for_primitive!(@integer i8);
+impl_rem_for_primitive!(@integer i16);
+impl_rem_for_primitive!(@integer i32);
+impl_rem_for_primitive!(@integer i64);
+impl_rem_for_primitive!(@integer i128);
+impl_rem_for_primitive!(@integer isize);
+impl_rem_for_primitive!(@integer u8);
+impl_rem_for_primitive!(@integer u16);
+impl_rem_for_primitive!(@integer u32);
+impl_rem_for_primitive!(@integer u64);
+impl_rem_for_primitive!(@integer u128);
+impl_rem_for_primitive!(@integer usize);
+impl_rem_for_primitive!(@float f32);
+impl_rem_for_primitive!(@float f64);
+
+/// Canonical operation name for [`PowOperation`].
+pub const POW_OPERATION_NAME: &str = "pow";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that raises one value to the power of another elementwise (i.e., `(x, y) ↦ x^y`, with the complex
+    /// power defined as the principal value `exp(y · log(x))`), promoting their element types and broadcasting their
+    /// shapes. Only floating-point and complex inputs are supported; integer inputs must first be explicitly converted
+    /// to a supported element type. Refer to the StableHLO [`power`](https://openxla.org/stablehlo/spec#power)
+    /// documentation for the floating-point and complex semantics. Array inputs that still carry partial sums are
+    /// rejected, and their reduced-axis markers must agree.
+    PowOperation,
+    POW_OPERATION_NAME,
+    Pow,
+    pow,
+    check_data_types = [@float],
+    check_array_types = [@no_unreduced, @same_reduced_axes],
+);
+
+impl_differentiable_elementwise_operation! {
+    @binary
+    PowOperation,
+    jvp<C>
+    where
+        C::Value: ZeroLike
+            + OneLike
+            + Sub
+            + Mul
+            + Pow
+            + Log
+            + Compare<C::Value>
+            + Select,
+    {
+        // `d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy`, with `log(x)` evaluated at a base of one when `x = 0`
+        // so that the exponent contribution vanishes instead of producing `log(0) = -∞`.
+        |(left, left_tangent), (right, _)| {
+            let exponent = right.sub(&right.one_like()?)?;
+            right.mul(&left.pow(&exponent)?)?.mul(&left_tangent)?
+        };
+        |(left, _), (right, right_tangent)| {
+            let base_is_zero = left.compare(&left.zero_like()?, ComparisonDirection::Equal)?;
+            let safe_base = base_is_zero.select(&left.one_like()?, &left)?;
+            left.pow(&right)?.mul(&safe_base.log()?)?.mul(&right_tangent)?
+        };
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for elementwise powers on floating-point and complex inputs. Eager values compute directly
+    /// while contextual values bind [`PowOperation`]. Failures are returned as [`ProgramError`]s.
+    Pow,
+    /// Raises this value to the power `exponent` elementwise, promoting both inputs to a common floating-point or
+    /// complex element type.
+    pow(exponent),
+    PowOperation,
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    Pow,
+    pow,
+    operation = "pow",
+    inputs = @float,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |left, right| FloatingPointArrayElement::pow(left, right),
+);
+
+/// Implements [`Pow`] for one host primitive type. Only floating-point primitives are supported, matching the
+/// reference backends' float-only power operation.
+macro_rules! impl_pow_for_primitive {
+    ($type:ty) => {
+        impl Pow for $type {
+            #[inline]
+            fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
+                Ok(<$type>::powf(*self, *exponent))
+            }
+        }
+    };
+}
+
+impl_pow_for_primitive!(f32);
+impl_pow_for_primitive!(f64);
+
+/// Canonical operation name for [`SqrtOperation`].
+pub const SQRT_OPERATION_NAME: &str = "sqrt";
+
+define_elementwise_operation!(
+    @unary @accuracy
+    /// [`Operation`] that computes the elementwise square root of one value (i.e., `x ↦ √x`, the principal branch
+    /// `√z` on complex inputs) while preserving its array metadata. Only floating-point and complex inputs are
+    /// supported, and inputs that still carry partial sums are rejected.
+    SqrtOperation,
+    SQRT_OPERATION_NAME,
+    Sqrt,
+    sqrt_with_accuracy,
+    check_data_types = [@float],
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_elementwise_operation! {
+    @unary
+    SqrtOperation,
+    jvp<C> where C::Value: Add + Div {
+        |(_, input_tangent) -> output| input_tangent.div(&output.add(&output)?)?
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @unary @accuracy
+    /// Value capability for elementwise principal square roots on floating-point and complex inputs. Eager values
+    /// compute directly while contextual values bind [`SqrtOperation`]. Failures are returned as [`ProgramError`]s.
+    Sqrt,
+    /// Computes [`SqrtOperation`] elementwise for this value.
+    sqrt,
+    /// Behaves like [`sqrt`](Self::sqrt), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata
+    /// are unsupported.
+    sqrt_with_accuracy,
+    SqrtOperation,
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Sqrt,
+    sqrt_with_accuracy(_accuracy),
+    operation = "sqrt",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::sqrt(input),
+);
+
+/// Implements [`Sqrt`] for one host primitive type, which provides one implementation for every requested [`Accuracy`].
+macro_rules! impl_sqrt_for_primitive {
+    ($type:ty) => {
+        impl Sqrt for $type {
+            #[inline]
+            fn sqrt_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
+                Ok(<$type>::sqrt(*self))
+            }
+        }
+    };
+}
+
+impl_sqrt_for_primitive!(f32);
+impl_sqrt_for_primitive!(f64);
+
+/// Canonical operation name for [`RsqrtOperation`].
+pub const RSQRT_OPERATION_NAME: &str = "rsqrt";
+
+define_elementwise_operation!(
+    @unary @accuracy
+    /// [`Operation`] that computes the elementwise reciprocal square root of one value (i.e., `x ↦ 1/√x`, the principal
+    /// branch `1/√z` on complex inputs) while preserving its array metadata. Only floating-point and complex inputs are
+    /// supported, and inputs that still carry partial sums are rejected.
+    RsqrtOperation,
+    RSQRT_OPERATION_NAME,
+    Rsqrt,
+    rsqrt_with_accuracy,
+    check_data_types = [@float],
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_elementwise_operation! {
+    @unary
+    RsqrtOperation,
+    jvp<C>
+    where
+        C::Value: Neg + Add + Mul + Div,
+    {
+        // `d(rsqrt(x)) = -x^{-3/2} / 2 · dx = -(rsqrt(x) / (x + x)) · dx`, reusing the primal output evaluated
+        // at the tangent type.
+        |(input, input_tangent) -> output| output.div(&input.add(&input)?)?.neg()?.mul(&input_tangent)?
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @unary @accuracy
+    /// Value capability for elementwise reciprocal principal square roots on floating-point and complex inputs.
+    /// Eager values compute directly while contextual values bind [`RsqrtOperation`]. Failures are returned as
+    /// [`ProgramError`]s.
+    Rsqrt,
+    /// Computes [`RsqrtOperation`] elementwise for this value.
+    rsqrt,
+    /// Behaves like [`rsqrt`](Self::rsqrt), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata are
+    /// unsupported.
+    rsqrt_with_accuracy,
+    RsqrtOperation,
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Rsqrt,
+    rsqrt_with_accuracy(_accuracy),
+    operation = "rsqrt",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::rsqrt(input),
+);
+
+/// Implements [`Rsqrt`] for one host primitive type, which provides one implementation for every requested
+/// [`Accuracy`].
+macro_rules! impl_rsqrt_for_primitive {
+    ($type:ty) => {
+        impl Rsqrt for $type {
+            #[inline]
+            fn rsqrt_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
+                Ok(<$type>::sqrt(*self).recip())
+            }
+        }
+    };
+}
+
+impl_rsqrt_for_primitive!(f32);
+impl_rsqrt_for_primitive!(f64);
+
+/// Group of the elementwise arithmetic capabilities, including both the fallible capabilities (e.g., [`Add`]) and the
+/// panicking [`std::ops`] operator sugar for negation, addition, subtraction, multiplication, and division. It is
+/// implemented automatically for every type that implements all of its members. Integer-only [`SaturatingSub`] is
+/// required separately by [`ArrayOperations`](crate::ArrayOperations), so this bundle remains available to
+/// floating-point host scalars.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
+pub trait ArithmeticOperations<T = <Self as Capability>::Universe>:
+    Capability
+    + Sign<T>
+    + Neg<T>
+    + std::ops::Neg<Output = Self>
+    + Abs<T>
+    + Add<T>
+    + std::ops::Add<Output = Self>
+    + Sub<T>
+    + std::ops::Sub<Output = Self>
+    + Mul<T>
+    + std::ops::Mul<Output = Self>
+    + Div<T>
+    + std::ops::Div<Output = Self>
+    + Rem<T>
+    + Pow<T>
+    + Sqrt<T>
+    + Rsqrt<T>
+{
+}
+
+impl<
+    T,
+    V: Sign<T>
+        + Neg<T>
+        + std::ops::Neg<Output = V>
+        + Abs<T>
+        + Add<T>
+        + std::ops::Add<Output = V>
+        + Sub<T>
+        + std::ops::Sub<Output = V>
+        + Mul<T>
+        + std::ops::Mul<Output = V>
+        + Div<T>
+        + std::ops::Div<Output = V>
+        + Rem<T>
+        + Pow<T>
+        + Sqrt<T>
+        + Rsqrt<T>,
+> ArithmeticOperations<T> for V
+{
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use approx::assert_abs_diff_eq;
+    use half::{bf16, f16};
+    use indoc::indoc;
+    use num_complex::Complex as ComplexNumber;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+        Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, Layout,
+        LogicalMesh, MAX_DIMENSION_EXTENT, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
+    };
+    use crate::axes::NamedAxis;
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        TransposableOperation, TranspositionContext, differentiate_at,
+    };
+    use crate::interpretation::InterpretableOperation;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
+    use crate::operations::constants::one_like::OneLike;
+    use crate::operations::manipulation::conversions::ConvertElementType;
+    use crate::operations::reductions::{Reduce, ReductionKind};
+    use crate::parameters::{Parameter, Parameterwise, Placeholder};
+    use crate::partial::PartialValue;
+    use crate::programs::{
+        EffectClasses, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, Type, TypeError, Typed, ValueProjection,
+    };
+    use crate::tracing::Trace;
+
+    use super::*;
+
+    #[test]
+    fn test_sign_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = SignOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::U8],
+                    error = "cannot compute the sign of a value of data type `u8`",
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the sign of a value of data type `bool`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SignOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_sign_interpretation() {
+        assert_eq!(
+            SignOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(-3.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(-1.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_sign_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SignOperation::new(),
+            inputs = [Array::scalar(-0.7).unwrap()],
+            expected = Array::scalar(-1.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_sign_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = SignOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sign_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = SignOperation::new(),
+            cases = [{
+                primals = [Array::scalar(-2.0).unwrap()],
+                tangents = [Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(-1.0).unwrap()],
+                tangent_outputs = [Array::scalar(0.0).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sign_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = SignOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_sign() {
+        assert_eq!(Array::scalar(-3i32).unwrap().sign().unwrap(), Array::scalar(-1i32).unwrap());
+        assert_eq!(Array::scalar(0i32).unwrap().sign().unwrap(), Array::scalar(0i32).unwrap());
+        assert_eq!(Array::scalar(5i64).unwrap().sign().unwrap(), Array::scalar(1i64).unwrap());
+        assert_eq!(Array::scalar(-2.5f32).unwrap().sign().unwrap(), Array::scalar(-1.0f32).unwrap());
+        assert_eq!(Array::scalar(2.5f64).unwrap().sign().unwrap(), Array::scalar(1.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(-4.0)).unwrap().sign().unwrap(),
+            Array::scalar(bf16::from_f32(-1.0)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(4.0)).unwrap().sign().unwrap(),
+            Array::scalar(f16::from_f32(1.0)).unwrap(),
+        );
+
+        // Complex signs normalize to `z / |z|` and map the origin to itself.
+        let input = ComplexNumber::new(3.0f64, -4.0f64);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.6, -0.8)).unwrap(),
+            epsilon = 1e-12,
+        );
+        assert_eq!(
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap().sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap(),
+        );
+
+        assert_eq!(
+            Array::vector(vec![-0.7, 0.0, 2.0]).unwrap().sign().unwrap(),
+            Array::vector(vec![-1.0, 0.0, 1.0]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_sign_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(
+            invalid.sign(),
+            Err(TypeError::invalid("cannot compute the sign of a value of data type `bool`").into()),
+        );
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.sign(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_sign_unreduced() {
+        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
+        assert_eq!(input.sign(), Err(TypeError::invalid("`sign` does not support unreduced inputs").into()));
+    }
+
+    #[test]
+    fn test_array_sign_special_values() {
+        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
+        let signs = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [4]),
+            &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
+        )
+        .unwrap()
+        .sign()
+        .unwrap()
+        .elements::<f64>()
+        .unwrap();
+        assert_eq!(signs[0], -1.0);
+        assert_eq!(signs[1].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
+        assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
+        let narrow =
+            Array::from_elements(ArrayType::new_static(DataType::I2, [3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX])
+                .unwrap();
+        assert_eq!(
+            narrow.sign().unwrap().elements::<i2>(),
+            Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
+        );
+        assert!(matches!(
+            Array::scalar(1u8).unwrap().sign(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute the sign of a value of data type `u8`",
+        ));
+    }
+
+    #[test]
+    fn test_sign_primitives() {
+        assert_eq!(Sign::sign(&-5i32), Ok(-1));
+        assert_eq!(Sign::sign(&0i32), Ok(0));
+        assert_eq!(Sign::sign(&-2.5f64), Ok(-1.0));
+        assert_eq!(Sign::sign(&-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!(Sign::sign(&f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_neg_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = NegOperation,
+            cases = [{
+                input_data_types = [DataType::F64],
+                output_data_types = [DataType::F64],
+            }],
+        );
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = NegOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::Token],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Token),
+                },
+                {
+                    input_data_types = [DataType::Zero],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Zero),
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Boolean),
+                },
+                {
+                    input_data_types = [DataType::F8E8M0FNU],
+                    error = format!("`neg` does not support input data type `{}`", DataType::F8E8M0FNU),
+                },
+            ],
+        );
+
+        // Negation is linear, so partial-sum and reduced markers pass through unchanged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        check_operation_type_inference!(
+            operation = NegOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [unreduced.clone()],
+                output_types = [unreduced],
+            }],
+        );
+
+        let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        check_operation_type_inference!(
+            operation = NegOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [reduced.clone()],
+                output_types = [reduced],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_neg_interpretation() {
+        let operation = NegOperation::<ArrayType>::new();
+        assert_eq!(
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0).unwrap()]),
+            Ok(vec![Array::scalar(-2.0).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1u8).unwrap()]),
+            Ok(vec![Array::scalar(u8::MAX).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(ComplexNumber::new(1.0f64, -2.0)).unwrap()],
+            ),
+            Ok(vec![Array::scalar(ComplexNumber::new(-1.0f64, 2.0)).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_neg_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = NegOperation::new(),
+            inputs = [Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(-2.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_neg_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = NegOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![-1.0, 2.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_neg_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = NegOperation::new(),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(-2.0).unwrap()],
+                tangent_outputs = [Array::scalar(-3.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = neg %0
+                        %3:f64[] = neg %1
+                    in (%2, %3)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_neg_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = NegOperation::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(-3.0).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = neg %0
+                    in (%1)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_neg() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(vector.neg().unwrap(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
+
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(-vector.clone(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
+    }
+
+    #[test]
+    fn test_array_neg_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(invalid.neg(), Err(TypeError::invalid("`neg` does not support input data type `bool`").into()));
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.neg(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_neg_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            left.neg(),
+            Array::vector(vec![f8e4m3fn::from_f64(-1.0).unwrap(), f8e4m3fn::from_f64(-2.0).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_array_neg_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        assert_eq!(left.neg().unwrap(), Array::vector(vec![-left_values[0], -left_values[1]]).unwrap());
+    }
+
+    #[test]
+    fn test_array_neg_integers() {
+        // Negation wraps deterministically for unsigned and two's-complement signed elements, matching the scalar
+        // reference backend (and StableHLO's integer semantics), rather than panicking or saturating.
+        let unsigned = Array::vector(vec![0u8, 1, 255]).unwrap();
+        assert_eq!(unsigned.neg().unwrap().elements::<u8>(), Ok(vec![0, 255, 1]));
+        let minimum = Array::vector(vec![i8::MIN, -5]).unwrap();
+        assert_eq!(minimum.neg().unwrap().elements::<i8>(), Ok(vec![i8::MIN, 5]));
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        assert_eq!(narrow.neg().unwrap().elements::<i4>(), Ok(vec![i4::new(-7).unwrap(), i4::MIN]));
+    }
+
+    #[test]
+    fn test_neg_primitives() {
+        assert_eq!(Neg::neg(&5i32), Ok(-5));
+        assert_eq!(
+            Neg::neg(&i8::MIN),
+            Err(ProgramError::InvalidArgument {
+                message: format!("`{NEG_OPERATION_NAME}` output does not fit in `i8`"),
+            }),
+        );
+        assert_eq!(Neg::neg(&2.5f64), Ok(-2.5));
+    }
+
+    #[test]
+    fn test_neg_parameterwise() {
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!(Neg::neg(&model).map(Parameterwise::into_inner), Ok((vec![-10, -20], -30)));
+
+        // The `-` operator negates every parameter.
+        assert_eq!((-model).into_inner(), (vec![-10, -20], -30));
+    }
+
+    #[test]
+    fn test_abs_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::I2],
+                    output_data_types = [DataType::I2],
+                },
+                {
+                    input_data_types = [DataType::I4],
+                    output_data_types = [DataType::I4],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::C128],
+                    output_data_types = [DataType::F64],
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::Token],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Token),
+                },
+                {
+                    input_data_types = [DataType::Zero],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Zero),
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the absolute value of a value of data type `bool`",
+                },
+                {
+                    input_data_types = [DataType::I1],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::I1),
+                },
+                {
+                    input_data_types = [DataType::U32],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::U32),
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = AbsOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F32)],
+        );
+    }
+
+    #[test]
+    fn test_abs_interpretation() {
+        let operation = AbsOperation::new();
+
+        assert_eq!(
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(-2.0).unwrap()]),
+            Ok(vec![Array::scalar(2.0).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
+            ),
+            Ok(vec![Array::scalar(5.0).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_abs_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = AbsOperation::new(),
+            inputs = [Array::scalar(-2.0).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_abs_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = AbsOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = AbsOperation::new(),
+            cases = [
+                {
+                    primals = [Array::scalar(0.7).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap()],
+                    primal_outputs = [Array::scalar(0.7).unwrap()],
+                    tangent_outputs = [Array::scalar(3.0).unwrap()],
+                    jvp = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = abs %0
+                            %3:f64[] = zero_like %0
+                            %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
+                            %5:f64[] = neg %1
+                            %6:f64[] = select %4 %1 %5
+                        in (%2, %6)
+                    "},
+                },
+                {
+                    primals = [Array::scalar(-2.5).unwrap()],
+                    tangents = [Array::scalar(2.0).unwrap()],
+                    primal_outputs = [Array::scalar(2.5).unwrap()],
+                    tangent_outputs = [Array::scalar(-2.0).unwrap()],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_at_zero() {
+        // The real rule chooses the right derivative at zero and remains constant under another derivative.
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(0.0f64).unwrap()).gradient(|x| x.abs().unwrap()).unwrap(),
+            Array::scalar(1.0).unwrap(),
+            epsilon = 1e-9,
+        );
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(0.0f64).unwrap())
+                .gradient(|x| { differentiate_at(x).gradient(|x| x.abs().unwrap()).unwrap() })
+                .unwrap(),
+            Array::scalar(0.0).unwrap(),
+            epsilon = 1e-9,
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_complex() {
+        // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
+        // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
+        // the reverse mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
+        let z = ComplexNumber::new(0.7f64, -0.3f64);
+        let (value, gradient_value) =
+            differentiate_at(Array::scalar(z).unwrap()).value_and_gradient(|z| z.abs().unwrap()).unwrap();
+        assert_eq!(value, Array::scalar(z.norm()).unwrap());
+        let expected = z.conj() / z.norm();
+        assert_abs_diff_eq!(gradient_value, Array::scalar(expected).unwrap(), epsilon = 1e-12);
+
+        // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
+        // finite-difference oracle perturbs each element's real and imaginary parts independently.
+        check_gradient!(
+            |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum).unwrap()),
+            at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+
+        // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
+        // zero tangent and gradient at the origin.
+        assert_eq!(
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap())
+                .jvp(Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)).unwrap(), |z| z.abs()),
+            Ok((Array::scalar(0.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()).gradient(|z| z.abs().unwrap()),
+            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_complex_avoids_overflow() {
+        // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
+        // directional derivative `Re((conj(z) / |z|) * dz)`.
+        assert_eq!(
+            differentiate_at(Array::scalar(ComplexNumber::new(1e308f64, 0.0)).unwrap())
+                .jvp(Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap(), |z| z.abs()),
+            Ok((Array::scalar(1e308f64).unwrap(), Array::scalar(2.0f64).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_low_precision_uses_widened_tangents() {
+        // The coefficient and tangent are computed in the widened differential representation.
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(tangent.elements::<f32>(), Ok(vec![3.0]));
+    }
+
+    #[test]
+    fn test_abs_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = AbsOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_abs() {
+        assert_eq!(Array::vector(vec![-1.5, 2.5]).unwrap().abs().unwrap(), Array::vector(vec![1.5, 2.5]).unwrap());
+
+        // The absolute value of a complex array is its elementwise magnitude with a real element data type.
+        let complex = Array::vector(vec![3.0]).unwrap().complex(&Array::vector(vec![4.0]).unwrap()).unwrap();
+        let magnitude = complex.abs().unwrap();
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
+        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]).unwrap(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_array_abs_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(
+            invalid.abs(),
+            Err(TypeError::invalid("cannot compute the absolute value of a value of data type `bool`").into()),
+        );
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.abs(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_abs_unreduced() {
+        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
+        assert_eq!(input.abs(), Err(TypeError::invalid("`abs` does not support unreduced inputs").into()));
+    }
+
+    #[test]
+    fn test_array_abs_low_precision() {
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let negative = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[-1.0, -2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(negative.abs().unwrap(), left);
+    }
+
+    #[test]
+    fn test_array_abs_complex() {
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+
+        // The absolute value is the elementwise magnitude with a real element data type.
+        let magnitude = left.abs().unwrap();
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
+        assert_abs_diff_eq!(
+            magnitude,
+            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_array_abs_integers() {
+        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
+    }
+
+    #[test]
+    fn test_abs_primitives() {
+        assert_eq!(Abs::abs(&-5i32), Ok(5));
+        assert_eq!(
+            Abs::abs(&i8::MIN),
+            Err(ProgramError::InvalidArgument { message: "`abs` output does not fit in `i8`".to_string() }),
+        );
+        assert_eq!(Abs::abs(&5usize), Ok(5));
+        assert_eq!(Abs::abs(&-2.5f64), Ok(2.5));
+    }
+
+    #[test]
+    fn test_add_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = AddOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = format!("`{ADD_OPERATION_NAME}` input types are not broadcast-compatible"),
+                },
+            ],
+        );
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let plain = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let unreduced = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+
+        check_operation_type_inference!(
+            operation = AddOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [unreduced.clone(), unreduced.clone()],
+                    output_types = [unreduced.clone()],
+                },
+                {
+                    input_types = [unreduced.clone(), plain.clone()],
+                    error = "`add` inputs must be unreduced over the same axes",
+                },
+                {
+                    input_types = [plain.clone(), unreduced.clone()],
+                    error = "`add` inputs must be unreduced over the same axes",
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = AddOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_add_interpretation() {
+        assert_eq!(
+            AddOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.5f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(5.5f64).unwrap()]),
+        );
+        assert_eq!(
+            AddOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0).unwrap(), Array::vector(vec![3.5, -1.0]).unwrap()],
+            ),
+            Ok(vec![Array::vector(vec![5.5, 1.0]).unwrap()]),
+        );
+        assert_eq!(
+            AddOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[
+                    Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
+                ],
+            ),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.5f64, 1.0)).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_add_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = AddOperation::new(),
+            inputs = [Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
+            expected = Array::scalar(5.5).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_add_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = AddOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                    (@replicated, Array::scalar(3.0).unwrap()),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![4.0, 1.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_add_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = AddOperation::new(),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap(), Array::scalar(5.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(-1.0).unwrap()],
+                primal_outputs = [Array::scalar(7.0).unwrap()],
+                tangent_outputs = [Array::scalar(2.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = add %0 %1
+                        %5:f64[] = add %2 %3
+                    in (%4, %5)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_add_differentiation_low_precision() {
+        // Rank-zero arrays support both half-precision variants through the ordinary array operations.
+        assert_eq!(
+            differentiate_at(Array::scalar(bf16::from_f32(3.0)).unwrap())
+                .jvp(Array::scalar(bf16::ONE).unwrap(), |x| Ok(x.clone() + x)),
+            Ok((Array::scalar(bf16::from_f32(6.0)).unwrap(), Array::scalar(bf16::from_f32(2.0)).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(f16::from_f32(3.0)).unwrap())
+                .jvp(Array::scalar(f16::ONE).unwrap(), |x| Ok(x.clone() + x)),
+            Ok((Array::scalar(f16::from_f32(6.0)).unwrap(), Array::scalar(f16::from_f32(2.0)).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_add_transposition() {
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        check_operation_transposition!(
+            @exact,
+            operation = AddOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::scalar(3.0).unwrap()],
+                    input_cotangents = [Array::scalar(3.0).unwrap(), Array::scalar(3.0).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[] .
+                        in (%0, %0)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@linear(type = vector_type.clone())),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(vector_type.clone(), &[2.0, 3.0, 4.0]).unwrap()],
+                    input_cotangents = [
+                        Array::scalar(9.0).unwrap(),
+                        Array::from_elements::<f64>(vector_type, &[2.0, 3.0, 4.0]).unwrap(),
+                    ],
+                    pullback = indoc! {"
+                        lambda %0:f64[3] .
+                        let %1:f64[] = reduce [kind=sum, axes=[0]] %0
+                        in (%1, %0)
+                    "},
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_add_operation_provider() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let array_ir_type = ArrayIrType::from(array_type.clone());
+
+        // Ordinary constructors retain their unique homogeneous conversion into an array IR family.
+        let direct: ArrayIrOperation<Array> = AddOperation::new().into();
+        assert_eq!(direct.to_string(), "add");
+        assert_eq!(
+            direct.infer_output_types(&[array_ir_type.clone(), array_ir_type.clone()], &[]),
+            Ok(vec![array_ir_type.clone()]),
+        );
+
+        // Generic cotangent requests select that same array member without a competing owned conversion.
+        let provided =
+            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&array_ir_type, &array_ir_type])
+                .unwrap();
+        assert_eq!(provided.to_string(), "add");
+        let dimension_type = ArrayIrType::Dimension(DimensionValue::constant(2).unwrap().r#type().into_owned());
+        assert_eq!(
+            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&array_ir_type, &dimension_type])
+                .unwrap_err(),
+            ProgramError::Type(TypeError::invalid("`add` input 1 must be an array but got type `dimension<2>`")),
+        );
+        assert_eq!(
+            provided.infer_output_types(&[array_ir_type.clone(), array_ir_type.clone()], &[]),
+            Ok(vec![array_ir_type]),
+        );
+        let provided = ArrayOperation::<Array>::provide(AddOperation::new(), &[&array_type, &array_type]).unwrap();
+        assert_eq!(provided.to_string(), "add");
+        assert_eq!(
+            provided.infer_output_types(&[array_type.clone(), array_type], &[]),
+            Ok(vec![ArrayType::scalar(DataType::F32)])
+        );
+        assert_eq!(
+            ArrayOperation::<Array>::provide(AddOperation::new(), &[]).unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 2, actual: 0 },
+        );
+    }
+
+    #[test]
+    fn test_array_add() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(vector.add(&Array::scalar(1.0).unwrap()).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]).unwrap());
+
+        // Mixed-precision inputs promote to the common element data type.
+        let promoted =
+            Array::vector(vec![1.0f32, 2.0]).unwrap().add(&Array::vector(vec![0.5f64, 0.5]).unwrap()).unwrap();
+        assert_eq!(promoted, Array::vector(vec![1.5f64, 2.5]).unwrap());
+
+        // General broadcasting traverses arbitrary input layouts while mixed element types normalize
+        // through the canonical conversion kernel.
+        let left_type =
+            ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
+        let left = Array::from_elements(left_type, &[1.0f32, 2.0]).unwrap();
+        let right_type =
+            ArrayType::new_static(DataType::F64, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
+        let right = Array::from_elements(right_type, &[0.5f64, 1.0, 1.5]).unwrap();
+        let sum = left.add(&right).unwrap();
+        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3]));
+        assert_eq!(sum.elements::<f64>(), Ok(vec![1.5, 2.0, 2.5, 2.5, 3.0, 3.5]));
+
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(vector.clone() + Array::scalar(1.0).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]).unwrap());
+
+        // Integer arithmetic wraps deterministically, matching the scalar reference backend.
+        let wrapped = Array::vector(vec![255u8]).unwrap().add(&Array::vector(vec![1u8]).unwrap()).unwrap();
+        assert_eq!(wrapped.elements::<u8>(), Ok(vec![0]));
+    }
+
+    #[test]
+    fn test_array_add_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let varying = Array::from_elements(varying_type.clone(), &[2f32]).unwrap();
+        let invariant = Array::scalar(1f32).unwrap();
+        let expected = Err(TypeError::invalid(
+            "`add` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack an \
+             axis, as `align_manual_variation` does",
+        )
+        .into());
+        assert_eq!(invariant.add(&varying), expected);
+        assert_eq!(varying.add(&invariant), expected);
+        assert_eq!(varying.add(&varying), Array::from_elements(varying_type, &[4f32]));
+
+        let empty_type = ArrayType::new_static(DataType::F32, [0]);
+        let empty = Array::from_elements::<f32>(empty_type.clone(), &[]).unwrap();
+        let varying_empty = Array::from_elements::<f32>(
+            empty_type
+                .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(empty.add(&varying_empty), expected);
+    }
+
+    #[test]
+    fn test_tracer_add_manual_variation() {
+        // A capability for an operation with several inputs (here, `add`) aligns its inputs before binding, so the
+        // `parallel_vary` transition precedes the operation and the operation's inputs share their variation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(left, right)| Add::add(&left, &right),
+            (invariant, varying.clone()),
+            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['devices'=2:manual]>, []}], \
+                    %1:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
+                let %2:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = \
+                    parallel_vary [axis_name=\"devices\"] %0
+                    %3:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = add %2 %1
+                in (%3)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_array_add_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let sum = left.add(&right).unwrap();
+        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2]));
+        assert_eq!(
+            sum.elements::<f8e4m3fn>(),
+            Ok(vec![f8e4m3fn::from_f64(1.5).unwrap(), f8e4m3fn::from_f64(2.25).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_array_add_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let right = Array::vector(vec![ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        let right_values = [ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)];
+        assert_eq!(
+            left.add(&right).unwrap(),
+            Array::vector(vec![left_values[0] + right_values[0], left_values[1] + right_values[1]]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_add_integers() {
+        // Sub-byte arithmetic wraps using the declared bit width.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        assert_eq!(
+            narrow.add(&Array::scalar(i4::new(1).unwrap()).unwrap()).unwrap().elements::<i4>(),
+            Ok(vec![i4::MIN, i4::new(-7).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_add_primitives() {
+        assert_eq!(Add::add(&2usize, &3), Ok(5));
+        assert_eq!(Add::add(&-2i32, &3), Ok(1));
+        assert_eq!(
+            Add::add(&i8::MAX, &1),
+            Err(ProgramError::InvalidArgument { message: "`add` output does not fit in `i8`".to_string() }),
+        );
+        assert_eq!(Add::add(&2.5f64, &0.5), Ok(3.0));
+    }
+
+    #[test]
+    fn test_add_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Array IR tracers stage the homogeneous addition as an array-member instruction.
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| inputs[0].add(&inputs[1]),
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = add %0 %1
+                in (%2)"
+            },
+        );
+
+        // Concrete array IR values add their array members, while first-class dimension members are rejected.
+        let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
+        assert_eq!(left.add(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.add(&dimension),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // Batching and differentiation reach the homogeneous rules through the array IR member projection.
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerArrayIrContext, ArrayIrBatchingPolicy>| item.add(&item),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f32, 4.0, 6.0, 8.0]).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(left.clone()).jvp(right.clone(), |input| input.add(&input)),
+            Ok((
+                ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![6.0f32, 8.0]).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_add_universes() {
+        // An unchanged generic bound resolves to each implementor's own universe, including host integers
+        // that no array data type can represent, reference arrays, and first-class dimensions.
+        fn checked_sum<A: Add + Clone>(values: &[A]) -> Result<A, ProgramError> {
+            values[1..].iter().try_fold(values[0].clone(), |sum, value| sum.add(value))
+        }
+        assert_eq!(checked_sum(&[1i64, 2, 3]), Ok(6));
+        assert_eq!(checked_sum(&[u128::MAX - 1, 1]), Ok(u128::MAX));
+        assert_eq!(
+            checked_sum(&[i128::MAX, 1]),
+            Err(ProgramError::InvalidArgument { message: "`add` output does not fit in `i128`".to_string() }),
+        );
+        assert_eq!(checked_sum(&[1.5f64, 2.5]), Ok(4.0));
+        assert_eq!(
+            checked_sum(&[Array::vector(vec![1.0f32, 2.0]).unwrap(), Array::vector(vec![3.0f32, 4.0]).unwrap()]),
+            Ok(Array::vector(vec![4.0f32, 6.0]).unwrap()),
+        );
+        let dimensions = [DimensionValue::constant(2).unwrap(), DimensionValue::constant(3).unwrap()];
+        assert_eq!(checked_sum(&dimensions).map(|dimension| dimension.extent()), Ok(5));
+
+        // Calls infer the universe from their receiver. Host primitives use the fully qualified form because the method
+        // call `2i64.add(&3)` resolves to the by-value `std::ops::Add::add` first.
+        assert_eq!(Add::add(&2i64, &3), Ok(5));
+        assert_eq!(
+            Array::scalar(1.0f32).unwrap().add(&Array::scalar(2.0f32).unwrap()),
+            Ok(Array::scalar(3.0f32).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_add_parameterwise() {
+        // Structures add their corresponding parameters with default or explicit universes, and they reject
+        // structures with different parameter paths without masking the errors of the parameters themselves.
+        let vector = |values: Vec<f32>| Array::vector(values).unwrap();
+        let left = Parameterwise::<Array, _>::from((vector(vec![1.0, 2.0]), vector(vec![3.0])));
+        let right = Parameterwise::from((vector(vec![10.0, 20.0]), vector(vec![30.0])));
+        assert_eq!(
+            Add::add(&left, &right).map(Parameterwise::into_inner),
+            Ok((vector(vec![11.0, 22.0]), vector(vec![33.0]))),
+        );
+        assert_eq!(Add::<ArrayType>::add(&left, &right), Add::add(&left, &right));
+        assert_eq!(
+            Add::add(
+                &Parameterwise::<Array, _>::from(vec![vector(vec![1.0])]),
+                &Parameterwise::from(vec![vector(vec![1.0]), vector(vec![2.0])]),
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+        assert_eq!(
+            Add::add(&left, &Parameterwise::from((vector(vec![10.0, 20.0, 30.0]), vector(vec![30.0])))),
+            Err(ProgramError::Type(TypeError::invalid("failed to broadcast shape `[3]` to shape `[2]`"))),
+        );
+
+        // Array IR parameters add their array members, and first-class dimension members are rejected.
+        let array_ir = |values: Vec<f32>| ArrayIrValue::Array(vector(values));
+        let left = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![array_ir(vec![1.0]), array_ir(vec![2.0])]);
+        assert_eq!(
+            Add::add(&left, &left).map(Parameterwise::into_inner),
+            Ok(vec![array_ir(vec![2.0]), array_ir(vec![4.0])]),
+        );
+        let dimension = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![ArrayIrValue::Dimension(
+            DimensionValue::constant(2).unwrap(),
+        )]);
+        assert_eq!(
+            Add::add(&dimension, &dimension),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // The `+` operator adds corresponding parameters or a single parameter to every parameter.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!((model.clone() + Parameterwise::from((vec![1i32, 2], 3i32))).into_inner(), (vec![11, 22], 33));
+        assert_eq!((model + 1).into_inner(), (vec![11, 21], 31));
+
+        // The `+` operator moves corresponding parameters, and so they need not implement `Clone`.
+        #[derive(Debug, PartialEq)]
+        struct Leaf(i32);
+
+        impl Parameter for Leaf {}
+
+        impl std::ops::Add for Leaf {
+            type Output = Self;
+
+            fn add(self, right: Self) -> Self {
+                Self(self.0 + right.0)
+            }
+        }
+
+        let sum =
+            Parameterwise::<Leaf, _>::from(vec![Leaf(1), Leaf(2)]) + Parameterwise::from(vec![Leaf(10), Leaf(20)]);
+        assert_eq!(sum.into_inner(), vec![Leaf(11), Leaf(22)]);
+
+        // A failed `+` operator poisons a staged trace, which reports the error at its boundary.
+        let traced = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                let left = Parameterwise::<Tracer<TracingContext<Array, ArrayOperation<Array>>>, _>::from(vec![
+                    inputs[0].clone(),
+                ]);
+                Ok((left + Parameterwise::from(vec![inputs[1].clone()])).into_inner().remove(0))
+            },
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [3])],
+        );
+        assert!(matches!(traced, Err(ProgramError::Type(_))));
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to broadcast shape `[3]` to shape `[2]`")]
+    fn test_add_parameterwise_eager_failure() {
+        // Eager parameters have no deferral point, and so a failed `+` operator panics immediately.
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![1.0f32, 2.0]).unwrap()]);
+        let _ = left + Parameterwise::from(vec![Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()]);
+    }
+
+    #[test]
+    fn test_sub_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = SubOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = format!("`{SUB_OPERATION_NAME}` input types are not broadcast-compatible"),
+                },
+            ],
+        );
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let plain = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let unreduced = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+
+        check_operation_type_inference!(
+            operation = SubOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [unreduced.clone(), unreduced.clone()],
+                    output_types = [unreduced.clone()],
+                },
+                {
+                    input_types = [unreduced.clone(), plain.clone()],
+                    error = "`sub` inputs must be unreduced over the same axes",
+                },
+                {
+                    input_types = [plain.clone(), unreduced.clone()],
+                    error = "`sub` inputs must be unreduced over the same axes",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = SubOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_sub_interpretation() {
+        let operation = SubOperation::<ArrayType>::new();
+
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.5f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(-1.5f64).unwrap()]),
+        );
+        assert_eq!(
+            SubOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
+            ),
+            Ok(vec![Array::scalar(-1.5).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[
+                    Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
+                ],
+            ),
+            Ok(vec![Array::scalar(ComplexNumber::new(0.5f64, 3.0)).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_sub_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SubOperation::new(),
+            inputs = [Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
+            expected = Array::scalar(-1.5).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_sub_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = SubOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                    (@replicated, Array::scalar(3.0).unwrap()),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![-2.0, -5.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sub_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = SubOperation::new(),
+            cases = [{
+                primals = [Array::scalar(5.0).unwrap(), Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(3.0).unwrap()],
+                tangent_outputs = [Array::scalar(2.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = sub %0 %1
+                        %5:f64[] = sub %2 %3
+                    in (%4, %5)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sub_transposition() {
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        check_operation_transposition!(
+            @exact,
+            operation = SubOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::scalar(3.0).unwrap()],
+                    input_cotangents = [Array::scalar(3.0).unwrap(), Array::scalar(-3.0).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[] .
+                        let %1:f64[] = neg %0
+                        in (%0, %1)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@linear(type = vector_type.clone())),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(vector_type.clone(), &[2.0, 3.0, 4.0]).unwrap()],
+                    input_cotangents = [
+                        Array::scalar(9.0).unwrap(),
+                        Array::from_elements::<f64>(vector_type, &[-2.0, -3.0, -4.0]).unwrap(),
+                    ],
+                    pullback = indoc! {"
+                        lambda %0:f64[3] .
+                        let %1:f64[] = reduce [kind=sum, axes=[0]] %0
+                            %2:f64[3] = neg %0
+                        in (%1, %2)
+                    "},
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_sub() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            vector.sub(&Array::vector(vec![0.5, 1.0, 1.5]).unwrap()).unwrap(),
+            Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_sub_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            left.sub(&right),
+            Array::vector(vec![f8e4m3fn::from_f64(0.5).unwrap(), f8e4m3fn::from_f64(1.75).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_array_sub_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let right = Array::vector(vec![ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        let right_values = [ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)];
+        assert_eq!(
+            left.sub(&right).unwrap(),
+            Array::vector(vec![left_values[0] - right_values[0], left_values[1] - right_values[1]]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_sub_integers() {
+        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        assert_eq!(
+            narrow.sub(&Array::scalar(i4::new(1).unwrap()).unwrap()).unwrap().elements::<i4>(),
+            Ok(vec![i4::new(6).unwrap(), i4::new(7).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_sub_primitives() {
+        assert_eq!(Sub::sub(&5usize, &3), Ok(2));
+        assert_eq!(
+            Sub::sub(&0usize, &1),
+            Err(ProgramError::InvalidArgument { message: "`sub` output does not fit in `usize`".to_string() }),
+        );
+        assert_eq!(Sub::sub(&2.5f32, &0.5), Ok(2.0));
+    }
+
+    #[test]
+    fn test_sub_parameterwise() {
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![10.0f32, 20.0]).unwrap()]);
+        let right = Parameterwise::from(vec![Array::vector(vec![1.0f32, 2.0]).unwrap()]);
+        assert_eq!(
+            Sub::sub(&left, &right).map(Parameterwise::into_inner),
+            Ok(vec![Array::vector(vec![9.0f32, 18.0]).unwrap()]),
+        );
+        assert_eq!(
+            Sub::sub(&left, &Parameterwise::from(Vec::new())),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+
+        // The `-` operator subtracts corresponding parameters or a single parameter from every parameter.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!((model.clone() - Parameterwise::from((vec![1i32, 2], 3i32))).into_inner(), (vec![9, 18], 27));
+        assert_eq!((model - 1).into_inner(), (vec![9, 19], 29));
+    }
+
+    #[test]
+    #[should_panic(expected = "binary parameterwise operation inputs must have the same parameter structure")]
+    fn test_sub_parameterwise_mismatched_structures() {
+        let _ = Parameterwise::<i32, _>::from((vec![1i32], 2i32)) - Parameterwise::from((vec![1i32, 2], 3i32));
+    }
+
+    #[test]
+    fn test_saturating_sub_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = SaturatingSubOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I8, DataType::I16],
+                    output_data_types = [DataType::I16],
+                },
+                {
+                    input_data_types = [DataType::U8, DataType::I16],
+                    output_data_types = [DataType::I16],
+                },
+                {
+                    input_data_types = [DataType::U64, DataType::U64],
+                    output_data_types = [DataType::U64],
+                },
+                {
+                    input_data_types = [DataType::I64, DataType::U64],
+                    error = "`saturating_sub` requires an integer result data type",
+                },
+                {
+                    input_data_types = [DataType::F32, DataType::I32],
+                    error = "`saturating_sub` does not support input data type `f32`",
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::Boolean],
+                    error = "`saturating_sub` does not support input data type `bool`",
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    error = "`saturating_sub` does not support input data type `c64`",
+                },
+                {
+                    input_data_types = [DataType::Token, DataType::I32],
+                    error = "`saturating_sub` does not support input data type `token`",
+                },
+                {
+                    input_data_types = [DataType::Zero, DataType::I32],
+                    error = "`saturating_sub` does not support input data type `zero`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SaturatingSubOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::I32), ArrayType::scalar(DataType::I32)],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = SaturatingSubOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::I32), ArrayType::scalar(DataType::I32)],
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_type_inference_dimensions() {
+        let operation = SaturatingSubOperation::<DimensionType>::new();
+        assert_eq!(operation.to_string(), SATURATING_SUB_OPERATION_NAME);
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+        let left = DimensionType::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(2, Some(9)).unwrap());
+        let output = operation.infer_output_types(&[left.clone(), right.clone()], &[]).unwrap().remove(0);
+        assert_eq!(output.bounds(), DimensionBounds::new(0, Some(3)).unwrap());
+        let repeated = operation.infer_output_types(&[left, right], &[]).unwrap().remove(0);
+        assert_ne!(output.identities().collect::<Vec<_>>(), repeated.identities().collect::<Vec<_>>());
+
+        // One stateless operation accepts both independently named inputs and exact refinements of earlier inputs.
+        let left = DimensionType::new("exact_left", DimensionBounds::new(6, Some(7)).unwrap());
+        let right = DimensionType::new("exact_right", DimensionBounds::new(2, Some(3)).unwrap());
+        assert_eq!(operation.infer_output_types(&[left, right], &[]).unwrap()[0].extent(), Some(4));
+        let zero = DimensionValue::constant(0).unwrap().r#type().into_owned();
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::at_least(1));
+        assert_eq!(
+            operation.infer_output_types(&[unbounded.clone(), zero.clone()], &[]).unwrap()[0].bounds(),
+            unbounded.bounds(),
+        );
+
+        // Identity folds still validate both inputs against the portable dimension range.
+        if let Some(invalid_extent) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let invalid = DimensionType::new("invalid", DimensionBounds::at_least(invalid_extent));
+            let expected =
+                DimensionError::ExtentExceedsBackendWidth { value: invalid_extent, maximum: MAX_DIMENSION_EXTENT };
+            let error = operation.infer_output_types(&[zero.clone(), invalid.clone()], &[]).unwrap_err();
+            assert_eq!(error, TypeError::from(expected.clone()));
+            assert_eq!(operation.fold(&[zero, invalid], &[]), Err(TypeError::from(expected)));
+        }
+    }
+
+    #[test]
+    fn test_saturating_sub_interpretation() {
+        assert_eq!(
+            SaturatingSubOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![i8::MIN, i8::MAX, 3, -3]).unwrap(), Array::vector(vec![1i8, -1, 7, 7]).unwrap(),],
+            ),
+            Ok(vec![Array::vector(vec![i8::MIN, i8::MAX, -4, -10]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_interpretation_dimensions() {
+        assert_eq!(
+            DimensionValue::constant(3)
+                .unwrap()
+                .saturating_sub(&DimensionValue::constant(7).unwrap())
+                .unwrap()
+                .extent(),
+            0,
+        );
+        assert_eq!(
+            DimensionValue::constant(MAX_DIMENSION_EXTENT)
+                .unwrap()
+                .saturating_sub(&DimensionValue::constant(0).unwrap())
+                .unwrap()
+                .extent(),
+            MAX_DIMENSION_EXTENT,
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SaturatingSubOperation::new(),
+            inputs = [Array::scalar(i8::MIN).unwrap(), Array::scalar(1i8).unwrap()],
+            expected = Array::scalar(i8::MIN).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_partial_evaluation_dimensions() {
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(9)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(9)).unwrap());
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = vec![builder.add_input(left.clone()), builder.add_input(right.clone())];
+        let outputs =
+            builder.add_instruction(SaturatingSubOperation::new(), Vec::new(), inputs, None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let expected = indoc! {"
+            lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+            let %2:dimension<max(0, left - right) ∈ [0, 9)> = saturating_sub %0 %1
+            in (%2)"};
+        assert_eq!(program.to_string(), expected);
+        let residual = program
+            .partially_evaluate(&[PartialValue::Unknown(left.clone()), PartialValue::Unknown(right)])
+            .unwrap();
+        assert_eq!(residual.program().to_string(), expected);
+        assert_eq!(
+            residual
+                .interpret(
+                    &EagerContext::new(),
+                    &[DimensionValue::constant(3).unwrap(), DimensionValue::constant(7).unwrap(),]
+                )
+                .unwrap()[0]
+                .extent(),
+            0,
+        );
+        let identity = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(left),
+                PartialValue::Known(DimensionValue::constant(0).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(
+            identity.program().to_string(),
+            indoc! {"
+            lambda %0:dimension<left ∈ [0, 9)> .
+            in (%0)"}
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_identity_dimensions() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(value, zero)| Ok(vec![value.saturating_sub(&zero)?, zero.saturating_sub(&value)?]),
+            (
+                DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+                DimensionValue::constant(0).unwrap().r#type().into_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0> .
+            in (%0, %1)"}
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = SaturatingSubOperation::new(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![i8::MIN, i8::MAX]).unwrap()),
+                        (@replicated, Array::scalar(1i8).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![i8::MIN, 126]).unwrap())],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(0i8).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![i8::MIN, i8::MAX]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![i8::MAX, -127]).unwrap())],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation() {
+        // Integer primals have no ordinary tangent values, including where the primal arithmetic saturates.
+        let outputs = SaturatingSubOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(i8::MAX).unwrap()).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(-1i8).unwrap()).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(i8::MAX).unwrap());
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero),
+        ));
+
+        // The public JVP boundary accepts only zero-space tangent values and preserves their shape.
+        let left = Array::vector(vec![i8::MIN, i8::MAX, 3]).unwrap();
+        let right = Array::vector(vec![1i8, -1, 7]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::new_static(DataType::Zero, [3]), &[]).unwrap();
+        assert_eq!(
+            differentiate_at((left, right))
+                .jvp((zero.clone(), zero.clone()), |(left, right)| left.saturating_sub(&right)),
+            Ok((Array::vector(vec![i8::MIN, i8::MAX, -4]).unwrap(), zero)),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation_staged() {
+        // Integer tangent slots are omitted from the program, leaving exactly the primal subtraction.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| Ok(vec![inputs[0].saturating_sub(&inputs[1])?]),
+            vec![ArrayType::new_static(DataType::I8, [3]), ArrayType::scalar(DataType::I8)],
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:i8[3], %1:i8[] .
+                let %2:i8[3] = saturating_sub %0 %1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation_reverse() {
+        // Reverse mode transposes the empty tangent program and returns structural-zero integer cotangents.
+        let left = Array::vector(vec![i8::MIN, i8::MAX, 3]).unwrap();
+        let right = Array::scalar(1i8).unwrap();
+        let (primal, pullback) =
+            differentiate_at((left, right)).vjp(|(left, right)| left.saturating_sub(&right)).unwrap();
+        assert_eq!(primal, Array::vector(vec![i8::MIN, 126, 2]).unwrap());
+        assert!(pullback.residuals().is_empty());
+        let zero_type = ArrayType::new_static(DataType::Zero, [3]);
+        assert_eq!(
+            pullback.apply(Array::from_logical_bytes(zero_type.clone(), &[]).unwrap()),
+            Ok((MaybeZero::Zero(zero_type), MaybeZero::Zero(ArrayType::scalar(DataType::Zero)))),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation_dimensions() {
+        // First-class dimensions use the same discrete rule through the array IR family. No tangent slots or
+        // arithmetic are needed, and the primal result retains its inferred extent bounds.
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let left = ValueProjection::<DimensionType>::into_projected(inputs[0].clone())?;
+                let right = ValueProjection::<DimensionType>::into_projected(inputs[1].clone())?;
+                Ok(vec![left.saturating_sub(&right)?.into_value()])
+            },
+            vec![
+                ArrayIrType::from(DimensionType::new("left", bounds)),
+                ArrayIrType::from(DimensionType::new("right", bounds)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+                let %2:dimension<max(0, left - right) ∈ [0, 9)> = saturating_sub %0 %1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_transposition() {
+        // Program transposition elides integer cotangents, so exercise the primitive's rejection directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            SaturatingSubOperation::<ArrayType>::new().transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::I8)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::I8)),
+                ],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `saturating_sub` is not transposable",
+        ));
+    }
+
+    #[test]
+    fn test_array_saturating_sub() {
+        // Signed saturation preserves negative differences and clamps at both numeric bounds.
+        assert_eq!(
+            Array::vector(vec![i8::MIN, i8::MAX, 3, -3])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![1i8, -1, 7, 7]).unwrap()),
+            Ok(Array::vector(vec![i8::MIN, i8::MAX, -4, -10]).unwrap()),
+        );
+        assert_eq!(
+            Array::vector(vec![0u8, u8::MAX, 3])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![1u8, 1, 7]).unwrap()),
+            Ok(Array::vector(vec![0u8, 254, 0]).unwrap()),
+        );
+
+        // Extreme differences cannot be represented in the same 64-bit carrier before saturation.
+        assert_eq!(
+            Array::vector(vec![i64::MIN, i64::MAX, i64::MIN, i64::MAX])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![i64::MAX, i64::MIN, i64::MIN, i64::MAX]).unwrap()),
+            Ok(Array::vector(vec![i64::MIN, i64::MAX, 0, 0]).unwrap()),
+        );
+        assert_eq!(
+            Array::vector(vec![0u64, u64::MAX, 5])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![u64::MAX, 1, 2]).unwrap()),
+            Ok(Array::vector(vec![0u64, u64::MAX - 1, 3]).unwrap()),
+        );
+
+        let left = Array::from_elements(ArrayType::new_static(DataType::I16, [2, 1]), &[i16::MIN, 100]).unwrap();
+        let right = Array::from_elements(ArrayType::new_static(DataType::U8, [1, 3]), &[1u8, 3, 255]).unwrap();
+        assert_eq!(
+            left.saturating_sub(&right),
+            Ok(Array::from_elements(
+                ArrayType::new_static(DataType::I16, [2, 3]),
+                &[i16::MIN, i16::MIN, i16::MIN, 99, 97, -155],
+            )
+            .unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_array_saturating_sub_sub_byte() {
+        macro_rules! check_sub_byte {
+            // Exhaust every pair against a wider signed arithmetic oracle, then clamp to the logical element width.
+            ($element:ty) => {{
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                let mut expected = Vec::new();
+                let minimum = <$element>::MIN.value() as i16;
+                let maximum = <$element>::MAX.value() as i16;
+                for left_value in minimum..=maximum {
+                    for right_value in minimum..=maximum {
+                        left.push(<$element>::new(left_value as _).unwrap());
+                        right.push(<$element>::new(right_value as _).unwrap());
+                        expected
+                            .push(<$element>::new((left_value - right_value).clamp(minimum, maximum) as _).unwrap());
+                    }
+                }
+                assert_eq!(
+                    Array::vector(left).unwrap().saturating_sub(&Array::vector(right).unwrap()),
+                    Ok(Array::vector(expected).unwrap()),
+                );
+            }};
+        }
+
+        check_sub_byte!(i1);
+        check_sub_byte!(i2);
+        check_sub_byte!(i4);
+        check_sub_byte!(u1);
+        check_sub_byte!(u2);
+        check_sub_byte!(u4);
+    }
+
+    #[test]
+    fn test_array_saturating_sub_empty() {
+        let left = Array::from_elements(ArrayType::new_static(DataType::I16, [0, 1]), &[] as &[i16]).unwrap();
+        let right = Array::from_elements(ArrayType::new_static(DataType::U8, [1, 3]), &[1u8, 3, 255]).unwrap();
+        assert_eq!(
+            left.saturating_sub(&right),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::I16, [0, 3]), &[] as &[i16]).unwrap()),
+        );
+
+        let invalid = Array::from_elements(ArrayType::new_static(DataType::Boolean, [0]), &[] as &[bool]).unwrap();
+        assert_eq!(
+            invalid.saturating_sub(&Array::scalar(1i32).unwrap()),
+            Err(TypeError::invalid("`saturating_sub` does not support input data type `bool`").into()),
+        );
+        let invalid = Array::from_elements(ArrayType::new_static(DataType::F32, [0]), &[] as &[f32]).unwrap();
+        assert_eq!(
+            invalid.saturating_sub(&Array::scalar(1i32).unwrap()),
+            Err(TypeError::invalid("`saturating_sub` does not support input data type `f32`").into()),
+        );
+        let left = Array::from_elements(ArrayType::new_static(DataType::I64, [0]), &[] as &[i64]).unwrap();
+        assert_eq!(
+            left.saturating_sub(&Array::scalar(1u64).unwrap()),
+            Err(TypeError::invalid("`saturating_sub` requires an integer result data type").into()),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_primitives() {
+        assert_eq!(SaturatingSub::saturating_sub(&3i32, &7), Ok(-4));
+        assert_eq!(SaturatingSub::saturating_sub(&i8::MIN, &1), Ok(i8::MIN));
+        assert_eq!(SaturatingSub::saturating_sub(&i8::MAX, &-1), Ok(i8::MAX));
+        assert_eq!(SaturatingSub::saturating_sub(&i128::MIN, &i128::MAX), Ok(i128::MIN));
+        assert_eq!(SaturatingSub::saturating_sub(&i128::MAX, &i128::MIN), Ok(i128::MAX));
+        assert_eq!(SaturatingSub::saturating_sub(&isize::MIN, &1), Ok(isize::MIN));
+        assert_eq!(SaturatingSub::saturating_sub(&0u128, &u128::MAX), Ok(0));
+        assert_eq!(SaturatingSub::saturating_sub(&u128::MAX, &1), Ok(u128::MAX - 1));
+        assert_eq!(SaturatingSub::saturating_sub(&0usize, &1), Ok(0));
+    }
+
+    #[test]
+    fn test_saturating_sub_parameterwise() {
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![i8::MIN, 3]).unwrap()]);
+        let right = Parameterwise::from(vec![Array::vector(vec![1i8, 7]).unwrap()]);
+        assert_eq!(
+            left.saturating_sub(&right).map(Parameterwise::into_inner),
+            Ok(vec![Array::vector(vec![i8::MIN, -4]).unwrap()]),
+        );
+        assert_eq!(
+            left.saturating_sub(&Parameterwise::from(Vec::new())),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+
+        let left = Parameterwise::<i8, _>::from((vec![i8::MIN, 3], i8::MAX));
+        let right = Parameterwise::from((vec![1i8, 7], -1i8));
+        assert_eq!(left.saturating_sub(&right).map(Parameterwise::into_inner), Ok((vec![i8::MIN, -4], i8::MAX)));
+
+        let left = ArrayIrValue::Array(Array::scalar(0u64).unwrap());
+        let right = ArrayIrValue::Array(Array::scalar(u64::MAX).unwrap());
+        assert_eq!(left.saturating_sub(&right), Ok(ArrayIrValue::Array(Array::scalar(0u64).unwrap())));
+    }
+
+    #[test]
+    fn test_saturating_sub_array_ir_projection() {
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(left, right)| left.saturating_sub(&right),
+            (ArrayIrType::Array(ArrayType::scalar(DataType::I8)), ArrayIrType::Array(ArrayType::scalar(DataType::I8))),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:i8[], %1:i8[] .
+            let %2:i8[] = saturating_sub %0 %1
+            in (%2)"}
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::scalar(i8::MAX).unwrap()),
+                ArrayIrValue::Array(Array::scalar(-1i8).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::scalar(i8::MAX).unwrap())),
+        );
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(
+            dimension.saturating_sub(&dimension),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+    }
+
+    #[test]
+    fn test_mul_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = MulOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = format!("`{MUL_OPERATION_NAME}` input types are not broadcast-compatible"),
+                },
+            ],
+        );
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [8]);
+        let unreduced_x = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_x = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_y = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["y"]).unwrap())
+            .unwrap();
+
+        // Unreduced over `x` times reduced over `x` is the partial-sum-times-replicated case: the product stays
+        // unreduced over `x`, and the reduced marker is cleared.
+        let output = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[unreduced_x.clone(), reduced_x.clone()], &[])
+            .unwrap();
+        assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::from(["x".to_string()]));
+        assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
+
+        // Two inputs both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
+        check_operation_type_inference!(
+            operation = MulOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [unreduced_x.clone(), unreduced_x.clone()],
+                error = format!("`{MUL_OPERATION_NAME}` cannot multiply two inputs that are both unreduced"),
+            }],
+        );
+
+        // Unreduced over `x` requires the other input to be reduced over exactly `x`, not a different axis.
+        check_operation_type_inference!(
+            operation = MulOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [unreduced_x.clone(), reduced_y.clone()],
+                error = format!(
+                    "`{MUL_OPERATION_NAME}` requires the second input to be reduced over the axes the first is \
+                     unreduced over",
+                ),
+            }],
+        );
+
+        // Two inputs reduced over the same axis multiply to a value reduced over that axis.
+        let output = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[reduced_x.clone(), reduced_x.clone()], &[])
+            .unwrap();
+        assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::from(["x".to_string()]));
+        assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::new());
+
+        // A reduced input cannot be multiplied by an otherwise replicated input because the result would inherit a
+        // reduction marker that does not describe both inputs.
+        check_operation_type_inference!(
+            operation = MulOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [reduced_x.clone(), vector_type.clone()],
+                error = format!("`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes"),
+            }],
+        );
+    }
+
+    #[test]
+    fn test_mul_interpretation() {
+        let operation = MulOperation::<ArrayType>::new();
+
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.5f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(7.0f64).unwrap()]),
+        );
+        assert_eq!(
+            MulOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
+            ),
+            Ok(vec![Array::scalar(7.0).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[
+                    Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
+                ],
+            ),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.0f64, 2.0) * ComplexNumber::new(0.5f64, -1.0)).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_mul_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = MulOperation::new(),
+            inputs = [Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
+            expected = Array::scalar(7.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_mul_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = MulOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                    (@replicated, Array::scalar(3.0).unwrap()),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -6.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_mul_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = MulOperation::new(),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap(), Array::scalar(5.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(-1.0).unwrap()],
+                primal_outputs = [Array::scalar(10.0).unwrap()],
+                tangent_outputs = [Array::scalar(13.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = mul %0 %1
+                        %5:f64[] = mul %1 %2
+                        %6:f64[] = mul %0 %3
+                        %7:f64[] = add %5 %6
+                    in (%4, %7)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_mul_differentiation_complex() {
+        // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
+        // `c128` payloads, and the reverse mode pullback applies the bilinear (conjugation-free) transpose pairing.
+        let left = ComplexNumber::new(1.0f64, 2.0);
+        let right = ComplexNumber::new(0.5f64, -1.0);
+        let left_tangent = ComplexNumber::new(-0.5f64, 0.25);
+        let right_tangent = ComplexNumber::new(2.0f64, 1.0);
+        let (primal, tangent) =
+            differentiate_at((Array::vector(vec![left]).unwrap(), Array::vector(vec![right]).unwrap()))
+                .jvp(
+                    (Array::vector(vec![left_tangent]).unwrap(), Array::vector(vec![right_tangent]).unwrap()),
+                    |(left, right)| Ok(left * right),
+                )
+                .unwrap();
+        assert_eq!(primal, Array::vector(vec![left * right]).unwrap());
+        assert_eq!(tangent, Array::vector(vec![left_tangent * right + left * right_tangent]).unwrap());
+        let (_, pullback) = differentiate_at((Array::vector(vec![left]).unwrap(), Array::vector(vec![right]).unwrap()))
+            .vjp(|(left, right)| Ok(left * right))
+            .unwrap();
+        let cotangent = ComplexNumber::new(0.5f64, 3.0);
+        let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent]).unwrap()).unwrap();
+        assert_eq!(left_cotangent, MaybeZero::Value(Array::vector(vec![cotangent * right]).unwrap()));
+        assert_eq!(right_cotangent, MaybeZero::Value(Array::vector(vec![cotangent * left]).unwrap()));
+    }
+
+    #[test]
+    fn test_mul_transposition() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        check_operation_transposition!(
+            @exact,
+            operation = MulOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@known, Array::scalar(4.0).unwrap()),
+                        (@linear(type = scalar_type.clone())),
+                    ],
+                    output_cotangents = [Array::scalar(1.0).unwrap()],
+                    input_cotangents = [Array::scalar(4.0).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@known, Array::from_elements::<f64>(vector_type.clone(), &[1.0, 2.0, 3.0]).unwrap()),
+                        (@linear(type = scalar_type)),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(vector_type.clone(), &[2.0, 3.0, 4.0]).unwrap()],
+                    input_cotangents = [Array::scalar(20.0).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[3], %1:f64[3] .
+                        let %2:f64[3] = mul %1 %0
+                            %3:f64[] = reduce [kind=sum, axes=[0]] %2
+                        in (%3)
+                    "},
+                },
+            ],
+        );
+
+        // A reduced primal coefficient stays reduced when scaling an unreduced output cotangent.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let reduced_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let cotangent_type = reduced_type.cotangent().unwrap();
+        let coefficient = Array::from_elements(reduced_type.clone(), &[2.0f64, 3.0]).unwrap();
+        let cotangent = Array::from_elements(cotangent_type.clone(), &[4.0f64, 5.0]).unwrap();
+        let expected = Array::from_elements(cotangent_type, &[8.0f64, 15.0]).unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = MulOperation::new(),
+            cases = [
+                {
+                    inputs = [(@known, coefficient.clone()), (@linear(type = reduced_type.clone()))],
+                    output_cotangents = [cotangent.clone()],
+                    input_cotangents = [expected.clone()],
+                },
+                {
+                    inputs = [(@linear(type = reduced_type)), (@known, coefficient)],
+                    output_cotangents = [cotangent],
+                    input_cotangents = [expected],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_mul() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(Mul::mul(&vector, &vector).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]).unwrap());
+        // Scaling by an `f64` preserves the array's element data type.
+        let scaled = Array::vector(vec![1.0f32, 2.0]).unwrap() * 2.0;
+        assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_array_mul_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
+        let partial_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let left = Array::from_elements(partial_type.clone(), &[2.0f32, 3.0]).unwrap();
+        let right = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
+        let expected = Array::from_elements(partial_type, &[8.0f32, 15.0]).unwrap();
+
+        // A partial sum times an input reduced over the same mesh axes remains a partial sum in either order.
+        assert_eq!(Mul::mul(&left, &right), Ok(expected.clone()));
+        assert_eq!(Mul::mul(&right, &left), Ok(expected));
+
+        // Multiplying two partial sums is invalid, including when no scalar evaluation would occur.
+        assert!(matches!(
+            Mul::mul(&left, &left),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`mul` cannot multiply two inputs that are both unreduced",
+        ));
+        let empty_type = left.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
+        let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
+        assert!(matches!(
+            Mul::mul(&empty, &empty),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`mul` cannot multiply two inputs that are both unreduced",
+        ));
+    }
+
+    #[test]
+    fn test_array_mul_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(Mul::mul(&left, &right), Array::vector(vec![f8e4m3fn::from_f64(0.5).unwrap(); 2]));
+    }
+
+    #[test]
+    fn test_array_mul_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let right = Array::vector(vec![ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        let right_values = [ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)];
+        assert_eq!(
+            Mul::mul(&left, &right).unwrap(),
+            Array::vector(vec![left_values[0] * right_values[0], left_values[1] * right_values[1]]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_mul_primitives() {
+        assert_eq!(
+            Mul::mul(&usize::MAX, &2),
+            Err(ProgramError::InvalidArgument { message: "`mul` output does not fit in `usize`".to_string() }),
+        );
+        assert_eq!(Mul::mul(&3usize, &4), Ok(12));
+        assert_eq!(
+            Mul::mul(&i8::MAX, &2),
+            Err(ProgramError::InvalidArgument { message: "`mul` output does not fit in `i8`".to_string() }),
+        );
+        assert_eq!(Mul::mul(&2.5f64, &4.0), Ok(10.0));
+    }
+
+    #[test]
+    fn test_mul_parameterwise() {
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![10.0f32, 20.0]).unwrap()]);
+        let right = Parameterwise::from(vec![Array::vector(vec![1.0f32, 2.0]).unwrap()]);
+        assert_eq!(
+            Mul::mul(&left, &right).map(Parameterwise::into_inner),
+            Ok(vec![Array::vector(vec![10.0f32, 40.0]).unwrap()]),
+        );
+        assert_eq!(
+            Mul::mul(&left, &Parameterwise::from(Vec::new())),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+
+        // The `*` operator multiplies corresponding parameters or scales every parameter by a single parameter.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!((model.clone() * Parameterwise::from((vec![1i32, 2], 3i32))).into_inner(), (vec![10, 40], 90));
+        assert_eq!((model * 2).into_inner(), (vec![20, 40], 60));
+
+        // Differentiation reaches the parameters through parameterwise arithmetic that is wrapped inside the
+        // differentiated function and unwrapped at its boundary.
+        let scalar = |value: f32| Array::scalar(value).unwrap();
+        let model = (scalar(1.0), vec![scalar(2.0), scalar(3.0)]);
+        let (value, gradient) = differentiate_at(model.clone())
+            .value_and_gradient(|model| {
+                let (first, rest) = (Parameterwise::from(model.clone()) * Parameterwise::from(model)).into_inner();
+                rest.into_iter().fold(first, |sum, parameter| sum + parameter)
+            })
+            .unwrap();
+        assert_eq!(value, scalar(14.0));
+        assert_eq!(gradient, (scalar(2.0), vec![scalar(4.0), scalar(6.0)]));
+    }
+
+    #[test]
+    fn test_div_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = DivOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = format!("`{DIV_OPERATION_NAME}` input types are not broadcast-compatible"),
+                },
+            ],
+        );
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let plain = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let unreduced = plain
+            .clone()
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let reduced = plain
+            .clone()
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        check_operation_type_inference!(
+            operation = DivOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [unreduced.clone(), plain.clone()],
+                    error = "`div` requires the denominator to be reduced over the axes \
+                             the numerator is unreduced over",
+                },
+                {
+                    input_types = [plain, unreduced.clone()],
+                    error = "`div` denominator must not be unreduced",
+                },
+                {
+                    input_types = [unreduced.clone(), reduced],
+                    output_types = [unreduced],
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = DivOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_div_interpretation() {
+        let operation = DivOperation::<ArrayType>::new();
+
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(7.0f32).unwrap(), Array::scalar(2.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(3.5f64).unwrap()]),
+        );
+        assert_eq!(
+            DivOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(7.0).unwrap(), Array::scalar(2.0).unwrap()],
+            ),
+            Ok(vec![Array::scalar(3.5).unwrap()]),
+        );
+        assert_abs_diff_eq!(
+            match operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[
+                    Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
+                ],
+            ) {
+                Ok(outputs) => outputs[0].clone(),
+                Err(error) => panic!("expected a complex quotient but got {error}"),
+            },
+            Array::scalar(ComplexNumber::new(1.0f64, 2.0) / ComplexNumber::new(0.5f64, -1.0)).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_div_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = DivOperation::new(),
+            inputs = [Array::scalar(7.0).unwrap(), Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(3.5).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_div_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = DivOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![3.0, -6.0]).unwrap()),
+                    (@replicated, Array::scalar(3.0).unwrap()),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_div_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = DivOperation::new(),
+            cases = [{
+                primals = [Array::scalar(6.0).unwrap(), Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(4.0).unwrap()],
+                primal_outputs = [Array::scalar(3.0).unwrap()],
+                tangent_outputs = [Array::scalar(-4.5).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = div %0 %1
+                        %5:f64[] = div %2 %1
+                        %6:f64[] = mul %1 %1
+                        %7:f64[] = div %0 %6
+                        %8:f64[] = neg %7
+                        %9:f64[] = mul %8 %3
+                        %10:f64[] = add %5 %9
+                    in (%4, %10)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_div_differentiation_preserves_small_tangents() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let smallest_positive = f64::from_bits(1);
+        let outputs = DivOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new(Array::scalar(0.0).unwrap(), Array::scalar(smallest_positive).unwrap())
+                        .unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(smallest_positive).unwrap()).unwrap(),
+                ],
+            )
+            .unwrap();
+        match outputs[0].tangent() {
+            MaybeZero::Value(tangent) => assert_eq!(tangent, &Array::scalar(1.0).unwrap()),
+            MaybeZero::Zero(_) => panic!("expected a live division tangent"),
+        }
+    }
+
+    #[test]
+    fn test_div_differentiation_low_precision_uses_widened_tangents() {
+        let left = Array::scalar(4.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let right = Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let (primal, tangent) = differentiate_at((left, right))
+            .jvp((Array::scalar(1.0f32).unwrap(), Array::scalar(1.0f32).unwrap()), |(left, right)| Ok(left / right))
+            .unwrap();
+        assert_eq!(primal, Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap());
+        assert_eq!(tangent, Array::scalar(-0.5f32).unwrap());
+    }
+
+    #[test]
+    fn test_div_transposition() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        check_operation_transposition!(
+            @approx(epsilon = 1e-12),
+            operation = DivOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = scalar_type.clone())),
+                        (@known, Array::scalar(3.0).unwrap()),
+                    ],
+                    output_cotangents = [Array::scalar(2.0).unwrap()],
+                    input_cotangents = [Array::scalar(2.0 / 3.0).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = div %0 %1
+                        in (%2)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@linear(type = scalar_type)),
+                        (@known, Array::from_elements::<f64>(vector_type.clone(), &[2.0, 4.0, 5.0]).unwrap()),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(vector_type.clone(), &[2.0, 4.0, 10.0]).unwrap()],
+                    input_cotangents = [Array::scalar(4.0).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[3], %1:f64[3] .
+                        let %2:f64[3] = div %0 %1
+                            %3:f64[] = reduce [kind=sum, axes=[0]] %2
+                        in (%3)
+                    "},
+                },
+                {
+                    // An integer coefficient remains a primal value despite having a structural-zero tangent type.
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@known, Array::scalar(2i32).unwrap()),
+                    ],
+                    output_cotangents = [Array::scalar(4.0f64).unwrap()],
+                    input_cotangents = [Array::scalar(2.0f64).unwrap()],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_div_transposition_low_precision() {
+        // The known denominator must widen explicitly: this format does not implicitly promote with `f32`.
+        check_operation_transposition!(
+            @exact,
+            operation = DivOperation::new(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::scalar(DataType::F8E8M0FNU))),
+                    (@known, Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap()),
+                ],
+                output_cotangents = [Array::scalar(4.0f32).unwrap()],
+                input_cotangents = [Array::scalar(2.0f32).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_div_transposition_reduced() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let reduced = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(mesh, 0).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let unreduced = reduced.cotangent().unwrap();
+        // The transpose divides an unreduced output cotangent by the known reduced denominator.
+        check_operation_transposition!(
+            @exact,
+            operation = DivOperation::new(),
+            cases = [{
+                inputs = [
+                    (@linear(type = reduced.clone())),
+                    (@known, Array::from_elements(reduced, &[4.0f64]).unwrap()),
+                ],
+                output_cotangents = [Array::from_elements(unreduced.clone(), &[8.0f64]).unwrap()],
+                input_cotangents = [Array::from_elements(unreduced, &[2.0f64]).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_div() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            Div::div(&vector, &Array::scalar(2.0).unwrap()).unwrap(),
+            Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_div_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            Div::div(&left, &right),
+            Array::vector(vec![f8e4m3fn::from_f64(2.0).unwrap(), f8e4m3fn::from_f64(8.0).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_array_div_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let right = Array::vector(vec![ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        let right_values = [ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)];
+        assert_abs_diff_eq!(
+            Div::div(&left, &right).unwrap(),
+            Array::vector(vec![left_values[0] / right_values[0], left_values[1] / right_values[1]]).unwrap(),
+            epsilon = 1e-12,
+        );
+
+        // Ratio-based division can still overflow when both denominator components are near the largest value.
+        let large = Array::scalar(ComplexNumber::new(1e308f64, 1e308)).unwrap();
+        let quotient = Div::div(&large, &large).unwrap().elements::<ComplexNumber<f64>>().unwrap()[0];
+        assert!(quotient.re.is_nan());
+        assert_eq!(quotient.im.to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn test_array_div_integers() {
+        // Integer quotients truncate toward zero, and exceptional inputs have deterministic wrapped outputs.
+        assert_eq!(Array::scalar(-7i32).unwrap().div(&Array::scalar(2i32).unwrap()), Array::scalar(-3i32));
+        assert_eq!(Array::scalar(1i32).unwrap().div(&Array::scalar(0i32).unwrap()), Array::scalar(-1i32));
+        assert_eq!(Array::scalar(1u8).unwrap().div(&Array::scalar(0u8).unwrap()), Array::scalar(u8::MAX));
+        assert_eq!(Array::scalar(i8::MIN).unwrap().div(&Array::scalar(-1i8).unwrap()), Array::scalar(i8::MIN));
+    }
+
+    #[test]
+    fn test_div_primitives() {
+        assert_eq!(Div::div(&7usize, &2), Ok(3));
+        assert_eq!(
+            Div::div(&7usize, &0),
+            Err(ProgramError::InvalidArgument {
+                message: "`div` divisor is zero or the output does not fit in `usize`".to_string(),
+            }),
+        );
+        assert_eq!(
+            Div::div(&i8::MIN, &-1),
+            Err(ProgramError::InvalidArgument {
+                message: "`div` divisor is zero or the output does not fit in `i8`".to_string(),
+            }),
+        );
+        assert_eq!(Div::div(&1.0f64, &0.0), Ok(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_div_parameterwise() {
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        let update = Parameterwise::from((vec![1i32, 2], 3i32));
+        assert_eq!(Div::div(&model, &update).map(Parameterwise::into_inner), Ok((vec![10, 10], 10)));
+
+        // The `/` operator divides corresponding parameters or every parameter by a single parameter on the right.
+        assert_eq!((model.clone() / update).into_inner(), (vec![10, 10], 10));
+        assert_eq!((model / 10).into_inner(), (vec![1, 2], 3));
+    }
+
+    #[test]
+    fn test_rem_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = RemOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32, DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    error = "`rem` does not support input data type `c64`",
+                },
+                {
+                    input_data_types = [DataType::Boolean, DataType::Boolean],
+                    error = "`rem` does not support input data type `bool`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = RemOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_rem_interpretation() {
+        assert_eq!(
+            RemOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(7.5f64).unwrap(), Array::scalar(2.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(1.5f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_rem_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = RemOperation::new(),
+            inputs = [Array::scalar(7.5).unwrap(), Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(1.5).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_rem_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = RemOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![7.5, -7.5]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![2.0, 2.0]).unwrap()),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5, -1.5]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_rem_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = RemOperation::new(),
+            cases = [{
+                primals = [Array::scalar(7.5).unwrap(), Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap()],
+                primal_outputs = [Array::scalar(1.5).unwrap()],
+                // 3.0 - trunc(7.5 / 2.0) · 5.0 = 3.0 - 3.0 · 5.0 = -12.0.
+                tangent_outputs = [Array::scalar(-12.0).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_rem_differentiation_rounded_quotient() {
+        // At a floating-point quotient boundary, the declared derivative uses trunc(x / y), not (x - rem(x, y)) / y.
+        let (_, tangent) = differentiate_at(Array::scalar(0.1f64).unwrap())
+            .jvp(Array::scalar(1.0f64).unwrap(), |divisor| divisor.one_like()?.rem(&divisor))
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(-10.0f64).unwrap());
+    }
+
+    #[test]
+    fn test_rem_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = RemOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_rem() {
+        assert_eq!(Array::scalar(7i32).unwrap() % Array::scalar(3i32).unwrap(), Array::scalar(1i32).unwrap());
+        assert_eq!(
+            Array::scalar(7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
+            Array::scalar(1i32).unwrap(),
+        );
+
+        // The result takes the sign of the dividend.
+        assert_eq!(
+            Array::scalar(-7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
+            Array::scalar(-1i32).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(7i64).unwrap().rem(&Array::scalar(-3i64).unwrap()).unwrap(),
+            Array::scalar(1i64).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(7u32).unwrap().rem(&Array::scalar(3u32).unwrap()).unwrap(),
+            Array::scalar(1u32).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(7.5f64).unwrap().rem(&Array::scalar(2.0f64).unwrap()).unwrap(),
+            Array::scalar(1.5f64).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(-7.5f32).unwrap().rem(&Array::scalar(2.0f32).unwrap()).unwrap(),
+            Array::scalar(-1.5f32).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(7.5))
+                .unwrap()
+                .rem(&Array::scalar(bf16::from_f32(2.0)).unwrap())
+                .unwrap(),
+            Array::scalar(bf16::from_f32(7.5f32 % 2.0f32)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(7.5)).unwrap().rem(&Array::scalar(f16::from_f32(2.0)).unwrap()).unwrap(),
+            Array::scalar(f16::from_f32(7.5f32 % 2.0f32)).unwrap(),
+        );
+
+        assert_eq!(
+            Array::vector(vec![7.5, -7.5]).unwrap().rem(&Array::vector(vec![2.0, 2.0]).unwrap()).unwrap(),
+            Array::vector(vec![1.5, -1.5]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_rem_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(left.rem(&right), Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(); 2]));
+    }
+
+    #[test]
+    fn test_array_rem_integers() {
+        // A zero divisor returns the dividend; the minimum signed value is divisible by `-1` without overflowing.
+        assert_eq!(Array::scalar(7i32).unwrap().rem(&Array::scalar(0i32).unwrap()), Array::scalar(7i32));
+        assert_eq!(Array::scalar(1u8).unwrap().rem(&Array::scalar(0u8).unwrap()), Array::scalar(1u8));
+        assert_eq!(Array::scalar(i8::MIN).unwrap().rem(&Array::scalar(-1i8).unwrap()), Array::scalar(0i8));
+    }
+
+    #[test]
+    fn test_rem_primitives() {
+        assert_eq!(Rem::rem(&7usize, &4), Ok(3));
+        assert_eq!(
+            Rem::rem(&7usize, &0),
+            Err(ProgramError::InvalidArgument {
+                message: "`rem` divisor is zero or the output does not fit in `usize`".to_string(),
+            }),
+        );
+        assert!(Rem::rem(&1.0f64, &0.0).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_rem_parameterwise() {
+        // Structures combine corresponding parameters, or every parameter with a single parameter on the right.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        let divisor = Parameterwise::from((vec![3i32, 6], 7i32));
+        assert_eq!(Rem::rem(&model, &divisor).map(Parameterwise::into_inner), Ok((vec![1, 2], 2)));
+        assert_eq!((model.clone() % divisor).into_inner(), (vec![1, 2], 2));
+        assert_eq!((model % 4).into_inner(), (vec![2, 0], 2));
+    }
+
+    #[test]
+    fn test_pow_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = PowOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::I32],
+                    error = "`pow` does not support input data type `i32`",
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = PowOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_pow_interpretation() {
+        assert_eq!(
+            PowOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(8.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_pow_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = PowOperation::new(),
+            inputs = [Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()],
+            expected = Array::scalar(8.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_pow_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = PowOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![2.0, 3.0]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![3.0, 2.0]).unwrap()),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![8.0, 9.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_pow_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = PowOperation::new(),
+            cases = [
+                {
+                    primals = [Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap()],
+                    primal_outputs = [Array::scalar(8.0).unwrap()],
+                    // d(x^y) = y · x^{y-1} · dx + x^y · ln(x) · dy = 3.0 · (3.0 · 4.0) + 5.0 · (8.0 · ln(2)).
+                    tangent_outputs = [Array::scalar(3.0 * (3.0 * 4.0) + 5.0 * (8.0 * 2.0f64.ln())).unwrap()],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_pow_differentiation_at_zero_base() {
+        // A zero base exercises the guarded log factor: the exponent contribution is exactly zero instead of
+        // `log(0) = -∞` turning the tangent into a NaN. The finite-difference oracle cannot check this boundary
+        // point (perturbing the base below zero is undefined), so the guard is asserted on the staged JVP program
+        // directly.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let base = builder.add_input(ArrayType::scalar(DataType::F64));
+        let exponent = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(PowOperation::new(), Vec::new(), vec![base, exponent], None).unwrap()[0];
+        let jvp_program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let outputs = jvp_program
+            .interpret(vec![
+                Array::scalar(0.0).unwrap(),
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(1.0).unwrap(),
+                Array::scalar(1.0).unwrap(),
+            ])
+            .unwrap();
+        assert_eq!(outputs, vec![Array::scalar(0.0).unwrap(), Array::scalar(0.0).unwrap()]);
+    }
+
+    #[test]
+    fn test_pow_differentiation_complex() {
+        // The holomorphic gradient of z² is 2z.
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(input).unwrap())
+                .holomorphic()
+                .gradient(|input| {
+                    let exponent = input.one_like().unwrap() + input.one_like().unwrap();
+                    input.pow(&exponent).unwrap()
+                })
+                .unwrap(),
+            Array::scalar(input * 2.0).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_pow_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = PowOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_pow() {
+        assert_eq!(
+            Array::scalar(2.0f32).unwrap().pow(&Array::scalar(3.0f32).unwrap()).unwrap(),
+            Array::scalar(2.0f32.powf(3.0)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(2.0f64).unwrap().pow(&Array::scalar(3.0f64).unwrap()).unwrap(),
+            Array::scalar(2.0f64.powf(3.0)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.0))
+                .unwrap()
+                .pow(&Array::scalar(bf16::from_f32(3.0)).unwrap())
+                .unwrap(),
+            Array::scalar(bf16::from_f32(2.0f32.powf(3.0))).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.0)).unwrap().pow(&Array::scalar(f16::from_f32(3.0)).unwrap()).unwrap(),
+            Array::scalar(f16::from_f32(2.0f32.powf(3.0))).unwrap(),
+        );
+
+        // The complex power is the principal value `exp(y · log(x))`.
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let exponent = ComplexNumber::new(2.0f64, 0.0f64);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().pow(&Array::scalar(exponent).unwrap()).unwrap(),
+            Array::scalar(input.powc(exponent)).unwrap(),
+            epsilon = 1e-12,
+        );
+        assert_eq!(Array::scalar(2.0).unwrap().pow(&Array::scalar(3.0).unwrap()), Array::scalar(8.0));
+    }
+
+    #[test]
+    fn test_array_pow_promotion_and_broadcasting() {
+        // Both inputs promote before broadcasting their independent axes.
+        let bases = Array::matrix(2, 1, vec![2.0f32, 3.0]).unwrap();
+        let exponents = Array::matrix(1, 3, vec![1.0f64, 2.0, 3.0]).unwrap();
+        assert_eq!(bases.pow(&exponents), Array::matrix(2, 3, vec![2.0f64, 4.0, 8.0, 3.0, 9.0, 27.0]));
+        assert_eq!(
+            Array::scalar(2.0f64).unwrap().pow(&Array::scalar(3i32).unwrap()),
+            Err(TypeError::invalid("`pow` does not support input data type `i32`").into()),
+        );
+    }
+
+    #[test]
+    fn test_pow_primitives() {
+        assert_eq!(Pow::pow(&2.0f64, &3.0), Ok(8.0));
+    }
+
+    #[test]
+    fn test_sqrt() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = SqrtOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "sqrt");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "sqrt [accuracy=highest]");
+    }
+
+    #[test]
+    fn test_sqrt_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = SqrtOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::I32],
+                    error = "`sqrt` does not support input data type `i32`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SqrtOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_sqrt_interpretation() {
+        assert_eq!(
+            SqrtOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(4.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(2.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_sqrt_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SqrtOperation::new(),
+            inputs = [Array::scalar(4.0).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_sqrt_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = SqrtOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.sqrt(), 2.0f64.sqrt()]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sqrt_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = SqrtOperation::new(),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(2.0f64.sqrt()).unwrap()],
+                tangent_outputs = [Array::scalar(3.0 / (2.0 * 2.0f64.sqrt())).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = sqrt %0
+                        %3:f64[] = add %2 %2
+                        %4:f64[] = div %1 %3
+                    in (%2, %4)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sqrt_differentiation_complex() {
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(input).unwrap())
+                .holomorphic()
+                .gradient(|input| input.sqrt().unwrap())
+                .unwrap(),
+            Array::scalar(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt())).unwrap(),
+            epsilon = 1e-14,
+        );
+    }
+
+    #[test]
+    fn test_sqrt_differentiation_low_precision_uses_widened_tangents() {
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.sqrt()).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+
+        // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 / (2.0 * 2.0f32.sqrt()), epsilon = 1e-6);
+
+        // The widened staged tangent program recomputes the denominator in the widened differential representation
+        // instead of converting the narrower primal output.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
+        let output = builder.add_instruction(SqrtOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[], %1:f32[] .
+                let %2:f8e8m0fnu[] = sqrt %0
+                    %3:f32[] = convert_element_type [data_type=f32] %0
+                    %4:f32[] = sqrt %3
+                    %5:f32[] = add %4 %4
+                    %6:f32[] = div %1 %5
+                in (%2, %6)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_sqrt_differentiation_unrepresentable_tangent() {
+        // The primal square root is representable, but a live zero tangent at zero requires `0 / 0`.
+        // A format without NaN must return the conversion error rather than panic in the derivative rule.
+        let zero = Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap();
+        assert_eq!(
+            differentiate_at(zero.clone()).jvp(zero, |input| input.sqrt()),
+            Err(DifferentiationError::Program(TypeError::invalid("data type `f4e2m1fn` cannot represent NaN").into(),)),
+        );
+    }
+
+    #[test]
+    fn test_sqrt_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = SqrtOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_sqrt() {
+        assert_eq!(Array::scalar(0.25f32).unwrap().sqrt().unwrap(), Array::scalar(0.5f32).unwrap());
+        assert_eq!(Array::scalar(0.25f64).unwrap().sqrt().unwrap(), Array::scalar(0.5f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.25)).unwrap().sqrt().unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.25)).unwrap().sqrt().unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap(),
+        );
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().sqrt().unwrap(),
+            Array::scalar(input.sqrt()).unwrap(),
+            epsilon = 1e-12,
+        );
+
+        // The principal branch maps the negative real axis to the positive imaginary axis.
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).unwrap().sqrt().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 2.0)).unwrap(),
+            epsilon = 1e-12,
+        );
+
+        assert_eq!(Array::scalar(4.0).unwrap().sqrt().unwrap(), Array::scalar(2.0).unwrap());
+    }
+
+    #[test]
+    fn test_array_sqrt_complex() {
+        // Complex square roots use the principal branch for each typed element.
+        let values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        let input = Array::vector(values.to_vec()).unwrap();
+        assert_abs_diff_eq!(
+            input.sqrt().unwrap(),
+            Array::vector(vec![values[0].sqrt(), values[1].sqrt()]).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_sqrt_primitives() {
+        assert_eq!(Sqrt::sqrt(&4.0f64), Ok(2.0));
+    }
+
+    #[test]
+    fn test_rsqrt() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = RsqrtOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "rsqrt");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "rsqrt [accuracy=highest]");
+    }
+
+    #[test]
+    fn test_rsqrt_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = RsqrtOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::I32],
+                    error = "`rsqrt` does not support input data type `i32`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = RsqrtOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_interpretation() {
+        assert_eq!(
+            RsqrtOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(4.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(0.5f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = RsqrtOperation::new(),
+            inputs = [Array::scalar(4.0).unwrap()],
+            expected = Array::scalar(0.5).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = RsqrtOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 4.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0 / 0.5f64.sqrt(), 0.5]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_differentiation() {
+        let expected_tangent = 3.0 * -(1.0 / (2.0 * 4.0f64.powf(1.5)));
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = RsqrtOperation::new(),
+            cases = [{
+                primals = [Array::scalar(4.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.5).unwrap()],
+                tangent_outputs = [Array::scalar(expected_tangent).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_differentiation_complex() {
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+
+        // d(1/√z)/dz = -z^{-3/2} / 2 on the principal branch.
+        let expected = input.powc(ComplexNumber::new(-1.5, 0.0)) * ComplexNumber::new(-0.5, 0.0);
+        assert_abs_diff_eq!(
+            Array::scalar(expected).unwrap(),
+            differentiate_at(Array::scalar(input).unwrap())
+                .holomorphic()
+                .gradient(|input| { input.rsqrt().unwrap() })
+                .unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = RsqrtOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_rsqrt() {
+        assert_eq!(Array::scalar(0.5f32).unwrap().rsqrt().unwrap(), Array::scalar(1.0 / 0.5f32.sqrt()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().rsqrt().unwrap(), Array::scalar(1.0 / 0.5f64.sqrt()).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().rsqrt().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / 0.5f32.sqrt())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().rsqrt().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / 0.5f32.sqrt())).unwrap(),
+        );
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let expected = ComplexNumber::new(1.0, 0.0) / input.sqrt();
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().rsqrt().unwrap(),
+            Array::scalar(expected).unwrap(),
+            epsilon = 1e-12,
+        );
+        assert_eq!(Array::scalar(4.0).unwrap().rsqrt().unwrap(), Array::scalar(0.5).unwrap());
+    }
+
+    #[test]
+    fn test_rsqrt_primitives() {
+        assert_eq!(Rsqrt::rsqrt(&4.0f64), Ok(0.5));
+    }
+}

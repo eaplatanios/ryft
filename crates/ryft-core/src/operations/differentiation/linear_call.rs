@@ -1,0 +1,1565 @@
+use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
+
+use crate::arrays::{ArrayIrType, ArrayType};
+use crate::batching::{
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
+};
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{
+    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
+};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::zero::Zero;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{
+    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
+    ProgramError, RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    Value,
+};
+use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
+
+/// Canonical operation name for [`LinearCallOperation`].
+pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
+
+/// [`Operation`] that represents a call to a residual-parameterized linear map together with its transpose. For
+/// fixed residual values `r`, this operation represents a linear map `Lᵣ : U → V` and its transpose `Lᵣᵀ : V* → U*`.
+/// Linearity applies only to `u ∈ U`: for scalars `a` and `b`, `Lᵣ(a · u₁ + b · u₂) = a · Lᵣ(u₁) + b · Lᵣ(u₂)`. The
+/// residuals `r` are fixed primal values that parameterize the map, so transposition produces cotangents for `u` but
+/// neither differentiates nor accumulates cotangents for `r`. Its two region interfaces are deliberately symmetric:
+///
+///   - `forward`: `(r, u) ↦ v = Lᵣ(u)`, and
+///   - `transpose`: `(r, v̄) ↦ ū = Lᵣᵀ(v̄)`.
+///
+/// Instruction inputs are ordered as `[residuals..., linear_inputs...]`, matching both region input interfaces, and
+/// [`residual_count`](Self::residual_count) separates the two input roles. That symmetry makes transposition a
+/// *swap*: the transpose of `Lᵣ` staged with regions `(forward, transpose)` is the same operation staged with the
+/// regions `(transpose, forward)` over `[residuals..., output_cotangents...]`, so transposing twice restores the
+/// original call and a pullback program retains the linear-call boundary (and its explicit residual edges) instead
+/// of dissolving it. This mirrors the transpose rule of [JAX's
+/// `jax.custom_derivatives.linear_call`](https://github.com/jax-ml/jax/blob/main/jax/_src/custom_derivatives.py),
+/// which has no rendered documentation page and is therefore linked at its source. The swap re-derives each side's
+/// expected interface with the cotangent type mapping, which requires `cotangent(cotangent(u)) = u` for the linear
+/// types. Tangent types (the only types linearization rules stage as linear inputs) satisfy this even where primal
+/// storage types do not (e.g., `f8e8m0fnu`, whose tangent and cotangent representations are both `f32`). A transpose
+/// result must describe the same cotangent space as its corresponding linear input. Besides identical types, this
+/// admits representations that refine one another under [`TypeRefinements`], such as a static extent of 2 and a
+/// retained dimension constrained to exactly 2. A merely compatible or less precise shape is not sufficient.
+///
+/// Instruction inputs carry ordinary values. Reference allocations may be created and consumed locally
+/// within either attached region, but caller references cannot enter through the instruction inputs. The local
+/// [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) rule rebuilds such allocations
+/// in each region independently without threading external state through the call boundary.
+///
+/// Every residual is an ordinary typed Single Static Assignment (SSA) edge rather than differentiation-only payload
+/// metadata. Partial evaluation can lift those values into the enclosing [`Linearization`](crate::Linearization)
+/// residual environment, and partition-aware transposition receives the same values as known inputs in
+/// deterministic order.
+///
+/// An explicit operation boundary is necessary because a tangent program must retain more than the computation of
+/// `Lᵣ(u)`. After linearization, that program may be cloned, imported, simplified, differentiated again, or transposed
+/// independently of the primal program. Merely inlining the forward computation would lose its association with both
+/// the residual values and the program that implements `Lᵣᵀ`. Attaching both regions to this operation makes that
+/// association survive through the ordinary [`Program`](crate::Program) region, input, identity-renaming, and import
+/// machinery, without an ambient value lookup or side table.
+///
+/// The dynamic reshape operation illustrates the need for this representation. Its tangent map reshapes an input
+/// tangent using the output extents, whereas its transpose reshapes an output cotangent using the original input
+/// extents. Those input extents cannot always be recovered from the output shape (e.g., `[n, 4] → [2, 2·n]`). The
+/// reshape rule therefore carries both sets of extents as explicit residual inputs and attaches forward and inverse
+/// reshape regions to one [`LinearCallOperation`]. Other shape-dependent linear rules can use the same mechanism; the
+/// operation itself has no array- or dimension-specific semantics.
+///
+/// This operation derives its complete interface from its attached `forward` and `transpose` [`Region`](crate::Region)s
+/// and can be interpreted, lowered, batched, transposed, and differentiated again. A linear map that supplies only a
+/// reverse rule (e.g., the backward rule of a custom derivative) has no executable forward program, so it is
+/// represented by a [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) instead, whose transposition
+/// applies that rule inline rather than swapping regions. Keeping such maps out of this operation means that every
+/// consumer of a linear call can rely on its forward region.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct LinearCallOperation<T: DifferentiableType> {
+    /// Number of leading residual inputs.
+    residual_count: usize,
+
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`](crate::Type) universe in which it is valid.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: DifferentiableType> LinearCallOperation<T> {
+    /// Creates a new [`LinearCallOperation`] with two attached regions, `forward` and `transpose`, whose leading
+    /// `residual_count` inputs are residuals.
+    #[inline]
+    pub fn new(residual_count: usize) -> Self {
+        Self { residual_count, marker: PhantomData }
+    }
+
+    /// Returns the number of leading residual inputs.
+    #[inline]
+    pub fn residual_count(&self) -> usize {
+        self.residual_count
+    }
+
+    /// Splits the provided `input_types` into its leading residual types and trailing linear types.
+    fn split_inputs<'a>(&self, input_types: &'a [T]) -> Result<(&'a [T], &'a [T]), TypeError> {
+        if self.residual_count > input_types.len() {
+            return Err(TypeError::invalid(format!(
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
+                self.residual_count,
+                input_types.len(),
+            )));
+        }
+        // The local-reference discharge rule rebuilds allocations inside each region but does not thread caller
+        // references through either boundary. Positional input provenance must not implicitly widen that contract.
+        if let Some(position) = input_types.iter().position(|r#type| r#type.is_reference()) {
+            return Err(TypeError::invalid(format!(
+                "`{LINEAR_CALL_OPERATION_NAME}` input {position} is a reference; only references local to its attached \
+                 regions are supported",
+            )));
+        }
+        Ok(input_types.split_at(self.residual_count))
+    }
+
+    /// Stages a residual-parameterized [`LinearCallOperation`]. It traces its two attached [`Region`](crate::Region)s
+    /// and binds the resulting [`LinearCallOperation`] in `context`. This is a canonical constructor rather than a
+    /// separate binding path as the final step is still an ordinary [`Context::bind`], and everything before it only
+    /// constructs the operation's two region programs. It exists because every producer of a linear call must uphold
+    /// the same boundary convention, which is easy to get subtly wrong at any one of many call sites:
+    ///
+    ///   - the instruction inputs are ordered as `[residuals..., linear_inputs...]`,
+    ///   - the `forward` region receives the same values in the same order,
+    ///   - the `transpose` region receives the same residuals followed by one cotangent-typed input
+    ///     per traced forward output, and
+    ///   - the operation carries its regions in `[forward, transpose]` order, with
+    ///     [`residual_count`](Self::residual_count) separating the two input roles.
+    ///
+    /// Callers therefore provide only the operation-specific mathematics of the two maps, as closures over tracers that
+    /// are already split into their residual and linear/cotangent groups.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] in which the linear call is staged.
+    ///   - `residuals`: Fixed primal values parameterizing both regions.
+    ///   - `linear_inputs`: Tangent values to which the forward linear map is applied.
+    ///   - `forward`: Function that builds the forward map `v = Lᵣ(u)` from `(residuals, linear_inputs)`.
+    ///   - `transpose`: Function that builds the transpose map `ū = Lᵣᵀ(v̄)` from `(residuals, output_cotangents)`.
+    pub(crate) fn stage<
+        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+        ForwardFn: FnOnce(
+            &[Tracer<NestedTracingContext<C>>],
+            &[Tracer<NestedTracingContext<C>>],
+        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+        TransposeFn: FnOnce(
+            &[Tracer<NestedTracingContext<C>>],
+            &[Tracer<NestedTracingContext<C>>],
+        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+    >(
+        context: &C,
+        residuals: Vec<C::Value>,
+        linear_inputs: Vec<C::Value>,
+        forward_fn: ForwardFn,
+        transpose_fn: TransposeFn,
+    ) -> Result<Vec<C::Value>, ProgramError>
+    where
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
+    {
+        /// Internal helper that stages like [`stage`](Self::stage) with the callback types erased. This is the body of
+        /// that function, which only wraps its callbacks, so that this body is compiled once per context rather than
+        /// once per pair of callback types. Each callback is invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<T: DifferentiableType, C: Context<Type = T, Operation: From<LinearCallOperation<T>>>>(
+            context: &C,
+            residuals: Vec<C::Value>,
+            linear_inputs: Vec<C::Value>,
+            forward_fn: &mut dyn FnMut(
+                &[Tracer<NestedTracingContext<C>>],
+                &[Tracer<NestedTracingContext<C>>],
+            ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+            transpose_fn: &mut dyn FnMut(
+                &[Tracer<NestedTracingContext<C>>],
+                &[Tracer<NestedTracingContext<C>>],
+            ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+        ) -> Result<Vec<C::Value>, ProgramError>
+        where
+            TracingContext<C::Constant, C::Operation>:
+                StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
+        {
+            let residual_count = residuals.len();
+            let forward_input_types =
+                residuals.iter().chain(&linear_inputs).map(|value| value.r#type().into_owned()).collect();
+            let (_, forward) = NestedTracingContext::trace(
+                context.clone(),
+                move |inputs| {
+                    let (residuals, linear_inputs) = inputs.split_at(residual_count);
+                    forward_fn(residuals, linear_inputs)
+                },
+                forward_input_types,
+            )?;
+            let mut transpose_input_types =
+                residuals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+            transpose_input_types.extend(
+                forward
+                    .outputs()
+                    .map(|output| output.r#type().cotangent())
+                    .collect::<Result<Vec<_>, DifferentiationError>>()?,
+            );
+            let (_, transpose) = NestedTracingContext::trace(
+                context.clone(),
+                move |inputs| {
+                    let (residuals, output_cotangents) = inputs.split_at(residual_count);
+                    transpose_fn(residuals, output_cotangents)
+                },
+                transpose_input_types,
+            )?;
+            let mut inputs = residuals;
+            inputs.extend(linear_inputs);
+            context.bind(LinearCallOperation::new(residual_count), vec![forward, transpose], inputs.as_slice())
+        }
+
+        let mut forward_fn = Some(forward_fn);
+        let mut transpose_fn = Some(transpose_fn);
+        inner(
+            context,
+            residuals,
+            linear_inputs,
+            &mut |residuals, linear_inputs| forward_fn.take().unwrap()(residuals, linear_inputs),
+            &mut |residuals, output_cotangents| transpose_fn.take().unwrap()(residuals, output_cotangents),
+        )
+    }
+
+    /// Batches an invocation to this [`LinearCallOperation`] by structurally batching its two attached
+    /// [`Region`](crate::Region)s. A completely replicated call is preserved unchanged when the batching level
+    /// is _unnamed_, which is precisely when no attached region can observe it.
+    ///
+    /// Every other call batches its forward region to discover the batched output axes, batches its transpose region
+    /// under those axes, and aligns the transpose outputs with the original linear-input axes (i.e., a cotangent for a
+    /// replicated linear input is summed across the batch by `collapse_fn`, while cotangents for mapped linear inputs
+    /// retain their packed axes).
+    ///
+    /// The batching policy owns the boundary shape of its structurally batched programs.
+    /// [`BatchingPolicy::adapt_batched_program`](crate::BatchingPolicy::adapt_batched_program)
+    /// adapts each batched region to the plain two-region linear-call boundary, and any
+    /// [`BatchingPolicy::boundary_inputs`](crate::BatchingPolicy::boundary_inputs) (e.g., an array IR
+    /// program's first-class mapped extent) become additional leading residuals of the batched call.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
+    ///   - `driver`: [`BatchingDriver`] exposing this call's attached regions.
+    ///   - `inputs`: Batched instruction inputs, ordered as `[residuals..., linear_inputs...]`.
+    ///   - `input_axes`: Batch axis of each input in `inputs`.
+    pub(crate) fn batch_regions<
+        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+        P: CotangentBatchingPolicy<C>,
+        D: BatchingDriver<C, P>,
+    >(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+        input_axes: Vec<BatchAxis>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        if self.residual_count > inputs.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
+                self.residual_count,
+                inputs.len(),
+            ))
+            .into());
+        }
+        check_count!("input", input_axes, inputs.len(), ProgramError);
+        let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+
+        // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
+        // original call avoids manufacturing a batch axis that neither region observes. What makes that shortcut sound
+        // is the level being unnamed rather than the inputs being replicated: an attached region's value can vary per
+        // batch item with no mapped input at all, but only by addressing the level _by name_ (e.g., an `axis_index`
+        // or a collective over this level's axis, both of which a transposed program naturally contains because
+        // `parallel_all_gather` transposes to `parallel_sum_scatter` and vice versa). Every named-axis operation
+        // resolves the level it belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an
+        // unnamed level is provably invisible to all of them, including those of operation families this crate does not
+        // know about. A named level therefore batches its regions structurally, which is also what lets the named-axis
+        // operations inside them resolve against it.
+        if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
+            let outputs = context.parent().bind(self.clone(), driver.region_programs(), input_values.as_slice())?;
+            return Ok(outputs.into_iter().map(P::replicated).collect());
+        }
+
+        let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
+        let (forward, output_axes) = P::adapt_batched_program(
+            driver.batch_program(
+                context,
+                driver.region(0)?,
+                input_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?,
+            None,
+            P::sum_mapped_cotangents,
+        )?
+        .into_parts();
+
+        // Batch the supplied transpose under the forward result axes. Cotangents for replicated linear inputs are
+        // summed during adaptation; mapped linear inputs instead retain their packed axes.
+        let transpose_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
+        let (transpose, transpose_output_axes) = P::adapt_batched_program(
+            driver.batch_program(
+                context,
+                driver.region(1)?,
+                transpose_input_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
+            )?,
+            Some(linear_axes),
+            P::sum_mapped_cotangents,
+        )?
+        .into_parts();
+        check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
+        check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
+
+        // Rebinding the call must reconcile the boundaries of the structurally batched regions with the packed input
+        // types, because `linear_call` inference requires its regions' boundaries to match the input types exactly.
+        // The two can differ even though every carrier here is dense: a region may retain a symbolic source extent
+        // (e.g., `f64[batch, n]`) that the packed inputs refine to a concrete one (e.g., `f64[batch, 3]`). Both regions
+        // are therefore specialized to the packed input types (which is a no-op whenever the boundaries already agree),
+        // and the transpose's cotangent inputs derive from the specialized forward's physical outputs for the same
+        // reason. Each returned packed value is wrapped with the output axis reported by structural batching.
+        let mut packed_inputs = P::boundary_inputs(context.axis_extent());
+        let boundary_input_count = packed_inputs.len();
+        packed_inputs.extend(input_values);
+        let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let forward = forward.specialize(forward_input_types.as_slice())?;
+        let physical_output_types = forward.output_types();
+        let mut transpose_input_types = packed_inputs[..boundary_input_count + self.residual_count]
+            .iter()
+            .map(|input| input.r#type().into_owned())
+            .collect::<Vec<_>>();
+        transpose_input_types.extend(
+            physical_output_types
+                .iter()
+                .map(DifferentiableType::cotangent)
+                .collect::<Result<Vec<_>, DifferentiationError>>()
+                .map_err(TypeError::from)?,
+        );
+        let transpose = transpose.specialize(transpose_input_types.as_slice())?;
+        let outputs = context.parent().bind(
+            LinearCallOperation::new(self.residual_count + boundary_input_count),
+            vec![forward, transpose],
+            packed_inputs.as_slice(),
+        )?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        check_count!("output", driver.region(0)?.output_ids(), outputs.len(), ProgramError);
+        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
+    }
+}
+
+impl<T: DifferentiableType> Debug for LinearCallOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LinearCallOperation").field("residual_count", &self.residual_count).finish()
+    }
+}
+
+impl<T: DifferentiableType> Display for LinearCallOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
+    type Type = T;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        LINEAR_CALL_OPERATION_NAME
+    }
+
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")] }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
+        let forward = &region_interfaces[0];
+        let same_forward_inputs = forward.input_types() == input_types;
+
+        // Keeping an unchanged region needs no structural substitution. Repeated indexed inputs still require
+        // numerical equality at region entry; deriving a renaming cannot prove that relationship from their types.
+        let renaming = if same_forward_inputs {
+            TypeIdentityRenaming::new()
+        } else {
+            T::derive_identity_renaming(forward.input_types(), input_types)?
+        };
+
+        let (residual_types, _) = self.split_inputs(input_types)?;
+        let mut transpose_input_types = residual_types.to_vec();
+        for r#type in forward.output_types() {
+            transpose_input_types.push(r#type.rename_identities(&renaming)?.cotangent()?);
+        }
+        let transpose_inputs =
+            (transpose_input_types != region_interfaces[1].input_types()).then_some(transpose_input_types);
+        Ok(vec![(!same_forward_inputs).then(|| input_types.to_vec()), transpose_inputs])
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
+        let forward = &region_interfaces[0];
+        check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` forward input"), [
+            input_types,
+            forward.input_types(),
+        ]);
+        let (residual_types, linear_types) = self.split_inputs(input_types)?;
+        let output_types = forward.output_types();
+        let transpose = &region_interfaces[1];
+        let mut transpose_input_types = residual_types.to_vec();
+        transpose_input_types
+            .extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?);
+        let transpose_output_types =
+            linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
+        check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` transpose input"), [
+            &transpose_input_types,
+            transpose.input_types(),
+        ]);
+
+        // Explicit dimension inputs retain their nominal identities even when their bounds prove an exact extent.
+        // Consequently, specializing `linear: f32[n]` to `f32[2]` can leave its transpose's `zero[n](extent)` output
+        // typed as `f32[n]`, with `n` now constrained to exactly 2. Require refinement in both directions to accept
+        // these equivalent representations without accepting a merely broader transpose result. In particular,
+        // `f32[n]` with non-singleton bounds, a different extent, or unrelated non-exact identities still fail.
+        if transpose_output_types != transpose.output_types()
+            && (T::Refinements::new(transpose_output_types.iter(), transpose.output_types().iter()).is_err()
+                || T::Refinements::new(transpose.output_types().iter(), transpose_output_types.iter()).is_err())
+        {
+            check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` transpose output"), [
+                &transpose_output_types,
+                transpose.output_types(),
+            ]);
+        }
+
+        Ok(output_types.to_vec())
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        // The forward computation receives instruction inputs positionally while the transpose is a dormant rule with
+        // a distinct cotangent boundary. This correspondence does not grant reference access or output identity.
+        if region_index == 0 {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
+    }
+
+    #[inline]
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        // The call's outputs are exactly its forward region's outputs.
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, LINEAR_CALL_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("residual_count", self.residual_count)?;
+            Ok(())
+        })
+    }
+}
+
+impl_reference_dischargeable_operation!(@local_reference <T> LinearCallOperation<T> where T: DifferentiableType);
+
+impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCallOperation<C::Type> {
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        driver.interpret_region(context, 0, inputs.to_vec())
+    }
+}
+
+impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C::Type>>>>
+    PartiallyEvaluatableOperation<C> for LinearCallOperation<C::Type>
+{
+}
+
+impl<
+    T: DifferentiableType,
+    C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+    P: CotangentBatchingPolicy<C>,
+> BatchableOperation<C, P> for LinearCallOperation<T>
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
+        self.batch_regions(context, driver, inputs, input_axes)
+    }
+}
+
+impl<
+    C: Context<
+            Type: DifferentiableType,
+            Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
+        > + Zero<C::Value>,
+> DifferentiableOperation<C> for LinearCallOperation<C::Type>
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        inputs.len().checked_sub(self.residual_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
+                self.residual_count,
+                inputs.len(),
+            ))
+        })?;
+
+        let forward = driver.region(0)?;
+        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        if inputs.iter().all(|input| input.tangent().is_zero()) {
+            let primal_outputs = forward.interpret_in_context(context.primal(), primals)?;
+            return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
+        }
+
+        // With fixed residuals this is already a linear map. Preserve its paired regions when applying it to tangents
+        // as differentiating the implementation would discard the supplied transpose, and may require rules that the
+        // mathematical map does not need (e.g., transposing a runtime-sized scatter used by a slice pullback). Reuse
+        // is valid only when taking tangents preserves the linear boundary types. Low-precision storage whose tangent
+        // representation differs must still take the general differentiation path below.
+        let output_types = forward.output_types();
+        if inputs[..self.residual_count].iter().all(|input| input.tangent().is_zero())
+            && inputs[self.residual_count..]
+                .iter()
+                .all(|input| input.tangent().r#type() == input.primal().r#type())
+            && output_types.iter().all(|r#type| r#type.tangent().is_ok_and(|tangent| &tangent == r#type))
+        {
+            let outputs = forward.interpret_in_context(context.primal(), primals)?;
+            let sources = inputs
+                .iter()
+                .map(|input| context.primal_to_tangent(input.primal().clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut tangent_inputs = sources[..self.residual_count].to_vec();
+            for input in &inputs[self.residual_count..] {
+                tangent_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
+                    input.tangent().clone(),
+                    sources.iter(),
+                )?);
+            }
+            let tangents = context.tangent().bind(
+                self.clone(),
+                vec![forward.to_program(), driver.region(1)?.to_program()],
+                &tangent_inputs,
+            )?;
+            check_count!("output", tangents, outputs.len(), ProgramError);
+            return outputs
+                .into_iter()
+                .zip(tangents)
+                .map(|(primal, tangent)| DifferentiationDual::new(primal, MaybeZero::Value(tangent)))
+                .collect();
+        }
+
+        // Differentiate the dependence on residual parameters as well as the map's linear arguments.
+        let input_indices = (0..forward.input_ids().len()).collect::<Vec<_>>();
+        let linearization = driver.linearize_program(forward, &input_indices, Some(&[]))?;
+        let output_types = forward.output_types();
+        let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
+        let residuals = outputs.split_off(output_types.len());
+        let mut tangent_inputs = Vec::new();
+        for input in inputs {
+            if !input.tangent().r#type().is_zero_space() {
+                tangent_inputs.push(match input.tangent() {
+                    MaybeZero::Value(value) => value.clone(),
+                    MaybeZero::Zero(_) => {
+                        let source = context.primal_to_tangent(input.primal().clone())?;
+                        C::Operation::materialize_zero_from_residual_sources(
+                            context.tangent(),
+                            input.tangent().clone(),
+                            std::iter::once(&source),
+                        )?
+                    }
+                });
+            }
+        }
+        tangent_inputs.extend(
+            residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
+        );
+        let tangent_outputs = linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
+        let tangent_output_slots = linearization.tangent_output_slots();
+        check_count!(
+            "output",
+            tangent_outputs,
+            tangent_output_slots.iter().filter(|&&has_slot| has_slot).count(),
+            ProgramError,
+        );
+        let mut tangent_outputs = tangent_outputs.into_iter();
+        outputs
+            .into_iter()
+            .zip(tangent_output_slots)
+            .map(|(primal, &has_slot)| match has_slot {
+                true => DifferentiationDual::new(primal, tangent_outputs.next().unwrap()),
+                false => DifferentiationDual::new_with_zero_tangent(primal),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+impl<
+    V: Value<Type: DifferentiableType>,
+    O: Operation<Type = V::Type>
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
+        + ResidualZeroProvider<V::Type, Operation = O>
+        + From<LinearCallOperation<V::Type>>,
+> TransposableOperation<V, O> for LinearCallOperation<V::Type>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        if self.residual_count > inputs.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
+                self.residual_count,
+                inputs.len(),
+            ))
+            .into());
+        }
+        check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        let (residual_inputs, linear_inputs) = inputs.split_at(self.residual_count);
+        let residuals = residual_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                input.as_known().cloned().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "`{LINEAR_CALL_OPERATION_NAME}` residual input {index} is not known during transposition",
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let transpose = driver.region(1)?;
+
+        // Unrequested gradients can omit a pure backward program, but its observable effects must still execute and
+        // its deferred work must still be staged even when all seeds are structural zeros or none of the linear inputs
+        // requests a cotangent. The backward program is selected here, so its own summary decides; deferred work that
+        // exists only in its dormant alternatives (i.e., nested rule regions) creates no obligation.
+        if (outputs.iter().all(MaybeZero::is_zero) || !accumulators.iter().any(CotangentAccumulator::is_needed))
+            && !transpose.effects().is_retained_when_unused()
+        {
+            return Ok(());
+        }
+
+        // Classify each transpose-region output as structurally zero by inspecting its producing instruction in the
+        // source region, so zero cotangents stay symbolic instead of accumulating. An output that forwards an output
+        // cotangent input is zero exactly when that cotangent is a structural zero, which this call materializes below
+        // only because the transposed call needs a value. Outputs that forward a residual or a constant conservatively
+        // classify as non-zero.
+        let cotangent_input_ids = &transpose.input_ids()[self.residual_count..];
+        let output_is_zero = transpose
+            .output_ids()
+            .iter()
+            .map(|output| {
+                if let Some(cotangent_index) = cotangent_input_ids.iter().position(|input| input == output) {
+                    return outputs[cotangent_index].is_zero();
+                }
+                transpose
+                    .instructions()
+                    .iter()
+                    .find_map(|instruction| {
+                        instruction
+                            .outputs()
+                            .iter()
+                            .position(|candidate| candidate == output)
+                            .map(|output_index| instruction.operation().is_zero(output_index))
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        // A dead output's structural-zero cotangent still becomes a real input of the transposed call. Its type
+        // alone cannot construct it when it references runtime identities, but the boundary collectively names every
+        // such quantity: at least one peer cotangent is live here (the all-zero case returned above) and the retained
+        // residuals are live too, so the zero is assembled from them one identity at a time before falling back to the
+        // nullary zero that every identity-free type keeps.
+        let materialized_cotangents = outputs
+            .iter()
+            .cloned()
+            .map(|output| {
+                O::materialize_zero_from_residual_sources(
+                    &**context,
+                    output,
+                    outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut transpose_inputs = residuals;
+        transpose_inputs.extend(materialized_cotangents);
+
+        // A linear call transposes by _swapping_ its regions: the pullback stages the same operation with the
+        // transpose region leading, over the same residuals followed by the output cotangents. Transposing twice
+        // therefore restores the original call, and the pullback retains the linear-call boundary together with
+        // its explicit residual edges.
+        let swapped = LinearCallOperation::new(self.residual_count);
+        let transpose_program = transpose.to_program();
+        let forward_program = driver.region(0)?.to_program();
+        let input_cotangents = context.bind(swapped, vec![transpose_program, forward_program], &transpose_inputs)?;
+        check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
+
+        // Residual inputs are known and contribute nothing. Preserve structural zeros reported by the stored
+        // backward program, including zeros whose runtime extents belong to the caller's primal inputs.
+        linear_inputs
+            .iter()
+            .zip(input_cotangents)
+            .zip(output_is_zero)
+            .zip(&accumulators[self.residual_count..])
+            .filter(|(((input, _), is_zero), _)| input.is_unknown() && !is_zero)
+            .try_for_each(|(((_, cotangent), _), accumulator)| {
+                accumulator.accumulate(context, MaybeZero::Value(cotangent))
+            })?;
+        Ok(())
+    }
+}
+
+impl From<LinearCallOperation<ArrayType>> for LinearCallOperation<ArrayIrType> {
+    #[inline]
+    fn from(operation: LinearCallOperation<ArrayType>) -> Self {
+        // The payload stores no types; its attached regions follow the program conversion separately.
+        Self::new(operation.residual_count)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::rc::Rc;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use ryft_macros::Operation;
+
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+    };
+    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{
+        CotangentDestinationKind, DifferentiationError, TransposableOperation, TransposedProgram,
+        TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    };
+    use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::collectives::axis_index::AxisIndexOperation;
+    use crate::operations::constants::zero::ZeroOperation;
+    use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
+    use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation};
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
+    use crate::programs::{
+        AttachedRegions, EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver,
+        RegionRef, RegionSlot,
+    };
+    use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
+    use crate::tracing::TracingContext;
+
+    use super::*;
+
+    /// Builds the scalar program `(r, u) ↦ r · u` used as a residual-parameterized linear-map region.
+    pub(crate) fn scalar_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type);
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, residual], None).unwrap()[0];
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Builds the scalar program `u ↦ u · axis_index("items")`, a linear map whose factor is read from the named
+    /// `items` axis rather than from an input. It serves as both regions of a linear call whose value varies per
+    /// batch item even though every input is replicated.
+    fn axis_scaled_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
+        let index = builder
+            .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
+        let factor = builder
+            .add_instruction(ConvertElementTypeOperation::new(DataType::F64, false), Vec::new(), vec![index], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, factor], None).unwrap()[0];
+        builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    #[test]
+    fn test_linear_call_operation() {
+        // A linear call derives its interface from its two attached regions.
+        let operation = LinearCallOperation::<ArrayType>::new(1);
+        assert_eq!(operation.name(), LINEAR_CALL_OPERATION_NAME);
+        assert_eq!(operation.residual_count(), 1);
+        assert_eq!(operation.to_string(), "linear_call [residual_count=1]");
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")]);
+        assert_eq!(format!("{operation:?}"), "LinearCallOperation { residual_count: 1 }");
+    }
+
+    #[test]
+    fn test_linear_call_operation_supports_a_third_family_member() {
+        // A third-member residual paired with a first-member linear value proves that the operation and its attached
+        // regions use generic program storage without an array/dimension-specific projection.
+
+        /// Linear-call-only family over the three-member program type. [`Context`] requires its operation family to
+        /// provide [`GuardOperation`](crate::GuardOperation) requests even when replay needs no guard. The derive
+        /// supplies a rejecting provider, keeping that implementation on this test family instead of adding it to
+        /// the production [`LinearCallOperation`]. This test's identity-free input types prove all boundary
+        /// relationships, so eager replay never requests a guard.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type(ProjectedProgramType), constant(ProjectedProgramValue))]
+        enum ProjectedLinearCallOperation {
+            LinearCall(LinearCallOperation<ProjectedProgramType>),
+        }
+
+        let linear_type = ProjectedProgramType::First(ProjectedMemberType);
+        let residual_type = ProjectedProgramType::Third(ProjectedMemberType);
+        let forward = {
+            let mut builder = ProgramBuilder::<ProjectedProgramValue, ProjectedLinearCallOperation>::new();
+            builder.add_input(residual_type.clone());
+            let linear = builder.add_input(linear_type.clone());
+            builder
+                .build::<Vec<ProjectedProgramValue>, Vec<ProjectedProgramValue>>(
+                    vec![linear],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let transpose = {
+            let mut builder = ProgramBuilder::<ProjectedProgramValue, ProjectedLinearCallOperation>::new();
+            builder.add_input(residual_type.clone());
+            let cotangent = builder.add_input(linear_type.clone());
+            builder
+                .build::<Vec<ProjectedProgramValue>, Vec<ProjectedProgramValue>>(
+                    vec![cotangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ProjectedProgramValue, ProjectedLinearCallOperation>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(residual_type);
+        let linear = builder.add_input(linear_type);
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ProjectedProgramValue>, Vec<ProjectedProgramValue>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linear = ProjectedProgramValue::First(ProjectedMemberValue(2));
+        let residual = ProjectedProgramValue::Third(ProjectedMemberValue(7));
+        assert_eq!(program.interpret(vec![residual, linear.clone()]), Ok(vec![linear]));
+        assert_eq!(program.instructions()[0].regions().len(), 2);
+    }
+
+    #[test]
+    fn test_linear_call_operation_type_inference_rejects_reference_inputs() {
+        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let inputs = vec![reference, scalar.clone()];
+        let regions = vec![
+            RegionInterface::new(inputs.clone(), vec![scalar.clone()], EffectClasses::NONE),
+            RegionInterface::new(inputs.clone(), vec![scalar], EffectClasses::NONE),
+        ];
+        let operation = LinearCallOperation::<ArrayIrType>::new(1);
+        // A reference residual previously failed reference-region validation. Declaring positional producer sources
+        // keeps that boundary unsupported and now rejects it explicitly before specialization or ordinary inference.
+        assert_eq!(
+            operation.infer_region_input_types(&inputs, &regions),
+            Err(TypeError::invalid(
+                "`linear_call` input 0 is a reference; only references local to its attached regions are supported",
+            )),
+        );
+        assert_eq!(
+            operation.infer_output_types(&inputs, &regions),
+            Err(TypeError::invalid(
+                "`linear_call` input 0 is a reference; only references local to its attached regions are supported",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_region_data_flow() {
+        let operation = LinearCallOperation::<ArrayType>::new(1);
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        // Only the forward region executes; its residual and linear inputs retain their declared positions.
+        assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Input { index: 0 });
+        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 1 });
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::None);
+        assert_eq!(
+            operation.output_region_provenance(1),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_discharges_local_references_in_both_regions() {
+        // Each region computes `coefficient * linear input` through a private reference lifecycle. Discharge must
+        // retain both regions so transposition still uses the declared rule after backend preparation.
+        let region = || {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let coefficient = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let linear = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![coefficient], None).unwrap()[0];
+            let coefficient =
+                builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let output = builder
+                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![coefficient, linear], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let coefficient = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let linear = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let regions = vec![
+            builder.import_region(region().entry_region_ref()),
+            builder.import_region(region().entry_region_ref()),
+        ];
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), regions, vec![coefficient, linear], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let discharged =
+            program.clone().discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+        assert_eq!(discharged.instructions()[0].regions().len(), 2);
+        assert!(!discharged.entry_region_ref().contains_references_in_closure());
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+        ];
+        let expected = vec![ArrayIrValue::Array(Array::scalar(12.0_f32).unwrap())];
+        assert_eq!(discharged.interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(discharged.transpose_with_respect_to(&[1], &[]).unwrap().interpret(inputs), Ok(expected));
+
+        // A targeted rewrite discharges only the selected region's allocation and retains the other lifecycle.
+        let targets = program.reference_discharge_targets(0).unwrap();
+        assert_eq!(targets.len(), 2);
+        let partial = program.partially_discharge_references(0, &targets[..1]).unwrap();
+        assert!(partial.program().entry_region_ref().contains_references_in_closure());
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_preserves_its_transpose() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let forward = scalar_multiply_program();
+        let transpose = forward.clone();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type);
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // A varying residual with a shared linear input produces mapped outputs. Its transpose must sum the per-item
+        // cotangents back into the single shared input cotangent.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(4.0).unwrap()]),
+            Ok(vec![Array::vector(vec![8.0, 12.0]).unwrap()]),
+        );
+
+        let instruction = &batched.instructions()[0];
+        let transpose = batched.region_ref(instruction.regions()[1]).unwrap().to_program();
+        assert_eq!(
+            transpose.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::vector(vec![5.0, 7.0]).unwrap()]),
+            Ok(vec![Array::scalar(31.0).unwrap()]),
+        );
+
+        // A replicated residual and mapped linear input preserve the mapped cotangent instead of reducing it.
+        let (batched_linear, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched_linear.interpret(vec![Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![6.0, 8.0]).unwrap()]),
+        );
+        let instruction = &batched_linear.instructions()[0];
+        let transpose = batched_linear.region_ref(instruction.regions()[1]).unwrap().to_program();
+        assert_eq!(
+            transpose.interpret(vec![Array::scalar(2.0).unwrap(), Array::vector(vec![5.0, 7.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![10.0, 14.0]).unwrap()]),
+        );
+
+        // Rebatching an executable linear call composes mapped axes without losing either attached region.
+        let (nested, output_axes) = batched_linear
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            nested.interpret(vec![
+                Array::vector(vec![2.0, 3.0]).unwrap(),
+                Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]).unwrap(),
+            ]),
+            Ok(vec![Array::matrix(2, 2, vec![8.0, 10.0, 18.0, 21.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_rewrites_replicated_regions_naming_the_batch_axis() {
+        // Both regions of `u ↦ u · axis_index("items")` address the enclosing named batching level, so the call's
+        // value varies per batch item even though its single input is replicated.
+        let regions = AttachedRegions::from(vec![axis_scaled_multiply_program(), axis_scaled_multiply_program()]);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+                .with_axis_name("items".to_string());
+
+        // Batching must therefore rewrite both regions instead of taking the all-replicated fast path, which would bind
+        // the call unchanged and leave the `axis_index` unresolved (it then reaches eager interpretation and reports
+        // "`axis_index` for the device mesh axis `items` has no eager value").
+        let outputs = LinearCallOperation::new(0)
+            .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0).unwrap())])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_preserves_a_replicated_unnamed_call() {
+        let forward = scalar_multiply_program();
+        let transpose = forward.clone();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(ArrayType::scalar(DataType::F64));
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // An unnamed level is the shape every differentiation-generated linear call is batched under, and no operation
+        // can address it, so a completely replicated call keeps its fast path: the staged instruction retains its
+        // residual count, its input order, and both regions byte for byte.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = linear_call [residual_count=1] %0 %1 [
+                    forward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(batched.to_string(), program.to_string());
+
+        // A *named* level is conservatively structural even for regions that name no axis, because the level's name is
+        // all this rule can decide on. The rewritten regions are semantically the source regions, so the batched call
+        // still computes `r · u` and reports its output replicated.
+        let regions = AttachedRegions::from(vec![scalar_multiply_program(), scalar_multiply_program()]);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+                .with_axis_name("items".to_string());
+        let outputs = LinearCallOperation::new(1)
+            .batch(
+                &context,
+                &driver,
+                &[
+                    ArrayBatch::replicated(Array::scalar(2.0).unwrap()),
+                    ArrayBatch::replicated(Array::scalar(4.0).unwrap()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value(), &Array::scalar(8.0).unwrap());
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_threads_the_mapped_extent() -> Result<(), ProgramError> {
+        type TestProgram =
+            Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>;
+
+        // The dimension residual remains replicated while the linear input and output carry the inferred mapped
+        // extent. Both attached regions are structurally batched with that extent threaded through their boundary.
+        let residual_type = DimensionType::new("residual", DimensionBounds::new(0, Some(9))?);
+        let array_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::new();
+        builder.add_input(residual_type.clone().into());
+        let linear = builder.add_input(array_type.clone().into());
+        let forward: TestProgram = builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder])?;
+        let mut builder = ProgramBuilder::new();
+        builder.add_input(residual_type.clone().into());
+        let linear = builder.add_input(array_type.into());
+        let transpose: TestProgram = builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder])?;
+        let residual = ArrayIrValue::Dimension(DimensionValue::new(residual_type, 3)?);
+        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]).unwrap());
+        let output: ArrayIrValue<Array> = batch(
+            |(residual, linear)| {
+                let outputs = residual.context().bind(
+                    ArrayIrOperation::LinearCall(LinearCallOperation::new(1)),
+                    vec![forward, transpose],
+                    &[residual.clone(), linear],
+                )?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (residual, linear.clone()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        assert_eq!(output, linear);
+        Ok(())
+    }
+
+    #[test]
+    fn test_linear_call_operation_nested_jvp_differentiates_residual_parameters() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let forward = scalar_multiply_program();
+        let transpose = forward.clone();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type);
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // For `Lᵣ(u) = r · u`, the nested JVP is `(r, u, ṙ, u̇) ↦ (r · u, ṙ · u + r · u̇)`. At
+        // `(r, u, ṙ, u̇) = (2, 3, 5, 7)`, the primal is `6` and the tangent is `5 · 3 + 2 · 7 = 29`.
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(3.0).unwrap(),
+                Array::scalar(5.0).unwrap(),
+                Array::scalar(7.0).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(6.0).unwrap(), Array::scalar(29.0).unwrap()]),
+        );
+
+        // Holding the coefficient fixed applies the same paired map to the linear tangent. The residual-dependent
+        // case above must still differentiate the coefficient itself.
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        let mut outputs = linearization
+            .primal()
+            .interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()])
+            .unwrap();
+        let mut tangent_inputs = vec![Array::scalar(7.0).unwrap()];
+        tangent_inputs.extend(outputs.split_off(1));
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![Array::scalar(14.0).unwrap()]));
+        assert!(linearization.tangent().instructions().iter().any(|instruction| matches!(
+            instruction.operation(), ArrayOperation::LinearCall(operation) if operation.residual_count() == 1,
+        )));
+    }
+
+    #[test]
+    fn test_linear_call_operation_jvp_keeps_local_tangent_references_fresh_per_invocation() {
+        // The identity map accumulates into a zero-initialized reference and consumes it. Its transpose is the
+        // same map. Hoisting tangent state into the primal program would reuse a consumed reference on the next call.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let zero = builder.add_constant(Array::scalar(0.0_f32).unwrap().into());
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let region = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let forward = builder.import_region(region.entry_region_ref());
+        let transpose = builder.import_region(region.entry_region_ref());
+        let output = builder
+            .add_instruction(LinearCallOperation::new(0), vec![forward, transpose], vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs =
+            linearization.primal().interpret(vec![Array::scalar(3.0_f32).unwrap().into()]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![Array::scalar(3.0_f32).unwrap().into()]);
+
+        // Reuse the same primal residuals with different tangents, then repeat the first tangent.
+        let outputs = [2.0_f32, 5.0, 2.0].map(|tangent| {
+            let mut inputs = vec![Array::scalar(tangent).unwrap().into()];
+            inputs.extend(residuals.clone());
+            linearization.tangent().interpret(inputs).unwrap()
+        });
+        assert_eq!(
+            outputs,
+            [
+                vec![Array::scalar(2.0_f32).unwrap().into()],
+                vec![Array::scalar(5.0_f32).unwrap().into()],
+                vec![Array::scalar(2.0_f32).unwrap().into()],
+            ],
+        );
+        let tangent = linearization.tangent();
+        let call = tangent
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_),))
+            .unwrap();
+        let forward = tangent.region_ref(call.regions()[0]).unwrap();
+        assert_eq!(
+            forward
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.operation().name() == "reference_new")
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_transposition_swaps_the_attached_regions() {
+        /// Exposes an executable linear call's two regions directly to its transposition rule.
+        struct TwoRegionDriver<'r> {
+            forward: RegionRef<'r, Array, ArrayOperation<Array>>,
+            transpose: RegionRef<'r, Array, ArrayOperation<Array>>,
+        }
+
+        impl RegionDriver<Array, ArrayOperation<Array>> for TwoRegionDriver<'_> {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
+            where
+                Array: 'r,
+                ArrayOperation<Array>: 'r,
+            {
+                [self.forward, self.transpose].into_iter()
+            }
+        }
+
+        impl TranspositionDriver<Array, ArrayOperation<Array>> for TwoRegionDriver<'_> {
+            fn transpose_program(
+                &self,
+                _region: RegionRef<'_, Array, ArrayOperation<Array>>,
+                _input_indices: &[usize],
+                _materialize_zeros: &[bool],
+                _destination_kinds: &[CotangentDestinationKind],
+            ) -> Result<TransposedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
+                unreachable!("linear call transposition swaps regions and never re-enters transposition")
+            }
+        }
+
+        let r#type = ArrayType::scalar(DataType::F64);
+        let forward = scalar_multiply_program();
+        let transpose = {
+            // Deliberately use a different body from `forward` so the rendered program proves the region order was
+            // swapped instead of merely proving that two indistinguishable regions remain attached.
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let residual = builder.add_input(r#type.clone());
+            let output_cotangent = builder.add_input(r#type.clone());
+            let input_cotangent = builder
+                .add_instruction(AddOperation::new(), Vec::new(), vec![output_cotangent, residual], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![input_cotangent], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let driver = TwoRegionDriver { forward: forward.entry_region_ref(), transpose: transpose.entry_region_ref() };
+
+        // A structural-zero output cotangent returns structural zeros for both the residual and the linear input
+        // without replaying either region or staging a materialized array zero.
+        let zero_context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let residual = zero_context.input(r#type.clone());
+        let zero_cotangents = {
+            let mut rule_context = TranspositionContext::new(zero_context.clone());
+            let rule_inputs = &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())];
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::new(1)
+                .transpose(&mut rule_context, &driver, rule_inputs, &[MaybeZero::Zero(r#type.clone())], &accumulators)
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
+        assert_eq!(zero_cotangents.len(), 2);
+        assert!(zero_cotangents.iter().all(MaybeZero::is_zero));
+        assert!(zero_context.builder().borrow().instructions().is_empty());
+
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let residual = context.input(r#type.clone());
+        let output_cotangent = context.input(r#type.clone());
+
+        // Transposition must assign a structural zero to the known residual and stage one swapped linear call for the
+        // unknown linear input's cotangent.
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Known(residual), PartialValue::Unknown(r#type)];
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::new(1)
+                .transpose(
+                    &mut rule_context,
+                    &driver,
+                    rule_inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
+        assert_eq!(cotangents.len(), 2);
+        assert!(cotangents[0].is_zero());
+        let output = match &cotangents[1] {
+            MaybeZero::Value(value) => value.atom_id().unwrap(),
+            MaybeZero::Zero(_) => panic!("expected a live linear-input cotangent"),
+        };
+
+        let builder = context.builder().clone();
+        drop((context, cotangents));
+        let builder = Rc::try_unwrap(builder).expect("the builder is uniquely owned once every tracer is dropped");
+        let program = builder
+            .into_inner()
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = linear_call [residual_count=1] %0 %1 [
+                    forward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = add %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_transposition_preserves_dynamic_structural_zeros() {
+        let dimension = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
+        let dimension_type = DimensionType::from(dimension.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut forward_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        forward_builder.add_input(dimension_type.clone().into());
+        forward_builder.add_input(array_type.clone().into());
+        let output = forward_builder
+            .add_instruction(ZeroOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
+        let forward = forward_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The stored backward region constructs a zero with its retained extent. Transposition recognizes that
+        // output as structural and omits its returned value. The opaque call retains its existing deferred-work
+        // policy, so its regions and explicit residual remain staged even with no returned cotangent.
+        let mut transpose_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = transpose_builder.add_input(dimension_type.clone().into());
+        transpose_builder.add_input(scalar_type.clone().into());
+        let zero = transpose_builder
+            .add_instruction(ZeroOperation::new(array_type.clone()), Vec::new(), vec![extent], None)
+            .unwrap()[0];
+        let transpose = transpose_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![zero],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(dimension_type.clone().into());
+        let input = builder.add_input(array_type.into());
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![extent, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        // Specializing the linear input makes it static while the transpose's explicit zero constructor keeps its
+        // exact named extent. Both describe the same cotangent space, so this call remains valid and executable.
+        let exact_dimension = DimensionType::new("size", DimensionBounds::new(2, Some(3)).unwrap());
+        let specialized = program
+            .clone()
+            .specialize(&[exact_dimension.clone().into(), ArrayType::new_static(DataType::F32, [2]).into()])
+            .unwrap();
+        assert_eq!(specialized.output_types(), vec![ArrayIrType::Array(scalar_type.clone())]);
+        assert_eq!(
+            specialized.interpret(vec![
+                DimensionValue::new(exact_dimension, 2).unwrap().into(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[3_f32, 5.]).unwrap().into(),
+            ]),
+            Ok(vec![Array::scalar(0_f32).unwrap().into()]),
+        );
+        let omitted = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        assert_eq!(omitted.cotangents(), &[TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            omitted.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:dimension<size ∈ [0, 4)> .
+                let %2:f32[size] = linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<size ∈ [0, 4)>, %1:f32[] .
+                        let %2:f32[size] = zero [type=f32[size]] %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<size ∈ [0, 4)>, %1:f32[size] .
+                        let %2:f32[] = zero [type=f32[]]
+                        in (%2)
+                    },
+                ]
+                in ()"},
+        );
+
+        // The raw program API explicitly requests a dense result and can use the retained extent to construct it.
+        let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        for extent in [0, 2] {
+            assert_eq!(
+                pullback.interpret(vec![
+                    ArrayIrValue::Array(Array::from_elements(scalar_type.clone(), &[7_f32]).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), extent).unwrap()),
+                ]),
+                Ok(vec![ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F32, [extent]), &vec![0_f32; extent],)
+                        .unwrap()
+                )])
+            );
+        }
+    }
+}

@@ -1,0 +1,2179 @@
+use std::borrow::Cow;
+
+use crate::arrays::batching::{ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy};
+use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
+use crate::arrays::references::ArrayReferenceTransform;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::ir::ArrayIrType;
+use crate::axes::Axis;
+use crate::batching::BatchingError;
+use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
+use crate::differentiation::{
+    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
+    MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver, transpose_projected_operation,
+};
+use crate::operations::{
+    AddOperation, ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation,
+    GuardOperation, LinearCallOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
+    ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation, ScatterOperation, Zero,
+    ZeroLikeOperation, ZeroOperation,
+};
+use crate::partial::PartialValue;
+use crate::programs::{
+    AtomId, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+};
+use crate::tracing::{Tracer, TracingContext};
+
+// Homogeneous array operations construct input-free zeros when their output types need no runtime extent source.
+// Symbolic zeros instead require an exact-type source, because this universe has no first-class dimension values.
+// Keep this blanket specific to `ArrayType`, disjoint from the runtime-extent protocol for `ArrayIrType` below.
+impl<O> ResidualZeroProvider<ArrayType> for O
+where
+    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ZeroLikeOperation<ArrayType>>,
+{
+    #[inline]
+    fn requires_zero_source(r#type: &ArrayType) -> bool {
+        r#type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
+    }
+
+    fn materialize_zero_from_residual_sources<
+        'v,
+        C: Context<Type = ArrayType, Value: 'v, Operation = O> + Zero<C::Value>,
+        I: IntoIterator<Item = &'v C::Value>,
+    >(
+        context: &C,
+        zero: MaybeZero<C::Value>,
+        sources: I,
+    ) -> Result<C::Value, ProgramError> {
+        let r#type = match zero {
+            MaybeZero::Value(value) => return Ok(value),
+            MaybeZero::Zero(r#type) => r#type,
+        };
+
+        if !Self::requires_zero_source(&r#type) {
+            return context.zero(&r#type);
+        }
+
+        // Inspect candidates before binding anything: another representation or merely equal bounds cannot supply
+        // this zero's complete type. The consumer owns the source; no exemplar is captured as a residual here. A
+        // source of a different type is rejected even when it names the same extents (e.g., the primal `i32[n]` of
+        // a `zero[n]` cotangent), because this universe has no first-class dimensions to carry them across types.
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == &r#type) else {
+            let source_types = sources.iter().map(|source| source.r#type().to_string()).collect::<Vec<_>>();
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot materialize a zero of type {} because no source has exactly that type (source types: [{}])",
+                    r#type,
+                    source_types.join(", "),
+                ),
+            });
+        };
+
+        Ok(context
+            .bind(O::from(ZeroLikeOperation::new()), Vec::new(), std::slice::from_ref(*source))?
+            .remove(0))
+    }
+}
+
+// Array-IR operation families share declaration, capture, and assembly regardless of their backend representation.
+// Static zeros use the family's `OperationProvider`. Dynamic zeros consume one extent input per dynamic axis.
+// Captured residuals contain one extent per distinct dimension identity, in first-occurrence order. Assembly expands
+// repeated identities back into the constructor's per-axis input order. Builder-level capture reads each identity's
+// first axis from the ordinary primal array. Value-level capture also accepts first-class dimensions and references
+// (i.e., a dimension with the requested identity is reused, an array supplies a `DimensionSizeOperation` read, and a
+// reference is read before obtaining its referent's extent). A source is inspected before staging anything, so a
+// candidate without the requested identity leaves no instructions behind.
+impl<O> ResidualZeroProvider<ArrayIrType> for O
+where
+    O: Operation<Type = ArrayIrType>
+        + OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>, Operation = O>
+        + From<ZeroOperation<ArrayType>>
+        + From<DimensionSizeOperation>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
+{
+    #[inline]
+    fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
+        match r#type {
+            ArrayIrType::Array(r#type) => ExactShape::for_residual_zero(r#type.shape())
+                .1
+                .into_iter()
+                .map(|(_, variable)| DimensionType::from(variable).into())
+                .collect(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn capture_zero_residuals<V: Value<Type = ArrayIrType>>(
+        builder: &mut ProgramBuilder<V, O>,
+        source: AtomId,
+        r#type: &ArrayIrType,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        // Reading only each identity's first source axis establishes the same deduplicated residual ordering
+        // used by zero construction, including when several axes share one identity.
+        let r#type = <&ArrayType>::try_from(r#type)?;
+        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+        first_axes
+            .into_iter()
+            .map(|(axis, _)| {
+                Ok(builder.add_instruction(
+                    DimensionSizeOperation::new(r#type, axis)?,
+                    Vec::new(),
+                    vec![source],
+                    None,
+                )?[0])
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = O>>(
+        context: &C,
+        source: &C::Value,
+        residual_type: &ArrayIrType,
+    ) -> Result<Option<C::Value>, ProgramError> {
+        let ArrayIrType::Dimension(residual_type) = residual_type else {
+            return Ok(None);
+        };
+
+        // A static residual has no identity for a source to supply.
+        let Some(variable) = residual_type.variable() else {
+            return Ok(None);
+        };
+        let source_type = source.r#type();
+        let array_type = match source_type.as_ref() {
+            ArrayIrType::Dimension(source_type) => {
+                // A matching first-class dimension already is the residual and so we reuse it without staging a read.
+                return Ok((source_type.variable() == Some(variable)).then(|| source.clone()));
+            }
+            ArrayIrType::Reference(reference) => reference.referent(),
+            ArrayIrType::Array(array_type) => array_type,
+        };
+
+        // Match the dimension identity before reading a reference or staging an extent query. The caller tries
+        // candidate sources in order, so an unrelated candidate must leave the program unchanged.
+        let Some(axis) = array_type
+            .shape()
+            .dimensions()
+            .iter()
+            .position(|dimension| matches!(dimension, Dimension::Dynamic(candidate) if candidate == variable))
+        else {
+            return Ok(None);
+        };
+
+        // An array supplies its extent directly. A reference must first supply its current array value.
+        // Borrow ordinary arrays so that only the reference case needs an owned intermediate value.
+        let source = if matches!(source_type.as_ref(), ArrayIrType::Reference(_)) {
+            Cow::Owned(context.bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(source))?.remove(0))
+        } else {
+            Cow::Borrowed(source)
+        };
+
+        Ok(Some(
+            context
+                .bind(
+                    DimensionSizeOperation::new(array_type, axis)?,
+                    Vec::new(),
+                    std::slice::from_ref(source.as_ref()),
+                )?
+                .remove(0),
+        ))
+    }
+
+    #[inline]
+    fn zero_operation_with_residuals<R: Clone>(
+        r#type: ArrayIrType,
+        residuals: &[R],
+    ) -> Result<(O, Vec<R>), ProgramError> {
+        // Capture stores one residual per distinct dimension identity, even when that identity occurs on
+        // several axes. Validate that compact list before expanding it into constructor inputs.
+        let array_type = <&ArrayType>::try_from(&r#type)?;
+        let (shape, first_axes) = ExactShape::for_residual_zero(array_type.shape());
+        let expected_residual_count = first_axes.len();
+        if residuals.len() != expected_residual_count {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "dynamic zero expected {expected_residual_count} extent residuals but got {}",
+                    residuals.len(),
+                ),
+            });
+        }
+
+        if expected_residual_count == 0 {
+            // Static zeros need no extent inputs. Preserve the family's provider choice and reuse the owned type.
+            return Ok((Self::provide(ZeroOperation::new(r#type), &[])?, Vec::new()));
+        }
+
+        // Dynamic constructors take one input per dynamic axis: a shape [n, n, m] expands residuals [n, m]
+        // into inputs [n, n, m]. Static axes stay in the stored type and consume no input.
+        let zero_inputs = shape.dynamic_dimensions(residuals);
+        Ok((O::from(ZeroOperation::new(array_type.clone())), zero_inputs))
+    }
+}
+
+/// Exact runtime [`Shape`] expressed in the coordinate system of a [`LinearResiduals`] list, so that it can be
+/// reconstructed inside a [`LinearCallOperation`]'s attached [`Region`](crate::Region)s. A [`Shape`] describes an
+/// array _type_: each axis is either a static extent or a [`DimensionVariable`] identity. What a staged region needs
+/// is one step more concrete (i.e., where the runtime extent of each axis lives) and the only values in scope there
+/// are the region's residual inputs. [`ExactShape`] is that plan, containing one [`ExactShapeDimension`] per axis,
+/// referring to static extents directly and to dynamic extents by residual slot index. It is produced by
+/// [`LinearResiduals::retain_shape`] next to the residual list that gives those indices meaning during rule staging
+/// or by [`Self::for_residual_zero`] when planning zeros required inside a region. Consumers that own primal extent
+/// sources can also use the plan to materialize structural zeros locally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactShape(Vec<ExactShapeDimension>);
+
+impl ExactShape {
+    /// Builds the canonical [`ExactShape`] plan for constructing a zero of [`Shape`] `shape` without any surrounding
+    /// [`LinearResiduals`] list, and returns it together with the source axes a caller must read to populate those
+    /// residuals. [`ResidualZeroProvider`] and dynamic-zero constructors use this plan when a consumer needs a value,
+    /// such as a reference accumulator allocation or a dense region boundary. Disconnected pullback results remain
+    /// structural zeros until their consumer supplies an extent source. Residual slots are assigned by first axis
+    /// occurrence, and repeated uses of one dimension identity reuse the same slot, preserving equality between axes
+    /// without retaining duplicate scalar values. The returned list contains one `(axis, variable)` entry per distinct
+    /// dynamic identity, in slot order, telling the caller which source axis to read (e.g., with
+    /// [`DimensionSizeOperation`]) to obtain each residual value.
+    pub fn for_residual_zero(shape: &Shape) -> (Self, Vec<(usize, DimensionVariable)>) {
+        // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse
+        // that slot, preserving equality between axes without retaining duplicate scalar values.
+        let mut first_axes = Vec::new();
+        let dimensions = shape
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                Dimension::Static(extent) => ExactShapeDimension::Static(*extent),
+                Dimension::Dynamic(variable) => {
+                    let residual =
+                        first_axes.iter().position(|(_, candidate)| candidate == variable).unwrap_or_else(|| {
+                            let residual = first_axes.len();
+                            first_axes.push((axis, variable.clone()));
+                            residual
+                        });
+                    ExactShapeDimension::Residual(residual)
+                }
+            })
+            .collect();
+        (Self(dimensions), first_axes)
+    }
+
+    /// Materializes one first-class dimension value per axis of this shape in `context` (typically an attached region
+    /// body). Static axes stage a [`DimensionValue`] [`ConstantOperation`], while dynamic axes clone the residual
+    /// value their slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by
+    /// operations that take one dimension input per output axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] in which static extents are staged as dimension constants.
+    ///   - `residuals`: Residual values owned by `context`, indexed by this plan's residual slots (i.e., the region's
+    ///     view of the [`LinearResiduals`] list this shape was built against).
+    pub fn dimensions<C: Context<Type = ArrayIrType, Operation: From<ConstantOperation<DimensionValue>>>>(
+        &self,
+        context: &C,
+        residuals: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        self.0
+            .iter()
+            .map(|dimension| match dimension {
+                ExactShapeDimension::Static(extent) => Ok(context
+                    .bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?
+                    .remove(0)),
+                ExactShapeDimension::Residual(index) => Ok(residuals[*index].clone()),
+            })
+            .collect()
+    }
+
+    /// Returns the residual values required by mixed dynamic array constructors, in dynamic-axis order. Constructors
+    /// such as the dynamic zero consume one dimension input per _dynamic_ axis, in axis order, while this plan stores
+    /// deduplicated residual slots. This method expands the plan back into that input convention: static axes
+    /// contribute nothing, and repeated identities intentionally produce repeated inputs referring to the one
+    /// shared residual value.
+    ///
+    /// # Parameters
+    ///
+    ///   - `residuals`: Residual values indexed by this plan's residual slots.
+    pub fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
+        // Mixed array constructors consume one input per dynamic axis. Expand deduplicated residual slots back into
+        // axis order here, so repeated identities intentionally produce repeated inputs.
+        self.0
+            .iter()
+            .filter_map(|dimension| match dimension {
+                ExactShapeDimension::Static(_) => None,
+                ExactShapeDimension::Residual(index) => Some(residuals[*index].clone()),
+            })
+            .collect()
+    }
+
+    /// Returns this exact shape transposed by `permutation`, so that output axis `i` is copied from source axis
+    /// `permutation[i]`. Rules whose transpose sees a permuted view of a retained shape (e.g., a reshape with a
+    /// `dimensions` permutation) use this to derive that view without retaining any additional residuals. Residual
+    /// slot indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`. Invalid axes
+    /// or a permutation whose length differs from this shape return a [`TypeError`].
+    #[inline]
+    pub fn transposed(&self, permutation: &Permutation) -> Result<Self, TypeError> {
+        Ok(Self(permutation.normalize(self.0.len())?.into_iter().map(|axis| self.0[axis]).collect()))
+    }
+}
+
+/// One dimension of an [`ExactShape`] that describes where the runtime extent of the corresponding axis lives, from
+/// the point of view of a [`LinearCallOperation`]'s attached [`Region`](crate::Region). This is the [`ExactShape`]
+/// counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExactShapeDimension {
+    /// Compile-time extent that can be reconstructed as a dimension constant in either attached region.
+    Static(usize),
+
+    /// Index of the ordinary Single Static Assignment (SSA) residual that carries this dynamic extent.
+    Residual(usize),
+}
+
+/// Ordered residual list accumulated by an extent-sensitive linearization rule (e.g., for slice, reshape, pad, reduce
+/// gather, or a shape-changing collective) while it stages a [`LinearCallOperation`].
+///
+/// A linear call's attached forward and transpose [`Region`](crate::Region)s later run without access to the primal
+/// trace, so everything they need from it must cross the call boundary as ordinary trailing Single Static Assignment
+/// (SSA) instruction inputs, called _residuals_. A rule retains values one by one while building its regions, remembers
+/// the returned indices, and finally passes [`Self::into_values`] as the staged linear call's residual input list.
+/// Inside a region, the same indices address the region's residual inputs.
+///
+/// The most important residuals in the array universe are exact runtime extents. A transpose region typically has to
+/// construct values with the exact shape of a primal _input_ (e.g., the zero-padded cotangent of a slice), and that
+/// shape is neither recoverable from the region's cotangent inputs nor from any ambient side channel, because runtime
+/// dimensions are ordinary Single Static Assignment (SSA) values. [`Self::retain_shape`] reads such extents from primal
+/// arrays with [`DimensionSizeOperation`] on demand, and [`ExactShape`] is the compile-time plan that lets a region
+/// rebuild an exact shape from the retained residuals.
+///
+/// Dynamic dimension definitions are deduplicated by identity. Retaining a dimension-typed value whose
+/// [`DimensionType`] carries no concrete extent reuses the slot of any previously retained residual with the same
+/// [`DimensionVariable`], because a variable that appears several times (across axes, or as both an axis and an
+/// explicit dimension input) denotes one runtime extent. This keeps input lists minimal and, more importantly,
+/// preserves the type-level equality between axes when shapes are reconstructed inside the attached regions. All other
+/// valid differential residuals (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are
+/// purely positional: every retention appends a new slot, and the values themselves are never inspected. References
+/// have no differential representation and are rejected by the fallible differentiation type boundary (i.e., via
+/// [`DifferentiableType`]) before a valid linearization can retain them.
+#[derive(Clone, Debug)]
+pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
+    /// Retained residual [`Value`]s, in the trailing-input order of the staged linear call. Indices returned by the
+    /// retention methods point into this list and stay valid because the list is append-only.
+    values: Vec<V>,
+}
+
+impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
+    /// Creates a new empty [`LinearResiduals`] instance.
+    #[inline]
+    pub fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    /// Returns the retained residual values, in residual-slot order.
+    #[inline]
+    pub fn values(&self) -> &[V] {
+        self.values.as_slice()
+    }
+
+    /// Consumes this residual list and returns its values, in residual-slot order. The result is what a rule passes
+    /// as the residual input list when staging its [`LinearCallOperation`].
+    #[inline]
+    pub fn into_values(self) -> Vec<V> {
+        self.values
+    }
+
+    /// Retains `value` and returns the residual slot index that will address it inside the attached
+    /// [`Region`](crate::Region)s. When `value` is a dynamic dimension definition (i.e., its type is
+    /// [`ArrayIrType::Dimension`] and that [`DimensionType`] has no concrete extent), retention deduplicates by
+    /// identity: if a residual with the same [`DimensionVariable`] was already retained, its existing slot index is
+    /// returned and `value` is dropped, since both values denote the same runtime extent. Every other valid
+    /// differential value (i.e., ordinary arrays, and dimensions whose types pin a concrete extent and therefore carry
+    /// no identity worth sharing) is appended to a fresh slot unconditionally, even when it compares equal to an
+    /// already-retained value. Unresolved references must never reach this method through a valid differentiation
+    /// pipeline.
+    pub fn retain(&mut self, value: V) -> usize {
+        if let ArrayIrType::Dimension(r#type) = value.r#type().as_ref()
+            && r#type.extent().is_none()
+            && let Some(index) = self.values.iter().position(|value| {
+                matches!(
+                    value.r#type().as_ref(),
+                    ArrayIrType::Dimension(candidate) if candidate.variable() == r#type.variable()
+                )
+            })
+        {
+            return index;
+        }
+        let index = self.values.len();
+        self.values.push(value);
+        index
+    }
+
+    /// Retains an ordered value list and returns the residual slot index corresponding to each source value, applying
+    /// the [`Self::retain`] deduplication rule value by value (so two source values may map to one shared slot).
+    #[inline]
+    pub fn retain_all<I: IntoIterator<Item = V>>(&mut self, values: I) -> Vec<usize> {
+        values.into_iter().map(|value| self.retain(value)).collect()
+    }
+
+    /// Retains the exact runtime shape of `array` and returns the [`ExactShape`] plan that lets an attached region
+    /// reconstruct it from the residual values in this [`LinearResiduals`] instance. Static axes contribute plan
+    /// entries only and retain nothing. Each dynamic axis first looks for an already-retained dimension residual
+    /// with the same [`DimensionVariable`] and reuses its slot. Only identities not yet represented bind a
+    /// [`DimensionSizeOperation`] read of `array` in `context` (i.e., the primal trace) and retain its result.
+    /// Repeated identities within the shape therefore share one residual and one read.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] that owns the primal trace being linearized, in which any required
+    ///     [`DimensionSizeOperation`] reads are bound.
+    ///   - `array`: [`ArrayType`]-typed value owned by `context` whose exact runtime shape must become available inside
+    ///     the attached regions. Passing a non-array value fails with a kind-mismatch [`TypeError`].
+    pub fn retain_shape<C: Context<Type = ArrayIrType, Value = V, Operation: From<DimensionSizeOperation>>>(
+        &mut self,
+        context: &C,
+        array: &V,
+    ) -> Result<ExactShape, ProgramError> {
+        let array_type = array.r#type();
+        let array_type = <&ArrayType>::try_from(array_type.as_ref())?;
+        array_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                Dimension::Static(extent) => Ok(ExactShapeDimension::Static(*extent)),
+                Dimension::Dynamic(variable) => {
+                    if let Some(index) = self.values.iter().position(|value| {
+                        matches!(
+                            value.r#type().as_ref(),
+                            ArrayIrType::Dimension(r#type) if r#type.variable() == Some(variable)
+                        )
+                    }) {
+                        Ok(ExactShapeDimension::Residual(index))
+                    } else {
+                        Ok(ExactShapeDimension::Residual(
+                            self.retain(
+                                context
+                                    .bind(
+                                        DimensionSizeOperation::new(array_type, axis)?,
+                                        Vec::new(),
+                                        std::slice::from_ref(array),
+                                    )?
+                                    .remove(0),
+                            ),
+                        ))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(ExactShape)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> Default for LinearResiduals<V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayExtentBatchingPolicy<C>>
+    CotangentBatchingPolicy<C> for ArrayBatchingPolicy<P>
+{
+    fn sum_mapped_cotangents(
+        _context: &TracingContext<C::Constant, C::Operation>,
+        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
+        axis: Axis,
+    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
+        // Sum the packed per-item cotangents along the mapped axis, removing that axis.
+        let normalized_axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| {
+            BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis }
+        })?;
+        Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?)
+    }
+}
+
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Operation: OperationProjection<
+                ArrayType,
+                Projected: OperationProvider<
+                    ArrayType,
+                    GuardOperation<ArrayType>,
+                    Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
+                > + From<ReduceOperation>,
+            >,
+        >,
+> CotangentBatchingPolicy<C> for ArrayIrBatchingPolicy
+{
+    fn sum_mapped_cotangents(
+        _context: &TracingContext<C::Constant, C::Operation>,
+        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
+        axis: Axis,
+    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
+        // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability, whose staged operation
+        // lifts back through the array IR operation family.
+        let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
+        let normalized_axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| {
+            BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis }
+        })?;
+        Ok(ValueProjection::from_projected(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?))
+    }
+}
+
+impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
+where
+    A: Value<Type = ArrayType>,
+    C: ContextProjection<
+            ArrayType,
+            Type = ArrayIrType,
+            Constant: ValueProjection<ArrayType, Projected = A>,
+            Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+                           + From<ArrayIrOperation<A>>
+                           + From<DynamicBroadcastOperation>
+                           + From<DimensionSizeOperation>
+                           + From<DimensionToScalarOperation>
+                           + From<LinearCallOperation<ArrayIrType>>
+                           + From<ZeroOperation<ArrayType>>
+                           + From<ConstantOperation<DimensionValue>>
+                           + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+                           + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        > + Zero<C::Value>,
+    ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+    ScatterOperation: MemberDifferentiableOperation<C>,
+{
+    #[inline]
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::Jvp)
+    }
+
+    #[inline]
+    fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::JvpForTranspose)
+    }
+}
+
+impl<A, V, O> MemberTransposableOperation<V, O> for ArrayOperation<A>
+where
+    A: Value<Type = ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType>
+        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
+    ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        // Slice rules can update an enclosing reference accumulator, which the array family cannot represent.
+        // Other rules retain the homogeneous projected context and contribute ordinary cotangent values.
+        match self {
+            Self::Slice(operation) => operation.transpose_in_parent(context, driver, inputs, outputs, accumulators),
+            Self::DynamicSlice(operation) => {
+                operation.transpose_in_parent(context, driver, inputs, outputs, accumulators)
+            }
+            operation => transpose_projected_operation::<ArrayType, ArrayOperation<A>, V, O>(
+                context,
+                operation,
+                inputs,
+                outputs,
+                accumulators,
+            ),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
+    /// Applies the explicitly selected member [`DifferentiationRule`]. Structural zero output tangents stay structural,
+    /// including those whose types name runtime extents, so a zero that nothing combines with a live tangent stages
+    /// nothing, and linearization can omit it from its tangent program. For example, the projected `complex`, `pad`,
+    /// `concatenate`, and `parallel_ragged_all_to_all` rules materialize a structural zero input tangent with the
+    /// `zero` that their projected context constructs from the type alone once another input tangent is live, and that
+    /// `zero` cannot name runtime extents. For such operations, when any input tangent is live, this function therefore
+    /// first materializes every structural zero input tangent whose type names runtime extents, reading those extents
+    /// from its primal.
+    fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+        rule: DifferentiationRule,
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        C: ContextProjection<
+                ArrayType,
+                Type = ArrayIrType,
+                Constant: ValueProjection<ArrayType, Projected = A>,
+                Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+                               + From<ArrayIrOperation<A>>
+                               + From<DynamicBroadcastOperation>
+                               + From<DimensionSizeOperation>
+                               + From<DimensionToScalarOperation>
+                               + From<LinearCallOperation<ArrayIrType>>
+                               + From<ZeroOperation<ArrayType>>
+                               + From<ConstantOperation<DimensionValue>>
+                               + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+                               + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+            > + Zero<C::Value>,
+        ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+        ScatterOperation: MemberDifferentiableOperation<C>,
+    {
+        // Structural zero input tangents whose types name runtime extents, which a projected array context cannot
+        // construct from the types alone.
+        let runtime_extent_zeros = inputs
+            .iter()
+            .map(|input| {
+                input.tangent().is_zero()
+                    && input
+                        .tangent()
+                        .r#type()
+                        .identities()
+                        .any(|(position, _)| position == TypeIdentityPosition::Reference)
+            })
+            .collect::<Vec<_>>();
+        let materialized_inputs =
+            if matches!(self, Self::Complex(_) | Self::Pad(_) | Self::Concatenate(_) | Self::ParallelRaggedAllToAll(_))
+                && inputs.iter().any(|input| !input.tangent().is_zero())
+                && runtime_extent_zeros.contains(&true)
+            {
+                Some(
+                    inputs
+                        .iter()
+                        .zip(&runtime_extent_zeros)
+                        .map(|(input, &runtime_extent_zero)| {
+                            if !runtime_extent_zero {
+                                return Ok(input.clone());
+                            }
+                            let tangent_primal = context.primal_to_tangent(input.primal().clone())?;
+                            let tangent = C::Operation::materialize_zero_from_residual_sources(
+                                context.tangent(),
+                                input.tangent().clone(),
+                                std::iter::once(&tangent_primal),
+                            )?;
+                            DifferentiationDual::new(input.primal().clone(), MaybeZero::Value(tangent))
+                        })
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                )
+            } else {
+                None
+            };
+        let inputs = materialized_inputs.as_deref().unwrap_or(inputs);
+        Ok(match self {
+            Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::DynamicSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::DynamicUpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Gather(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            operation @ (Self::Add(_)
+            | Self::Sub(_)
+            | Self::Mul(_)
+            | Self::Div(_)
+            | Self::Rem(_)
+            | Self::Pow(_)
+            | Self::Max(_)
+            | Self::Min(_)
+            | Self::Clamp(_)
+            | Self::Atan2(_)
+            | Self::LogAddExp(_)
+            | Self::And(_)
+            | Self::Or(_)
+            | Self::Xor(_)
+            | Self::Complex(_)
+            | Self::Compare(_)
+            | Self::Select(_)) => {
+                // These elementwise operations infer a shared result shape from inputs that may broadcast.
+                // The projected member rule must differentiate inputs that already have the dynamic result shape.
+                // Its `ElementwiseDerivativeAlignment` cannot replicate into a runtime extent itself: its
+                // `BroadcastOperation` stores the complete output shape as metadata, which program replay
+                // never refines. Read runtime extents from the inputs that carry them and replicate through
+                // `DynamicBroadcastOperation`, so linearization retains dimension values instead of
+                // result-shaped arrays for aligned inputs.
+                let input_types = inputs
+                    .iter()
+                    .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
+                    .collect::<Result<Vec<_>, TypeError>>()?;
+                let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+                let [output_type] = output_types.as_slice() else {
+                    return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+                };
+                let output_shape = output_type.shape();
+                let replicated = if output_type.tangent()?.is_zero_space()
+                    || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+                    || input_types.iter().all(|input_type| input_type.shape() == output_shape)
+                {
+                    None
+                } else {
+                    // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated
+                    // dimension denotes one runtime extent, so it is read once and shared by every axis that carries
+                    // it.
+                    let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
+                    for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
+                        if let Some(previous) =
+                            output_shape.dimensions()[..axis].iter().position(|earlier| earlier == dimension)
+                        {
+                            extents.push(extents[previous].clone());
+                            continue;
+                        }
+                        let extent = match dimension {
+                            Dimension::Static(extent) => {
+                                let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
+                                context.primal().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
+                            }
+                            Dimension::Dynamic(_) => {
+                                let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
+                                    let input_axis = axis.checked_sub(output_shape.rank() - input_type.rank())?;
+                                    (&input_type.dimension(input_axis) == dimension).then_some((index, input_axis))
+                                });
+                                let Some((index, input_axis)) = source else {
+                                    return Err(TypeError::invalid(format!(
+                                        "cannot replicate `{}` inputs into result shape {} because no \
+                                         input carries its runtime axis {}",
+                                        operation.name(),
+                                        output_shape,
+                                        axis,
+                                    ))
+                                    .into());
+                                };
+                                context
+                                    .primal()
+                                    .bind(
+                                        DimensionSizeOperation::new(&input_types[index], input_axis)?,
+                                        Vec::new(),
+                                        std::slice::from_ref(inputs[index].primal()),
+                                    )?
+                                    .remove(0)
+                            }
+                        };
+                        extents.push(extent);
+                    }
+
+                    // Replication is structurally linear, so the primal and the tangent of a narrower input ride the
+                    // same mixed broadcast, and a structural-zero tangent stays structural at the replicated tangent
+                    // type.
+                    let replicated_inputs = inputs
+                        .iter()
+                        .zip(input_types.iter())
+                        .map(|(input, input_type)| {
+                            if input_type.shape() == output_shape {
+                                return Ok(input.clone());
+                            }
+                            let offset = output_shape.rank() - input_type.rank();
+                            let replication = DynamicBroadcastOperation::new(
+                                (0..input_type.rank()).map(|axis| axis + offset).collect(),
+                            );
+                            let mut replication_inputs = Vec::with_capacity(1 + extents.len());
+                            replication_inputs.push(input.primal().clone());
+                            replication_inputs.extend(extents.iter().cloned());
+                            let primal = context
+                                .primal()
+                                .bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?
+                                .remove(0);
+                            let tangent = match input.tangent() {
+                                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                                MaybeZero::Value(tangent) => {
+                                    let mut tangent_inputs = vec![tangent.clone()];
+                                    tangent_inputs.extend(
+                                        extents
+                                            .iter()
+                                            .cloned()
+                                            .map(|value| context.primal_to_tangent(value))
+                                            .collect::<Result<Vec<_>, _>>()?,
+                                    );
+                                    MaybeZero::Value(
+                                        context
+                                            .tangent()
+                                            .bind(replication, Vec::new(), tangent_inputs.as_slice())?
+                                            .remove(0),
+                                    )
+                                }
+                            };
+                            DifferentiationDual::new(primal, tangent)
+                        })
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                    Some(replicated_inputs)
+                };
+                rule.apply_projected(context, operation, replicated.as_deref().unwrap_or(inputs))?
+            }
+            operation => rule.apply_projected(context, operation, inputs)?,
+        })
+    }
+}
+
+/// Materializes one array input's forward mode tangent as a concrete projected array value, reading whatever runtime
+/// extents the tangent type omits from the input's primal. A mixed array rule that has to hand a concrete tangent to a
+/// staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
+/// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary
+/// [`ZeroOperation`] is unconstructible for it). The primal names every one of those extents, because the tangent
+/// type derivation preserves shapes exactly and rewrites only element representation, layout, and sharding.
+///
+/// The zero is therefore staged through the *mixed* parent family's residual protocol rather than the projected array
+/// view, and the result is projected back. That is deliberate: the mixed family owns the dynamic zero constructor that
+/// consumes one first-class dimension input per dynamic axis, while the projected homogeneous family has only the
+/// nullary form. Routing through the parent is also what makes widened tangent representations (e.g., the `f32` tangent
+/// of an `f8e8m0fnu` primal) work at a dynamic shape, which naming the primal's whole type as an exemplar could not.
+/// Identity-free tangent types declare no residuals and keep the canonical nullary zero, whose zero-producing marker
+/// keeps higher-order partial evaluation structural.
+///
+/// # Parameters
+///
+///   - `context`: Projected array view of the active mixed [`Context`], whose parent stages the zero.
+///   - `input`: Forward mode dual whose tangent is materialized and whose primal supplies its runtime extents.
+pub fn materialize_array_tangent<
+    C: Context<
+            Type = ArrayIrType,
+            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation> + OperationProjection<ArrayType>,
+        > + Zero<C::Value>,
+>(
+    context: &ProjectedContext<C, ArrayType>,
+    input: &DifferentiationDual<C::Value>,
+) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, DifferentiationError> {
+    let tangent = C::Operation::materialize_zero_from_residual_sources(
+        context.parent(),
+        input.tangent().clone(),
+        std::iter::once(input.primal()),
+    )?;
+    Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(tangent)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::arrays::Array;
+    use crate::arrays::elements::f8e8m0fnu;
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
+    use crate::arrays::references::ArrayReference;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{
+        DifferentiableType, Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate,
+        TransposedProgramCotangent, differentiate_at,
+    };
+    use crate::operations::{
+        Add, ComplexOperation, Dot, DotDimensionNumbers, MulOperation, StopGradientOperation, TransposeOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::programs::{EmptyRegionDriver, ReferenceType};
+
+    use super::*;
+
+    #[test]
+    fn test_array_operation_requires_zero_source() {
+        // Static zeros come from their types. A symbolic extent is defined only by a value of exactly that type.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        assert!(!ArrayOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::F32, [2])));
+        assert!(!ArrayOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::Zero, [2])));
+        assert!(ArrayOperation::<Array>::requires_zero_source(&symbolic_type));
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![2.into()]));
+        let source = context.input(r#type.clone());
+        let live = ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Value(source.clone()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(live.atom_id(), source.atom_id());
+        let zero = ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(r#type),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![live.atom_id().unwrap(), zero.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = zero [type=f32[2]]
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![3f32, 4f32]).unwrap()]),
+            Ok(vec![Array::vector(vec![3f32, 4f32]).unwrap(), Array::vector(vec![0f32, 0f32]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources_symbolic() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::unbounded());
+        let shape = Shape::new(vec![extent.into()]);
+        let r#type = ArrayType::new(DataType::F32, shape.clone());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let other_representation = context.input(ArrayType::new(DataType::F64, shape));
+        let other_shape = context.input(ArrayType::new(DataType::F32, Shape::new(vec![2.into()])));
+        let first = context.input(r#type.clone());
+        let second = context.input(r#type.clone());
+        let zero = ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(r#type.clone()),
+            [&other_representation, &other_shape, &first, &second],
+        )
+        .unwrap();
+        assert_eq!(zero.r#type().as_ref(), &r#type);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![zero.atom_id().unwrap()], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:f32[2], %2:f32[extent], %3:f32[extent] .
+                let %4:f32[extent] = zero_like %2
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![1f64, 2f64, 3f64]).unwrap(),
+                Array::vector(vec![1f32, 2f32]).unwrap(),
+                Array::vector(vec![4f32, 5f32, 6f32]).unwrap(),
+                Array::vector(vec![7f32, 8f32, 9f32]).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![0f32; 3]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources_missing_exact_type() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::unbounded());
+        let shape = Shape::new(vec![extent.into()]);
+        let r#type = ArrayType::new(DataType::F32, shape.clone());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let other_representation = context.input(ArrayType::new(DataType::F8E8M0FNU, shape));
+        let other_identity = context.input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::unbounded()).into()]),
+        ));
+        assert_eq!(
+            ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+                &context,
+                MaybeZero::Zero(r#type.clone()),
+                &[],
+            )
+            .map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type f32[extent] because no source has exactly that type \
+                          (source types: [])"
+                    .into(),
+            }),
+        );
+
+        // A source with an equally named but distinct extent identity renders like the zero type yet is not exact.
+        assert_eq!(
+            ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+                &context,
+                MaybeZero::Zero(r#type),
+                [&other_representation, &other_identity],
+            )
+            .map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type f32[extent] because no source has exactly that type \
+                          (source types: [f8e8m0fnu[extent], f32[extent]])"
+                    .into(),
+            }),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources_gradient_cotangent_type() {
+        // The gradient of a disconnected `k: i32[extent]` is a structural zero of the cotangent type `zero[extent]`.
+        // The primal `k` is its only source, but its type differs, and this universe has no first-class dimensions
+        // that could carry `extent` from `k` to the zero, so the gradient is rejected explicitly.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let key_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let x = context.input(ArrayType::scalar(DataType::F32));
+        let k = context.input(key_type);
+        assert_eq!(
+            context.differentiate_at((x, k)).value_and_gradient(|(x, _)| x).map(|_| ()),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type zero[extent] because no source has exactly that type \
+                          (source types: [i32[extent]])"
+                    .into(),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_zero_residual_types() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let r#type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![rows.clone().into(), rows.clone().into(), columns.clone().into(), 4.into()]),
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_residual_types(&r#type.into()),
+            vec![DimensionType::from(rows).into(), DimensionType::from(columns.clone()).into()],
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_residual_types(&ArrayType::scalar(DataType::F32).into(),),
+            Vec::<ArrayIrType>::new(),
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_residual_types(&DimensionType::from(columns).into(),),
+            Vec::<ArrayIrType>::new(),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_requires_zero_source() {
+        // Static zeros come from their types. A symbolic extent is read from a source as a first-class dimension.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        assert!(!ArrayIrOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::F32, [2]).into()));
+        assert!(!ArrayIrOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::Zero, [2]).into()));
+        assert!(ArrayIrOperation::<Array>::requires_zero_source(&symbolic_type.into()));
+    }
+
+    #[test]
+    fn test_array_ir_operation_capture_zero_residuals() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let r#type =
+            ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into(), columns.into(), 4.into()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source = builder.add_input(r#type.clone().into());
+        let residuals =
+            ArrayIrOperation::<Array>::capture_zero_residuals(&mut builder, source, &r#type.clone().into()).unwrap();
+
+        // Repeated axes share one residual, captured from the first axis carrying each identity.
+        assert_eq!(residuals, vec![AtomId::new(1), AtomId::new(2)]);
+        assert_eq!(builder.instructions().len(), 2);
+        for (instruction, axis) in builder.instructions().iter().zip([0, 2]) {
+            assert!(
+                matches!(instruction.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == axis)
+            );
+            assert_eq!(instruction.inputs(), &[source]);
+        }
+        let static_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let static_source = builder.add_input(static_type.clone());
+        assert_eq!(
+            ArrayIrOperation::<Array>::capture_zero_residuals(&mut builder, static_source, &static_type,),
+            Ok(Vec::new()),
+        );
+        assert_eq!(builder.instructions().len(), 2);
+    }
+
+    #[test]
+    fn test_array_ir_operation_capture_zero_residual_value() {
+        // Identity-directed capture answers per declared residual rather than per exemplar, so it must inspect a
+        // candidate's type before staging anything. A candidate that does not name the requested quantity has to be
+        // rejected without leaving a dead read behind, and a first-class dimension that already *is* the quantity has
+        // to be reused rather than re-read.
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
+        let rows_residual_type = ArrayIrType::Dimension(DimensionType::from(rows.clone()));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+
+        // A first-class dimension of exactly the residual type is the extent already and is reused verbatim.
+        let dimension = context.input(rows_residual_type.clone());
+        let captured =
+            ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &dimension, &rows_residual_type).unwrap();
+        assert_eq!(captured.unwrap().atom_id(), dimension.atom_id());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // An array naming the quantity on a non-leading axis contributes a read of that axis, even though its element
+        // type and its other axes differ from anything the zero's own type mentions.
+        let array = context.input(
+            ArrayType::new(
+                DataType::F8E8M0FNU,
+                Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(rows.clone())]),
+            )
+            .into(),
+        );
+        let captured =
+            ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &array, &rows_residual_type).unwrap();
+        assert_eq!(captured.unwrap().r#type().as_ref(), &rows_residual_type);
+        {
+            let builder = context.builder().borrow();
+            let [instruction] = builder.instructions() else {
+                panic!("expected exactly one staged extent read");
+            };
+            let ArrayIrOperation::DimensionSize(operation) = instruction.operation() else {
+                panic!("expected a dimension-size read");
+            };
+            assert_eq!(operation.axis(), 1);
+        }
+
+        // Candidates that do not name the quantity, and residual types that are not first-class dimensions at all,
+        // both answer `None` without staging anything.
+        let unrelated =
+            context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(columns)])).into());
+        assert!(
+            ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &unrelated, &rows_residual_type)
+                .unwrap()
+                .is_none(),
+        );
+        let dimension_type = ArrayIrType::Dimension(DimensionType::from(rows));
+        assert!(
+            ArrayIrOperation::<Array>::capture_zero_residual_value(
+                &context,
+                &dimension,
+                &ArrayType::scalar(DataType::F64).into(),
+            )
+            .unwrap()
+            .is_none(),
+        );
+        assert_eq!(dimension.r#type().as_ref(), &dimension_type);
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_array_ir_operation_capture_zero_residual_value_reference() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dimension_type = DimensionType::from(extent.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = context.input(ReferenceType::new(array_type).into());
+
+        // A candidate with no matching dimension must not read the reference or stage an extent query.
+        let unrelated = DimensionType::new("other", DimensionBounds::unbounded()).into();
+        assert_eq!(ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &reference, &unrelated), Ok(None));
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        let dimension = ArrayIrOperation::<Array>::capture_zero_residual_value(
+            &context,
+            &reference,
+            &dimension_type.clone().into(),
+        )
+        .unwrap()
+        .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![dimension.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap());
+        let outputs = program.interpret(vec![ArrayIrValue::Reference(reference.clone())]).unwrap();
+        let [ArrayIrValue::Dimension(dimension)] = outputs.as_slice() else {
+            panic!("expected one dimension residual");
+        };
+        assert_eq!(dimension.extent(), 3);
+        assert_eq!(dimension.r#type().extent(), Some(3));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_array_ir_operation_zero_operation_with_residuals() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into(), columns.into()]));
+        let residuals = [AtomId::new(5), AtomId::new(8)];
+        let (operation, zero_inputs) =
+            ArrayIrOperation::<Array>::zero_operation_with_residuals(r#type.clone().into(), &residuals).unwrap();
+        assert!(matches!(operation, ArrayIrOperation::Zero(operation) if operation.r#type() == &r#type));
+        assert_eq!(zero_inputs, vec![residuals[0], residuals[0], residuals[1]]);
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_operation_with_residuals(r#type.into(), &residuals[..1],).map(|_| ()),
+            Err(ProgramError::InvalidArgument { message: "dynamic zero expected 2 extent residuals but got 1".into() }),
+        );
+        let static_type = ArrayType::scalar(DataType::F32);
+        let (operation, zero_inputs) =
+            ArrayIrOperation::<Array>::zero_operation_with_residuals(static_type.clone().into(), &[] as &[AtomId])
+                .unwrap();
+        assert!(
+            matches!(operation, ArrayIrOperation::Array(ArrayOperation::Zero(operation)) if operation.r#type() == &static_type)
+        );
+        assert_eq!(zero_inputs, Vec::<AtomId>::new());
+    }
+
+    #[test]
+    fn test_array_ir_operation_materialize_zero_from_residual_sources() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::unbounded());
+        let r#type: ArrayIrType =
+            ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.into()])).into();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source = context.input(r#type.clone());
+
+        // The default boundary protocol shares the array-IR capture and assembly rules: one captured extent is reused
+        // for both dynamic axes of the assembled zero.
+        let zero = ArrayIrOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(r#type.clone()),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert_eq!(zero.r#type().as_ref(), &r#type);
+        let builder = context.builder().borrow();
+        let [dimension_size, zero] = builder.instructions() else {
+            panic!("expected one dimension-size instruction followed by one zero instruction");
+        };
+        assert!(
+            matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0)
+        );
+        assert_eq!(dimension_size.inputs(), &[source.atom_id().unwrap()]);
+        assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[dimension_size.outputs()[0], dimension_size.outputs()[0]]);
+    }
+
+    #[test]
+    fn test_array_ir_value_and_gradient_with_captures() {
+        // The capture supplies the derivative with respect to `x` in `f(x; c) = (x + c) · c`.
+        let (value, gradient) = differentiate_at(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0]).unwrap()))
+            .with_captures(ArrayIrValue::Array(Array::vector(vec![3f32, 4.0]).unwrap()))
+            .value_and_gradient(|x, c| x.add(&c)?.dot(&c, &DotDimensionNumbers::inner_product()))
+            .unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0f32 * 3.0 + 6.0 * 4.0).unwrap()));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::vector(vec![3f32, 4.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_array_ir_linearize_dynamic_zero_space_output_tangent() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![extent_type.dimension().clone()]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = context.input(extent_type.into());
+        let key = context.input(key_type.clone().into());
+        let (_, pushforward) =
+            context.linearize(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![extent, key], ()).unwrap();
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let key_tangent = context.input(key_type.tangent().unwrap().into());
+
+        // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
+        // result must consume the key extent captured at linearization time.
+        assert_eq!(
+            pushforward.program().to_string(),
+            indoc! {"
+                lambda  .
+                in ()
+            "}
+            .trim_end(),
+        );
+        let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![tangent.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<extent ∈ [1, 8)>, %1:u64[extent], %3:zero[], %4:zero[extent] .
+                let %2:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %1
+                    %5:zero[extent] = zero [type=zero[extent]] %2
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+        let zero = ArrayIrValue::Array(Array::from_logical_bytes(zero_type, &[]).unwrap());
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1u64, 2]).unwrap()),
+                ArrayIrValue::Array(Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap()),
+                zero.clone(),
+            ]),
+            Ok(vec![zero]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_vjp_dynamic_zero_space_input_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let key = context.input(key_type.clone().into());
+        let accumulator = context.input(ArrayType::scalar(DataType::F64).into());
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![key, accumulator], ()).unwrap();
+        let cotangent = context.input(ArrayType::scalar(DataType::F64).into());
+
+        // The compact pullback has no result slot for the key's zero differential space. The public result preserves
+        // that zero without capturing its extent or constructing an array.
+        let transposed = pullback.transposed_program(&[]).unwrap();
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+        let cotangents = pullback.apply(cotangent).unwrap();
+        assert!(pullback.residuals().is_empty());
+        assert_eq!(cotangents[0], MaybeZero::Zero(ArrayIrType::Array(key_type.tangent().unwrap())));
+        assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
+        let MaybeZero::Value(cotangent) = &cotangents[1] else {
+            panic!("expected a live scalar cotangent");
+        };
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![cotangent.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:u64[extent], %1:f64[], %2:f64[] .
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1u64, 2]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(3f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(4f64).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(4f64).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(
+            DataType::F8E8M0FNU,
+            Shape::new(vec![extent_type.dimension().clone(), extent_type.dimension().clone()]),
+        );
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(dynamic_type.clone().into());
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![scalar],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert!(linearization.primal().instructions().is_empty());
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+            lambda %0:f64[] .
+            in (%0)
+        "}
+            .trim_end()
+        );
+        let outputs = pullback.program().interpret(vec![ArrayIrValue::Array(Array::scalar(2f64).unwrap())]).unwrap();
+        assert_eq!(
+            pullback.assemble_cotangents(
+                &[dynamic_type.cotangent().unwrap().into(), ArrayType::scalar(DataType::F64).into()],
+                outputs,
+            ),
+            Ok(vec![
+                Some(MaybeZero::Zero(dynamic_type.cotangent().unwrap().into())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(2f64).unwrap()))),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_nested_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dynamic = context.input(dynamic_type.clone().into());
+        let scalar = context.input(scalar_type.clone().into());
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
+        assert!(pullback.residuals().is_empty());
+        let transposed = pullback.transposed_program(&[]).unwrap();
+        assert!(transposed.program().instructions().is_empty());
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        let cotangent = context.input(scalar_type.into());
+        let cotangents = pullback.apply(vec![cotangent]).unwrap();
+        assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type.cotangent().unwrap().into()));
+        assert!(context.builder().borrow().instructions().is_empty());
+        let materialized = pullback.materialize_cotangents(cotangents).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                materialized.iter().map(|value| value.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f8e8m0fnu[extent], %1:f64[], %2:f64[] .
+            let %3:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
+                %4:f32[extent] = zero [type=f32[extent]] %3
+            in (%4, %2)
+        "}
+            .trim_end()
+        );
+    }
+
+    #[test]
+    fn test_array_nested_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let dynamic = context.input(dynamic_type.clone());
+        let scalar = context.input(scalar_type.clone());
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
+        assert!(pullback.residuals().is_empty());
+        let cotangent = context.input(scalar_type);
+        let cotangents = pullback.apply(vec![cotangent]).unwrap();
+        assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type));
+        assert!(context.builder().borrow().instructions().is_empty());
+        let materialized = pullback.materialize_cotangents(cotangents).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                materialized.iter().map(|value| value.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[extent], %1:f64[], %2:f64[] .
+            let %3:f32[extent] = zero_like %0
+            in (%3, %2)
+        "}
+            .trim_end()
+        );
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![1f32, 2f32, 3f32]).unwrap(),
+                Array::scalar(7f64).unwrap(),
+                Array::scalar(2f64).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![0f32; 3]).unwrap(), Array::scalar(2f64).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_exact_shape_dimensions() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let shape = Shape::new(vec![Dimension::Static(2), n.dimension().clone()]);
+        let (plan, _) = ExactShape::for_residual_zero(&shape);
+
+        // Static axes stage dimension constants, while dynamic axes reuse the residual values without staging
+        // anything new.
+        let context = TestContext::new();
+        let residual = context.input(n.into());
+        let dimensions = plan.dimensions(&context, std::slice::from_ref(&residual)).unwrap();
+        let [static_dimension, dynamic_dimension] = dimensions.as_slice() else {
+            panic!("expected one dimension value per axis");
+        };
+        assert!(matches!(
+            static_dimension.r#type().as_ref(),
+            ArrayIrType::Dimension(r#type) if r#type.extent() == Some(2),
+        ));
+        assert_eq!(dynamic_dimension.atom_id().unwrap(), residual.atom_id().unwrap());
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one staged dimension constant");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+    }
+
+    #[test]
+    fn test_linear_residuals() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::new(1, Some(9)).unwrap());
+        let mut residuals =
+            LinearResiduals::<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>::new();
+        assert!(residuals.values().is_empty());
+
+        // Symbolic dimension definitions share one slot per identity, keyed by variable rather than by value, so a
+        // repeated identity reuses its slot even when the retained value instance differs.
+        let n_value = context.input(n.clone().into());
+        assert_eq!(residuals.retain(n_value.clone()), 0);
+        assert_eq!(residuals.retain(context.input(n.into())), 0);
+        let m_value = context.input(m.into());
+        assert_eq!(residuals.retain(m_value.clone()), 1);
+
+        // Ordinary array residuals stay positional, so equal arrays still occupy distinct slots.
+        let array = context.input(ArrayType::new_static(DataType::F64, [2]).into());
+        assert_eq!(residuals.retain(array.clone()), 2);
+        assert_eq!(residuals.retain(array), 3);
+
+        // A static dimension type (e.g., that of an eager dimension value) has no identity to share and so is never
+        // deduplicated.
+        let constant = context.input(DimensionValue::constant(3).unwrap().r#type().into_owned().into());
+        assert_eq!(residuals.retain(constant.clone()), 4);
+        assert_eq!(residuals.retain(constant), 5);
+
+        // `retain_all` maps each source value to its (possibly shared) slot, in source order.
+        assert_eq!(residuals.retain_all(vec![m_value, n_value.clone()]), vec![1, 0]);
+
+        // The retained list keeps slot order, and a deduplicated slot keeps the first value retained for it.
+        assert_eq!(residuals.values().len(), 6);
+        assert_eq!(residuals.values()[0], n_value);
+        assert_eq!(residuals.into_values().len(), 6);
+    }
+
+    #[test]
+    fn test_linear_residuals_retain_shape() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let array_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), n.dimension().clone(), n.dimension().clone()]),
+        );
+
+        // Reading an exact shape binds one `DimensionSize` read per distinct dynamic identity: the static axis
+        // contributes a plan entry only, and the repeated identity reuses the first read's residual slot.
+        let context = TestContext::new();
+        let array = context.input(array_type.clone().into());
+        let mut residuals = LinearResiduals::new();
+        let shape = residuals.retain_shape(&context, &array).unwrap();
+        assert_eq!(
+            shape,
+            ExactShape(vec![
+                ExactShapeDimension::Static(2),
+                ExactShapeDimension::Residual(0),
+                ExactShapeDimension::Residual(0),
+            ]),
+        );
+        assert_eq!(residuals.values().len(), 1);
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one dimension-size read");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)));
+        drop(builder);
+
+        // An already-retained residual with the same identity is reused without binding another read.
+        let context = TestContext::new();
+        let array = context.input(array_type.into());
+        let dimension = context.input(n.into());
+        let mut residuals = LinearResiduals::new();
+        assert_eq!(residuals.retain(dimension), 0);
+        let shape = residuals.retain_shape(&context, &array).unwrap();
+        assert_eq!(
+            shape,
+            ExactShape(vec![
+                ExactShapeDimension::Static(2),
+                ExactShapeDimension::Residual(0),
+                ExactShapeDimension::Residual(0),
+            ]),
+        );
+        assert_eq!(residuals.values().len(), 1);
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // Non-array values are rejected with a kind mismatch.
+        let context = TestContext::new();
+        let dimension = context.input(DimensionType::new("k", DimensionBounds::new(1, Some(9)).unwrap()).into());
+        let mut residuals = LinearResiduals::new();
+        assert_eq!(
+            residuals.retain_shape(&context, &dimension),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+    }
+
+    #[test]
+    fn test_exact_shape_for_residual_zero() {
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::new(1, Some(9)).unwrap());
+        let shape = Shape::new(vec![
+            Dimension::Static(2),
+            n.dimension().clone(),
+            Dimension::Static(3),
+            n.dimension().clone(),
+            m.dimension().clone(),
+        ]);
+
+        // Slots are assigned by first occurrence and the repeated identity reuses slot 0, while the first-axes list
+        // names the source axis to read for each distinct identity, in slot order.
+        let (plan, first_axes) = ExactShape::for_residual_zero(&shape);
+        assert_eq!(
+            plan,
+            ExactShape(vec![
+                ExactShapeDimension::Static(2),
+                ExactShapeDimension::Residual(0),
+                ExactShapeDimension::Static(3),
+                ExactShapeDimension::Residual(0),
+                ExactShapeDimension::Residual(1),
+            ]),
+        );
+        assert_eq!(first_axes, vec![(1, n.variable().unwrap().clone()), (4, m.variable().unwrap().clone())]);
+
+        // Dynamic-constructor input expansion is in axis order and intentionally repeats shared slots.
+        assert_eq!(plan.dynamic_dimensions(&["n", "m"]), vec!["n", "n", "m"]);
+
+        // Transposing copies output axis `i` from source axis `permutation[i]`, preserving residual slot indices.
+        assert_eq!(
+            plan.transposed(&Permutation::from(vec![-1, 0, 1, 2, 3])).unwrap(),
+            ExactShape(vec![
+                ExactShapeDimension::Residual(1),
+                ExactShapeDimension::Static(2),
+                ExactShapeDimension::Residual(0),
+                ExactShapeDimension::Static(3),
+                ExactShapeDimension::Residual(0),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_batching_sum_mapped_cotangents() {
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
+
+        // The array policy reduce-sums the packed per-item cotangents along the mapped axis, dropping that axis.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let cotangent_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let cotangent = context.input(cotangent_type);
+        let summed = <ArrayBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+            &context,
+            cotangent.clone(),
+            Axis::from(0),
+        )
+        .unwrap();
+        assert_eq!(summed.r#type().as_ref(), &ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one staged reduction");
+        };
+        assert!(matches!(instruction.operation(), ArrayOperation::Reduce(_)));
+        drop(builder);
+
+        // An axis outside the cotangent's rank is rejected.
+        assert!(matches!(
+            <ArrayBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+                &context,
+                cotangent,
+                Axis::from(5),
+            ),
+            Err(BatchingError::BatchAxisOutOfBounds { axis, .. }) if axis == Axis::from(5),
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_batching_sum_mapped_cotangents() {
+        type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // The array IR policy projects the replayed cotangent to its array member, reduce-sums along the (here
+        // negative and normalized) mapped axis, and lifts the sum back into the array IR family.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let cotangent_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let cotangent = context.input(cotangent_type.into());
+        let summed = <ArrayIrBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+            &context,
+            cotangent,
+            Axis::from(-2),
+        )
+        .unwrap();
+        assert_eq!(
+            summed.r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
+        );
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one staged reduction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Reduce(_))));
+        drop(builder);
+
+        // Dimension-typed cotangents cannot be projected to the array member.
+        let dimension = context.input(DimensionType::new("k", DimensionBounds::new(1, Some(9)).unwrap()).into());
+        assert!(matches!(
+            <ArrayIrBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+                &context,
+                dimension,
+                Axis::from(0),
+            ),
+            Err(BatchingError::Type(error)) if error == TypeError::invalid("expected array type but got dimension type"),
+        ));
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let array_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Dynamic(extent)]),
+        );
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(scalar, array)| {
+                let context = DifferentiationContext::fused(array.context().clone());
+                let inputs = [
+                    DifferentiationDual::new_with_zero_tangent(scalar)?,
+                    DifferentiationDual::new(array.clone(), MaybeZero::Value(array))?,
+                ];
+                let output = ArrayOperation::<Array>::Mul(MulOperation::new())
+                    .jvp_in_parent(&context, &EmptyRegionDriver, &inputs)?
+                    .remove(0);
+                let MaybeZero::Value(tangent) = output.tangent() else {
+                    panic!("expected a live output tangent");
+                };
+                Ok((output.primal().clone(), tangent.clone()))
+            },
+            (ArrayIrType::Array(ArrayType::scalar(DataType::F64)), ArrayIrType::Array(array_type)),
+        )
+        .unwrap();
+
+        // A repeated dynamic extent needs one read, and the scalar's structural-zero tangent needs no broadcast.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[extent, extent] .
+                let %2:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %1
+                    %3:f64[extent, extent] = broadcast [output_axes=[]] %0 %2 %2
+                    %4:f64[extent, extent] = mul %3 %1
+                    %5:f64[extent, extent] = mul %3 %1
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+        let array = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f64, 2.0, 3.0, 4.0]).unwrap());
+        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f64, 4.0, 6.0, 8.0]).unwrap());
+        assert_eq!(
+            program.interpret((ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()), array)),
+            Ok((expected.clone(), expected)),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_without_dynamic_replication() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let dynamic_shape = Shape::new(vec![Dimension::Dynamic(extent)]);
+
+        // These cases use ordinary projected rules: static results, aligned dynamic inputs, and zero tangent spaces.
+        // The structural zero output tangents stay structural, so nothing reads the runtime extents of dynamic results.
+        for (left_type, right_type, expected) in [
+            (
+                ArrayType::scalar(DataType::F64),
+                ArrayType::new_static(DataType::F64, [3]),
+                indoc! {"
+                    lambda %0:f64[], %1:f64[3] .
+                    let %2:f64[3] = mul %0 %1
+                    in (%2)
+                "}
+                .trim_end(),
+            ),
+            (
+                ArrayType::new(DataType::F64, dynamic_shape.clone()),
+                ArrayType::new(DataType::F64, dynamic_shape.clone()),
+                indoc! {"
+                    lambda %0:f64[extent], %1:f64[extent] .
+                    let %2:f64[extent] = mul %0 %1
+                    in (%2)
+                "}
+                .trim_end(),
+            ),
+            (
+                ArrayType::scalar(DataType::I32),
+                ArrayType::new(DataType::I32, dynamic_shape),
+                indoc! {"
+                    lambda %0:i32[], %1:i32[extent] .
+                    let %2:i32[extent] = mul %0 %1
+                    in (%2)
+                "}
+                .trim_end(),
+            ),
+        ] {
+            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |(left, right)| {
+                    let context = DifferentiationContext::fused(left.context().clone());
+                    let inputs = [
+                        DifferentiationDual::new_with_zero_tangent(left)?,
+                        DifferentiationDual::new_with_zero_tangent(right)?,
+                    ];
+                    let output = ArrayOperation::<Array>::Mul(MulOperation::new())
+                        .jvp_in_parent(&context, &EmptyRegionDriver, &inputs)?
+                        .remove(0);
+                    Ok(output.primal().clone())
+                },
+                (ArrayIrType::Array(left_type), ArrayIrType::Array(right_type)),
+            )
+            .unwrap();
+            assert_eq!(program.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_dynamic_zero_space_tangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![1.into(), Dimension::Dynamic(extent.clone()), 1.into()]));
+
+        // Invoke the member rule directly: the program-level all-zero fast path deliberately bypasses it. Integer
+        // primals have a zero differential space, and their structural tangents retain the permuted symbolic shape.
+        // Handling that shape must not attempt an invalid conversion from integers to the `zero` element type.
+        let (_, jvp) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| {
+                let context = DifferentiationContext::fused(input.context().clone());
+                let output = ArrayOperation::<Array>::Transpose(TransposeOperation::new([1, 0, 2]))
+                    .jvp_in_parent(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
+                    )
+                    .unwrap()
+                    .remove(0);
+                assert!(matches!(
+                    output.tangent(),
+                    MaybeZero::Zero(r#type) if r#type == &ArrayIrType::Array(ArrayType::new(
+                        DataType::Zero,
+                        Shape::new(vec![Dimension::Dynamic(extent.clone()), 1.into(), 1.into()]),
+                    )),
+                ));
+                Ok(output.primal().clone())
+            },
+            ArrayIrType::Array(input_type),
+        )
+        .unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:i32[1, extent, 1] .
+                let %1:i32[extent, 1, 1] = transpose [permutation=[1, 0, 2]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            jvp.interpret(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 3, 1]), &[2_i32, 0, 1]).unwrap(),
+            )),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3, 1, 1]), &[2_i32, 0, 1]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            jvp.interpret(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 0, 1]), &[] as &[i32]).unwrap(),
+            )),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [0, 1, 1]), &[] as &[i32]).unwrap(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_dynamic_mixed_structural_zero_input() {
+        // `complex(x, stop_gradient(y))` over a dynamic shape. The projected `complex` rule needs a concrete tangent
+        // for each part once either part is live, but the zero it constructs from the type alone cannot name the
+        // runtime extent `n`, so the structural zero tangent of the stopped part is materialized from its primal before
+        // the rule runs. Under linearization that zero is known and crosses to the tangent program as a residual.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let x = builder.add_input(input_type.clone().into());
+        let y = builder.add_input(input_type.into());
+        let stopped = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
+                Vec::new(),
+                vec![y],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Complex(ComplexOperation::new())),
+                Vec::new(),
+                vec![x, stopped],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n], %2:f32[n], %3:f32[n] .
+                let %4:f32[n] = stop_gradient %1
+                    %5:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %4
+                    %6:f32[n] = zero [type=f32[n]] %5
+                    %7:c64[n] = complex %0 %4
+                    %8:c64[n] = complex %2 %6
+                in (%7, %8)"}
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[n] = stop_gradient %1
+                    %3:c64[n] = complex %0 %2
+                    %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %2
+                    %5:f32[n] = zero [type=f32[n]] %4
+                in (%3, %5)"}
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n], %2:f32[n] .
+                let %3:c64[n] = complex %0 %2
+                in (%3)"}
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:c64[n], %1:f32[n] .
+                let %2:f32[n] = real %0
+                    %3:c64[n] = neg %0
+                    %4:f32[n] = imaginary %3
+                in (%2)"}
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_in_parent_dynamic_widened_zero() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The projected constant derivative reads the runtime extent from its primal result and constructs a zero
+        // in the wider tangent representation, without converting the primal's element data.
+        let jvp = program.jvp().unwrap();
+
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[extent], %1:f32[extent] .
+                let %2:f8e8m0fnu[extent] = stop_gradient %0
+                    %3:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %2
+                    %4:f32[extent] = zero [type=f32[extent]] %3
+                in (%2, %4)
+            "}
+            .trim_end(),
+        );
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
+            &[1.0, 2.0, 4.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap();
+        let expected_primal = primal.clone();
+        assert_eq!(
+            jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
+            Ok(vec![
+                ArrayIrValue::Array(expected_primal),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_jvp_for_transpose_in_parent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(scalar, scalar_tangent, array)| {
+                let context = DifferentiationContext::fused(array.context().clone());
+                let inputs = [
+                    DifferentiationDual::new(scalar, MaybeZero::Value(scalar_tangent))?,
+                    DifferentiationDual::new_with_zero_tangent(array)?,
+                ];
+                let output = ArrayOperation::<Array>::Mul(MulOperation::new())
+                    .jvp_for_transpose_in_parent(&context, &EmptyRegionDriver, &inputs)?
+                    .remove(0);
+                let MaybeZero::Value(tangent) = output.tangent() else {
+                    panic!("expected a live output tangent");
+                };
+                Ok((output.primal().clone(), tangent.clone()))
+            },
+            (scalar_type.clone(), scalar_type, ArrayIrType::Array(array_type)),
+        )
+        .unwrap();
+
+        // Replicate both the scalar primal and its live tangent using the static row count and dynamic column extent.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[2, extent] .
+                let %3:dimension<2> = constant [value=2]
+                    %4:dimension<extent ∈ [0, 5)> = dimension_size [axis=1] %2
+                    %5:f64[2, extent] = broadcast [output_axes=[]] %0 %3 %4
+                    %6:f64[2, extent] = broadcast [output_axes=[]] %1 %3 %4
+                    %7:f64[2, extent] = mul %5 %2
+                    %8:f64[2, extent] = mul %2 %6
+                in (%7, %8)
+            "}
+            .trim_end(),
+        );
+        let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let primal = ArrayIrValue::Array(Array::matrix(2, 3, vec![2.0f64, 4.0, 6.0, 8.0, 10.0, 12.0]).unwrap());
+        let tangent = ArrayIrValue::Array(Array::matrix(2, 3, vec![3.0f64, 6.0, 9.0, 12.0, 15.0, 18.0]).unwrap());
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(3.0f64).unwrap()),
+                array,
+            )),
+            Ok((primal, tangent)),
+        );
+    }
+
+    #[test]
+    fn test_materialize_array_tangent() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.dimension().clone()]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let context = TestContext::new();
+        let projected_context = ProjectedContext::<TestContext, ArrayType>::new(context.clone());
+        let primal = context.input(dynamic_type.clone().into());
+
+        // A concrete tangent is projected and returned unchanged, staging nothing.
+        let tangent = context.input(dynamic_type.clone().into());
+        let input = DifferentiationDual::new(primal.clone(), MaybeZero::Value(tangent.clone())).unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.value().atom_id().unwrap(), tangent.atom_id().unwrap());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // A structural zero whose type names a runtime extent reads that extent from the primal and stages the mixed
+        // dynamic zero constructor over it, because the type-only nullary zero cannot supply what `n` names.
+        let input = DifferentiationDual::new(primal.clone(), MaybeZero::Zero(ArrayIrType::Array(dynamic_type.clone())))
+            .unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.r#type().as_ref(), &dynamic_type);
+        {
+            let builder = context.builder().borrow();
+            let [size, zero] = builder.instructions() else {
+                panic!("expected one staged extent read followed by one staged dynamic zero");
+            };
+            assert!(matches!(size.operation(), ArrayIrOperation::DimensionSize(_)));
+            assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
+            assert_eq!(zero.inputs(), size.outputs());
+        }
+
+        // An identity-free structural zero declares no residuals and keeps the canonical nullary zero, whose
+        // zero-producing marker keeps higher-order partial evaluation structural.
+        let static_primal = context.input(static_type.clone().into());
+        let input =
+            DifferentiationDual::new(static_primal, MaybeZero::Zero(ArrayIrType::Array(static_type.clone()))).unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.r#type().as_ref(), &static_type);
+        {
+            let builder = context.builder().borrow();
+            let [_, _, instruction] = builder.instructions() else {
+                panic!("expected the two earlier instructions followed by one staged nullary zero");
+            };
+            assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
+        }
+
+        // A widening element family is materialized from the same primal even though the two types differ. The `f32`
+        // tangent of a dynamically shaped `f8e8m0fnu` primal has no exemplar of its own type anywhere, and naming the
+        // extent instead of matching the whole type is what makes it constructible.
+        let widening_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![n.dimension().clone()]));
+        let widening_primal = context.input(widening_type.clone().into());
+        let widened_tangent_type = widening_type.tangent().unwrap();
+        assert_eq!(widened_tangent_type.data_type(), DataType::F32);
+        let input = DifferentiationDual::new(
+            widening_primal,
+            MaybeZero::Zero(ArrayIrType::Array(widened_tangent_type.clone())),
+        )
+        .unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.r#type().as_ref(), &widened_tangent_type);
+        {
+            let builder = context.builder().borrow();
+            let [.., size, zero] = builder.instructions() else {
+                panic!("expected one staged extent read followed by one staged widened dynamic zero");
+            };
+            assert!(matches!(size.operation(), ArrayIrOperation::DimensionSize(_)));
+            assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
+            assert_eq!(zero.inputs(), size.outputs());
+        }
+    }
+}

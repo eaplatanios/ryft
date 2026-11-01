@@ -1,0 +1,5372 @@
+//! Calls to foreign kernels registered with the executing backend, which are the Ryft analogue of
+//! [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html).
+//! This module provides the following:
+//!
+//!   - The [`CustomCallOperation`], which carries a target name, declared output types, typed [`CustomCallAttribute`]
+//!     configuration, and optional input layouts, buffer aliases, and observable [`EffectClass`]. Backends resolve the
+//!     target in their kernel registry and execute the kernel. The reference [`Array`] backend has no such registry,
+//!     and so it reports an unsupported-operation error.
+//!   - The [`CustomCall`] capability, which executes or stages a [`CustomCallOperation`] on concrete values and
+//!     transform tracers alike, and [`CustomCallOperation::call`], which does the same through a context and so also
+//!     serves calls without inputs.
+//!   - The transform contracts that an opaque kernel cannot provide by itself like [`CustomCallBatching`] which selects
+//!     how mapped inputs reach the kernel.
+//!
+//! Homogeneous array calls require static output shapes. Mixed [`ArrayIrType`] calls additionally accept trailing
+//! first-class dimension inputs that ground dynamic output axes without entering the kernel ABI. Undeclared output
+//! shardings inherit the manual-axis variation of the inputs. Differentiation requires wrapping the call in a
+//! [`composite`](crate::composite) with derivative rules, while partial evaluation uses the ordinary
+//! fold-or-residualize behavior of the executing context. Refer to [`CustomCallOperation`] for the complete calling
+//! convention and to the [StableHLO specification](https://openxla.org/stablehlo/spec#custom_call) for the operation
+//! that the XLA backend lowers it to.
+
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::fmt::Display;
+use std::hash::{Hash, Hasher};
+
+use ryft_macros::capability;
+
+use crate::arrays::{
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
+    ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionRefinements,
+    DimensionSource, DimensionType, DimensionValue, DimensionVariable, Layout, Sharding, ShardingDimension,
+    TiledLayout,
+};
+use crate::axes::Axis;
+use crate::batching::{
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    MemberBatchableOperation, batch_projected_operation,
+};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext};
+use crate::differentiation::{
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    MemberDifferentiableOperation,
+};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
+use crate::operations::composites::COMPOSITE_OPERATION_NAME;
+use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::control_flow::scan::ScanOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+use crate::parameters::Placeholder;
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::{
+    EffectClass, EffectClasses, Effects, EmptyRegionDriver, MemberOperation, Operation, OperationFormatter,
+    OperationPayloadProjection, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
+
+/// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the underlying foreign
+/// kernel. The variants cover every attribute kind that a typed Foreign Function Interface (FFI) can decode: UTF-8
+/// strings, arbitrary binary data, Booleans, signed and unsigned integers of 8, 16, 32, and 64 bits, 32-bit and 64-bit
+/// floating-point values, one-dimensional [`CustomCallArrayAttribute`]s of those numeric types, and nested
+/// dictionaries. Kernels decode scalars strictly by type, so a kernel that expects, for example, a 32-bit float must
+/// receive [`F32`](Self::F32) rather than [`F64`](Self::F64). Binary payloads preserve every byte, including
+/// zero-valued bytes and invalid UTF-8, without an implicit text encoding. Backends must preserve these values or
+/// reject unsupported variants. Dictionaries retain insertion order and require unique names within each dictionary.
+///
+/// The `From` conversions allow direct arguments to [`CustomCallOperation::with_attribute`]: `&str` and `String` become
+/// [`String`](Self::String), `&[u8]` and `Vec<u8>` become [`Bytes`](Self::Bytes), every supported scalar type becomes
+/// its corresponding scalar variant, and every other supported `Vec<T>` becomes an [`Array`](Self::Array). Unsigned
+/// 8-bit arrays must therefore be spelled out explicitly as [`CustomCallArrayAttribute::U8`]. Unsuffixed integer and
+/// floating-point literals follow Rust's default literal types (i.e., `i32` and `f64`), so use suffixes such as `4i64`
+/// or `2.5f32` to select another width.
+///
+/// Equality and hashing compare floating-point values bitwise, so that attributes are faithful keys of the values
+/// that backends receive (e.g., `-0.0` and `+0.0` are distinct, and every NaN equals itself). [`I64`](Self::I64)
+/// and [`F64`](Self::F64) render as bare literals, while the other scalar variants render with a Rust type suffix
+/// (e.g., `4i32` or `2.5f32`), and [`String`](Self::String) renders as a quoted and escaped Rust string literal
+/// (e.g., `"fast"`), so that renderings distinguish every scalar type and keep string contents apart from the
+/// surrounding operation syntax.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{CustomCallArrayAttribute, CustomCallAttribute};
+/// assert_eq!(CustomCallAttribute::from(2.5f32), CustomCallAttribute::F32(2.5));
+/// assert_eq!(
+///     CustomCallAttribute::from(vec![1i32, 2]),
+///     CustomCallAttribute::Array(CustomCallArrayAttribute::I32(vec![1, 2])),
+/// );
+/// assert_eq!(
+///     CustomCallAttribute::Dictionary(vec![
+///         ("scale".to_string(), CustomCallAttribute::from(2.5f32)),
+///         ("mode".to_string(), CustomCallAttribute::from("fast")),
+///     ])
+///     .to_string(),
+///     "{scale=2.5f32, mode=\"fast\"}",
+/// );
+/// ```
+#[derive(Clone, Debug)]
+pub enum CustomCallAttribute {
+    String(String),
+    Bytes(Vec<u8>),
+    Boolean(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Array(CustomCallArrayAttribute),
+    Dictionary(Vec<(String, CustomCallAttribute)>),
+}
+
+impl Display for CustomCallAttribute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::String(string) => write!(formatter, "{string:?}"),
+            Self::Bytes(bytes) => write!(formatter, "bytes {bytes:02x?}"),
+            Self::Boolean(boolean) => write!(formatter, "{boolean}"),
+            Self::I8(integer) => write!(formatter, "{integer}i8"),
+            Self::I16(integer) => write!(formatter, "{integer}i16"),
+            Self::I32(integer) => write!(formatter, "{integer}i32"),
+            Self::I64(integer) => write!(formatter, "{integer}"),
+            Self::U8(integer) => write!(formatter, "{integer}u8"),
+            Self::U16(integer) => write!(formatter, "{integer}u16"),
+            Self::U32(integer) => write!(formatter, "{integer}u32"),
+            Self::U64(integer) => write!(formatter, "{integer}u64"),
+            Self::F32(float) => write!(formatter, "{float:?}f32"),
+            Self::F64(float) => write!(formatter, "{float:?}"),
+            Self::Array(array) => write!(formatter, "{array}"),
+            Self::Dictionary(attributes) => {
+                formatter.write_str("{")?;
+                for (index, (name, value)) in attributes.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{name}={value}")?;
+                }
+                formatter.write_str("}")
+            }
+        }
+    }
+}
+
+impl PartialEq for CustomCallAttribute {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Bytes(left), Self::Bytes(right)) => left == right,
+            (Self::Boolean(left), Self::Boolean(right)) => left == right,
+            (Self::I8(left), Self::I8(right)) => left == right,
+            (Self::I16(left), Self::I16(right)) => left == right,
+            (Self::I32(left), Self::I32(right)) => left == right,
+            (Self::I64(left), Self::I64(right)) => left == right,
+            (Self::U8(left), Self::U8(right)) => left == right,
+            (Self::U16(left), Self::U16(right)) => left == right,
+            (Self::U32(left), Self::U32(right)) => left == right,
+            (Self::U64(left), Self::U64(right)) => left == right,
+            (Self::F32(left), Self::F32(right)) => left.to_bits() == right.to_bits(),
+            (Self::F64(left), Self::F64(right)) => left.to_bits() == right.to_bits(),
+            (Self::Array(left), Self::Array(right)) => left == right,
+            (Self::Dictionary(left), Self::Dictionary(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CustomCallAttribute {}
+
+impl Hash for CustomCallAttribute {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::String(string) => string.hash(state),
+            Self::Bytes(bytes) => bytes.hash(state),
+            Self::Boolean(boolean) => boolean.hash(state),
+            Self::I8(integer) => integer.hash(state),
+            Self::I16(integer) => integer.hash(state),
+            Self::I32(integer) => integer.hash(state),
+            Self::I64(integer) => integer.hash(state),
+            Self::U8(integer) => integer.hash(state),
+            Self::U16(integer) => integer.hash(state),
+            Self::U32(integer) => integer.hash(state),
+            Self::U64(integer) => integer.hash(state),
+            Self::F32(float) => float.to_bits().hash(state),
+            Self::F64(float) => float.to_bits().hash(state),
+            Self::Array(array) => array.hash(state),
+            Self::Dictionary(attributes) => attributes.hash(state),
+        }
+    }
+}
+
+impl From<&str> for CustomCallAttribute {
+    #[inline]
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for CustomCallAttribute {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&[u8]> for CustomCallAttribute {
+    #[inline]
+    fn from(value: &[u8]) -> Self {
+        Self::Bytes(value.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for CustomCallAttribute {
+    #[inline]
+    fn from(value: Vec<u8>) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl From<bool> for CustomCallAttribute {
+    #[inline]
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl From<CustomCallArrayAttribute> for CustomCallAttribute {
+    #[inline]
+    fn from(value: CustomCallArrayAttribute) -> Self {
+        Self::Array(value)
+    }
+}
+
+/// Implements the scalar and array `From` conversions into [`CustomCallAttribute`] for a numeric element type.
+macro_rules! impl_custom_call_attribute_conversions {
+    // This branch converts both scalars and vectors of the element type.
+    ($type:ty, $variant:ident) => {
+        impl_custom_call_attribute_conversions!(@scalar $type, $variant);
+
+        impl From<Vec<$type>> for CustomCallAttribute {
+            #[inline]
+            fn from(value: Vec<$type>) -> Self {
+                Self::Array(CustomCallArrayAttribute::$variant(value))
+            }
+        }
+    };
+
+    // This branch converts only scalars of the element type, for `u8`, whose vectors are binary data.
+    (@scalar $type:ty, $variant:ident) => {
+        impl From<$type> for CustomCallAttribute {
+            #[inline]
+            fn from(value: $type) -> Self {
+                Self::$variant(value)
+            }
+        }
+    };
+}
+
+impl_custom_call_attribute_conversions!(i8, I8);
+impl_custom_call_attribute_conversions!(i16, I16);
+impl_custom_call_attribute_conversions!(i32, I32);
+impl_custom_call_attribute_conversions!(i64, I64);
+impl_custom_call_attribute_conversions!(@scalar u8, U8);
+impl_custom_call_attribute_conversions!(u16, U16);
+impl_custom_call_attribute_conversions!(u32, U32);
+impl_custom_call_attribute_conversions!(u64, U64);
+impl_custom_call_attribute_conversions!(f32, F32);
+impl_custom_call_attribute_conversions!(f64, F64);
+
+/// One-dimensional numeric array carried by [`CustomCallAttribute::Array`]. The supported element types
+/// match the numeric array attributes that XLA's typed Foreign Function Interface (FFI) can decode (e.g., as
+/// a `Span<const int32_t>`). Boolean arrays are omitted because XLA's typed FFI does not support Boolean array
+/// attributes. Equality and hashing compare floating-point elements bitwise, like [`CustomCallAttribute`] does
+/// for scalars, and arrays render with their element type (e.g., `array<i32: 1, 2>`).
+#[derive(Clone, Debug)]
+pub enum CustomCallArrayAttribute {
+    I8(Vec<i8>),
+    I16(Vec<i16>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+}
+
+impl CustomCallArrayAttribute {
+    /// Returns the number of elements in this array.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::I8(values) => values.len(),
+            Self::I16(values) => values.len(),
+            Self::I32(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::U8(values) => values.len(),
+            Self::U16(values) => values.len(),
+            Self::U32(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::F32(values) => values.len(),
+            Self::F64(values) => values.len(),
+        }
+    }
+
+    /// Returns `true` if this array has no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Display for CustomCallArrayAttribute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn write_values<T: std::fmt::Debug>(
+            formatter: &mut std::fmt::Formatter<'_>,
+            element_type: &str,
+            values: &[T],
+        ) -> std::fmt::Result {
+            write!(formatter, "array<{element_type}")?;
+            for (index, value) in values.iter().enumerate() {
+                write!(formatter, "{}{value:?}", if index == 0 { ": " } else { ", " })?;
+            }
+            formatter.write_str(">")
+        }
+
+        match self {
+            Self::I8(values) => write_values(formatter, "i8", values),
+            Self::I16(values) => write_values(formatter, "i16", values),
+            Self::I32(values) => write_values(formatter, "i32", values),
+            Self::I64(values) => write_values(formatter, "i64", values),
+            Self::U8(values) => write_values(formatter, "u8", values),
+            Self::U16(values) => write_values(formatter, "u16", values),
+            Self::U32(values) => write_values(formatter, "u32", values),
+            Self::U64(values) => write_values(formatter, "u64", values),
+            Self::F32(values) => write_values(formatter, "f32", values),
+            Self::F64(values) => write_values(formatter, "f64", values),
+        }
+    }
+}
+
+impl PartialEq for CustomCallArrayAttribute {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::I8(left), Self::I8(right)) => left == right,
+            (Self::I16(left), Self::I16(right)) => left == right,
+            (Self::I32(left), Self::I32(right)) => left == right,
+            (Self::I64(left), Self::I64(right)) => left == right,
+            (Self::U8(left), Self::U8(right)) => left == right,
+            (Self::U16(left), Self::U16(right)) => left == right,
+            (Self::U32(left), Self::U32(right)) => left == right,
+            (Self::U64(left), Self::U64(right)) => left == right,
+            (Self::F32(left), Self::F32(right)) => {
+                left.iter().map(|value| value.to_bits()).eq(right.iter().map(|value| value.to_bits()))
+            }
+            (Self::F64(left), Self::F64(right)) => {
+                left.iter().map(|value| value.to_bits()).eq(right.iter().map(|value| value.to_bits()))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CustomCallArrayAttribute {}
+
+impl Hash for CustomCallArrayAttribute {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::I8(values) => values.hash(state),
+            Self::I16(values) => values.hash(state),
+            Self::I32(values) => values.hash(state),
+            Self::I64(values) => values.hash(state),
+            Self::U8(values) => values.hash(state),
+            Self::U16(values) => values.hash(state),
+            Self::U32(values) => values.hash(state),
+            Self::U64(values) => values.hash(state),
+            Self::F32(values) => {
+                values.len().hash(state);
+                values.iter().for_each(|value| value.to_bits().hash(state));
+            }
+            Self::F64(values) => {
+                values.len().hash(state);
+                values.iter().for_each(|value| value.to_bits().hash(state));
+            }
+        }
+    }
+}
+
+/// Declares that an output of a [`CustomCallOperation`] aliases an input.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CustomCallInputOutputAlias {
+    /// Index of the aliased input.
+    input_index: usize,
+
+    /// Index of the output that aliases the input.
+    output_index: usize,
+}
+
+impl CustomCallInputOutputAlias {
+    /// Creates an alias from the input at `input_index` to the output at `output_index`.
+    pub const fn new(input_index: usize, output_index: usize) -> Self {
+        Self { input_index, output_index }
+    }
+
+    /// Returns the index of the aliased input.
+    pub const fn input_index(&self) -> usize {
+        self.input_index
+    }
+
+    /// Returns the index of the output that aliases the input.
+    pub const fn output_index(&self) -> usize {
+        self.output_index
+    }
+}
+
+impl Display for CustomCallInputOutputAlias {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}->{}", self.input_index, self.output_index)
+    }
+}
+
+/// Unrolling policy for the scan used by [`CustomCallBatching::Sequential`]. Batching stages one scan whose body makes
+/// one unbatched kernel call. When compiling that scan, the backend expands consecutive iterations according to this
+/// policy, trading compiled code size for loop overhead while preserving the number, order, and inputs of the kernel
+/// calls. Eager interpretation executes one item per iteration regardless of this policy.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CustomCallUnrolling {
+    /// Keep one kernel call per loop trip. This is the default.
+    #[default]
+    Disabled,
+
+    /// Emit this many body copies per loop trip. The factor must be at least `1`.
+    Factor(usize),
+
+    /// Emit one straight-line kernel call per batch item, with no loop. This requires a statically known batch
+    /// extent and corresponds to JAX's `sequential_unrolled` mode.
+    Full,
+}
+
+/// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its inputs. Ryft cannot derive
+/// a batching rule for an opaque kernel, so the author of the call declares which of the few universally meaningful
+/// strategies applies, using [`with_batching`](CustomCallOperation::with_batching). This mirrors JAX's `vmap_method`
+/// selection on [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). A call whose
+/// inputs are all replicated never consults this behavior; it is bound unchanged.
+///
+/// Note that the single-call strategies require the kernel to understand batch-prefixed buffers. Every output gains the
+/// full mapped extent, so an input/output alias remains valid only when its input also carries that complete output
+/// shape. Aliases of replicated inputs are consequently rejected by [`ExpandDimensions`](Self::ExpandDimensions) when
+/// the batch extent exceeds one, and by [`Vectorized`](Self::Vectorized) whenever they would change the logical shape.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CustomCallBatching {
+    /// Report a [`BatchingError::UnsupportedOperation`] naming the mapped input. This is the default because a foreign
+    /// kernel's contract is opaque and silently choosing a strategy could execute the kernel on buffers it never agreed
+    /// to accept.
+    #[default]
+    Rejected,
+
+    /// Apply the kernel once per batch item through a `scan` whose body performs exactly one unbatched call. Mapped
+    /// inputs are realigned to batch axis `0` and sliced one row per iteration, replicated inputs become invariant loop
+    /// carries, and the per-iteration results are stacked back on batch axis `0`. The kernel therefore observes exactly
+    /// the buffers it would have seen without the transform, at the cost of `b` sequential calls; a side-effecting
+    /// kernel consequently runs `b` ordered times. The `unroll` policy selects the factor forwarded to
+    /// [`ScanOperation::with_unroll`]; full unrolling requires a statically known batch extent.
+    Sequential {
+        /// Policy controlling how the staged scan's iterations are unrolled during compilation.
+        unroll: CustomCallUnrolling,
+    },
+
+    /// Align every input to batch axis `0` and call the kernel exactly once on batch-prefixed buffers, declaring
+    /// batch-prefixed output types. The kernel must itself understand the leading batch axis. Replicated inputs are
+    /// materialized across the batch first, so every input and result carries the same leading extent, aliases stay
+    /// type-preserving, and a side-effecting kernel runs exactly once.
+    BroadcastAll,
+
+    /// Align mapped inputs to batch axis `0`, insert a size-one leading axis into replicated inputs, and call the
+    /// kernel exactly once. Every output gains the full mapped extent. The kernel must broadcast its size-one inputs
+    /// internally.
+    ExpandDimensions,
+
+    /// Align mapped inputs to batch axis `0`, keep replicated inputs unchanged, and call the kernel exactly once.
+    /// Every output gains the full mapped extent. The kernel must distinguish batch-prefixed inputs from invariant
+    /// inputs and implement the required vectorization itself.
+    Vectorized,
+}
+
+impl Display for CustomCallBatching {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected => formatter.write_str("rejected"),
+            Self::Sequential { unroll: CustomCallUnrolling::Disabled } => formatter.write_str("sequential"),
+            Self::Sequential { unroll: CustomCallUnrolling::Factor(unroll) } => {
+                write!(formatter, "sequential(unroll={unroll})")
+            }
+            Self::Sequential { unroll: CustomCallUnrolling::Full } => formatter.write_str("sequential(unroll=full)"),
+            Self::BroadcastAll => formatter.write_str("broadcast_all"),
+            Self::ExpandDimensions => formatter.write_str("expand_dimensions"),
+            Self::Vectorized => formatter.write_str("vectorized"),
+        }
+    }
+}
+
+/// Canonical operation name for [`CustomCallOperation`].
+pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
+
+/// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields,
+/// where a configuration attribute of the same name would be indistinguishable from the field.
+const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
+    ["target", "input_layouts", "input_output_alias", "has_side_effect", "effect_class", "batching"];
+
+/// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name. It is the
+/// Ryft analogue of JAX's [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html).
+/// This operation is opaque to Ryft: its output types are declared up front instead of inferred, and typed
+/// [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration.
+///
+/// This is an [`ArrayType`] operation that participates in two input contracts. In homogeneous array programs it
+/// accepts only the foreign kernel's array inputs, so every declared output must have a static shape. As a mixed member
+/// of the [`ArrayIrType`] operation family (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one
+/// trailing first-class dimension input per dynamic axis occurrence in the declared outputs, ordered first by output
+/// and then by axis, and type inference verifies that each input either defines its corresponding output axis's
+/// variable or supplies an exact extent within that variable's bounds, refining the output axis to that extent.
+/// These logical result extents do not enter the foreign kernel ABI: only the leading array inputs are passed to the
+/// kernel. Eager execution and backend lowering use the trailing inputs to verify or attach the declared logical sizes
+/// to the returned buffers. Both contracts share one payload with the same target, output declarations, attributes,
+/// layouts, aliases, effects, rendering, and backend-kernel semantics.
+///
+/// Backends that support bounded dynamic arrays pass each array to the kernel as a dense buffer at its inclusive bounds
+/// and allocate dynamic outputs the same way. Elements beyond the runtime extent are unspecified. A kernel that needs
+/// the live extent must receive it as an ordinary array input. Dynamic inputs without a finite bound are rejected.
+///
+/// Input/output aliases, declared with [`CustomCallInputOutputAlias`], allow a backend to reuse an input array's buffer
+/// for an output without changing Ryft's functional Single Static Assignment (SSA) semantics. Alias indices address
+/// only array inputs and outputs; trailing dimension inputs and backend-internal effect tokens are excluded.
+///
+/// Type inference also validates the configuration: attribute names must be unique (including within nested
+/// dictionaries) and must not reuse the names of the operation's own rendered fields (i.e., `target`, `input_layouts`,
+/// `input_output_alias`, `has_side_effect`, `effect_class`, and `batching`), declared input layouts must match the rank
+/// of their inputs, and each alias must connect an input and an output of identical types apart from their original
+/// layouts, with matching layouts at the kernel boundary. Output types declared without a sharding inherit the
+/// manual-axis variation of the inputs, placed replicated on their mesh, because opaque code cannot be assumed to
+/// produce the same result on every device. Aliases are compared against these effective output types after extent
+/// refinement and sharding inheritance, so an input that carries the manual variation its output inherits can alias
+/// an output declared without a sharding.
+///
+/// The XLA backend lowers this operation to a [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call)
+/// using the typed Foreign Function Interface (FFI) calling convention (i.e., `api_version = 4`), with the attributes
+/// carried as the `backend_config` dictionary. Handlers are registered with the executing PJRT client under the same
+/// target name (e.g., via `ryft-pjrt`'s `Client::register_ffi_handler`). The reference array backend cannot execute
+/// foreign kernels, so eager interpretation on it reports an error.
+///
+/// # Transformations
+///
+/// Because the kernel is opaque, Ryft cannot derive its transform rules automatically:
+///
+///   - **Differentiation:** Forward mode differentiation binds the call unchanged and returns structural zero tangents
+///     when every input tangent is a structural zero (including when the call has no inputs). Any other derivative
+///     reports an error directing users to call the kernel through a [`composite`](crate::composite) with derivative
+///     rules (refer to [`Composite::from_custom_call`](crate::Composite::from_custom_call)). The call is not linear,
+///     so it never transposes.
+///   - **Batching:** A call whose inputs are all replicated is bound unchanged, because a region-free foreign kernel
+///     cannot observe the transform's named axis. A mapped input is governed by the [`CustomCallBatching`] behavior
+///     selected with [`with_batching`](Self::with_batching): the default [`Rejected`](CustomCallBatching::Rejected)
+///     reports an error naming that input, [`Sequential`](CustomCallBatching::Sequential) applies the kernel once per
+///     batch item through a `scan` with an explicit [`CustomCallUnrolling`] policy, and
+///     [`BroadcastAll`](CustomCallBatching::BroadcastAll), [`ExpandDimensions`](CustomCallBatching::ExpandDimensions),
+///     and [`Vectorized`](CustomCallBatching::Vectorized) hand the kernel batch-prefixed buffers in a single call.
+///     A [`composite`](crate::composite) without its own batching rule batches its primal region structurally, so a
+///     mapped input reaches this same operation and meets this same contract. Single-call strategies shift declared
+///     input and output layouts so that the new batch axis is the most major one.
+///   - **Partial Evaluation:** Known calls execute or stage through the parent context when it supports them, and pure
+///     calls remain residual when an eager parent cannot execute them. Residual calls retain their declared effects
+///     through dead-code elimination.
+///
+/// # Effects
+///
+/// A call is pure unless it declares an [`EffectClass`]. [`with_side_effect`](Self::with_side_effect) declares
+/// [`EffectClass::UnorderedIo`] (i.e., the contract of JAX's `has_side_effect=True`) meaning that the call stays alive
+/// through dead-code elimination and is observable, without any ordering dependency and without a token in the kernel's
+/// calling convention. [`with_effect_class`](Self::with_effect_class) enables selecting a stronger contract:
+/// [`EffectClass::OrderedIo`] preserves the call's execution order relative to other ordered I/O effects across every
+/// participating device, and [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O
+/// executing on the same device, which is what permits the call to execute once per device inside `shard_map` bodies.
+/// Every effectful call is lowered with `has_side_effect = true`. Backends that sequence ordered effects through tokens
+/// (e.g., the XLA backend) pass a call with an *ordered* class one extra token input after its array inputs and expect
+/// one extra token output after its declared outputs, so the kernel's handler must accept and return that token; an
+/// unordered call carries no token. Renderings show every effectful call as `has_side_effect=true` and name the class
+/// with `effect_class=...` unless it is the unordered one.
+///
+/// # Backend Contract
+///
+/// This operation is backend-independent by design, and this payload is the entire portable contract: a target name
+/// resolved in the executing backend's kernel registry, declared output types, typed configuration attributes, optional
+/// input layouts and buffer aliases, and an optional effect class. A backend supports the operation by providing (1) a
+/// process- or client-level registry that resolves target names to executable kernels at execution time, (2) a calling
+/// convention that hands the kernel its input buffers (in their declared layouts), output buffers matching the declared
+/// output types, and the decoded attributes, and (3) an execution engine that honors the declared effect class for
+/// side-effecting calls. Backends that cannot execute foreign kernels (like the reference array backend) reject
+/// interpretation with a clear error instead of guessing.
+///
+/// Inputs without a declared layout (including [`None`] entries) and outputs without a layout use dense row-major
+/// storage. Backend-specific configuration belongs in the backend's lowering or a backend-owned operation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CustomCallOperation {
+    /// Name under which the foreign kernel is registered with the executing backend.
+    target_name: String,
+
+    /// Typed configuration attributes forwarded to the kernel, in insertion order.
+    attributes: Vec<(String, CustomCallAttribute)>,
+
+    /// Declared buffer layouts of the array inputs, with one entry per array input, or empty when undeclared.
+    input_layouts: Vec<Option<Layout>>,
+
+    /// Flat array input/output buffer aliases, in declaration order.
+    input_output_aliases: Vec<CustomCallInputOutputAlias>,
+
+    /// Declared output types of the call; inference adds inherited manual variation to undeclared shardings.
+    output_types: Vec<ArrayType>,
+
+    /// Observable effect of the call, or `None` for a pure call.
+    effect_class: Option<EffectClass>,
+
+    /// Behavior requested when the batching transform maps one of this call's inputs.
+    batching: CustomCallBatching,
+}
+
+impl CustomCallOperation {
+    /// Creates a new [`CustomCallOperation`] with the provided target name and declared output types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `target_name`: Name under which the foreign kernel is registered with the executing backend.
+    ///   - `output_types`: Declared output types; undeclared shardings inherit the inputs' manual variation.
+    #[inline]
+    pub fn new<N: Into<String>>(target_name: N, output_types: Vec<ArrayType>) -> Self {
+        Self {
+            target_name: target_name.into(),
+            attributes: Vec::new(),
+            input_layouts: Vec::new(),
+            input_output_aliases: Vec::new(),
+            output_types,
+            effect_class: None,
+            batching: CustomCallBatching::default(),
+        }
+    }
+
+    /// Returns this [`CustomCallOperation`] with the provided typed configuration attribute appended. Attribute names
+    /// must be unique (including within nested [`Dictionary`](CustomCallAttribute::Dictionary) attributes) and must
+    /// not reuse the names of the operation's own rendered fields (i.e., `target`, `input_layouts`,
+    /// `input_output_alias`, `has_side_effect`, `effect_class`, and `batching`), both of which type
+    /// inference validates.
+    #[inline]
+    pub fn with_attribute<N: Into<String>, V: Into<CustomCallAttribute>>(mut self, name: N, value: V) -> Self {
+        self.attributes.push((name.into(), value.into()));
+        self
+    }
+
+    /// Returns this [`CustomCallOperation`] declaring the buffer layouts in which the kernel receives its array
+    /// inputs, replacing any earlier declaration. The declaration has one entry per array input (excluding the trailing
+    /// dimension inputs of the mixed [`ArrayIrType`] form). [`None`] entries request dense row-major storage, and an
+    /// empty declaration requests it for every input, regardless of the layouts of their [`ArrayType`]s. Backends
+    /// convert each input to the requested layout before invoking the kernel, so the kernel's buffer contract does not
+    /// depend on how the input value happens to be stored. This holds after batching too, which shifts declared layouts
+    /// together with the inputs that gain a leading batch axis. Row-major defaults remain row-major after inserting
+    /// that most-major axis. Count, rank, and alias compatibility are validated during type inference, when the input
+    /// types are available.
+    #[inline]
+    pub fn with_input_layouts<L: IntoIterator<Item = Option<Layout>>>(mut self, input_layouts: L) -> Self {
+        self.input_layouts = input_layouts.into_iter().collect();
+        self
+    }
+
+    /// Returns this operation with an alias from array input `input_index` to array output `output_index`. Index bounds
+    /// and type compatibility are validated during type inference, when the input types are available. Each input and
+    /// output can participate in at most one alias.
+    pub fn with_input_output_alias(mut self, input_index: usize, output_index: usize) -> Result<Self, TypeError> {
+        if let Some(alias) = self
+            .input_output_aliases
+            .iter()
+            .find(|alias| alias.input_index == input_index || alias.output_index == output_index)
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` cannot add alias {input_index}->{output_index} because alias \
+                 `{alias}` already uses the same input or output",
+            )));
+        }
+        self.input_output_aliases.push(CustomCallInputOutputAlias::new(input_index, output_index));
+        Ok(self)
+    }
+
+    /// Returns this call declaring [`EffectClass::UnorderedIo`], replacing any earlier effect selection. This is the
+    /// same contract as JAX's `has_side_effect=True`: the call is kept alive through dead-code elimination and remains
+    /// observable, but promises no ordering relative to other effects and adds no token to the kernel's calling
+    /// convention, so handlers written against JAX's convention work unchanged. Select an ordered class with
+    /// [`with_effect_class`](Self::with_effect_class) when the kernel's effects must execute in program order.
+    #[inline]
+    pub fn with_side_effect(self) -> Self {
+        self.with_effect_class(EffectClass::UnorderedIo)
+    }
+
+    /// Returns this call declaring the provided observable effect class, replacing any earlier selection. Every class
+    /// keeps the call alive through dead-code elimination and marks the lowered call `has_side_effect`. The I/O classes
+    /// differ in ordering scope: [`EffectClass::OrderedIo`] promises one order across devices,
+    /// [`EffectClass::DeviceOrderedIo`] promises program order only among the ordered I/O executing on the same device
+    /// and therefore permits the handler to run once per device (the handler must tolerate that replication), and
+    /// [`EffectClass::UnorderedIo`] promises no ordering. The ordered classes change the kernel's calling convention
+    /// on backends that sequence effects through tokens (e.g., the XLA backend): the handler receives one token input
+    /// after the array inputs and returns one token output after the declared outputs. An unordered call carries no
+    /// token. The effect class does not supply batching or differentiation rules, and does not determine whether
+    /// execution blocks the calling thread.
+    #[inline]
+    pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
+        self.effect_class = Some(effect_class);
+        self
+    }
+
+    /// Returns this [`CustomCallOperation`] requesting the provided [`CustomCallBatching`] behavior when the batching
+    /// transform maps one of its inputs. Refer to the documentation of [`CustomCallBatching`] for the available
+    /// behaviors and for why the default rejects mapped inputs.
+    #[inline]
+    pub fn with_batching(mut self, batching: CustomCallBatching) -> Self {
+        self.batching = batching;
+        self
+    }
+
+    /// Returns the name under which the foreign kernel is registered with the executing backend.
+    #[inline]
+    pub fn target_name(&self) -> &str {
+        self.target_name.as_str()
+    }
+
+    /// Returns the typed configuration attributes forwarded to the kernel, in insertion order.
+    #[inline]
+    pub fn attributes(&self) -> &[(String, CustomCallAttribute)] {
+        self.attributes.as_slice()
+    }
+
+    /// Returns the declared buffer layouts of the array inputs, which are either empty or contain one entry per array
+    /// input. Refer to [`with_input_layouts`](Self::with_input_layouts) for more information.
+    #[inline]
+    pub fn input_layouts(&self) -> &[Option<Layout>] {
+        self.input_layouts.as_slice()
+    }
+
+    /// Returns the flat array input/output buffer aliases in declaration order.
+    #[inline]
+    pub fn input_output_aliases(&self) -> &[CustomCallInputOutputAlias] {
+        self.input_output_aliases.as_slice()
+    }
+
+    /// Returns the declared output types of the call.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        self.output_types.as_slice()
+    }
+
+    /// Returns whether the call has observable side effects beyond its returned outputs.
+    #[inline]
+    pub fn has_side_effect(&self) -> bool {
+        self.effect_class.is_some()
+    }
+
+    /// Returns the observable [`EffectClass`] declared by this call, or `None` for a pure call.
+    #[inline]
+    pub fn effect_class(&self) -> Option<EffectClass> {
+        self.effect_class
+    }
+
+    /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one
+    /// of this call's inputs.
+    #[inline]
+    pub fn batching(&self) -> CustomCallBatching {
+        self.batching
+    }
+
+    /// Calls the foreign kernel described by this operation in `context` with the provided inputs, returning one value
+    /// per declared output type. This binds the operation through [`Context::bind`] and is therefore available in every
+    /// context, eager and staged alike. It is the entry point for calls without array inputs (e.g., kernels that act as
+    /// sources), which the value-level [`CustomCall`] capability cannot dispatch because it routes a call through the
+    /// context of its first input.
+    #[inline]
+    pub fn call<C: Context<Operation: From<CustomCallOperation>>>(
+        &self,
+        context: &C,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        context.bind(self.clone(), Vec::new(), inputs)
+    }
+
+    /// Validates the attributes, declared input layouts, and aliases of this operation against the provided array input
+    /// types and effective output types.
+    fn validate_configuration(&self, input_types: &[&ArrayType], output_types: &[ArrayType]) -> Result<(), TypeError> {
+        /// Returns the first duplicate attribute name, including names in nested dictionaries.
+        fn duplicate_name(attributes: &[(String, CustomCallAttribute)]) -> Option<&str> {
+            attributes.iter().enumerate().find_map(|(index, (name, value))| {
+                if attributes[..index].iter().any(|(existing, _)| existing == name) {
+                    return Some(name.as_str());
+                }
+                match value {
+                    CustomCallAttribute::Dictionary(attributes) => duplicate_name(attributes),
+                    _ => None,
+                }
+            })
+        }
+
+        if let Some(name) = duplicate_name(self.attributes.as_slice()) {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` declares attribute `{name}` more than once",
+            )));
+        }
+
+        if let Some((name, _)) =
+            self.attributes.iter().find(|(name, _)| RESERVED_ATTRIBUTE_NAMES.contains(&name.as_str()))
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` attribute `{name}` reuses the name \
+                 of one of the operation's own fields",
+            )));
+        }
+
+        // A non-empty layout declaration names every array input. Validate its count and ranks before comparing
+        // the layouts of aliased buffers; an empty declaration still leaves the aliases to validate below.
+        if !self.input_layouts.is_empty() {
+            if self.input_layouts.len() != input_types.len() {
+                return Err(TypeError::invalid(format!(
+                    "`{}` declares {} input layout(s) but the call has {} array input(s)",
+                    CUSTOM_CALL_OPERATION_NAME,
+                    self.input_layouts.len(),
+                    input_types.len(),
+                )));
+            }
+
+            for (input_index, (layout, input_type)) in self.input_layouts.iter().zip(input_types).enumerate() {
+                let Some(layout) = layout else {
+                    continue;
+                };
+
+                let layout_rank = match layout {
+                    Layout::Tiled(layout) => layout.rank(),
+                    Layout::Strided(layout) => layout.rank(),
+                };
+
+                if layout_rank != input_type.rank() {
+                    return Err(TypeError::invalid(format!(
+                        "`{CUSTOM_CALL_OPERATION_NAME}` input layout `{layout}` has rank {layout_rank} but input \
+                         {input_index} has type `{input_type}`",
+                    )));
+                }
+            }
+        }
+
+        // Alias indices exclude trailing dimension inputs and refer to the effective output types
+        // supplied by inference.
+        for alias in &self.input_output_aliases {
+            let Some(input_type) = input_types.get(alias.input_index) else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` refers to input {} but the call has {} array input(s)",
+                    CUSTOM_CALL_OPERATION_NAME,
+                    alias,
+                    alias.input_index,
+                    input_types.len(),
+                )));
+            };
+
+            let Some(output_type) = output_types.get(alias.output_index) else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` refers to output {} but the call has {} output(s)",
+                    CUSTOM_CALL_OPERATION_NAME,
+                    alias,
+                    alias.output_index,
+                    output_types.len(),
+                )));
+            };
+
+            // The backend may convert the input's storage before the call. Aliases constrain its logical type and
+            // its layout at the kernel boundary, rather than the input value's original physical arrangement.
+            if (*input_type).clone().with_layout(None) != output_type.clone().with_layout(None) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` requires matching input and output types but \
+                     input {} has type `{}` and output {} has type `{}`",
+                    CUSTOM_CALL_OPERATION_NAME, alias, alias.input_index, input_type, alias.output_index, output_type,
+                )));
+            }
+
+            let row_major = Layout::Tiled(TiledLayout::new((0..input_type.rank()).rev().collect(), Vec::new()));
+            let input_layout = self.input_layouts.get(alias.input_index).and_then(Option::as_ref).unwrap_or(&row_major);
+            if input_layout != output_type.layout().unwrap_or(&row_major) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` requires the kernel layout `{}` of \
+                     input {} to match the layout of output {}",
+                    CUSTOM_CALL_OPERATION_NAME, alias, input_layout, alias.input_index, alias.output_index,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the number of array inputs of a mixed invocation with `input_types`, the refinements that its trailing
+    /// first-class output-extent inputs establish, and this call's declared output types refined by them. Each trailing
+    /// extent either defines the identity of its declared output axis or has an exact type that refines that axis to
+    /// its extent.
+    fn refine_declared_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+    ) -> Result<(usize, ArrayTypeRefinements, Vec<ArrayType>), TypeError> {
+        let dynamic_output_dimensions = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter_map(Dimension::variable)
+            .collect::<Vec<_>>();
+        let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
+            return Err(TypeError::invalid(format!(
+                "`{}` expects {} trailing output-extent dimension(s) but received only {} input(s)",
+                CUSTOM_CALL_OPERATION_NAME,
+                dynamic_output_dimensions.len(),
+                input_types.len(),
+            )));
+        };
+
+        let mut refinements = DimensionRefinements::default();
+        for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
+            let input_type = <&DimensionType>::try_from(input_type)?;
+            if !refinements.record_input_refinement(expected_variable, input_type)? {
+                // A rejected input is either an exact extent outside the declared axis's bounds
+                // or a dimension of an unrelated identity, and the diagnostic names which.
+                return Err(TypeError::invalid(match input_type.extent() {
+                    Some(extent) => format!(
+                        "`{}` output-extent input has extent {}, which lies outside \
+                         the bounds {} of the corresponding declared output axis `{}`",
+                        CUSTOM_CALL_OPERATION_NAME,
+                        extent,
+                        expected_variable.bounds(),
+                        expected_variable,
+                    ),
+                    None => format!(
+                        "`{}` output-extent input defines dimension variable `{}`, but the \
+                         corresponding declared output axis refers to `{}`",
+                        CUSTOM_CALL_OPERATION_NAME,
+                        input_type.dimension(),
+                        expected_variable,
+                    ),
+                }));
+            }
+        }
+
+        let refinements = ArrayTypeRefinements::from(refinements);
+        let output_types = self
+            .output_types
+            .iter()
+            .map(|output_type| refinements.refine_declared(output_type, &[]))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((array_input_count, refinements, output_types))
+    }
+
+    /// Returns the declared output types with undeclared shardings inheriting the inputs' manual variation.
+    fn infer_array_output_types(&self, input_types: &[&ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        // Opaque code cannot be assumed to produce the same result on every device, so an output whose declared type
+        // says nothing about placement inherits the manual variation of the inputs, placed replicated on their mesh.
+        // A declared sharding is the author's statement and is kept as is.
+        let Some(input_sharding) = input_types.iter().find_map(|input_type| input_type.sharding()) else {
+            return Ok(self.output_types.clone());
+        };
+        let varying_manual_axes = input_types
+            .iter()
+            .filter_map(|input_type| input_type.sharding())
+            .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
+            .collect::<BTreeSet<_>>();
+        self.output_types
+            .iter()
+            .map(|output_type| {
+                if output_type.sharding().is_some() || varying_manual_axes.is_empty() {
+                    return Ok(output_type.clone());
+                }
+                let sharding = Sharding::replicated(input_sharding.mesh().clone(), output_type.rank())
+                    .with_varying_manual_axes(varying_manual_axes.clone())
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
+            })
+            .collect()
+    }
+
+    /// Batches this call through a scan over `arrays`, whose mapped axes have already been aligned to axis `0`.
+    /// Replicated arrays and trailing output `extents` are invariant carries. The body restores the call's original
+    /// input order, then returns those carries unchanged followed by the per-item results. `length_input` supplies
+    /// the scan's runtime trip count when `batch_dimension` is dynamic.
+    fn batch_sequential<
+        C: Context<Type: From<ArrayType>, Operation: From<CustomCallOperation> + From<ScanOperation<C::Type>>>,
+        P: BatchingPolicy<C>,
+    >(
+        &self,
+        context: &BatchingContext<C, P>,
+        arrays: &[P::Batch],
+        extents: &[P::Batch],
+        batch_dimension: Dimension,
+        length_input: Option<&C::Value>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        // Replicated arrays are invariant carries; mapped arrays are stacks that the scan slices along axis `0`.
+        // Retain the original indices so the carry/stack partition does not change the custom call's input order.
+        let (carry_indices, stacked_indices): (Vec<_>, Vec<_>) =
+            (0..arrays.len()).partition(|&index| P::batch_axis(&arrays[index]).is_replicated());
+
+        // The scan supplies an iteration index before the carries and slices; the custom call does not consume it.
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+
+        // Extents lead the carries so the call can reuse them as its trailing dimension inputs.
+        let mut carry_inputs = extents
+            .iter()
+            .map(|extent| builder.add_input(P::unbatched_type(extent).into_owned()))
+            .collect::<Vec<_>>();
+        let mut packed = extents.iter().map(P::value).cloned().collect::<Vec<_>>();
+        let mut call_inputs = vec![None; arrays.len()];
+
+        // Declare body inputs and pack scan inputs in the same carry-first order. Body types omit the mapped axis,
+        // while packed values retain it so the scan can select each iteration's slice.
+        for &index in carry_indices.iter().chain(stacked_indices.iter()) {
+            let input = builder.add_input(P::unbatched_type(&arrays[index]).into_owned());
+            call_inputs[index] = Some(input);
+            if P::batch_axis(&arrays[index]).is_replicated() {
+                carry_inputs.push(input);
+            }
+            packed.push(P::value(&arrays[index]).clone());
+        }
+
+        // Restore the custom call's array input order, then append its result extents from the leading carries.
+        // The partition visits every array exactly once, so every input slot is populated before unwrapping.
+        let call_inputs = call_inputs
+            .into_iter()
+            .map(Option::unwrap)
+            .chain(carry_inputs[..extents.len()].iter().copied())
+            .collect::<Vec<_>>();
+
+        // Per-item outputs can vary over the mapped axis's manual mesh axes, just as `ArrayType::unbatched` exposes
+        // on input slices. Extend declared shardings accordingly; outputs without a sharding inherit input variation
+        // during inference. Single-call batching records this variation through `ArrayType::batched` instead.
+        let output_types = self
+            .output_types
+            .iter()
+            .map(|output_type| {
+                let Some(sharding) = output_type.sharding() else {
+                    return Ok(output_type.clone());
+                };
+                let manual_axes = context.axis_sharding().manual_axes(sharding.mesh());
+                if manual_axes.is_empty() {
+                    return Ok(output_type.clone());
+                }
+                let mut sharding = sharding.clone();
+                sharding
+                    .extend_varying_manual_axes(manual_axes)
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+
+        // Apply the call to one item and return all invariant carries unchanged. Only the call's results are stacked
+        // by the scan, so carried extents remain available to declare the result shapes on every iteration.
+        let operation = Self { output_types, ..self.clone() };
+        let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
+        let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
+        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            body_outputs,
+            vec![Placeholder; 1 + extents.len() + arrays.len()],
+            vec![Placeholder; carry_inputs.len() + self.output_types.len()],
+        )?;
+
+        // Stacked results carry the batch axis's placement, like every other batched value.
+        let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
+            .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
+
+        // Full unrolling uses the static trip count as its factor. An empty scan still needs a positive factor.
+        if let CustomCallBatching::Sequential { unroll } = self.batching {
+            let unroll = match unroll {
+                CustomCallUnrolling::Disabled => 1,
+                CustomCallUnrolling::Factor(unroll) => unroll,
+                CustomCallUnrolling::Full => batch_dimension
+                    .value()
+                    .ok_or_else(|| BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "custom call `{}` batching `{}` requires a statically known batch extent \
+                             but the mapped axis has dynamic extent `{}`",
+                            self.target_name, self.batching, batch_dimension,
+                        ),
+                    })?
+                    .max(1),
+            };
+            scan = scan.with_unroll(unroll)?;
+        }
+
+        // A dynamic trip count is a trailing scan input, separate from the per-item result extents carried above.
+        packed.extend(length_input.cloned());
+        let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
+        check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
+
+        // Drop the invariant carry results; each remaining stack exposes its leading scan axis as the batch axis.
+        outputs.drain(..carry_inputs.len());
+        outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect()
+    }
+
+    /// Returns this call's declared input layouts for a single-call batching strategy, in which the inputs
+    /// selected by `batch_prefixed` gain a leading batch axis and their declared layouts shift accordingly. Refer to
+    /// [`batch_prefixed_layout`](Self::batch_prefixed_layout) for how layouts shift. Inputs that keep their shape keep
+    /// their declaration. Row-major defaults remain row-major when the new axis is most major, so empty declarations
+    /// and [`None`] entries stay unchanged.
+    fn batch_prefixed_input_layouts<F: Fn(usize) -> bool>(
+        &self,
+        batch_prefixed: F,
+    ) -> Result<Vec<Option<Layout>>, BatchingError> {
+        self.input_layouts
+            .iter()
+            .enumerate()
+            .map(|(input_index, layout)| match layout {
+                Some(layout) if batch_prefixed(input_index) => {
+                    self.batch_prefixed_layout("input", input_index, layout).map(Some)
+                }
+                _ => Ok(layout.clone()),
+            })
+            .collect()
+    }
+
+    /// Returns this call's declared output types with a leading batch dimension inserted, which is the declaration a
+    /// single-call batching strategy hands to its kernel. Each output inserts the batch dimension itself as its most
+    /// major axis, shifting any explicit layout as described in [`batch_prefixed_layout`](Self::batch_prefixed_layout).
+    /// Alias validation compares the resulting types and kernel layouts against the aligned inputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `batch_dimension`: Mapped-axis [`Dimension`] inserted as each output's new leading axis.
+    ///   - `axis_sharding`: Placement assigned to the inserted axis of outputs that carry sharding metadata.
+    fn batch_prefixed_output_types(
+        &self,
+        batch_dimension: Dimension,
+        axis_sharding: &ShardingDimension,
+    ) -> Result<Vec<ArrayType>, BatchingError> {
+        self.output_types
+            .iter()
+            .enumerate()
+            .map(|(output_index, output_type)| {
+                let batched_type = output_type.batched(0, batch_dimension.clone(), axis_sharding.clone())?;
+                Ok(match output_type.layout() {
+                    None => batched_type,
+                    Some(layout) => {
+                        batched_type.with_layout(self.batch_prefixed_layout("output", output_index, layout)?)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Returns `layout` after inserting a new most-major batch axis into the array it describes. An explicit
+    /// [`TiledLayout`] shifts each logical dimension index by one and gains the new axis as its most major
+    /// physical dimension, which keeps its tiles valid because tiling applies to the most minor dimensions.
+    /// Layouts are part of the foreign kernel's buffer contract and must not be silently dropped, so a
+    /// [`StridedLayout`](crate::StridedLayout) is rejected instead, because a correct batch stride depends
+    /// on element sizes that the layout does not carry.
+    ///
+    /// # Parameters
+    ///
+    ///   - `role`: Either `"input"` or `"output"`, naming the role of the laid-out array in diagnostics.
+    ///   - `index`: Index of the laid-out array among the inputs or outputs of this call, for diagnostics.
+    ///   - `layout`: Layout to shift.
+    fn batch_prefixed_layout(&self, role: &str, index: usize, layout: &Layout) -> Result<Layout, BatchingError> {
+        match layout {
+            Layout::Tiled(layout) => Ok(Layout::Tiled(TiledLayout::new(
+                layout.minor_to_major().iter().map(|axis| axis + 1).chain(std::iter::once(0)).collect(),
+                layout.tiles().to_vec(),
+            ))),
+            Layout::Strided(_) => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` cannot batch {} {} because its strided layout `{}` does not \
+                     determine the byte stride of the inserted batch axis",
+                    self.target_name, role, index, layout,
+                ),
+            }),
+        }
+    }
+}
+
+impl Display for CustomCallOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for CustomCallOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        CUSTOM_CALL_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        let array_input_types = input_types.iter().collect::<Vec<_>>();
+
+        // Aliases are compared against the effective output types, after undeclared shardings inherit the inputs'
+        // manual variation, so an input carrying exactly that variation can alias an output declared without one.
+        let output_types = self.infer_array_output_types(array_input_types.as_slice())?;
+        self.validate_configuration(array_input_types.as_slice(), output_types.as_slice())?;
+
+        // The homogeneous universe has no way to ground a dynamic result extent: only the mixed form accepts the
+        // trailing first-class dimension inputs that define one.
+        for output_type in &self.output_types {
+            if output_type.static_shape().is_none() {
+                return Err(TypeError::invalid(format!(
+                    "`{CUSTOM_CALL_OPERATION_NAME}` requires explicit result-extent inputs for dynamic output type \
+                     `{output_type}`",
+                )));
+            }
+        }
+
+        Ok(output_types)
+    }
+
+    #[inline]
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(self.effect_class.map(EffectClasses::single).unwrap_or(EffectClasses::NONE)))
+    }
+
+    #[inline]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
+        Ok(Self {
+            target_name: self.target_name.clone(),
+            attributes: self.attributes.clone(),
+            input_layouts: self.input_layouts.clone(),
+            input_output_aliases: self.input_output_aliases.clone(),
+            output_types: self
+                .output_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            effect_class: self.effect_class,
+            batching: self.batching,
+        })
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CUSTOM_CALL_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("target", &self.target_name)?;
+            for (name, value) in &self.attributes {
+                operation.field(name, value)?;
+            }
+            if !self.input_layouts.is_empty() {
+                let input_layouts = self
+                    .input_layouts
+                    .iter()
+                    .map(|layout| layout.as_ref().map_or_else(|| "default".to_string(), Layout::to_string))
+                    .collect::<Vec<_>>();
+                operation.field("input_layouts", format_args!("[{}]", input_layouts.join(", ")))?;
+            }
+            for alias in &self.input_output_aliases {
+                operation.field("input_output_alias", alias)?;
+            }
+            if let Some(effect_class) = self.effect_class {
+                operation.field("has_side_effect", true)?;
+                if effect_class != EffectClass::UnorderedIo {
+                    operation.field("effect_class", effect_class)?;
+                }
+            }
+            if self.batching != CustomCallBatching::default() {
+                operation.field("batching", self.batching)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl_reference_dischargeable_operation!(@reference_free CustomCallOperation);
+
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CustomCallOperation
+where
+    C::Value: CustomCall,
+{
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        C::Value::custom_call(self, inputs)
+    }
+}
+
+// Partial evaluation uses the default fold-or-residualize policy. Known calls execute or stage through the parent
+// context when supported; pure calls remain residual when an eager parent cannot execute them. Effectful failures
+// propagate, and residual calls retain their declared effects through dead-code elimination.
+impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> PartiallyEvaluatableOperation<C>
+    for CustomCallOperation
+{
+}
+
+impl<
+    C: Context<
+            Type = ArrayType,
+            Operation: From<CustomCallOperation> + From<BroadcastOperation> + From<ScanOperation<C::Type>>,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for CustomCallOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // A foreign kernel is opaque, so Ryft cannot derive how a batch axis threads through it. A call whose inputs
+        // are _all replicated_ is nevertheless bound unchanged through the parent context and reports replicated
+        // outputs, matching JAX, which only invokes a batching rule once some input is actually mapped.
+        //
+        // That all-replicated shortcut is sound _for this operation specifically_ because a custom call is region-free
+        // by construction (i.e., `Operation::infer_output_types` rejects every attached region, so the kernel is a leaf
+        // that observes only its instruction inputs). A foreign kernel therefore cannot observe the transform's named
+        // axis, and running it unchanged over replicated inputs computes exactly what each batch item would have
+        // computed on its own. The shortcut must never be generalized to region-carrying operations, because a region
+        // can contain a named-axis operation whose value differs per batch item even when every input of the enclosing
+        // instruction is replicated. For example, mapping a region that returns the named-axis index still produces
+        // `[0, 1, 2]` at extent `3` even with replicated inputs. Composite wrappers therefore always batch their
+        // regions structurally.
+        //
+        // A mapped input is instead governed by the call's own `CustomCallBatching` behavior. `Rejected` reports
+        // a `BatchingError::UnsupportedOperation` naming that input and its mapped axis, `Sequential` stages a
+        // `ScanOperation` whose body performs a single unbatched call (mapped inputs realigned to batch axis `0` and
+        // sliced per iteration, replicated inputs threaded as invariant carries), `CustomCallUnrolling::Full` sets its
+        // unroll factor to the static batch extent, and `BroadcastAll` aligns every input to batch axis `0` and rebinds
+        // one call whose declared outputs gain the same leading batch dimension. The other single-call modes differ
+        // only in whether replicated inputs gain a singleton axis or remain unchanged. All mapped behaviors keep the
+        // staged program's size independent of the batch extent: unrolling expands the scan during backend compilation.
+        // They compose with nested batching, because the rewritten instruction is bound through the parent context and
+        // carries the same behavior selection.
+        //
+        // Sequential batching requires a statically known mapped extent here: the scan trip count is a host `usize`
+        // in this universe. The mixed `ArrayIrType` rule below owns the dynamic-extent case, where the trip count is a
+        // first-class dimension input (and which full unrolling rejects, because a dynamic trip count cannot be fully
+        // unrolled).
+        let Some((index, mapped)) = inputs.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
+        else {
+            let values = inputs.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
+            let outputs = context.parent().bind(self.clone(), Vec::new(), values.as_slice())?;
+            return Ok(outputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>());
+        };
+
+        match self.batching {
+            CustomCallBatching::Rejected => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no batching rule for input {} mapped at batch {}; invoke a \
+                     kernel that understands the batch axis, or select an explicit batching behavior with \
+                     `CustomCallOperation::with_batching`",
+                    self.target_name,
+                    index,
+                    mapped.batch_axis(),
+                ),
+            }),
+            CustomCallBatching::Sequential { .. } => {
+                let aligned = inputs
+                    .iter()
+                    .map(|input| {
+                        if input.batch_axis().is_replicated() {
+                            Ok(input.clone())
+                        } else {
+                            P::match_axis(context, input, Axis::from(0))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.batch_sequential(context, &aligned, &[], P::axis_size(context)?.into(), None)
+            }
+            CustomCallBatching::BroadcastAll
+            | CustomCallBatching::ExpandDimensions
+            | CustomCallBatching::Vectorized => {
+                // Mapped axes always move to physical axis 0. Replicated inputs either gain the full mapped extent,
+                // gain a singleton axis for the kernel to broadcast internally, or keep their original shape.
+                let aligned = inputs
+                    .iter()
+                    .map(|input| {
+                        if !input.batch_axis().is_replicated() || self.batching == CustomCallBatching::BroadcastAll {
+                            return P::match_axis(context, input, Axis::from(0));
+                        }
+                        if self.batching == CustomCallBatching::Vectorized {
+                            return Ok(input.clone());
+                        }
+                        let input_type = input.r#type();
+                        let output_type = input_type.batched(0, Dimension::Static(1), ShardingDimension::Replicated)?;
+                        let output_axes = (1..=input_type.rank()).collect();
+                        let dimension_sources = std::iter::once(DimensionSource::Static(1))
+                            .chain(input_type.shape().dimensions().iter().enumerate().map(|(axis, dimension)| {
+                                match dimension {
+                                    Dimension::Static(extent) => DimensionSource::Static(*extent),
+                                    Dimension::Dynamic(_) => {
+                                        DimensionSource::Value { source: input.value().clone(), axis }
+                                    }
+                                }
+                            }))
+                            .collect();
+                        P::broadcast_input(context, input, output_type, output_axes, Axis::from(0), dimension_sources)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let output_types =
+                    self.batch_prefixed_output_types(P::axis_dimension(context)?, context.axis_sharding())?;
+                let values = aligned.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
+                let input_layouts = self.batch_prefixed_input_layouts(|index| {
+                    self.batching != CustomCallBatching::Vectorized
+                        || inputs.get(index).is_some_and(|input| !input.batch_axis().is_replicated())
+                })?;
+                let operation = Self { output_types, input_layouts, ..self.clone() };
+                let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
+                Ok(outputs
+                    .into_iter()
+                    .map(|output| ArrayBatch::new(output, BatchAxis::new(0)))
+                    .collect::<Result<Vec<_>, _>>()?)
+            }
+        }
+    }
+}
+
+impl_differentiable_operation! {
+    CustomCallOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>,
+    {
+        |operation, context, _driver, inputs| {
+            // Foreign kernels require explicit composite derivative rules to propagate live tangents.
+            if inputs.iter().any(|input| !input.tangent().is_zero()) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "custom call `{}` has no differentiation rule; call it through a `{}` \
+                         with derivative rules to provide one",
+                        operation.target_name,
+                        COMPOSITE_OPERATION_NAME,
+                    ),
+                }
+                .into());
+            }
+
+            // Replay the primal call with structural-zero output tangents, including when the call has no inputs
+            // and the driver's usual zero-tangent shortcut does not apply.
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            context
+                .primal()
+                .bind(operation.clone(), Vec::new(), primals.as_slice())?
+                .into_iter()
+                .map(DifferentiationDual::new_with_zero_tangent)
+                .collect()
+        }
+    },
+    transpose = @nonlinear,
+}
+
+impl MemberOperation<ArrayIrType> for CustomCallOperation {
+    #[inline]
+    fn infer_parent_region_input_types(
+        &self,
+        _input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        Ok(Vec::new())
+    }
+
+    fn infer_parent_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        // In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension input
+        // per dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference
+        // verifies that each input defines its output axis's variable or refines it to an exact extent. The trailing
+        // inputs never reach the foreign kernel; they only ground the declared logical result extents.
+        check_count!("region", region_interfaces, 0, TypeError);
+        let (array_input_count, refinements, _) = self.refine_declared_output_types(input_types)?;
+        let array_input_types =
+            input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+
+        // Aliases compare the effective output contract: an exact trailing extent can make a symbolic declaration
+        // match a concrete input, and inherited manual variation can make a sharded input match an output declared
+        // without a sharding.
+        let output_types = self
+            .infer_array_output_types(array_input_types.as_slice())?
+            .iter()
+            .map(|output_type| refinements.refine_declared(output_type, &[]))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_configuration(array_input_types.as_slice(), output_types.as_slice())?;
+        Ok(output_types.into_iter().map(ArrayIrType::from).collect())
+    }
+
+    #[inline]
+    fn rename_parent_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<DimensionVariable>,
+    ) -> Result<Self, TypeError> {
+        self.rename_type_identities(renaming)
+    }
+}
+
+impl<
+    C: Domain<
+            Type = ArrayIrType,
+            Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
+        >,
+> MemberInterpretableOperation<C> for CustomCallOperation
+where
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>,
+{
+    fn interpret_in_parent<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        // Mixed-universe interpretation splits the inputs into the kernel's array inputs and the trailing declared
+        // result extents, runs the kernel through the projected array value family, and verifies that every dynamic
+        // output axis has exactly the extent its input declared before lifting the outputs back into the parent
+        // value family.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_parent_output_types(input_types.as_slice(), &[])?;
+        let (array_input_count, _, output_types) = self.refine_declared_output_types(input_types.as_slice())?;
+        let array_inputs = inputs[..array_input_count]
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<ArrayType>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_extents = inputs[array_input_count..]
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // The projected kernel sees the declaration refined by the concrete invocation's extents, so its own alias
+        // validation and allocation agree with the mixed boundary rather than seeing the unrefined symbolic declaration
+        // again. Metadata that inference only inherits (e.g., manual variation sharding) stays undeclared.
+        let operation = Self { output_types, ..self.clone() };
+        let outputs =
+            <C::Value as ValueProjection<ArrayType>>::Projected::custom_call(&operation, array_inputs.iter())?;
+        check_count!("output", outputs, self.output_types.len(), ProgramError);
+        let mut output_extents = output_extents.into_iter();
+        for (output_index, (output, output_type)) in outputs.iter().zip(&self.output_types).enumerate() {
+            for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+                if matches!(dimension, Dimension::Dynamic(_)) {
+                    let expected_extent = output_extents.next().unwrap().extent();
+                    let actual_extent = output.dimension_size(axis)?;
+                    if actual_extent != expected_extent {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "`{CUSTOM_CALL_OPERATION_NAME}` output {output_index} axis {axis} has extent \
+                                 {actual_extent}, but its explicit extent input is {expected_extent}",
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(outputs.into_iter().map(<C::Value as ValueProjection<ArrayType>>::from_projected).collect())
+    }
+}
+
+impl<
+    C: ContextProjection<
+            ArrayType,
+            Type = ArrayIrType,
+            Operation: OperationPayloadProjection
+                           + OperationProjection<
+                ArrayType,
+                Projected: From<CustomCallOperation>
+                               + From<BroadcastOperation>
+                               + From<ScanOperation<ArrayType>>
+                               + From<TransposeOperation>,
+            > + From<CustomCallOperation>
+                           + From<DynamicBroadcastOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ScanOperation<C::Type>>,
+        >,
+> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
+where
+    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Transpose,
+{
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // Each dynamic output axis occurrence contributes one trailing extent input, including repeated identities.
+        let extent_count = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            .count();
+        let Some(array_input_count) = inputs.len().checked_sub(extent_count) else {
+            return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
+        };
+        let (arrays, extents) = inputs.split_at(array_input_count);
+
+        // Output extents must be shared across batch items: mapped extents would require ragged output arrays.
+        for extent in extents {
+            extent.validate_replicated_dimension()?;
+        }
+
+        // With only array inputs and a static batch extent, the homogeneous rule has everything it needs. Dynamic
+        // extents stay here so the resulting scans and calls can consume their first-class dimension inputs.
+        let batch_dimension =
+            <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
+        if extents.is_empty() && batch_dimension.value().is_some() {
+            return batch_projected_operation(context, self, inputs);
+        }
+
+        // When all array inputs are invariant, bind the call once and keep its outputs replicated.
+        let Some((index, mapped)) = arrays.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
+        else {
+            let values = inputs.iter().map(ArrayIrBatch::value).cloned().collect::<Vec<_>>();
+            let outputs = context.parent().bind(self.clone(), Vec::new(), values.as_slice())?;
+            return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>());
+        };
+
+        match self.batching {
+            CustomCallBatching::Rejected => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no batching rule for input {} mapped at batch {}; invoke a \
+                     kernel that understands the batch axis, or select an explicit batching behavior with \
+                     `CustomCallOperation::with_batching`",
+                    self.target_name,
+                    index,
+                    mapped.batch_axis(),
+                ),
+            }),
+            CustomCallBatching::Sequential { .. } => {
+                // Move mapped axes to axis `0`; replicated arrays and output extents become invariant scan carries.
+                let aligned = arrays
+                    .iter()
+                    .map(|input| {
+                        if input.batch_axis().is_replicated() {
+                            Ok(input.clone())
+                        } else {
+                            driver.align_batch_axis(context, input.clone(), Axis::from(0))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // A dynamic trip count needs its dimension value as a trailing scan input; static counts live
+                // in the scan payload. The body reuses the carried extents for each item's original output shapes.
+                let length_input = batch_dimension.variable().map(|_| context.axis_extent());
+                self.batch_sequential(context, &aligned, extents, batch_dimension, length_input)
+            }
+            CustomCallBatching::BroadcastAll
+            | CustomCallBatching::ExpandDimensions
+            | CustomCallBatching::Vectorized => {
+                // Stage one call with batch-prefixed outputs. Mapped inputs use leading axis `0`; replicated arrays
+                // gain the full batch extent for `BroadcastAll`, a singleton axis for `ExpandDimensions`, or keep
+                // their shape for `Vectorized`. First-class output extents stay separate from the kernel's inputs.
+                let aligned = arrays
+                    .iter()
+                    .map(|input| {
+                        if !input.batch_axis().is_replicated() || self.batching == CustomCallBatching::BroadcastAll {
+                            return driver.align_batch_axis(context, input.clone(), Axis::from(0));
+                        }
+                        if self.batching == CustomCallBatching::Vectorized {
+                            return Ok(input.clone());
+                        }
+
+                        // The remaining case is singleton expansion. Use the input's runtime extents for its original
+                        // axes and preserve their placement; the new length-one axis is replicated.
+                        let value_type = input.value().r#type();
+                        let input_type = <&ArrayType>::try_from(value_type.as_ref())?;
+                        let output_type = input_type.batched(0, Dimension::Static(1), ShardingDimension::Replicated)?;
+                        let mut output_dimensions = context.parent().bind(
+                            ConstantOperation::new(DimensionValue::constant(1).unwrap()),
+                            Vec::new(),
+                            &[],
+                        )?;
+                        for axis in 0..input_type.rank() {
+                            output_dimensions.push(input.value().dimension_size(axis)?);
+                        }
+                        let output_axes = (1..=input_type.rank()).collect::<Vec<_>>();
+                        let value = input.value().dynamic_broadcast_with_output_sharding(
+                            &output_dimensions,
+                            &output_axes,
+                            output_type.sharding().cloned(),
+                        )?;
+                        ArrayIrBatch::new(value, BatchAxis::new(0))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let output_types =
+                    self.batch_prefixed_output_types(batch_dimension.clone(), context.axis_sharding())?;
+
+                // Shift explicit layout declarations for inputs that gain a leading batch axis. `Vectorized`
+                // leaves replicated inputs unexpanded and keeps their original layout declarations.
+                let input_layouts = self.batch_prefixed_input_layouts(|index| {
+                    self.batching != CustomCallBatching::Vectorized
+                        || arrays.get(index).is_some_and(|input| !input.batch_axis().is_replicated())
+                })?;
+                let operation = Self { output_types, input_layouts, ..self.clone() };
+
+                // Regroup the trailing extents in output/axis order. A dynamic batch axis contributes the shared batch
+                // extent before each output's original extents. Static batch axes add no extent inputs.
+                let mut values = aligned.iter().map(|batch| batch.value().clone()).collect::<Vec<_>>();
+                let mut declared_extents = extents.iter();
+                for output_type in &self.output_types {
+                    if batch_dimension.variable().is_some() {
+                        values.push(context.axis_extent().clone());
+                    }
+                    for dimension in output_type.shape().dimensions() {
+                        if matches!(dimension, Dimension::Dynamic(_)) {
+                            values.push(declared_extents.next().unwrap().value().clone());
+                        }
+                    }
+                }
+                let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
+                Ok(outputs
+                    .into_iter()
+                    .map(|output| ArrayIrBatch::new(output, BatchAxis::new(0)))
+                    .collect::<Result<Vec<_>, _>>()?)
+            }
+        }
+    }
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>> MemberDifferentiableOperation<C>
+    for CustomCallOperation
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Trailing output extents are integer dimensions with structural-zero tangents. Any live array tangent still
+        // requires explicit composite derivative rules for the foreign kernel.
+        if inputs.iter().any(|input| !input.tangent().is_zero()) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no differentiation rule; call it through a `{}` with \
+                     derivative rules to provide one",
+                    self.target_name, COMPOSITE_OPERATION_NAME,
+                ),
+            }
+            .into());
+        }
+
+        // Replay the primal call with structural-zero output tangents, including calls without inputs.
+        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        context
+            .primal()
+            .bind(self.clone(), Vec::new(), primals.as_slice())?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect()
+    }
+}
+
+/// Represents the ability to call foreign kernels registered with the executing backend. [`CustomCall`] stages or
+/// executes a [`CustomCallOperation`]; refer to its documentation for the calling convention and transform rules.
+/// Context-carrying values dispatch through the first input's context, so a call without inputs goes through
+/// [`CustomCallOperation::call`] on the context itself instead. Concrete eager values delegate to their backend,
+/// which determines whether zero-input kernels are supported.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait CustomCall<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Calls the foreign kernel described by `operation` with the provided inputs, returning one value per
+    /// declared output type, and a [`ProgramError`] if something goes wrong.
+    fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
+        operation: &CustomCallOperation,
+        inputs: I,
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        Self: 'o;
+}
+
+impl CustomCall for Array {
+    fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
+        operation: &CustomCallOperation,
+        _inputs: I,
+    ) -> Result<Vec<Self>, ProgramError> {
+        // The reference backend has no foreign-kernel registry.
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "the reference array backend cannot execute the foreign kernel `{}`",
+                operation.target_name(),
+            ),
+        })
+    }
+}
+
+impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
+    fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
+        operation: &CustomCallOperation,
+        inputs: I,
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        Self: 'o,
+    {
+        // A concrete array IR value executes the kernel on its array members through the mixed-universe interpretation
+        // rule, which also verifies the extents of dynamic outputs against the trailing dimension inputs. It uses
+        // `ValueDirectDispatch`, so the generic implementation below never applies to it.
+        let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
+        operation.interpret_in_parent(&EagerContext::<Self>::new(), &EmptyRegionDriver, inputs.as_slice())
+    }
+}
+
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<CustomCallOperation>>>>
+    CustomCall<T> for V
+{
+    fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
+        operation: &CustomCallOperation,
+        inputs: I,
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        Self: 'o,
+    {
+        // Any context-carrying value calls foreign kernels by binding a `CustomCallOperation` through its own context,
+        // in either universe, because the operation is also a native member operation of the array IR universe. The
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers and backend-owned values without conflicting with the concrete
+        // implementations above.
+        let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
+        let Some(first) = inputs.first() else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "the custom-call capability dispatches through its first input's context, so calling `{}` with \
+                     no inputs requires `CustomCallOperation::call` on the context instead",
+                    operation.target_name(),
+                ),
+            });
+        };
+        first.domain().bind(operation.clone(), Vec::new(), inputs.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use indoc::{formatdoc, indoc};
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue,
+        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, ShardingDimension, StridedLayout, Tile,
+        TileDimension,
+    };
+    use crate::batching::{
+        BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingError, BatchingTracer,
+        ProgramBatchingOutputAxesPolicy, batch,
+    };
+    use crate::contexts::StagingContext;
+    use crate::differentiation::DifferentiableOperation;
+    use crate::interpretation::InterpretableOperation;
+    use crate::macros::{check_operation_transposition, check_operation_type_inference};
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::partial::PartialValue;
+    use crate::programs::{
+        AttachedRegions, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope, ValueDirectDispatch,
+        ValueDomainDispatch,
+    };
+    use crate::tests::hash_of;
+    use crate::tracing::{DomainTracer, Trace, TracingContext};
+
+    use super::*;
+
+    /// Traces one call of `operation` over inputs of `input_types` in the homogeneous [`ArrayType`] universe, batches
+    /// the traced program over `axis_size` items with `input_batch_axes`, and returns the rendering of the batched
+    /// program together with its natural output batch axes.
+    fn batch_custom_call(
+        operation: CustomCallOperation,
+        input_types: Vec<ArrayType>,
+        axis_size: usize,
+        input_batch_axes: &[BatchAxis],
+    ) -> Result<(String, Vec<BatchAxis>), BatchingError> {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                CustomCall::custom_call(&operation, inputs.iter())
+            },
+            input_types,
+        )?;
+        let (batched, output_axes) = program
+            .batched(
+                axis_size,
+                ShardingDimension::Replicated,
+                input_batch_axes,
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?
+            .into_parts();
+        Ok((batched.to_string(), output_axes))
+    }
+
+    /// Binds one call of `operation` through a batching context in the mixed [`ArrayIrType`] universe and returns the
+    /// rendering of the staged program together with the batch axes of the call's outputs. The call receives, in order,
+    /// an input of per-item type `item_type` mapped along a new leading batch axis, one replicated input of each of
+    /// `replicated_types`, and one replicated trailing output-extent input of each of `extent_types`. Without a
+    /// `static_batch_extent`, the batch extent is a leading dynamic `batch ∈ [1, 9)` program input, which keeps the
+    /// call on the mixed batching rule instead of the projected homogeneous one. A static batch extent is staged as a
+    /// dimension constant instead.
+    fn batch_array_ir_custom_call(
+        operation: CustomCallOperation,
+        static_batch_extent: Option<usize>,
+        item_type: ArrayType,
+        replicated_types: &[ArrayType],
+        extent_types: &[DimensionType],
+    ) -> Result<(String, Vec<BatchAxis>), ProgramError> {
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = match static_batch_extent {
+            Some(extent) => Dimension::Static(extent),
+            None => Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?)),
+        };
+        let dynamic_batch_extent = batch.variable().map(|batch| trace.input(DimensionType::from(batch.clone()).into()));
+        let mapped = trace.input(item_type.batched(0, batch.clone(), ShardingDimension::Replicated)?.into());
+        let replicated = replicated_types
+            .iter()
+            .map(|replicated_type| trace.input(replicated_type.clone().into()))
+            .chain(extent_types.iter().map(|extent_type| trace.input(extent_type.clone().into())))
+            .collect::<Vec<_>>();
+        let input_count = usize::from(dynamic_batch_extent.is_some()) + 1 + replicated.len();
+        let batch_extent = match (batch.value(), dynamic_batch_extent) {
+            (Some(extent), _) => trace.lift(ArrayIrValue::Dimension(DimensionValue::constant(extent)?))?,
+            (None, batch_extent) => batch_extent.unwrap(),
+        };
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+        let inputs = std::iter::once(ArrayIrBatch::new(mapped, BatchAxis::new(0))?)
+            .chain(replicated.into_iter().map(ArrayIrBatch::replicated))
+            .map(|input| BatchingTracer::new(context.clone(), input))
+            .collect::<Vec<_>>();
+        let outputs = context.bind(operation, Vec::new(), &inputs)?;
+        let output_axes = outputs.iter().map(|output| output.batch().batch_axis()).collect::<Vec<_>>();
+        let outputs = outputs
+            .into_iter()
+            .map(|output| output.into_batch().into_value().atom_id())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_count = outputs.len();
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            outputs,
+            vec![Placeholder; input_count],
+            vec![Placeholder; output_count],
+        )?;
+        Ok((program.to_string(), output_axes))
+    }
+
+    /// Real array that supplies an executable identity foreign kernel (i.e., one that returns its inputs as its
+    /// outputs after validating the call's own homogeneous type inference) for mixed-universe interpretation tests,
+    /// which the reference [`Array`] backend cannot run because it has no kernel registry.
+    #[derive(Clone, Debug, PartialEq)]
+    struct IdentityKernelArray(Array);
+
+    impl Display for IdentityKernelArray {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl Parameter for IdentityKernelArray {}
+
+    impl Typed for IdentityKernelArray {
+        type Type = ArrayType;
+
+        fn r#type(&self) -> Cow<'_, ArrayType> {
+            self.0.r#type()
+        }
+    }
+
+    impl Value for IdentityKernelArray {
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
+
+        fn domain(&self) -> Self::Domain {
+            EagerContext::new()
+        }
+    }
+
+    impl CustomCall for IdentityKernelArray {
+        fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
+            operation: &CustomCallOperation,
+            inputs: I,
+        ) -> Result<Vec<Self>, ProgramError> {
+            let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            operation.infer_output_types(input_types.as_slice(), &[])?;
+            Ok(inputs)
+        }
+    }
+
+    impl DimensionSize<usize> for IdentityKernelArray {
+        fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
+            self.0.dimension_size(axis)
+        }
+    }
+
+    #[test]
+    fn test_custom_call_attribute() {
+        // Every scalar conversion selects the variant of its Rust type, and unsuffixed literals follow Rust's default
+        // literal types.
+        assert_eq!(CustomCallAttribute::from("x"), CustomCallAttribute::String("x".to_string()));
+        assert_eq!(CustomCallAttribute::from("x".to_string()), CustomCallAttribute::String("x".to_string()));
+        assert_eq!(CustomCallAttribute::from(true), CustomCallAttribute::Boolean(true));
+        assert_eq!(CustomCallAttribute::from(-1i8), CustomCallAttribute::I8(-1));
+        assert_eq!(CustomCallAttribute::from(-2i16), CustomCallAttribute::I16(-2));
+        assert_eq!(CustomCallAttribute::from(-3i32), CustomCallAttribute::I32(-3));
+        assert_eq!(CustomCallAttribute::from(-4i64), CustomCallAttribute::I64(-4));
+        assert_eq!(CustomCallAttribute::from(5u8), CustomCallAttribute::U8(5));
+        assert_eq!(CustomCallAttribute::from(6u16), CustomCallAttribute::U16(6));
+        assert_eq!(CustomCallAttribute::from(7u32), CustomCallAttribute::U32(7));
+        assert_eq!(CustomCallAttribute::from(8u64), CustomCallAttribute::U64(8));
+        assert_eq!(CustomCallAttribute::from(2.5f32), CustomCallAttribute::F32(2.5));
+        assert_eq!(CustomCallAttribute::from(2.5f64), CustomCallAttribute::F64(2.5));
+        assert_eq!(CustomCallAttribute::from(4), CustomCallAttribute::I32(4));
+        assert_eq!(CustomCallAttribute::from(2.5), CustomCallAttribute::F64(2.5));
+
+        // Every numeric vector except `Vec<u8>` (which is binary data) becomes an array attribute.
+        assert_eq!(
+            CustomCallAttribute::from(vec![1i8, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::I8(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1i16, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::I16(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1i32, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::I32(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1i64, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::I64(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1u16, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::U16(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1u32, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::U32(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1u64, 2]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::U64(vec![1, 2])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1.5f32, 2.0]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::F32(vec![1.5, 2.0])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(vec![1.5f64, 2.0]),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::F64(vec![1.5, 2.0])),
+        );
+        assert_eq!(
+            CustomCallAttribute::from(CustomCallArrayAttribute::U8(vec![1, 2])),
+            CustomCallAttribute::Array(CustomCallArrayAttribute::U8(vec![1, 2])),
+        );
+
+        // Byte vectors and byte slices become binary data.
+        assert_eq!(CustomCallAttribute::from(vec![0u8, 0x80, 0xff]), CustomCallAttribute::Bytes(vec![0, 0x80, 0xff]));
+        assert_eq!(
+            CustomCallAttribute::from([0u8, 0x80, 0xff].as_slice()),
+            CustomCallAttribute::Bytes(vec![0, 0x80, 0xff]),
+        );
+
+        // `I64` and `F64` render as bare literals, while every other scalar carries its Rust type suffix.
+        let dictionary = CustomCallAttribute::Dictionary(vec![
+            ("count".to_string(), CustomCallAttribute::I64(1)),
+            ("options".to_string(), CustomCallAttribute::Dictionary(vec![("mode".to_string(), "fast".into())])),
+        ]);
+        for (attribute, display, debug) in [
+            (CustomCallAttribute::String("x".to_string()), "\"x\"", "String(\"x\")"),
+            (CustomCallAttribute::from("a \"b\", c]"), "\"a \\\"b\\\", c]\"", "String(\"a \\\"b\\\", c]\")"),
+            (CustomCallAttribute::Bytes(vec![0, 255]), "bytes [00, ff]", "Bytes([0, 255])"),
+            (CustomCallAttribute::Bytes(Vec::new()), "bytes []", "Bytes([])"),
+            (CustomCallAttribute::Boolean(true), "true", "Boolean(true)"),
+            (CustomCallAttribute::I8(-1), "-1i8", "I8(-1)"),
+            (CustomCallAttribute::I16(-2), "-2i16", "I16(-2)"),
+            (CustomCallAttribute::I32(-3), "-3i32", "I32(-3)"),
+            (CustomCallAttribute::I64(-4), "-4", "I64(-4)"),
+            (CustomCallAttribute::U8(5), "5u8", "U8(5)"),
+            (CustomCallAttribute::U16(6), "6u16", "U16(6)"),
+            (CustomCallAttribute::U32(7), "7u32", "U32(7)"),
+            (CustomCallAttribute::U64(8), "8u64", "U64(8)"),
+            (CustomCallAttribute::F32(1.0), "1.0f32", "F32(1.0)"),
+            (CustomCallAttribute::F64(2.0), "2.0", "F64(2.0)"),
+            (CustomCallAttribute::from(vec![1i32, 2]), "array<i32: 1, 2>", "Array(I32([1, 2]))"),
+            (CustomCallAttribute::Dictionary(Vec::new()), "{}", "Dictionary([])"),
+            (
+                dictionary,
+                "{count=1, options={mode=\"fast\"}}",
+                "Dictionary([(\"count\", I64(1)), (\"options\", Dictionary([(\"mode\", String(\"fast\"))]))])",
+            ),
+        ] {
+            assert_eq!(attribute.to_string(), display);
+            assert_eq!(format!("{attribute:?}"), debug);
+        }
+    }
+
+    #[test]
+    fn test_custom_call_attribute_equality() {
+        // Equal attributes are equal and hash identically, so they work as map keys.
+        let attribute = CustomCallAttribute::F64(2.5);
+        assert_eq!(attribute, attribute.clone());
+        assert_eq!(hash_of(&attribute), hash_of(&CustomCallAttribute::from(2.5)));
+        assert_eq!(hash_of(&CustomCallAttribute::from("name")), hash_of(&CustomCallAttribute::from("name")));
+        let attributes = HashMap::from([
+            (attribute, "scale"),
+            (CustomCallAttribute::F32(2.5), "narrow_scale"),
+            (CustomCallAttribute::from(vec![1i32, 2]), "sizes"),
+            (CustomCallAttribute::Dictionary(vec![("mode".to_string(), "fast".into())]), "options"),
+        ]);
+        assert_eq!(attributes.get(&CustomCallAttribute::F64(2.5)), Some(&"scale"));
+        assert_eq!(attributes.get(&CustomCallAttribute::F32(2.5)), Some(&"narrow_scale"));
+        assert_eq!(attributes.get(&CustomCallAttribute::from(vec![1i32, 2])), Some(&"sizes"));
+        assert_eq!(
+            attributes.get(&CustomCallAttribute::Dictionary(vec![("mode".to_string(), "fast".into())])),
+            Some(&"options"),
+        );
+        assert_eq!(attributes.get(&CustomCallAttribute::F64(3.5)), None);
+
+        // Floating-point attributes compare bitwise: every NaN equals itself, and signed zeros are distinct.
+        let nan = CustomCallAttribute::F64(f64::NAN);
+        assert_eq!(nan, nan.clone());
+        assert_eq!(hash_of(&nan), hash_of(&CustomCallAttribute::F64(f64::NAN)));
+        assert_ne!(nan, CustomCallAttribute::F64(-f64::NAN));
+        assert_ne!(CustomCallAttribute::F64(-0.0), CustomCallAttribute::F64(0.0));
+        assert_eq!(CustomCallAttribute::F32(f32::NAN), CustomCallAttribute::F32(f32::NAN));
+        assert_eq!(hash_of(&CustomCallAttribute::F32(f32::NAN)), hash_of(&CustomCallAttribute::F32(f32::NAN)));
+        assert_ne!(CustomCallAttribute::F32(-0.0), CustomCallAttribute::F32(0.0));
+
+        // Attributes of different variants never compare equal, even when they hold equal values of different types or
+        // widths.
+        assert_ne!(CustomCallAttribute::I64(1), CustomCallAttribute::F64(1.0));
+        assert_ne!(CustomCallAttribute::I64(1), CustomCallAttribute::Boolean(true));
+        assert_ne!(CustomCallAttribute::I32(1), CustomCallAttribute::I64(1));
+        assert_ne!(CustomCallAttribute::U8(1), CustomCallAttribute::I8(1));
+        assert_ne!(CustomCallAttribute::F32(1.0), CustomCallAttribute::F64(1.0));
+        assert_ne!(CustomCallAttribute::String("true".to_string()), CustomCallAttribute::Boolean(true));
+        assert_ne!(CustomCallAttribute::String(String::new()), CustomCallAttribute::Bytes(vec![]));
+
+        // Dictionaries compare their entries in insertion order.
+        assert_ne!(
+            CustomCallAttribute::Dictionary(vec![
+                ("a".to_string(), CustomCallAttribute::I64(1)),
+                ("b".to_string(), CustomCallAttribute::I64(2)),
+            ]),
+            CustomCallAttribute::Dictionary(vec![
+                ("b".to_string(), CustomCallAttribute::I64(2)),
+                ("a".to_string(), CustomCallAttribute::I64(1)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_array_attribute() {
+        // Arrays render with their element type, and empty arrays omit the element list.
+        for (array, length, display, debug) in [
+            (CustomCallArrayAttribute::I8(vec![-1, 2]), 2, "array<i8: -1, 2>", "I8([-1, 2])"),
+            (CustomCallArrayAttribute::I16(vec![-1, 2]), 2, "array<i16: -1, 2>", "I16([-1, 2])"),
+            (CustomCallArrayAttribute::I32(vec![-1, 2]), 2, "array<i32: -1, 2>", "I32([-1, 2])"),
+            (CustomCallArrayAttribute::I64(vec![-1, 2]), 2, "array<i64: -1, 2>", "I64([-1, 2])"),
+            (CustomCallArrayAttribute::U8(vec![1]), 1, "array<u8: 1>", "U8([1])"),
+            (CustomCallArrayAttribute::U16(vec![1]), 1, "array<u16: 1>", "U16([1])"),
+            (CustomCallArrayAttribute::U32(vec![1]), 1, "array<u32: 1>", "U32([1])"),
+            (CustomCallArrayAttribute::U64(vec![1]), 1, "array<u64: 1>", "U64([1])"),
+            (CustomCallArrayAttribute::F32(vec![1.5, -0.0]), 2, "array<f32: 1.5, -0.0>", "F32([1.5, -0.0])"),
+            (
+                CustomCallArrayAttribute::F64(vec![1.0, 2.5, 3.0]),
+                3,
+                "array<f64: 1.0, 2.5, 3.0>",
+                "F64([1.0, 2.5, 3.0])",
+            ),
+            (CustomCallArrayAttribute::I32(Vec::new()), 0, "array<i32>", "I32([])"),
+            (CustomCallArrayAttribute::F64(Vec::new()), 0, "array<f64>", "F64([])"),
+        ] {
+            assert_eq!(array.len(), length);
+            assert_eq!(array.is_empty(), length == 0);
+            assert_eq!(array.to_string(), display);
+            assert_eq!(format!("{array:?}"), debug);
+        }
+
+        // Equal arrays hash identically, so they work as map keys.
+        let array = CustomCallArrayAttribute::I32(vec![1, 2]);
+        assert_eq!(array, array.clone());
+        assert_eq!(hash_of(&array), hash_of(&CustomCallArrayAttribute::I32(vec![1, 2])));
+        let arrays = HashMap::from([(array, "sizes"), (CustomCallArrayAttribute::F32(vec![0.5]), "scales")]);
+        assert_eq!(arrays.get(&CustomCallArrayAttribute::I32(vec![1, 2])), Some(&"sizes"));
+        assert_eq!(arrays.get(&CustomCallArrayAttribute::F32(vec![0.5])), Some(&"scales"));
+        assert_eq!(arrays.get(&CustomCallArrayAttribute::I32(vec![2, 1])), None);
+
+        // Floating-point elements compare bitwise, and arrays of different element types never compare equal.
+        assert_eq!(CustomCallArrayAttribute::F32(vec![f32::NAN]), CustomCallArrayAttribute::F32(vec![f32::NAN]));
+        assert_eq!(
+            hash_of(&CustomCallArrayAttribute::F64(vec![f64::NAN])),
+            hash_of(&CustomCallArrayAttribute::F64(vec![f64::NAN])),
+        );
+        assert_ne!(CustomCallArrayAttribute::F32(vec![-0.0]), CustomCallArrayAttribute::F32(vec![0.0]));
+        assert_ne!(CustomCallArrayAttribute::F64(vec![-0.0]), CustomCallArrayAttribute::F64(vec![0.0]));
+        assert_ne!(CustomCallArrayAttribute::F64(vec![1.0]), CustomCallArrayAttribute::F64(vec![1.0, 1.0]));
+        assert_ne!(CustomCallArrayAttribute::I32(vec![1]), CustomCallArrayAttribute::I64(vec![1]));
+        assert_ne!(CustomCallArrayAttribute::I8(Vec::new()), CustomCallArrayAttribute::U8(Vec::new()));
+    }
+
+    #[test]
+    fn test_custom_call_input_output_alias() {
+        let alias = CustomCallInputOutputAlias::new(0, 1);
+        assert_eq!(alias.input_index(), 0);
+        assert_eq!(alias.output_index(), 1);
+        assert_eq!(alias.to_string(), "0->1");
+        assert_eq!(format!("{alias:?}"), "CustomCallInputOutputAlias { input_index: 0, output_index: 1 }");
+        assert_eq!(alias, CustomCallInputOutputAlias::new(0, 1));
+        assert_ne!(alias, CustomCallInputOutputAlias::new(1, 0));
+        assert_eq!(hash_of(&alias), hash_of(&CustomCallInputOutputAlias::new(0, 1)));
+        let aliases = HashMap::from([(alias, "first"), (CustomCallInputOutputAlias::new(1, 0), "second")]);
+        assert_eq!(aliases.get(&CustomCallInputOutputAlias::new(0, 1)), Some(&"first"));
+        assert_eq!(aliases.get(&CustomCallInputOutputAlias::new(1, 0)), Some(&"second"));
+        assert_eq!(aliases.get(&CustomCallInputOutputAlias::new(1, 1)), None);
+    }
+
+    #[test]
+    fn test_custom_call_batching_variants() {
+        assert_eq!(CustomCallUnrolling::default(), CustomCallUnrolling::Disabled);
+        assert_eq!(CustomCallBatching::default(), CustomCallBatching::Rejected);
+        for (batching, display, debug) in [
+            (CustomCallBatching::Rejected, "rejected", "Rejected"),
+            (
+                CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled },
+                "sequential",
+                "Sequential { unroll: Disabled }",
+            ),
+            (
+                CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) },
+                "sequential(unroll=2)",
+                "Sequential { unroll: Factor(2) }",
+            ),
+            (
+                CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full },
+                "sequential(unroll=full)",
+                "Sequential { unroll: Full }",
+            ),
+            (CustomCallBatching::BroadcastAll, "broadcast_all", "BroadcastAll"),
+            (CustomCallBatching::ExpandDimensions, "expand_dimensions", "ExpandDimensions"),
+            (CustomCallBatching::Vectorized, "vectorized", "Vectorized"),
+        ] {
+            assert_eq!(batching.to_string(), display);
+            assert_eq!(format!("{batching:?}"), debug);
+        }
+
+        // Unroll factors distinguish sequential behaviors, and equal behaviors hash identically.
+        assert_ne!(
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled },
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(1) },
+        );
+        assert_eq!(hash_of(&CustomCallBatching::BroadcastAll), hash_of(&CustomCallBatching::BroadcastAll));
+        let behaviors = HashMap::from([
+            (CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) }, "sequential"),
+            (CustomCallBatching::Vectorized, "vectorized"),
+        ]);
+        assert_eq!(
+            behaviors.get(&CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) }),
+            Some(&"sequential"),
+        );
+        assert_eq!(behaviors.get(&CustomCallBatching::Vectorized), Some(&"vectorized"));
+        assert_eq!(behaviors.get(&CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled }), None);
+    }
+
+    #[test]
+    fn test_custom_call() {
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
+        assert_eq!(operation.name(), CUSTOM_CALL_OPERATION_NAME);
+        assert_eq!(operation.target_name(), "ryft.test.add_one");
+        assert!(operation.attributes().is_empty());
+        assert!(operation.input_layouts().is_empty());
+        assert!(operation.input_output_aliases().is_empty());
+        assert_eq!(operation.output_types(), &[ArrayType::new_static(DataType::F32, [2])]);
+        assert!(!operation.has_side_effect());
+        assert_eq!(operation.effect_class(), None);
+        assert!(operation.effects().is_pure());
+        assert_eq!(operation.batching(), CustomCallBatching::Rejected);
+        assert_eq!(operation.to_string(), "custom_call [target=ryft.test.add_one]");
+
+        // Operations compare and hash by their complete payload.
+        assert_eq!(operation, operation.clone());
+        assert_eq!(hash_of(&operation), hash_of(&operation.clone()));
+        assert_ne!(operation, CustomCallOperation::new("ryft.test.add_two", operation.output_types().to_vec()));
+        assert_ne!(operation, operation.clone().with_batching(CustomCallBatching::BroadcastAll));
+        assert_eq!(
+            format!("{:?}", CustomCallOperation::new("kernel", Vec::new())),
+            "CustomCallOperation { target_name: \"kernel\", attributes: [], input_layouts: [], \
+             input_output_aliases: [], output_types: [], effect_class: None, batching: Rejected }",
+        );
+
+        // Every configured field renders in declaration order, one field per line once the section is long.
+        let operation = operation
+            .with_attribute("scale", 2.0)
+            .with_input_layouts([None])
+            .with_input_output_alias(0, 0)
+            .unwrap()
+            .with_effect_class(EffectClass::DeviceOrderedIo)
+            .with_batching(CustomCallBatching::BroadcastAll);
+        assert_eq!(
+            operation.to_string(),
+            indoc! {"
+                custom_call [
+                    target=ryft.test.add_one,
+                    scale=2.0,
+                    input_layouts=[default],
+                    input_output_alias=0->0,
+                    has_side_effect=true,
+                    effect_class=device_ordered_io,
+                    batching=broadcast_all,
+                ]
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_with_attribute() {
+        let operation = CustomCallOperation::new("kernel", Vec::new())
+            .with_attribute("scale", 2.5f32)
+            .with_attribute("count", 4i64)
+            .with_attribute("label", "x");
+        assert_eq!(
+            operation.attributes(),
+            &[
+                ("scale".to_string(), CustomCallAttribute::F32(2.5)),
+                ("count".to_string(), CustomCallAttribute::I64(4)),
+                ("label".to_string(), CustomCallAttribute::String("x".to_string())),
+            ],
+        );
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, scale=2.5f32, count=4, label=\"x\"]");
+
+        // Nested dictionaries and arrays render inline, and long attribute lists wrap onto one line per field.
+        let operation = operation
+            .with_attribute("sizes", vec![1i32, 2])
+            .with_attribute(
+                "options",
+                CustomCallAttribute::Dictionary(vec![
+                    ("verbose".to_string(), true.into()),
+                    ("offset".to_string(), 7u8.into()),
+                ]),
+            )
+            .with_attribute("payload", vec![0u8, 255]);
+        assert_eq!(
+            operation.to_string(),
+            indoc! {"
+                custom_call [
+                    target=kernel,
+                    scale=2.5f32,
+                    count=4,
+                    label=\"x\",
+                    sizes=array<i32: 1, 2>,
+                    options={verbose=true, offset=7u8},
+                    payload=bytes [00, ff],
+                ]
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_with_input_layouts() {
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([Some(column_major.clone()), None]);
+        assert_eq!(operation.input_layouts(), &[Some(column_major.clone()), None]);
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, input_layouts=[tiled{0,1}, default]]");
+
+        // A later declaration replaces the earlier one, and an empty declaration removes the field.
+        let strided = Layout::Strided(StridedLayout::new(vec![4]));
+        let operation = operation.with_input_layouts([Some(strided.clone())]);
+        assert_eq!(operation.input_layouts(), &[Some(strided)]);
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, input_layouts=[strided{4}]]");
+        let operation = operation.with_input_layouts(Vec::new());
+        assert!(operation.input_layouts().is_empty());
+        assert_eq!(operation.to_string(), "custom_call [target=kernel]");
+    }
+
+    #[test]
+    fn test_custom_call_with_input_output_alias() {
+        let operation = CustomCallOperation::new(
+            "kernel",
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [3])],
+        )
+        .with_input_output_alias(0, 0)
+        .unwrap()
+        .with_input_output_alias(2, 1)
+        .unwrap();
+        assert_eq!(
+            operation.input_output_aliases(),
+            &[CustomCallInputOutputAlias::new(0, 0), CustomCallInputOutputAlias::new(2, 1)],
+        );
+        assert_eq!(
+            operation.to_string(),
+            "custom_call [target=kernel, input_output_alias=0->0, input_output_alias=2->1]",
+        );
+
+        // Each input and each output participates in at most one alias.
+        assert!(matches!(
+            operation.clone().with_input_output_alias(0, 2),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` cannot add alias 0->2 because alias `0->0` already uses the same input \
+                               or output",
+        ));
+        assert!(matches!(
+            operation.with_input_output_alias(1, 1),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` cannot add alias 1->1 because alias `2->1` already uses the same input \
+                               or output",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_with_side_effect() {
+        // The plain side effect is the unordered, tokenless contract of JAX's `has_side_effect=True`.
+        let operation = CustomCallOperation::new("kernel", Vec::new()).with_side_effect();
+        assert!(operation.has_side_effect());
+        assert_eq!(operation.effect_class(), Some(EffectClass::UnorderedIo));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        // The unordered class renders as the bare `has_side_effect` flag.
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true]");
+        // The side effect replaces any earlier effect selection.
+        assert_eq!(
+            operation.with_effect_class(EffectClass::OrderedIo).with_side_effect().effect_class(),
+            Some(EffectClass::UnorderedIo),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_with_effect_class() {
+        // Classes other than the unordered class render explicitly beside the side-effect flag.
+        let device_ordered =
+            CustomCallOperation::new("kernel", Vec::new()).with_effect_class(EffectClass::DeviceOrderedIo);
+        assert!(device_ordered.has_side_effect());
+        assert_eq!(device_ordered.effect_class(), Some(EffectClass::DeviceOrderedIo));
+        assert_eq!(device_ordered.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
+        assert_eq!(
+            device_ordered.to_string(),
+            "custom_call [target=kernel, has_side_effect=true, effect_class=device_ordered_io]",
+        );
+
+        // Ordered classes name themselves in the rendering, unlike the unordered class of `with_side_effect`.
+        let ordered = CustomCallOperation::new("kernel", Vec::new()).with_effect_class(EffectClass::OrderedIo);
+        assert!(ordered.has_side_effect());
+        assert_eq!(ordered.effect_class(), Some(EffectClass::OrderedIo));
+        assert_eq!(ordered.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(ordered.to_string(), "custom_call [target=kernel, has_side_effect=true, effect_class=ordered_io]");
+
+        // The last selection wins.
+        assert_eq!(ordered.with_effect_class(EffectClass::UnorderedIo).effect_class(), Some(EffectClass::UnorderedIo));
+    }
+
+    #[test]
+    fn test_custom_call_with_batching() {
+        // The batching behavior renders only when it differs from the default `Rejected` behavior.
+        let operation = CustomCallOperation::new("kernel", Vec::new());
+        assert_eq!(operation.batching(), CustomCallBatching::Rejected);
+        assert_eq!(operation.to_string(), "custom_call [target=kernel]");
+        let operation =
+            operation.with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        assert_eq!(operation.batching(), CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential]");
+        let operation =
+            operation.with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) });
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential(unroll=2)]");
+        let operation = operation.with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential(unroll=full)]");
+        let operation = operation.with_batching(CustomCallBatching::BroadcastAll).with_side_effect();
+        assert_eq!(operation.batching(), CustomCallBatching::BroadcastAll);
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true, batching=broadcast_all]");
+        let operation = operation.with_batching(CustomCallBatching::Rejected);
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true]");
+    }
+
+    #[test]
+    fn test_custom_call_call() {
+        // Calling through the context binds the operation like the capability does, and it is the entry point for
+        // calls without array inputs, which the capability cannot route through a first input.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = trace.input(ArrayType::new_static(DataType::F32, [2]));
+        let source = CustomCallOperation::new("ryft.test.source", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let [generated] = source.call(&trace, &[]).unwrap().try_into().unwrap();
+        let add = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let [output] = add.call(&trace, &[input, generated]).unwrap().try_into().unwrap();
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = custom_call [target=ryft.test.source]
+                    %2:f32[2] = custom_call [target=ryft.test.add] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference() {
+        // Declared output types do not depend on the inputs, which the kernel receives verbatim.
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])]),
+            cases = [
+                { input_types = [], output_types = [ArrayType::new_static(DataType::F32, [2])] },
+                {
+                    input_types = [ArrayType::scalar(DataType::I32), ArrayType::new_static(DataType::F64, [3])],
+                    output_types = [ArrayType::new_static(DataType::F32, [2])],
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", Vec::new()),
+            cases = [{ input_types = [], output_types = [] }],
+        );
+
+        // Aliases must refer to an existing input and output of identical types.
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2])],
+                    output_types = [ArrayType::new_static(DataType::F32, [2])],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32)],
+                    error = "`custom_call` alias `0->0` requires matching input and output types but input 0 has \
+                             type `f32[]` and output 0 has type `f32[2]`",
+                },
+                {
+                    input_types = [],
+                    error = "`custom_call` alias `0->0` refers to input 0 but the call has 0 array input(s)",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_output_alias(0, 1)
+                .unwrap(),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                error = "`custom_call` alias `0->1` refers to output 1 but the call has 1 output(s)",
+            }],
+        );
+
+        // Custom calls are region-free.
+        assert_eq!(
+            CustomCallOperation::new("kernel", Vec::new())
+                .infer_output_types(&[], &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)]),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_attribute_names() {
+        // Attribute names must be unique within each dictionary, including nested ones, in both universes.
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", Vec::new())
+                .with_attribute("scale", 1.0)
+                .with_attribute("scale", 2.0),
+            cases = [{ input_types = [], error = "`custom_call` declares attribute `scale` more than once" }],
+        );
+        let nested = CustomCallOperation::new("kernel", Vec::new()).with_attribute(
+            "options",
+            CustomCallAttribute::Dictionary(vec![
+                ("mode".to_string(), "fast".into()),
+                ("mode".to_string(), "slow".into()),
+            ]),
+        );
+        check_operation_type_inference!(
+            operation = nested.clone(),
+            cases = [{ input_types = [], error = "`custom_call` declares attribute `mode` more than once" }],
+        );
+        assert_eq!(
+            nested.infer_parent_output_types(&[], &[]),
+            Err(TypeError::invalid("`custom_call` declares attribute `mode` more than once")),
+        );
+
+        // The same name may appear at different nesting levels.
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", Vec::new()).with_attribute("mode", "fast").with_attribute(
+                "options",
+                CustomCallAttribute::Dictionary(vec![("mode".to_string(), "slow".into())]),
+            ),
+            cases = [{ input_types = [], output_types = [] }],
+        );
+
+        // Top-level attribute names that the operation renders as its own fields are rejected in both universes,
+        // while the same names inside a nested dictionary are unambiguous and accepted.
+        let reserved = CustomCallOperation::new("kernel", Vec::new()).with_attribute("target", "other");
+        check_operation_type_inference!(
+            operation = reserved.clone(),
+            cases = [{
+                input_types = [],
+                error = "`custom_call` attribute `target` reuses the name of one of the operation's own fields",
+            }],
+        );
+        assert_eq!(
+            reserved.infer_parent_output_types(&[], &[]),
+            Err(TypeError::invalid(
+                "`custom_call` attribute `target` reuses the name of one of the operation's own fields",
+            )),
+        );
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", Vec::new()).with_attribute(
+                "options",
+                CustomCallAttribute::Dictionary(vec![("batching".to_string(), "none".into())]),
+            ),
+            cases = [{ input_types = [], output_types = [] }],
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_input_layouts() {
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_layouts([Some(column_major.clone()), None]),
+            cases = [
+                {
+                    input_types = [matrix_type.clone(), ArrayType::scalar(DataType::I32)],
+                    output_types = [ArrayType::new_static(DataType::F32, [2])],
+                },
+                {
+                    input_types = [matrix_type.clone()],
+                    error = "`custom_call` declares 2 input layout(s) but the call has 1 array input(s)",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2]), ArrayType::scalar(DataType::I32)],
+                    error = "`custom_call` input layout `tiled{0,1}` has rank 2 but input 0 has type `f32[2]`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_layouts([Some(Layout::Strided(StridedLayout::new(vec![12, 4])))]),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                error = "`custom_call` input layout `strided{12,4}` has rank 2 but input 0 has type `f32[2]`",
+            }],
+        );
+
+        // A declared layout of an aliased input must match the layout of its output.
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![matrix_type.clone()])
+                .with_input_layouts([Some(column_major.clone())])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [{
+                input_types = [matrix_type.clone()],
+                error = "`custom_call` alias `0->0` requires the kernel layout `tiled{0,1}` of input 0 to match the \
+                         layout of output 0",
+            }],
+        );
+        let column_major_type = matrix_type.clone().with_layout(column_major.clone());
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![column_major_type.clone()])
+                .with_input_layouts([Some(column_major.clone())])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [
+                { input_types = [column_major_type.clone()], output_types = [column_major_type.clone()] },
+                { input_types = [matrix_type.clone()], output_types = [column_major_type.clone()] },
+            ],
+        );
+
+        // Default layouts describe the kernel boundary independently of the input's original storage. Explicit
+        // row-major output metadata is equivalent to leaving the output layout unspecified.
+        let aliased =
+            CustomCallOperation::new("kernel", vec![matrix_type.clone()]).with_input_output_alias(0, 0).unwrap();
+        check_operation_type_inference!(
+            operation = aliased.clone(),
+            cases = [{ input_types = [column_major_type.clone()], output_types = [matrix_type.clone()] }],
+        );
+        check_operation_type_inference!(
+            operation = aliased.with_input_layouts([None]),
+            cases = [{ input_types = [column_major_type.clone()], output_types = [matrix_type.clone()] }],
+        );
+        let row_major_type = matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new())));
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![row_major_type.clone()])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [{ input_types = [matrix_type.clone()], output_types = [row_major_type] }],
+        );
+
+        // Without a declaration the kernel receives the aliased input in the default row-major layout, which cannot
+        // alias a column-major output, even when the input value itself is stored column-major.
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![column_major_type.clone()])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [{
+                input_types = [column_major_type],
+                error = "`custom_call` alias `0->0` requires the kernel layout `tiled{1,0}` of input 0 to match the \
+                         layout of output 0",
+            }],
+        );
+
+        // Mixed calls declare layouts only for their leading array inputs, excluding trailing dimension inputs.
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_type.clone()])
+            .with_input_layouts([Some(column_major)]);
+        assert_eq!(
+            operation.infer_parent_output_types(&[matrix_type.clone().into(), length.clone().into()], &[]),
+            Ok(vec![dynamic_type.into()]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(&[matrix_type.clone().into(), matrix_type.into(), length.into()], &[]),
+            Err(TypeError::invalid("`custom_call` declares 1 input layout(s) but the call has 2 array input(s)")),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_manual_variation() {
+        // Opaque code cannot be assumed to agree across devices, so an output declared without a sharding inherits
+        // the inputs' manual variation, placed replicated on their mesh, whereas a declared sharding is kept as is.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let varying_input = ArrayType::new_static(DataType::F32, [2]).with_sharding(varying.clone()).unwrap();
+        let invariant_input =
+            ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let operation = CustomCallOperation::new(
+            "ryft.test.add_one",
+            vec![ArrayType::new_static(DataType::F32, [2]), invariant_input.clone()],
+        );
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [varying_input.clone()],
+                    output_types = [varying_input.clone(), invariant_input.clone()],
+                },
+                // Invariant and unsharded inputs leave undeclared outputs unsharded.
+                {
+                    input_types = [invariant_input.clone()],
+                    output_types = [ArrayType::new_static(DataType::F32, [2]), invariant_input.clone()],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2])],
+                    output_types = [ArrayType::new_static(DataType::F32, [2]), invariant_input.clone()],
+                },
+            ],
+        );
+
+        // Aliases are compared against the effective output types, so an input carrying exactly the manual variation
+        // that an undeclared output inherits can alias that output, in both universes, whereas an invariant sharded
+        // input cannot, because the undeclared output inherits no sharding from it.
+        let aliased = CustomCallOperation::new("ryft.test.in_place", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        check_operation_type_inference!(
+            operation = aliased.clone(),
+            cases = [
+                { input_types = [varying_input.clone()], output_types = [varying_input.clone()] },
+                {
+                    input_types = [invariant_input.clone()],
+                    error = "`custom_call` alias `0->0` requires matching input and output types but input 0 has \
+                             type `f32[2][sharding={mesh<['m'=2:manual]>, [{}]}]` and output 0 has type `f32[2]`",
+                },
+            ],
+        );
+        assert_eq!(
+            aliased.infer_parent_output_types(&[varying_input.clone().into()], &[]),
+            Ok(vec![varying_input.clone().into()]),
+        );
+
+        // The mixed universe applies the same rule, including to dynamic outputs.
+        assert_eq!(
+            operation.infer_parent_output_types(&[varying_input.clone().into()], &[]),
+            Ok(vec![varying_input.clone().into(), invariant_input.into()]),
+        );
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_type.clone()]);
+        assert_eq!(
+            operation.infer_parent_output_types(&[varying_input.into(), length.into()], &[]),
+            Ok(vec![dynamic_type.with_sharding(varying).unwrap().into()]),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_dynamic_outputs() {
+        // The homogeneous form has no way to ground a dynamic result extent, because only the mixed form accepts the
+        // trailing first-class dimension inputs that define one.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new(
+                "ryft.test.dynamic",
+                vec![
+                    ArrayType::new_static(DataType::F32, [2]),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)])),
+                ],
+            ),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                error = "`custom_call` requires explicit result-extent inputs for dynamic output type `f32[rows, 3]`",
+            }],
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_array_ir() {
+        // Array IR output extents are positional instruction inputs: output-major and then axis-major.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(17)).unwrap());
+        let dynamic_output_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(rows.clone()),
+                Dimension::Static(3),
+                Dimension::Dynamic(columns.clone()),
+            ]),
+        );
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()]);
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[
+                    ArrayType::new_static(DataType::F32, [2]).into(),
+                    DimensionType::from(rows.clone()).into(),
+                    DimensionType::from(columns.clone()).into(),
+                ],
+                &[],
+            ),
+            Ok(vec![dynamic_output_type.clone().into()]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[
+                    ArrayType::new_static(DataType::F32, [2]).into(),
+                    DimensionType::from(columns.clone()).into(),
+                    DimensionType::from(rows.clone()).into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` output-extent input defines dimension variable `columns`, but the corresponding \
+                 declared output axis refers to `rows`",
+            )),
+        );
+
+        // An exact extent input refines its declared output axis only within that axis's bounds.
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[
+                    ArrayType::new_static(DataType::F32, [2]).into(),
+                    DimensionType::from(Dimension::Static(20)).into(),
+                    DimensionType::from(columns.clone()).into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` output-extent input has extent 20, which lies outside the bounds [1, 9) of the \
+                 corresponding declared output axis `rows`",
+            )),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap()).into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` expects 2 trailing output-extent dimension(s) but received only 1 input(s)",
+            )),
+        );
+
+        // Aliases count only the leading array inputs, so a dynamic aliased output validates against its array input.
+        assert_eq!(
+            operation.clone().with_input_output_alias(0, 0).unwrap().infer_parent_output_types(
+                &[
+                    dynamic_output_type.clone().into(),
+                    DimensionType::from(rows.clone()).into(),
+                    DimensionType::from(columns.clone()).into(),
+                ],
+                &[],
+            ),
+            Ok(vec![dynamic_output_type.into()]),
+        );
+
+        // Custom calls are region-free in the mixed universe too.
+        let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
+        assert_eq!(operation.infer_parent_region_input_types(&[], &[]), Ok(Vec::new()));
+        assert_eq!(
+            operation.infer_parent_region_input_types(&[], std::slice::from_ref(&region)),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[DimensionType::from(rows).into(), DimensionType::from(columns).into()],
+                std::slice::from_ref(&region),
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_array_ir_exact_alias_outputs() {
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(9)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
+        let concrete_type = ArrayType::new_static(DataType::F32, [3]);
+        let operation = CustomCallOperation::new("identity", vec![symbolic_type.clone()])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[concrete_type.clone().into(), DimensionType::from(Dimension::Static(3)).into()],
+                &[],
+            ),
+            Ok(vec![concrete_type.clone().into()]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(&[symbolic_type.clone().into(), length.clone().into()], &[]),
+            Ok(vec![symbolic_type.clone().into()]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[concrete_type.clone().into(), DimensionType::from(Dimension::Static(4)).into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` alias `0->0` requires matching input and output types but input 0 has type \
+                 `f32[3]` and output 0 has type `f32[4]`",
+            )),
+        );
+
+        // An exact extent refines the output to `f32[3]`, which a symbolic `f32[length]` input no longer matches.
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[symbolic_type.clone().into(), DimensionType::from(Dimension::Static(3)).into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` alias `0->0` requires matching input and output types but input 0 has type \
+                 `f32[length]` and output 0 has type `f32[3]`",
+            )),
+        );
+
+        // Conflicting extents for a repeated identity are rejected before the alias is compared.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let square = CustomCallOperation::new(
+            "identity",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into()]))],
+        )
+        .with_input_output_alias(0, 0)
+        .unwrap();
+        assert_eq!(
+            square.infer_parent_output_types(
+                &[
+                    ArrayType::new_static(DataType::F32, [3, 3]).into(),
+                    DimensionType::from(Dimension::Static(3)).into(),
+                    DimensionType::from(Dimension::Static(4)).into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "rows".to_string(),
+                expected: 3,
+                actual: 4,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_array_ir_exact_alias_outputs_specialization() {
+        // Replaying an independently built symbolic call at exact inputs must apply the same alias contract as type
+        // inference, which compares the alias against the output refined by its exact extent.
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(9)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
+        let concrete_type = ArrayType::new_static(DataType::F32, [3]);
+        let operation = CustomCallOperation::new("identity", vec![symbolic_type.clone()])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(symbolic_type.into());
+        let extent = builder.add_input(length.into());
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input, extent], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let specialized = program
+            .clone()
+            .specialize(&[concrete_type.clone().into(), DimensionType::from(Dimension::Static(3)).into()])
+            .unwrap();
+        assert_eq!(
+            specialized.to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:dimension<3> .
+                let %2:f32[3] = custom_call [target=identity, input_output_alias=0->0] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // The aliased input and the extent input share the `length` identity, so specializing them to different exact
+        // extents is rejected before the call is replayed.
+        assert_eq!(
+            program
+                .specialize(&[concrete_type.into(), DimensionType::from(Dimension::Static(4)).into()])
+                .map(|program| program.to_string()),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "length".to_string(),
+                expected: 3,
+                actual: 4,
+            }))),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_rename_type_identities() {
+        // Renaming rewrites every dynamic output axis in both universes and preserves every other field.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let renamed_rows = DimensionVariable::new("renamed_rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation_with = |rows: &DimensionVariable| {
+            CustomCallOperation::new(
+                "ryft.test.renamed",
+                vec![
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())])),
+                    ArrayType::new_static(DataType::F32, [4]),
+                    ArrayType::scalar(DataType::I32),
+                ],
+            )
+            .with_attribute("scale", 2.0)
+            .with_input_output_alias(0, 1)
+            .unwrap()
+            .with_effect_class(EffectClass::UnorderedIo)
+            .with_batching(CustomCallBatching::BroadcastAll)
+        };
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(rows.clone(), renamed_rows.clone()).unwrap();
+        let expected = operation_with(&renamed_rows);
+        let operation = operation_with(&rows);
+        assert_eq!(operation.rename_type_identities(&renaming), Ok(expected.clone()));
+        assert_eq!(operation.rename_parent_type_identities(&renaming), Ok(expected));
+        assert_eq!(operation.rename_type_identities(&TypeIdentityRenaming::new()), Ok(operation));
+    }
+
+    #[test]
+    fn test_custom_call_interpretation() {
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
+        assert!(matches!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![1.0, 2.0]).unwrap()],
+            ),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `ryft.test.add_one`",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_interpretation_array_ir() {
+        // The reference backend has no kernel registry, so the identity-kernel fixture executes over real arrays to
+        // exercise the mixed rule's verification of dynamic output extents.
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = CustomCallOperation::new(
+            "identity",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]))],
+        );
+        let input = ArrayIrValue::Array(IdentityKernelArray(Array::vector(vec![1.0f32, 2.0]).unwrap()));
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(length.clone(), 2).unwrap());
+        assert_eq!(ArrayIrValue::custom_call(&operation, [&input, &extent]), Ok(vec![input.clone()]));
+        let wrong_extent = ArrayIrValue::Dimension(DimensionValue::new(length, 3).unwrap());
+        assert!(matches!(
+            ArrayIrValue::custom_call(&operation, [&input, &wrong_extent]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "`custom_call` output 0 axis 0 has extent 2, but its explicit extent input is 3",
+        ));
+
+        // An eager extent is typed exactly, so any extent within the declared axis bounds refines that axis, while an
+        // extent outside them is rejected.
+        let literal_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(ArrayIrValue::custom_call(&operation, [&input, &literal_extent]), Ok(vec![input.clone()]));
+        let aliased = operation.clone().with_input_output_alias(0, 0).unwrap();
+        assert_eq!(ArrayIrValue::custom_call(&aliased, [&input, &literal_extent]), Ok(vec![input.clone()]));
+        assert!(matches!(
+            ArrayIrValue::custom_call(&aliased, [&input, &wrong_extent]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`custom_call` alias `0->0` requires matching input and output types but input 0 has \
+                               type `f32[2]` and output 0 has type `f32[3]`",
+        ));
+        let out_of_bounds = ArrayIrValue::Dimension(DimensionValue::constant(7).unwrap());
+        assert!(matches!(
+            ArrayIrValue::custom_call(&operation, [&input, &out_of_bounds]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`custom_call` output-extent input has extent 7, which lies outside the bounds [1, 5) \
+                               of the corresponding declared output axis `length`",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_interpretation_array_ir_multiple_dynamic_outputs() {
+        // Trailing extents are consumed output-major and then axis-major, so a static output between two dynamic ones
+        // consumes none, and each dynamic axis is verified against exactly its own extent input.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = CustomCallOperation::new(
+            "identity",
+            vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()])),
+                ArrayType::new_static(DataType::F32, [2]),
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), columns.simplified_dimension()])),
+            ],
+        );
+        let vector = ArrayIrValue::Array(IdentityKernelArray(Array::vector(vec![1.0f32, 2.0]).unwrap()));
+        let matrix = ArrayIrValue::Array(IdentityKernelArray(
+            Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        ));
+        let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(
+            ArrayIrValue::custom_call(&operation, [&vector, &vector, &matrix, &two, &three]),
+            Ok(vec![vector.clone(), vector.clone(), matrix.clone()]),
+        );
+        assert!(matches!(
+            ArrayIrValue::custom_call(&operation, [&vector, &vector, &matrix, &three, &two]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "`custom_call` output 0 axis 0 has extent 2, but its explicit extent input is 3",
+        ));
+        assert!(matches!(
+            ArrayIrValue::custom_call(&operation, [&vector, &vector, &matrix, &two, &two]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "`custom_call` output 2 axis 1 has extent 3, but its explicit extent input is 2",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_partial_evaluation() {
+        // `check_operation_partial_evaluation!` requires executable primal semantics, which the reference backend
+        // cannot provide for a foreign kernel, so this test checks the default rule explicitly.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                CustomCall::custom_call(
+                    &CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])]),
+                    [&input],
+                )
+            },
+            ArrayType::new_static(DataType::F32, [2]),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        let residual = indoc! {"
+            lambda %0:f32[2] .
+            let %1:f32[2] = custom_call [target=kernel] %0
+            in (%1)
+        "}
+        .trim_end();
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(ArrayType::new_static(DataType::F32, [2]))])
+            .unwrap();
+        assert_eq!(evaluation.program().to_string(), residual);
+        assert!(evaluation.outputs()[0].is_unknown());
+
+        // A pure known call stays residual when the eager backend cannot execute it, preserving it for a backend that
+        // supports the foreign kernel.
+        let known = program
+            .partially_evaluate(&[PartialValue::Known(Array::vector(vec![1.0f32, 2.0]).unwrap())])
+            .unwrap();
+        assert_eq!(known.program().to_string(), residual);
+        assert!(known.outputs()[0].is_unknown());
+        assert!(matches!(
+            known.interpret(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `kernel`",
+        ));
+
+        // A known effectful call propagates the execution failure, and disabling effect folding keeps even a known,
+        // result-free call observable in the residual program.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder
+            .add_instruction(
+                CustomCallOperation::new("record", Vec::new()).with_side_effect(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new()).unwrap();
+        assert!(matches!(
+            program.partially_evaluate(&[]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `record`",
+        ));
+        let evaluation = program
+            .entry_region_ref()
+            .partially_evaluate_in_context(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[], false)
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda  .
+                let () = custom_call [target=record, has_side_effect=true]
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert_eq!(evaluation.program().effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+    }
+
+    #[test]
+    fn test_custom_call_batching() {
+        // The default behavior rejects a mapped input, naming it and its batch axis.
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let input_types = vec![ArrayType::new_static(DataType::F32, [2]); 2];
+        assert!(matches!(
+            batch_custom_call(operation.clone(), input_types.clone(), 2, &[BatchAxis::replicated(), BatchAxis::new(0)]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call `ryft.test.add_one` has no batching rule for input 1 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
+        ));
+
+        // A call whose inputs are all replicated is bound unchanged and reports replicated outputs, because the
+        // region-free foreign kernel cannot observe the transform's axis.
+        let (batched, output_axes) =
+            batch_custom_call(operation, input_types, 2, &[BatchAxis::replicated(), BatchAxis::replicated()]).unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = custom_call [target=ryft.test.add_one] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_rejected_without_type_queries() {
+        // A call using the default batching contract rejects a mapped input without projecting any input type.
+
+        /// Array value whose type queries are counted for the default (`Rejected`) batching regression.
+        #[derive(Clone, Debug, PartialEq)]
+        struct TypeReadCountingArray {
+            /// Array type returned by [`Typed::r#type`].
+            r#type: ArrayType,
+
+            /// Number of type queries since the last reset.
+            type_read_count: Rc<Cell<usize>>,
+        }
+
+        impl Display for TypeReadCountingArray {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.r#type.fmt(formatter)
+            }
+        }
+
+        impl Parameter for TypeReadCountingArray {}
+
+        impl Typed for TypeReadCountingArray {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, Self::Type> {
+                self.type_read_count.set(self.type_read_count.get() + 1);
+                Cow::Borrowed(&self.r#type)
+            }
+        }
+
+        impl Value for TypeReadCountingArray {
+            type Dispatch = ValueDomainDispatch;
+            type Domain = TypeReadCountingContext;
+
+            fn domain(&self) -> Self::Domain {
+                TypeReadCountingContext
+            }
+        }
+
+        /// Minimal context used only to prove that rejected homogeneous batching performs no input type projection.
+        #[derive(Copy, Clone)]
+        struct TypeReadCountingContext;
+
+        impl Domain for TypeReadCountingContext {
+            type Type = ArrayType;
+            type Value = TypeReadCountingArray;
+            type Constant = TypeReadCountingArray;
+            type Operation = ArrayOperation<TypeReadCountingArray>;
+        }
+
+        impl Context for TypeReadCountingContext {
+            fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+                Ok(constant)
+            }
+
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
+                &self,
+                _operation: O,
+                _regions: R,
+                _inputs: &[Self::Value],
+            ) -> Result<Vec<Self::Value>, ProgramError>
+            where
+                Self::Constant: 'r,
+                Self::Operation: 'r,
+            {
+                unreachable!("the rejected custom-call batching path must not bind an operation")
+            }
+
+            fn is_eager(&self) -> bool {
+                false
+            }
+
+            fn provenance(&self) -> Provenance {
+                Provenance::unknown()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+                function()
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+                function()
+            }
+        }
+
+        let type_read_count = Rc::new(Cell::new(0));
+        let input = TypeReadCountingArray {
+            r#type: ArrayType::new_static(DataType::F32, [2, 3]),
+            type_read_count: Rc::clone(&type_read_count),
+        };
+        let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
+        type_read_count.set(0);
+
+        let operation = CustomCallOperation::new("ryft.test.dense", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TypeReadCountingContext, 2);
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call `ryft.test.dense` has no batching rule for input 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
+        ));
+        assert_eq!(type_read_count.get(), 0);
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir() -> Result<(), ProgramError> {
+        // The mixed rule rejects mapped inputs by default as well. A dynamic mapped extent keeps the call on the mixed
+        // rule itself rather than on the projected homogeneous one.
+        let operation =
+            CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2, 3])]);
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let error = batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[]).unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call `ryft.test.add_one` has no batching rule for input 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
+        ));
+
+        // The all-replicated shortcut keeps the trailing first-class output-extent input as an ordinary replicated
+        // input of the unchanged call.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9))?);
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type.clone()]);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = trace.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let extent = trace.input(DimensionType::from(rows).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2)?)),
+        );
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(input)),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
+        ];
+        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
+        let output_id = output.into_batch().into_value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:dimension<rows ∈ [1, 9)> .
+                let %2:dimension<2> = const 2
+                    %3:f32[rows] = custom_call [target=ryft.test.dynamic] %0 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_delegation() -> Result<(), ProgramError> {
+        // An extent-free call over a static mapped extent is exactly the homogeneous contract, so the mixed rule
+        // delegates to the projected homogeneous rule and lifts its result back into the array IR universe, where the
+        // projected policy materializes the replicated input through a dimension-valued broadcast.
+        let operation = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let mapped = trace.input(ArrayType::new_static(DataType::F32, [3, 2]).into());
+        let replicated = trace.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let batch_extent = trace.lift(ArrayIrValue::Dimension(DimensionValue::constant(3)?))?;
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(replicated)),
+        ];
+        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+        let output_id = output.into_batch().into_value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2] .
+                let %2:dimension<3> = const 3
+                    %3:dimension<2> = constant [value=2]
+                    %4:f32[3, 2] = broadcast [output_axes=[1]] %1 %2 %3
+                    %5:f32[3, 2] = custom_call [target=ryft.test.add, batching=broadcast_all] %0 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_extent_inputs() -> Result<(), ProgramError> {
+        // Trailing output-extent inputs are validated as replicated dimensions before any array projection.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9))?);
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type]);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let inputs = [
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2)?)),
+            ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2i32)?)),
+        ];
+        assert!(matches!(
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &inputs),
+            Err(BatchingError::Type(TypeError::Invalid { message }))
+                if message == "expected dimension type but got array type",
+        ));
+        assert!(matches!(
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &[]),
+            Err(BatchingError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential() {
+        // `Sequential` stages one `scan` whose body performs exactly one unbatched call: the mapped input is sliced one
+        // row per iteration while the replicated input rides along as an invariant carry. A side-effecting kernel
+        // therefore runs once per batch item, in iteration order.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
+                        .with_side_effect()
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+                CustomCall::custom_call(&operation, inputs.iter())
+            },
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
+        )
+        .unwrap();
+        let (batched, output_axes) = program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2] .
+                let %2:f32[2], %3:f32[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2], %2:f32[2] .
+                        let %3:f32[2] = custom_call [target=ryft.test.add_one, has_side_effect=true, \
+                batching=sequential] %2 %1
+                        in (%1, %3)
+                    },
+                ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_extent_carries() -> Result<(), ProgramError> {
+        // The mixed rule threads replicated first-class output extents as leading invariant scan carries, so the body's
+        // call declares exactly the per-item extents it was given, and it supports a dynamic mapped extent by
+        // consuming it as the scan's trailing trip-count input.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()]))],
+        )
+        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, ArrayType::new_static(DataType::F32, [2]), &[], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
+                let %3:dimension<rows ∈ [1, 9)>, %4:f32[batch, rows] = scan [carry_count=1, iteration_count=batch, \
+                reverse=false] %2 %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2] .
+                        let %3:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential] %2 %1
+                        in (%1, %3)
+                    },
+                ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_extent_and_array_carries() -> Result<(), ProgramError> {
+        // Replicated extents lead the carries and replicated arrays follow them, while the body's call consumes its
+        // inputs in the original order: the array inputs first and the trailing extents last.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()]))],
+        )
+        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, vector_type.clone(), &[vector_type], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:f32[2], %3:dimension<rows ∈ [1, 9)> .
+                let %4:dimension<rows ∈ [1, 9)>, %5:f32[2], %6:f32[batch, rows] = scan [carry_count=2, iteration_count=batch, \
+                reverse=false] %3 %2 %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2], %3:f32[2] .
+                        let %4:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential] %3 %2 %1
+                        in (%1, %2, %4)
+                    },
+                ]
+                in (%6)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_side_effect() {
+        // The scan inherits the declared effect class of the call it repeats.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.record", vec![ArrayType::new_static(DataType::F32, [2])])
+                        .with_effect_class(EffectClass::OrderedIo)
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+                Ok(CustomCall::custom_call(&operation, [&input])?.remove(0))
+            },
+            ArrayType::new_static(DataType::F32, [2]),
+        )
+        .unwrap();
+        let (batched, output_axes) = program
+            .to_flat_program()
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2] .
+                let %1:f32[3, 2] = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2] = custom_call [
+                            target=ryft.test.record,
+                            has_side_effect=true,
+                            effect_class=ordered_io,
+                            batching=sequential,
+                        ] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_aliased_layouts() -> Result<(), ProgramError> {
+        // The scan body carries the explicit input layout to the call, where the backend arranges the aliased buffer.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = trace.input(ArrayType::new_static(DataType::F32, [2, 2]));
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
+        let output_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
+            vec![output_id],
+            vec![Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2] .
+                let %1:f32[2, 2] = scan [carry_count=0, iteration_count=2, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2][layout=tiled{0:T(2)}] = custom_call [
+                            target=ryft.test.aliased_layout,
+                            input_layouts=[tiled{0:T(2)}],
+                            input_output_alias=0->0,
+                            batching=sequential,
+                        ] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_aliased_layouts() -> Result<(), ProgramError> {
+        // The mixed body carries the same explicit kernel layout contract as the homogeneous body.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = trace.input(DimensionType::from(batch.clone()).into());
+        let input = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
+        let output_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let outputs =
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?;
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2] .
+                let %2:f32[batch, 2] = scan [carry_count=0, iteration_count=batch, reverse=false] %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2][layout=tiled{0:T(2)}] = custom_call [
+                            target=ryft.test.aliased_layout,
+                            input_layouts=[tiled{0:T(2)}],
+                            input_output_alias=0->0,
+                            batching=sequential,
+                        ] %1
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_refined_aliased_layouts() -> Result<(), ProgramError> {
+        // The declared output `f32[rows]` aliases the `f32[2]` slice that each loop trip receives, and its trailing
+        // extent input refines it to `f32[2]`. Its explicit input layout matches the declared output's layout, so the
+        // alias holds at the refined output type.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4))?);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = trace.input(DimensionType::from(batch.clone()).into());
+        let input = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let rows_extent = trace.input(DimensionType::from(Dimension::Static(2)).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]))
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let inputs = [ArrayIrBatch::new(input, BatchAxis::new(0))?, ArrayIrBatch::replicated(rows_extent)];
+        let outputs = operation.batch_in_parent(&context, &EmptyRegionDriver, &inputs)?;
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder; 3],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2], %2:dimension<2> .
+                let %3:dimension<2>, %4:f32[batch, 2] = scan [carry_count=1, iteration_count=batch, reverse=false] %2 %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:dimension<2>, %2:f32[2] .
+                        let %3:f32[2][layout=tiled{0:T(2)}] = custom_call [
+                            target=ryft.test.aliased_layout,
+                            input_layouts=[tiled{0:T(2)}],
+                            input_output_alias=0->0,
+                            batching=sequential,
+                        ] %2 %1
+                        in (%1, %3)
+                    },
+                ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_manual_axis_aliases() -> Result<(), ProgramError> {
+        // Placing the batch axis on a manual mesh axis makes every per-item value vary along that axis. The scan body
+        // of `Sequential` declares that variation on the call's declared output sharding, exactly as its per-item
+        // inputs carry it, so an alias declared against the unbatched types keeps validating, and the scan gives the
+        // stacked results the batch axis's own placement as its stacked-axis sharding.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let packed = invariant.batched(0, Dimension::Static(2), ShardingDimension::Sharded(vec!["m".to_string()]))?;
+        let varying = packed.unbatched(BatchAxis::new(0))?;
+        assert_ne!(varying, invariant);
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = trace.input(packed.clone());
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2)
+            .with_axis_sharding(ShardingDimension::Sharded(vec!["m".to_string()]));
+        let operation = CustomCallOperation::new("ryft.test.in_place", vec![invariant])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
+            vec![output_id],
+            vec![Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{packed} .
+                let %1:{packed} = scan [carry_count=0, iteration_count=2, reverse=false, stacked_axis_shardings=[{{'m'}}]] %0 [
+                    body={{
+                        lambda %0:i64[], %1:{varying} .
+                        let %2:{varying} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
+                batching=sequential] %1
+                        in (%2)
+                    }},
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_input_layouts() {
+        // The scan body performs the unbatched call, so declared input layouts stay unchanged.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let (batched, _) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2, 3]); 2],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2, 3], %1:f32[2, 3] .
+                let %2:f32[2, 3], %3:f32[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2, 3], %2:f32[2, 3] .
+                        let %3:f32[2] = custom_call [target=kernel, input_layouts=[tiled{0,1}, tiled{1,0}], \
+                batching=sequential] %2 %1
+                        in (%1, %3)
+                    },
+                ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_input_layouts() -> Result<(), ProgramError> {
+        // The scan body performs the unbatched call, so declared input layouts stay unchanged.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2, 3], %2:f32[2, 3] .
+                let %3:f32[2, 3], %4:f32[batch, 2] = scan [carry_count=1, iteration_count=batch, reverse=false] %2 %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2, 3], %2:f32[2, 3] .
+                        let %3:f32[2] = custom_call [target=kernel, input_layouts=[tiled{0,1}, tiled{1,0}], \
+                batching=sequential] %2 %1
+                        in (%1, %3)
+                    },
+                ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_unroll() {
+        // The unroll factor is forwarded to the staged `scan`, even when it does not divide the batch
+        // extent (lowerings run the remaining iterations after the unrolled loop).
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) });
+        let input_types = vec![ArrayType::new_static(DataType::F32, [2])];
+        let (batched, _) = batch_custom_call(operation.clone(), input_types.clone(), 4, &[BatchAxis::new(0)]).unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[4, 2] = scan [carry_count=0, iteration_count=4, reverse=false, unroll=2] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=2)] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let (batched, _) = batch_custom_call(operation, input_types.clone(), 3, &[BatchAxis::new(0)]).unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2] .
+                let %1:f32[3, 2] = scan [carry_count=0, iteration_count=3, reverse=false, unroll=2] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=2)] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // A zero factor is rejected by the scan contract.
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(0) });
+        assert!(matches!(
+            batch_custom_call(operation, input_types, 4, &[BatchAxis::new(0)]),
+            Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`scan` unroll factor must be at least 1",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_full_unroll() {
+        // Full unrolling stages the same scan as `Sequential`, with an unroll factor equal to the static batch extent.
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
+        let input_types = vec![ArrayType::new_static(DataType::F32, [2])];
+        let (batched, _) = batch_custom_call(operation.clone(), input_types.clone(), 4, &[BatchAxis::new(0)]).unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[4, 2] = scan [carry_count=0, iteration_count=4, reverse=false, unroll=4] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=full)] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // An empty batch still needs a positive unroll factor, so it unrolls by the default factor of 1.
+        let (batched, _) = batch_custom_call(operation, input_types, 0, &[BatchAxis::new(0)]).unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[0, 2] .
+                let %1:f32[0, 2] = scan [carry_count=0, iteration_count=0, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=full)] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_full_unroll() -> Result<(), ProgramError> {
+        // A dynamic batch extent cannot be fully unrolled.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let error = batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[]).unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `kernel` batching `sequential(unroll=full)` requires a statically known \
+                               batch extent but the mapped axis has dynamic extent `batch`",
+        ));
+
+        // A static batch extent with a trailing output extent stays on the mixed rule and unrolls completely.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()]))],
+        )
+        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, Some(4), ArrayType::new_static(DataType::F32, [2]), &[], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:f32[4, 2], %1:dimension<rows ∈ [1, 9)> .
+                let %2:dimension<4> = const 4
+                    %3:dimension<rows ∈ [1, 9)>, %4:f32[4, rows] = scan [carry_count=1, iteration_count=4, reverse=false, \
+                unroll=4] %1 %0 [
+                        body={
+                            lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2] .
+                            let %3:f32[rows] = custom_call [target=ryft.test.dynamic, \
+                batching=sequential(unroll=full)] %2 %1
+                            in (%1, %3)
+                        },
+                    ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_sequential_nested() {
+        // The inner level stages a scan whose body calls the kernel once per item, and the outer level batches that
+        // scan structurally, so the kernel still runs on exactly the per-item buffers it declared.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+                CustomCall::custom_call(&operation, inputs.iter())
+            },
+            vec![ArrayType::new_static(DataType::F32, [2])],
+        )
+        .unwrap();
+        let (inner, _) = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        let (outer, output_axes) = inner
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+
+        // The outer scan keeps its own axis in front and reports the outer batch axis at position 1.
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        assert_eq!(
+            outer.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3, 2] .
+                let %1:f32[3, 2, 2] = transpose [permutation=[1, 0, 2]] %0
+                    %2:f32[3, 2, 2] = scan [carry_count=0, iteration_count=3, reverse=false] %1 [
+                        body={
+                            lambda %0:i64[], %1:f32[2, 2] .
+                            let %2:f32[2, 2] = scan [carry_count=0, iteration_count=2, reverse=false] %1 [
+                                body={
+                                    lambda %0:i64[], %1:f32[2] .
+                                    let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential] %1
+                                    in (%2)
+                                },
+                            ]
+                            in (%2)
+                        },
+                    ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all() {
+        // `BroadcastAll` materializes every input on the batch axis and rebinds exactly one call whose declared
+        // outputs gain the same leading extent. Output 0 aliases input 0 and keeps its matching batch-prefixed type,
+        // while output 1 keeps its declared tiled layout with every logical index shifted by one and the inserted
+        // batch axis as its most major dimension.
+        let column_major = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let operation = CustomCallOperation::new(
+            "ryft.test.scaled_add",
+            vec![ArrayType::new_static(DataType::F32, [2]), column_major],
+        )
+        .with_input_output_alias(0, 0)
+        .unwrap()
+        .with_batching(CustomCallBatching::BroadcastAll);
+        let (batched, output_axes) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2]); 2],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2] .
+                let %2:f32[3, 2] = broadcast [output_type=f32[3, 2], output_axes=[1]] %1
+                    %3:f32[3, 2], %4:f32[3, 2, 3][layout=tiled{1,2,0}] = custom_call [target=ryft.test.scaled_add, \
+                input_output_alias=0->0, batching=broadcast_all] %0 %2
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_broadcast_all() -> Result<(), ProgramError> {
+        // The mixed rule regroups the trailing extents so each output's new leading dynamic axis is grounded by the
+        // transform's extent.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()]))],
+        )
+        .with_batching(CustomCallBatching::BroadcastAll);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, ArrayType::new_static(DataType::F32, [2]), &[], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
+                let %3:f32[batch, rows] = custom_call [target=ryft.test.dynamic, batching=broadcast_all] %1 %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_broadcast_all_multiple_outputs() -> Result<(), ProgramError> {
+        // With several outputs, the transform's extent is prepended to each output's trailing extent group, including
+        // a statically declared output that had no extents of its own, so the regrouped inputs stay output-major.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![
+                ArrayType::new_static(DataType::F32, [2]),
+                ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()])),
+            ],
+        )
+        .with_batching(CustomCallBatching::BroadcastAll);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, ArrayType::new_static(DataType::F32, [2]), &[], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
+                let %3:f32[batch, 2], %4:f32[batch, rows] = custom_call [target=ryft.test.dynamic, \
+                batching=broadcast_all] %1 %0 %0 %2
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_side_effect() {
+        // `BroadcastAll` executes a side-effecting kernel exactly once over batch-prefixed buffers, unlike
+        // `Sequential`, which executes it once per batch item.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.record", vec![ArrayType::new_static(DataType::F32, [2])])
+                        .with_side_effect()
+                        .with_batching(CustomCallBatching::BroadcastAll);
+                CustomCall::custom_call(&operation, inputs.iter())
+            },
+            vec![ArrayType::new_static(DataType::F32, [2])],
+        )
+        .unwrap();
+        let (batched, _) = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2] .
+                let %1:f32[3, 2] = custom_call [target=ryft.test.record, has_side_effect=true, \
+                batching=broadcast_all] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_aliased_layouts() -> Result<(), ProgramError> {
+        // Mapped and replicated aliases keep matching input and output layout declarations after inserting a batch
+        // axis.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mapped = trace.input(ArrayType::new_static(DataType::F32, [2, 2]));
+        let output_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let replicated = trace.input(output_type.clone());
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
+        let operation =
+            CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone(), output_type.clone()])
+                .with_input_layouts([output_type.layout().cloned(), output_type.layout().cloned()])
+                .with_input_output_alias(0, 0)?
+                .with_input_output_alias(1, 1)?
+                .with_batching(CustomCallBatching::BroadcastAll);
+        let outputs = operation.batch(
+            &context,
+            &EmptyRegionDriver,
+            &[ArrayBatch::new(mapped, BatchAxis::new(0))?, ArrayBatch::replicated(replicated)],
+        )?;
+        let output_ids = outputs.iter().map(|output| output.value().atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
+            output_ids,
+            vec![Placeholder, Placeholder],
+            vec![Placeholder, Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2][layout=tiled{0:T(2)}] .
+                let %2:f32[2, 2] = broadcast [output_type=f32[2, 2], output_axes=[1]] %1
+                    %3:f32[2, 2][layout=tiled{1,0:T(2)}], %4:f32[2, 2][layout=tiled{1,0:T(2)}] = custom_call [
+                        target=ryft.test.aliased_layout,
+                        input_layouts=[tiled{1,0:T(2)}, tiled{1,0:T(2)}],
+                        input_output_alias=0->0,
+                        input_output_alias=1->1,
+                        batching=broadcast_all,
+                    ] %0 %2
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_broadcast_all_aliased_layouts() -> Result<(), ProgramError> {
+        // The mixed rule shifts the explicit input layout together with its aliased output's layout.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = trace.input(DimensionType::from(batch.clone()).into());
+        let input = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
+        let output_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let outputs =
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?;
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2] .
+                let %2:f32[batch, 2][layout=tiled{1,0:T(2)}] = custom_call [
+                    target=ryft.test.aliased_layout,
+                    input_layouts=[tiled{1,0:T(2)}],
+                    input_output_alias=0->0,
+                    batching=broadcast_all,
+                ] %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_manual_axis_aliases() -> Result<(), ProgramError> {
+        // Placing the batch axis on a manual mesh axis makes every per-item value vary along that axis. `BroadcastAll`
+        // records that variation through the batch-prefixed output declaration, which also gives the result the batch
+        // axis's own placement, so an alias declared against the unbatched types keeps validating.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let packed = invariant.batched(0, Dimension::Static(2), ShardingDimension::Sharded(vec!["m".to_string()]))?;
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = trace.input(packed.clone());
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2)
+            .with_axis_sharding(ShardingDimension::Sharded(vec!["m".to_string()]));
+        let operation = CustomCallOperation::new("ryft.test.in_place", vec![invariant])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
+            vec![output_id],
+            vec![Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{packed} .
+                let %1:{packed} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
+                batching=broadcast_all] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_input_layouts() {
+        // Every input gains the leading batch axis, so every declared layout shifts to keep it most major.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let (batched, _) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2, 3]); 2],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2, 3], %1:f32[2, 3] .
+                let %2:f32[3, 2, 3] = broadcast [output_type=f32[3, 2, 3], output_axes=[1, 2]] %1
+                    %3:f32[3, 2] = custom_call [
+                        target=kernel,
+                        input_layouts=[tiled{1,2,0}, tiled{2,1,0}],
+                        batching=broadcast_all,
+                    ] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_broadcast_all_input_layouts() -> Result<(), ProgramError> {
+        // Every input gains the leading batch axis, including the replicated one, so every declared layout shifts.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2, 3], %2:f32[2, 3] .
+                let %3:dimension<2> = constant [value=2]
+                    %4:dimension<3> = constant [value=3]
+                    %5:f32[batch, 2, 3] = broadcast [output_axes=[1, 2]] %2 %0 %3 %4
+                    %6:f32[batch, 2] = custom_call [
+                        target=kernel,
+                        input_layouts=[tiled{1,2,0}, tiled{2,1,0}],
+                        batching=broadcast_all,
+                    ] %1 %5 %0
+                in (%6)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_undeclared_input_layouts() {
+        // Undeclared layouts request row-major storage even when replicated inputs carry column-major or strided
+        // type metadata. Batching never turns that metadata into an implicit kernel layout declaration.
+        let operation =
+            CustomCallOperation::new("ryft.test.scaled_add", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_batching(CustomCallBatching::BroadcastAll);
+        let column_major = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let (batched, _) = batch_custom_call(
+            operation.clone(),
+            vec![ArrayType::new_static(DataType::F32, [2]), column_major],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2, 3][layout=tiled{0,1}] .
+                let %2:f32[3, 2, 3] = broadcast [output_type=f32[3, 2, 3], output_axes=[1, 2]] %1
+                    %3:f32[3, 2] = custom_call [target=ryft.test.scaled_add, batching=broadcast_all] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let strided =
+            ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
+        let (batched, _) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2]), strided],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2, 3][layout=strided{12,4}] .
+                let %2:f32[3, 2, 3] = broadcast [output_type=f32[3, 2, 3], output_axes=[1, 2]] %1
+                    %3:f32[3, 2] = custom_call [target=ryft.test.scaled_add, batching=broadcast_all] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_strided_input_layouts() {
+        // A strided input layout cannot gain a batch axis, because its byte stride is not derivable from the layout.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([Some(Layout::Strided(StridedLayout::new(vec![4])))])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        assert!(matches!(
+            batch_custom_call(operation, vec![ArrayType::new_static(DataType::F32, [2])], 3, &[BatchAxis::new(0)]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `kernel` cannot batch input 0 because its strided layout `strided{4}` does \
+                               not determine the byte stride of the inserted batch axis",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_broadcast_all_strided_input_layouts() -> Result<(), ProgramError> {
+        // The mixed rule rejects a strided input layout for the same reason as the homogeneous rule.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([Some(Layout::Strided(StridedLayout::new(vec![12, 4]))), None])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let error = batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[]).unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `kernel` cannot batch input 0 because its strided layout `strided{12,4}` \
+                               does not determine the byte stride of the inserted batch axis",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_strided_output_layouts() {
+        // A strided output layout cannot be shifted onto a batched declaration either.
+        let strided =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![strided])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        assert!(matches!(
+            batch_custom_call(operation, vec![ArrayType::new_static(DataType::F32, [2])], 3, &[BatchAxis::new(0)]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `ryft.test.add_one` cannot batch output 0 because its strided layout \
+                               `strided{4}` does not determine the byte stride of the inserted batch axis",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_broadcast_all_strided_output_layouts() -> Result<(), ProgramError> {
+        // The mixed rule rejects a strided output layout for the same reason as the homogeneous rule.
+        let strided =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![strided])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let error = batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[]).unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `ryft.test.add_one` cannot batch output 0 because its strided layout \
+                               `strided{4}` does not determine the byte stride of the inserted batch axis",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_broadcast_all_nested() {
+        // The inner rule binds its rewritten call through a parent that is itself a batching context, so the outer
+        // level batches the rewritten instruction structurally: each level broadcasts the replicated input over its
+        // own batch axis and prepends that axis to the declared outputs.
+        let operation = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::BroadcastAll);
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(mapped, replicated): (
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            )| {
+                Ok(batch(
+                    |(mapped, replicated)| {
+                        batch(
+                            |(mapped, replicated)| CustomCall::custom_call(&operation, [&mapped, &replicated]),
+                            (mapped, replicated),
+                            (BatchAxis::new(0), BatchAxis::replicated()),
+                            BatchAxis::new(0),
+                            None,
+                        )
+                        .map_err(ProgramError::from)
+                    },
+                    (mapped, replicated),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )?)
+            },
+            (ArrayType::new_static(DataType::F32, [2, 3, 2]), ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3, 2], %1:f32[2] .
+                let %2:f32[3, 2] = broadcast [output_type=f32[3, 2], output_axes=[1]] %1
+                    %3:f32[2, 3, 2] = broadcast [output_type=f32[2, 3, 2], output_axes=[1, 2]] %2
+                    %4:f32[2, 3, 2] = custom_call [target=ryft.test.add, batching=broadcast_all] %0 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_expand_dimensions() {
+        // Mapped inputs move to batch axis 0 and replicated inputs gain a singleton leading axis.
+        let operation =
+            CustomCallOperation::new("ryft.test.vectorized", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_output_alias(0, 0)
+                .unwrap()
+                .with_batching(CustomCallBatching::ExpandDimensions);
+        let (batched, output_axes) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2]); 2],
+            3,
+            &[BatchAxis::new(1), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[2, 3], %1:f32[2] .
+                let %2:f32[3, 2] = transpose [permutation=[1, 0]] %0
+                    %3:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[1]] %1
+                    %4:f32[3, 2] = custom_call [target=ryft.test.vectorized, input_output_alias=0->0, \
+                batching=expand_dimensions] %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_expand_dimensions() -> Result<(), ProgramError> {
+        // Singleton expansion preserves each replicated array's own extents rather than using the mapped extent.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()]))],
+        )
+        .with_batching(CustomCallBatching::ExpandDimensions);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, vector_type.clone(), &[vector_type], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:f32[2], %3:dimension<rows ∈ [1, 9)> .
+                let %4:dimension<1> = constant [value=1]
+                    %5:dimension<2> = constant [value=2]
+                    %6:f32[1, 2] = broadcast [output_axes=[1]] %2 %4 %5
+                    %7:f32[batch, rows] = custom_call [target=ryft.test.dynamic, batching=expand_dimensions] %1 %6 %0 %3
+                in (%7)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_expand_dimensions_dynamic_replicated_inputs() {
+        // Singleton expansion of a replicated input with a bounded dynamic dimension reads that dimension's runtime
+        // extent from the input itself, so the expanded input keeps the same dynamic extent.
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = CustomCallOperation::new("ryft.test.expand", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::ExpandDimensions);
+        let (batched, output_axes) = batch_custom_call(
+            operation,
+            vec![
+                ArrayType::new_static(DataType::F32, [2]),
+                ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()])),
+            ],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[length] .
+                let %2:f32[1, length] = broadcast [output_type=f32[1, length], output_axes=[1]] %1
+                    %3:f32[3, 2] = custom_call [target=ryft.test.expand, batching=expand_dimensions] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_expand_dimensions_side_effect() {
+        // `ExpandDimensions` executes a side-effecting kernel exactly once, like every single-call behavior.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.record", vec![ArrayType::new_static(DataType::F32, [2])])
+                        .with_effect_class(EffectClass::UnorderedIo)
+                        .with_batching(CustomCallBatching::ExpandDimensions);
+                CustomCall::custom_call(&operation, inputs.iter())
+            },
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
+        )
+        .unwrap();
+        let (batched, _) = program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2] .
+                let %2:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[1]] %1
+                    %3:f32[3, 2] = custom_call [target=ryft.test.record, has_side_effect=true, \
+                batching=expand_dimensions] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_expand_dimensions_replicated_aliases() {
+        // A singleton-expanded replicated input cannot alias an output that gains the full batch extent.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mapped = trace.input(ArrayType::new_static(DataType::F32, [3, 2]));
+        let replicated = trace.input(ArrayType::new_static(DataType::F32, [2]));
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 3);
+        let operation =
+            CustomCallOperation::new("ryft.test.vectorized", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_output_alias(1, 0)
+                .unwrap()
+                .with_batching(CustomCallBatching::ExpandDimensions);
+        assert!(matches!(
+            operation.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayBatch::new(mapped, BatchAxis::new(0)).unwrap(), ArrayBatch::replicated(replicated)],
+            ),
+            Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`custom_call` alias `1->0` requires matching input and output types but input 1 has \
+                               type `f32[1, 2]` and output 0 has type `f32[3, 2]`",
+        ));
+
+        // At batch extent 1 the singleton-expanded input has the complete batch-prefixed shape, so the aliased output
+        // takes its type and the alias stays valid.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mapped = trace.input(ArrayType::new_static(DataType::F32, [1, 2]));
+        let replicated = trace.input(ArrayType::new_static(DataType::F32, [2]));
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 1);
+        let outputs = operation
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayBatch::new(mapped, BatchAxis::new(0)).unwrap(), ArrayBatch::replicated(replicated)],
+            )
+            .unwrap();
+        let output_id = outputs[0].value().atom_id().unwrap();
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output_id], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[1, 2], %1:f32[2] .
+                let %2:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[1]] %1
+                    %3:f32[1, 2] = custom_call [target=ryft.test.vectorized, input_output_alias=1->0, \
+                batching=expand_dimensions] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_expand_dimensions_input_layouts() {
+        // Replicated inputs gain a singleton leading axis, so their declared layouts shift like those of mapped ones.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::ExpandDimensions);
+        let (batched, _) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2, 3]); 2],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2, 3], %1:f32[2, 3] .
+                let %2:f32[1, 2, 3] = broadcast [output_type=f32[1, 2, 3], output_axes=[1, 2]] %1
+                    %3:f32[3, 2] = custom_call [
+                        target=kernel,
+                        input_layouts=[tiled{1,2,0}, tiled{2,1,0}],
+                        batching=expand_dimensions,
+                    ] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_expand_dimensions_input_layouts() -> Result<(), ProgramError> {
+        // The replicated input gains a singleton leading axis, so its declared layout shifts like the mapped one.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::ExpandDimensions);
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2, 3], %2:f32[2, 3] .
+                let %3:dimension<1> = constant [value=1]
+                    %4:dimension<2> = constant [value=2]
+                    %5:dimension<3> = constant [value=3]
+                    %6:f32[1, 2, 3] = broadcast [output_axes=[1, 2]] %2 %3 %4 %5
+                    %7:f32[batch, 2] = custom_call [
+                        target=kernel,
+                        input_layouts=[tiled{1,2,0}, tiled{2,1,0}],
+                        batching=expand_dimensions,
+                    ] %1 %6 %0
+                in (%7)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_expand_dimensions_nested() {
+        // The inner rule binds its rewritten call through a parent that is itself a batching context, so the outer
+        // level batches the rewritten instruction structurally: each level gives the replicated input another
+        // singleton leading axis and prepends its own batch axis to the declared outputs.
+        let operation = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::ExpandDimensions);
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(mapped, replicated): (
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            )| {
+                Ok(batch(
+                    |(mapped, replicated)| {
+                        batch(
+                            |(mapped, replicated)| CustomCall::custom_call(&operation, [&mapped, &replicated]),
+                            (mapped, replicated),
+                            (BatchAxis::new(0), BatchAxis::replicated()),
+                            BatchAxis::new(0),
+                            None,
+                        )
+                        .map_err(ProgramError::from)
+                    },
+                    (mapped, replicated),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )?)
+            },
+            (ArrayType::new_static(DataType::F32, [2, 3, 2]), ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3, 2], %1:f32[2] .
+                let %2:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[1]] %1
+                    %3:f32[1, 1, 2] = broadcast [output_type=f32[1, 1, 2], output_axes=[1, 2]] %2
+                    %4:f32[2, 3, 2] = custom_call [target=ryft.test.add, batching=expand_dimensions] %0 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_vectorized() {
+        // Mapped inputs move to batch axis 0 and replicated inputs keep their original shape.
+        let operation =
+            CustomCallOperation::new("ryft.test.vectorized", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_output_alias(0, 0)
+                .unwrap()
+                .with_batching(CustomCallBatching::Vectorized);
+        let (batched, output_axes) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2]); 2],
+            3,
+            &[BatchAxis::new(1), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[2, 3], %1:f32[2] .
+                let %2:f32[3, 2] = transpose [permutation=[1, 0]] %0
+                    %3:f32[3, 2] = custom_call [target=ryft.test.vectorized, input_output_alias=0->0, \
+                batching=vectorized] %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_vectorized() -> Result<(), ProgramError> {
+        // The replicated array reaches the call unchanged, ahead of the transform's extent and the trailing output
+        // extents, which ground each output's new leading dynamic axis.
+        let rows = DimensionType::new("rows", DimensionBounds::new(1, Some(9))?);
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.simplified_dimension()]))],
+        )
+        .with_batching(CustomCallBatching::Vectorized);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, vector_type.clone(), &[vector_type], &[rows])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:f32[2], %3:dimension<rows ∈ [1, 9)> .
+                let %4:f32[batch, rows] = custom_call [target=ryft.test.dynamic, batching=vectorized] %1 %2 %0 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_vectorized_side_effect() {
+        // `Vectorized` executes a side-effecting kernel exactly once over the mapped input and the unchanged
+        // replicated input.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.record", vec![ArrayType::new_static(DataType::F32, [2])])
+                        .with_effect_class(EffectClass::DeviceOrderedIo)
+                        .with_batching(CustomCallBatching::Vectorized);
+                CustomCall::custom_call(&operation, inputs.iter())
+            },
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
+        )
+        .unwrap();
+        let (batched, _) = program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2] .
+                let %2:f32[3, 2] = custom_call [
+                    target=ryft.test.record,
+                    has_side_effect=true,
+                    effect_class=device_ordered_io,
+                    batching=vectorized,
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_vectorized_replicated_aliases() {
+        // An unchanged replicated input cannot alias an output that gains the batch extent.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mapped = trace.input(ArrayType::new_static(DataType::F32, [3, 2]));
+        let replicated = trace.input(ArrayType::new_static(DataType::F32, [2]));
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 3);
+        let operation =
+            CustomCallOperation::new("ryft.test.vectorized", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_input_output_alias(1, 0)
+                .unwrap()
+                .with_batching(CustomCallBatching::Vectorized);
+        assert!(matches!(
+            operation.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayBatch::new(mapped, BatchAxis::new(0)).unwrap(), ArrayBatch::replicated(replicated)],
+            ),
+            Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`custom_call` alias `1->0` requires matching input and output types but input 1 has \
+                               type `f32[2]` and output 0 has type `f32[3, 2]`",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_batching_vectorized_input_layouts() {
+        // Replicated inputs keep their shape, so only the declared layouts of mapped inputs shift.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::Vectorized);
+        let (batched, _) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2, 3]); 2],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2, 3], %1:f32[2, 3] .
+                let %2:f32[3, 2] = custom_call [target=kernel, input_layouts=[tiled{1,2,0}, tiled{1,0}], \
+                batching=vectorized] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_vectorized_input_layouts() -> Result<(), ProgramError> {
+        // Only the mapped input gains the leading batch axis, so the replicated input keeps its declared layout.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_input_layouts([
+                Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+                Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+            ])
+            .with_batching(CustomCallBatching::Vectorized);
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let (program, output_axes) =
+            batch_array_ir_custom_call(operation, None, matrix_type.clone(), &[matrix_type], &[])?;
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2, 3], %2:f32[2, 3] .
+                let %3:f32[batch, 2] = custom_call [target=kernel, input_layouts=[tiled{1,2,0}, tiled{1,0}], \
+                batching=vectorized] %1 %2 %0
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_vectorized_undeclared_input_layouts() {
+        // Undeclared layouts request row-major storage, and the unchanged replicated input keeps its column-major type
+        // metadata without that metadata becoming an implicit kernel layout declaration.
+        let operation =
+            CustomCallOperation::new("ryft.test.scaled_add", vec![ArrayType::new_static(DataType::F32, [2])])
+                .with_batching(CustomCallBatching::Vectorized);
+        let column_major = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let (batched, _) = batch_custom_call(
+            operation,
+            vec![ArrayType::new_static(DataType::F32, [2]), column_major],
+            3,
+            &[BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2, 3][layout=tiled{0,1}] .
+                let %2:f32[3, 2] = custom_call [target=ryft.test.scaled_add, batching=vectorized] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batching_vectorized_nested() {
+        // The inner rule binds its rewritten call through a parent that is itself a batching context, so the outer
+        // level batches the rewritten instruction structurally: the replicated input reaches the single call unchanged,
+        // and each level prepends its own batch axis to the declared outputs.
+        let operation = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_batching(CustomCallBatching::Vectorized);
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(mapped, replicated): (
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            )| {
+                Ok(batch(
+                    |(mapped, replicated)| {
+                        batch(
+                            |(mapped, replicated)| CustomCall::custom_call(&operation, [&mapped, &replicated]),
+                            (mapped, replicated),
+                            (BatchAxis::new(0), BatchAxis::replicated()),
+                            BatchAxis::new(0),
+                            None,
+                        )
+                        .map_err(ProgramError::from)
+                    },
+                    (mapped, replicated),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )?)
+            },
+            (ArrayType::new_static(DataType::F32, [2, 3, 2]), ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3, 2], %1:f32[2] .
+                let %2:f32[2, 3, 2] = custom_call [target=ryft.test.add, batching=vectorized] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_differentiation() {
+        // A live tangent requires derivative rules that an opaque kernel cannot provide.
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
+                               `composite` with derivative rules to provide one",
+        ));
+
+        // Invoked directly, the rule rejects a live tangent before staging the primal call.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]));
+        let tangent = context.input(ArrayType::new_static(DataType::F32, [2]));
+        assert!(matches!(
+            operation.jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new(input, MaybeZero::Value(tangent)).unwrap()],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
+                               `composite` with derivative rules to provide one",
+        ));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_custom_call_differentiation_zero_tangents() {
+        // Structural-zero input tangents replay the call on the primals and pair each output with a zero tangent.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]));
+        let outputs = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].tangent().is_zero());
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2]));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![outputs[0].primal().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = custom_call [target=ryft.test.add_one] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_differentiation_without_inputs() {
+        // A zero-input call has no input tangent at all, so its outputs carry structural-zero tangents.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let outputs = CustomCallOperation::new("ryft.test.source", vec![ArrayType::new_static(DataType::F32, [2])])
+            .with_side_effect()
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &[])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].tangent().is_zero());
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2]));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![outputs[0].primal().atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[2] = custom_call [target=ryft.test.source, has_side_effect=true]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_differentiation_array_ir() {
+        // The mixed universe follows the same rule as the homogeneous one.
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]).into());
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
+                               `composite` with derivative rules to provide one",
+        ));
+
+        // A zero-input mixed call replays unchanged with structural-zero output tangents.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let outputs = CustomCallOperation::new("ryft.test.source", vec![ArrayType::new_static(DataType::F32, [2])])
+            .jvp_in_parent(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &[])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].tangent().is_zero());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![outputs[0].primal().atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[2] = custom_call [target=ryft.test.source]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_differentiation_array_ir_extent_inputs() {
+        // Trailing output-extent inputs are integer dimensions whose tangents are structural zeros, so they never make
+        // a call differentiable on their own: a live array tangent is still rejected, and a call whose array tangents
+        // are structural zeros replays unchanged with structural-zero output tangents.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let operation = CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]))],
+        );
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]).into());
+        let extent = builder.add_input(DimensionType::from(rows.clone()).into());
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "custom call `ryft.test.dynamic` has no differentiation rule; call it through a \
+                               `composite` with derivative rules to provide one",
+        ));
+
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let extent = context.input(DimensionType::from(rows).into());
+        let outputs = operation
+            .jvp_in_parent(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(input).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(extent).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].tangent().is_zero());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![outputs[0].primal().atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:dimension<rows ∈ [1, 9)> .
+                let %2:f32[rows] = custom_call [target=ryft.test.dynamic] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]),
+            input_types = [ArrayType::new_static(DataType::F32, [2])],
+        );
+    }
+
+    #[test]
+    fn test_custom_call_transposition_array_ir() {
+        // Transposition of the mixed carrier routes through the array IR dispatch to the projected nonlinear rule.
+        check_operation_transposition!(
+            @rejected,
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]),
+            input_types = [ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))],
+        );
+    }
+
+    #[test]
+    fn test_array_custom_call() {
+        // The reference backend has no foreign-kernel registry, with or without inputs.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])]);
+        assert!(matches!(
+            Array::custom_call(&operation, [&Array::vector(vec![1.0f32, 2.0]).unwrap()]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `kernel`",
+        ));
+        assert!(matches!(
+            Array::custom_call(&operation, std::iter::empty()),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `kernel`",
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_value_custom_call() {
+        // Concrete array IR values call the kernel on their array members.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])]);
+        assert!(matches!(
+            ArrayIrValue::custom_call(&operation, [&ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap())]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `kernel`",
+        ));
+    }
+
+    #[test]
+    fn test_tracer_custom_call() {
+        // Context-carrying values stage the call through the context of their first input.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                let operation =
+                    CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
+                Ok(CustomCall::custom_call(&operation, std::slice::from_ref(&input))?.remove(0))
+            },
+            ArrayType::new_static(DataType::F32, [2]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = custom_call [target=ryft.test.add_one] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Without inputs there is no context to dispatch through.
+        let operation = CustomCallOperation::new("ryft.test.source", vec![ArrayType::new_static(DataType::F32, [2])]);
+        assert!(matches!(
+            <DomainTracer<EagerContext<Array, ArrayOperation<Array>>> as CustomCall>::custom_call(
+                &operation,
+                std::iter::empty(),
+            ),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the custom-call capability dispatches through its first input's context, so calling \
+                               `ryft.test.source` with no inputs requires `CustomCallOperation::call` on the context \
+                               instead",
+        ));
+    }
+}

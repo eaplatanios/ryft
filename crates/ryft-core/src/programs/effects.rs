@@ -1,103 +1,163 @@
-/// Named class of observable _effects_ that an [`Operation`](crate::Operation) can have. Effect classes exist because
+use std::fmt::Display;
+
+use crate::programs::ProgramError;
+use crate::programs::instructions::InstructionId;
+use crate::programs::types::Type;
+
+/// Named class of observable effects that an [`Operation`](crate::Operation) can have. Effect classes exist because
 /// [`Program`](crate::Program) transforms and backend lowering can have behavior conditional on those classes. For
-/// example, XLA lowering threads one StableHLO token chain per ordered effect class to preserve execution order,
-/// mirroring [JAX's side effect sequencing design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html).
+/// example, XLA lowering threads StableHLO token chains for backend-supported ordered classes to preserve execution
+/// order, mirroring [JAX's design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html). Ordered state
+/// is instead discharged before ordinary XLA lowering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Effect {
-    /// Observable input/output (e.g., printing) [`Effect`] whose execution order relative to other
-    /// [`OrderedIo`](Self::OrderedIo) effects is observable (e.g., interleaved printed output). Operations with this
-    /// effect must not be folded away or get eliminated, and their relative execution order must be preserved.
+pub enum EffectClass {
+    /// Observable runtime assertion whose execution order relative to other
+    /// [`OrderedAssertion`](Self::OrderedAssertion) effects determines which failing requirement is reported first.
+    /// Operations with this effect must not be eliminated without execution unless their requirement has been proven,
+    /// and the relative execution order of retained assertions must be preserved.
+    OrderedAssertion,
+
+    /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other ordered I/O
+    /// effects is observable (e.g., interleaved printed output) and forms one total order across every participating
+    /// device. Operations with this effect must not be folded away or get eliminated, and their relative execution
+    /// order must be preserved. Because a global order cannot be provided by devices that execute independently, a
+    /// program containing this effect must execute on a single device; backends reject multi-device placement of it.
+    /// Use [`DeviceOrderedIo`](Self::DeviceOrderedIo) when per-device order suffices.
     OrderedIo,
 
-    /// Observable input/output (e.g., printing) [`Effect`] whose execution order relative to other effects is not
+    /// Observable input/output [`EffectClass`] whose execution order relative to other ordered I/O effects
+    /// executing on the same device is observable and must be preserved, while occurrences on different devices have
+    /// no promised relative order. Operations with this effect must not be folded away or get eliminated. Every device
+    /// participating in a multi-device execution runs its own copy of the effect and preserves program order among the
+    /// ordered I/O effects it executes, so this class is the one to declare for effects that tolerate replicated
+    /// per-device execution (e.g., inside the body of a [`ShardMapOperation`](crate::ShardMapOperation)).
+    DeviceOrderedIo,
+
+    /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other effects is not
     /// observable. Operations with this effect must not be folded away or get eliminated, but independent unordered-I/O
-    /// effects may execute in any order.
+    /// effects may execute in any order. In particular, a compiled program may execute an unordered effect before a
+    /// failing [`OrderedAssertion`](Self::OrderedAssertion) (including a [`GuardOperation`](crate::GuardOperation))
+    /// that precedes it in program order, which only ordered effects are guaranteed to follow.
     UnorderedIo,
+
+    /// Observable access to mutable state whose execution order relative to other [`OrderedState`](Self::OrderedState)
+    /// effects on the same state is observable and must be preserved. This effect _orders_ and does not gate
+    /// transforms. Partial evaluation, linearization, and differentiation place stateful operations according to the
+    /// effect ordering rules documented in [`partial`](crate::partial) instead of rejecting them, while dead-code
+    /// elimination keeps them alive unless the only state behavior of the instruction is a reference allocation that
+    /// nothing accesses (refer to [`ReferenceEffect::Allocate`]). Stateful operations must still be either discharged
+    /// before stateless lowering or handled by a state-aware backend. Structured reference effects derive this class
+    /// through [`Effects::classes`]; an operation lists it explicitly only for opaque state with no structured
+    /// reference description, and generic consumers must not infer a particular state representation from the class.
+    /// Keeping state distinct from I/O also prevents generic transforms from treating mutation like an external I/O
+    /// effect.
+    OrderedState,
 }
 
-impl Effect {
-    /// All declared [`Effect`] classes, in bit order, backing [`Effects`]'s [`IntoIterator`] implementation.
-    const ALL: [Effect; 2] = [Effect::OrderedIo, Effect::UnorderedIo];
+impl EffectClass {
+    /// All declared effect classes, in bit order, backing [`EffectClasses`]'s [`IntoIterator`] implementation.
+    const ALL: [EffectClass; 5] = [
+        EffectClass::OrderedAssertion,
+        EffectClass::OrderedIo,
+        EffectClass::DeviceOrderedIo,
+        EffectClass::UnorderedIo,
+        EffectClass::OrderedState,
+    ];
 
-    /// Returns the bit representing this [`Effect`] class inside an [`Effects`] set.
-    #[inline]
+    /// Returns the bit representing this effect class inside an [`EffectClasses`] set.
     const fn bit(self) -> u8 {
         match self {
-            Effect::OrderedIo => 1 << 0,
-            Effect::UnorderedIo => 1 << 1,
+            EffectClass::OrderedAssertion => 1 << 0,
+            EffectClass::OrderedIo => 1 << 1,
+            EffectClass::DeviceOrderedIo => 1 << 2,
+            EffectClass::UnorderedIo => 1 << 3,
+            EffectClass::OrderedState => 1 << 4,
         }
     }
 
-    /// Returns `true` if the execution order of this [`Effect`] class relative to other effects of the same class is
-    /// observable and must be preserved.
-    #[inline]
+    /// Returns `true` if the execution order of this effect class relative to other effects of the same class
+    /// is observable and must be preserved. The ordered I/O classes (i.e., [`OrderedIo`](Self::OrderedIo) and
+    /// [`DeviceOrderedIo`](Self::DeviceOrderedIo)) additionally share one ordering relationship: on any one device,
+    /// their occurrences execute in program order relative to each other, and they differ only in whether that order
+    /// also spans devices.
     pub const fn is_ordered(self) -> bool {
         match self {
-            Effect::OrderedIo => true,
-            Effect::UnorderedIo => false,
+            EffectClass::OrderedState
+            | EffectClass::OrderedAssertion
+            | EffectClass::OrderedIo
+            | EffectClass::DeviceOrderedIo => true,
+            EffectClass::UnorderedIo => false,
         }
     }
 }
 
-/// Set of observable [`Effect`] classes of an [`Operation`](crate::Operation), describing the behaviors the operation
-/// has beyond computing outputs from inputs, such as printing. [`Program`](crate::Program) transforms consult this
+impl Display for EffectClass {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            EffectClass::OrderedAssertion => "ordered_assertion",
+            EffectClass::OrderedIo => "ordered_io",
+            EffectClass::DeviceOrderedIo => "device_ordered_io",
+            EffectClass::UnorderedIo => "unordered_io",
+            EffectClass::OrderedState => "ordered_state",
+        })
+    }
+}
+
+/// Set of observable effect classes of an [`Operation`](crate::Operation), describing the behaviors the operation has
+/// beyond computing outputs from inputs, such as printing. [`Program`](crate::Program) transforms consult this
 /// classification, instead of hardcoding operation lists, before folding, eliminating, or reordering
 /// [`Instruction`](crate::Instruction)s. For example:
 ///
 ///   - Dead-code elimination ([`Program::simplified`](crate::Program::simplified) and
-///     [`Program::into_simplified`](crate::Program::into_simplified)) keeps non-[pure](Self::is_pure) instructions
-///     alive even when no program output consumes their results.
+///     [`Program::into_simplified`](crate::Program::into_simplified)) keeps instructions with observable effects alive
+///     even when no program output consumes their results.
 ///   - [Ordered](Self::is_ordered) effect classes additionally promise that the relative execution order of same-class
 ///     instructions is preserved. Transforms that would interleave or reorder such instructions with respect to each
-///     other must keep them on one side of any split they introduce, and XLA lowering threads one StableHLO token
-///     chain per ordered class.
+///     other must keep them on one side of any split they introduce. For example, XLA lowering threads StableHLO token
+///     chains for the ordered classes it supports directly and rejects unresolved ordered state.
 ///
-/// The classification of a whole [`Program`](crate::Program) is the [`union`](Self::union) of its instructions'
-/// classifications and can be obtained via [`Program::effects`](crate::Program::effects). This is also what nested
-/// program operations report through [`Operation::effects`](crate::Operation::effects), so that effects remain visible
-/// through higher-order boundaries such as loop bodies and compiled function callees.
+/// An operation's own classes are derived from its [`Effects`] declaration through [`Effects::classes`]. The
+/// classification of a whole [`Program`](crate::Program) is the [`union`](Self::union) of its instructions' classes
+/// together with those of their attached computation regions, derived once when regions are sealed and obtained via
+/// [`Program::effects`](crate::Program::effects), so that effects remain visible through higher-order boundaries such
+/// as loop bodies and compiled function callees without the region-bearing operation restating them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Effects {
-    /// Bit set over [`Effect::bit`]s.
+pub struct EffectClasses {
+    /// Bit set over [`EffectClass::bit`]s.
     bits: u8,
 }
 
-impl Effects {
-    /// Empty [`Effects`] set meaning that the operation's outputs are a deterministic function of its inputs and it has
-    /// no other observable behavior. Pure operations may be folded, eliminated, duplicated, and reordered freely.
-    pub const PURE: Effects = Effects { bits: 0 };
+impl EffectClasses {
+    /// Empty [`EffectClasses`] set.
+    pub const NONE: EffectClasses = EffectClasses { bits: 0 };
 
-    /// Returns the [`Effects`] set containing only `effect`.
-    #[inline]
-    pub const fn single(effect: Effect) -> Effects {
-        Effects { bits: effect.bit() }
+    /// Returns the [`EffectClasses`] set containing only `effect_class`.
+    pub const fn single(effect_class: EffectClass) -> EffectClasses {
+        EffectClasses { bits: effect_class.bit() }
     }
 
-    /// Returns the union of this [`Effects`] set and `other`.
-    #[inline]
-    pub const fn union(self, other: Effects) -> Effects {
-        Effects { bits: self.bits | other.bits }
+    /// Returns the union of this [`EffectClasses`] set and `other`.
+    pub const fn union(self, other: EffectClasses) -> EffectClasses {
+        EffectClasses { bits: self.bits | other.bits }
     }
 
-    /// Returns `true` if this [`Effects`] set is empty (i.e., if it is equal to [`Effects::PURE`]).
-    #[inline]
-    pub const fn is_pure(self) -> bool {
+    /// Returns `true` if this [`EffectClasses`] set is empty (i.e., if it is equal to [`EffectClasses::NONE`]).
+    pub const fn is_empty(self) -> bool {
         self.bits == 0
     }
 
-    /// Returns `true` if this [`Effects`] set contains `effect`.
-    #[inline]
-    pub const fn contains(self, effect: Effect) -> bool {
-        self.bits & effect.bit() != 0
+    /// Returns `true` if this [`EffectClasses`] set contains `effect_class`.
+    pub const fn contains(self, effect_class: EffectClass) -> bool {
+        self.bits & effect_class.bit() != 0
     }
 
-    /// Returns `true` if this [`Effects`] set contains any [`Effect`] class whose execution order is observable.
-    #[inline]
+    /// Returns `true` if this [`EffectClasses`] set contains any class whose execution order is observable.
     pub const fn is_ordered(self) -> bool {
         let mut index = 0;
-        while index < Effect::ALL.len() {
-            let effect = Effect::ALL[index];
-            if effect.is_ordered() && self.contains(effect) {
+        while index < EffectClass::ALL.len() {
+            let effect_class = EffectClass::ALL[index];
+            if effect_class.is_ordered() && self.contains(effect_class) {
                 return true;
             }
             index += 1;
@@ -106,37 +166,569 @@ impl Effects {
     }
 }
 
-/// Iterator over the [`Effect`] classes contained in an [`Effects`] set, yielded in declaration order.
-pub struct EffectsIterator {
-    /// [`Effects`] set whose contained effect classes are being iterated over.
-    effects: Effects,
+/// Iterator over the effect classes contained in an [`EffectClasses`] set, yielded in declaration order.
+pub struct EffectClassesIterator {
+    /// [`EffectClasses`] set whose contained effect classes are being iterated over.
+    classes: EffectClasses,
 
-    /// Index into [`Effect::ALL`] of the next candidate effect class to consider.
+    /// Index into [`EffectClass::ALL`] of the next candidate effect class to consider.
     index: usize,
 }
 
-impl Iterator for EffectsIterator {
-    type Item = Effect;
+impl Iterator for EffectClassesIterator {
+    type Item = EffectClass;
 
     #[inline]
-    fn next(&mut self) -> Option<Effect> {
-        while self.index < Effect::ALL.len() {
-            let effect = Effect::ALL[self.index];
+    fn next(&mut self) -> Option<EffectClass> {
+        while self.index < EffectClass::ALL.len() {
+            let effect_class = EffectClass::ALL[self.index];
             self.index += 1;
-            if self.effects.contains(effect) {
-                return Some(effect);
+            if self.classes.contains(effect_class) {
+                return Some(effect_class);
             }
         }
         None
     }
 }
 
-impl IntoIterator for Effects {
-    type Item = Effect;
-    type IntoIter = EffectsIterator;
+impl IntoIterator for EffectClasses {
+    type Item = EffectClass;
+    type IntoIter = EffectClassesIterator;
 
-    fn into_iter(self) -> EffectsIterator {
-        EffectsIterator { effects: self, index: 0 }
+    fn into_iter(self) -> EffectClassesIterator {
+        EffectClassesIterator { classes: self, index: 0 }
+    }
+}
+
+/// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReferenceAccessMode {
+    /// Reads the referenced value without replacing it.
+    Read,
+
+    /// Replaces the selected referenced value without observing its previous contents.
+    Write,
+
+    /// Observes the selected referenced value and replaces it with a successor in program order.
+    /// [`ReferenceSwapOperation`](crate::ReferenceSwapOperation) remains [`ReferenceAccessMode::ReadWrite`] even
+    /// when a caller leaves its old-value result dead: liveness is a use-site fact, not operation semantics.
+    ReadWrite,
+
+    /// Combines an update with the current state as an _ordered_ additive accumulation. Accumulation stays distinct
+    /// from [`ReferenceAccessMode::Write`] because it is linear in the update input and therefore transposable,
+    /// unlike a replacement. It carries no commutativity or atomicity promise: same-allocation accumulations execute
+    /// in program order (floating-point addition cannot generally be reordered while preserving results), and
+    /// atomic/commutative accumulation is not supported by this mode.
+    Accumulate,
+
+    /// Adds an update atomically to each selected element with device-scoped sequential consistency. Atomic accesses
+    /// share a total order consistent with [`Program`](crate::Program)-instance order (e.g., an entire array update
+    /// need not be indivisible). The caller accepts any allowed ordering, including floating-point variation. Mixing
+    /// conflicting non-atomic accesses requires synchronization. Sequential replay selects one admitted order, and this
+    /// mode retains [`EffectClass::OrderedState`] without granting generic transforms reordering rights.
+    AtomicAccumulate,
+
+    /// Consumes the allocation. After such an access, the allocation and its entire alias family are invalid.
+    /// Consumption is a lifetime event, and not a type of memory-access.
+    /// [`ReferenceFreezeOperation`](crate::ReferenceFreezeOperation) is the canonical consuming access operations
+    /// that also returns the final value.
+    Consume,
+}
+
+impl ReferenceAccessMode {
+    /// Returns whether this [`ReferenceAccessMode`] consumes the complete reference allocation.
+    pub const fn is_consuming(self) -> bool {
+        match self {
+            Self::Read | Self::Write | Self::ReadWrite | Self::Accumulate | Self::AtomicAccumulate => false,
+            Self::Consume => true,
+        }
+    }
+}
+
+impl Display for ReferenceAccessMode {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read => write!(formatter, "read"),
+            Self::Write => write!(formatter, "write"),
+            Self::ReadWrite => write!(formatter, "read/write"),
+            Self::Accumulate => write!(formatter, "accumulate"),
+            Self::AtomicAccumulate => write!(formatter, "atomic accumulate"),
+            Self::Consume => write!(formatter, "consume"),
+        }
+    }
+}
+
+/// [`Reference`](crate::Reference) effect of an [`Operation`](crate::Operation), expressed in the operation's own input
+/// and output index space. Unlike an [`EffectClass`], a reference effect names the input or output it targets so that
+/// program-level reference analysis can resolve it to a canonical allocation (i.e., an entry input, a capture, or an
+/// allocation instruction). The indices are never resource identifiers, so the same declaration is valid for every
+/// application of the operation.
+///
+/// Every reference effect is an occurrence of [`EffectClass::OrderedState`]: [`Effects::classes`] derives that class
+/// from the presence of any reference effect, and so reference operations never declare it separately. Aliasing is
+/// deliberately _not_ a reference effect, because creating a new handle onto an existing allocation has no observable
+/// behavior. Whole-root forwarding is described by
+/// [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceEffect {
+    /// The output at `output_index` allocates a fresh reference and defines a new canonical allocation. Allocation is
+    /// an effect because an allocation must never be duplicated or merged with another (i.e., each application mints a
+    /// distinct mutable cell), but it is _unobservable when unused_ meaning that an allocation that nothing accesses
+    /// can be eliminated together with its dead alias family. An allocation whose creation or abandonment has an
+    /// observable failure, synchronization, or external lifetime consequence must additionally declare the
+    /// corresponding explicit [`EffectClass`], which keeps it alive.
+    Allocate {
+        /// Index of the [`Operation`](crate::Operation) output defining the new allocation.
+        output_index: usize,
+    },
+
+    /// The reference input at `input_index` is accessed with `mode`. Every access is observable when unused, including
+    /// a read, because an access can wait for pending backend completion, reconcile pending state, and report
+    /// poisoning, a consumed reference, or a mutex poisoning; eliminating an unused access would remove an observable
+    /// synchronization point or error.
+    Access {
+        /// Index of the [`Operation`](crate::Operation) input being accessed.
+        input_index: usize,
+
+        /// [`ReferenceAccessMode`] of the access.
+        mode: ReferenceAccessMode,
+    },
+}
+
+/// Complete operation-local effect declaration of an [`Operation`](crate::Operation) that contains its explicitly
+/// declared effect classes and its [`ReferenceEffect`]s. This is the single authoritative declaration from which the
+/// aggregate [`EffectClasses`] consumed by transforms and lowering, the reference facts consumed by
+/// [`ReferenceAnalysis`](crate::ReferenceAnalysis) and discharge, and the retention decision of
+/// dead-code elimination are all derived.
+///
+/// The declaration is _intrinsic_ to the operation and expressed in its own input and output index space.
+/// [`Region`](crate::Region)-bearing operations (e.g., loops and conditionals) declare only what they do themselves,
+/// which is usually nothing, even when their nested programs are effectful or touch references (region sealing
+/// aggregates nested effects into region metadata, and reference analysis recurses into attached regions rather than
+/// trusting per-instruction declarations alone). How values cross an attached region's boundary is a separate contract,
+/// declared through the region-boundary hooks of [`Operation`](crate::Operation) (e.g.,
+/// [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input) and
+/// [`Operation::output_region_provenance`](crate::Operation::output_region_provenance)), which are positional
+/// constraints that analysis applies only to reference-typed positions; this declaration never restates them.
+///
+/// Declarations are stored in canonical order regardless of the order in which they were constructed. Specifically,
+/// accesses are sorted by input index, then allocations are sorted by output index. Two declarations with the same
+/// facts therefore compare equal, and iteration order is deterministic for diagnostics and analysis records.
+///
+/// # Declared Effect Classes
+///
+/// The declared classes are the [`EffectClass`]es the operation author lists directly (e.g., assertions, I/O, and
+/// _opaque_ ordered state that has no structured reference description). [`Self::classes`] additionally derives
+/// [`EffectClass::OrderedState`] from the presence of any [`ReferenceEffect`], so an operation with reference effects
+/// must list `OrderedState` explicitly only for genuinely opaque state, never to classify its reference effects. That
+/// convention cannot be enforced here, because a redundant class is indistinguishable from an operation that has both
+/// a structured access and opaque state. [`EffectsSummary::has_explicit_ordered_state`] retains the distinction across
+/// nested computations, so partial evaluation and rematerialization cannot mistake this additional state for a confined
+/// reference lifecycle.
+///
+/// # Deferred Work
+///
+/// [`Self::with_deferred_work`] marks an operation that carries an unresolved transformation obligation (e.g.,
+/// a selected backward rule whose effects materialize only when a later transform such as transposition runs it).
+/// Deferred work is not an execution effect. It contributes no [`EffectClass`], so it neither makes the operation
+/// impure nor orders it against other effects. Instead, it is an orthogonal obligation that shared transform
+/// boundaries enforce:
+///
+///   - Folding (i.e., [`Operation::resolve_fold`](crate::Operation::resolve_fold)) and partial evaluation
+///     (i.e., [`PartialEvaluationContext::fold_or_residualize`](crate::PartialEvaluationContext::fold_or_residualize))
+///     never remove or execute the operation early, even when all of its inputs are known.
+///   - Dead code elimination retains the operation even when none of its outputs is used (refer to
+///     [`EffectsSummary::is_retained_when_unused`]). This includes ordinary primal-only programs,
+///     because simplification must preserve a selected obligation.
+///   - Transposition visits the operation even without live output cotangents or reference state, so that its
+///     retained rule runs with ignored destinations and structural-zero seeds.
+///
+/// The declaration is immutable semantic metadata. It must describe the obligation itself rather than a cache state:
+/// populating a callback or specialization cache never clears it, and only replacing the carrier with resolved
+/// operations discharges the obligation. A declaration that depends on the operation payload makes that payload
+/// semantics-bearing metadata, which must render as required by [`Operation::render`](crate::Operation::render).
+/// Merely registering a dormant derivative rule does not create an obligation. Like effect classes, deferred work
+/// propagates through attached computation regions during region sealing but not through dormant rule regions.
+///
+/// # Examples
+///
+/// Reference operations declare no explicit effect classes. Each of the six primitives
+/// declares one [`ReferenceEffect`]:
+///
+///   | Operation                          | Reference Effect                              |
+///   | ---------------------------------- | --------------------------------------------- |
+///   | `reference_new(x) -> r`            | `Allocate { output_index: 0 }`                |
+///   | `reference_read(r) -> x`           | `Access { input_index: 0, mode: Read }`       |
+///   | `reference_write(r, x) -> ()`      | `Access { input_index: 0, mode: Write }`      |
+///   | `reference_swap(r, x) -> old`      | `Access { input_index: 0, mode: ReadWrite }`  |
+///   | `reference_add_update(r, x) -> ()` | `Access { input_index: 0, mode: Accumulate }` |
+///   | `reference_freeze(r) -> x`         | `Access { input_index: 0, mode: Consume }`    |
+///
+/// A folded access carries its transforms on the access operation and declares the same root access effect
+/// as a whole-reference access. Complete-root forwarding is declared through
+/// [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input) and carries no
+/// effect. An operation such as `print(x) -> ()` declares the explicit class [`EffectClass::OrderedIo`] without
+/// reference effects.
+///
+/// The derived [`classes`](Self::classes) are `{OrderedState}` for primitive reference operations, `NONE` for identity
+/// aliases, and `{OrderedIo}` for `print`. An unused allocation or identity alias can be eliminated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Effects {
+    /// Aggregate [`EffectClass`]es, observability, and explicit state derived once from the declaration.
+    summary: EffectsSummary,
+
+    /// [`ReferenceEffect`]s in canonical order. Single Static Assignment (SSA) value (i.e., non-reference) inputs and
+    /// outputs are omitted from this list.
+    reference_effects: Vec<ReferenceEffect>,
+}
+
+impl Effects {
+    /// Creates a new [`Effects`] declaration from its components, canonicalizing the order
+    /// of the provided `reference_effects`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when one input index receives two accesses or one output index
+    /// receives two allocations. Each position must appear at most once. The declaration carries no arity information,
+    /// so [`ProgramBuilder`](crate::ProgramBuilder) validates index ranges against each instruction's actual
+    /// input/output arity.
+    pub fn new(declared: EffectClasses, mut reference_effects: Vec<ReferenceEffect>) -> Result<Self, ProgramError> {
+        // Accesses precede allocations so that the canonical order reads inputs first and then outputs.
+        reference_effects.sort_by_key(|effect| match effect {
+            ReferenceEffect::Access { input_index, .. } => (0, *input_index),
+            ReferenceEffect::Allocate { output_index } => (1, *output_index),
+        });
+
+        // Canonical ordering places duplicate input accesses and output allocations next to one another.
+        for pair in reference_effects.windows(2) {
+            match (&pair[0], &pair[1]) {
+                (
+                    ReferenceEffect::Access { input_index: previous, .. },
+                    ReferenceEffect::Access { input_index, .. },
+                ) if previous == input_index => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!("input {input_index} received two reference accesses"),
+                    });
+                }
+                (ReferenceEffect::Allocate { output_index: previous }, ReferenceEffect::Allocate { output_index })
+                    if previous == output_index =>
+                {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!("output {output_index} received two reference classifications"),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let has_access = reference_effects.iter().any(|effect| matches!(effect, ReferenceEffect::Access { .. }));
+        let classes = if reference_effects.is_empty() {
+            declared
+        } else {
+            declared.union(EffectClasses::single(EffectClass::OrderedState))
+        };
+
+        let summary = EffectsSummary {
+            classes,
+            has_observable_effects_when_unused: !declared.is_empty() || has_access,
+            has_explicit_ordered_state: declared.contains(EffectClass::OrderedState),
+            has_deferred_work: false,
+        };
+
+        Ok(Self { summary, reference_effects })
+    }
+
+    /// Returns this [`Effects`] declaration marked as carrying deferred work (i.e., an unresolved transformation
+    /// obligation). Refer to the [Deferred Work](Self#deferred-work) section for the semantics and the
+    /// declaration contract.
+    #[inline]
+    pub fn with_deferred_work(mut self) -> Self {
+        self.summary.has_deferred_work = true;
+        self
+    }
+
+    /// Returns the shared empty [`Effects`] declaration of pure [`Operation`](crate::Operation)s that neither
+    /// create nor access [`Reference`](crate::Reference)s.
+    #[inline]
+    pub fn empty() -> &'static Self {
+        &EMPTY_EFFECTS
+    }
+
+    /// Creates a new [`Effects`] declaration that consists only of the provided directly declared effect classes,
+    /// which is the declaration of assertion, I/O, and opaque-state operations that neither create nor access
+    /// references.
+    #[inline]
+    pub fn explicit(classes: EffectClasses) -> Self {
+        Self::new(classes, Vec::new()).unwrap()
+    }
+
+    /// Returns the [`EffectsSummary`] derived from this declaration.
+    #[inline]
+    pub fn summary(&self) -> EffectsSummary {
+        self.summary
+    }
+
+    /// Returns the aggregate [`EffectClasses`] of the declaring [`Operation`](crate::Operation) that consist of
+    /// its directly declared classes combined with [`EffectClass::OrderedState`] when it declares at least one
+    /// [`ReferenceEffect`]. Aliases contribute no effect class.
+    #[inline]
+    pub fn classes(&self) -> EffectClasses {
+        self.summary.classes
+    }
+
+    /// Returns `true` if the aggregate [`classes`](Self::classes) are [`EffectClasses::NONE`]. Deferred work is
+    /// independent of these classes; [`EffectsSummary::is_pure`] additionally requires no deferred work.
+    #[inline]
+    pub fn is_pure(&self) -> bool {
+        self.summary.classes.is_empty()
+    }
+
+    /// Returns `true` if the [`Operation`](crate::Operation) declares `effect_class` directly, rather than it being
+    /// derived from reference effects. [`EffectsSummary::has_explicit_ordered_state`] preserves this distinction for
+    /// [`EffectClass::OrderedState`] across nested computations.
+    #[inline]
+    pub fn declares(&self, effect_class: EffectClass) -> bool {
+        match effect_class {
+            // Only ordered state can be synthesized by reference declarations.
+            EffectClass::OrderedState => self.summary.has_explicit_ordered_state,
+            _ => self.summary.classes.contains(effect_class),
+        }
+    }
+
+    /// Returns the [`ReferenceEffect`]s of the declaring [`Operation`](crate::Operation) in canonical order
+    /// (i.e., accesses sorted by input index come first, followed by allocations sorted by output index).
+    #[inline]
+    pub fn reference_effects(&self) -> &[ReferenceEffect] {
+        self.reference_effects.as_slice()
+    }
+
+    /// Returns `true` if this [`Effects`] declaration names at least one reference access. Allocations,
+    /// reference-typed boundaries, and reference-typed constants are not considered accesses.
+    #[inline]
+    pub fn has_accesses(&self) -> bool {
+        self.reference_effects.iter().any(|effect| matches!(effect, ReferenceEffect::Access { .. }))
+    }
+
+    /// Returns the `(input_index, mode)` pairs of the declared reference accesses of this [`Effects`] declaration,
+    /// in ascending input index order.
+    #[inline]
+    pub fn accesses(&self) -> impl Iterator<Item = (usize, ReferenceAccessMode)> {
+        self.reference_effects.iter().filter_map(|effect| match effect {
+            ReferenceEffect::Access { input_index, mode } => Some((*input_index, *mode)),
+            ReferenceEffect::Allocate { .. } => None,
+        })
+    }
+
+    /// Returns the output positions at which the declaring [`Operation`](crate::Operation) allocates a fresh
+    /// reference, in ascending output index order.
+    #[inline]
+    pub fn allocation_output_indices(&self) -> impl Iterator<Item = usize> {
+        self.reference_effects.iter().filter_map(|effect| match effect {
+            ReferenceEffect::Allocate { output_index } => Some(*output_index),
+            ReferenceEffect::Access { .. } => None,
+        })
+    }
+
+    /// Returns `true` if this declaration names at least one [`ReferenceEffect`] (i.e., if the declaring
+    /// [`Operation`](crate::Operation) creates or accesses references). This is intentionally not called `is_empty`
+    /// because an operation with ordered I/O and no reference declarations is far from effect-free.
+    #[inline]
+    pub fn has_reference_declarations(&self) -> bool {
+        !self.reference_effects.is_empty()
+    }
+
+    /// Validates this [`Effects`] declaration against one [`Operation`](crate::Operation) application. For validation
+    /// to succeed, every named input and output position must exist in the application, and every named position must
+    /// be reference-typed, because reference effects describe reference allocations and a declaration on a
+    /// non-reference input or output could never be resolved by reference analysis. Opaque state on
+    /// non-reference values is declared through an explicit [`EffectClass::OrderedState`] instead.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation_name`: Name of the operation whose declaration is being validated, used for diagnostic purposes.
+    ///   - `input_types`: Types of the inputs of the application.
+    ///   - `output_types`: Types of the outputs/results inferred for the application.
+    pub(crate) fn validate_application<T: Type>(
+        &self,
+        operation_name: &str,
+        input_types: &[T],
+        output_types: &[T],
+    ) -> Result<(), ProgramError> {
+        let validate_input = |input_index: usize, role: &str| match input_types.get(input_index) {
+            Some(r#type) if r#type.is_reference() => Ok(()),
+            Some(r#type) => Err(ProgramError::MalformedProgram(format!(
+                "operation `{operation_name}` names {role} input {input_index} but it has non-reference type `{type}`",
+            ))),
+            None => Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` names {} input {} but the application input count is {}",
+                operation_name,
+                role,
+                input_index,
+                input_types.len(),
+            ))),
+        };
+
+        let validate_output = |output_index: usize| match output_types.get(output_index) {
+            Some(r#type) if r#type.is_reference() => Ok(()),
+            Some(r#type) => Err(ProgramError::MalformedProgram(format!(
+                "operation `{operation_name}` classifies output {output_index} but it has non-reference type `{type}`",
+            ))),
+            None => Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` classifies output {} but the application output count is {}",
+                operation_name,
+                output_index,
+                output_types.len(),
+            ))),
+        };
+
+        for effect in &self.reference_effects {
+            match effect {
+                ReferenceEffect::Access { input_index, .. } => validate_input(*input_index, "an accessed")?,
+                ReferenceEffect::Allocate { output_index } => validate_output(*output_index)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Shared empty declaration returned by `Effects::empty` so that the `Operation` trait default can hand out a borrow
+// without allocating (`Vec::new` is `const`, so this static needs no lazy initialization).
+static EMPTY_EFFECTS: Effects = Effects { summary: EffectsSummary::PURE, reference_effects: Vec::new() };
+
+/// Aggregate summary of [`Effects`] that survives union across [`Instruction`](crate::Instruction)s and
+/// [`Region`](crate::Region)s without index translation. It records the aggregate [`EffectClasses`], whether unused
+/// results permit elimination, whether an executable instruction directly declares [`EffectClass::OrderedState`], and
+/// whether an executable instruction carries deferred work. The explicit ordered-state distinction cannot be recovered
+/// from the classes once reference effects derive the same class.
+///
+/// The observability information reflects the runtime contract for references: a read operation may synchronize with
+/// pending backend work or report a reference-state failure, so every access is observable even when unused, while an
+/// unused allocation is not. Operations declare [`Effects`], while instruction and region queries derive and
+/// aggregate this summary rather than requiring operation authors to construct it directly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EffectsSummary {
+    /// Aggregate [`EffectClasses`].
+    classes: EffectClasses,
+
+    /// Whether an application with no live output still has an observable consequence and must be retained by
+    /// dead-code elimination. Explicit nonempty [`EffectClasses`] and reference accesses set this flag, while
+    /// allocations do not.
+    has_observable_effects_when_unused: bool,
+
+    /// Whether an operation directly declares [`EffectClass::OrderedState`], independently of its reference effects.
+    has_explicit_ordered_state: bool,
+
+    /// Whether an operation carries deferred work. Refer to the [Deferred Work](Effects#deferred-work) section of
+    /// the [`Effects`] documentation for more information.
+    has_deferred_work: bool,
+}
+
+impl EffectsSummary {
+    /// [`EffectsSummary`] of a pure [`Operation`](crate::Operation) application (i.e., no effect classes, observable
+    /// consequences when its result is unused, or deferred work).
+    pub const PURE: EffectsSummary = EffectsSummary {
+        classes: EffectClasses::NONE,
+        has_observable_effects_when_unused: false,
+        has_explicit_ordered_state: false,
+        has_deferred_work: false,
+    };
+
+    /// [`EffectsSummary`] of an application that carries [deferred work](Effects#deferred-work) and nothing else (e.g.,
+    /// the obligation that an effectful [`RegionRole::DeferredRule`](crate::RegionRole::DeferredRule) region places on
+    /// its owning [`Operation`](crate::Operation)).
+    pub const DEFERRED_WORK: EffectsSummary = EffectsSummary {
+        classes: EffectClasses::NONE,
+        has_observable_effects_when_unused: false,
+        has_explicit_ordered_state: false,
+        has_deferred_work: true,
+    };
+
+    /// Returns the aggregate [`EffectClasses`] of this [`EffectsSummary`].
+    pub const fn classes(self) -> EffectClasses {
+        self.classes
+    }
+
+    /// Returns whether this summary has no effect classes and carries no [deferred work](Effects#deferred-work).
+    /// Unlike [`Effects::is_pure`], this also excludes unresolved transformation obligations. An unused reference
+    /// allocation can be eliminated but still has an effect class, so it is not pure.
+    pub const fn is_pure(self) -> bool {
+        self.classes.is_empty() && !self.has_deferred_work
+    }
+
+    /// Returns whether an application with no live output still has an observable consequence and must be retained by
+    /// dead-code elimination.
+    pub const fn has_observable_effects_when_unused(self) -> bool {
+        self.has_observable_effects_when_unused
+    }
+
+    /// Returns whether any executable instruction directly declares [`EffectClass::OrderedState`], rather than deriving
+    /// it solely from [`ReferenceEffect`]s. A direct declaration describes state that reference analysis cannot assign
+    /// to the declared reference roots, even when the instruction also accesses those roots. Partial evaluation
+    /// therefore orders it against every root, and rematerialization cannot replay it as part of a confined reference
+    /// lifecycle. Checking [`classes`](Self::classes) alone cannot distinguish these cases.
+    pub const fn has_explicit_ordered_state(self) -> bool {
+        self.has_explicit_ordered_state
+    }
+
+    /// Returns whether any executable instruction carries deferred work (i.e., an unresolved transformation
+    /// obligation). Deferred work contributes no [`EffectClass`]. Refer to the [Deferred Work](Effects#deferred-work)
+    /// section of the [`Effects`] documentation for the transform contract.
+    pub const fn has_deferred_work(self) -> bool {
+        self.has_deferred_work
+    }
+
+    /// Returns whether dead-code elimination must retain an application whose outputs are unused, which is
+    /// the case when it has [observable effects when unused](Self::has_observable_effects_when_unused) or
+    /// [deferred work](Self::has_deferred_work).
+    pub const fn is_retained_when_unused(self) -> bool {
+        self.has_observable_effects_when_unused || self.has_deferred_work
+    }
+
+    /// Returns the union of this [`EffectsSummary`] with `other`, combining [`EffectClasses`] and retaining each flag
+    /// when either side sets it. An enclosing operation cannot suppress an observable nested effect, an explicit
+    /// ordered-state declaration, or nested deferred work.
+    pub const fn union(self, other: EffectsSummary) -> EffectsSummary {
+        EffectsSummary {
+            classes: self.classes.union(other.classes),
+            has_observable_effects_when_unused: self.has_observable_effects_when_unused
+                || other.has_observable_effects_when_unused,
+            has_explicit_ordered_state: self.has_explicit_ordered_state || other.has_explicit_ordered_state,
+            has_deferred_work: self.has_deferred_work || other.has_deferred_work,
+        }
+    }
+}
+
+/// Occurrence of an [`EffectClass`] intrinsically carried by an [`Instruction`](crate::Instruction)
+/// in a [`Region`](crate::Region).
+pub struct EffectClassOccurrence<'o, O> {
+    /// Location of the [`Instruction`](crate::Instruction) corresponding to this occurrence in the source
+    /// [`Region`](crate::Region) arena.
+    instruction: InstructionId,
+
+    /// [`EffectClass`]-carrying [`Operation`](crate::Operation).
+    operation: &'o O,
+}
+
+impl<'o, O> EffectClassOccurrence<'o, O> {
+    /// Creates a new [`EffectClassOccurrence`].
+    #[inline]
+    pub(crate) fn new(instruction: InstructionId, operation: &'o O) -> Self {
+        Self { instruction, operation }
+    }
+
+    /// Returns the location of the [`Instruction`](crate::Instruction) corresponding to this occurrence in the source
+    /// [`Region`](crate::Region) arena.
+    #[inline]
+    pub fn instruction(&self) -> InstructionId {
+        self.instruction
+    }
+
+    /// Returns the [`EffectClass`]-carrying [`Operation`](crate::Operation).
+    #[inline]
+    pub fn operation(&self) -> &'o O {
+        self.operation
     }
 }
 
@@ -146,50 +738,482 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayIrType, ArrayType, DataType};
+    use crate::programs::references::ReferenceType;
+    use crate::programs::regions::RegionId;
+
     use super::*;
 
     #[test]
-    fn test_effects() {
-        // The empty set is pure, contains nothing, reports no ordering, and iterates over nothing.
-        assert!(Effects::PURE.is_pure());
-        assert!(!Effects::PURE.contains(Effect::OrderedIo));
-        assert!(!Effects::PURE.contains(Effect::UnorderedIo));
-        assert!(!Effects::PURE.is_ordered());
-        assert_eq!(Effects::PURE.into_iter().collect::<Vec<_>>(), Vec::<Effect>::new());
+    fn test_effect_classes() {
+        // The empty set contains nothing, reports no ordering, and iterates over nothing.
+        assert!(EffectClasses::NONE.is_empty());
+        assert!(!EffectClasses::NONE.contains(EffectClass::OrderedAssertion));
+        assert!(!EffectClasses::NONE.contains(EffectClass::OrderedIo));
+        assert!(!EffectClasses::NONE.contains(EffectClass::UnorderedIo));
+        assert!(!EffectClasses::NONE.contains(EffectClass::OrderedState));
+        assert!(!EffectClasses::NONE.is_ordered());
+        assert_eq!(EffectClasses::NONE.into_iter().collect::<Vec<_>>(), Vec::<EffectClass>::new());
 
-        // A singleton set contains only its effect, and only the ordered-I/O class reports observable ordering.
-        let ordered = Effects::single(Effect::OrderedIo);
-        let unordered = Effects::single(Effect::UnorderedIo);
-        assert!(!ordered.is_pure());
-        assert!(ordered.contains(Effect::OrderedIo));
-        assert!(!ordered.contains(Effect::UnorderedIo));
-        assert!(ordered.is_ordered());
-        assert!(!unordered.is_pure());
+        // A singleton set contains only its effect, and every ordered class reports observable ordering.
+        let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
+        let ordered_io = EffectClasses::single(EffectClass::OrderedIo);
+        let device_ordered_io = EffectClasses::single(EffectClass::DeviceOrderedIo);
+        let unordered = EffectClasses::single(EffectClass::UnorderedIo);
+        let ordered_state = EffectClasses::single(EffectClass::OrderedState);
+        assert!(!device_ordered_io.is_empty());
+        assert!(device_ordered_io.contains(EffectClass::DeviceOrderedIo));
+        assert!(!device_ordered_io.contains(EffectClass::OrderedIo));
+        assert!(device_ordered_io.is_ordered());
+        assert_eq!(device_ordered_io.into_iter().collect::<Vec<_>>(), vec![EffectClass::DeviceOrderedIo]);
+        assert!(!assertion.is_empty());
+        assert!(assertion.contains(EffectClass::OrderedAssertion));
+        assert!(!assertion.contains(EffectClass::OrderedIo));
+        assert!(assertion.is_ordered());
+        assert!(!ordered_io.is_empty());
+        assert!(!ordered_io.contains(EffectClass::OrderedAssertion));
+        assert!(ordered_io.contains(EffectClass::OrderedIo));
+        assert!(!ordered_io.contains(EffectClass::UnorderedIo));
+        assert!(ordered_io.is_ordered());
+        assert!(!unordered.is_empty());
         assert!(!unordered.is_ordered());
-        assert_eq!(ordered.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedIo]);
-        assert_eq!(unordered.into_iter().collect::<Vec<_>>(), vec![Effect::UnorderedIo]);
+        assert!(!ordered_state.is_empty());
+        assert!(ordered_state.contains(EffectClass::OrderedState));
+        assert!(ordered_state.is_ordered());
+        assert_eq!(assertion.into_iter().collect::<Vec<_>>(), vec![EffectClass::OrderedAssertion]);
+        assert_eq!(ordered_io.into_iter().collect::<Vec<_>>(), vec![EffectClass::OrderedIo]);
+        assert_eq!(unordered.into_iter().collect::<Vec<_>>(), vec![EffectClass::UnorderedIo]);
+        assert_eq!(ordered_state.into_iter().collect::<Vec<_>>(), vec![EffectClass::OrderedState]);
 
-        // Union is commutative and idempotent, `PURE` is its identity element, and the combined set contains both
-        // classes and iterates in declaration order.
-        let both = ordered.union(unordered);
-        assert_eq!(both, unordered.union(ordered));
-        assert_eq!(both.union(both), both);
-        assert_eq!(both.union(Effects::PURE), both);
-        assert_eq!(Effects::PURE.union(ordered), ordered);
-        assert!(!both.is_pure());
-        assert!(both.contains(Effect::OrderedIo));
-        assert!(both.contains(Effect::UnorderedIo));
-        assert!(both.is_ordered());
-        assert_eq!(both.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedIo, Effect::UnorderedIo]);
+        // Union is commutative and idempotent, `NONE` is its identity element, and the combined set contains every
+        // class and iterates in declaration order.
+        let all = assertion.union(ordered_io).union(device_ordered_io).union(unordered).union(ordered_state);
+        assert_eq!(all, unordered.union(device_ordered_io).union(ordered_io).union(assertion).union(ordered_state));
+        assert_eq!(all.union(all), all);
+        assert_eq!(all.union(EffectClasses::NONE), all);
+        assert_eq!(EffectClasses::NONE.union(assertion), assertion);
+        assert!(!all.is_empty());
+        assert!(all.contains(EffectClass::OrderedAssertion));
+        assert!(all.contains(EffectClass::OrderedIo));
+        assert!(all.contains(EffectClass::DeviceOrderedIo));
+        assert!(all.contains(EffectClass::UnorderedIo));
+        assert!(all.contains(EffectClass::OrderedState));
+        assert!(all.is_ordered());
+        assert_eq!(
+            all.into_iter().collect::<Vec<_>>(),
+            vec![
+                EffectClass::OrderedAssertion,
+                EffectClass::OrderedIo,
+                EffectClass::DeviceOrderedIo,
+                EffectClass::UnorderedIo,
+                EffectClass::OrderedState
+            ],
+        );
 
         // Equality distinguishes distinct sets, self-equality holds for rebuilt sets, and hashing supports map lookups.
-        assert_eq!(ordered, Effects::single(Effect::OrderedIo));
-        assert_ne!(ordered, unordered);
-        assert_ne!(ordered, both);
-        assert_ne!(both, Effects::PURE);
-        let lookup = HashMap::from([(ordered, "ordered"), (both, "both")]);
-        assert_eq!(lookup.get(&Effects::single(Effect::OrderedIo)), Some(&"ordered"));
-        assert_eq!(lookup.get(&unordered.union(ordered)), Some(&"both"));
+        assert_eq!(assertion, EffectClasses::single(EffectClass::OrderedAssertion));
+        assert_ne!(assertion, ordered_io);
+        assert_ne!(ordered_io, unordered);
+        assert_ne!(ordered_io, all);
+        assert_ne!(all, EffectClasses::NONE);
+        let lookup = HashMap::from([(assertion, "assertion"), (ordered_io, "ordered I/O"), (all, "all")]);
+        assert_eq!(lookup.get(&EffectClasses::single(EffectClass::OrderedAssertion)), Some(&"assertion"));
+        assert_eq!(lookup.get(&EffectClasses::single(EffectClass::OrderedIo)), Some(&"ordered I/O"));
+        assert_eq!(
+            lookup.get(&unordered.union(ordered_io).union(device_ordered_io).union(assertion).union(ordered_state)),
+            Some(&"all"),
+        );
         assert_eq!(lookup.get(&unordered), None);
+    }
+
+    #[test]
+    fn test_effect_class_display() {
+        assert_eq!(EffectClass::OrderedAssertion.to_string(), "ordered_assertion");
+        assert_eq!(EffectClass::OrderedIo.to_string(), "ordered_io");
+        assert_eq!(EffectClass::DeviceOrderedIo.to_string(), "device_ordered_io");
+        assert_eq!(EffectClass::UnorderedIo.to_string(), "unordered_io");
+        assert_eq!(EffectClass::OrderedState.to_string(), "ordered_state");
+    }
+
+    #[test]
+    fn test_reference_access_mode() {
+        let cases = [
+            (ReferenceAccessMode::Read, "read", false),
+            (ReferenceAccessMode::Write, "write", false),
+            (ReferenceAccessMode::ReadWrite, "read/write", false),
+            (ReferenceAccessMode::Accumulate, "accumulate", false),
+            (ReferenceAccessMode::AtomicAccumulate, "atomic accumulate", false),
+            (ReferenceAccessMode::Consume, "consume", true),
+        ];
+        for (mode, display, is_consuming) in cases {
+            assert_eq!(mode.to_string(), display);
+            assert_eq!(mode.is_consuming(), is_consuming);
+        }
+    }
+
+    #[test]
+    fn test_effects() {
+        // The shared empty declaration is pure, declares nothing, and equals a freshly constructed empty declaration.
+        let empty = Effects::empty();
+        assert_eq!(empty.classes(), EffectClasses::NONE);
+        assert!(empty.is_pure());
+        assert!(!empty.declares(EffectClass::OrderedState));
+        assert_eq!(empty.reference_effects(), &[]);
+        assert_eq!(empty.accesses().collect::<Vec<_>>(), Vec::<(usize, ReferenceAccessMode)>::new());
+        assert!(!empty.has_accesses());
+        assert_eq!(empty.allocation_output_indices().collect::<Vec<_>>(), Vec::<usize>::new());
+        assert!(!empty.has_reference_declarations());
+        assert_eq!(empty.summary(), EffectsSummary::PURE);
+        assert_eq!(empty, &Effects::new(EffectClasses::NONE, vec![]).unwrap());
+        assert_eq!(empty, &Effects::explicit(EffectClasses::NONE));
+
+        // Directly declared classes are also part of the aggregate, and any nonempty directly declared class set is
+        // observable when unused.
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(io.classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert!(!io.is_pure());
+        assert!(io.declares(EffectClass::OrderedIo));
+        assert!(!io.declares(EffectClass::OrderedState));
+        assert!(!io.has_reference_declarations());
+        assert!(io.summary().has_observable_effects_when_unused());
+
+        // An allocation derives `OrderedState` without the author listing it, but is not observable when unused.
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        assert_eq!(allocation.classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert!(!allocation.is_pure());
+        assert!(!allocation.declares(EffectClass::OrderedState));
+        assert_eq!(allocation.reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
+        assert_eq!(allocation.allocation_output_indices().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(allocation.accesses().collect::<Vec<_>>(), Vec::<(usize, ReferenceAccessMode)>::new());
+        assert!(!allocation.has_accesses());
+        assert!(allocation.has_reference_declarations());
+        assert_eq!(allocation.summary().classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert!(!allocation.summary().has_observable_effects_when_unused());
+
+        // An access, including a read, derives `OrderedState` and is observable when unused.
+        let read = Effects::new(
+            EffectClasses::NONE,
+            vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+        )
+        .unwrap();
+        assert_eq!(read.classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert!(!read.declares(EffectClass::OrderedState));
+        assert_eq!(read.accesses().collect::<Vec<_>>(), vec![(0, ReferenceAccessMode::Read)]);
+        assert!(read.has_accesses());
+
+        assert_eq!(read.allocation_output_indices().collect::<Vec<_>>(), Vec::<usize>::new());
+        assert!(read.summary().has_observable_effects_when_unused());
+
+        // A mixed declaration composes conservatively: directly declared opaque state stays distinguishable from the
+        // derived class, and one observable component retains the whole application.
+        let mixed = Effects::new(
+            EffectClasses::single(EffectClass::OrderedState)
+                .union(EffectClasses::single(EffectClass::OrderedAssertion)),
+            vec![ReferenceEffect::Allocate { output_index: 1 }],
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.classes(),
+            EffectClasses::single(EffectClass::OrderedState)
+                .union(EffectClasses::single(EffectClass::OrderedAssertion)),
+        );
+        assert!(mixed.declares(EffectClass::OrderedState));
+        assert!(mixed.declares(EffectClass::OrderedAssertion));
+        assert!(!mixed.declares(EffectClass::OrderedIo));
+        assert!(mixed.summary().has_observable_effects_when_unused());
+
+        // Equality distinguishes distinct declarations and clones compare equal.
+        assert_ne!(allocation, read);
+        assert_ne!(io, Effects::explicit(EffectClasses::single(EffectClass::UnorderedIo)));
+        assert_eq!(mixed.clone(), mixed);
+    }
+
+    #[test]
+    fn test_effects_canonical_order() {
+        // Author order is not significant: accesses sort by input index and precede allocations,
+        // which sort by output index.
+        let effects = Effects::new(
+            EffectClasses::NONE,
+            vec![
+                ReferenceEffect::Allocate { output_index: 3 },
+                ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
+                ReferenceEffect::Allocate { output_index: 1 },
+                ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            effects.reference_effects(),
+            &[
+                ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
+                ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
+                ReferenceEffect::Allocate { output_index: 1 },
+                ReferenceEffect::Allocate { output_index: 3 },
+            ],
+        );
+        assert_eq!(
+            effects.accesses().collect::<Vec<_>>(),
+            vec![(0, ReferenceAccessMode::Read), (2, ReferenceAccessMode::Write)],
+        );
+        assert_eq!(effects.allocation_output_indices().collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(
+            effects,
+            Effects::new(
+                EffectClasses::NONE,
+                vec![
+                    ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
+                    ReferenceEffect::Allocate { output_index: 1 },
+                    ReferenceEffect::Allocate { output_index: 3 },
+                ],
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_effects_rejects_two_accesses_for_one_input() {
+        assert!(matches!(
+            Effects::new(
+                EffectClasses::NONE,
+                vec![
+                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
+                ],
+            ),
+            Err(ProgramError::InvalidArgument { message }) if message == "input 2 received two reference accesses",
+        ));
+    }
+
+    #[test]
+    fn test_effects_rejects_two_allocations_for_one_output() {
+        assert!(matches!(
+            Effects::new(
+                EffectClasses::NONE,
+                vec![
+                    ReferenceEffect::Allocate { output_index: 3 },
+                    ReferenceEffect::Allocate { output_index: 1 },
+                    ReferenceEffect::Allocate { output_index: 3 },
+                ],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "output 3 received two reference classifications",
+        ));
+    }
+
+    #[test]
+    fn test_effects_rejection_precedence() {
+        // Duplicate accesses precede output conflicts, regardless of their indices or declaration order.
+        assert!(matches!(
+            Effects::new(
+                EffectClasses::NONE,
+                vec![
+                    ReferenceEffect::Allocate { output_index: 0 },
+                    ReferenceEffect::Access { input_index: 3, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Allocate { output_index: 0 },
+                    ReferenceEffect::Access { input_index: 3, mode: ReferenceAccessMode::Write },
+                ],
+            ),
+            Err(ProgramError::InvalidArgument { message }) if message == "input 3 received two reference accesses",
+        ));
+
+        // Duplicate allocations are rejected after access positions have been validated.
+        assert!(matches!(
+            Effects::new(
+                EffectClasses::NONE,
+                vec![ReferenceEffect::Allocate { output_index: 7 }, ReferenceEffect::Allocate { output_index: 7 }],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "output 7 received two reference classifications",
+        ));
+    }
+
+    #[test]
+    fn test_effects_with_deferred_work() {
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+        let deferred = Effects::empty().clone().with_deferred_work();
+        let deferred_io = io.clone().with_deferred_work();
+
+        // Deferred work is an obligation orthogonal to execution effects: it adds no effect class, keeps the
+        // declaration pure, and leaves the declared classes and reference effects unchanged.
+        assert_eq!(deferred.classes(), EffectClasses::NONE);
+        assert!(deferred.is_pure());
+        assert!(deferred.summary().has_deferred_work());
+        assert!(!deferred.summary().has_observable_effects_when_unused());
+        assert!(!Effects::empty().summary().has_deferred_work());
+        assert_eq!(deferred_io.classes(), io.classes());
+        assert_eq!(deferred_io.reference_effects(), io.reference_effects());
+        assert!(deferred_io.summary().has_deferred_work());
+        assert_ne!(deferred_io, io);
+    }
+
+    #[test]
+    fn test_effects_validate_application() {
+        let array = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let reference = ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let read = Effects::new(
+            EffectClasses::NONE,
+            vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+        )
+        .unwrap();
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+
+        // Well-typed declarations on existing positions are accepted, and so is the empty declaration on anything.
+        assert_eq!(read.validate_application("test.read", &[reference.clone()], &[array.clone()]), Ok(()));
+        assert_eq!(
+            allocation.validate_application("test.reference_new", &[array.clone()], &[reference.clone()]),
+            Ok(())
+        );
+        assert_eq!(Effects::empty().validate_application("test.add", &[array.clone()], &[array.clone()]), Ok(()));
+
+        // Out-of-range positions are rejected with the application's arity.
+        assert_eq!(
+            read.validate_application::<ArrayIrType>("test.read", &[], &[]),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.read` names an accessed input 0 but the application input count is 0".to_string(),
+            )),
+        );
+        assert_eq!(
+            allocation.validate_application("test.reference_new", &[array.clone()], &[]),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.reference_new` classifies output 0 but the application output count is 0".to_string(),
+            )),
+        );
+
+        // Non-reference endpoints are rejected for accesses and allocations alike.
+        assert_eq!(
+            read.validate_application("test.read", &[array.clone()], &[array.clone()]),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.read` names an accessed input 0 but it has non-reference type `f32[]`".to_string(),
+            )),
+        );
+        assert_eq!(
+            allocation.validate_application("test.reference_new", &[array.clone()], &[array]),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.reference_new` classifies output 0 but it has non-reference type `f32[]`".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_effects_summary() {
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        let read = Effects::new(
+            EffectClasses::NONE,
+            vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+        )
+        .unwrap();
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+
+        // The pure summary is the identity element of `union`.
+        assert_eq!(EffectsSummary::PURE.classes(), EffectClasses::NONE);
+        assert!(!EffectsSummary::PURE.has_observable_effects_when_unused());
+        assert_eq!(EffectsSummary::PURE.union(EffectsSummary::PURE), EffectsSummary::PURE);
+        assert_eq!(EffectsSummary::PURE.union(read.summary()), read.summary());
+        assert_eq!(io.summary().union(EffectsSummary::PURE), io.summary());
+
+        // Union combines classes and retains the observable-when-unused bit if either side sets it, so an
+        // allocation-only outer summary cannot suppress a nested access or I/O effect, while two allocation-only
+        // summaries stay discardable.
+        let allocation_and_read: EffectsSummary = allocation.summary().union(read.summary());
+        assert_eq!(allocation_and_read.classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert!(allocation_and_read.has_observable_effects_when_unused());
+        assert_eq!(allocation_and_read, read.summary().union(allocation.summary()));
+        let allocation_and_io = allocation.summary().union(io.summary());
+        assert_eq!(
+            allocation_and_io.classes(),
+            EffectClasses::single(EffectClass::OrderedState).union(EffectClasses::single(EffectClass::OrderedIo)),
+        );
+        assert!(allocation_and_io.has_observable_effects_when_unused());
+        assert_eq!(allocation.summary().union(allocation.summary()), allocation.summary());
+        assert!(!allocation.summary().union(allocation.summary()).has_observable_effects_when_unused());
+    }
+
+    #[test]
+    fn test_effects_summary_is_pure() {
+        assert!(EffectsSummary::PURE.is_pure());
+
+        // An unused allocation is discardable, but allocating state is still an effect.
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        assert!(!allocation.summary().has_observable_effects_when_unused());
+        assert!(!allocation.summary().is_pure());
+
+        // A declaration can have no runtime effects while its summary retains a transformation obligation.
+        let deferred = Effects::empty().clone().with_deferred_work();
+        assert!(deferred.is_pure());
+        assert!(!deferred.summary().is_pure());
+        assert!(!EffectsSummary::PURE.union(deferred.summary()).is_pure());
+    }
+
+    #[test]
+    fn test_effects_summary_has_explicit_ordered_state() {
+        let read = Effects::new(
+            EffectClasses::NONE,
+            vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+        )
+        .unwrap();
+        let mixed = Effects::new(
+            EffectClasses::single(EffectClass::OrderedState),
+            vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
+        )
+        .unwrap();
+        let explicit = Effects::explicit(EffectClasses::single(EffectClass::OrderedState));
+
+        // Both declarations have the same aggregate classes and observability, but only the directly declared
+        // state prevents transforms from attributing every effect to known reference roots.
+        assert_eq!(read.summary().classes(), mixed.summary().classes());
+        assert_eq!(read.summary().classes(), explicit.summary().classes());
+        assert!(read.summary().has_observable_effects_when_unused());
+        assert!(mixed.summary().has_observable_effects_when_unused());
+        assert!(!EffectsSummary::PURE.has_explicit_ordered_state());
+        assert!(!read.summary().has_explicit_ordered_state());
+        assert!(explicit.summary().has_explicit_ordered_state());
+        assert!(mixed.summary().has_explicit_ordered_state());
+        assert!(read.summary().union(mixed.summary()).has_explicit_ordered_state());
+        assert!(mixed.summary().union(read.summary()).has_explicit_ordered_state());
+    }
+
+    #[test]
+    fn test_effects_summary_has_deferred_work() {
+        let deferred = Effects::empty().clone().with_deferred_work();
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+
+        // Union retains nested deferred work regardless of the side that carries it, without adding effect classes.
+        assert!(!EffectsSummary::PURE.has_deferred_work());
+        assert!(deferred.summary().has_deferred_work());
+        assert!(EffectsSummary::PURE.union(deferred.summary()).has_deferred_work());
+        assert!(deferred.summary().union(EffectsSummary::PURE).has_deferred_work());
+        assert!(!io.summary().has_deferred_work());
+        assert!(io.summary().union(deferred.summary()).has_deferred_work());
+        assert_eq!(io.summary().union(deferred.summary()).classes(), io.summary().classes());
+    }
+
+    #[test]
+    fn test_effects_summary_is_retained_when_unused() {
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+        let deferred = Effects::empty().clone().with_deferred_work();
+
+        // Dead-code elimination retains observable effects and deferred work, but not pure or allocation-only work.
+        assert!(!EffectsSummary::PURE.is_retained_when_unused());
+        assert!(!allocation.summary().is_retained_when_unused());
+        assert!(io.summary().is_retained_when_unused());
+        assert!(deferred.summary().is_retained_when_unused());
+        assert!(allocation.summary().union(deferred.summary()).is_retained_when_unused());
+    }
+
+    #[test]
+    fn test_effect_class_occurrence() {
+        let operation = "effectful";
+        let instruction = InstructionId::new(RegionId::new(2), 3);
+        let occurrence = EffectClassOccurrence::new(instruction, &operation);
+        assert_eq!(occurrence.instruction(), instruction);
+        assert_eq!(occurrence.operation(), &operation);
     }
 }

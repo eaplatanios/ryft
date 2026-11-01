@@ -1,0 +1,3210 @@
+//! Vectorizes computations by running one closure over packed batches while preserving each flowing value's unbatched
+//! per-item type.
+//!
+//! Batching does not mechanically prepend a dimension to every intermediate value. A policy-selected carrier owns the
+//! packed parent-context value and records whether one physical dimension is the mapped batch axis or whether the value
+//! is replicated across all batch items. Each operation-owned [`BatchableOperation`] rule decides how that metadata
+//! propagates, aligns, broadcasts, moves, reduces, or interacts with nested programs. Refer to [`BatchingContext`] for
+//! a rendered diagram of the value-level transform pipeline.
+//!
+//! # Choosing an Entry Point
+//!
+//!   - [`batch`] is the ordinary value-level entry point. It recovers an execution context from the first input leaf,
+//!     broadcasts the input-axis specification across the input structure, invokes the closure once over
+//!     [`BatchingTracer`] values, and materializes the requested output axes. It cannot serve an input structure with
+//!     no leaves because there is no value from which to recover a context.
+//!   - [`Batch::batch`] performs the same transform through an explicitly owned [`Context`]. It supports empty input
+//!     structures when [`BatchAxisSpecification`] supplies an explicit extent.
+//!   - [`Program::batched`] structurally rewrites an already staged program. Higher-order operation rules use this path
+//!     when they need a reusable transformed region and explicit natural or aligned output-axis metadata.
+//!
+//! # Axes, Extent, and Output Placement
+//!
+//! [`BatchAxis::new`] marks the physical dimension that indexes batch items; [`BatchAxis::replicated`] marks a value
+//! shared unchanged across them. Negative mapped axes normalize against the packed rank. Every mapped input must agree
+//! on one extent. [`BatchAxisSpecification`] may leave that extent to inference, pin it explicitly, or provide the only
+//! extent for a fully replicated or empty transform. Its optional name binds the new logical axis for collectives and
+//! other named-axis operations.
+//!
+//! Output specifications describe the requested physical placement. A naturally mapped output is transposed when its
+//! axis must move, while a naturally replicated output is broadcast when a mapped output is requested. Requesting a
+//! replicated result never silently collapses a genuinely mapped output; the closure must perform an explicit reduction
+//! when that is the intended computation.
+//!
+//! # Transform Frame and Policy
+//!
+//! [`BatchingContext`] is one active batching level. It wraps the parent [`Context`] and stores the mapped extent,
+//! optional name, and sharding placement. [`BatchingTracer`] is the flowing value stamped with that level.
+//! [`BatchingPolicy`] selects the batch carrier, extent representation, and structurally batched program boundary
+//! for one value universe. [`BatchableOperation`] owns the semantic rule for one operation payload.
+//!
+//! The array carrier [`ArrayBatch`](crate::ArrayBatch) pairs a packed array with its mapped-axis position and exposes
+//! shared alignment and broadcasting operations. Genuinely [`ElementwiseOperation`](crate::ElementwiseOperation)
+//! payloads use the common elementwise batching rule. Shape-changing, reducing, indexing, control-flow, and
+//! higher-order operations provide dedicated rules because their output axes follow operation-specific semantics.
+//!
+//! # Parent Ownership and Composition
+//!
+//! Packed values belong to the parent context, not to the active transform frame. Ordinary batching rules unpack their
+//! carriers, bind lifted work through [`BatchingContext::parent`], and wrap the parent-owned results in new carriers.
+//! An eager parent executes that work; a staging parent records it. Nested batching works without a side table because
+//! each outer carrier remains part of the inner level's parent value.
+//!
+//! Every rule returns its output carriers directly. Array shapes remain rectangular: a shared dynamic extent is
+//! supported, while an extent that depends on mapped data is rejected before it can define a per-item shape.
+//!
+//! # Nested Programs
+//!
+//! [`BatchingDriver`] gives a higher-order rule two distinct recursive paths. [`BatchingDriver::batch_region`] replays
+//! a borrowed region through the active transform over batch carriers. [`BatchingDriver::batch_program`] structurally
+//! rewrites a region into a standalone batched program. [`ProgramBatchingOutputAxesPolicy`] preserves natural output
+//! axes or requests explicit alignment.
+//!
+//! Some policies widen a standalone transformed boundary with bookkeeping values such as a first-class dynamic batch
+//! extent. [`BatchedProgram`] preserves that policy-specific boundary. Consumers either thread it through compatible
+//! higher-order operations or use [`BatchingPolicy::adapt_batched_program`] to remove bookkeeping outputs and restore
+//! an ordinary region boundary.
+//!
+//! # Extending Batching
+//!
+//! Implement [`BatchableOperation`] for each operation payload that may appear under batching. Use the shared
+//! elementwise path only for genuinely elementwise semantics; write a dedicated rule whenever dimensions, mapped axes,
+//! nested regions, named axes, or sharding require operation-specific handling. Member operations of heterogeneous
+//! families can reuse homogeneous rules through [`batch_projected_operation`] only when they are region-free and
+//! projectable. Member operations over shared bookkeeping values whose outer policy implements
+//! [`ReplicatedBatchingPolicyProjection`] need no rules at all as [`batch_replicated_projected_operation`] binds them
+//! once in the parent context.
+//!
+//! A new value universe supplies a [`BatchingPolicy`] and, for the public entry point, a
+//! [`BatchingEntrypointPolicy`]. Add [`RecursiveBatchingPolicy`] when its region programs support structural batching
+//! and return their output batch axes. Invalid axis, extent, metadata, projection, and region contracts must return an
+//! exact [`BatchingError`] rather than panic.
+
+use std::borrow::Cow;
+use std::fmt::{Debug, Display};
+use std::rc::Rc;
+
+use thiserror::Error;
+
+use ryft_macros::Parameter;
+
+use crate::arrays::{ArrayType, DimensionType, ShardingDimension};
+use crate::axes::{Axis, AxisError};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
+use crate::interpretation::InterpretableOperation;
+use crate::macros::check_count;
+use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::programs::{
+    AttachedRegions, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
+    ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
+    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
+use crate::tracing::{Tracer, TracingContext};
+
+#[cfg(doc)]
+use crate::operations::Composite;
+
+/// Represents batching-related errors.
+///
+/// [`BatchingError`] and [`ProgramError`] deliberately form a conversion cycle in which each type
+/// can carry the other. Batching rules get executed by binding operations (i.e., via [`Context::bind`] and
+/// [`StagingContext::stage_operation`]), which can result in [`ProgramError`]s. So, [`BatchingError`]s travel up a
+/// trace, type-erased, inside [`ProgramError::Custom`] payloads. In the other direction, the public batching transform
+/// entry point is typed to [`BatchingError`], and a batching trace can also fail for reasons that are not related to
+/// batching. Those program errors surface through the [`BatchingError::Program`] variant. The paired [`From`]
+/// implementations keep this cycle normalized instead of letting the two types nest: converting to [`ProgramError`]
+/// unwraps a [`BatchingError::Program`] back into the program error that it carries, maps a [`BatchingError::Axis`]
+/// error onto [`ProgramError::Axis`], and wraps every other variant in [`ProgramError::Custom`], while converting to
+/// [`BatchingError`] maps a [`ProgramError::Axis`] error onto [`BatchingError::Axis`], unwraps a
+/// [`ProgramError::Custom`] payload holding a [`BatchingError`], and wraps every other program error in
+/// [`BatchingError::Program`]. Round trips therefore never nest one error type inside the other, and `?` re-types
+/// errors correctly at both boundaries. Outside of these conversions, a [`BatchingError`] carried by a [`ProgramError`]
+/// can be recovered using [`ProgramError::downcast_custom`].
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BatchingError {
+    #[error("encountered an empty batch")]
+    EmptyBatch,
+
+    #[error("mismatched batch sizes across batched leaves; expected size {expected} but got {actual}")]
+    MismatchedBatchSizes { expected: usize, actual: usize },
+
+    #[error("{message}")]
+    MisalignedBatchAxes { message: String },
+
+    #[error("batch axis {axis} of array type {type} has dynamic size")]
+    DynamicBatchAxis { r#type: Box<ArrayType>, axis: Axis },
+
+    #[error("batch axis {axis} is out of bounds for array type {type}")]
+    BatchAxisOutOfBounds { r#type: Box<ArrayType>, axis: Axis },
+
+    #[error("dimension type {type} cannot carry mapped batch axis {axis}")]
+    MappedDimension { r#type: Box<DimensionType>, axis: BatchAxis },
+
+    #[error("{message}")]
+    InvalidBatchMetadata { message: String },
+
+    #[error("{message}")]
+    UnsupportedOperation { message: String },
+
+    #[error("mismatched batch output axes; expected {expected} but got {actual}")]
+    MismatchedOutputAxes { expected: BatchAxis, actual: BatchAxis },
+
+    #[error("broadcasting the replicated input leaf {input} changes the batched output leaf {output}")]
+    BroadcastInvarianceViolation { input: usize, output: usize },
+
+    #[error(transparent)]
+    Parameter(#[from] ParameterError),
+
+    #[error(transparent)]
+    Type(#[from] TypeError),
+
+    #[error(transparent)]
+    Axis(#[from] AxisError),
+
+    #[error(transparent)]
+    Program(ProgramError),
+}
+
+impl From<ProgramError> for BatchingError {
+    #[inline]
+    fn from(error: ProgramError) -> Self {
+        match error {
+            ProgramError::Axis(error) => BatchingError::Axis(error),
+            error => match error.downcast_custom::<BatchingError>() {
+                Some(batching) => batching.clone(),
+                None => BatchingError::Program(error),
+            },
+        }
+    }
+}
+
+impl From<BatchingError> for ProgramError {
+    #[inline]
+    fn from(error: BatchingError) -> Self {
+        match error {
+            BatchingError::Program(error) => error,
+            BatchingError::Axis(error) => ProgramError::Axis(error),
+            error => ProgramError::custom(error),
+        }
+    }
+}
+
+/// A batched value's mapped batch axis. [`BatchAxis::new`]`(k)` means that the value's batch dimension sits at packed
+/// axis `k`. [`BatchAxis::replicated`] (the [`Default`]) means that the value is *replicated* (i.e., it carries no
+/// dimension for the batch and is interpreted as the same value for every batch item). For example, a traced constant
+/// in `batch(|x| x + 1)` is replicated, while `x` carries the mapped input axis. Runtime control flow predicates may
+/// also be replicated, because a single predicate may select one branch for the whole batch while a batch-varying
+/// predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e., scalar)
+/// values. Any shaped constant or input is replicated when none of its dimensions indexes the batch.
+///
+/// This is the batch axis carried by an [`ArrayBatch`](crate::ArrayBatch) and, during the batching transform, by the
+/// [`Tracer`] metadata. Carrying it on the value itself lets the per-operation batching rules route the mapped batch
+/// axis straight from the value in hand.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
+pub struct BatchAxis(Option<Axis>);
+
+impl BatchAxis {
+    /// Creates a mapped [`BatchAxis`] at position `axis`.
+    #[inline]
+    pub fn new<A: Into<Axis>>(axis: A) -> Self {
+        Self(Some(axis.into()))
+    }
+
+    /// Creates a mapped [`BatchAxis`] from an already-normalized position.
+    #[inline]
+    pub fn from_position(position: usize) -> Self {
+        Self::new(position)
+    }
+
+    /// Creates a replicated or mapped [`BatchAxis`] from an already-normalized optional position.
+    #[inline]
+    pub fn from_optional_position(position: Option<usize>) -> Self {
+        position.map(Self::from_position).unwrap_or_default()
+    }
+
+    /// Creates a replicated [`BatchAxis`] (i.e., the batched value is shared unchanged across every batch item).
+    /// This is equivalent to [`BatchAxis::default`].
+    #[inline]
+    pub fn replicated() -> Self {
+        Self(None)
+    }
+
+    /// Returns the mapped batch axis position, or `None` if this [`BatchAxis`] is replicated.
+    #[inline]
+    pub fn axis(&self) -> Option<Axis> {
+        self.0
+    }
+
+    /// Returns `true` if this [`BatchAxis`] is replicated (i.e., if it carries no mapped batch axis).
+    #[inline]
+    pub fn is_replicated(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl Display for BatchAxis {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(axis) => write!(formatter, "axis {axis}"),
+            None => write!(formatter, "replicated"),
+        }
+    }
+}
+
+impl From<Option<isize>> for BatchAxis {
+    #[inline]
+    fn from(axis: Option<isize>) -> Self {
+        Self(axis.map(Axis::from))
+    }
+}
+
+impl<A: Into<Axis>> From<A> for BatchAxis {
+    #[inline]
+    fn from(axis: A) -> Self {
+        Self(Some(axis.into()))
+    }
+}
+
+/// Specification of a batch axis introduced by the batching transform that contains an optional explicit extent and
+/// an optional axis name that can be referenced by operations that support named axes. The extent is normally
+/// inferred from the inputs that are being batched. An explicit extent can be provided to either pin it or to drive
+/// a broadcasted batching transform whose extent would otherwise be unobservable. Its representation is selected by
+/// the active [`BatchingPolicy`] (e.g., homogeneous arrays use a host `usize`, while array IR programs use a
+/// first-class dimension value). The axis name makes the batch axis addressable by name from collective operations
+/// inside the batched function body. The default `usize` form converts from `None`, `Some(extent)`, and `extent`
+/// directly. For example:
+///
+/// ```ignore
+/// domain.batch(f, input, input_axes, output_axes, None)?;                                     // Inferred, anonymous.
+/// domain.batch(f, input, input_axes, output_axes, 8)?;                                        // Explicit, anonymous.
+/// domain.batch(f, input, input_axes, output_axes, BatchAxisSpecification::named("devices"))?; // Inferred, named.
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchAxisSpecification<E = usize> {
+    /// Explicit batch extent, or `None` to infer it from the inputs that are being batched.
+    extent: Option<E>,
+
+    /// Name that operations (e.g., collectives) can use to refer to it, or `None` for an anonymous axis.
+    name: Option<String>,
+}
+
+impl<E> Default for BatchAxisSpecification<E> {
+    #[inline]
+    fn default() -> Self {
+        Self { extent: None, name: None }
+    }
+}
+
+impl<E> BatchAxisSpecification<E> {
+    /// Creates a named [`BatchAxisSpecification`] with an explicit batch extent.
+    #[inline]
+    pub fn new<N: Into<String>>(extent: E, name: N) -> Self {
+        Self { extent: Some(extent), name: Some(name.into()) }
+    }
+
+    /// Creates an anonymous [`BatchAxisSpecification`] with an explicit batch extent.
+    #[inline]
+    pub fn with_extent(extent: E) -> Self {
+        Self { extent: Some(extent), name: None }
+    }
+
+    /// Creates a named [`BatchAxisSpecification`] whose batch extent is inferred from the mapped inputs.
+    #[inline]
+    pub fn named<N: Into<String>>(name: N) -> Self {
+        Self { extent: None, name: Some(name.into()) }
+    }
+
+    /// Returns the explicit batch extent, or `None` when it is to be inferred from mapped inputs.
+    #[inline]
+    pub fn extent(&self) -> Option<&E> {
+        self.extent.as_ref()
+    }
+
+    /// Returns the name of this [`BatchAxisSpecification`] that operations (e.g., collectives) can use to refer
+    /// to it, or `None` for an anonymous axis.
+    #[inline]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+impl<E> From<Option<E>> for BatchAxisSpecification<E> {
+    #[inline]
+    fn from(extent: Option<E>) -> Self {
+        Self { extent, name: None }
+    }
+}
+
+impl From<usize> for BatchAxisSpecification {
+    #[inline]
+    fn from(extent: usize) -> Self {
+        Self::with_extent(extent)
+    }
+}
+
+/// Extent of the batch axis introduced at a [`BatchingLevel`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BatchingLevelExtent<T> {
+    /// Host extent that was fixed when the level was created (e.g., by a homogeneous array policy).
+    Static(usize),
+
+    /// First-class extent value of the provided type. Its runtime value is not part of the level and is instead
+    /// supplied as a leading boundary input. Refer to the documentation of [`BatchingPolicy::boundary_inputs`]
+    /// for more information on dynamic batching extents.
+    Dynamic(T),
+}
+
+/// Description of one batching level (i.e., everything that a [`RecursiveBatchingPolicy`] needs to structurally batch a
+/// nested [`Program`] at that level, without a live [`BatchingContext`]). An operation whose nested programs are traced
+/// only after the operation itself was batched records the level through [`BatchingDriver::batching_level`] and later
+/// batches those programs with [`RecursiveBatchingPolicy::batch_program_at_level`]. A level never contains a runtime
+/// value: first-class extents contribute only their type, and their value reaches batched programs as the leading
+/// boundary input that [`BatchingPolicy::boundary_inputs`] supplies to every consumer of that policy's batched
+/// programs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BatchingLevel<T> {
+    /// Extent of the batch axis introduced at this level.
+    extent: BatchingLevelExtent<T>,
+
+    /// Name that operations (e.g., collectives) can use to refer to the batch axis, or [`None`] for an anonymous axis.
+    axis_name: Option<String>,
+
+    /// Sharding placement assigned to every newly materialized batch axis.
+    axis_sharding: ShardingDimension,
+}
+
+impl<T> BatchingLevel<T> {
+    /// Creates a new [`BatchingLevel`].
+    #[inline]
+    pub fn new(extent: BatchingLevelExtent<T>, axis_name: Option<String>, axis_sharding: ShardingDimension) -> Self {
+        Self { extent, axis_name, axis_sharding }
+    }
+
+    /// Returns the extent of the batch axis introduced at this [`BatchingLevel`].
+    #[inline]
+    pub fn extent(&self) -> &BatchingLevelExtent<T> {
+        &self.extent
+    }
+
+    /// Returns the name of the batch axis introduced at this [`BatchingLevel`], or [`None`] for an anonymous axis.
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
+    }
+
+    /// Returns the sharding placement assigned to every newly materialized batch axis.
+    #[inline]
+    pub fn axis_sharding(&self) -> &ShardingDimension {
+        &self.axis_sharding
+    }
+}
+
+impl<T: Type> BatchingLevel<T> {
+    /// Returns this [`BatchingLevel`] after simultaneously renaming the type identities of its first-class extent
+    /// type, as specified by the provided [`TypeIdentityRenaming`].
+    pub fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let extent = match &self.extent {
+            BatchingLevelExtent::Static(extent) => BatchingLevelExtent::Static(*extent),
+            BatchingLevelExtent::Dynamic(r#type) => BatchingLevelExtent::Dynamic(r#type.rename_identities(renaming)?),
+        };
+        Ok(Self { extent, axis_name: self.axis_name.clone(), axis_sharding: self.axis_sharding.clone() })
+    }
+}
+
+/// Result produced by batching a nested [`Program`]. Every [`BatchingPolicy`] selects one implementation through
+/// [`BatchingPolicy::BatchedProgram`]. Implementations retain their complete policy-specific program boundary while
+/// exposing the two pieces of information needed by universe-neutral batching machinery: one [`BatchAxis`] per semantic
+/// source-program output and the transformed program itself. Any bookkeeping inputs or outputs added by a policy are
+/// retained in the returned program and excluded from [`Self::output_axes`]. Concrete implementations remain
+/// responsible for validating their stronger boundary invariants.
+pub trait BatchedProgram<V: Value, O: Operation<Type = V::Type>> {
+    /// Returns the mapped axes of the source [`Region`](crate::Region)'s semantic outputs.
+    fn output_axes(&self) -> &[BatchAxis];
+
+    /// Consumes this [`BatchedProgram`] and returns its underlying transformed [`Program`] and semantic output axes
+    /// without altering its [`BatchingPolicy`]-specific boundary.
+    fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>);
+}
+
+/// [`BatchedProgram`] whose underlying transformed [`Program`] carries exactly the source [`Region`](crate::Region)'s
+/// inputs and outputs, without any [`BatchingPolicy`]-owned bookkeeping boundary values. This is the reusable default
+/// carrier for batching policies that preserve region boundaries. Policies that widen transformed boundaries select
+/// their own [`BatchedProgram`] implementation so consumers cannot silently mistake a bookkeeping input or output for
+/// one belonging to the source region.
+pub struct BoundaryPreservingBatchedProgram<V: Typed + Parameter, O> {
+    /// Structurally transformed [`Program`].
+    program: Program<V, O, Vec<V>, Vec<V>>,
+
+    /// Mapped axes of the source [`Region`](crate::Region)'s outputs.
+    output_axes: Vec<BatchAxis>,
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V, O> {
+    /// Creates a new [`BoundaryPreservingBatchedProgram`] that carries exactly the source
+    /// [`Region`](crate::Region)'s inputs and outputs.
+    #[inline]
+    pub fn new(program: Program<V, O, Vec<V>, Vec<V>>, output_axes: Vec<BatchAxis>) -> Result<Self, ProgramError> {
+        check_count!("output", output_axes, program.output_count(), ProgramError);
+        Ok(Self { program, output_axes })
+    }
+
+    /// Creates a new [`BoundaryPreservingBatchedProgram`] from the parts of a structurally batched program
+    /// whose boundary may still carry a [`BatchingPolicy`]'s widening.
+    ///
+    /// This constructor performs the two boundary adjustments that turn a widened batched program back into an
+    /// ordinary [`Region`](crate::Region) program, both by replaying the program and rebuilding its output
+    /// boundary:
+    ///
+    ///   - It drops the leading `widening_output_count` outputs, which carry transform bookkeeping (e.g., the
+    ///     array IR policy's forwarded mapped extent) rather than source-region results.
+    ///   - It reconciles each remaining output with the batch axis its consumer requires: an output that is mapped
+    ///     while its required axis is replicated is collapsed along its mapped axis by `collapse_fn`. Every other
+    ///     combination passes through unchanged.
+    ///
+    /// Unlike [`Self::new`], the provided parts deliberately do *not* need to satisfy this type's boundary
+    /// invariant: `output_axes` excludes the bookkeeping outputs that `program` still carries, so the parts only
+    /// become a valid [`BoundaryPreservingBatchedProgram`] once the replay has dropped those outputs. The constructed
+    /// result always satisfies the invariant, and its output axes report each collapsed output as replicated
+    /// (collapsing is what made it so). When neither adjustment applies (no bookkeeping outputs and no required axes),
+    /// the parts are rewrapped directly, without a replay.
+    ///
+    /// This is the shared implementation behind every [`BatchingPolicy::adapt_batched_program`] implementation:
+    /// each policy calls it with its own widening output count so that the replay machinery exists exactly once.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Structurally batched program, which may still carry `widening_output_count` leading
+    ///     bookkeeping outputs beyond the source region's own outputs.
+    ///   - `output_axes`: Mapped batch axis of each source-region output of `program`, in order, *excluding* the
+    ///     bookkeeping outputs (i.e., one entry per output that the constructed result keeps).
+    ///   - `required_output_axes`: Batch axis that the consumer requires for each kept output, or [`None`] to
+    ///     keep every output's natural axis. Only mapped-to-replicated mismatches are resolved (via `collapse_fn`),
+    ///     because they are the one mismatch no structural axis movement can fix; batch the program with
+    ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally movable axis already
+    ///     matches its requirement.
+    ///   - `widening_output_count`: Number of leading `program` outputs that belong to the policy's boundary
+    ///     widening and must be dropped.
+    ///   - `collapse_fn`: Collapses one mapped output along the provided axis, within the replay's own
+    ///     [`TracingContext`]. A collapsed output arrives as the per-item family `{y₀, …, yₙ₋₁}` packed along the
+    ///     mapped axis while its consumer requires the one value that is correct in the replicated position, so this
+    ///     function is the consumer's chosen left inverse to replication along the batch axis. Which inverse is correct
+    ///     depends on what the output *means*, which is why callers own this step. For example, the
+    ///     [`LinearCallOperation`](crate::LinearCallOperation) transpose consumer collapses cotangents by summation
+    ///     (i.e., `ȳ = Σᵢ ȳᵢ`, because replicating a primal across the batch is a broadcast and the transpose of a
+    ///     broadcast is a summation), while a hypothetical consumer of replicated primal values would instead select
+    ///     any one item.
+    #[inline]
+    pub fn from_widened_boundary<
+        CollapseFn: Fn(
+            &TracingContext<V, O>,
+            Tracer<TracingContext<V, O>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<V, O>>, BatchingError>,
+    >(
+        program: Program<V, O, Vec<V>, Vec<V>>,
+        output_axes: Vec<BatchAxis>,
+        required_output_axes: Option<&[BatchAxis]>,
+        widening_output_count: usize,
+        collapse_fn: CollapseFn,
+    ) -> Result<Self, BatchingError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
+        /// Internal helper that constructs a [`BoundaryPreservingBatchedProgram`] like [`Self::from_widened_boundary`]
+        /// with the collapse callback type erased. This is the body of that function, which only wraps its callback,
+        /// so that this body is compiled once per value type and operation family rather than once per callback type:
+        /// every adaptation with a distinct collapse closure would otherwise instantiate this body and every closure
+        /// and iterator adapter in it again. The callback is invoked once per collapsed output.
+        #[allow(clippy::type_complexity)]
+        fn inner<V: Value, O: Operation<Type = V::Type>>(
+            program: Program<V, O, Vec<V>, Vec<V>>,
+            output_axes: Vec<BatchAxis>,
+            required_output_axes: Option<&[BatchAxis]>,
+            widening_output_count: usize,
+            collapse_fn: &dyn Fn(
+                &TracingContext<V, O>,
+                Tracer<TracingContext<V, O>>,
+                Axis,
+            ) -> Result<Tracer<TracingContext<V, O>>, BatchingError>,
+        ) -> Result<BoundaryPreservingBatchedProgram<V, O>, BatchingError>
+        where
+            TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+        {
+            if let Some(required_output_axes) = required_output_axes {
+                check_count!("output", output_axes, required_output_axes.len(), ProgramError);
+            } else if widening_output_count == 0 {
+                return Ok(BoundaryPreservingBatchedProgram::new(program, output_axes)?);
+            }
+
+            // Replay the program over fresh tracer inputs so that its output boundary can be rebuilt. The block scopes
+            // the tracing context and every traced value because recovering the rebuilt program below requires unique
+            // ownership of the shared builder, and so all other handles to it must have been released by then.
+            let (builder, output_ids) = {
+                let context = TracingContext::<V, O>::new();
+                let builder = context.builder().clone();
+                let inputs = program.input_types().into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+                let mut outputs = program.interpret_in_context(&context, inputs)?;
+                check_count!("output", outputs, output_axes.len() + widening_output_count, ProgramError);
+
+                // The leading widening outputs carry transform bookkeeping rather than source-region results,
+                // so the rebuilt boundary omits them.
+                outputs.drain(..widening_output_count);
+
+                // Collapse each output that is mapped while its consumer requires it replicated. This is the one
+                // mismatch no structural axis movement can resolve, so it must be reduced away here.
+                if let Some(required_output_axes) = required_output_axes {
+                    outputs = outputs
+                        .into_iter()
+                        .zip(output_axes.iter().zip(required_output_axes))
+                        .map(|(output, (actual, required))| match (actual.axis(), required.axis()) {
+                            (Some(axis), None) => collapse_fn(&context, output, axis),
+                            _ => Ok(output),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+
+                (builder, outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?)
+            };
+
+            // With the context and tracers gone, the builder handle is unique and the traced instructions can be sealed
+            // into the rebuilt program behind the adjusted output boundary.
+            let input_count = program.input_count();
+            let output_count = output_ids.len();
+            let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+            let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
+
+            // A collapsed output is replicated in the rebuilt program, so the reported axes must say so
+            // instead of repeating the pre-collapse mapped axis.
+            let output_axes = match required_output_axes {
+                Some(required_output_axes) => output_axes
+                    .into_iter()
+                    .zip(required_output_axes)
+                    .map(|(actual, required)| match (actual.axis(), required.axis()) {
+                        (Some(_), None) => BatchAxis::replicated(),
+                        _ => actual,
+                    })
+                    .collect(),
+                None => output_axes,
+            };
+
+            Ok(BoundaryPreservingBatchedProgram::new(program, output_axes)?)
+        }
+
+        inner(program, output_axes, required_output_axes, widening_output_count, &collapse_fn)
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> BatchedProgram<V, O> for BoundaryPreservingBatchedProgram<V, O> {
+    #[inline]
+    fn output_axes(&self) -> &[BatchAxis] {
+        self.output_axes.as_slice()
+    }
+
+    #[inline]
+    fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>) {
+        (self.program, self.output_axes)
+    }
+}
+
+/// [`Type`] capability selecting the canonical [`BatchingEntrypointPolicy`] used by the public batching transform.
+/// This is a batching-owned extension of [`Type`] and not part of the core type contract. It lets one blanket [`Batch`]
+/// implementation select the canonical policy for each program universe without adding batching machinery to [`Type`]
+/// or [`Context`] and without relying on overlapping blanket implementations distinguished only by [`Domain::Type`].
+pub trait BatchableType: Type {
+    /// Canonical [`BatchingEntrypointPolicy`] selecting this type universe's batch carrier, extent representation,
+    /// and public entrypoint behavior.
+    type Policy: Copy + Clone + Debug;
+}
+
+/// Transform-owned policy selecting the batch carrier and mapped-axis extent representation used by a
+/// [`BatchingContext`]. One generic batching frame (i.e., [`BatchingContext`], [`BatchingTracer`], [`BatchingDriver`],
+/// and the [`BatchableOperation`] rule contract) serves every [`Program`] universe, and this policy names the three
+/// places where those universes genuinely differ:
+///
+///   - **The Batch Carrier (i.e., [`Self::Batch`]):** A batched value maintains a split between its unbatched per-item
+///     type and the parent-owned packed value that stores the whole batch. How that split is represented is specific
+///     to each value kind: an ordinary array gains a mapped axis in its packed shape (i.e.,
+///     [`ArrayBatch`](crate::ArrayBatch)), while a first-class dimension is shared shape metadata.
+///     An array IR carrier therefore keeps dimension members replicated and rejects mapped dimension members.
+///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while an
+///     array IR universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
+///     remains a Single Static Assignment (SSA) value flowing through instruction inputs rather than being treated as
+///     static transform metadata.
+///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Programs over homogeneous arrays preserve
+///     source region's boundary exactly and produce [`BoundaryPreservingBatchedProgram`]s, while an array IR universe
+///     may thread bookkeeping values such as its first-class mapped extent through standalone nested programs.
+///     Every selected carrier implements [`BatchedProgram`], while [`Self::boundary_inputs`] and
+///     [`Self::adapt_batched_program`] let consumers complete or shed policy-specific widening.
+///
+/// The policy is deliberately limited to carrier selection, construction, access, type derivation,
+/// and invariant enforcement. Array-specific alignment and broadcasting are represented as functions on
+/// [`ArrayBatch`](crate::ArrayBatch) (an array IR policy may project an array member into that carrier to reuse
+/// an existing array rule). Batching nested [`Region`](crate::Region) support is provided separately by the
+/// [`RecursiveBatchingPolicy`] trait, allowing a batching carrier to support region-free operations without
+/// also supporting recursive transformation of nested programs.
+pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
+    /// Batch-carrying representation for values owned by `C`.
+    type Batch: Clone + Debug + Display + Parameter;
+
+    /// Representation of the mapped-axis extent.
+    type Extent: Clone + Debug;
+
+    /// Result of structurally batching a nested [`Program`], including any policy-owned bookkeeping widening of the
+    /// program boundary. Refer to the documentation of [`Self::adapt_batched_program`] for how consumers shed that
+    /// widening when they need an ordinary [`Region`](crate::Region) boundary.
+    type BatchedProgram: BatchedProgram<C::Constant, C::Operation>;
+
+    /// Wraps a parent-owned packed value with the requested mapped axis, validating and normalizing that axis.
+    fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError>;
+
+    /// Wraps a parent-owned packed value as replicated across the batch.
+    fn replicated(value: C::Value) -> Self::Batch;
+
+    /// Returns the parent-owned packed value stored in `batch`.
+    fn value(batch: &Self::Batch) -> &C::Value;
+
+    /// Returns the [`BatchAxis`] carried by `batch`.
+    fn batch_axis(batch: &Self::Batch) -> BatchAxis;
+
+    /// Lifts the per-item declaration type, `declared`, to a packed type using `input` as the carrier template. The
+    /// result is `declared` with `input`'s mapped batch axis inserted, using the batch extent and the axis sharding
+    /// of `context`. A replicated `input` has no mapped axis to insert, and so the result is `declared` unchanged.
+    ///
+    /// The declaration is supplied independently of the actual per-item type returned by [`Self::unbatched_type`].
+    /// For example, a declaration `f32[n]` lifts to `f32[b, n]` for a leading mapped axis of extent `b`, even when the
+    /// carrier's actual packed type is `f32[b, 5]`. Keeping `n` preserves the declaration's relationships with other
+    /// inputs. The carrier supplies the mapped-axis position, member representation, and existing manual variation;
+    /// the context supplies the batching level's extent and axis sharding. These inputs are needed to construct the
+    /// lifted declaration, whereas reading an existing carrier's per-item type needs only that carrier.
+    ///
+    /// Operations that preserve their inputs' logical values (e.g., guards and casts) use this function to lift their
+    /// per-item declarations to the packed values that they bind in the parent context. It only derives a type and
+    /// creates no value, so the inserted axis preserves `input`'s existing variation on the manual mesh axes of the
+    /// mapped dimension, while every other constraint (including variation on other manual axes) remains as declared.
+    /// Callers remain responsible for validating the original per-item contract before lifting it and for validating
+    /// the packed values against the lifted declaration, preserving any runtime relationship checks that it requires.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`BatchingContext`] that supplies the batch extent and the axis sharding.
+    ///   - `input`: Carrier supplying the mapped-axis position, member representation, and existing manual variation.
+    ///   - `declared`: Per-item declaration to lift, which may differ from the carrier's actual per-item type and may
+    ///     describe an operation's output carried like `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when a mapped `input` has a type that cannot carry a batch axis. Implementations may
+    /// also reject a `declared` type that does not describe `input`. Diagnostics name the offending type rather than an
+    /// operation, so callers that want to attribute an error to an operation must map it themselves.
+    fn batched_type(
+        context: &BatchingContext<C, Self>,
+        input: &Self::Batch,
+        declared: &C::Type,
+    ) -> Result<C::Type, BatchingError>;
+
+    /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
+    fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type>;
+
+    /// Returns the parent-owned bookkeeping values that this policy's structurally batched programs require
+    /// prepended to the instruction inputs that feed their source region inputs when they are rebound as ordinary
+    /// [`Region`](crate::Region)s of an operation that does not thread this policy's batching state itself.
+    ///
+    /// A structurally batched program's boundary is not always the source region's boundary. A batched nested program
+    /// is sealed and cannot reference values owned by the parent program, so a policy whose batching state is itself a
+    /// parent-owned value must widen the batched boundary with leading inputs that reintroduce that state. This
+    /// function supplies the parent-owned value for each such input, in boundary order, so consumers can complete
+    /// an adapted program's inputs without knowing which policy produced it:
+    ///
+    ///   - Homogeneous array policies return no values (the default), because their mapped-axis extent
+    ///     is static transform metadata and their batched programs carry exactly the source boundary.
+    ///   - [`ArrayIrBatching`](crate::ArrayIrBatchingPolicy) returns its first-class mapped-extent dimension value,
+    ///     because every dynamic batch dimension inserted into one of its batched programs references the
+    ///     [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
+    ///
+    /// Refer to the documentation of [`Self::adapt_batched_program`] for the output-side counterpart of this contract,
+    /// along with a complete boundary example.
+    #[inline]
+    fn boundary_inputs(_axis_extent: &Self::Extent) -> Vec<C::Value> {
+        Vec::new()
+    }
+
+    /// Adapts one structurally batched program to an ordinary [`Region`](crate::Region) boundary by removing this
+    /// policy's bookkeeping outputs and reducing each mapped output whose requested target axis is replicated.
+    ///
+    /// Structural batching widens some policies' program boundaries with bookkeeping state (refer to the documentation
+    /// of [`Self::boundary_inputs`] for more information on that bookkeeping state). Extent-threading higher-order
+    /// operations such as `condition`, `while`, and `scan` consume that widened boundary as-is, but an operation whose
+    /// attached regions are plain programs must adapt it first. For example, batched program with support for dynamic
+    /// dimensions and shapes may have the boundary:
+    ///
+    /// ```text
+    /// [extent, inputs...] ↦ [extent, outputs...]
+    /// ```
+    ///
+    /// The two extent slots play different roles, which is why adaptation removes one but not the other. The leading
+    /// *input* is load-bearing for the program itself: it defines the [`DimensionVariable`](crate::DimensionVariable)
+    /// that every inserted dynamic batch dimension's type references, and a sealed program's types must be grounded by
+    /// a value in its own scope, so removing it would leave the program referencing an undefined identity. The leading
+    /// *output* carries no information of its own: it merely relays the extent so an enclosing extent-threading
+    /// operation can chain it through its own sealed regions (e.g., a batched while body must return the extent it
+    /// consumed so the next iteration's boundary can be fed). A consumer that does not thread extents has no use for
+    /// the relay, so adapting the program drops the forwarded output, producing `[extent, inputs...] ↦ [outputs...]`,
+    /// while [`Self::boundary_inputs`] supplies the value for the kept input (e.g., a batched linear call consumes
+    /// the extent as one more leading residual). Homogeneous array policies adapt without any boundary change.
+    ///
+    /// When `required_output_axes` is provided, the adaptation additionally reconciles each remaining output with
+    /// the batch axis its consumer requires (i.e., an output that is mapped while its required axis is replicated is
+    /// passed to `reduce`, which must collapse it along the mapped axis). This is, for example, how a batched transpose
+    /// program returns one shared cotangent for a replicated linear input (i.e., replicating a value across batch items
+    /// is semantically a broadcast, the transpose of a broadcast is a summation, and so the per-item cotangents are
+    /// summed).
+    ///
+    /// The result is always a [`BoundaryPreservingBatchedProgram`], so programs that need neither adjustment are
+    /// rewrapped unchanged, without a replay.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Structurally batched program to adapt.
+    ///   - `required_output_axes`: Batch axes that the consumer requires for each non-bookkeeping output, or [`None`]
+    ///     when the outputs' natural axes are already correct. Only mapped-to-replicated mismatches are resolved here,
+    ///     because no structural alignment can fix them; batch the program with
+    ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally
+    ///     movable axis already matches its requirement.
+    ///   - `collapse_fn`: Function that collapses one mapped output along the provided axis within the replayed
+    ///     program's own [`TracingContext`], turning the per-item family `{y₀, …, yₙ₋₁}` packed along that axis into
+    ///     the one value that is correct in the replicated position (i.e., the consumer's chosen left inverse to
+    ///     replication along the batch axis). Callers own this step because which inverse is correct depends on what
+    ///     the output means (e.g., summation for cotangents), and not on boundary bookkeeping. Refer to the
+    ///     documentation of [`BoundaryPreservingBatchedProgram::from_widened_boundary`] for more information.
+    fn adapt_batched_program<
+        CollapseFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    >(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        collapse_fn: CollapseFn,
+    ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError>;
+}
+
+/// Selects the [`BatchingPolicy`] used when an outer policy `Self` projects one member type `T` from heterogeneous
+/// [`Context`] `C`. A [`BatchingPolicy`] determines one context's batch carrier, mapped-extent representation, and
+/// structurally batched program boundary. It cannot by itself determine how each member type of a heterogeneous
+/// context should represent those concepts. For example, an array member needs an [`ArrayBatch`](crate::ArrayBatch)
+/// carrier that may hold a mapped axis. Every projected policy must nevertheless preserve the outer policy's exact
+/// mapped-extent representation. This type-indexed relation records that choice independently for every supported
+/// `(C, T)` pair. A member whose values are shared by every batch item, such as a first-class dimension, needs no
+/// member policy and implements [`ReplicatedBatchingPolicyProjection`] instead.
+///
+/// Note that this trait carries no runtime state. Implementing it only establishes the associated
+/// [`Projected`](Self::Projected) policy used by [`batch_projected_operation`]. Unsupported member projections simply
+/// omit an implementation, while heterogeneous backends with several independently batchable member kinds can select a
+/// different policy for each kind.
+pub trait BatchingPolicyProjection<C: Context, T: Type>: BatchingPolicy<C>
+where
+    ProjectedContext<C, T>: Context,
+{
+    /// [`BatchingPolicy`] used while applying the projected member operation's batching rule. Its mapped extent
+    /// representation must be identical to the outer policy's, so projection never specializes that extent.
+    type Projected: BatchingPolicy<ProjectedContext<C, T>, Extent = Self::Extent>;
+}
+
+/// Projection of an outer [`BatchingPolicy`] `Self` onto member type `T` of heterogeneous [`Context`] `C` for members
+/// whose values are shared by every batch item (i.e., replicated), which lets [`batch_replicated_projected_operation`]
+/// batch a region-free member operation by binding it once in the parent context instead of applying a member batching
+/// rule. This is the batching contract of shared bookkeeping values such as first-class dimensions: every batch item
+/// observes the same value, so evaluating the operation once yields the result for every batch item. A value that
+/// differs per batch item (e.g., one extent per batch item) cannot cross this replicated projection.
+///
+/// Unlike [`BatchingPolicyProjection`], this projection selects no member [`BatchingPolicy`]: a replicated member
+/// value needs no batch axis, extent, or structurally batched program of its own, so the member side of the boundary
+/// is the bare projected value. Lifting a member result back is always [`BatchingPolicy::replicated`] applied to the
+/// embedded value, and so it needs no hook. An implementation explicitly promises that:
+///
+///   1. [`Self::project_replicated_batch`] returns the member value of a replicated carrier and rejects every carrier
+///      that is mapped, or whose metadata the bare value cannot represent, with an exact [`BatchingError`].
+///   2. A region-free operation over such values may be bound unchanged, once, in the parent context.
+///      Its results are replicated.
+///
+/// Implement this trait only for member types whose values are genuinely shared by every batch item. A structural
+/// member's zero differential space does not imply this contract: differentiation and batching are independent
+/// transforms, and a structural value could still vary per batch item. [`batch_replicated_projected_operation`]
+/// additionally checks the first promise at runtime, so an implementation that breaks it fails with a diagnostic rather
+/// than silently replicating a mapped value.
+pub trait ReplicatedBatchingPolicyProjection<C: ContextProjection<T>, T: Type>: BatchingPolicy<C> {
+    /// Converts one outer carrier into the bare member value that it replicates, rejecting a mapped carrier or one with
+    /// metadata that the member value cannot represent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an exact [`BatchingError`] naming what the member value cannot carry (e.g.,
+    /// [`BatchingError::MappedDimension`] for a mapped first-class dimension), or the [`TypeError`]
+    /// of a carrier whose value does not belong to member type `T`.
+    fn project_replicated_batch(
+        batch: &Self::Batch,
+    ) -> Result<<C::Value as ValueProjection<T>>::Projected, BatchingError>;
+}
+
+/// Policy capability for recursively applying batching to nested [`Program`] [`Region`](crate::Region)s. This is
+/// separate from [`BatchingPolicy`] because a carrier can be useful for region-free batching before its program
+/// universe supports structural region rewriting. The active [`BatchingContext`] and [`RecursiveBatchingDriver`]
+/// are neutral with respect to the underlying value kind (each policy owns the mechanics required to replay its
+/// own [`Operation`] universe).
+pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
+    /// Returns the context-neutral [`BatchingLevel`] that `context` introduces.
+    fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<C::Type>;
+
+    /// Structurally batches `region` at the provided [`BatchingLevel`] and returns the resulting transformed
+    /// [`BatchedProgram`]. This is the complete structural batching transform: it depends on no live
+    /// [`BatchingContext`], so it can batch a program that is traced long after the level was recorded (e.g., a
+    /// custom derivative rule that is traced lazily when a batched call is first differentiated). A level whose
+    /// extent representation this policy does not support is rejected with [`BatchingError::UnsupportedOperation`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `level`: [`BatchingLevel`] at which to batch `region`, normally obtained from [`Self::batching_level`].
+    ///   - `region`: Region to batch.
+    ///   - `input_axes`: [`BatchAxis`] for each input of `region`.
+    ///   - `output_axes_policy`: [`ProgramBatchingOutputAxesPolicy`] for packaging the batched program outputs.
+    fn batch_program_at_level(
+        level: &BatchingLevel<C::Type>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<Self::BatchedProgram, BatchingError>;
+
+    /// Structurally batches `region` at the level that `context` introduces and returns the resulting transformed
+    /// [`BatchedProgram`]. This composes [`Self::batching_level`] with [`Self::batch_program_at_level`].
+    #[inline]
+    fn batch_program(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<Self::BatchedProgram, BatchingError> {
+        Self::batch_program_at_level(&Self::batching_level(context), region, input_axes, output_axes_policy)
+    }
+
+    /// Replays `region` through the provided [`BatchingContext`].
+    fn batch_region(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<Self::Batch>,
+    ) -> Result<Vec<Self::Batch>, BatchingError>;
+
+    /// Aligns `batch` so that it carries the mapped batch axis at `axis`, broadcasting a replicated batch along the
+    /// context's batch extent or moving an existing mapped axis. Reference rules use this to reconcile a value with the
+    /// batch axis of the reference it is written into or read from, since a reference's axis is fixed by its referent
+    /// and cannot move.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Batching context whose extent and sharding describe the batch axis.
+    ///   - `batch`: Batch carrier to align.
+    ///   - `axis`: Position the mapped batch axis must occupy in the aligned carrier.
+    fn align_batch_axis(
+        context: &BatchingContext<C, Self>,
+        batch: Self::Batch,
+        axis: Axis,
+    ) -> Result<Self::Batch, BatchingError> {
+        // The default implementation accepts a batch that already carries the requested axis and rejects every other
+        // request. Policies whose values can be broadcasted and/or transposed override this default implementation.
+        let _ = context;
+        if Self::batch_axis(&batch).axis() == Some(axis) {
+            return Ok(batch);
+        }
+        Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "batching policy cannot align a batch carrying {} to axis {}",
+                Self::batch_axis(&batch),
+                axis,
+            ),
+        })
+    }
+
+    /// Returns the extent of the batch axis introduced by `context` when it is statically known, or `None` when the
+    /// extent is only known at runtime. This is how a [`BatchingContext`] reports the size of the named axis it binds
+    /// (refer to the documentation of [`NamedAxes`](crate::NamedAxes)) independently of how the policy represents its
+    /// extent: a host `usize` extent is always known, while a first-class dimension value is known only when the
+    /// parent context resolves it to a constant.
+    #[inline]
+    fn static_batch_axis_extent(_context: &BatchingContext<C, Self>) -> Option<usize> {
+        None
+    }
+}
+
+/// Policy capability for taking the diagonal of a value along two of its batch axes that share one extent. When two
+/// batching levels of the same extent batch one computation (e.g., a batch of tangents batched around a program that is
+/// itself already batched), the per-item result of item `i` is the element at index `i` along both batch axes, and the
+/// remaining elements form the outer product of the two batches. Composites whose batching rules depend on their input
+/// batch axes use this capability to recover exact per-item tangents from such an outer product. Refer to
+/// [`Composite::with_broadcast_sensitive_batching`](crate::Composite::with_broadcast_sensitive_batching)
+/// for more information.
+pub trait DiagonalBatchingPolicy<C: Context>: BatchingPolicy<C> {
+    /// Returns the elements of `value` whose indices along `kept_axis` and `removed_axis` agree. The result has
+    /// the shape of `value` without `removed_axis`, so `kept_axis` moves one position earlier when it follows
+    /// `removed_axis`. Elements are copied exactly (e.g., signed zeros and `NaN`s are preserved).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when either axis is out of range, when the two axes are the same, when their extents
+    /// differ, or when the policy cannot represent an extent of `value` (e.g., a dynamic extent of a homogeneous array
+    /// policy, whose extents are host integers).
+    fn diagonal(
+        context: &C,
+        value: &C::Value,
+        kept_axis: usize,
+        removed_axis: usize,
+    ) -> Result<C::Value, BatchingError>;
+}
+
+/// Policy capability for invoking the public batching transform on flat parent values. [`Batch::batch`] owns
+/// [`Parameterized`] broadcasting, tracer construction, closure invocation, and output structure reconstruction once
+/// for every program universe. This capability owns the universe-specific boundary mechanics: selecting and validating
+/// the mapped extent, packing and normalizing inputs, and materializing each requested output axis.
+pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
+    /// Packs inputs, reconciles the mapped extent and sharding, and constructs their [`BatchingContext`].
+    /// The returned context must use `context` or a clone sharing its reference identities and builders as its parent.
+    /// This policy hook does not validate reference aliases; callers should use [`BatchingContext::prepare_inputs`],
+    /// which checks the original inputs before packing and retains their boundary for later capture validation.
+    fn pack_inputs(
+        context: &C,
+        inputs: Vec<C::Value>,
+        input_batch_axes: Vec<BatchAxis>,
+        batch_axis: BatchAxisSpecification<Self::Extent>,
+    ) -> Result<(BatchingContext<C, Self>, Vec<Self::Batch>), BatchingError>;
+
+    /// Materializes `output` with the provided output [`BatchAxis`] and returns its parent value.
+    fn materialize_output(
+        context: &BatchingContext<C, Self>,
+        output: Self::Batch,
+        output_batch_axis: BatchAxis,
+    ) -> Result<C::Value, BatchingError>;
+}
+
+/// Provides [`Instruction`](crate::Instruction)-scoped access to the nested [`Region`](crate::Region)s attached to
+/// an [`Operation`] being batched. Every [`BatchableOperation`] application receives a [`BatchingDriver`]. The driver
+/// keeps any attached regions borrowed and re-enters batching with the durable [`BatchingContext`] supplied by the
+/// operation rule. [`RegionDriver`] provides its structural region access, while this trait adds batching-specific
+/// recursion. Region-free applications expose a region count of zero through the same contract.
+pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Constant, C::Operation> {
+    /// Returns the context-neutral [`BatchingLevel`] that `context` introduces. Recursive drivers delegate to
+    /// [`RecursiveBatchingPolicy::batching_level`], which is how a region-carrying rule written against the
+    /// policy-neutral [`BatchingPolicy`] contract records a level for nested programs that it traces later, without
+    /// bounding itself by [`RecursiveBatchingPolicy`] (a bound that would cycle with the policy's own operation
+    /// requirements). The default rejects the request, because a driver without recursive access to a policy cannot
+    /// batch nested programs at arbitrary levels.
+    #[inline]
+    fn batching_level(&self, context: &BatchingContext<C, P>) -> Result<BatchingLevel<C::Type>, BatchingError> {
+        let _ = context;
+        Err(BatchingError::UnsupportedOperation {
+            message: "this batching driver cannot batch nested programs".to_string(),
+        })
+    }
+
+    /// Returns the statically known batch extent, or [`None`] when this driver cannot establish it. Recursive drivers
+    /// delegate to [`RecursiveBatchingPolicy::static_batch_axis_extent`], including for first-class extents whose
+    /// values or exact types establish a static size. This avoids requiring recursive policy bounds on operation rules.
+    #[inline]
+    fn static_batch_axis_extent(&self, _context: &BatchingContext<C, P>) -> Option<usize> {
+        None
+    }
+
+    /// Batches `region` structurally at the provided input batch axes and output-axes policy, returning the rewritten
+    /// standalone program and its inferred output batch axes.
+    fn batch_program(
+        &self,
+        context: &BatchingContext<C, P>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<P::BatchedProgram, BatchingError>;
+
+    /// Batches the region at `index` over the provided batched values by re-entering the active batching transform.
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C, P>,
+        index: usize,
+        inputs: Vec<P::Batch>,
+    ) -> Result<Vec<P::Batch>, BatchingError>;
+
+    /// Aligns `batch` so that it carries the mapped batch axis at `axis`. Recursive drivers delegate to
+    /// [`RecursiveBatchingPolicy::align_batch_axis`], which is how a rule written against the policy-neutral
+    /// [`BatchingPolicy`] contract (e.g., the reference rules that reconcile a stored value with the fixed axis of the
+    /// reference it is written into) reaches the policy's broadcast and transpose machinery without bounding itself by
+    /// [`RecursiveBatchingPolicy`], a bound that would cycle with the policy's own operation requirements. A driver
+    /// without recursive access to a policy cannot broadcast or transpose a carrier and must accept a batch that
+    /// already carries the requested axis while rejecting every other request, as [`EmptyRegionDriver`] does.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Batching context whose extent and sharding describe the batch axis.
+    ///   - `batch`: Batch carrier to align.
+    ///   - `axis`: Position the mapped batch axis must occupy in the aligned carrier.
+    fn align_batch_axis(
+        &self,
+        context: &BatchingContext<C, P>,
+        batch: P::Batch,
+        axis: Axis,
+    ) -> Result<P::Batch, BatchingError>;
+}
+
+impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDriver {
+    #[inline]
+    fn batch_program(
+        &self,
+        _context: &BatchingContext<C, P>,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+        _input_axes: &[BatchAxis],
+        _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<P::BatchedProgram, BatchingError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot batch a program".to_string()).into())
+    }
+
+    #[inline]
+    fn batch_region(
+        &self,
+        _context: &BatchingContext<C, P>,
+        _index: usize,
+        _inputs: Vec<P::Batch>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot batch a region".to_string()).into())
+    }
+
+    #[inline]
+    fn align_batch_axis(
+        &self,
+        _context: &BatchingContext<C, P>,
+        batch: P::Batch,
+        axis: Axis,
+    ) -> Result<P::Batch, BatchingError> {
+        // Returning the batch unchanged is safe only when its mapped axis already matches the requested axis.
+        // Replicated batches need a broadcast and batches mapped at another axis need a transpose; this driver
+        // rejects both because it cannot perform those operations. Neither the value nor its axis metadata change.
+        if P::batch_axis(&batch).axis() == Some(axis) {
+            return Ok(batch);
+        }
+        Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "batching driver cannot align a batch carrying {} to axis {}",
+                P::batch_axis(&batch),
+                axis,
+            ),
+        })
+    }
+}
+
+/// [`BatchingDriver`] scoped to one [`Operation`] application. It borrows the application's complete
+/// [`AttachedRegions`], which preserve the operation-defined ordering of owned regions, borrowed regions, and shared
+/// callees without materializing a combined region collection. Recursive requests re-enter the active batching
+/// transform or batch a selected region structurally.
+pub struct RecursiveBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    /// Application-scoped [`AttachedRegions`].
+    regions: &'r AttachedRegions<'r, V, O>,
+}
+
+impl<'r, V: Value, O: Operation<Type = V::Type>> RecursiveBatchingDriver<'r, V, O> {
+    /// Creates a new [`RecursiveBatchingDriver`] over the provided application-scoped [`AttachedRegions`].
+    #[inline]
+    pub fn new(regions: &'r AttachedRegions<'r, V, O>) -> Self {
+        Self { regions }
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveBatchingDriver<'_, V, O> {
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.regions.regions()
+    }
+
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.region_count()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
+        self.regions.region(index)
+    }
+}
+
+impl<C: Context, P: RecursiveBatchingPolicy<C>> BatchingDriver<C, P>
+    for RecursiveBatchingDriver<'_, C::Constant, C::Operation>
+{
+    #[inline]
+    fn batching_level(&self, context: &BatchingContext<C, P>) -> Result<BatchingLevel<C::Type>, BatchingError> {
+        Ok(P::batching_level(context))
+    }
+
+    #[inline]
+    fn static_batch_axis_extent(&self, context: &BatchingContext<C, P>) -> Option<usize> {
+        P::static_batch_axis_extent(context)
+    }
+
+    #[inline]
+    fn batch_program(
+        &self,
+        context: &BatchingContext<C, P>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<P::BatchedProgram, BatchingError> {
+        P::batch_program(context, region, input_axes, output_axes_policy)
+    }
+
+    #[inline]
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C, P>,
+        index: usize,
+        inputs: Vec<P::Batch>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        P::batch_region(context, self.region(index)?, inputs)
+    }
+
+    #[inline]
+    fn align_batch_axis(
+        &self,
+        context: &BatchingContext<C, P>,
+        batch: P::Batch,
+        axis: Axis,
+    ) -> Result<P::Batch, BatchingError> {
+        P::align_batch_axis(context, batch, axis)
+    }
+}
+
+/// Represents [`Operation`]s that can be batched (i.e., vectorized). The trait is parameterized by the parent
+/// [`Context`] `C` that owns the packed values flowing through the batching transform, and every rule receives
+/// the active durable [`BatchingContext`] plus a [`BatchingDriver`]. Ordinary rules lift their operation to its
+/// batch-carrying inputs and then execute or stage the lifted work through `context.parent()` (typically via
+/// [`InterpretableBatchableOperation::interpret_with_batch_axes`]), so an eager parent interprets it immediately while
+/// a staging parent stages it into the enclosing trace. Rules whose semantics depend on the active transform frame
+/// (e.g., named-axis collectives) inspect [`BatchingContext::axis_name`] and [`BatchingContext::axis_extent`] directly,
+/// and recursive higher-order rules replay their nested programs through the same contract. Consequently, invoking a
+/// batching rule always requires an active [`BatchingContext`].
+///
+/// # Deriving Batchable Operation Enums
+///
+/// `#[derive(Operation)]` generates a [`BatchableOperation`] dispatcher when the enum specifies
+/// `#[ryft(dispatch(batching))]`. It follows the operation derivation's enum-shape and type-inference rules
+/// and generates:
+///
+///   - A dispatcher at `BatchableOperation<C, ArrayBatchingPolicy>`, where
+///     [`ArrayBatchingPolicy`](crate::ArrayBatchingPolicy) is the array-domain policy and `C` is the parent
+///     [`Context`], that forwards the active [`BatchingContext`] to every variant's own rule. One dispatcher covers
+///     eager and staging parents alike, because the parent/active distinction lives in each rule's body rather than
+///     in dispatch.
+///   - Per-variant `Payload: BatchableOperation<C, ArrayBatchingPolicy>` predicates that transport each rule's own
+///     capability requirements to the use site. Nested programs batch structurally through [`Program::batched`],
+///     requested by higher-order rules through their active [`BatchingDriver`], whose concrete implementation
+///     establishes the finite program-level bounds at its construction site.
+///
+/// The super-trait is `Operation<Type = C::Type>`, so a payload whose [`Operation::Type`] disagrees with `C::Type`
+/// cannot implement the rule for `C`, and every `Payload: BatchableOperation<C, P>` predicate elaborates to that
+/// equality without restating it. Two trait-solver limitations shape how the equality is written at implementation
+/// heads whose batching context is itself built from `Self` (e.g., `EagerContext<V, Self>`): normalizing
+/// `<C as Domain>::Type` through such a context's `Domain` implementation recurses into `Self`'s own bounds, and an
+/// explicit `Self: Operation<Type = T>` next to the elaborated one leaves two projection candidates that the solver
+/// cannot choose between. Both are avoided by stating the context's type as an assumption instead (i.e.,
+/// `C: Context<Type = T>`), which the derived dispatcher does for its projected-member rules.
+pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::Type> {
+    /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
+    /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
+    /// current operation application's regions and has a region count of zero for region-free applications. Packed
+    /// values in `inputs` and the returned outputs are owned by `context.parent()`.
+    ///
+    /// # Contract
+    ///
+    ///   - **Axis Alignment:** If two or more inputs carry a mapped axis (i.e., `batch_axis.is_some()`), elementwise
+    ///     operations require them to agree on the axis position. When they disagree, this function returns
+    ///     [`BatchingError::MisalignedBatchAxes`] with an error message that names the misaligned axes and suggests the
+    ///     user repositions one of them with [`TransposeOperation`](crate::TransposeOperation) (i.e., the N-D axis
+    ///     permutation primitive) before invoking the operation. Operations with explicit axis arguments (e.g., `Dot`,
+    ///     `Transpose`, `Reshape`, etc.) rewrite those arguments to thread the mapped axis through correctly.
+    ///   - **Output Axes:** For elementwise operations, the output
+    ///     [`ArrayBatch::batch_axis`](crate::ArrayBatch::batch_axis) matches the common input batch axis.
+    ///     For operations with explicit axis arguments, the output axis follows from the lifted axis arguments.
+    ///   - **Zero Propagation:** Linear batching rules preserve zero tangent payloads through their operation-specific
+    ///     semantics. Canonical staged zeros are handled before batching reaches concrete value-level interpretation.
+    ///   - **Parent-Owned Work:** Ordinary rules must execute or stage lifted work through `context.parent()` and
+    ///     return parent-owned values; only rules keyed on the active frame's axis metadata inspect the
+    ///     [`BatchingContext`] itself.
+    ///
+    /// Note that in order to be able to provide [`BatchableOperation`] implementations for operation families that
+    /// select the generated batching dispatcher, it is a common convention for operations that can be part of such
+    /// operation families to implement this trait even if they do not support batching and to have this  function
+    /// simply return a [`BatchingError::UnsupportedOperation`] error.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError>;
+}
+
+/// Batching rule for a member [`Operation`] whose instruction has a mixed signature in a parent operation universe.
+/// If this operation has native type `T` while the enclosing operation family uses type `U`, an ordinary
+/// [`BatchableOperation`] implementation can describe only the homogeneous `T -> T` contract because its
+/// [`batch`](BatchableOperation::batch) method requires `Self::Type = C::Type`. This trait instead receives the parent
+/// [`BatchingContext`] and its `U`-typed batches, allowing the rule to account for inputs or results belonging to
+/// other members of `U`.
+///
+/// Shape-changing collectives are the motivating example. Their native array operation consumes one array, whereas
+/// their array-or-dimension instruction consumes that array followed by first-class result extents. Operation-family
+/// dispatchers should use this trait only when the parent signature differs from the operation's native
+/// [`Operation::Type`].
+pub trait MemberBatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
+    /// Applies this member operation's batching rule in its enclosing parent operation universe.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active parent [`BatchingContext`] through which the rule stages mixed operations.
+    ///   - `driver`: Instruction-scoped [`BatchingDriver`] exposing any attached regions.
+    ///   - `inputs`: Parent-universe batches in the mixed instruction's input order.
+    fn batch_in_parent<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError>;
+}
+
+/// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over packed
+/// values whose mapped batch axes are specified by the caller. This policy controls how the replayed output tracers are
+/// packaged into the resulting program.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ProgramBatchingOutputAxesPolicy {
+    /// Keep the output axes naturally produced by the per-operation batching rules.
+    /// Replicated outputs remain replicated.
+    Natural,
+
+    /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with
+    /// [`TransposeOperation`](crate::TransposeOperation) and broadcasting replicated outputs across the batch.
+    AlignAllTo(Axis),
+
+    /// Align each output `i` to the mapped axis of the `i`-th entry, with one entry per program output. A *mapped*
+    /// entry forces the output to carry its batch axis at that position, moving an already-batched output with
+    /// [`TransposeOperation`](crate::TransposeOperation) and broadcasting a replicated output across the batch, while
+    /// a _replicated_ entry keeps that output's natural axis (it is a lower bound, not an equality constraint).
+    AlignEachTo(Vec<BatchAxis>),
+}
+
+/// Capability to interpret an [`Operation`] on [`BatchingPolicy`]-selected batches and repackage its outputs as batches
+/// carrying specified axes. This is the shared application path the per-operation [`BatchableOperation`] rules use once
+/// they have lifted an operation to its batch-carrying inputs. It centralizes the packed-value ownership invariant of
+/// the batching transform: the lifted operation is always interpreted against `context.parent()`, which owns the packed
+/// values, and never against the [`BatchingContext`] itself. Every [`InterpretableOperation`] over the parent's values
+/// gets it for free through the blanket implementation below, so an operation earns it directly from its interpretation
+/// rule.
+pub trait InterpretableBatchableOperation<C: Context, P: BatchingPolicy<C>> {
+    /// Interprets this operation on the *unpacked* values of batched `inputs` against `context.parent()` and repackages
+    /// each output as a [`BatchingPolicy`]-selected batch carrying the corresponding `output_batch_axes` entry.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`BatchingContext`] whose parent interprets the lifted operation,
+    ///     as in [`InterpretableOperation::interpret`].
+    ///   - `inputs`: Batch-carrying inputs the lifted operation is interpreted over.
+    ///   - `output_batch_axes`: [`BatchAxis`] to attach to each produced output. This slice must have one entry
+    ///     per output that this [`Operation`] produces on these inputs.
+    fn interpret_with_batch_axes(
+        &self,
+        context: &BatchingContext<C, P>,
+        inputs: &[P::Batch],
+        output_batch_axes: &[BatchAxis],
+    ) -> Result<Vec<P::Batch>, BatchingError>;
+}
+
+impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> InterpretableBatchableOperation<C, P> for O {
+    #[inline]
+    fn interpret_with_batch_axes(
+        &self,
+        context: &BatchingContext<C, P>,
+        inputs: &[P::Batch],
+        output_batch_axes: &[BatchAxis],
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        /// Internal helper that unpacks the input values of `inputs`, interprets the operation once through `interpret`
+        /// against the parent context (which owns those packed values), and repackages each output with its requested
+        /// `BatchAxis`. This is the body of the enclosing blanket [`InterpretableBatchableOperation`] implementation,
+        /// which only supplies the operation's interpretation, so that this body is compiled once per context and
+        /// policy rather than once per operation type.
+        fn inner<C: Context, P: BatchingPolicy<C>>(
+            context: &BatchingContext<C, P>,
+            inputs: &[P::Batch],
+            output_batch_axes: &[BatchAxis],
+            interpret: &dyn Fn(&C, &[C::Value]) -> Result<Vec<C::Value>, ProgramError>,
+        ) -> Result<Vec<P::Batch>, BatchingError> {
+            if inputs.is_empty() {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            }
+            let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+            let output_values = interpret(&context.parent().clone(), input_values.as_slice())?;
+            check_count!("output", output_values, output_batch_axes.len(), ProgramError);
+            output_values
+                .into_iter()
+                .zip(output_batch_axes.iter().copied())
+                .map(|(value, axis)| P::batch(value, axis))
+                .collect()
+        }
+
+        // Every `InterpretableOperation` over the parent context's values is an `InterpretableBatchableOperation`.
+        inner(context, inputs, output_batch_axes, &|parent, input_values| {
+            self.interpret(parent, &EmptyRegionDriver, input_values)
+        })
+    }
+}
+
+/// Active [`Context`] for one batching level, introducing exactly one logical mapped axis. Its [`BatchingPolicy`]
+/// selects the carrier, extent, and structural program-boundary representation. Operations bound through this context
+/// dispatch to their [`BatchableOperation`] rules, which ordinarily bind lifted packed work through the parent context.
+/// The active frame therefore owns transform metadata without pretending to be the backend that owns the packed values.
+///
+/// # Value-Level Batching Pipeline
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   inputs["Structured Inputs and Broadcast Input Axes"]
+///   prepare["Entrypoint Policy &lt;code&gt;pack_inputs&lt;/code&gt;"]
+///   inputs --> prepare
+///   specification["Extent and Optional Axis Name"] --> prepare
+///   prepare --> context["Batching Context"]
+///   prepare --> carriers["Policy-Selected Batch Carriers"]
+///   context --> tracers["Batching Tracer Inputs"]
+///   carriers --> tracers
+///   tracers --> closure["Invoke Closure Once over Packed Batches"]
+///   closure -->|"operation application"| bind["Context &lt;code&gt;bind&lt;/code&gt;"]
+///   regions["Attached Regions"] --> driver["Instruction-Scoped Batching Driver"]
+///   bind --> driver
+///   driver --> rule["Batchable Operation Rule"]
+///   driver --> nested["Optional Active Region Replay or Structural Program Batching"]
+///   rule -->|"lift packed work"| parent["Parent Context &lt;code&gt;bind&lt;/code&gt;"]
+///   parent --> packed["Parent-Owned Packed Results"]
+///   packed --> assemble["Rule Assembles Output Carriers"]
+///   nested --> assemble
+///   rule -->|"metadata-only or specialized result"| assemble
+///   assemble --> outputs["Output Carriers"]
+///   outputs --> flowing["Flowing Batching Tracer Results"]
+///   flowing --> closure
+///   closure -->|"returns"| closure_outputs["Structured Closure Outputs"]
+///   closure_outputs --> materialize["Entrypoint Policy &lt;code&gt;materialize_output&lt;/code&gt;"]
+///   materialize --> result["Parent-Owned Outputs in Requested Axis Positions"]
+/// ```
+///
+/// One context instance is shared by every tracer at this batching level. Its parent may itself be eager, staging, or
+/// another transform context, which is what makes batching compose without changing this pipeline.
+#[cfg_attr(doc, ryft_macros::mermaid)]
+#[derive(Debug, Clone)]
+pub struct BatchingContext<C: Context, P: BatchingPolicy<C>> {
+    /// [`Context`] that this [`BatchingContext`] is nested into.
+    parent: C,
+
+    /// Extent of the new batch axis.
+    axis_extent: P::Extent,
+
+    /// Optional name for the new batch axis that enables [`Operation`]s (e.g., collective operations)
+    /// to address this axis by name.
+    axis_name: Option<String>,
+
+    /// Sharding placement of the transform-owned mapped dimension.
+    axis_sharding: ShardingDimension,
+
+    /// Validated [`ReferenceBoundary`], retained so [`Context::lift`] can reject a captured alias before wrapping it as
+    /// replicated. Identities belong to the parent context, which keeps their builders alive. The immutable boundary
+    /// is shared through [`Rc`] because every tracer clones this context; capture checks do not add new identities.
+    input_references: Rc<ReferenceBoundary>,
+}
+
+impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
+    /// Creates a new [`BatchingPolicy`]-explicit [`BatchingContext`] with an unnamed and
+    /// [`ShardingDimension::Replicated`] mapped axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `parent`: [`Context`] into which batched operations are lifted.
+    ///   - `axis_extent`: Extent of the transform-owned mapped dimension.
+    #[inline]
+    pub fn with_policy(parent: C, axis_extent: P::Extent) -> Self {
+        Self {
+            parent,
+            axis_extent,
+            axis_name: None,
+            axis_sharding: ShardingDimension::Replicated,
+            input_references: Rc::new(ReferenceBoundary::default()),
+        }
+    }
+
+    /// Sets the optional name through which [`Operation`]s such as collectives can address the mapped axis/dimension.
+    #[inline]
+    pub fn with_axis_name<A: Into<Option<String>>>(mut self, axis_name: A) -> Self {
+        self.axis_name = axis_name.into();
+        self
+    }
+
+    /// Sets the sharding placement of the transform-owned mapped axis/dimension.
+    #[inline]
+    pub fn with_axis_sharding(mut self, axis_sharding: ShardingDimension) -> Self {
+        self.axis_sharding = axis_sharding;
+        self
+    }
+
+    /// Returns the [`Context`] that this [`BatchingContext`] is nested into.
+    #[inline]
+    pub fn parent(&self) -> &C {
+        &self.parent
+    }
+
+    /// Returns the extent of the new batch axis.
+    #[inline]
+    pub fn axis_extent(&self) -> &P::Extent {
+        &self.axis_extent
+    }
+
+    /// Returns the optional name for the new batch axis that enables [`Operation`]s (e.g., collective operations)
+    /// to address this axis by name.
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
+    }
+
+    /// Returns the sharding placement of the transform-owned mapped dimension.
+    #[inline]
+    pub fn axis_sharding(&self) -> &ShardingDimension {
+        &self.axis_sharding
+    }
+}
+
+impl<C: Context, P: BatchingEntrypointPolicy<C>> BatchingContext<C, P> {
+    /// Prepares flat inputs and returns their [`BatchingContext`] and packed carriers. Reference inputs must identify
+    /// distinct allocations in `parent`; they are validated before the policy packs or normalizes any values. The
+    /// returned context retains that boundary and so lifting a captured alias of an input is rejected as well.
+    ///
+    /// Extent, axis, and sharding validation are delegated to [`BatchingEntrypointPolicy::pack_inputs`]. Unlike
+    /// [`with_policy`](Self::with_policy), this function constructs a context for a specific set of input values.
+    ///
+    /// # Parameters
+    ///
+    ///   - `parent`: Context owning the input values and their reference identities.
+    ///   - `inputs`: Flat packed values before applying the new batching level.
+    ///   - `input_batch_axes`: Mapped or replicated axis for each input, in the same order as `inputs`.
+    ///   - `batch_axis`: Optional extent and name of the new batch axis.
+    pub fn prepare_inputs(
+        parent: &C,
+        inputs: Vec<C::Value>,
+        input_batch_axes: Vec<BatchAxis>,
+        batch_axis: BatchAxisSpecification<P::Extent>,
+    ) -> Result<(Self, Vec<P::Batch>), BatchingError> {
+        let input_references = ReferenceBoundary::new(
+            parent,
+            inputs.iter().enumerate().map(|(index, value)| (ReferenceBoundaryPosition::Input(index), value)),
+        )
+        .map_err(ProgramError::from)?;
+        let (mut context, inputs) = P::pack_inputs(parent, inputs, input_batch_axes, batch_axis)?;
+        context.input_references = Rc::new(input_references);
+        Ok((context, inputs))
+    }
+}
+
+impl<C: Context<Type: BatchableType<Policy: BatchingPolicy<C>>>>
+    BatchingContext<C, <C::Type as BatchableType>::Policy>
+{
+    /// Creates a [`BatchingContext`] using the canonical policy selected by the provided context's [`BatchableType`].
+    #[inline]
+    pub fn new(parent: C, axis_extent: <<C::Type as BatchableType>::Policy as BatchingPolicy<C>>::Extent) -> Self {
+        Self::with_policy(parent, axis_extent)
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
+    /// Aligns the logical outputs of `batched_program` to `target_output_axes` while preserving the complete program
+    /// boundary selected by `P::BatchedProgram`, including any [`BatchingPolicy`]-owned bookkeeping inputs or outputs.
+    /// The existing transformed [`Program`] is returned when its output axes already match. Otherwise, `region` is
+    /// batched again with its live outputs aligned to the target axes.
+    ///
+    /// [`Region`](crate::Region)-carrying operation rules use this after discovering and semantically reconciling
+    /// natural output axes across related regions. This method only performs the mechanical output-boundary alignment.
+    /// It deliberately does not decide which axes correspond or which one should win. A mapped target axis moves a
+    /// naturally mapped output or broadcasts a naturally replicated output. Callers must never use this method to
+    /// collapse a mapped output to replicated, because that requires [`Operation`]-specific semantics such as cotangent
+    /// summation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `driver`: [`BatchingDriver`] that structurally transforms `region` if alignment is required.
+    ///   - `region`: Source [`Region`](crate::Region) from which `batched_program` was produced.
+    ///   - `input_axes`: Batch axes used to produce `batched_program` and to perform any aligned replay.
+    ///   - `batched_program`: Batched [`Program`] with its policy-specific boundary and natural output axes.
+    ///   - `target_output_axes`: Semantically reconciled output axes targeted by the region's consumer.
+    pub(crate) fn align_batched_program_outputs<D: BatchingDriver<C, P>>(
+        &self,
+        driver: &D,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        batched_program: P::BatchedProgram,
+        target_output_axes: &[BatchAxis],
+    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
+        let aligned_program =
+            self.align_batched_program(driver, region, input_axes, batched_program, target_output_axes)?;
+        Ok(aligned_program.into_parts().0)
+    }
+
+    /// Aligns the logical outputs in the same way as [`Self::align_batched_program_outputs`], then uses
+    /// [`BatchingPolicy::adapt_batched_program`] to convert the policy-specific boundary into an ordinary attached
+    /// [`Region`](crate::Region) boundary. Adaptation preserves bookkeeping inputs required by the region itself but
+    /// removes bookkeeping outputs used only by operations that thread batching state through their regions.
+    ///
+    /// Alignment happens before adaptation because the reconciled `target_output_axes` describe the source region's
+    /// outputs, which is exactly the axis vector both steps are stated over (a policy's bookkeeping outputs never
+    /// appear in [`BatchedProgram::output_axes`]). Callers must reintroduce the shed inputs by prepending
+    /// [`BatchingPolicy::boundary_inputs`] to the inputs of the operation they attach the result to.
+    ///
+    /// Like [`Self::align_batched_program_outputs`], this performs no mapped-to-replicated collapse. Alignment resolves
+    /// every structurally movable mismatch, and collapsing a genuinely mapped output requires [`Operation`]-specific
+    /// semantics such as cotangent summation. Callers that need a collapse must batch and adapt the region themselves
+    /// with their own collapse function.
+    ///
+    /// # Parameters
+    ///
+    ///   - `driver`: [`BatchingDriver`] that structurally transforms `region` if alignment is required.
+    ///   - `region`: Source [`Region`](crate::Region) from which `batched_program` was produced.
+    ///   - `input_axes`: Batch axes used to produce `batched_program` and to perform any aligned replay.
+    ///   - `batched_program`: Batched [`Program`] with its policy-specific boundary and natural output axes.
+    ///   - `target_output_axes`: Semantically reconciled output axes targeted by the region's consumer.
+    pub(crate) fn align_and_adapt_batched_program_outputs<D: BatchingDriver<C, P>>(
+        &self,
+        driver: &D,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        batched_program: P::BatchedProgram,
+        target_output_axes: &[BatchAxis],
+    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
+        let aligned_program =
+            self.align_batched_program(driver, region, input_axes, batched_program, target_output_axes)?;
+        let adapted_program = P::adapt_batched_program(aligned_program, None, |_, _, axis| {
+            Err(BatchingError::MisalignedBatchAxes {
+                message: format!("cannot collapse a batched region output mapped along {axis} without a consumer rule"),
+            })
+        })?;
+        Ok(adapted_program.into_parts().0)
+    }
+
+    /// Returns `batched_program` when its output axes already equal `target_output_axes`, or structurally batches
+    /// `region` again while aligning its live outputs to those axes. This is the shared alignment step behind
+    /// [`Self::align_batched_program_outputs`] and [`Self::align_and_adapt_batched_program_outputs`], which differ
+    /// only in whether they adapt the policy-specific program boundary afterwards.
+    fn align_batched_program<D: BatchingDriver<C, P>>(
+        &self,
+        driver: &D,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        batched_program: P::BatchedProgram,
+        target_output_axes: &[BatchAxis],
+    ) -> Result<P::BatchedProgram, BatchingError> {
+        if batched_program.output_axes() == target_output_axes {
+            return Ok(batched_program);
+        }
+        let aligned_program = driver.batch_program(
+            self,
+            region,
+            input_axes,
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(target_output_axes.to_vec()),
+        )?;
+        if aligned_program.output_axes() != target_output_axes {
+            let actual_output_axes =
+                aligned_program.output_axes().iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            let target_output_axes = target_output_axes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            return Err(BatchingError::MisalignedBatchAxes {
+                message: format!(
+                    "batched region output axes [{actual_output_axes}] do not match the target output axes \
+                     [{target_output_axes}]",
+                ),
+            });
+        }
+        Ok(aligned_program)
+    }
+}
+
+impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> BatchingContext<C, P> {
+    /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
+    /// context, which only converts its input operation and regions, so that this body is compiled once per context
+    /// rather than once per input operation type or way of supplying regions.
+    fn bind_operation(
+        &self,
+        operation: C::Operation,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
+        inputs: &[BatchingTracer<C, P>],
+    ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError> {
+        // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
+        // inputs. The implementation dispatches primitive work through the parent context, executing eagerly under
+        // an eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
+        // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
+        // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
+        let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
+        Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
+    }
+}
+
+impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Domain for BatchingContext<C, P> {
+    type Type = C::Type;
+    type Value = BatchingTracer<C, P>;
+    type Constant = C::Constant;
+    type Operation = C::Operation;
+}
+
+impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Context for BatchingContext<C, P> {
+    #[inline]
+    fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C, P>, ProgramError> {
+        // Lifts a constant by lifting it in the parent context and wrapping it as a replicated batch through the
+        // policy's _checked_ `BatchingPolicy::batch` constructor, so kinds the policy cannot carry (e.g., mapped
+        // first-class dimensions) are rejected at this boundary rather than riding through batching unchecked. A
+        // captured reference is unbatched by definition: it arrives here replicated, and the reference rules reject
+        // writing a batched value into it while allowing replicated reads and writes. A capture that aliases one of
+        // the transform's reference inputs is rejected outright, because the input boundary's alias validation cannot
+        // see closure captures and the same allocation must not flow through the transform under two carriers.
+        let value = self.parent().lift(constant)?;
+
+        // Resolve the lifted value in the same parent that validated the inputs, so runtime and staged identities
+        // use the same namespace. Validation leaves the boundary unchanged, allowing repeated distinct captures.
+        match self.input_references.validate(self.parent(), [(ReferenceBoundaryPosition::Capture(0), &value)]) {
+            Err(ReferenceBoundaryError::AliasedRetained { other: ReferenceBoundaryPosition::Input(index), .. }) => {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("captured reference aliases batched input {index}; pass it as an input instead"),
+                });
+            }
+            result => result.map_err(ProgramError::from)?,
+        }
+
+        Ok(BatchingTracer::new(self.clone(), P::batch(value, BatchAxis::replicated())?))
+    }
+
+    #[inline]
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
+        &self,
+        operation: O,
+        regions: R,
+        inputs: &[BatchingTracer<C, P>],
+    ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        self.bind_operation(operation.into(), regions.into(), inputs)
+    }
+
+    #[inline]
+    fn is_eager(&self) -> bool {
+        self.parent().is_eager()
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // Batching stages rewritten primitive work through its parent, so provenance state lives with the parent.
+        self.parent().provenance()
+    }
+
+    #[inline]
+    fn resolve(&self, value: &BatchingTracer<C, P>) -> ValueResolution<C::Constant> {
+        if !P::batch_axis(value.batch()).is_replicated() {
+            // Parent constants and atom identities describe the packed batch, not one logical mapped item.
+            return ValueResolution::Opaque;
+        }
+        self.parent().resolve(P::value(value.batch()))
+    }
+
+    fn reference_identity(&self, value: &BatchingTracer<C, P>) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        self.parent().reference_identity(P::value(value.batch()))
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent().invoke_with_provenance_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent().invoke_with_provenance_scope(scope, function)
+    }
+}
+
+/// Batch-carrying value flowing through a [`BatchingContext`]. The function being batched operates on
+/// [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via [`Context::bind`], which
+/// applies the operation's [`BatchableOperation`] implementation against the parent context. An eager parent owns
+/// concrete packed values, while a staging parent owns [`Tracer`]s in the enclosing trace. The [`Typed`] view is always
+/// the policy-provided unbatched per-item type. The policy-selected inner carrier retains the packed value and any
+/// mapped-axis metadata.
+#[derive(Clone, Parameter)]
+pub struct BatchingTracer<C: Context, P: BatchingPolicy<C>> {
+    /// [`BatchingContext`] this value flows through, used to dispatch operations that involve it.
+    context: BatchingContext<C, P>,
+
+    /// [`BatchingPolicy`]-selected batch that corresponds to the batched underlying value.
+    batch: P::Batch,
+}
+
+impl<C: Context, P: BatchingPolicy<C>> BatchingTracer<C, P> {
+    /// Creates a new [`BatchingTracer`].
+    #[inline]
+    pub fn new(context: BatchingContext<C, P>, batch: P::Batch) -> Self {
+        Self { context, batch }
+    }
+
+    /// Returns the [`BatchingContext`] this [`BatchingTracer`] flows through.
+    #[inline]
+    pub fn context(&self) -> &BatchingContext<C, P> {
+        &self.context
+    }
+
+    /// Returns the [`BatchingPolicy`]-selected batch that corresponds to the batched underlying value.
+    #[inline]
+    pub fn batch(&self) -> &P::Batch {
+        &self.batch
+    }
+
+    /// Consumes this [`BatchingTracer`] and returns the underlying [`BatchingPolicy`]-selected batch.
+    #[inline]
+    pub fn into_batch(self) -> P::Batch {
+        self.batch
+    }
+
+    /// Returns the extent of the mapped axis introduced by this [`BatchingTracer`]'s active batching context.
+    #[inline]
+    pub fn batch_extent(&self) -> &P::Extent {
+        self.context.axis_extent()
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> PartialEq for BatchingTracer<C, P>
+where
+    P::Batch: PartialEq,
+{
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // A batch-carrying value compares by its packed value (through that value's own `PartialEq`, which is
+        // identity-shaped for tracer-valued parents) and its batch axis, ignoring the stamped context, so two
+        // batched values are equal exactly when their packed values are equal on the same axis.
+        self.batch == other.batch
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> Debug for BatchingTracer<C, P> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("BatchingTracer").field("batch", &self.batch).finish()
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> Display for BatchingTracer<C, P> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.batch)
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> Typed for BatchingTracer<C, P> {
+    type Type = C::Type;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, C::Type> {
+        P::unbatched_type(&self.batch)
+    }
+}
+
+impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Value for BatchingTracer<C, P> {
+    type Dispatch = ValueDomainDispatch;
+    type Domain = BatchingContext<C, P>;
+
+    #[inline]
+    fn domain(&self) -> BatchingContext<C, P> {
+        self.context().clone()
+    }
+}
+
+/// Extension trait that exposes a [`BatchingEntrypointPolicy`]-selected batching transform as a function on a
+/// [`Context`]. Refer to [`batch`] for the transform semantics. This trait also serves call sites that must name the
+/// context explicitly, most notably empty input structures from which the free function cannot recover an execution
+/// domain. [`Self::Policy`] selects the batch carrier, mapped-extent representation, and boundary mechanics for this
+/// context's program universe.
+pub trait Batch: Context {
+    /// Canonical [`BatchingEntrypointPolicy`] for this [`Context`]'s [`Program`] universe.
+    type Policy: BatchingEntrypointPolicy<Self>;
+
+    /// Batches `function` over the mapped axes of `input`, with this [`Context`] executing (or staging) the batched
+    /// operations. Refer to the documentation of the [`batch`] function for information on the batching transform and
+    /// its arguments. Unlike that function, this method also serves inputs with no leaf values (i.e., that are empty),
+    /// provided that `batch_axis` supplies an explicit batch extent.
+    #[inline]
+    fn batch<
+        F: FnOnce(I::To<BatchingTracer<Self, Self::Policy>>) -> Result<O, ProgramError>,
+        I: Parameterized<
+                Self::Value,
+                Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<Self, Self::Policy>>,
+            >,
+        O: Parameterized<
+                BatchingTracer<Self, Self::Policy>,
+                Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<Self::Value>,
+            >,
+        InputBatchAxes: Parameterized<BatchAxis>,
+        OutputBatchAxes: Parameterized<BatchAxis>,
+        Specification: Into<BatchAxisSpecification<<Self::Policy as BatchingPolicy<Self>>::Extent>>,
+    >(
+        &self,
+        function: F,
+        input: I,
+        input_batch_axes: InputBatchAxes,
+        output_batch_axes: OutputBatchAxes,
+        batch_axis: Specification,
+    ) -> Result<O::To<Self::Value>, BatchingError> {
+        /// Internal helper that batches like [`Batch::batch`] with the callback and specification types erased. This
+        /// is the body of that function, which only wraps its callback and converts its specification, so that this
+        /// body is compiled once per context and input, output, and axis structure rather than once per callback type.
+        /// The callback is invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<
+            C: Batch,
+            I: Parameterized<
+                    C::Value,
+                    Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<C, C::Policy>>,
+                >,
+            O: Parameterized<
+                    BatchingTracer<C, C::Policy>,
+                    Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<C::Value>,
+                >,
+            InputBatchAxes: Parameterized<BatchAxis>,
+            OutputBatchAxes: Parameterized<BatchAxis>,
+        >(
+            parent: &C,
+            function: &mut dyn FnMut(I::To<BatchingTracer<C, C::Policy>>) -> Result<O, ProgramError>,
+            input: I,
+            input_batch_axes: InputBatchAxes,
+            output_batch_axes: OutputBatchAxes,
+            batch_axis: BatchAxisSpecification<<C::Policy as BatchingPolicy<C>>::Extent>,
+        ) -> Result<O::To<C::Value>, BatchingError> {
+            let input_structure = input.parameter_structure();
+            let inputs = input.into_parameters().collect::<Vec<_>>();
+
+            // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf
+            // fills every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure
+            // broadcasts based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
+            let input_batch_axes = input_batch_axes
+                .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
+                .into_parameters()
+                .collect::<Vec<_>>();
+
+            // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
+            let (context, inputs) =
+                BatchingContext::<C, C::Policy>::prepare_inputs(parent, inputs, input_batch_axes, batch_axis)?;
+            let inputs =
+                inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
+            let input = I::To::<BatchingTracer<C, C::Policy>>::from_parameters(input_structure, inputs)?;
+            let output = function(input)?;
+
+            // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
+            // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
+            // structure gives one axis per leaf.
+            let output_structure = output.parameter_structure();
+            let output_batch_axis_values = output_batch_axes
+                .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
+                .into_parameters()
+                .collect::<Vec<_>>();
+
+            // The active policy materializes each requested output axis. Unwrapping to parent values preserves any
+            // enclosing batching level's metadata, so nested transforms require no side table.
+            let parent_outputs = output
+                .into_parameters()
+                .zip(output_batch_axis_values)
+                .map(|(output, output_batch_axis)| {
+                    C::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
+                })
+                .collect::<Result<Vec<_>, BatchingError>>()?;
+
+            Ok(O::To::<C::Value>::from_parameters(output_structure, parent_outputs)?)
+        }
+
+        let mut function = Some(function);
+        inner(
+            self,
+            &mut |input| function.take().unwrap()(input),
+            input,
+            input_batch_axes,
+            output_batch_axes,
+            batch_axis.into(),
+        )
+    }
+}
+
+impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch for C {
+    type Policy = <C::Type as BatchableType>::Policy;
+}
+
+/// Batches the provided `function` over the mapped axes of `input`, running it once over whole batches instead of once
+/// per batch item. This is the batching (i.e., vectorization) transform and the analogue of
+/// [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html).
+///
+/// The transform recovers a [`Context`] from the input's leaf values through [`Value::Domain`], wraps it in
+/// a [`BatchingContext`], and invokes `function` using [`BatchingTracer`] values, so that every operation inside the
+/// closure is lifted through its [`BatchableOperation`] implementation against the recovered context. This composes
+/// uniformly across the whole stack: an eager backend context interprets each batched operation immediately, an active
+/// [`StagingContext`] stages it into the enclosing trace, and a [`BatchingContext`] nests `batch` inside `batch` (each
+/// level's [`BatchingTracer`] carries its own batch axis and so nested maps thread through with no side table).
+/// Concretely, staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their batching level, concrete
+/// values recover the eager backend domain they name, etc. Inputs with *no leaf values* are the one case this function
+/// cannot serve. With nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
+/// `batch_axis` supplies an explicit batch extent. [`Batch::batch`] must be used in that case, with an explicit
+/// context.
+///
+/// `input_batch_axes` selects the mapped axis of each input leaf and `output_batch_axes` the position of the mapped
+/// axis in each output leaf. Both are [`Parameterized`] values over [`BatchAxis`] leaves that are broadcast into the
+/// corresponding parameter structure via [`Parameterized::broadcast_to_parameter_structure`]: a single [`BatchAxis`]
+/// applies to every leaf, a value whose structure matches gives one axis per leaf, and a smaller compatible structure
+/// broadcasts based on its prefixes. On the input side, [`BatchAxis::new(k)`](BatchAxis::new) maps the leaf on axis
+/// `k` of its packed type, while [`BatchAxis::replicated`] shares the leaf unchanged across the batch. On the output
+/// side, [`BatchAxis::new(k)`](BatchAxis::new) requests the mapped axis at position `k`: a naturally mapped output is
+/// transposed when needed, while a naturally replicated output is broadcast across the batch, matching JAX's `vmap`.
+/// Negative axes are normalized against the packed input or requested output rank, so `-1` denotes the final axis.
+/// [`BatchAxis::replicated`] requires the output to remain replicated; collapsing a genuinely mapped output instead
+/// requires an explicit reduction inside `function`.
+///
+/// When at least one input is mapped, the batch extent is inferred from those inputs. The `batch_axis` argument accepts
+/// the specification form selected by the execution context's [`Batch::Policy`]. It can supply an explicit extent
+/// (either to pin the inferred extent or to drive a fully-replicated transform whose extent would otherwise be
+/// unobservable) and an axis name that operations inside `function` like collectives can address.
+///
+/// # Parameters
+///
+///   - `function`: Function that represents the computation that needs to be batched/vectorized.
+///   - `input`: Input (potentially structured) that should be batched/vectorized.
+///   - `input_batch_axes`: [`BatchAxis`] selection for the input leaves, broadcast into the input's structure.
+///   - `output_batch_axes`: [`BatchAxis`] selection for the output leaves, broadcast into the output's structure.
+///   - `batch_axis`: [`BatchAxisSpecification`] to use carrying an optional explicit batch extent and an optional
+///     batch axis name.
+#[inline]
+pub fn batch<
+    V: Value<Domain: Batch>,
+    F: FnOnce(I::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<O, ProgramError>,
+    I: Parameterized<
+            V,
+            Family: ParameterizedFamily<BatchAxis>
+                        + ParameterizedFamily<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>,
+        >,
+    O: Parameterized<
+            BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
+        >,
+    InputBatchAxes: Parameterized<BatchAxis>,
+    OutputBatchAxes: Parameterized<BatchAxis>,
+    Specification: Into<BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>>,
+>(
+    function: F,
+    input: I,
+    input_batch_axes: InputBatchAxes,
+    output_batch_axes: OutputBatchAxes,
+    batch_axis: Specification,
+) -> Result<O::To<V>, BatchingError> {
+    let Some(context) = input.parameters().next().map(Value::domain) else {
+        return Err(BatchingError::EmptyBatch);
+    };
+    context.batch(function, input, input_batch_axes, output_batch_axes, batch_axis)
+}
+
+/// Applies a member [`Operation`]'s batching rule through a projected view of a heterogeneous [`BatchingContext`]. Use
+/// this function from a family-level operation dispatcher when the operation is [`Region`](crate::Region)-free and
+/// every input and result belongs to the same projectable member type `T`. It converts the packed input values to the
+/// member value family, preserves the outer batch axes and mapped extent, runs the member's existing batching rule,
+/// and converts the results back to the heterogeneous value family. [`BatchingPolicyProjection`] selects the member
+/// policy that represents the same extent for the specific projected type `T`. This keeps homogeneous member rules
+/// independent of the enclosing heterogeneous type.
+///
+/// Operations with mixed member types or attached regions require an explicit family-level batching rule instead. A
+/// member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an exact diagnostic naming it,
+/// because projection reaches the member rule with no region access: the attached regions are programs in the
+/// _heterogeneous_ universe, and no projected driver can present them in the member universe.
+///
+/// # Parameters
+///
+///   - `context`: Active heterogeneous [`BatchingContext`] whose mapped extent, axis metadata, and parent context are
+///     preserved while the member rule runs.
+///   - `operation`: Region-free operation expressed in the projected member operation family.
+///   - `inputs`: Packed heterogeneous batches corresponding to the operation's inputs.
+pub fn batch_projected_operation<
+    T: Type,
+    O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,
+    C: ContextProjection<T>,
+    P: BatchingPolicyProjection<C, T>,
+>(
+    context: &BatchingContext<C, P>,
+    operation: &O,
+    inputs: &[P::Batch],
+) -> Result<Vec<P::Batch>, BatchingError> {
+    if !operation.region_slots().is_empty() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "projected operation `{}` carries regions and cannot be batched through its member family; batch it \
+                 through a family-level carrier for that operation instead",
+                operation.name(),
+            ),
+        });
+    }
+    let projected_context = BatchingContext::<_, P::Projected>::with_policy(
+        ProjectedContext::new(context.parent().clone()),
+        context.axis_extent().clone(),
+    )
+    .with_axis_name(context.axis_name().map(str::to_string))
+    .with_axis_sharding(context.axis_sharding().clone());
+    let projected_inputs = inputs
+        .iter()
+        .map(|input| P::Projected::batch(C::Value::into_projected(P::value(input).clone())?, P::batch_axis(input)))
+        .collect::<Result<Vec<_>, BatchingError>>()?;
+    let outputs = operation.batch(&projected_context, &EmptyRegionDriver, projected_inputs.as_slice())?;
+    outputs
+        .iter()
+        .map(|output| {
+            P::batch(C::Value::from_projected(P::Projected::value(output).clone()), P::Projected::batch_axis(output))
+        })
+        .collect()
+}
+
+/// Batches a region-free member [`Operation`] over replicated member values by binding the operation once in the parent
+/// context through a [`ProjectedContext`] instead of applying a member batching rule. Use this function from a
+/// family-level operation dispatcher for a projected member whose values are shared bookkeeping (e.g., first-class
+/// dimensions) and whose outer policy implements [`ReplicatedBatchingPolicyProjection`] for it, so that its operation
+/// family needs no [`BatchableOperation`] implementation of its own. `#[derive(Operation)]` uses it for every
+/// `#[ryft(projected(T, structural))]` variant. Values that are the same for every batch item yield results that are
+/// the same for every batch item, so a single evaluation is the batched result.
+///
+/// The steps run in the following order, and each failure stops the remaining steps:
+///
+///   1. An operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected before any input is projected,
+///      because the attached regions are programs in the heterogeneous universe that this function cannot rebind.
+///   2. Every input carrier is converted into its member value through
+///      [`ReplicatedBatchingPolicyProjection::project_replicated_batch`], which rejects mapped carriers.
+///   3. Every input carrier must be replicated. A correct [`ReplicatedBatchingPolicyProjection`] already guarantees
+///      this, so this check only turns a broken implementation into an exact diagnostic.
+///   4. The complete operation payload is bound once in [`ProjectedContext`] over the parent context, with no regions.
+///      Binding through the real parent keeps eager execution, staging, enclosing transforms, placement, manual
+///      variation, and operation effects on their established execution paths, regardless of the batch size.
+///   5. Every result is embedded back into the heterogeneous value family and wrapped with
+///      [`BatchingPolicy::replicated`], preserving output count and order.
+///
+/// # Parameters
+///
+///   - `context`: Active heterogeneous [`BatchingContext`] whose parent context binds the operation.
+///   - `operation`: Region-free operation expressed in the projected member operation family.
+///   - `inputs`: Packed heterogeneous batches corresponding to the operation's inputs.
+///
+/// # Errors
+///
+/// Returns [`BatchingError::UnsupportedOperation`] when `operation` declares regions or
+/// when a projected input carrier is not replicated, propagates projection failures from
+/// [`ReplicatedBatchingPolicyProjection::project_replicated_batch`] (e.g., [`BatchingError::MappedDimension`]
+/// for a mapped first-class dimension), and propagates failures of the parent context's [`Context::bind`] as
+/// [`BatchingError::Program`].
+pub fn batch_replicated_projected_operation<
+    T: Type,
+    C: ContextProjection<T>,
+    P: ReplicatedBatchingPolicyProjection<C, T>,
+>(
+    context: &BatchingContext<C, P>,
+    operation: &<C::Operation as OperationProjection<T>>::Projected,
+    inputs: &[P::Batch],
+) -> Result<Vec<P::Batch>, BatchingError> {
+    if !operation.region_slots().is_empty() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "projected operation `{}` carries regions and cannot be batched through its member family; \
+                 batch it through a family-level carrier for that operation instead",
+                operation.name(),
+            ),
+        });
+    }
+
+    let values = inputs.iter().map(P::project_replicated_batch).collect::<Result<Vec<_>, BatchingError>>()?;
+    if let Some(input) = inputs.iter().find(|input| !P::batch_axis(input).is_replicated()) {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "projected operation `{}` requires replicated inputs, but its replicated batching projection accepted \
+                 an input of type `{}` with batch axis `{}`",
+                operation.name(),
+                P::unbatched_type(input),
+                P::batch_axis(input),
+            ),
+        });
+    }
+
+    let outputs = ProjectedContext::new(context.parent().clone()).bind(operation.clone(), Vec::new(), &values)?;
+    Ok(outputs
+        .into_iter()
+        .map(|output| P::replicated(<C::Value as ValueProjection<T>>::from_projected(output)))
+        .collect::<Vec<_>>())
+}
+
+/// Checks on sample values whether the batching rule behind `function` depends on its input batch axes
+/// beyond computing the batched function, which is what decides between [`Composite::with_batching`] and
+/// [`Composite::with_broadcast_sensitive_batching`] (the former is exact only for rules that do not). The function is
+/// batched once at `input_batch_axes`, and then once for each replicated input leaf with that leaf broadcast along the
+/// batch instead. Every batched output is mapped at axis `0`, and the outputs of each broadcast batch are compared with
+/// those of the first batch by `equivalence_fn` (e.g., exact equality, or equality within a numerical tolerance for a
+/// rule that uses a different but equivalent algorithm). This is the batching counterpart of
+/// [`check_gradient!`](crate::check_gradient): it observes the rule only through the
+/// public [`batch`] transform.
+///
+/// Passing the check on samples does not prove that the rule is independent of its axes, but failing it proves that it
+/// is not, in which case the function's derivatives batched with a replicated primal whose tangent is mapped require
+/// [`Composite::with_broadcast_sensitive_batching`] to be the per-item derivatives of its batched primal.
+///
+/// # Parameters
+///
+///   - `function`: Function to batch, which typically calls a [`Composite`] with a custom batching rule.
+///   - `input`: Sample input of `function`, with every mapped leaf packed along its batch axis.
+///   - `input_batch_axes`: Batch axis of each input leaf, with the structure of `input`.
+///   - `batch_axis`: Batch axis specification passed to every [`batch`] call. It must supply the batch extent when
+///     every input leaf is replicated.
+///   - `equivalence_fn`: Comparison deciding whether two batched output leaves agree.
+///
+/// # Errors
+///
+/// Returns [`BatchingError::BroadcastInvarianceViolation`] for the first replicated input leaf whose broadcast changes
+/// a batched output leaf. Failures during batching propagate as their existing [`BatchingError`] variants.
+pub fn check_batching_rule_consistency<V, F, Input, Output, Specification, EquivalenceFn>(
+    function: F,
+    input: Input,
+    input_batch_axes: Input::To<BatchAxis>,
+    batch_axis: Specification,
+    equivalence_fn: EquivalenceFn,
+) -> Result<(), BatchingError>
+where
+    V: Value<Domain: Batch>,
+    F: Fn(Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<Output, ProgramError>,
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<BatchAxis>
+                        + ParameterizedFamily<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>,
+        >,
+    Output: Parameterized<
+            BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
+        >,
+    Specification: Into<BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>>,
+    EquivalenceFn: Fn(&V, &V) -> bool,
+{
+    let batch_axis = batch_axis.into();
+    let structure = input.parameter_structure();
+    let inputs = input.into_parameters().collect::<Vec<_>>();
+    let input_axes = input_batch_axes.into_parameters().collect::<Vec<_>>();
+    let batched = |inputs: Vec<V>, input_axes: Vec<BatchAxis>| -> Result<Vec<V>, BatchingError> {
+        let input = Input::from_parameters(structure.clone(), inputs)?;
+        let input_axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes)?;
+        let outputs = batch(&function, input, input_axes, BatchAxis::new(0), batch_axis.clone())?;
+        Ok(outputs.into_parameters().collect())
+    };
+    let expected = batched(inputs.clone(), input_axes.clone())?;
+    for (input, axis) in input_axes.iter().enumerate() {
+        if !axis.is_replicated() {
+            continue;
+        }
+
+        // The leaf is broadcast by a batch of the complete input that returns only that leaf, so that its extent is
+        // inferred exactly as in the batches that it is compared with.
+        let input_value = Input::from_parameters(structure.clone(), inputs.clone())?;
+        let axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone())?;
+        let broadcast: V = batch(
+            |tracers: Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>| {
+                Ok(tracers.into_parameters().nth(input).unwrap())
+            },
+            input_value,
+            axes,
+            BatchAxis::new(0),
+            batch_axis.clone(),
+        )?;
+
+        let mut broadcast_inputs = inputs.clone();
+        broadcast_inputs[input] = broadcast;
+        let mut broadcast_axes = input_axes.clone();
+        broadcast_axes[input] = BatchAxis::new(0);
+        let actual = batched(broadcast_inputs, broadcast_axes)?;
+        if let Some(output) =
+            expected.iter().zip(&actual).position(|(expected, actual)| !equivalence_fn(expected, actual))
+        {
+            return Err(BatchingError::BroadcastInvarianceViolation { input, output });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+        ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Shape, ShardingDimension,
+    };
+    use crate::contexts::EagerContext;
+    use crate::operations::{AddOperation, Reduce, ReductionKind, composite};
+    use crate::parameters::Placeholder;
+    use crate::programs::{ProgramBuilder, Typed};
+    use crate::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
+        ProjectedProgramType, ProjectedProgramValue, TestArrayContext,
+    };
+    use crate::tracing::{DomainTracer, Trace};
+
+    use super::*;
+
+    /// Batch carrier shared by the heterogeneous and projected-member batching fixtures.
+    #[derive(Clone, Debug, PartialEq)]
+    struct ProjectedBatch<V: Value> {
+        /// Packed value.
+        value: V,
+
+        /// Mapped axis.
+        batch_axis: BatchAxis,
+    }
+
+    impl<V: Value> Display for ProjectedBatch<V> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "batch[{}, {}]", self.value, self.batch_axis)
+        }
+    }
+
+    impl<V: Value> Parameter for ProjectedBatch<V> {}
+
+    impl<V: Value> Typed for ProjectedBatch<V> {
+        type Type = V::Type;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            self.value.r#type()
+        }
+    }
+
+    /// Batching policy proving that the generic frame does not encode the fixture's member kinds.
+    #[derive(Copy, Clone, Debug)]
+    struct ProjectedProgramBatching;
+
+    type ProjectedProgramContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+    impl<C> BatchingPolicy<C> for ProjectedProgramBatching
+    where
+        C: Context<
+                Type = ProjectedProgramType,
+                Value = ProjectedProgramValue,
+                Constant = ProjectedProgramValue,
+                Operation = ProjectedProgramOperation,
+            >,
+    {
+        type Batch = ProjectedBatch<C::Value>;
+        type Extent = usize;
+        type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
+
+        fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+            if !batch_axis.is_replicated() && !matches!(value, ProjectedProgramValue::First(_)) {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!("{} values must remain replicated under batching", value.r#type()),
+                });
+            }
+            Ok(ProjectedBatch { value, batch_axis })
+        }
+
+        fn replicated(value: C::Value) -> Self::Batch {
+            ProjectedBatch { value, batch_axis: BatchAxis::replicated() }
+        }
+
+        fn value(batch: &Self::Batch) -> &C::Value {
+            &batch.value
+        }
+
+        fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+            batch.batch_axis
+        }
+
+        fn batched_type(
+            _context: &BatchingContext<C, Self>,
+            input: &Self::Batch,
+            declared: &C::Type,
+        ) -> Result<C::Type, BatchingError> {
+            // The fixture's types have no axes. A mapped carrier records its batch axis beside its packed value,
+            // so there is no packed type into which that axis could be inserted.
+            if input.batch_axis.is_replicated() {
+                return Ok(declared.clone());
+            }
+            Err(BatchingError::UnsupportedOperation { message: format!("type `{declared}` cannot carry a batch axis") })
+        }
+
+        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
+            batch.r#type()
+        }
+
+        fn adapt_batched_program<
+            CollapseFn: Fn(
+                &TracingContext<C::Constant, C::Operation>,
+                Tracer<TracingContext<C::Constant, C::Operation>>,
+                Axis,
+            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+        >(
+            program: Self::BatchedProgram,
+            required_output_axes: Option<&[BatchAxis]>,
+            collapse_fn: CollapseFn,
+        ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
+            let (program, output_axes) = program.into_parts();
+            BoundaryPreservingBatchedProgram::from_widened_boundary(
+                program,
+                output_axes,
+                required_output_axes,
+                0,
+                collapse_fn,
+            )
+        }
+    }
+
+    impl RecursiveBatchingPolicy<ProjectedProgramContext> for ProjectedProgramBatching {
+        fn batching_level(
+            context: &BatchingContext<ProjectedProgramContext, Self>,
+        ) -> BatchingLevel<ProjectedProgramType> {
+            BatchingLevel::new(BatchingLevelExtent::Static(*context.axis_extent()), None, ShardingDimension::Replicated)
+        }
+
+        fn batch_program_at_level(
+            _level: &BatchingLevel<ProjectedProgramType>,
+            _region: RegionRef<'_, ProjectedProgramValue, ProjectedProgramOperation>,
+            _input_axes: &[BatchAxis],
+            _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+        ) -> Result<Self::BatchedProgram, BatchingError> {
+            Err(BatchingError::UnsupportedOperation { message: "fixture does not batch nested programs".to_string() })
+        }
+
+        fn batch_region(
+            _context: &BatchingContext<ProjectedProgramContext, Self>,
+            _region: RegionRef<'_, ProjectedProgramValue, ProjectedProgramOperation>,
+            _inputs: Vec<Self::Batch>,
+        ) -> Result<Vec<Self::Batch>, BatchingError> {
+            Err(BatchingError::UnsupportedOperation { message: "fixture does not batch nested regions".to_string() })
+        }
+
+        fn static_batch_axis_extent(context: &BatchingContext<ProjectedProgramContext, Self>) -> Option<usize> {
+            Some(*context.axis_extent())
+        }
+    }
+
+    impl BatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<2>> for ProjectedProgramBatching {
+        type Projected = ProjectedMemberBatching<2>;
+    }
+
+    // The rule is context-generic so that the `Operation<Type = C::Type>` super-trait of `BatchableOperation` is
+    // discharged from the context bound instead of by normalizing an eager context that is itself built from this
+    // operation family.
+    impl<C> BatchableOperation<C, ProjectedProgramBatching> for ProjectedProgramOperation
+    where
+        C: Context<
+                Type = ProjectedProgramType,
+                Value = ProjectedProgramValue,
+                Constant = ProjectedProgramValue,
+                Operation = ProjectedProgramOperation,
+            >,
+    {
+        fn batch<D: BatchingDriver<C, ProjectedProgramBatching>>(
+            &self,
+            _context: &BatchingContext<C, ProjectedProgramBatching>,
+            _driver: &D,
+            inputs: &[ProjectedBatch<C::Value>],
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError> {
+            if inputs.len() != 1 {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            }
+            Ok(inputs.to_vec())
+        }
+    }
+
+    /// Projected-member policy used to prove that projected batching does not depend on array carriers.
+    #[derive(Copy, Clone, Debug)]
+    struct ProjectedMemberBatching<const MEMBER: u8>;
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>>> BatchingPolicy<C>
+        for ProjectedMemberBatching<MEMBER>
+    {
+        type Batch = ProjectedBatch<C::Value>;
+        type Extent = usize;
+        type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
+
+        fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+            Ok(ProjectedBatch { value, batch_axis })
+        }
+
+        fn replicated(value: C::Value) -> Self::Batch {
+            ProjectedBatch { value, batch_axis: BatchAxis::replicated() }
+        }
+
+        fn value(batch: &Self::Batch) -> &C::Value {
+            &batch.value
+        }
+
+        fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+            batch.batch_axis
+        }
+
+        fn batched_type(
+            _context: &BatchingContext<C, Self>,
+            input: &Self::Batch,
+            declared: &C::Type,
+        ) -> Result<C::Type, BatchingError> {
+            // The fixture's types have no axes. A mapped carrier records its batch axis beside its packed value,
+            // so there is no packed type into which that axis could be inserted.
+            if input.batch_axis.is_replicated() {
+                return Ok(declared.clone());
+            }
+            Err(BatchingError::UnsupportedOperation { message: format!("type `{declared}` cannot carry a batch axis") })
+        }
+
+        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
+            batch.r#type()
+        }
+
+        fn adapt_batched_program<
+            CollapseFn: Fn(
+                &TracingContext<C::Constant, C::Operation>,
+                Tracer<TracingContext<C::Constant, C::Operation>>,
+                Axis,
+            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+        >(
+            program: Self::BatchedProgram,
+            required_output_axes: Option<&[BatchAxis]>,
+            collapse_fn: CollapseFn,
+        ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
+            let (program, output_axes) = program.into_parts();
+            BoundaryPreservingBatchedProgram::from_widened_boundary(
+                program,
+                output_axes,
+                required_output_axes,
+                0,
+                collapse_fn,
+            )
+        }
+    }
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>>>
+        BatchableOperation<C, ProjectedMemberBatching<MEMBER>> for ProjectedMemberOperation<MEMBER>
+    {
+        fn batch<D: BatchingDriver<C, ProjectedMemberBatching<MEMBER>>>(
+            &self,
+            _context: &BatchingContext<C, ProjectedMemberBatching<MEMBER>>,
+            _driver: &D,
+            inputs: &[ProjectedBatch<C::Value>],
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError> {
+            check_count!("input", inputs, 1, ProgramError);
+
+            // `Scoped` doubles its input to test transposition provenance. Returning its input unchanged here would
+            // incorrectly batch it as identity, so this fixture explicitly rejects that unsupported operation.
+            if matches!(self, ProjectedMemberOperation::Scoped) {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "the projected member fixture batches only identities".to_string(),
+                });
+            }
+
+            Ok(inputs.to_vec())
+        }
+    }
+
+    // The first member's values are shared by every batch item: projection returns the member value and rejects a
+    // mapped carrier before the operation is bound.
+    impl ReplicatedBatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<0>> for ProjectedProgramBatching {
+        fn project_replicated_batch(
+            batch: &ProjectedBatch<ProjectedProgramValue>,
+        ) -> Result<ProjectedMemberValue<0>, BatchingError> {
+            let value = ValueProjection::<ProjectedMemberType<0>>::into_projected(batch.value.clone())?;
+            if !batch.batch_axis.is_replicated() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!("{} values must remain replicated under batching", value.r#type()),
+                });
+            }
+            Ok(value)
+        }
+    }
+
+    // The second member's projection deliberately breaks the replicated promise by ignoring the carrier's axis, which
+    // pins the runtime check that turns such a broken implementation into a diagnostic.
+    impl ReplicatedBatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<1>> for ProjectedProgramBatching {
+        fn project_replicated_batch(
+            batch: &ProjectedBatch<ProjectedProgramValue>,
+        ) -> Result<ProjectedMemberValue<1>, BatchingError> {
+            Ok(ValueProjection::<ProjectedMemberType<1>>::into_projected(batch.value.clone())?)
+        }
+    }
+
+    #[test]
+    fn test_batching_error_conversions_normalize_round_trips() {
+        // A batching error that crossed into the kernel as a custom payload converts back to itself, and a
+        // `BatchingError::Program` converts back to the program error it carries, so round trips never nest.
+        let batching = BatchingError::MismatchedBatchSizes { expected: 4, actual: 5 };
+        let program = ProgramError::from(batching.clone());
+        assert!(matches!(
+            program.downcast_custom::<BatchingError>(),
+            Some(BatchingError::MismatchedBatchSizes { expected: 4, actual: 5 }),
+        ));
+        assert_eq!(BatchingError::from(program), batching);
+
+        let program = ProgramError::EscapedProgramBuilder;
+        let batching = BatchingError::from(program.clone());
+        assert_eq!(batching, BatchingError::Program(ProgramError::EscapedProgramBuilder));
+        assert_eq!(ProgramError::from(batching), program);
+
+        // Axis errors map between the dedicated variants of the two types in both directions.
+        let axis = AxisError::UnboundAxisName { name: "batch".to_string() };
+        assert_eq!(ProgramError::from(BatchingError::Axis(axis.clone())), ProgramError::Axis(axis.clone()));
+        assert_eq!(BatchingError::from(ProgramError::Axis(axis.clone())), BatchingError::Axis(axis));
+    }
+
+    #[test]
+    fn test_batch_axis() {
+        assert_eq!(BatchAxis::default(), BatchAxis::replicated());
+        assert!(BatchAxis::replicated().is_replicated());
+        assert!(!BatchAxis::new(2).is_replicated());
+        assert_eq!(BatchAxis::replicated().axis(), None);
+        assert_eq!(BatchAxis::new(2).axis(), Some(Axis::from(2)));
+        assert_eq!(BatchAxis::from(None), BatchAxis::replicated());
+        assert_eq!(BatchAxis::from(Some(3)), BatchAxis::new(3));
+        assert_eq!(BatchAxis::from(3), BatchAxis::new(3));
+        assert_ne!(BatchAxis::new(0), BatchAxis::new(1));
+        assert_eq!(format!("{:?}", BatchAxis::new(1)), "BatchAxis(Some(Axis(1)))");
+    }
+
+    #[test]
+    fn test_batch_axis_specification() {
+        assert_eq!(BatchAxisSpecification::from(None::<usize>), BatchAxisSpecification::default());
+        assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::with_extent(4));
+        assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::with_extent(4));
+        assert_eq!(BatchAxisSpecification::new(4, "i"), BatchAxisSpecification::new(4, "i").clone());
+        assert_ne!(BatchAxisSpecification::with_extent(4), BatchAxisSpecification::with_extent(5));
+        assert_ne!(BatchAxisSpecification::<usize>::named("i"), BatchAxisSpecification::<usize>::named("j"),);
+        assert_ne!(BatchAxisSpecification::<usize>::named("i"), BatchAxisSpecification::default());
+        assert_eq!(
+            format!("{:?}", BatchAxisSpecification::<usize>::named("i")),
+            "BatchAxisSpecification { extent: None, name: Some(\"i\") }",
+        );
+    }
+
+    #[test]
+    fn test_boundary_preserving_batched_program() {
+        // Construction validates that the output axes cover exactly the program's outputs.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            BoundaryPreservingBatchedProgram::new(program, Vec::new()).map(|_| ()),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        );
+
+        // A well-formed result preserves its program and output axes through `into_parts`.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (program, output_axes) =
+            BoundaryPreservingBatchedProgram::new(program, vec![BatchAxis::replicated()]).unwrap().into_parts();
+        assert_eq!(program.output_ids(), &[input]);
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+    }
+
+    #[test]
+    fn test_boundary_preserving_batched_program_from_widened_boundary() {
+        let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let sum = |context: &TracingContext<Array, ArrayOperation<Array>>,
+                   output: Tracer<TracingContext<Array, ArrayOperation<Array>>>,
+                   axis: Axis| {
+            let _ = context;
+            Ok(output.reduce(&[axis.normalize(output.r#type().rank()).unwrap()], ReductionKind::Sum)?)
+        };
+
+        // Parts that need no adjustment (no widening outputs and no required axes) are rewrapped without a replay.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(packed_type.clone());
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let rendered = program.to_string();
+        let (program, output_axes) = BoundaryPreservingBatchedProgram::from_widened_boundary(
+            program,
+            vec![BatchAxis::new(0)],
+            None,
+            0,
+            |_, _, _| unreachable!("rewrapping must not collapse any output"),
+        )
+        .unwrap()
+        .into_parts();
+        assert_eq!(program.to_string(), rendered);
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+
+        // Widening outputs are bookkeeping rather than source-region results, so the rebuilt boundary drops them
+        // while the corresponding inputs stay (they ground the program's own computation).
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let widening = builder.add_input(ArrayType::scalar(DataType::F64));
+        let source = builder.add_input(packed_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![widening, source], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (program, output_axes) = BoundaryPreservingBatchedProgram::from_widened_boundary(
+            program,
+            vec![BatchAxis::new(0)],
+            None,
+            1,
+            |_, _, _| unreachable!("dropping a widening output must not collapse any source output"),
+        )
+        .unwrap()
+        .into_parts();
+        assert_eq!(program.input_count(), 2);
+        assert_eq!(
+            program.interpret(vec![Array::scalar(7.0).unwrap(), Array::vector(vec![2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![2.0, 3.0]).unwrap()]),
+        );
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+
+        // A mapped output whose required axis is replicated is collapsed by `collapse_fn` and reported as replicated,
+        // while a mapped output whose required axis is mapped passes through untouched.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(packed_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let (program, output_axes) = BoundaryPreservingBatchedProgram::from_widened_boundary(
+            program,
+            vec![BatchAxis::new(0), BatchAxis::new(0)],
+            Some(&[BatchAxis::replicated(), BatchAxis::new(0)]),
+            0,
+            sum,
+        )
+        .unwrap()
+        .into_parts();
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::scalar(5.0).unwrap(), Array::vector(vec![2.0, 3.0]).unwrap()]),
+        );
+        assert_eq!(output_axes, vec![BatchAxis::replicated(), BatchAxis::new(0)]);
+
+        // The required axes must cover exactly the non-widening outputs.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(packed_type);
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert!(matches!(
+            BoundaryPreservingBatchedProgram::from_widened_boundary(
+                program,
+                vec![BatchAxis::new(0)],
+                Some(&[BatchAxis::replicated(), BatchAxis::new(0)]),
+                0,
+                sum,
+            )
+            .map(|_| ()),
+            Err(BatchingError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 1 })),
+        ));
+    }
+
+    #[test]
+    fn test_batching_policy_is_member_kind_agnostic() {
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let tracer = BatchingTracer::new(
+            context.clone(),
+            <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
+                ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+            ),
+        );
+        assert_eq!(tracer.r#type(), Cow::Owned(ProjectedProgramType::Third(ProjectedMemberType::<2>)));
+        assert_eq!(tracer.batch_extent(), &5);
+
+        let operation = ProjectedProgramOperation::from(ProjectedMemberOperation::<2>::Identity);
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap();
+        assert_eq!(
+            outputs,
+            vec![ProjectedBatch {
+                value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                batch_axis: BatchAxis::replicated(),
+            }],
+        );
+
+        assert!(matches!(
+            <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::batch(
+                ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                BatchAxis::new(0),
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "member_2 values must remain replicated under batching",
+        ));
+    }
+
+    #[test]
+    fn test_batching_driver_static_batch_axis_extent() -> Result<(), ProgramError> {
+        let arrays = BatchingContext::<TestArrayContext, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
+        assert_eq!(EmptyRegionDriver.static_batch_axis_extent(&arrays), None);
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        assert_eq!(driver.static_batch_axis_extent(&arrays), Some(2));
+
+        let eager = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(3)?),
+        );
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        assert_eq!(driver.static_batch_axis_extent(&eager), Some(3));
+
+        // Exact types prove the size without executing a staged extent. Wider types remain unknown.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(4, Some(5))?);
+        let staged = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.input(DimensionType::from(exact).into()),
+        );
+        assert_eq!(driver.static_batch_axis_extent(&staged), Some(4));
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::new(1, Some(5))?);
+        let staged = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.input(DimensionType::from(dynamic).into()),
+        );
+        assert_eq!(driver.static_batch_axis_extent(&staged), None);
+
+        // The driver delegates the query for an independent policy and value universe as well.
+        let custom = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        assert_eq!(driver.static_batch_axis_extent(&custom), Some(5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_batching_driver_align_batch_axis() -> Result<(), BatchingError> {
+        let context = BatchingContext::<TestArrayContext, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
+        let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), Some(0))?;
+        let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
+
+        // The default accepts a batch that already carries the requested axis and rejects every other request, since a
+        // driver without recursive access to the policy cannot broadcast or transpose.
+        assert_eq!(EmptyRegionDriver.align_batch_axis(&context, mapped.clone(), Axis::from(0))?, mapped);
+        assert_eq!(
+            EmptyRegionDriver.align_batch_axis(&context, mapped.clone(), Axis::from(1)),
+            Err(BatchingError::UnsupportedOperation {
+                message: "batching driver cannot align a batch carrying axis 0 to axis 1".to_string(),
+            }),
+        );
+        assert_eq!(
+            EmptyRegionDriver.align_batch_axis(&context, replicated.clone(), Axis::from(0)),
+            Err(BatchingError::UnsupportedOperation {
+                message: "batching driver cannot align a batch carrying replicated to axis 0".to_string(),
+            }),
+        );
+
+        // The recursive driver delegates to the policy, which moves a mapped axis and broadcasts a replicated batch
+        // along the context's extent.
+        let driver = RecursiveBatchingDriver::new(&AttachedRegions::Empty);
+        let moved = driver.align_batch_axis(&context, mapped, Axis::from(1))?;
+        assert_eq!(moved.batch_axis(), BatchAxis::new(1));
+        assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap());
+        let broadcasted = driver.align_batch_axis(&context, replicated, Axis::from(1))?;
+        assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
+        assert_eq!(broadcasted.value(), &Array::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]).unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn test_elementwise_operation_interpret_with_batch_axes_packages_outputs_and_validates_count() {
+        // `interpret_with_batch_axes` interprets the operation on the unpacked input values and repackages each
+        // output as an `ArrayBatch` carrying the requested output batch axis. Here two batched length-3 inputs are
+        // added elementwise, yielding a single batched sum mapped on axis 0.
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Some(0)).unwrap();
+        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]).unwrap(), Some(0)).unwrap();
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 3);
+        let outputs = AddOperation::new()
+            .interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(*outputs[0].r#type(), vector_type);
+        assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]).unwrap());
+
+        // An `output_batch_axes` length that disagrees with the number of produced outputs is rejected.
+        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Some(0)).unwrap();
+        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]).unwrap(), Some(0)).unwrap();
+        assert!(matches!(
+            AddOperation::new().interpret_with_batch_axes(&context, &[left, right], &[]),
+            Err(BatchingError::Program(_)),
+        ));
+    }
+
+    #[test]
+    fn test_batching_context() {
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 4);
+        assert!(context.parent().is_eager());
+        assert_eq!(context.axis_extent(), &4);
+        assert_eq!(context.axis_name(), None);
+        assert_eq!(context.axis_sharding(), &ShardingDimension::Replicated);
+
+        let context = context.with_axis_name("items".to_string()).with_axis_sharding(ShardingDimension::sharded(["x"]));
+        assert_eq!(context.axis_name(), Some("items"));
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+    }
+
+    #[test]
+    fn test_batching_context_align_batched_program_outputs() {
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let (_, source_program) = TestArrayContext::trace(|inputs: Vec<_>| Ok(inputs), vec![vector_type]).unwrap();
+        let input_axes = [BatchAxis::new(1)];
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
+
+        // A program whose natural output axes already match the required axes is returned without asking the driver
+        // to replay it. Using the empty driver pins that fast path because any replay through it would fail.
+        let batched_program = source_program
+            .entry_region_ref()
+            .batched(2, ShardingDimension::Replicated, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        let unchanged_program = context
+            .align_batched_program_outputs(
+                &EmptyRegionDriver,
+                source_program.entry_region_ref(),
+                input_axes.as_slice(),
+                batched_program,
+                &[BatchAxis::new(1)],
+            )
+            .unwrap();
+        let axis_one_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        assert_eq!(unchanged_program.input_types(), std::slice::from_ref(&axis_one_type));
+        assert_eq!(unchanged_program.output_types(), std::slice::from_ref(&axis_one_type));
+        assert!(unchanged_program.instructions().is_empty());
+
+        // Requiring axis 0 instead causes one aligned replay of the source region. The input retains its axis-1 packed
+        // layout, while the live output is transposed to the requested axis-0 layout.
+        let regions = AttachedRegions::from(vec![source_program]);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let region = driver.region(0).unwrap();
+        let batched_program = region
+            .batched(2, ShardingDimension::Replicated, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        let aligned_program = context
+            .align_batched_program_outputs(
+                &driver,
+                region,
+                input_axes.as_slice(),
+                batched_program,
+                &[BatchAxis::new(0)],
+            )
+            .unwrap();
+        let axis_zero_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(aligned_program.input_types(), std::slice::from_ref(&axis_one_type));
+        assert_eq!(aligned_program.output_types(), std::slice::from_ref(&axis_zero_type));
+        assert_eq!(aligned_program.instructions().len(), 1);
+        assert!(matches!(aligned_program.instructions()[0].operation(), ArrayOperation::Transpose(_)));
+        assert_eq!(
+            aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_batching_context_align_and_adapt_batched_program_outputs() {
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let mut source_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source_input = source_builder.add_input(vector_type.clone().into());
+        let source_program = source_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![source_input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let trace = TraceContext::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(8)).unwrap());
+        let extent_type = DimensionType::from(batch.clone());
+        let extent = trace.input(extent_type.clone().into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, extent);
+        let input_axes = [BatchAxis::new(0)];
+        let batched_program = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<TraceContext>>::batch_program(
+            &context,
+            source_program.entry_region_ref(),
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )
+        .unwrap();
+
+        // The target axis already matches, so the empty driver proves that the fast path is used. Adaptation retains
+        // the leading extent input that grounds the dynamic batch dimension but removes its bookkeeping output.
+        let adapted_program = context
+            .align_and_adapt_batched_program_outputs(
+                &EmptyRegionDriver,
+                source_program.entry_region_ref(),
+                input_axes.as_slice(),
+                batched_program,
+                input_axes.as_slice(),
+            )
+            .unwrap();
+        let packed_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
+        assert_eq!(
+            adapted_program.input_types(),
+            &[ArrayIrType::Dimension(extent_type), ArrayIrType::Array(packed_type.clone())],
+        );
+        assert_eq!(adapted_program.output_types(), &[ArrayIrType::Array(packed_type)]);
+        assert_eq!(adapted_program.output_ids(), &adapted_program.input_ids()[1..]);
+        assert!(adapted_program.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_batching_context_prepare_inputs() -> Result<(), BatchingError> {
+        let parent = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
+        let (context, inputs) = BatchingContext::<_, ArrayIrBatchingPolicy>::prepare_inputs(
+            &parent,
+            vec![reference.clone()],
+            vec![BatchAxis::new(0)],
+            BatchAxisSpecification::default(),
+        )?;
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            context.lift(reference.clone()).unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "captured reference aliases batched input 0; pass it as an input instead".to_string(),
+            },
+        );
+        let distinct = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32).unwrap()));
+        for _ in 0..2 {
+            assert_eq!(context.lift(distinct.clone())?.batch().batch_axis(), BatchAxis::replicated());
+        }
+        assert_eq!(
+            BatchingContext::<_, ArrayIrBatchingPolicy>::prepare_inputs(
+                &parent,
+                vec![reference.clone(), reference],
+                vec![BatchAxis::new(0); 2],
+                BatchAxisSpecification::default(),
+            )
+            .unwrap_err(),
+            BatchingError::Program(ProgramError::InvalidArgument {
+                message: "input 1 and input 0 bind the same reference allocation".to_string(),
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_batching_context_resolve() {
+        let parent = TestArrayContext::new();
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::with_policy(parent, 2);
+        let packed = Array::vector(vec![2f64, 3f64]).unwrap();
+        let mapped = BatchingTracer::new(context.clone(), ArrayBatch::new(packed, Some(0)).unwrap());
+        assert_eq!(mapped.r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        assert_eq!(context.resolve(&mapped), ValueResolution::Opaque);
+        let constant = Array::scalar(7f64).unwrap();
+        let replicated = BatchingTracer::new(context.clone(), ArrayBatch::replicated(constant.clone()));
+        assert_eq!(context.resolve(&replicated), ValueResolution::Constant(constant));
+
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::with_policy(trace.clone(), 2);
+        let packed = trace.input(ArrayType::new_static(DataType::F64, [2]));
+        let mapped = BatchingTracer::new(context.clone(), ArrayBatch::new(packed, Some(0)).unwrap());
+        assert_eq!(mapped.r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        assert_eq!(context.resolve(&mapped), ValueResolution::Opaque);
+        let input = trace.input(ArrayType::scalar(DataType::F64));
+        let replicated = BatchingTracer::new(context.clone(), ArrayBatch::replicated(input.clone()));
+        assert_eq!(context.resolve(&replicated), ValueResolution::Staged(input.atom_id().unwrap()));
+        assert!(trace.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_batch() {
+        // A single `BatchAxis` specification broadcasts into the whole input and output parameter structures, so both
+        // leaves of the pair are mapped on axis 0 without spelling out either structure.
+        let output: (Array, Array) = TestArrayContext::new()
+            .batch(
+                |(left, right)| Ok((left.clone() + right.clone(), left * right)),
+                (Array::vector(vec![1.0, 3.0]).unwrap(), Array::vector(vec![2.0, 4.0]).unwrap()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output, (Array::vector(vec![3.0, 7.0]).unwrap(), Array::vector(vec![2.0, 12.0]).unwrap()));
+
+        // With no mapped input and no explicit batch size, the batch size is unobservable.
+        let error = TestArrayContext::new()
+            .batch(
+                |x| Ok(x.clone() * x),
+                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
+                BatchAxis::replicated(),
+                BatchAxis::replicated(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error, BatchingError::EmptyBatch);
+
+        // With no leaf value to recover a context from, the free `batch` reports an empty batch even when an explicit
+        // batch size is provided.
+        let error = batch(
+            |x: Vec<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>| Ok(x),
+            Vec::<Array>::new(),
+            BatchAxis::replicated(),
+            BatchAxis::replicated(),
+            2,
+        )
+        .unwrap_err();
+        assert_eq!(error, BatchingError::EmptyBatch);
+    }
+
+    #[test]
+    fn test_batch_projected_operation() {
+        // The third fixture member is intentionally unrelated to arrays. Successfully applying its identity batching
+        // rule proves that the adapter depends only on the projection and policy contracts, while preserving the
+        // heterogeneous policy's packed value and replicated-axis representation.
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let input = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+        );
+        let outputs = batch_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, &[input]).unwrap();
+        assert_eq!(
+            outputs,
+            vec![ProjectedBatch {
+                value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                batch_axis: BatchAxis::replicated(),
+            }],
+        );
+    }
+
+    #[test]
+    fn test_batch_replicated_projected_operation() {
+        // The first fixture member is unrelated to arrays and has no member batching rule, so a successful application
+        // proves that the operation is bound once through the parent context and that its results are rebuilt as
+        // replicated heterogeneous carriers.
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let left = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
+            ProjectedProgramValue::First(ProjectedMemberValue::<0>(3)),
+        );
+        let right = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
+            ProjectedProgramValue::First(ProjectedMemberValue::<0>(4)),
+        );
+        let outputs = batch_replicated_projected_operation::<ProjectedMemberType<0>, _, _>(
+            &context,
+            &ProjectedMemberOperation::<0>::Add,
+            &[left.clone(), right],
+        )
+        .unwrap();
+        assert_eq!(
+            outputs,
+            vec![ProjectedBatch {
+                value: ProjectedProgramValue::First(ProjectedMemberValue::<0>(7)),
+                batch_axis: BatchAxis::replicated(),
+            }],
+        );
+    }
+
+    #[test]
+    fn test_batch_replicated_projected_operation_rejects_mapped_inputs() {
+        // The outer policy accepts a mapped first member, so the carrier reaches the replicated projection, which
+        // rejects the mapped axis before the operation is bound.
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let mapped = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::batch(
+            ProjectedProgramValue::First(ProjectedMemberValue::<0>(3)),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        assert!(matches!(
+            batch_replicated_projected_operation::<ProjectedMemberType<0>, _, _>(
+                &context,
+                &ProjectedMemberOperation::<0>::Identity,
+                &[mapped],
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "member_0 values must remain replicated under batching",
+        ));
+
+        // A projection that breaks its replicated promise by accepting a mapped carrier is caught by the runtime check
+        // instead of having its value silently replicated. The outer policy's constructor rejects a mapped second
+        // member, so the malformed carrier is built directly.
+        let input = ProjectedBatch {
+            value: ProjectedProgramValue::Second(ProjectedMemberValue::<1>(3)),
+            batch_axis: BatchAxis::new(0),
+        };
+        assert!(matches!(
+            batch_replicated_projected_operation::<ProjectedMemberType<1>, _, _>(
+                &context,
+                &ProjectedMemberOperation::<1>::Identity,
+                &[input],
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == format!(
+                    "projected operation `projected_member` requires replicated inputs, but its replicated batching \
+                     projection accepted an input of type `member_1` with batch axis `{}`",
+                    BatchAxis::new(0),
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_check_batching_rule_consistency() {
+        // A rule that computes `2xy` when both inputs are mapped and `xy` otherwise changes its batched output
+        // when the replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
+        type Tracer = DomainTracer<TestArrayContext>;
+        let scaled_product = |inconsistent: bool| {
+            composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
+                move |(x, y): (Tracer, Tracer),
+                      (x_axis, y_axis): (BatchAxis, BatchAxis),
+                      _: BatchingLevelExtent<Tracer>| {
+                    let product = x * y;
+                    let scale = match inconsistent && !x_axis.is_replicated() && !y_axis.is_replicated() {
+                        true => 2.0,
+                        false => 1.0,
+                    };
+                    let scale = product.context().lift(Array::scalar(scale)?)?;
+                    Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
+                },
+            )
+        };
+        let input = (Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(), Array::scalar(4.0f64).unwrap());
+        let input_axes = (BatchAxis::new(0), BatchAxis::replicated());
+        let check = |inconsistent: bool| {
+            let function = scaled_product(inconsistent);
+            check_batching_rule_consistency(
+                |inputs| function.call(inputs),
+                input.clone(),
+                input_axes,
+                None,
+                |expected: &Array, actual: &Array| expected == actual,
+            )
+        };
+        assert_eq!(check(false), Ok(()));
+        assert_eq!(check(true), Err(BatchingError::BroadcastInvarianceViolation { input: 1, output: 0 }));
+
+        // Every input of a fully replicated batch is broadcast in turn, which requires an explicit extent.
+        let function = scaled_product(true);
+        assert_eq!(
+            check_batching_rule_consistency(
+                |inputs| function.call(inputs),
+                (Array::scalar(1.0f64).unwrap(), Array::scalar(4.0f64).unwrap()),
+                (BatchAxis::replicated(), BatchAxis::replicated()),
+                3,
+                |expected: &Array, actual: &Array| expected == actual,
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn test_check_batching_rule_consistency_batching_error() {
+        assert_eq!(
+            check_batching_rule_consistency(
+                Ok,
+                Array::scalar(1f64).unwrap(),
+                BatchAxis::replicated(),
+                None,
+                |expected: &Array, actual: &Array| expected == actual,
+            ),
+            Err(BatchingError::EmptyBatch),
+        );
+    }
+}

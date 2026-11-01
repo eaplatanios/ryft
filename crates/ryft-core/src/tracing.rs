@@ -1,89 +1,71 @@
-//! Contains machinery for _tracing_ Rust execution into typed [`Program`]s.
+//! Traces Rust function execution into immutable, typed [`Program`]s.
 //!
-//! Tracing substitutes symbolic [`Tracer`] values for runtime inputs and executes a Rust closure once. Operations
-//! on those tracers bind through an active staging context, which appends typed instructions to a shared
-//! [`ProgramBuilder`], and finalization validates the resulting atom graph and records the closure's structured
-//! outputs as an immutable program.
+//! Tracing is a staging boundary. It replaces runtime inputs with symbolic [`Tracer`] values and invokes the supplied
+//! Rust closure once. Operations applied to those values bind through an active [`StagingContext`], which records typed
+//! instructions in a shared [`ProgramBuilder`]. Finalization validates the resulting graph, preserves the structured
+//! input and output boundaries, and returns the program together with its inferred output types. Refer to the
+//! [`TracingContext`] documentation for a rendered diagram of this pipeline and the relationship between root and
+//! nested tracing.
 //!
-//! Tracing records the operations bound by the host execution path. It does not record arbitrary Rust. Dynamic behavior
-//! must be represented by staged operations, and host branches execute during tracing only when their conditions are
-//! concretely available.
+//! # What Gets Traced
 //!
-//! ```text
-//!               ┌─────────────┐
-//!               │ Input Types │
-//!               └──────┬──────┘
-//!                      │ create input tracers
-//!                      ▼
-//!     ┌─────────────────────────────────┐
-//!     │ Tracing Context + Input Tracers │
-//!     └────────────────┬────────────────┘
-//!                      │ execute the Rust closure once, binding operations as instructions
-//!                      ▼
-//! ┌─────────────────────────────────────────┐
-//! │ Output Tracers + Recorded Instructions  │
-//! └────────────────────┬────────────────────┘
-//!                      │ build
-//!                      ▼
-//!                 ┌─────────┐
-//!                 │ Program │
-//!                 └─────────┘
-//! ```
+//! Tracing records operations bound through [`Context::bind`]; it does not record arbitrary Rust execution. Ordinary
+//! host computation runs immediately while the closure is being traced. Consequently, a Rust `if`, loop, or container
+//! traversal may depend only on information concretely available at trace time. Runtime-dependent behavior must be
+//! represented explicitly by staged control-flow or data operations.
 //!
-//! # Entry Points
+//! The closure is part of specialization semantics: changing static host values can change which operations are
+//! recorded. Dynamic runtime data should remain in tracer inputs rather than being inspected by host code.
 //!
-//! [`Trace::trace`] is the usual domain-oriented entry point. It creates a fresh [`DomainTracingContext`], converts
-//! the abstract input structure into tracers, invokes the closure, and returns both output types and the finalized
-//! program, while [`Trace::infer_output_type`] runs the same trace but retains only abstract outputs.
+//! # Choosing an Entry Point
 //!
-//! Use [`TracingContext::trace`] directly when the value, operation, and capture types are named independently rather
-//! than through a domain. [`TracingContext::trace_with_named_axes`] additionally installs named-axis bindings for the
-//! trace, and [`NestedTracingContext::trace`] creates a fresh inner builder while retaining a parent context for
-//! lifting, captures, and composition inside higher-order transforms.
+//!   - [`Trace::trace`] accepts abstract input types and traces in the implementing [`Domain`]'s type, constant, and
+//!     operation universe. [`Trace::infer_output_type`] performs the same trace but returns only the output types.
+//!   - [`trace`] and [`infer_output_type`] accept example values. The values contribute only their abstract types; they
+//!     are neither executed nor captured, and their statically known domain selects the tracing universe.
+//!   - [`TracingContext::trace`] names the value, operation, and capture representations directly.
+//!     [`TracingContext::trace_with_named_axes`] additionally seeds named-axis bindings for operations such as
+//!     collectives.
+//!   - [`NestedTracingContext::trace`] records a flat inner program in an enclosing [`Context`]'s universe. It is used
+//!     for loop bodies, branches, derivative rules, and other regions that need a fresh builder while retaining parent
+//!     capabilities. [`NestedTracingContext::trace_with_named_axes`] lets local bindings shadow parent axes.
 //!
-//! The free [`trace`] and [`infer_output_type`] functions expose the same entry points for callers holding example
-//! values rather than abstract types: the values contribute only their types, and the trace runs in their statically
-//! known execution domain.
+//! [`DomainTracingContext`] and [`DomainTracer`] are the usual aliases for root domain tracing;
+//! [`NestedTracer`] is the corresponding nested-trace value alias.
 //!
-//! # Tracers and Errors
+//! # Tracer Identity and Failure Propagation
 //!
-//! A [`Tracer`] stores its context, abstract type, and [`TracerState`]. A live tracer names one [`AtomId`] in its
-//! context's builder, and tracer equality is staging identity (i.e., same builder and same atom) and not runtime value
-//! equality.
+//! A [`Tracer`] carries its context, abstract type, and [`TracerState`]. A live tracer names one [`AtomId`] in exactly
+//! one builder. Equality is staging identity (i.e., same builder and same atom) and not equality of eventual runtime
+//! values. Trace boundaries reject foreign output tracers because reusing an atom index from another builder would
+//! silently alias an unrelated value.
 //!
-//! Operator conveniences use poisoned tracers to defer a staging failure until the trace boundary. Once a bind fails,
-//! downstream operations propagate [`TracerState::Poison`], and finalization returns the builder's original
-//! [`ProgramError`]. Explicitly fallible staging paths may return errors immediately. Code must never use an atom ID
-//! from one builder in another builder.
+//! Convenience operators defer binding errors by returning [`TracerState::Poison`]. Poison then propagates through
+//! downstream binds, and finalization reports the builder's original [`ProgramError`]. Explicitly fallible staging APIs
+//! may instead return errors immediately. A tracer that escapes the closure keeps the shared builder alive, so
+//! finalization rejects it with [`ProgramError::EscapedProgramBuilder`].
 //!
-//! # Tracing Contexts
+//! # Context State, Captures, and Nesting
 //!
-//! [`TracingContext`] is the ordinary root staging context. It owns shared handles to a program builder, a capture
-//! table, and named-axis bindings. Its constant type may differ from the concrete captured value type, which lets
-//! compiled domains store lifetime-free capture references in IR while retaining concrete runtime arrays separately.
+//! [`TracingContext`] shares one builder, capture table, and set of named-axis bindings across all of its clones.
+//! The staged constant type may differ from the captured runtime value type: compilation can therefore place stable
+//! [`CaptureReference`](crate::CaptureReference)s in source IR while retaining concrete runtime values separately.
+//! The result is later packaged as a [`ClosedProgram`](crate::ClosedProgram) without embedding runtime buffers in
+//! the program.
 //!
-//! [`DomainTracingContext`] selects those generic parameters from a [`Domain`], and [`DomainTracer`] is its common
-//! tracer alias. [`NestedTracingContext`] wraps a parent context but allocates a new builder, making it suitable for
-//! tracing loop bodies, branches, derivative rules, and other nested programs without losing access to parent
-//! capabilities. [`NestedTracer`] is the corresponding alias.
-//!
-//! # Captures and Context Composition
-//!
-//! A tracing context implementing [`CapturingContext`](crate::CapturingContext) registers a concrete runtime value in
-//! its capture table and returns the staged constant payload referring to it. Transform and nested contexts delegate
-//! capture registration to their parent, so a captured value follows the same context stack as ordinary operations.
-//! Compilation uses this to build [`ClosedProgram`](crate::ClosedProgram)s without embedding runtime data in source IR.
+//! [`NestedTracingContext`] owns a fresh builder and local named-axis bindings but delegates capture registration and
+//! other parent capabilities through the enclosing context. Transform and nested contexts can therefore compose by
+//! following the same context stack for both operation binding and capture handling.
 //!
 //! # Extending Tracing
 //!
-//! Most new operations need no tracing-specific implementation: implement the operation and its type inference, add it
-//! to the domain's operation family, and stage it through [`Context::bind`]. Tracer capability implementations should
-//! pass the concrete operation payload into the context and let the operation family's [`From`] conversion select the
-//! wrapper variant.
+//! Most operations require no tracing-specific rule: implement the operation and its type inference, add it to the
+//! domain's operation family, and bind it through [`Context::bind`]. Tracer capability implementations should pass the
+//! concrete payload into the context and let the operation family's [`From`] conversion select its wrapper variant.
 //!
 //! A new staging context should implement [`Context`] with `Value = Tracer<Self>` and then [`StagingContext`]. Keep
-//! mutable builder state in shared handles, use checked builder APIs, make resolution conservative for foreign or
-//! poisoned tracers, and finalize only after all context and tracer clones have been dropped.
+//! mutable builder state behind shared handles, use checked builder APIs, resolve foreign or poisoned tracers
+//! conservatively, and finalize only after all context and tracer clones have been dropped.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -94,16 +76,14 @@ use ryft_macros::Parameter;
 
 use crate::axes::NamedAxis;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
-use crate::macros::check_builders;
+use crate::macros::{check_builders, check_count};
+use crate::operations::GuardOperation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::ProgramError;
-use crate::programs::atoms::AtomId;
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
-use crate::programs::regions::BindingRegionDriver;
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
+use crate::programs::{
+    AtomId, AttachedRegions, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
+    Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -120,6 +100,10 @@ pub enum TracerState {
 /// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values, and
 /// recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return _poisoned_
 /// tracers which are represented using [`TracerState::Poison`].
+///
+/// [`ValueProjection`] narrows the reported type without changing the staged atom. The borrowed type conversion may
+/// return any error convertible into [`TypeError`], including [`std::convert::Infallible`] when projecting a type onto
+/// itself.
 #[derive(Clone, Parameter)]
 pub struct Tracer<C: Context> {
     /// [`Context`] associated with this [`Tracer`].
@@ -165,9 +149,8 @@ impl<C: Context> Tracer<C> {
 // `Tracer` equality is *staging identity*, not value equality. Two tracers are equal if and only if they correspond to
 // the same staged `Atom` of the same `ProgramBuilder` (or are both poisoned in the same builder). Two tracers that
 // would evaluate to equal runtime values but were staged as distinct atoms are considered unequal, which is the
-// conservative answer trace-time analyses need. For example, the loop invariance fixed points of the `scan` and `while`
-// partial evaluation rules degrade to syntactic passthrough detection under a staging known-side context precisely
-// because of these semantics.
+// conservative answer trace-time analyses need: an analysis that treats equal values as interchangeable can never
+// conflate two distinct staged values.
 impl<C: StagingContext> PartialEq for Tracer<C> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -250,26 +233,53 @@ impl<C: Context> Typed for Tracer<C> {
 }
 
 impl<C: StagingContext> Value for Tracer<C> {
-    type DispatchDomain = C;
-    type ExecutionDomain = C;
+    type Dispatch = ValueDomainDispatch;
+    type Domain = C;
 
     #[inline]
-    fn dispatch_domain(&self) -> C {
-        self.context().clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> C {
+    fn domain(&self) -> C {
         self.context().clone()
     }
 }
 
-/// Ordinary active tracing [`Context`] over a [`Type`](crate::Type)/[`Value`]/[`Operation`] universe.
-/// [`TracingContext`] pairs the staged-constant and operation representations `(V, O)` of a program with the
-/// [`ProgramBuilder`] used for one tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is
-/// [`Tracer<Self>`](Tracer) and whose [`Domain::Constant`] is `V`. Its default [`StagingContext::stage_operation`]
-/// behavior records each primitive bind as a program instruction. Transform contexts wrap or replace this context when
-/// they need different binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
+impl<C: StagingContext, T: Type> ValueProjection<T> for Tracer<C>
+where
+    for<'t> &'t T: TryFrom<&'t C::Type>,
+    for<'t> <&'t T as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
+{
+    type Projected = ProjectedValue<T, Self>;
+    type ProjectedRef<'v>
+        = ProjectedValue<T, &'v Self>
+    where
+        Self: 'v,
+        T: 'v;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value.into_value()
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        T: 'v,
+    {
+        Ok(ProjectedValue::new(self, <&T>::try_from(&self.r#type).map_err(Into::<TypeError>::into)?.clone()))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        let r#type = <&T>::try_from(&self.r#type).map_err(Into::<TypeError>::into)?.clone();
+        Ok(ProjectedValue::new(self, r#type))
+    }
+}
+
+/// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs
+/// the staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one
+/// tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
+/// [`Domain::Constant`] is `V`. Its default [`StagingContext::stage_operation`] behavior records each primitive bind
+/// as a program instruction. Transform contexts wrap or replace this context when they need different binding behavior,
+/// but they still share the same [`Context`] protocol used by [`Tracer`] values.
 ///
 /// The optional capture parameter `C` names the concrete runtime value type stored in the capture table while tracing
 /// a captured [`Program`]. It is deliberately distinct from the staged-constant type `V`.
@@ -279,7 +289,33 @@ impl<C: StagingContext> Value for Tracer<C> {
 /// for `V`. `C` defaults to `V` for the common non-capturing case, where no capture table exists and the distinction
 /// is moot. Refer to [`CapturingContext`](crate::CapturingContext) and [`CaptureReference`](crate::CaptureReference)
 /// for more information on what captures are and how they are used in practice.
-pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
+///
+/// # Tracing Pipeline
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".edgeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   values["Example Input Values"]
+///   root["TracingContext"]
+///   values -->|"&lt;code&gt;trace&lt;/code&gt; or &lt;code&gt;infer_output_type&lt;/code&gt;"| root
+///   types["Domain + Input Types"] -->|"&lt;code&gt;Trace&lt;/code&gt; Trait"| root
+///   request["Nested Trace Request"] --> nested["NestedTracingContext"]
+///   parent["Enclosing Context"] -->|"universe and capabilities"| nested
+///   root --> root_state["Shared Builder, Capture Table, and Named Axes"]
+///   nested --> nested_state["Fresh Builder and Local Named Axes"]
+///   nested -.->|"delegates capture registration"| parent
+///   root_state --> tracers["Symbolic Input Tracers"]
+///   nested_state --> tracers
+///   tracers -->|"invoke once"| closure["Rust Closure"]
+///   closure -->|"bind typed operations"| builder["Active Program Builder"]
+///   builder -->|"validate and build"| result["Program + Structured Boundary Metadata"]
+/// ```
+///
+/// Both paths use the same staging protocol after creating their context. The root path owns capture storage. The
+/// nested path expresses its program in the parent's type, constant, and operation universe and delegates capture
+/// registration to that parent.
+#[cfg_attr(doc, ryft_macros::mermaid)]
+pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
     /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
     /// A [`Tracer`] holds its [`Context`] by value, and tracing freely clones tracers (and hence their contexts) as
@@ -295,9 +331,11 @@ pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     /// is filled only when tracing a captured [`Program`] (e.g., when just-in-time-compiling a function that closes
     /// over device buffers), in which case those values are passed to the compiled program as runtime arguments rather
     /// than being baked into it. Capturing is gated at the type level: [`capture`](crate::CapturingContext::capture)
-    /// is implemented only when the staged constant type is [`CaptureReference`](crate::CaptureReference), and so an
-    /// ordinary trace can never push into this table. Refer to the documentation of
-    /// [`CaptureReference`](crate::CaptureReference) for more information.
+    /// is implemented only when the staged constant type can embed a [`CaptureReference`](crate::CaptureReference),
+    /// and so an ordinary trace over plain runtime constants can never push into this table. Capture-owning traces
+    /// construct their context directly and read this table back out through [`captures`](Self::captures). The
+    /// [`trace`](Self::trace) entry points instead discard it and therefore reject traces that registered captures.
+    /// Refer to the documentation of [`CaptureReference`](crate::CaptureReference) for more information.
     ///
     /// Like the [`builder`](Self::builder), the table is held behind an [`Rc`] and a [`RefCell`] for the same reason:
     /// one capturing trace shares a single table across its many cloned contexts, so the [`Rc`] keeps every clone
@@ -306,15 +344,21 @@ pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     /// [`capture`](crate::CapturingContext::capture) needs to push through a shared `&self`.
     captures: Rc<RefCell<Vec<C>>>,
 
-    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
-    /// trace binds no named axes and this stays empty. Traces that run inside a manual-parallelism region (e.g., a
-    /// `shard_map` body) are seeded with that region's device mesh axes so that named-axis readers (e.g., collectives)
-    /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
-    /// cloned contexts.
+    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
+    /// implementation. An ordinary trace binds no named axes and this stays empty. Traces that run inside a
+    /// manual parallelism region (e.g., a `shard_map` body) are seeded with that region's device mesh axes so
+    /// that named axis readers (e.g., collectives) can validate and resolve them. The list is immutable for
+    /// the [`TracingContext`]'s lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
+
+    /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
+    /// [`Instruction`](crate::Instruction)s snapshot. It is shared behind an [`Rc`] (separately from [`Self::builder`]
+    /// so that [`ProvenanceScope`] transitions never hold a builder borrow) so that every cloned context observes the
+    /// same active scopes, while independent traces own independent states.
+    provenance: Rc<ProvenanceState>,
 }
 
-impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// Creates a new [`TracingContext`] over the `(V, O)` type universe with a fresh, empty [`ProgramBuilder`] and a
     /// fresh, empty capture table. Use [`builder`](Self::builder) afterward to read or finalize the staged program, and
     /// [`captures`](Self::captures) to read values registered through [`capture`](crate::CapturingContext::capture). To
@@ -327,6 +371,7 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
             builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
             named_axes: Rc::new(Vec::new()),
+            provenance: Rc::new(ProvenanceState::new()),
         }
     }
 
@@ -347,10 +392,15 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     /// Returns the named axes this trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
     /// implementation. Ordinary traces are seeded with no axes.
     #[inline]
-    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+    pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
     }
+}
 
+impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C>
+where
+    Self: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
     /// point. It creates a fresh [`TracingContext`] over the `(V, O)` type universe, executes `function` once on
     /// [`Tracer`] inputs standing in for `input_type`, and returns the output types plus the finalized program.
@@ -358,7 +408,9 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
     /// is preserved on the staged [`Tracer`] leaves so that callers tracing in a context with a non-default capture
     /// type (such as a backend whose runtime [`Domain::Value`] differs from its staged [`Domain::Constant`]) observe
-    /// that same context type.
+    /// that same context type. The trace must not register captures. Refer to the documentation of
+    /// [`trace_with_named_axes`](Self::trace_with_named_axes) for the rationale and the rejection semantics.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
@@ -373,6 +425,16 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
 
     /// Traces `function` against `input_type` like [`trace`](Self::trace), but seeds the trace's context with the
     /// provided named axes. Named-axis readers staged by `function` (e.g., collectives) resolve against these bindings.
+    /// This entry point returns only the traced [`Program`] and therefore has no way to hand a capture table to its
+    /// caller. A capture registered through [`capture`](crate::CapturingContext::capture) during the trace would leave
+    /// capture-referencing constants in the returned program while the values they name are silently discarded, and a
+    /// later use of that program inside a capture-owning scope (e.g., as an attached region of a compiled function)
+    /// would resolve those references against that unrelated scope's capture table, silently aliasing whichever value
+    /// occupies the referenced slot. Such traces are therefore rejected with [`ProgramError::DiscardedCaptures`].
+    /// Traces that need to capture must construct their [`TracingContext`] directly and pair the traced program with
+    /// the context's [`captures`](Self::captures) table (e.g., through a [`ClosedProgram`](crate::ClosedProgram)).
+    #[allow(clippy::type_complexity)]
+    #[inline]
     pub fn trace_with_named_axes<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
@@ -382,37 +444,68 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let input_structure = input_type.parameter_structure();
+        Self::trace_with_context_and_named_axes(|_, input| function(input), input_type, named_axes)
+    }
 
-        let (output_types, outputs, output_structure) = {
-            let context = Self {
-                builder: builder.clone(),
-                captures: Rc::new(RefCell::new(Vec::new())),
-                named_axes: Rc::new(named_axes),
-            };
-            let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
-            let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
-
-            // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
-            // whichever atom shares its index in this builder, and so we check for this here.
-            check_builders!(&builder, [output.parameters().map(|output| output.builder())])?;
-
-            builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
-            let output_structure = output.parameter_structure();
-            let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;
-            let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(ProgramError::from)?;
-            (output_types, outputs, output_structure)
-        };
-
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(outputs, input_structure, output_structure)?;
-
+    /// Creates a fresh [`TracingContext`] seeded with `named_axes` and traces `function` against `input_type`. Like
+    /// [`trace_with_named_axes`](Self::trace_with_named_axes), this returns the output types and finalized [`Program`],
+    /// but passes both the new context and the input [`Tracer`] structure to `function`. The context lets functions
+    /// with no input leaves create values through [`Context::lift`] or read named-axis indices through
+    /// [`AxisIndex`](crate::AxisIndex). It does not reuse an existing context or inherit its named axes.
+    ///
+    /// Output tracers must belong to the new context, and the callback must not retain that context or its tracers
+    /// after returning. Captures are rejected because the returned program has no accompanying capture table. Refer
+    /// to [`trace_with_named_axes`](Self::trace_with_named_axes) for the rationale and capture-owning alternatives.
+    ///
+    /// # Examples
+    ///
+    /// A function with no inputs can lift a constant through the explicitly supplied context:
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayOperation, Context, TracingContext};
+    /// let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+    ///     |context, ()| context.lift(Array::scalar(3f32).unwrap()),
+    ///     (),
+    ///     Vec::new(),
+    /// )
+    /// .unwrap();
+    /// assert_eq!(program.interpret(()).unwrap(), Array::scalar(3f32).unwrap());
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Callback receiving the fresh tracing context and inputs with the structure of `input_type`.
+    ///   - `input_type`: Structured input types. Use `()` when the function has no inputs.
+    ///   - `named_axes`: Named-axis bindings available to the callback and operations it stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from the callback or program construction, [`ProgramError::MismatchedProgramBuilders`] for
+    /// foreign output tracers, [`ProgramError::EscapedProgramBuilder`] if the callback retains the tracing context
+    /// or a tracer, and [`ProgramError::DiscardedCaptures`] if the trace registers captures.
+    #[allow(clippy::type_complexity)]
+    pub fn trace_with_context_and_named_axes<
+        F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+        let (output_types, program, capture_count) =
+            Self::trace_with_named_axes_counting_captures(function, input_type, named_axes)?;
+        if capture_count > 0 {
+            return Err(ProgramError::DiscardedCaptures { count: capture_count });
+        }
         Ok((output_types, program))
     }
 
     /// Traces `function` against `input_type` and returns the output type, without retaining the traced [`Program`].
-    /// Use this when callers only need the output types of an ordinary symbolic trace.
+    /// Use this when callers only need the output types of an ordinary symbolic trace. Unlike [`trace`](Self::trace),
+    /// captures registered during the trace are tolerated: the traced program is discarded together with them, so no
+    /// dangling capture reference can escape (e.g., output-type inference over a function that stages calls to
+    /// captured compiled functions remains valid).
     #[inline]
     pub fn infer_output_type<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
@@ -422,58 +515,171 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         function: F,
         input_type: Input,
     ) -> Result<Output::To<V::Type>, ProgramError> {
-        Ok(Self::trace(function, input_type)?.0)
+        Ok(Self::trace_with_named_axes_counting_captures(|_, input| function(input), input_type, Vec::new())?.0)
+    }
+
+    /// Traces like [`trace_with_named_axes`](Self::trace_with_named_axes) but additionally reports the number of
+    /// captures the trace registered into its local (and discarded) capture table, leaving the decision of whether
+    /// discarding them is acceptable to the caller. [`trace_with_named_axes`](Self::trace_with_named_axes) rejects
+    /// such traces because it retains the program, while [`infer_output_type`](Self::infer_output_type) tolerates
+    /// them because it discards the program along with the captures. It passes the trace's context to `function`
+    /// together with its inputs, like [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes).
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    fn trace_with_named_axes_counting_captures<
+        F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
+        /// Internal helper that traces like
+        /// [`trace_with_named_axes_counting_captures`](Self::trace_with_named_axes_counting_captures) with the callback
+        /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
+        /// once per input and output structure rather than once per callback type: every trace of a distinct closure
+        /// would otherwise instantiate this body and every closure and iterator adapter in it again. The callback is
+        /// invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<
+            V: Value,
+            O: Operation<Type = V::Type>,
+            C,
+            Input: Parameterized<
+                    V::Type,
+                    Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<TracingContext<V, O, C>>>,
+                >,
+            Output: Parameterized<
+                    Tracer<TracingContext<V, O, C>>,
+                    Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+                >,
+        >(
+            function: &mut dyn FnMut(
+                &TracingContext<V, O, C>,
+                Input::To<Tracer<TracingContext<V, O, C>>>,
+            ) -> Result<Output, ProgramError>,
+            input_type: Input,
+            named_axes: Vec<(String, NamedAxis)>,
+        ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError>
+        where
+            TracingContext<V, O, C>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+        {
+            let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+            let captures = Rc::new(RefCell::new(Vec::new()));
+            let input_structure = input_type.parameter_structure();
+
+            let (output_types, outputs, output_structure) = {
+                let context = TracingContext {
+                    builder: builder.clone(),
+                    captures: captures.clone(),
+                    named_axes: Rc::new(named_axes),
+                    provenance: Rc::new(ProvenanceState::new()),
+                };
+                let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
+                let output = function(&context, input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
+
+                // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
+                // whichever atom shares its index in this builder, and so we check for this here.
+                check_builders!(&builder, [output.parameters().map(|output| output.builder())])?;
+
+                builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+                let output_structure = output.parameter_structure();
+                let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;
+                let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(ProgramError::from)?;
+                (output_types, outputs, output_structure)
+            };
+
+            let capture_count = captures.borrow().len();
+            let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+            let program = builder.build(outputs, input_structure, output_structure)?;
+
+            Ok((output_types, program, capture_count))
+        }
+
+        let mut function = Some(function);
+        inner(
+            &mut |context: &Self, input: Input::To<Tracer<Self>>| function.take().unwrap()(context, input),
+            input_type,
+            named_axes,
+        )
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Clone for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContext<V, O, C> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
+        Self {
+            builder: self.builder.clone(),
+            captures: self.captures.clone(),
+            named_axes: self.named_axes.clone(),
+            provenance: self.provenance.clone(),
+        }
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Debug for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Debug for TracingContext<V, O, C> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Default for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Default for TracingContext<V, O, C> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Domain for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>, C>
+    Domain for TracingContext<V, O, C>
+{
     type Type = V::Type;
     type Value = Tracer<Self>;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>, C>
+    Context for TracingContext<V, O, C>
+{
     #[inline]
     fn lift(&self, constant: V) -> Result<Tracer<Self>, ProgramError> {
+        // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
+        // the lift that attempts it because region sealing re-checks every stored constant, but only at build time,
+        // when the tracing call that stored the constant is long gone.
+        if let Err(error) = constant.validate_as_constant() {
+            return Err(self.error(error.into()));
+        }
         Ok(self.constant(constant))
     }
 
     #[inline]
-    fn bind<P: Into<O>, D: BindingRegionDriver<V, O>>(
+    fn bind<'r, P: Into<O>, R: Into<AttachedRegions<'r, V, O>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[Tracer<Self>],
-    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        self.stage_operation(operation, driver, inputs)
+    ) -> Result<Vec<Tracer<Self>>, ProgramError>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.stage_operation(operation, regions, inputs)
     }
 
     #[inline]
     fn is_eager(&self) -> bool {
         // `TracingContext`s stage values as `Tracer`s rather than computing them and so they are never eager.
         false
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // A `TracingContext` is a staging boundary. It owns the builder that instructions are emitted into, and so it
+        // also owns the shared provenance state those instructions snapshot.
+        self.provenance.current()
     }
 
     #[inline]
@@ -485,13 +691,33 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
             return ValueResolution::Opaque;
         };
         match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
-            Some(constant) => ValueResolution::Concrete(constant.clone()),
+            Some(constant) => ValueResolution::Constant(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
     }
+
+    #[inline]
+    fn reference_identity(&self, value: &Tracer<Self>) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
+            return Ok(None);
+        }
+        self.builder().borrow().reference_identity(value.atom_id()?, Rc::as_ptr(self.builder()) as usize)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
+    }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> StagingContext for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>, C>
+    StagingContext for TracingContext<V, O, C>
+{
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
@@ -514,17 +740,29 @@ pub struct NestedTracingContext<C: Context> {
     /// [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
     builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
 
-    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation ahead
-    /// of the parent context's bindings. An ordinary nested trace binds no named axes of its own and this stays empty,
-    /// in which case every lookup delegates to the parent. The list is immutable for the [`NestedTracingContext`]'s
-    /// lifetime and shared across cloned contexts.
+    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
+    /// implementation ahead of the parent context's bindings. An ordinary nested trace binds no named axes of its
+    /// own and this stays empty, in which case every lookup delegates to the parent. The list is immutable for the
+    /// [`NestedTracingContext`]'s lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
+
+    /// Active [`ProvenanceState`] for the nested program, shared across cloned contexts and independent of the
+    /// parent's state. It is seeded with the parent context's current provenance at depth zero, so that instructions
+    /// staged in the nested program record where the nested program itself came from, while later replaying them
+    /// under the same ambient scopes preserves each instruction's provenance exactly.
+    provenance: Rc<ProvenanceState>,
 }
 
 impl<C: Context> NestedTracingContext<C> {
     /// Creates a new [`NestedTracingContext`] that owns a fresh [`ProgramBuilder`] and traces on behalf of `parent`.
     pub fn new(parent: C) -> Self {
-        Self { parent, builder: Rc::new(RefCell::new(ProgramBuilder::new())), named_axes: Rc::new(Vec::new()) }
+        let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
+        Self {
+            parent,
+            builder: Rc::new(RefCell::new(ProgramBuilder::new())),
+            named_axes: Rc::new(Vec::new()),
+            provenance,
+        }
     }
 
     /// Returns the [`Context`] that this [`NestedTracingContext`] is nested into.
@@ -542,7 +780,7 @@ impl<C: Context> NestedTracingContext<C> {
     /// Returns the named axes this nested trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
     /// implementation ahead of the parent context's bindings. Ordinary nested traces are seeded with no axes.
     #[inline]
-    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+    pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
     }
 
@@ -553,6 +791,7 @@ impl<C: Context> NestedTracingContext<C> {
     /// traced program is flat (i.e., [`Vec`]-parameterized) on both boundaries (the canonical shape for nested programs
     /// that are replayed positionally) with the closure's output [`Parameter`] structure returned alongside it so that
     /// callers can reassemble structured outputs from the program's flat outputs.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn trace<F, Output>(
         parent: C,
@@ -565,6 +804,7 @@ impl<C: Context> NestedTracingContext<C> {
     where
         F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
         Output: Parameterized<Tracer<Self>>,
+        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         Self::trace_with_named_axes(parent, function, input_types, Vec::new())
     }
@@ -572,6 +812,8 @@ impl<C: Context> NestedTracingContext<C> {
     /// Traces `function` against `input_types` like [`trace`](Self::trace), but seeds the nested trace's context with
     /// the provided named axes, which shadow same-named bindings of `parent`. This is the nested-tracing counterpart
     /// of [`TracingContext::trace_with_named_axes`].
+    #[allow(clippy::type_complexity)]
+    #[inline]
     pub fn trace_with_named_axes<F, Output>(
         parent: C,
         function: F,
@@ -584,48 +826,77 @@ impl<C: Context> NestedTracingContext<C> {
     where
         F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
         Output: Parameterized<Tracer<Self>>,
+        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let input_count = input_types.len();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let named_axes = Rc::new(named_axes);
-        let context = Self { parent, builder, named_axes };
+        /// Internal helper that traces like [`trace_with_named_axes`](Self::trace_with_named_axes) with the callback
+        /// type erased. This is the body of that function, which only wraps its callback, so that this body is compiled
+        /// once per output structure rather than once per callback type. The callback is invoked exactly once.
+        #[allow(clippy::type_complexity)]
+        fn inner<C: Context, Output>(
+            parent: C,
+            function: &mut dyn FnMut(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Output, ProgramError>,
+            input_types: Vec<C::Type>,
+            named_axes: Vec<(String, NamedAxis)>,
+        ) -> Result<
+            (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
+            ProgramError,
+        >
+        where
+            Output: Parameterized<Tracer<NestedTracingContext<C>>>,
+            NestedTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        {
+            let input_count = input_types.len();
+            let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+            let named_axes = Rc::new(named_axes);
+            let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
+            let context = NestedTracingContext { parent, builder, named_axes, provenance };
 
-        let (output_structure, output_atoms) = {
-            let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
-            let output = function(input_tracers)
-                .map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
-            context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
-            let output_structure = output.parameter_structure();
+            let (output_structure, output_atoms) = {
+                let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+                let output = function(input_tracers)
+                    .map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
+                context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
+                let output_structure = output.parameter_structure();
 
-            // The outputs must belong to this trace. A foreign tracer's atom ID would silently alias whichever atom
-            // shares its index in this builder, so the boundary rejects it with a builder-identity check.
-            check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
+                // The outputs must belong to this trace. A foreign tracer's atom ID would silently alias whichever
+                // atom shares its index in this builder, so the boundary rejects it with a builder-identity check.
+                check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
 
-            let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-            (output_structure, output_atoms)
-        };
+                let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+                (output_structure, output_atoms)
+            };
 
-        // Clone out the builder handle and drop the context so that the clone is the sole owner, letting
-        // `Rc::try_unwrap` recover the builder below unless a `Tracer` escaped the trace and still holds a reference.
-        let builder = context.builder().clone();
-        drop(context);
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+            // Clone out the builder handle and drop the context so that the clone is the sole owner, letting
+            // `Rc::try_unwrap` recover the builder below unless a `Tracer` escaped the trace and still holds
+            // a reference.
+            let builder = context.builder().clone();
+            drop(context);
+            let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
 
-        let output_count = output_atoms.len();
-        let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-            output_atoms,
-            vec![Placeholder; input_count],
-            vec![Placeholder; output_count],
-        )?;
+            let output_count = output_atoms.len();
+            let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                output_atoms,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )?;
 
-        Ok((output_structure, program))
+            Ok((output_structure, program))
+        }
+
+        let mut function = Some(function);
+        inner(parent, &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs), input_types, named_axes)
     }
 }
 
 impl<C: Context> Clone for NestedTracingContext<C> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { parent: self.parent.clone(), builder: self.builder.clone(), named_axes: self.named_axes.clone() }
+        Self {
+            parent: self.parent.clone(),
+            builder: self.builder.clone(),
+            named_axes: self.named_axes.clone(),
+            provenance: self.provenance.clone(),
+        }
     }
 }
 
@@ -646,23 +917,40 @@ impl<C: Context> Domain for NestedTracingContext<C> {
 impl<C: Context> Context for NestedTracingContext<C> {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<Tracer<Self>, ProgramError> {
+        // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
+        // the lift that attempts it because region sealing re-checks every stored constant, but only at build time,
+        // when the tracing call that stored the constant is long gone.
+        if let Err(error) = constant.validate_as_constant() {
+            return Err(self.error(error.into()));
+        }
         Ok(self.constant(constant))
     }
 
     #[inline]
-    fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, P: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        self.stage_operation(operation, driver, inputs)
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        self.stage_operation(operation, regions, inputs)
     }
 
     #[inline]
     fn is_eager(&self) -> bool {
         // `NestedTracingContext`s stage values as `Tracer`s rather than computing them and so they are never eager.
         false
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // A `NestedTracingContext` is a staging boundary for the nested program. It owns an independent provenance
+        // state seeded from its parent and not a delegation to the parent's state.
+        self.provenance.current()
     }
 
     #[inline]
@@ -674,9 +962,27 @@ impl<C: Context> Context for NestedTracingContext<C> {
             return ValueResolution::Opaque;
         };
         match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
-            Some(constant) => ValueResolution::Concrete(constant.clone()),
+            Some(constant) => ValueResolution::Constant(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
+    }
+
+    #[inline]
+    fn reference_identity(&self, value: &Tracer<Self>) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
+            return Ok(None);
+        }
+        self.builder().borrow().reference_identity(value.atom_id()?, Rc::as_ptr(self.builder()) as usize)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
     }
 }
 
@@ -719,6 +1025,7 @@ pub trait Trace: Domain {
     /// Traces `function` into a [`Program`] for the provided input types, in this [`Domain`]'s type, staged-constant,
     /// and operation universe. This is the explicitly named counterpart of the [`trace`] function, which recovers the
     /// tracing universe and signature from example values instead. Refer to its documentation for more information.
+    #[allow(clippy::type_complexity)]
     #[inline]
     fn trace<
         F: FnOnce(Input::To<DomainTracer<Self>>) -> Result<Output, ProgramError>,
@@ -739,7 +1046,11 @@ pub trait Trace: Domain {
             Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
-    > {
+    >
+    where
+        DomainTracingContext<Self>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
         DomainTracingContext::<Self>::trace(function, input_type)
     }
 
@@ -760,7 +1071,11 @@ pub trait Trace: Domain {
     >(
         function: F,
         input_type: Input,
-    ) -> Result<Output::To<Self::Type>, ProgramError> {
+    ) -> Result<Output::To<Self::Type>, ProgramError>
+    where
+        DomainTracingContext<Self>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
         DomainTracingContext::<Self>::infer_output_type(function, input_type)
     }
 }
@@ -769,27 +1084,26 @@ impl<D: Domain> Trace for D {}
 
 /// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
 /// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
-/// contribute only their abstract [`Type`](crate::Type)s; no runtime computation is performed on them, and they are
-/// not captured by the resulting program. The trace runs in the input value type's statically known
-/// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batch) and the differentiation entry
-/// points, no context instance needs to be recovered from the input leaves and inputs with no leaf values are still
-/// traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for the input types through
-/// a fresh [`DomainTracingContext`], and returns the inferred output types together with the finalized program.
-/// [`Trace::trace`] exposes the same trace with the tracing universe named explicitly and the abstract input types
-/// supplied directly.
+/// contribute only their abstract [`Type`]s; no runtime computation is performed on them, and they are not captured
+/// by the resulting program. The trace runs in the input value type's statically known [`Domain`](Value::Domain), and
+/// so, unlike [`batch`](crate::batch) and the differentiation entry points, no context instance needs to be recovered
+/// from the input leaves and inputs with no leaf values are still traceable. The trace invokes `function` once over
+/// [`DomainTracer`] inputs standing in for the input types through a fresh [`DomainTracingContext`], and returns the
+/// inferred output types together with the finalized program. [`Trace::trace`] exposes the same trace with the tracing
+/// universe named explicitly and the abstract input types supplied directly.
+#[allow(clippy::type_complexity)]
 #[inline]
 pub fn trace<
     V: Value,
-    F: FnOnce(InputType::To<DomainTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
+    F: FnOnce(InputType::To<DomainTracer<V::Domain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V, To<V::Type> = InputType, Family: ParameterizedFamily<V::Type>>,
     InputType: Parameterized<
             V::Type,
-            Family: ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>
-                        + ParameterizedFamily<DomainTracer<V::ExecutionDomain>>,
+            Family: ParameterizedFamily<<V::Domain as Domain>::Constant> + ParameterizedFamily<DomainTracer<V::Domain>>,
         >,
     Output: Parameterized<
-            DomainTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>,
+            DomainTracer<V::Domain>,
+            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::Domain as Domain>::Constant>,
         >,
 >(
     function: F,
@@ -798,15 +1112,22 @@ pub fn trace<
     (
         Output::To<V::Type>,
         Program<
-            <V::ExecutionDomain as Domain>::Constant,
-            <V::ExecutionDomain as Domain>::Operation,
-            InputType::To<<V::ExecutionDomain as Domain>::Constant>,
-            Output::To<<V::ExecutionDomain as Domain>::Constant>,
+            <V::Domain as Domain>::Constant,
+            <V::Domain as Domain>::Operation,
+            InputType::To<<V::Domain as Domain>::Constant>,
+            Output::To<<V::Domain as Domain>::Constant>,
         >,
     ),
     ProgramError,
-> {
-    V::ExecutionDomain::trace(function, input.map_parameters(|value| value.r#type().into_owned())?)
+>
+where
+    DomainTracingContext<V::Domain>: StagingContext<
+            Type = V::Type,
+            Constant = <V::Domain as Domain>::Constant,
+            Operation = <V::Domain as Domain>::Operation,
+        >,
+{
+    V::Domain::trace(function, input.map_parameters(|value| value.r#type().into_owned())?)
 }
 
 /// Traces `function` at the abstract signature of the provided `input` values and returns only the inferred
@@ -817,20 +1138,1491 @@ pub fn trace<
 #[inline]
 pub fn infer_output_type<
     V: Value,
-    F: FnOnce(InputType::To<DomainTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
+    F: FnOnce(InputType::To<DomainTracer<V::Domain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V, To<V::Type> = InputType, Family: ParameterizedFamily<V::Type>>,
     InputType: Parameterized<
             V::Type,
-            Family: ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>
-                        + ParameterizedFamily<DomainTracer<V::ExecutionDomain>>,
+            Family: ParameterizedFamily<<V::Domain as Domain>::Constant> + ParameterizedFamily<DomainTracer<V::Domain>>,
         >,
     Output: Parameterized<
-            DomainTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>,
+            DomainTracer<V::Domain>,
+            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::Domain as Domain>::Constant>,
         >,
 >(
     function: F,
     input: Input,
-) -> Result<Output::To<V::Type>, ProgramError> {
-    V::ExecutionDomain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
+) -> Result<Output::To<V::Type>, ProgramError>
+where
+    DomainTracingContext<V::Domain>: StagingContext<
+            Type = V::Type,
+            Constant = <V::Domain as Domain>::Constant,
+            Operation = <V::Domain as Domain>::Operation,
+        >,
+{
+    V::Domain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
+}
+
+impl<
+    T: Type,
+    V: Value<Type = T>,
+    O: Operation<Type = T>,
+    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
+    Output: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
+> Program<V, O, Input, Output>
+where
+    Input::ParameterStructure: Debug + PartialEq,
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+{
+    /// Specializes this [`Program`] to the provided refined input types by replaying every
+    /// [`Instruction`](crate::Instruction) into a fresh trace, so that type inference propagates the refinements
+    /// through the entire body and the rebuilt program's boundary and instruction output types are exactly as if it had
+    /// been traced at the refined types. The program is returned unchanged when the provided types equal its declared
+    /// input types, and each provided type must refine the corresponding declared type (refer to the documentation of
+    /// [`Type::is_refined_by`] for more information on refinement requirements). Anything else is rejected before the
+    /// replay begins.
+    ///
+    /// Replay tracks the correspondence between source and replayed type-identity definitions, updating downstream
+    /// operation payloads and nested region metadata consistently. Inference can therefore propagate concrete bounds
+    /// through first-class dimension arithmetic and into operations that receive their extents as explicit inputs.
+    /// This does not replace arbitrary stored shapes with runtime values. Instead, each operation remains responsible
+    /// for validating its payload against the refined inputs, and unsupported refinements retain their diagnostics.
+    pub fn specialize(self, input_types: &[T]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, self.input_count(), ProgramError);
+        let declared_input_types = self.input_types();
+        if declared_input_types == input_types {
+            return Ok(self);
+        }
+        for (declared, actual) in declared_input_types.iter().zip(input_types) {
+            if !declared.is_refined_by(actual) {
+                return Err(TypeError::invalid(format!(
+                    "specialized input type {actual} does not refine declared input type {declared}",
+                ))
+                .into());
+            }
+        }
+        let (builder, output_ids) = {
+            let context = TracingContext::<V, O>::new();
+            let builder = context.builder().clone();
+            let inputs = Input::To::<Tracer<TracingContext<V, O>>>::from_parameters(
+                self.input_structure().clone(),
+                input_types.iter().cloned().map(|r#type| context.input(r#type)),
+            )
+            .map_err(ProgramError::from)?;
+            let outputs = self.interpret_in_context(&context, inputs)?;
+            let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+            (builder, output_ids)
+        };
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        builder.build(output_ids, self.input_structure.clone(), self.output_structure.clone())
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
+    /// Returns the attached `regions` of an application of `operation` to instruction inputs of types `input_types`
+    /// specialized to the region input types that `operation` infers for those instruction inputs, or [`None`] when no
+    /// region requires specialization (per [`region_requires_specialization`](Self::region_requires_specialization)).
+    /// Regions are visited in application order, and the region input types are re-inferred after each specialization,
+    /// because the signature of one region can depend on another (e.g., a linear call's transpose receives the
+    /// cotangent of its specialized forward output). Specialization is an optimization, so this also returns [`None`]
+    /// when a region cannot be specialized or when `operation` rejects the specialized regions (e.g., a loop body
+    /// specialized at a sharded carry that returns that carry unsharded), leaving the regions to be used as declared.
+    ///
+    /// Contexts that consume attached regions structurally rather than by interpreting them use this. For example, a
+    /// region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` keeps its symbolic
+    /// extent `b` when only its identities are instantiated (a static type has no identity to rename `b` to), while
+    /// eager array inputs carry the static extent 2. Primitive operations infer their outputs from their inputs and so
+    /// never observe this, but a differentiation rule that linearizes such a region would construct tangents whose
+    /// types disagree with those of the primal outputs.
+    ///
+    /// Callers must validate the original region interfaces of the application first (refer to
+    /// [`Operation::validate_region_interfaces`]), because specialization could otherwise make mismatched region
+    /// signatures agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of inferring the region input types and of checking whether the regions require
+    /// specialization.
+    pub(crate) fn specialize_attached_regions<'r, R: Iterator<Item = RegionRef<'r, V, O>>>(
+        operation: &O,
+        input_types: &[V::Type],
+        regions: R,
+    ) -> Result<Option<Vec<Self>>, ProgramError>
+    where
+        V: 'r,
+        O: 'r,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
+        let regions = regions.collect::<Vec<_>>();
+        let mut interfaces = regions.iter().map(|region| region.interface()).collect::<Vec<_>>();
+        let mut region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
+        let mut programs: Option<Vec<Self>> = None;
+        for index in 0..regions.len() {
+            // A malformed list of region input types is reported when the operation is bound with these regions.
+            let Some(Some(requested)) = region_input_types.get(index) else {
+                continue;
+            };
+
+            match Self::region_requires_specialization(interfaces[index].input_types(), requested)? {
+                // A mixed refinement can be primitive-valid without admitting a structural substitution.
+                // Replaying it would erase a shared input relationship, so retain every declared region instead.
+                None => return Ok(None),
+                Some(false) => continue,
+                Some(true) => {}
+            }
+
+            let programs = programs.get_or_insert_with(|| regions.iter().map(|region| region.to_program()).collect());
+
+            // Specialization is an optimization, so a region that cannot be specialized leaves every region
+            // unspecialized, matching the staging fallback (refer to `TracingContext::stage_operation`).
+            let Ok(specialized) = programs[index].clone().specialize_to_region_input_types(requested) else {
+                return Ok(None);
+            };
+
+            interfaces[index] = specialized.interface();
+            programs[index] = specialized;
+            if index + 1 < regions.len() {
+                region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
+            }
+        }
+
+        // Specialized regions can be unusable even though their declared counterparts are fine (e.g., a loop body
+        // specialized at a sharded carry that returns that carry unsharded), so they are kept only when the operation
+        // accepts them.
+        if programs.is_some() && operation.infer_output_types(input_types, &interfaces).is_err() {
+            return Ok(None);
+        }
+
+        Ok(programs)
+    }
+
+    /// Returns whether an attached region whose declared input types are `declared` must be specialized before an
+    /// operation application that infers the region input types `requested` for it can use it, or [`None`] when it
+    /// cannot be specialized. Input types that differ from the declared ones only in their type identities require no
+    /// specialization, because instantiating the identities of the region at them makes its signature agree with them.
+    /// Input types that strictly refine the declared ones (e.g., a static extent where the region declares a dynamic
+    /// one) do, and so do input types that only narrow bounds: instantiating the formal dimension `d` of a region that
+    /// computes `d + 2` at an input that is exactly 3 makes its signature agree, but leaves `d + 2` with the bounds
+    /// that it was traced with instead of inferring that it is exactly 5. Valid mixed refinements that admit no
+    /// structural substitution (refer to [`region_input_identity_renaming`](Self::region_input_identity_renaming))
+    /// cannot be specialized, because replaying the region at them would erase a shared input relationship,
+    /// so they return [`None`].
+    pub(crate) fn region_requires_specialization(
+        declared: &[V::Type],
+        requested: &[V::Type],
+    ) -> Result<Option<bool>, TypeError> {
+        let Some(renaming) = Self::region_input_identity_renaming(declared, requested)? else {
+            return Ok(None);
+        };
+        let renamed =
+            declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+        let narrows_bounds = declared
+            .iter()
+            .zip(requested)
+            .any(|(declared, actual)| declared.is_refined_by(actual) && !actual.is_refined_by(declared));
+        Ok(Some(renamed != requested || narrows_bounds))
+    }
+
+    /// Derives the structural input substitution, returning [`None`] for a valid refinement that cannot be represented
+    /// by one substitution. Such a mixed signature must keep its declared region: replay at those types would remove a
+    /// shared relationship that its requested signature no longer expresses.
+    pub(crate) fn region_input_identity_renaming(
+        declared: &[V::Type],
+        requested: &[V::Type],
+    ) -> Result<Option<TypeIdentityRenaming<<V::Type as Type>::Identity>>, TypeError> {
+        match V::Type::derive_identity_renaming(declared, requested) {
+            Ok(renaming) => Ok(Some(renaming)),
+            Err(error) => match <V::Type as Type>::Refinements::new(declared.iter(), requested.iter()) {
+                Ok(_) => Ok(None),
+                Err(_) => Err(error),
+            },
+        }
+    }
+
+    /// Returns this attached region specialized to the region input types `input_types` that an operation
+    /// application infers for it for when this is needed). The type identities of the region are first instantiated at
+    /// `input_types`, and its body is then replayed at them so that type inference propagates their refinements through
+    /// it. The body is replayed even when the instantiated signature already equals `input_types`, which is the case
+    /// for inputs that only narrow bounds, whereas [`specialize`](Self::specialize) would return such a region
+    /// unchanged.
+    pub(crate) fn specialize_to_region_input_types(self, input_types: &[V::Type]) -> Result<Self, ProgramError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
+        let instantiated = self.with_instantiated_type_identities(input_types)?.into_owned();
+        if instantiated.input_types() != input_types {
+            return instantiated.specialize(input_types);
+        }
+        TracingContext::<V, O>::trace(
+            |inputs: Vec<Tracer<TracingContext<V, O>>>| {
+                // Only regions whose inputs narrow bounds reach this replay, so their input signatures are non-empty.
+                let context = inputs[0].context().clone();
+                instantiated.interpret_in_context(&context, inputs)
+            },
+            input_types.to_vec(),
+        )
+        .map(|(_, program)| program)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType,
+        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+    };
+    use crate::axes::{AxisError, NamedAxes};
+    use crate::captures::{CaptureReference, CapturingContext};
+    use crate::contexts::EagerContext;
+    use crate::operations::{
+        AddOperation, AssertOperation, AxisIndex, ConditionOperation, DimensionAddOperation, LinearCallOperation,
+        NegOperation, OneLike, OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead,
+        ReferenceSwap, ReferenceWrite, ZeroLike, ZeroOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::programs::{
+        AtomId, EffectClass, EffectClasses, Operation, ProgramError, ReferenceBoundary, ReferenceType, ReferenceView,
+        TypeError, Typed,
+    };
+    use crate::tests::{TestArrayContext, TestArrayTracingContext};
+
+    use super::*;
+
+    type FlatArrayProgram = Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>;
+    type FlatDimensionProgram =
+        Program<DimensionValue, DimensionOperation<DimensionValue>, Vec<DimensionValue>, Vec<DimensionValue>>;
+
+    #[test]
+    fn test_trace() {
+        let (output_type, program) =
+            TestArrayContext::trace(|x| Ok(x.clone() * x), ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(9.0).unwrap()));
+
+        // The free function traces at the abstract signature of example values, which contribute only their types
+        // (i.e., the resulting program neither captures nor depends on the example values themselves).
+        let (output_type, program) = trace(|x| Ok(x.clone() * x), Array::scalar(2.0).unwrap()).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(9.0).unwrap()));
+
+        // Structured inputs trace at the structured signature of the example values.
+        let (output_type, program) =
+            trace(|(x, y)| Ok(x * y), (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            program.interpret((Array::scalar(4.0).unwrap(), Array::scalar(5.0).unwrap())),
+            Ok(Array::scalar(20.0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_context_trace_rejects_captures_registered_into_its_discarded_capture_table() {
+        /// Capturing trace universe whose staged constants are capture references into a runtime `Array` table.
+        type CapturingTrace = TracingContext<CaptureReference<ArrayType>, ArrayOperation<Array>, Array>;
+
+        /// Stages `x + capture#0` with the capture registered through the trace's own context.
+        fn capturing_body(x: Tracer<CapturingTrace>) -> Result<Vec<Tracer<CapturingTrace>>, ProgramError> {
+            let context = x.context().clone();
+            let reference = context.capture(Array::scalar(3.0).unwrap())?;
+            let captured = StagingContext::constant(&context, reference);
+            context.bind(AddOperation::new(), Vec::new(), &[x, captured])
+        }
+
+        // `trace` retains the traced program but discards the trace's local capture table, so the registered
+        // capture would leave a dangling `capture#0` reference behind (silently aliasing whatever capture table
+        // later surrounds the program) and the trace is rejected instead.
+        let result = CapturingTrace::trace(capturing_body, ArrayType::scalar(DataType::F64));
+        assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
+
+        // `infer_output_type` discards the traced program together with the captures, and so the same body still
+        // infers output types successfully (e.g., shape inference over functions that call captured compiled
+        // functions remains valid).
+        let output_types = CapturingTrace::infer_output_type(capturing_body, ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(output_types, vec![ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_context_interpret_and_trace() {
+        let domain = TestArrayContext::new();
+        let (output, program) = domain
+            .interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::scalar(2.0 * 2.0 + (-2.0)).unwrap());
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(3.0 * 3.0 + (-3.0)).unwrap()));
+    }
+
+    #[test]
+    fn test_context_interpret_and_trace_with_reference_state() {
+        // Interpreting the traced program allocates fresh reference state on every run, so its outputs reflect the
+        // reads, swaps, writes, and updates in program order each time, and the program declares ordered state.
+        let inputs = (
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![5.0f32, 6.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+        );
+        let (outputs, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+            .interpret_and_trace(
+                |(initial, replacement, written, update)| {
+                    let reference = initial.reference_new()?;
+                    let snapshot = reference.read()?;
+                    let previous = reference.swap(&replacement)?;
+                    reference.write(&written)?;
+                    reference.add_update(&update)?;
+                    Ok((snapshot, previous, reference.freeze()?))
+                },
+                inputs.clone(),
+            )
+            .unwrap();
+        let expected = (
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![6.0f32, 8.0]).unwrap()),
+        );
+        assert_eq!(outputs, expected);
+        assert_eq!(program.interpret(inputs), Ok(expected));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+    }
+
+    #[test]
+    fn test_context_infer_output_type() {
+        let output_type =
+            TestArrayContext::infer_output_type(|x| Ok(-x.clone()), ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+
+        // The free function infers output types at the abstract signature of example values.
+        let output_type = infer_output_type(|x| Ok(-x.clone()), Array::scalar(1.5).unwrap()).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+    }
+
+    #[test]
+    fn test_tracer_state_clone_debug_and_equality() {
+        let live = TracerState::Live(AtomId::new(3));
+        assert_eq!(live.clone(), TracerState::Live(AtomId::new(3)));
+        assert_eq!(TracerState::Poison.clone(), TracerState::Poison);
+        assert_ne!(live, TracerState::Poison);
+        assert_eq!(format!("{live:?}"), "Live(AtomId { index: 3 })");
+        assert_eq!(format!("{:?}", TracerState::Poison), "Poison");
+    }
+
+    #[test]
+    fn test_tracer() {
+        // Test handles, atom lookup, cloning, typing, and rendering.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let tracer = tracing_context.tracer(atom, None);
+        let poisoned: Tracer<_> =
+            Tracer::new(tracing_context.clone(), TracerState::Poison, ArrayType::scalar(DataType::F64));
+        let cloned_tracer = tracer.clone();
+        assert!(Rc::ptr_eq(tracer.builder(), &builder));
+        assert_eq!(tracer.atom_id(), Ok(atom));
+        assert_eq!(poisoned.atom_id(), Err(ProgramError::PoisonedValue));
+        assert_eq!(cloned_tracer.state(), tracer.state());
+        assert_eq!(cloned_tracer.r#type(), tracer.r#type());
+        assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert_eq!(tracer.to_string(), "%0");
+        assert_eq!(
+            format!("{tracer:?}"),
+            "Tracer { state: Live(AtomId { index: 0 }), type: ArrayType { data_type: F64, shape: Shape { dimensions: \
+             [] }, layout: None, sharding: None, memory: Device }, .. }",
+        );
+        assert_eq!(poisoned.to_string(), "<poison:f64[]>");
+        assert_eq!(
+            format!("{poisoned:?}"),
+            "Tracer { state: Poison, type: ArrayType { data_type: F64, shape: Shape { dimensions: [] }, layout: None, \
+             sharding: None, memory: Device }, .. }",
+        );
+
+        // Test staging value-level identity helpers through the tracer convenience API.
+        let zero = tracer.zero_like().unwrap();
+        let one = tracer.one_like().unwrap();
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(one.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let zero_atom = zero.atom_id().expect("zero_like output should remain live");
+        let one_atom = one.atom_id().expect("one_like output should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Array, Vec<Array>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.interpret(Array::scalar(2.0).unwrap()),
+            Ok(vec![Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()])
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero_like %0
+                    %2:f64[] = one_like %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+
+        // Test staging a unary operation through the tracer convenience API.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let tracer = tracing_context.tracer(atom, None);
+        let output = tracer.unary(NegOperation::new());
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let output_atom = output.atom_id().expect("unary output should remain live");
+        let program =
+            builder.borrow().clone().build::<Array, Array>(vec![output_atom], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(Array::scalar(2.0).unwrap()), Ok(Array::scalar(-2.0).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Test staging a binary operation through the tracer convenience API.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+        let output = lhs.binary(&rhs, AddOperation::new());
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let output_atom = output.atom_id().expect("binary output should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(5.0).unwrap())
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Test that binary operations poison the result when inputs belong to different builders.
+        let context_a = DomainTracingContext::<TestArrayContext>::new();
+        let context_b = DomainTracingContext::<TestArrayContext>::new();
+        let builder_a = context_a.builder().clone();
+        let atom_a = builder_a.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let atom_b = context_b.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let tracer_a = context_a.tracer(atom_a, None);
+        let tracer_b = context_b.tracer(atom_b, None);
+        let output = tracer_a.binary(&tracer_b, AddOperation::new());
+        assert!(matches!(output.state(), TracerState::Poison));
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_tracer_value_projection() {
+        // An infallible same-type projection retains the atom and stages array operations in the original builder.
+        let array_type = ArrayType::scalar(DataType::F64);
+        let (output_type, program) = TestArrayTracingContext::trace(
+            |input| {
+                let borrowed = ValueProjection::<ArrayType>::projected(&input)?;
+                assert!(std::ptr::eq(*borrowed.value(), &input));
+                assert_eq!(borrowed.r#type(), input.r#type());
+                let projected = ValueProjection::<ArrayType>::into_projected(input.clone())?;
+                assert_eq!(projected.value().atom_id(), input.atom_id());
+                assert_eq!(Tracer::<TestArrayTracingContext>::from_projected(projected.clone()), input);
+                let mut outputs = projected.domain().bind(NegOperation::new(), Vec::new(), &[projected])?;
+                Ok(Tracer::<TestArrayTracingContext>::from_projected(outputs.remove(0)))
+            },
+            array_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, array_type.clone());
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)"},
+        );
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(-3.0).unwrap()));
+
+        // Fallible member projections retain their `TypeError` diagnostics for both borrowed and owned inputs.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(array_type.clone().into());
+        assert_eq!(ValueProjection::<ArrayType>::projected(&input).unwrap().r#type().as_ref(), &array_type);
+        let projected = ValueProjection::<ArrayType>::into_projected(input.clone()).unwrap();
+        assert_eq!(projected.r#type().as_ref(), &array_type);
+        assert_eq!(projected.into_value(), input);
+        let dimension = context.input(DimensionType::from(Dimension::Static(2)).into());
+        assert_eq!(
+            ValueProjection::<ArrayType>::projected(&dimension).map(|_| ()),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            ValueProjection::<ArrayType>::into_projected(dimension).map(|_| ()),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+    }
+
+    #[test]
+    fn test_tracer_unary_records_invalid_output_count_and_returns_poisoned_tracer() {
+        // The unary tracer must reject the empty output signature of an assertion.
+        let context = TestArrayTracingContext::new();
+        let builder = context.builder().clone();
+        let input_type = ArrayType::scalar(DataType::Boolean);
+        let tracer = context.input(input_type);
+        let output = tracer.unary(AssertOperation::new("condition must hold"));
+        assert!(matches!(output.state(), TracerState::Poison));
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::Boolean));
+        assert_eq!(
+            builder.borrow().error().cloned(),
+            Some(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context() {
+        let domain = TestArrayContext::new();
+
+        // Test construction, cloning, and debug formatting.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let cloned_context = tracing_context.clone();
+        assert!(Rc::ptr_eq(tracing_context.builder(), &builder));
+        assert!(Rc::ptr_eq(cloned_context.builder(), &builder));
+        assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
+
+        // Test creating a program constant in the staged program.
+        let constant = tracing_context.constant(Array::scalar(2.5).unwrap());
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let constant_atom = constant.atom_id().expect("constant tracer should remain live");
+        assert_eq!(constant_atom.index(), 0);
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Array>(vec![constant_atom], Vec::<Placeholder>::new(), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret(Vec::new()), Ok(Array::scalar(2.5).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = const 2.5
+                in (%0)
+            "}
+            .trim_end(),
+        );
+
+        // Test constructing tracers from builder-owned and explicitly cached types.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let atom = tracing_context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let builder_typed = tracing_context.tracer(atom, None);
+        let cached_typed = tracing_context.tracer(atom, Some(ArrayType::scalar(DataType::F64)));
+        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+
+        // Test that only the first recorded builder error is retained.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
+        assert_eq!(tracing_context.error(first_error.clone()), first_error);
+        assert_eq!(tracing_context.error(second_error), ProgramError::InvalidOutputCount { expected: 1, actual: 0 });
+        assert_eq!(builder.borrow().error().cloned(), Some(first_error));
+
+        // Test staging a valid operation through the context.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+        let outputs = tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(5.0).unwrap())
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Test rejecting inputs that belong to a different program builder.
+        let context_a = DomainTracingContext::<TestArrayContext>::new();
+        let context_b = DomainTracingContext::<TestArrayContext>::new();
+        let builder_a = context_a.builder().clone();
+        let atom_a = builder_a.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let atom_b = context_b.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let tracer_a = context_a.tracer(atom_a, None);
+        let tracer_b = context_b.tracer(atom_b, None);
+        assert!(matches!(
+            context_a.stage_operation(AddOperation::new(), Vec::new(), &[&tracer_a, &tracer_b]),
+            Err(ProgramError::MismatchedProgramBuilders),
+        ));
+        assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+
+        // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        builder.borrow_mut().error = Some(builder_error.clone());
+        let tracer = tracing_context.tracer(atom, None);
+        let outputs = tracing_context.stage_operation(NegOperation::new(), Vec::new(), &[&tracer]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0].state(), &TracerState::Poison));
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
+        assert!(matches!(
+            tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&tracer]),
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == "expected 2 inputs but got 1",
+        ));
+        assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
+
+        // Test propagating abstract-evaluation errors and recording them on the builder.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F8E3M4));
+        let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F32));
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+        let result = tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]);
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`add` input types are not broadcast-compatible",
+        ));
+        assert!(matches!(
+            builder.borrow().error().cloned(),
+            Some(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`add` input types are not broadcast-compatible",
+        ));
+
+        // Test staging program constants through the context without requiring the context itself to be a domain.
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
+        let builder = tracing_context.builder().clone();
+        let zero = tracing_context.constant(
+            domain
+                .bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+        let one = tracing_context.constant(
+            domain
+                .bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(one.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let zero_atom = zero.atom_id().expect("zero tracer should remain live");
+        let one_atom = one.atom_id().expect("one tracer should remain live");
+        assert_eq!(zero_atom.index(), 0);
+        assert_eq!(one_atom.index(), 1);
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![zero_atom, one_atom],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(Vec::new()), Ok(vec![Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = const 0.0
+                    %1:f64[] = const 1.0
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_reference_identity() {
+        let context = DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::new();
+        let root = context.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))));
+        let view = ReferenceView::<_, ArrayReferenceTransform, _>::new(root.clone())
+            .unwrap()
+            .dynamic_index(0, &context.constant(ArrayIrValue::Array(Array::scalar(0i32).unwrap())))
+            .unwrap();
+        assert_eq!(context.reference_identity(view.root()), context.reference_identity(&root));
+        assert!(matches!(
+            ReferenceBoundary::new(&context, [("input 0", &root), ("input 1", view.root())])
+                .map_err(ProgramError::from),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "input 1 and input 0 bind the same reference allocation",
+        ));
+        let other = context.input(root.r#type().into_owned());
+        assert_ne!(context.reference_identity(&root).unwrap(), context.reference_identity(&other).unwrap());
+        let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(context.reference_identity(&scalar), Ok(None));
+        let reference = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
+        let constant = context.constant(ArrayIrValue::Reference(reference.clone()));
+        assert_eq!(context.reference_identity(&constant), Ok(Some(ReferenceIdentity::Runtime(reference.id()))));
+    }
+
+    #[test]
+    fn test_tracing_context_trace() {
+        let (output_type, program) =
+            TestArrayContext::trace(|x| Ok(x.clone() * x.clone() + x.one_like()?), ArrayType::scalar(DataType::F64))
+                .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(10.0).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = one_like %0
+                    %3:f64[] = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Test using an escaped `ProgramBuilder`.
+        let escaped_builder = Rc::new(RefCell::new(None));
+        assert!(matches!(
+            TestArrayContext::trace(
+                |x| {
+                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
+                    Ok(x)
+                },
+                ArrayType::scalar(DataType::F64),
+            ),
+            Err(ProgramError::EscapedProgramBuilder),
+        ));
+
+        // Test that `TypeError`s are returned in certain cases.
+        assert!(matches!(
+            TestArrayContext::trace(
+                |inputs| Ok(inputs.0 + inputs.1),
+                (ArrayType::scalar(DataType::F8E3M4), ArrayType::scalar(DataType::F32)),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`add` input types are not broadcast-compatible",
+        ));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_rejects_consumed_reference_accesses() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestTracer = Tracer<TestContext>;
+
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 2]));
+        let consumed = "`reference_read` reads a reference whose alias family `reference_freeze` already consumed";
+
+        // Every clone of one tracer names the same staged atom, so a handle cloned before the freeze is invalidated
+        // with the rest of the alias family, and its next access is reported against the operation that performs it,
+        // not against the freeze and not at discharge.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.reference_new()?;
+                let alias = reference.clone();
+                reference.freeze()?;
+                alias.read()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
+
+        // Consumption invalidates a view exactly as it invalidates the allocation, because accesses through the view
+        // are staged against the same root.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.reference_new()?;
+                let row =
+                    ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference.clone())?.index(0, 0)?;
+                reference.freeze()?;
+                row.read()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
+
+        // Independent allocations stay independent, so consuming one says nothing about the other.
+        let (_, program) = TestContext::trace(
+            |inputs: Vec<TestTracer>| {
+                let first = inputs[0].reference_new()?;
+                let second = inputs[1].reference_new()?;
+                let frozen = first.freeze()?;
+                Ok(vec![frozen, second.read()?])
+            },
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                let %2:ref<f32[2, 2]> = reference_new %0
+                    %3:ref<f32[2, 2]> = reference_new %1
+                    %4:f32[2, 2] = reference_freeze %2
+                    %5:f32[2, 2] = reference_read %3
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes() {
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| context.lift(Array::scalar(3f32).unwrap()),
+            (),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F32));
+        assert_eq!(program.interpret(()), Ok(Array::scalar(3f32).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const 3.0
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_axis_index() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 };
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| {
+                assert_eq!(context.named_axis("devices"), Some(axis.clone()));
+                assert!(matches!(
+                    context.axis_index("missing"),
+                    Err(ProgramError::Axis(AxisError::UnboundAxisName { name })) if name == "missing",
+                ));
+                context.axis_index("devices")
+            },
+            (),
+            vec![("devices".to_string(), axis.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            output_type,
+            ArrayType::scalar(DataType::U64)
+                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+                .unwrap(),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:u64[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = \
+                        axis_index [axis_name=\"devices\", mesh=['devices'=2:manual]]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_captures() {
+        let result =
+            TracingContext::<CaptureReference<ArrayType>, ArrayOperation<Array>, Array>::trace_with_context_and_named_axes(
+                |context, ()| {
+                    let reference = context.capture(Array::scalar(3f32).unwrap())?;
+                    Ok(context.constant(reference))
+                },
+                (),
+                Vec::new(),
+            );
+        assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_foreign_outputs() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |_, ()| context.lift(Array::scalar(3f32).unwrap()),
+            (),
+            Vec::new(),
+        );
+        assert!(matches!(result, Err(ProgramError::MismatchedProgramBuilders)));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_escaped_context() {
+        let mut escaped_context = None;
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| {
+                escaped_context = Some(context.clone());
+                context.lift(Array::scalar(3f32).unwrap())
+            },
+            (),
+            Vec::new(),
+        );
+        assert!(escaped_context.is_some());
+        assert!(matches!(result, Err(ProgramError::EscapedProgramBuilder)));
+    }
+
+    #[test]
+    fn test_tracing_context_interpret_and_trace() {
+        let domain = TestArrayContext::new();
+        let (output, program) = domain
+            .interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::scalar(2.0f64 * 2.0f64 + (-2.0)).unwrap());
+        assert_eq!(
+            program.interpret(Array::scalar(0.5).unwrap()),
+            Ok(Array::scalar(0.5f64 * 0.5f64 + (-0.5)).unwrap())
+        );
+        assert_eq!(program.input_ids().len(), 1);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = neg %0
+                    %3:f64[] = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Test using a function with a tuple argument.
+        let (_, compiled) = domain
+            .interpret_and_trace(
+                |(x, y)| Ok(x.clone() * y + -x.clone()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                    %3:f64[] = neg %0
+                    %4:f64[] = add %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // Test using a function that contains unused code.
+        let (output, program) = domain
+            .interpret_and_trace(
+                |x| {
+                    let _ = -x.clone();
+                    Ok(x.clone() * x)
+                },
+                Array::scalar(2.0).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(output, Array::scalar(4.0).unwrap());
+        assert_eq!(program.interpret(Array::scalar(0.5).unwrap()), Ok(Array::scalar(0.25).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Test tracing value-level identity helpers as ordinary operations.
+        let (output, program) = domain
+            .interpret_and_trace(|x| Ok((x.zero_like()?, x.one_like()?)), Array::scalar(2.0).unwrap())
+            .unwrap();
+        assert_eq!(output, (Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero_like %0
+                    %2:f64[] = one_like %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_provenance() {
+        // Staged instructions snapshot the provenance that is active when they are staged, and cloned contexts observe
+        // the same shared scope state: the multiplication staged inside the scope carries it, while the addition staged
+        // outside it stays unknown.
+        let scope = ProvenanceScope::new("labeled");
+        let (_, program) = TestArrayContext::trace(
+            |x| {
+                let context = x.context().clone();
+                let scoped = context.invoke_with_provenance_scope(scope.clone(), || {
+                    assert_eq!(context.clone().provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
+                    x.clone() * x.clone()
+                });
+                Ok(scoped + x)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let provenances = program
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.provenance().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(provenances, vec![Provenance::scope(scope.clone(), Provenance::unknown()), Provenance::unknown()]);
+
+        // Independent traces own independent states, so scopes never leak across traces or leave residue behind.
+        let first = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let second = TracingContext::<Array, ArrayOperation<Array>>::new();
+        first.invoke_with_provenance_scope(scope.clone(), || {
+            assert_eq!(first.provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
+            assert_eq!(second.provenance(), Provenance::unknown());
+        });
+        assert_eq!(first.provenance(), Provenance::unknown());
+    }
+
+    #[test]
+    fn test_nested_tracing_context() {
+        // A nested trace over an eager `TestArrayContext` parent stages its own independent
+        // primal program and, like the root `TracingContext`, shares that program's builder across cloned contexts.
+        let nested = NestedTracingContext::new(TestArrayContext::new());
+        let builder = nested.builder().clone();
+        let cloned_context = nested.clone();
+        assert!(Rc::ptr_eq(nested.builder(), &builder));
+        assert!(Rc::ptr_eq(cloned_context.builder(), &builder));
+        assert_eq!(format!("{nested:?}"), "NestedTracingContext { .. }");
+
+        // Staging an operation appends to the nested program, which interprets and renders exactly
+        // as a root trace would.
+        let lhs = nested.input(ArrayType::scalar(DataType::F64));
+        let rhs = nested.input(ArrayType::scalar(DataType::F64));
+        let outputs = nested.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(5.0).unwrap())
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Runtime captures are not owned by the nested context. They delegate to the enclosing capturing context,
+        // so a value captured through the nested context lands in the parent's shared capture table.
+        let capturing_parent =
+            TracingContext::<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>::new();
+        let nested = NestedTracingContext::new(capturing_parent.clone());
+        let reference = nested
+            .capture(Array::scalar(7.0).unwrap())
+            .expect("capture should delegate to the enclosing context");
+        assert_eq!(reference.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Array::scalar(7.0).unwrap()]);
+    }
+
+    #[test]
+    fn test_nested_tracing_context_trace() {
+        // `trace` runs the closure once on tracer inputs standing in for the provided input types and finalizes
+        // the staged flat program together with the closure's output structure.
+        let (output_structure, program) = NestedTracingContext::trace(
+            TestArrayContext::new(),
+            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].clone() * inputs[0].clone(), -inputs[0].clone()]),
+            vec![ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        assert_eq!(output_structure, vec![Placeholder, Placeholder]);
+        assert_eq!(
+            program.interpret(vec![Array::scalar(2.0).unwrap()]),
+            Ok(vec![Array::scalar(4.0).unwrap(), Array::scalar(-2.0).unwrap()])
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = neg %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+
+        // A tracer escaping the closure keeps the shared builder alive and is reported at the trace boundary.
+        let escaped_tracer = Rc::new(RefCell::new(None));
+        assert!(matches!(
+            NestedTracingContext::trace(
+                TestArrayContext::new(),
+                |inputs: Vec<Tracer<_>>| {
+                    *escaped_tracer.borrow_mut() = Some(inputs[0].clone());
+                    Ok(inputs)
+                },
+                vec![ArrayType::scalar(DataType::F64)],
+            ),
+            Err(ProgramError::EscapedProgramBuilder),
+        ));
+
+        // `trace_with_named_axes` seeds the nested context with axis bindings that named-axis readers resolve inside
+        // the closure, while unseeded names keep delegating to the parent (an eager parent binds none).
+        let (_, program) = NestedTracingContext::trace_with_named_axes(
+            TestArrayContext::new(),
+            |inputs: Vec<Tracer<_>>| {
+                assert_eq!(inputs[0].context().named_axis("model"), Some(NamedAxis::Batched { size: Some(4) }));
+                assert_eq!(inputs[0].context().named_axis("unbound"), None);
+                Ok(inputs)
+            },
+            vec![ArrayType::scalar(DataType::F64)],
+            vec![("model".to_string(), NamedAxis::Batched { size: Some(4) })],
+        )
+        .unwrap();
+        assert_eq!(program.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(3.0).unwrap()]));
+    }
+
+    #[test]
+    fn test_nested_tracing_context_provenance() {
+        // A nested tracing context seeds its origin from the parent context's provenance and owns independent scope
+        // state for the nested program, so nested scopes fold over the seed without affecting the parent.
+        let outer_scope = ProvenanceScope::new("outer");
+        let nested_scope = ProvenanceScope::new("nested");
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        parent.invoke_with_provenance_scope(outer_scope.clone(), || {
+            let seed = parent.provenance();
+            let nested = NestedTracingContext::new(parent.clone());
+            assert_eq!(nested.provenance(), seed);
+            nested.invoke_with_provenance_scope(nested_scope.clone(), || {
+                assert_eq!(nested.provenance(), Provenance::scope(nested_scope.clone(), seed.clone()));
+                assert_eq!(parent.provenance(), seed);
+            });
+
+            // Instructions staged in a nested trace record the seeded origin.
+            let (_, nested_program) = NestedTracingContext::trace(
+                parent.clone(),
+                |inputs| Ok(vec![inputs[0].clone() + inputs[1].clone()]),
+                vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+            )
+            .unwrap();
+            assert_eq!(nested_program.instructions()[0].provenance(), &seed);
+        });
+    }
+
+    #[test]
+    fn test_program_specialize() {
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let (_, program) = TestArrayContext::trace(|x| Ok(x.clone() * x), dynamic_type.clone()).unwrap();
+
+        // Equal input types take the fast path and return the program unchanged.
+        let unchanged = program.clone().specialize(std::slice::from_ref(&dynamic_type)).unwrap();
+        assert_eq!(unchanged.to_string(), program.to_string());
+
+        // Refined input types replay the program so inference propagates the refinement through the entire body.
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let specialized = program.clone().specialize(std::slice::from_ref(&static_type)).unwrap();
+        assert_eq!(specialized.input_types(), vec![static_type.clone()]);
+        assert_eq!(specialized.output_types(), vec![static_type.clone()]);
+        assert_eq!(
+            specialized.interpret(Array::vector(vec![2.0, 3.0, 4.0]).unwrap()),
+            Ok(Array::vector(vec![4.0, 9.0, 16.0]).unwrap())
+        );
+
+        // Non-refining input types are rejected before the replay begins.
+        let unrelated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(7)]));
+        let error = program.specialize(std::slice::from_ref(&unrelated_type)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("specialized input type {unrelated_type} does not refine declared input type {dynamic_type}"),
+        );
+    }
+
+    #[test]
+    fn test_program_specialize_attached_regions() {
+        // A linear call whose forward region `x -> -x` and transpose region `ct -> -ct` are both traced over `f64[n]`.
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let negation = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(dynamic_type.clone());
+            let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.clone());
+        let forward = builder.import_program(negation());
+        let transpose = builder.import_program(negation());
+        let output = builder
+            .add_instruction(LinearCallOperation::<ArrayType>::new(0), vec![forward, transpose], vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let instruction = &program.instructions()[0];
+        let regions = || instruction.regions().iter().map(|region| program.region_ref(*region).unwrap());
+
+        // Instruction inputs of the declared types require no specialization.
+        assert!(
+            FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[dynamic_type.clone()], regions())
+                .unwrap()
+                .is_none()
+        );
+
+        // Static instruction inputs specialize the forward region, and the inputs of the transpose region, which
+        // receives the cotangents of the specialized forward outputs, are re-inferred and specialized in turn.
+        let specialized =
+            FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[static_type], regions())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            specialized.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = neg %0
+                in (%1)
+                lambda %0:f64[3] .
+                let %1:f64[3] = neg %0
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_program_region_requires_specialization() {
+        let extent = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let other_extent = DimensionType::new("other_extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let exact_extent = DimensionValue::constant(3).unwrap().r#type().into_owned();
+
+        // Equal input types, and input types that differ only in their type identities, require no specialization.
+        assert_eq!(
+            FlatDimensionProgram::region_requires_specialization(
+                std::slice::from_ref(&extent),
+                std::slice::from_ref(&extent),
+            ),
+            Ok(Some(false)),
+        );
+        assert_eq!(
+            FlatDimensionProgram::region_requires_specialization(
+                std::slice::from_ref(&extent),
+                std::slice::from_ref(&other_extent),
+            ),
+            Ok(Some(false)),
+        );
+
+        // Input types that only narrow bounds require specialization, and so do input types that strictly refine the
+        // declared ones.
+        assert_eq!(
+            FlatDimensionProgram::region_requires_specialization(
+                std::slice::from_ref(&extent),
+                std::slice::from_ref(&exact_extent),
+            ),
+            Ok(Some(true)),
+        );
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        assert_eq!(
+            FlatArrayProgram::region_requires_specialization(
+                std::slice::from_ref(&dynamic_type),
+                std::slice::from_ref(&static_type),
+            ),
+            Ok(Some(true)),
+        );
+
+        // Input types that the declared ones cannot be renamed to are rejected.
+        assert_eq!(
+            FlatArrayProgram::region_requires_specialization(std::slice::from_ref(&dynamic_type), &[]),
+            Err(TypeError::invalid("declared type count 1 does not match actual type count 0")),
+        );
+    }
+
+    #[test]
+    fn test_program_region_input_identity_renaming_classifies_mixed_refinements() {
+        type FlatIrProgram =
+            Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>;
+
+        let variable = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension = ArrayIrType::Dimension(DimensionType::from(variable.clone()));
+        let exact_dimension = ArrayIrType::Dimension(DimensionValue::constant(4).unwrap().r#type().into_owned());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
+        let static_type = ArrayType::new_static(DataType::F32, [3]);
+        let operation = ArrayIrOperation::<Array>::from(ConditionOperation::<ArrayIrType>::new());
+
+        // Ordinary structural substitutions remain supported; specialization is needed only for actual refinements.
+        assert!(
+            FlatIrProgram::region_input_identity_renaming(
+                std::slice::from_ref(&dimension),
+                std::slice::from_ref(&dimension),
+            )
+            .unwrap()
+            .unwrap()
+            .is_identity(),
+        );
+        let renamed_dimension = ArrayIrType::Dimension(DimensionType::new("renamed", variable.bounds()));
+        let renaming = FlatIrProgram::region_input_identity_renaming(
+            std::slice::from_ref(&dimension),
+            std::slice::from_ref(&renamed_dimension),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dimension.rename_identities(&renaming), Ok(renamed_dimension));
+
+        for (dynamic_member, static_member) in [
+            (ArrayIrType::Array(dynamic_type.clone()), ArrayIrType::Array(static_type.clone())),
+            (
+                ArrayIrType::Reference(ReferenceType::new(dynamic_type.clone())),
+                ArrayIrType::Reference(ReferenceType::new(static_type.clone())),
+            ),
+        ] {
+            for reversed in [false, true] {
+                let mut declared = vec![dimension.clone(), dynamic_member.clone()];
+                let mut requested = vec![dimension.clone(), static_member.clone()];
+                let mut invalid = vec![exact_dimension.clone(), static_member.clone()];
+                if reversed {
+                    declared.reverse();
+                    requested.reverse();
+                    invalid.reverse();
+                }
+
+                // Full refinement accepts the mixed boundary, but a rename-only substitution cannot retain its
+                // symbolic definition and concretize another occurrence. Such regions cannot be specialized, so
+                // optional specialization keeps both branches.
+                assert_eq!(FlatIrProgram::region_input_identity_renaming(&declared, &requested), Ok(None));
+                assert_eq!(FlatIrProgram::region_requires_specialization(&declared, &requested), Ok(None));
+                let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                for r#type in &declared {
+                    builder.add_input(r#type.clone());
+                }
+                let body = builder
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        Vec::new(),
+                        vec![Placeholder; 2],
+                        Vec::new(),
+                    )
+                    .unwrap();
+                let mut input_types = vec![ArrayType::scalar(DataType::Boolean).into()];
+                input_types.extend(requested);
+                assert!(
+                    FlatIrProgram::specialize_attached_regions(
+                        &operation,
+                        &input_types,
+                        [body.entry_region_ref(), body.entry_region_ref()].into_iter(),
+                    )
+                    .unwrap()
+                    .is_none(),
+                );
+                assert_eq!(body.input_types(), declared);
+                assert!(body.instructions().is_empty());
+
+                // A static dimension of four conflicts with the array/reference extent of three. Structural derivation
+                // reports the conflicting bindings; optional preparation declines replay and mandatory primitive
+                // inference rejects the original application before either branch can run.
+                let error = TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_string(),
+                    expected: if reversed { 3 } else { 4 },
+                    actual: if reversed { 4 } else { 3 },
+                });
+                assert_eq!(FlatIrProgram::region_input_identity_renaming(&declared, &invalid), Err(error.clone()));
+                assert_eq!(FlatIrProgram::region_requires_specialization(&declared, &invalid), Err(error.clone()));
+                input_types.truncate(1);
+                input_types.extend(invalid);
+                assert!(
+                    FlatIrProgram::specialize_attached_regions(
+                        &operation,
+                        &input_types,
+                        [body.entry_region_ref(), body.entry_region_ref()].into_iter(),
+                    )
+                    .unwrap()
+                    .is_none(),
+                );
+
+                // A reference input refines its region input by its referent like an array input,
+                // so both members report the same conflict.
+                assert_eq!(
+                    operation.infer_output_types(&input_types, &[body.interface(), body.interface()]),
+                    Err(error),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_program_specialize_to_region_input_types() {
+        // Input types that strictly refine the declared ones replay the region through `specialize`.
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type);
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let negation =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let specialized = negation.specialize_to_region_input_types(std::slice::from_ref(&static_type)).unwrap();
+        assert_eq!(specialized.input_types(), vec![static_type.clone()]);
+        assert_eq!(specialized.output_types(), vec![static_type]);
+
+        // Input types that only narrow bounds are replayed too, although instantiating the type identities of the
+        // region already makes its signature agree with them, in which case `specialize` would return the region
+        // unchanged. The replay infers that `d + 2` is exactly 5 for `d` that is exactly `3`.
+        let extent = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let two = DimensionValue::constant(2).unwrap();
+        let addition = DimensionAddOperation::new(&extent, two.r#type().as_ref()).unwrap();
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let input = builder.add_input(extent);
+        let two = builder.add_constant(two);
+        let output = builder.add_instruction(addition, Vec::new(), vec![input, two], None).unwrap()[0];
+        let region = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // An exact symbolic type keeps an identity for instantiation to rename, unlike a static type.
+        let exact_extent = DimensionType::new("exact", DimensionBounds::new(3, Some(4)).unwrap());
+        let instantiated =
+            region.with_instantiated_type_identities(std::slice::from_ref(&exact_extent)).unwrap().into_owned();
+        let unchanged = instantiated.specialize(std::slice::from_ref(&exact_extent)).unwrap();
+        assert_eq!(unchanged.output_types()[0].bounds(), DimensionBounds::new(2, Some(18)).unwrap());
+        let specialized = region.specialize_to_region_input_types(std::slice::from_ref(&exact_extent)).unwrap();
+        assert_eq!(specialized.output_types()[0].bounds(), DimensionBounds::new(5, Some(6)).unwrap());
+    }
 }

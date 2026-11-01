@@ -1,0 +1,657 @@
+use std::borrow::Cow;
+use std::fmt::Display;
+use std::hash::{Hash, Hasher};
+
+use ryft_macros::Parameter;
+
+use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::references::ArrayReference;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::DimensionType;
+use crate::arrays::types::ir::ArrayIrType;
+use crate::contexts::{Context, EagerContext};
+use crate::macros::check_count;
+use crate::parameters::Parameter;
+use crate::programs::{
+    Concretizable, LiteralIdentity, OperationProjection, ProgramError, ReferenceId, ReferenceType, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
+};
+
+/// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
+/// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the array value representation,
+/// which can be a backend array or a context-carrying value such as a tracer. Dimensions use the common
+/// [`DimensionValue`], a checked host representation, so eager dimension arithmetic remains host integer
+/// work and does not allocate arrays or dispatch to device backends.
+///
+/// This type lets arrays, checked host-side dimensions, and array references share one storage universe, while
+/// [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume only the member
+/// it understands. Reference operations remain family-native because their signatures cross member kinds. Ordinary
+/// numeric operations still project only the array member.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+#[allow(clippy::large_enum_variant, reason = "keep member values inline to avoid extra allocation and indirection")]
+pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
+    /// Ordinary backend [`ArrayType`]-typed [`Value`].
+    Array(A),
+
+    /// Checked host-side runtime [`DimensionValue`].
+    Dimension(DimensionValue),
+
+    /// [`ArrayReference`] to an ordinary backend [`ArrayType`]-typed [`Value`].
+    Reference(ArrayReference<A>),
+}
+
+impl<A: Value<Type = ArrayType>> ArrayIrValue<A> {
+    /// Returns this array IR member's diagnostic kind name.
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Array(_) => "array",
+            Self::Dimension(_) => "dimension",
+            Self::Reference(_) => "reference",
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> Display for ArrayIrValue<A> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Array(value) => Display::fmt(value, formatter),
+            Self::Dimension(value) => Display::fmt(value, formatter),
+            Self::Reference(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> Typed for ArrayIrValue<A> {
+    type Type = ArrayIrType;
+
+    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+        Cow::Owned(match self {
+            Self::Array(value) => ArrayIrType::Array(value.r#type().into_owned()),
+            Self::Dimension(value) => ArrayIrType::Dimension(value.r#type().into_owned()),
+            Self::Reference(value) => ArrayIrType::Reference(value.r#type().into_owned()),
+        })
+    }
+}
+
+impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self, ArrayIrOperation<A>>;
+
+    #[inline]
+    fn domain(&self) -> Self::Domain {
+        EagerContext::new()
+    }
+
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        match self {
+            Self::Array(value) => Ok(Self::Array(value.rename_type_identities(renaming)?)),
+            Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
+            Self::Reference(value) => Ok(Self::Reference(value.rename_type_identities(renaming)?)),
+        }
+    }
+
+    fn validate_as_constant(&self) -> Result<(), TypeError> {
+        match self {
+            Self::Array(_) | Self::Dimension(_) => Ok(()),
+            Self::Reference(_) => {
+                // A reference holder's runtime identity is process-local and deliberately absent from its deterministic
+                // rendering, so storing one as a program constant would let two programs over distinct holders render
+                // (and therefore fingerprint) identically. External references enter programs through inputs or
+                // captures instead.
+                Err(TypeError::invalid(
+                    "reference values cannot be stored as program constants; pass external references through program \
+                     inputs or captures instead",
+                ))
+            }
+        }
+    }
+
+    #[inline]
+    fn is_zero(&self) -> bool {
+        match self {
+            Self::Array(value) => value.is_zero(),
+            Self::Dimension(_) | Self::Reference(_) => false,
+        }
+    }
+
+    #[inline]
+    fn singleton(r#type: &ArrayIrType) -> Option<Self> {
+        // Only the dimension member has singleton types. Array types describe shapes rather than contents,
+        // and a reference type never determines the allocation that it names.
+        match r#type {
+            ArrayIrType::Dimension(r#type) => DimensionValue::singleton(r#type).map(Self::Dimension),
+            ArrayIrType::Array(_) | ArrayIrType::Reference(_) => None,
+        }
+    }
+
+    #[inline]
+    fn reference_id(&self) -> Option<ReferenceId> {
+        match self {
+            Self::Array(_) | Self::Dimension(_) => None,
+            Self::Reference(value) => Some(value.id()),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType> + LiteralIdentity> LiteralIdentity for ArrayIrValue<A> {
+    fn literal_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Array(left), Self::Array(right)) => left.literal_eq(right),
+            (Self::Dimension(left), Self::Dimension(right)) => left.literal_eq(right),
+            (Self::Reference(left), Self::Reference(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Array(array) => array.literal_hash(state),
+            Self::Dimension(dimension) => dimension.literal_hash(state),
+            Self::Reference(reference) => reference.hash(state),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ValueProjection<ArrayType> for ArrayIrValue<A> {
+    type Projected = A;
+    type ProjectedRef<'v>
+        = &'v A
+    where
+        Self: 'v;
+
+    #[inline]
+    fn from_projected(value: A) -> Self {
+        Self::Array(value)
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<&'v A, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        match self {
+            Self::Array(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
+        }
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<A, TypeError> {
+        match self {
+            Self::Array(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ValueProjection<DimensionType> for ArrayIrValue<A> {
+    type Projected = DimensionValue;
+    type ProjectedRef<'v>
+        = &'v DimensionValue
+    where
+        Self: 'v;
+
+    #[inline]
+    fn from_projected(value: DimensionValue) -> Self {
+        Self::Dimension(value)
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<&'v DimensionValue, TypeError>
+    where
+        DimensionType: 'v,
+    {
+        match self {
+            Self::Dimension(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
+        }
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<DimensionValue, TypeError> {
+        match self {
+            Self::Dimension(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ValueProjection<ReferenceType<ArrayType>> for ArrayIrValue<A> {
+    type Projected = ArrayReference<A>;
+    type ProjectedRef<'v>
+        = &'v ArrayReference<A>
+    where
+        Self: 'v;
+
+    #[inline]
+    fn from_projected(value: ArrayReference<A>) -> Self {
+        Self::Reference(value)
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<&'v ArrayReference<A>, TypeError>
+    where
+        ReferenceType<ArrayType>: 'v,
+    {
+        match self {
+            Self::Reference(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
+        }
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<ArrayReference<A>, TypeError> {
+        match self {
+            Self::Reference(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<A> for ArrayIrValue<A> {
+    #[inline]
+    fn from(value: A) -> Self {
+        Self::Array(value)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<DimensionValue> for ArrayIrValue<A> {
+    #[inline]
+    fn from(value: DimensionValue) -> Self {
+        Self::Dimension(value)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<ArrayReference<A>> for ArrayIrValue<A> {
+    #[inline]
+    fn from(value: ArrayReference<A>) -> Self {
+        Self::Reference(value)
+    }
+}
+
+impl<A: Concretizable<bool> + Value<Type = ArrayType>> Concretizable<bool> for ArrayIrValue<A> {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Array(value) => value.concretize(),
+            Self::Dimension(value) => Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from a first-class dimension `{value}`"),
+            }),
+            Self::Reference(value) => Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from reference `{value}`"),
+            }),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> TryFrom<bool> for ArrayIrValue<A> {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, Self::Error> {
+        Ok(Self::Array(A::try_from(value)?))
+    }
+}
+
+/// Extension of [`Context`] for contexts over the mixed [`ArrayIrType`] universe.
+///
+/// The operation family of such a context contains ordinary array operations only through its [`ArrayType`] member
+/// family (e.g., [`ArrayIrOperation::Array`]), which it exposes via
+/// [`OperationProjection<ArrayType>`](OperationProjection). Rules over this universe (e.g., the linear call regions
+/// that dynamically shaped differentiation rules stage, or the array reference discharge traversal) bind such array
+/// operations all the time, but [`Context::bind`] only accepts operations that convert into the operation family
+/// directly and conversions do not chain through a member family. [`ArrayIrContext`] provides that missing step once,
+/// instead of every rule spelling out the fully qualified projection path.
+///
+/// This trait is blanket-implemented for every [`Context`] over [`ArrayIrType`] whose operation family has an
+/// [`ArrayType`] member family, and so it is available in eager, tracing, and nested region contexts alike.
+/// That includes contexts over operation families defined in other crates (e.g., families that derive
+/// `#[ryft(members(ArrayType))]`), which is why custom operation implementations and transform rules
+/// outside of this crate should also use it instead of spelling out the projection themselves.
+pub trait ArrayIrContext: Context<Type = ArrayIrType> {
+    /// Binds the array operation `operation` in this context and returns its single output. This is the array
+    /// counterpart of [`Context::bind`] for the common case of an operation with no [`Region`](crate::Region)s
+    /// and exactly one output. `operation` is lifted into the operation family of this context through its
+    /// [`OperationProjection<ArrayType>`](OperationProjection) member family before it is bound.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Array operation to bind, which must produce exactly one output.
+    ///   - `inputs`: Inputs of `operation`, owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if this context fails to bind `operation` or if `operation` does not produce exactly
+    /// one output.
+    fn bind_array<O>(&self, operation: O, inputs: &[Self::Value]) -> Result<Self::Value, ProgramError>
+    where
+        Self::Operation: OperationProjection<ArrayType, Projected: From<O>>;
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType>>> ArrayIrContext for C {
+    fn bind_array<O>(&self, operation: O, inputs: &[C::Value]) -> Result<C::Value, ProgramError>
+    where
+        C::Operation: OperationProjection<ArrayType, Projected: From<O>>,
+    {
+        // The explicit projection is the one conversion step that `Context::bind` cannot infer on its own, because the
+        // member family converts into the operation family but `operation` only converts into the member family.
+        let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = operation.into();
+        let mut outputs = self.bind(operation, Vec::new(), inputs)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::arrays::Array;
+    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::captures::CaptureReference;
+    use crate::contexts::{Context, StagingContext};
+    use crate::differentiation::DifferentiationTracer;
+    use crate::operations::ConstantOperation;
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialTracer;
+    use crate::programs::{Atom, Program, ProgramBuilder, Region, RegionArena, RegionId};
+    use crate::tests::literal_hash_of;
+    use crate::tracing::{Tracer, TracingContext};
+
+    use super::*;
+
+    #[test]
+    fn test_array_ir_dimension_values_have_exact_types() {
+        // Eager dimension values are typed exactly, like eager arrays: a value created from a symbolic type reports a
+        // type that admits only its own extent, so values of different extents never share a type. Reusing one JIT
+        // specialization across extents is declared at the JIT boundary instead (refer to
+        // `CompiledFunctionDispatcher::with_staged_input_types`).
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let three = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let four = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type, 4).unwrap());
+        assert_eq!(three.r#type().to_string(), "dimension<3>");
+        assert_eq!(four.r#type().to_string(), "dimension<4>");
+        assert_ne!(three.r#type().into_owned(), four.r#type().into_owned());
+    }
+
+    #[test]
+    fn test_array_ir_value_projection() {
+        for value in [false, true] {
+            let array = ArrayIrValue::<Array>::try_from(value).unwrap();
+            assert_eq!(array, ArrayIrValue::Array(Array::scalar(value).unwrap()));
+            assert_eq!(Concretizable::<bool>::concretize(&array), Ok(value));
+            assert_eq!(ValueProjection::<ArrayType>::into_projected(array).unwrap(), Array::try_from(value).unwrap());
+        }
+        let array = Array::vector((0..4096).map(|value| value as f32).collect()).unwrap();
+        let payload = array.storage_bytes().as_ptr();
+        let stored = ArrayIrValue::Array(array);
+        let projected = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&stored).unwrap();
+        assert_eq!(projected.storage_bytes().as_ptr(), payload);
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored),
+            Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+        assert!(matches!(
+            ValueProjection::<DimensionType>::into_projected(stored.clone()),
+            Err(TypeError::Invalid { message }) if message == "expected dimension type but got array type",
+        ));
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ReferenceType<ArrayType>>>::projected(&stored),
+            Err(TypeError::invalid("expected reference type but got array type")),
+        );
+        let projected = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stored).unwrap();
+        assert_eq!(projected.storage_bytes().as_ptr(), payload);
+    }
+
+    #[test]
+    fn test_array_ir_dimension_projection() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
+        let dimension = DimensionValue::new(DimensionType::from(variable), 4).unwrap();
+        let stored = ArrayIrValue::<Array>::Dimension(dimension.clone());
+        assert_eq!(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::from_projected(dimension.clone()), stored);
+        assert_eq!(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored), Ok(&dimension));
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&stored),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ReferenceType<ArrayType>>>::projected(&stored),
+            Err(TypeError::invalid("expected reference type but got dimension type")),
+        );
+        assert_eq!(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::into_projected(stored), Ok(dimension));
+    }
+
+    #[test]
+    fn test_array_ir_reference_projection_preserves_holder_identity() {
+        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        let stored = ArrayIrValue::Reference(reference.clone());
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ReferenceType<ArrayType>>>::projected(&stored),
+            Ok(&reference),
+        );
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&stored),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored),
+            Err(TypeError::invalid("expected dimension type but got reference type")),
+        );
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ReferenceType<ArrayType>>>::into_projected(stored),
+            Ok(reference),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_reference_values_reject_program_constant_storage() {
+        // A reference holder's identity is deliberately absent from its deterministic rendering, so storing one as
+        // a program constant would let two programs over distinct holders render (and fingerprint) identically. The
+        // rejection lives at region sealing (i.e., the one boundary every construction path crosses) which this test
+        // exercises through the builder path, direct `RegionArena::from_regions` construction, and public
+        // `Program::new`. Sealing validates every region in the arena through the same path, so nested regions
+        // are covered by the same mechanism.
+        let expected_error = Err(TypeError::invalid(
+            "reference values cannot be stored as program constants; pass external references through program \
+            inputs or captures instead",
+        )
+        .into());
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let constant =
+            builder.add_constant(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())));
+        assert_eq!(
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![constant],
+                    Vec::new(),
+                    vec![Placeholder],
+                )
+                .map(|_| ()),
+            expected_error,
+        );
+
+        let reference_region = || {
+            Region::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(
+                vec![Atom::Constant(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        assert_eq!(RegionArena::from_regions(vec![reference_region()]).map(|_| ()), expected_error);
+        assert_eq!(
+            Program::<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                Vec<ArrayIrValue<Array>>,
+                Vec<ArrayIrValue<Array>>,
+            >::new(Vec::new(), Vec::new(), vec![reference_region()], RegionId::new(0))
+            .map(|_| ()),
+            expected_error,
+        );
+
+        // Sealing is the backstop that covers every construction path, but a trace reports the same rejection at the
+        // lift that attempted the storage, while the call that caused it is still on the stack.
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input: Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
+                    let context = input.context().clone();
+                    context.lift(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())))
+                },
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            )
+            .map(|_| ()),
+            expected_error,
+        );
+    }
+
+    #[test]
+    fn test_array_ir_value_is_zero() {
+        assert!(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap()).is_zero());
+        assert!(!ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()).is_zero());
+
+        // A zero-filled reference is a mutable handle, not a zero value that a transform can discard.
+        let reference = ArrayReference::new(Array::scalar(0.0f32).unwrap());
+        assert!(!ArrayIrValue::Reference(reference).is_zero());
+        let dimension = DimensionValue::new(DimensionType::new("size", DimensionBounds::unbounded()), 0).unwrap();
+        assert!(!ArrayIrValue::<Array>::Dimension(dimension).is_zero());
+    }
+
+    #[test]
+    fn test_array_ir_value_singleton() {
+        // Only the dimension member determines a value from its type; the array IR value keeps that type's identity.
+        let singleton_type = DimensionType::new("batch", DimensionBounds::new(4, Some(5)).unwrap());
+        assert_eq!(
+            ArrayIrValue::<Array>::singleton(&ArrayIrType::Dimension(singleton_type.clone())),
+            Some(ArrayIrValue::Dimension(DimensionValue::new(singleton_type.clone(), 4).unwrap())),
+        );
+        let wide_type = DimensionType::new("batch", DimensionBounds::new(4, Some(6)).unwrap());
+        assert_eq!(ArrayIrValue::<Array>::singleton(&ArrayIrType::Dimension(wide_type)), None);
+        assert_eq!(ArrayIrValue::<Array>::singleton(&ArrayIrType::Array(ArrayType::scalar(DataType::F32))), None);
+        assert_eq!(
+            ArrayIrValue::<Array>::singleton(&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(
+                DataType::F32,
+            )))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_array_ir_reference_value_identity_renaming() {
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let source_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Dynamic(second.clone())]),
+        );
+        let reference = ArrayReference::new(CaptureReference::new(0, source_type));
+        let value = ArrayIrValue::Reference(reference.clone());
+
+        // An identity renaming preserves the concrete holder and therefore every alias of it.
+        let unchanged = value.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
+        assert_eq!(
+            <ArrayIrValue<CaptureReference<ArrayType>> as ValueProjection<ReferenceType<ArrayType>>>::projected(
+                &unchanged,
+            ),
+            Ok(&reference),
+        );
+
+        // A bijective renaming delegates to the reference handle, which aliases the same allocation under the renamed
+        // referent type and leaves the original value unchanged.
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source.clone(), target.clone()).unwrap();
+        let renamed_value = value.rename_type_identities(&renaming).unwrap();
+        let renamed =
+            <ArrayIrValue<CaptureReference<ArrayType>> as ValueProjection<ReferenceType<ArrayType>>>::projected(
+                &renamed_value,
+            )
+            .unwrap();
+        assert_eq!(renamed, &reference);
+        assert_eq!(
+            renamed.r#type().referent(),
+            &ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(target.clone()), Dimension::Dynamic(second.clone())]),
+            ),
+        );
+        assert_eq!(
+            <ArrayIrValue<CaptureReference<ArrayType>> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value),
+            Ok(&reference),
+        );
+
+        // A renaming that the reference handle rejects is rejected by the value as well.
+        let mut merging = TypeIdentityRenaming::new();
+        merging.insert(source, target.clone()).unwrap();
+        merging.insert(second, target).unwrap();
+        assert_eq!(
+            value.rename_type_identities(&merging),
+            Err(TypeError::invalid("type identities `source` and `second` are both renamed to `target`")),
+        );
+    }
+
+    #[test]
+    fn test_literal_identity_array_ir_value() {
+        // Array literals follow the bitwise array identity.
+        let negative_zero = ArrayIrValue::<Array>::Array(Array::scalar(-0.0f64).unwrap());
+        let same_negative_zero = ArrayIrValue::<Array>::Array(Array::scalar(-0.0f64).unwrap());
+        let positive_zero = ArrayIrValue::<Array>::Array(Array::scalar(0.0f64).unwrap());
+        assert!(negative_zero.literal_eq(&same_negative_zero));
+        assert_eq!(literal_hash_of(&negative_zero), literal_hash_of(&same_negative_zero));
+        assert!(!negative_zero.literal_eq(&positive_zero));
+        let nan = ArrayIrValue::<Array>::Array(Array::scalar(f64::NAN).unwrap());
+        assert!(nan.literal_eq(&ArrayIrValue::Array(Array::scalar(f64::NAN).unwrap())));
+
+        // Dimension literals are identical exactly when their extents are, because their static types have no identity.
+        let dimension_literal = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        let same_dimension_literal = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        assert!(dimension_literal.literal_eq(&same_dimension_literal));
+        assert_eq!(literal_hash_of(&dimension_literal), literal_hash_of(&same_dimension_literal));
+        assert!(!dimension_literal.literal_eq(&ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap())));
+
+        // Literals of different kinds are never identical.
+        assert!(!dimension_literal.literal_eq(&ArrayIrValue::Array(Array::scalar(3i64).unwrap())));
+    }
+
+    #[test]
+    fn test_array_ir_tracer_projection_preserves_ssa_identity() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ConstantOperation<ArrayIrValue<Array>>>;
+
+        let context = TestContext::new();
+        let tracer = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let atom = tracer.atom_id().unwrap();
+        let projected = <Tracer<TestContext> as ValueProjection<ArrayType>>::projected(&tracer).unwrap();
+        assert_eq!(projected.value().atom_id(), Ok(atom));
+        let projected = <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(tracer).unwrap();
+        assert_eq!(projected.value().atom_id(), Ok(atom));
+        assert_eq!(<Tracer<TestContext> as ValueProjection<ArrayType>>::from_projected(projected).atom_id(), Ok(atom));
+
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let tracer = context.input(ArrayIrType::Reference(reference_type));
+        let atom = tracer.atom_id().unwrap();
+        let projected = <Tracer<TestContext> as ValueProjection<ReferenceType<ArrayType>>>::projected(&tracer).unwrap();
+        assert_eq!(projected.value().atom_id(), Ok(atom));
+        let projected =
+            <Tracer<TestContext> as ValueProjection<ReferenceType<ArrayType>>>::into_projected(tracer).unwrap();
+        assert_eq!(projected.value().atom_id(), Ok(atom));
+        assert_eq!(
+            <Tracer<TestContext> as ValueProjection<ReferenceType<ArrayType>>>::from_projected(projected).atom_id(),
+            Ok(atom),
+        );
+
+        fn assert_projection<V: ValueProjection<ArrayType>>() {}
+        fn assert_reference_projection<V: ValueProjection<ReferenceType<ArrayType>>>() {}
+        assert_projection::<PartialTracer<TestContext>>();
+        assert_projection::<DifferentiationTracer<TestContext>>();
+        assert_reference_projection::<PartialTracer<TestContext>>();
+        assert_reference_projection::<DifferentiationTracer<TestContext>>();
+    }
+}

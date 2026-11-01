@@ -1,11 +1,19 @@
-use std::fmt::Display;
+use std::any::{Any, TypeId};
+use std::borrow::Cow;
 
+use crate::macros::check_count;
 use crate::parameters::Parameterized;
-use crate::programs::Value;
-use crate::programs::effects::Effects;
-use crate::programs::programs::Program;
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
+use crate::programs::ProgramError;
+use crate::programs::effects::{Effects, ReferenceAccessMode};
+use crate::programs::identities::TypeIdentityRenaming;
+use crate::programs::instructions::Instruction;
+use crate::programs::programs::{Program, ProgramRenderingMode};
+use crate::programs::regions::{
+    InputRegionProvenance, OutputRegionProvenance, RegionArena, RegionDataFlow, RegionInterface, RegionLiveness,
+    RegionRef, RegionRole, RegionSlot,
+};
 use crate::programs::types::{Type, TypeError};
+use crate::programs::values::Value;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.
@@ -22,7 +30,7 @@ pub struct OperationFormatter<'f, 'a> {
     /// [`Formatter`](std::fmt::Formatter) receiving the rendered text.
     formatter: &'f mut std::fmt::Formatter<'a>,
 
-    /// Indentation of the rendered [`Instruction`](crate::Instruction) line that owns the [`Operation`]
+    /// Indentation of the rendered [`Instruction`] line that owns the [`Operation`]
     /// that is being rendered.
     indentation: usize,
 
@@ -46,8 +54,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 
     /// Renders the provided field name-value pair.
-    #[inline]
-    pub fn field(&mut self, name: &str, value: impl Display) -> std::fmt::Result {
+    pub fn field<V: std::fmt::Display>(&mut self, name: &str, value: V) -> std::fmt::Result {
         if self.is_multiline {
             write!(self.formatter, "\n{:indentation$}{name}={value},", "", indentation = self.indentation + 4)
         } else {
@@ -56,10 +63,30 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
         }
     }
 
+    /// Renders the provided list-valued field as `name=[first, second, ...]`, using each element's
+    /// [`Display`](std::fmt::Display) rendering and joining elements with `, `. `values` can be any iterable
+    /// collection, such as a slice or a lazily mapped iterator. Like [`field`](Self::field), the field renders
+    /// inline unless the bracketed section becomes too long. An element's rendering is not escaped, so elements
+    /// whose rendering can contain `, ` or `]` must escape it themselves if distinct lists need to render distinctly.
+    pub fn list<I: IntoIterator<Item: std::fmt::Display>>(&mut self, name: &str, values: I) -> std::fmt::Result {
+        let mut rendered = String::from("[");
+        for (index, value) in values.into_iter().enumerate() {
+            if index > 0 {
+                rendered.push_str(", ");
+            }
+            rendered.push_str(&value.to_string());
+        }
+        rendered.push(']');
+        self.field(name, rendered)
+    }
+
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued metadata
-    /// fields; attached [`Region`](crate::Region)s render through the contextual program renderer instead.
-    #[inline]
-    pub fn program<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
+    /// fields; attached [`Region`](crate::Region)s render through the contextual program renderer instead. Nested
+    /// program metadata always renders semantically: [`Operation::render`] carries no [`ProgramRenderingMode`], and
+    /// the instruction-level provenance suffix is owned by the contextual [`Program`] renderer. If a metadata
+    /// program's own provenance ever needs to render, reintroduce a mode-carrying operation rendering path instead
+    /// of changing this canonical output.
+    pub fn program<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         name: &str,
         program: &Program<V, O, Input, Output>,
@@ -71,14 +98,13 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
         writeln!(self.formatter)?;
         write!(self.formatter, "{:indentation$}", "", indentation = self.indentation + 4)?;
         writeln!(self.formatter, "{name}={{")?;
-        program.render(self.formatter, self.indentation + 8)?;
+        program.render(self.formatter, self.indentation + 8, ProgramRenderingMode::Semantic)?;
         writeln!(self.formatter)?;
         write!(self.formatter, "{:indentation$}", "", indentation = self.indentation + 4)?;
         write!(self.formatter, "}},")
     }
 
     /// Renders a bracketed section (using square brackets) using the provided closure for rendering its contents.
-    #[inline]
     pub fn bracketed(mut self, render_contents: impl FnOnce(&mut Self) -> std::fmt::Result) -> std::fmt::Result {
         write!(self.formatter, " [")?;
         render_contents(&mut self)?;
@@ -108,66 +134,70 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 }
 
-/// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as
-/// [`Instruction`](crate::Instruction)s in [`Program`]s. This trait represents the high-level operation interface
-/// that only requires operations to be able to provide their name and to infer their output [`Type`]s given their
-/// input [`Type`]s.
+/// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as [`Instruction`]s in
+/// [`Program`]s. This trait represents the high-level operation interface that only requires operations to be able
+/// to provide their name and to infer their output [`Type`]s given their input [`Type`]s.
 ///
 /// # Deriving Operation Enums
 ///
 /// Ryft provides a `#[derive(Operation)]` procedural macro via the `ryft-macros` crate for [`Operation`] sum types.
-/// It is meant for enums such as [`ScalarOperation`](crate::ScalarOperation), where every variant wraps one concrete
-/// operation payload and the enum should behave exactly like whichever payload it contains. The derived implementation
-/// generates:
+/// It is meant for enums such as [`ArrayOperation`](crate::ArrayOperation), where every variant wraps one concrete
+/// operation payload and the enum should behave exactly like whichever payload it contains. Operation-specific
+/// semantics always live on the payload implementations, so the derived enum is only an adapter and a dispatcher.
+/// The sections below are the canonical reference for the derivation macro, including information on the enum-level
+/// attributes, how the operation and constant types are determined, the variant-class grammar, the generated
+/// implementations and their contracts, and the macro's requirements.
 ///
-///   - An [`Operation<T>`](Operation) implementation whose semantic and rendering methods forward to the active
-///     variant payload.
-///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards
-///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
-///     or staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
-///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that likewise
-///     forwards to each concrete payload's partial-evaluation rule.
-///   - Optional [`BatchableOperation`](crate::BatchableOperation),
-///     [`DifferentiableOperation`](crate::DifferentiableOperation), and
-///     [`TransposableOperation`](crate::TransposableOperation) dispatchers selected independently through
-///     `#[ryft(dispatch(batching, differentiation, transposition))]`.
-///   - A [`Display`] implementation that renders through [`Operation::render`] with zero indentation, so that the enum
-///     display matches the canonical program rendering format.
-///   - `From<Payload> for Enum` conversions for concrete payload variants.
-///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
+/// ## Enum-Level Attributes
 ///
-/// The macro has the following requirements:
+/// Every enum-level attribute is optional and may appear at most once. Attributes may share one `#[ryft(...)]` list or
+/// be split across several, and `type(T)` and `constant(V)` may also be declared in separate lists. These are the
+/// supported enum-level attributes:
 ///
-///   - The derivation macro input must be an enum. Structs and unions are not supported.
-///   - Every variant must be a tuple variant with exactly one payload field.
-///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`. Boxed variants still delegate to
-///     `Payload`, and their generated `From<Payload>` implementation boxes the payload for the caller.
-///   - Every payload must implement [`Operation<T>`](Operation), either because it is a concrete operation type whose
-///     implementation already exists or because the derivation macro adds a bound for a bare generic payload.
-///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
-///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
-///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
-///     generic payload by adding an `Extension: Operation<T>` bound.
-///   - Each generated semantic dispatcher receives a corresponding bound on every payload, such as
-///     `Payload: InterpretableOperation<C>` or `Payload: BatchableOperation<C>`. Payload-specific value and context
-///     requirements belong on the payload's own semantic-trait implementation; Rust resolves those requirements through
-///     the generated payload bound without requiring the enum to repeat them.
-///   - Batching, differentiation, and transposition require selecting the corresponding dispatcher. Interpretation
-///     and partial evaluation are always generated and therefore do not appear in the `dispatch(...)` attribute.
+/// | Attribute                                  | Default  | Role                                               |
+/// | ------------------------------------------ | -------- | -------------------------------------------------- |
+/// | `#[ryft(crate = "...")]`                   | `ryft`   | Path through which generated code names Ryft items |
+/// | `#[ryft(type(T), constant(V))]`            | inferred | Primary operation type and stored constant type    |
+/// | `#[ryft(members(U [, structural(S)]...))]` | none     | Member universes the operation family declares     |
+/// | `#[ryft(dispatch(...))]`                   | none     | Optional identity and transform dispatchers        |
+///
+/// The earlier `#[ryft(identity)]`, `#[ryft(type = T)]`, and `#[ryft(constant = V)]` forms are rejected with
+/// diagnostics that name their `dispatch(identity)`, `type(T)`, and `constant(V)` replacements.
+///
+/// ### Crate Path
+///
+/// `#[ryft(crate = "...")]` overrides the path used to reference Ryft traits, helpers, macros, and error types from
+/// generated code. The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not
+/// need this attribute. Generated code names only items exported at the root of `ryft-core`, so any path that
+/// re-exports that root works.
+///
+/// ## Operation And Constant Types
 ///
 /// The operation type `T` is selected as follows:
 ///
-///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T` from
-///     that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<ArrayType>`.
-///     Multiple generic parameters may use the same `T`. For example,
-///     `V: Value<Type = ArrayType>, C: Value<Type = ArrayType>` still infers `ArrayType`.
-///   - If no `Value<Type = T>` bound is present, or if multiple distinct operation types are present (e.g.,
-///     `Value<Type = DataType>` and `Value<Type = ArrayType>`), the derivation macro cannot choose an operation type
-///     and reports a compilation error. In those cases, the caller must split the enum by operation type or implement
-///     [`Operation`] manually.
+///   - An enum whose stored values belong to a member type rather than its primary type may declare both contracts
+///     explicitly with `#[ryft(type(T), constant(C))]`. Here, `T` is the enum's primary operation type and `C` is
+///     the concrete value type stored as constants in programs using the enum. Both attributes must be supplied
+///     together, and each declares exactly one complete Rust type (e.g., a generic, qualified, or tuple type). For
+///     example, a heterogeneous operation enum parameterized by an array-member value `A` can declare
+///     `#[ryft(type(HeterogeneousType), constant(HeterogeneousValue<A>))]` without adding a phantom
+///     heterogeneous-value generic. Heterogeneous families declare them explicitly because their stored constants
+///     live in a member universe, so no single `Value<Type = T>` bound mentions the heterogeneous type the family's
+///     instructions actually flow.
+///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T`
+///     from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
+///     ArrayType>`. Multiple generic parameters may use the same `T`. For example, `V: Value<Type = ArrayType>,
+///     C: Value<Type = ArrayType>` still infers `ArrayType`.
+///   - If no `Value<Type = T>` bound is present, or if multiple distinct operation types are present (e.g., `Value<Type
+///     = DataType>` and `Value<Type = ArrayType>`), the derivation macro cannot choose an operation type and reports a
+///     compilation error. In those cases, the caller must split the enum by operation type or implement [`Operation`]
+///     manually.
 ///
 /// The value types used for interpretation are inferred from the enum's `Value<Type = T>` generic parameters:
 ///
+///   - For an enum with an explicit `#[ryft(type(T), constant(C))]` declaration, `C` is the nested program's stored
+///     constant type. The derived interpretation implementation remains generic over the context's runtime value type
+///     and requires the context to lift `C` into that runtime value type.
 ///   - For enums with one `Value<Type = T>` parameter, the payload parameter is treated as the nested program's
 ///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
 ///     implementation is generic over a runtime value `V` and an interpretation context. The generated implementations
@@ -179,78 +209,637 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     family, extra value parameters after the first two are substituted with the first value parameter.
 ///   - The generated dispatcher inherits value capabilities from the payload-owned
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementations. For example, a payload that extracts
-///     a predicate states its [`BooleanLike`](crate::BooleanLike) requirement on its own implementation, and the
-///     generated payload bound transports that requirement to the enum's use site.
+///     a predicate states its [`Concretizable<bool>`](crate::Concretizable) requirement on its own implementation, and
+///     the generated payload bound transports that requirement to the enum's use site.
 ///
-/// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
-/// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
-/// `ryft` crate normally do not need this attribute. The `#[ryft(dispatch(...))]` attribute selects optional transform
-/// dispatchers.
+/// ### Member Universes
 ///
-/// ## Example
+/// An operation family may declare its member universes once, at the enum level, with `#[ryft(members(U [,
+/// structural(S)]...))]`. Each entry is either a bare [`Type`] naming a computational member or `structural(Type)`
+/// naming a structural member, member types may not repeat, and an empty list is rejected. For example, the dynamic
+/// array family declares `#[ryft(members(ArrayType, structural(DimensionType)))]`. Declaring the members has three
+/// effects: (i) a `mixed` marker may omit its member type (see [Variant Classes](#variant-classes)), (ii) every member
+/// marker's type is checked against the declaration, and (iii) the generated structural mixed forward mode arm knows
+/// every computational universe an output may belong to.
+///
+/// ### Dispatchers
+///
+/// `#[ryft(dispatch(...))]` selects the optional dispatchers. They are accepted in any order, although by convention
+/// `identity` is typically listed first:
+///
+/// | Token             | Generated Dispatcher                                                        |
+/// | ----------------- | --------------------------------------------------------------------------- |
+/// | `identity`        | Payload-delegating `PartialEq`, `Eq`, and `Hash` (see below)                |
+/// | `discharge`       | [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) |
+/// | `batching`        | [`BatchableOperation`](crate::BatchableOperation)                           |
+/// | `differentiation` | [`DifferentiableOperation`](crate::DifferentiableOperation)                 |
+/// | `transposition`   | [`TransposableOperation`](crate::TransposableOperation)                     |
+///
+/// An empty list, an unknown token, and a repeated token are all compilation errors. Interpretation and partial
+/// evaluation implementations are always generated and therefore never appear in `dispatch(...)`. The selected
+/// dispatchers generate the following per-variant arms:
+///
+///   - `identity` generates [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to the payload of each
+///     variant, under which two operations are considered equal when they are the same variant with equal payloads, and
+///     the hash covers the variant and its payload. Unlike the standard derives, which bound every generic parameter
+///     by the derived trait, the generated implementations are bounded by the payload types themselves. A family is
+///     therefore comparable exactly when its payloads are, even when a payload needs a different bound on the family's
+///     value parameter (e.g., a [`ConstantOperation`](crate::ConstantOperation) payload, which compares its literal
+///     through [`LiteralIdentity`](crate::LiteralIdentity)). Operation identity must be _faithful_, meaning that
+///     payloads must compare every attribute that affects their semantics or lowering, because consumers such as eager
+///     dispatch caches reuse compiled programs for equal operations.
+///   - `discharge` delegates native variants to the payload's own
+///     [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) implementation, and replays every
+///     member variant and every bare generic extension variant as the complete enum through
+///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation), which rewrites nothing and
+///     instead rejects an application that carries regions or receives a live reference handle as an input. The
+///     dispatcher stays generic over the [`ReferenceDischargePolicy`](crate::ReferenceDischargePolicy) it threads,
+///     because a policy names the reference universe being discharged rather than the element universe the family's
+///     values belong to. It also leaves the destination context's constant type free, unlike the interpretation and
+///     partial evaluation implementations, which pin it: no discharge rule reads a constant, and pinning it would
+///     exclude a capture-lifted program, whose constants name its caller's captures rather than carrying the family's
+///     values.
+///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
+///     implementation and dispatches mixed variants in either role to the payload's parent-universe
+///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy
+///     projection named by [`BatchingPolicyProjection`](crate::BatchingPolicyProjection): computational projected
+///     variants apply the payload's member batching rule through
+///     [`batch_projected_operation`](crate::batch_projected_operation), while structural projected variants bind the
+///     payload once in the parent context through
+///     [`batch_replicated_projected_operation`](crate::batch_replicated_projected_operation). The structural path
+///     requires the family's policy to implement
+///     [`ReplicatedBatchingPolicyProjection`](crate::ReplicatedBatchingPolicyProjection) for the member type instead of
+///     [`BatchingPolicyProjection`](crate::BatchingPolicyProjection), requires the payload to be region-free, and
+///     reports default evidence; the payload family needs no batching rules or member policy of its own. A structural
+///     role alone never implies replication, so a family whose policy does not implement the replicated projection
+///     fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
+///     generic over its array batching mode, while an explicitly declared family uses the canonical policy named
+///     by [`BatchableType`](crate::BatchableType).
+///   - `differentiation` delegates native variants to the payload's own forward mode rule and computational member
+///     variants to [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation), and generates the
+///     structural arms described under [Variant Classes](#variant-classes) directly.
+///   - `transposition` delegates native variants to the payload's own rule, mixed variants in either role to
+///     [`transpose_mixed_operation`](crate::transpose_mixed_operation), and computational projected variants to
+///     [`MemberTransposableOperation`](crate::MemberTransposableOperation). A structural projected variant contributes
+///     no cotangents.
+///
+/// ## Variant Classes
+///
+/// An unmarked variant is native to the enum's primary type `T` and delegates directly to a payload implementing
+/// `Operation<Type = T>`. A variant whose payload instead lives in a member universe `U` declares a _member class_
+/// using the single grammar `class(U [, structural])`, where the class name selects the **boundary shape** relating
+/// the payload's type boundary to `T` and the optional `structural` token selects the transform role, stating whether
+/// transforms delegate to the payload’s computational rules or treat the payload as structural bookkeeping. The role
+/// defaults to computational, so the two boundaries and two roles give four member classes:
+///
+/// | Boundary \ Role | Computational           | Structural                          |
+/// | --------------- | ----------------------- | ----------------------------------- |
+/// | Projected       | `#[ryft(projected(U))]` | `#[ryft(projected(U, structural))]` |
+/// | Mixed           | `#[ryft(mixed(U))]`     | `#[ryft(mixed(U, structural))]`     |
+///
+///   - A **projected** boundary means that every input and result of the instruction belongs to `U`, so inference and
+///     eager execution project the heterogeneous boundary down to `U` and lift the results back into `T`. The member
+///     type may occur only once per boundary because [`OperationProjection<U>`] names one canonical projected family.
+///   - A **mixed** boundary means the instruction crosses member kinds: the payload keeps its native `Operation<Type =
+///     U>` contract while its parent instruction also consumes inputs belonging to other members of `T` (e.g., the
+///     first-class dimensions that supply a dynamic result shape) and may produce results in those members too. The
+///     mixed machinery classifies each input and each result by the member universe it belongs to rather than by its
+///     position, so the two input kinds may be arranged in any order. The payload supplies that boundary through
+///     [`MemberOperation`] and, for interpretation, through
+///     [`MemberInterpretableOperation`](crate::MemberInterpretableOperation). Several mixed variants may share one
+///     member type.
+///   - A **computational** role means that transforms recurse into the payload's own rules. A projected payload uses
+///     the member family's ordinary batching rules, and both projected and mixed payloads state their parent-universe
+///     derivative through [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation). A projected payload
+///     also supplies [`MemberTransposableOperation`](crate::MemberTransposableOperation), so its transpose rule can use
+///     cotangent buffers in the enclosing family. A mixed payload supplies its parent-universe batching rule through
+///     [`MemberBatchableOperation`](crate::MemberBatchableOperation). Transposition never needs a mixed rule because
+///     [`transpose_mixed_operation`](crate::transpose_mixed_operation) delegates the instruction's `U`-typed data
+///     inputs, in input order, to the payload's ordinary homogeneous
+///     [`TransposableOperation`](crate::TransposableOperation) rule and gives every other input a structural zero
+///     cotangent.
+///   - A **structural** role declares that the payload is bookkeeping. There is nothing to differentiate (i.e., the
+///     type has a zero differential space) and nothing to batch per item, so batched inputs must be replicated. A
+///     structural projected member reaches that behavior through its member family's rules and its projected batching
+///     policy, and its generated forward mode and transposition arms stage a zero tangent and contribute no cotangents
+///     respectively. A structural mixed member instead has its forward mode rule generated as the payload's primal plus
+///     one zero tangent per declared parent output, staged over the same inputs so that the runtime extents those
+///     inputs carry stays available to both. Each output's tangent is constructed in the computational member universe
+///     that output belongs to, discovered by projecting the declared output type across the family's computational
+///     members (see [Member Universes](#member-universes)). An output outside all of them, such as a structural member
+///     output, has a zero differential space and receives a symbolic zero tangent instead of a staged instruction.
+///     Batching is the one transform the structural role does not cover for a mixed boundary, because a mixed signature
+///     cannot be projected into one member kind. A structural mixed payload therefore still implements
+///     [`MemberBatchableOperation`](crate::MemberBatchableOperation), normally as a replicated-inputs-only rule.
+///
+/// ### Defaulting The Member Type
+///
+/// Only the `mixed` class can default its member type. A bare `#[ryft(mixed)]` or `#[ryft(mixed(structural))]` takes
+/// its data universe from the family's single computational member, so in the abbreviated role form the sole argument
+/// is a role and not a member type. The derivation reports an error when the family declares no
+/// [member universes](#member-universes) at all and when it declares several computational members, because neither
+/// case has a unique default; both ask for the explicit `mixed(U)` form. A named member type that the family does not
+/// declare is also an error. The `projected` class always names its member type, so `#[ryft(projected)]` does not
+/// parse.
+///
+/// ### Member Transposition
+///
+/// A computational projected payload implements [`MemberTransposableOperation`](crate::MemberTransposableOperation).
+/// Its generated transposition arm calls `transpose_in_parent` with the enclosing context, driver, and original
+/// accumulator handles. This lets an array member update a reference cotangent buffer even when its homogeneous
+/// type cannot represent references. The member rule can delegate to
+/// [`transpose_projected_operation`](crate::transpose_projected_operation) when it only needs homogeneous values.
+/// That adapter projects the inputs and forwards cotangent contributions to the original accumulators.
+///
+/// ### Suppressing The Owned Conversion
+///
+/// A variant may additionally use `#[ryft(skip_from)]` to suppress its generated owned `From<Payload>` conversion.
+/// Its borrowed `TryFrom<&Enum>` projection is still generated. Use this only when the enum provides a handwritten
+/// `From<Payload>` implementation whose result is not always that variant (e.g., because conversion promotes a member
+/// operation into a family-level carrier or selects a static versus dynamic representation from payload metadata).
+/// Without the marker, that handwritten implementation would conflict with the generated implementation, and the
+/// generated direct wrapper would bypass the required normalization.
+///
+/// ## Generated Implementations
+///
+/// The derived implementation generates:
+///
+///   - An [`Operation<Type = T>`](Operation) implementation whose semantic and rendering methods forward to the active
+///     variant payload.
+///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards native variants
+///     directly and projects member variants into their native eager value family. Operation-specific eager semantics
+///     still live on the payload implementations; the enum is only an adapter and dispatcher.
+///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that forwards native
+///     variants to their payload rules. Member variants use the enclosing operation's canonical fold-or-residualize
+///     path, which also consults projected [`Operation::fold`] rules without a second partial-value protocol.
+///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
+///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
+///     homogeneous operation-family projection.
+///   - An [`OperationPayloadProjection`] implementation, which recognizes and constructs payloads without naming the
+///     family that holds them, delegating through projected member variants. Refer to its documentation for which
+///     payloads it exposes and for the construction precedence.
+///   - [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation),
+///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
+///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers selected through
+///     [`#[ryft(dispatch(...))]`](#dispatchers).
+///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
+///     indentation, so that the enum display matches the canonical program rendering format.
+///   - `From<Payload> for Enum` conversions for concrete payload variants.
+///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
+///     These conversions fail with `Error = TypeError`, reporting that the stored operation cannot be projected into
+///     the payload. The message names the stored operation's [`Operation::name`] and the statically expected payload
+///     type, each surrounded by backticks.
+///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
+///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
+///     family-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
+///     requires its operation family to provide guard requests, so this lets a family that stores no guard serve as a
+///     context's family without a handwritten provider. A family with a native guard variant instead provides guards
+///     through the blanket implementation over its generated `From<GuardOperation<T>>` conversion.
+///
+/// ## Requirements And Limitations
+///
+/// The macro has the following requirements:
+///
+///   - The derivation macro input must be an enum. Structs and unions are not supported.
+///   - Every variant must be a tuple variant with exactly one payload field.
+///   - Member-class markers belong on the variant. Field-level `#[ryft(...)]` attributes are not supported.
+///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`. Boxed variants still delegate to
+///     `Payload`, and their generated `From<Payload>` implementation boxes the payload for the caller.
+///   - Every native payload must implement [`Operation<Type = T>`](Operation), where `T` is the enum's primary type.
+///     A member payload must instead implement `Operation<Type = U>` for the member type declared by its variant
+///     marker, or defaulted from `#[ryft(members(...))]`. The enclosing type and value families must provide the
+///     corresponding projection vocabulary.
+///   - A projected-boundary member type may occur only once because [`OperationProjection<U>`] has one canonical
+///     projected operation family. Several operations in the same member universe should first be collected into that
+///     family rather than declared as separate outer variants. Mixed-boundary variants do not claim that projection,
+///     so they may repeat a member type freely.
+///   - A payload type that [`OperationPayloadProjection::from_payload`] constructs (i.e., one that is `'static`
+///     independently of the enum's generic parameters) may be held by at most one family-native variant, so that
+///     construction is unambiguous.
+///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
+///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
+///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
+///     generic payload by adding an `Extension: Operation<Type = T>` bound.
+///   - Native guard variants are recognized syntactically, as family-native variants whose payload type (after
+///     unboxing) is a path whose last segment is `GuardOperation`. Projected and mixed member guards belong to their
+///     member universe and do not count. A guard payload named through a type alias is therefore not recognized, and
+///     a family that stores no recognized guard but has a handwritten `From<GuardOperation<T>>` conversion fails to
+///     compile with conflicting [`OperationProvider`] implementations
+///     ([E0119](https://doc.rust-lang.org/error_codes/E0119.html)). Name the payload `GuardOperation<T>` directly
+///     or remove the handwritten conversion.
+///   - Generated semantic dispatchers place their required bounds on the participating payloads. Payload-specific
+///     value and context requirements belong on the payload's own semantic-trait implementation; the enum does not
+///     duplicate them.
+///   - Reference discharge, batching, differentiation, and transposition require selecting the corresponding
+///     dispatcher. Interpretation and partial evaluation are always generated and therefore do not appear in the
+///     `dispatch(...)` attribute.
+///
+/// ## Examples
+///
+/// A homogeneous operation family infers its operation and constant types from the enum's `Value<Type = T>` generic
+/// parameter and needs no enum-level attributes:
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::{ConstantOperation, DataType, Operation, Value, ZeroOperation};
-/// # use ryft_core::backends::scalars::Scalar;
+/// # use ryft_core::arrays::{ArrayType, DataType};
+/// # use ryft_core::{Array, ConstantOperation, Operation, Value, ZeroOperation};
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
-/// enum BackendOperation<V: Value<Type = DataType>> {
-///     Zero(ZeroOperation<DataType>),
+/// enum BackendOperation<V: Value<Type = ArrayType>> {
+///     Zero(ZeroOperation<ArrayType>),
 ///     Constant(ConstantOperation<V>),
 /// }
 ///
-/// let operation = BackendOperation::<Scalar>::from(ZeroOperation::new(DataType::F32));
+/// let operation = BackendOperation::<Array>::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
 /// assert_eq!(operation.name(), "zero");
 /// ```
-pub trait Operation<T: Type>: Clone {
+///
+/// A heterogeneous operation family declares its operation and constant types explicitly, declares its member
+/// universes once with `members(...)`, and marks each non-native variant with its class. Unmarked variants are native
+/// to the heterogeneous type, `projected(U)` variants embed a whole member family behind a projection, and `mixed`
+/// variants default their data universe to the family's unique computational member:
+///
+/// ```rust
+/// # use ryft_core as ryft;
+/// # use ryft_core::{
+/// #   Operation, Value, ZeroOperation, Array, ArrayOperation, ArrayIrValue, DimensionOperation, DimensionValue,
+/// #   DimensionSizeOperation, ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape,
+/// # };
+/// # use ryft_macros::Operation;
+///
+/// #[derive(Clone, Debug, Operation)]
+/// #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
+/// #[ryft(members(ArrayType, structural(DimensionType)))]
+/// enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
+///     /// Mixed structural constructor whose inputs are the stored type's dynamic extents, its data universe
+///     /// defaults to `ArrayType` (i.e., the unique computational member), and its transforms are fully generated.
+///     #[ryft(mixed(structural))]
+///     Zero(ZeroOperation<ArrayType>),
+///
+///     /// Projected computational member family that includes every homogeneous array operation, behind a projection.
+///     #[ryft(projected(ArrayType))]
+///     Array(ArrayOperation<A>),
+///
+///     /// Projected structural member family representing dimension bookkeeping with zero differential space.
+///     #[ryft(projected(DimensionType, structural))]
+///     Dimension(DimensionOperation<DimensionValue>),
+///
+///     /// Native mixed-signature payload that consumes an array and produces a first-class dimension.
+///     DimensionSize(DimensionSizeOperation),
+/// }
+///
+/// let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+/// let operation = HeterogeneousOperation::<Array>::from(DimensionSizeOperation::new(&input_type, 0).unwrap());
+/// assert_eq!(operation.name(), "dimension_size");
+/// ```
+pub trait Operation: Clone {
+    /// Canonical [`Type`] universe of this [`Operation`]. Every payload has exactly one operation contract, so
+    /// this associated type is the single source of truth for the operation's type universe. [`Program`]s require
+    /// `O: Operation<Type = V::Type>`, which makes the value/operation type agreement compiler-enforced instead of
+    /// depending on a separately supplied type argument.
+    type Type: Type;
+
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
-    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and
-    /// attached-region [`RegionInterface`]s without executing it, validating the complete hypothetical
-    /// [`Instruction`](crate::Instruction) that the arguments describe.
+    /// Returns output [`TypeIdentity`](crate::TypeIdentity) definitions explicitly owned by this operation.
+    /// A declaration establishes one identity shared by its output occurrences, including repeated intrinsic
+    /// definition positions or reference-only positions without a separate defining value. The operation owns the
+    /// checks and runtime semantics establishing the shared family; a declaration alone supplies no numerical proof.
+    /// For example, a call can export the same dimension value in two result slots under one fresh result identity.
     ///
-    /// [`ProgramBuilder`](crate::ProgramBuilder)s never ask their callers to provide region interfaces. They receive
-    /// input/operand atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s,
-    /// derive the interface slice from their own [`Region`](crate::Region) arena, and invoke this function internally.
-    /// Calling this function directly with synthetic [`RegionInterface`] performs a pure hypothetical inference and
-    /// cannot mutate or create a [`Program`].
+    /// Each identity must occur on an output and appear only once in this declaration. An identity carried by an
+    /// instruction input is forwarded. Otherwise, it must be fresh in the region, even when an earlier instruction
+    /// established it without this instruction consuming it. Region sealing records definitions in output-occurrence
+    /// order. Undeclared intrinsic definition positions establish their identities individually and cannot repeat.
     ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Input/operand [`Type`]s in instruction input order.
-    ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
-    ///     [`Operation`]-defined [`region_names`](Self::region_names) region order. Region-free operations receive an
-    ///     empty slice and ignore it.
-    fn infer_output_types(
-        &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError>;
-
-    /// Returns stable names for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in the operation-defined
-    /// region order (e.g., `["true", "false"]` for a condition operation). The declared region count must match the
-    /// number of regions attached to every [`Instruction`](crate::Instruction) applying this operation.
-    /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
-    /// [`Program`] is built. The names also label the region slots when rendering [`Program`]s. The default declares
-    /// no region slots, which is correct for region-free operations.
+    /// These identities are operation metadata and must follow [`Self::rename_type_identities`]. The default declares
+    /// no identities and allocates nothing.
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
+    fn defined_type_identities(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
+        Cow::Borrowed(&[])
+    }
+
+    /// Returns declarations for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in operation-defined
+    /// order. Each [`RegionSlot`] supplies the stable name used by diagnostics and rendering together with the
+    /// [`RegionRole`] that determines whether the region may execute during ordinary interpretation. The declared
+    /// region count must match the number of regions attached to every [`Instruction`].
+    /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
+    /// [`Program`] is built. The default declares no region slots, which is correct for region-free operations.
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
         &[]
     }
 
-    /// Returns information about which attached-[`Region`](crate::Region) `output_index`-th output can come from.
-    /// An empty vector means that the [`Instruction`](crate::Instruction) result is produced by the [`Operation`]
-    /// itself. A non-empty vector forwards the result to every listed region output, in semantic order. Analyses
-    /// recursively resolve those outputs and may therefore recover no instruction producer when a path ends at a
-    /// region input or constant. Region-forwarding operations such as the condition and scan operations override this
-    /// function. The empty default is correct for every operation whose results are not forwarded region outputs.
+    /// Returns the declared [`RegionRole`] for the attached region at `index` or [`None`] when `index` is out of range.
+    #[inline]
+    fn region_role(&self, index: usize) -> Option<RegionRole> {
+        self.region_slots().get(index).map(|slot| slot.role)
+    }
+
+    /// Validates that `region_count` matches the number of regions declared by [`Self::region_slots`]. This is the
+    /// arity part of [`Self::validate_region_interfaces`], for code that pairs attached regions with region slots
+    /// before their interfaces exist (e.g., while summarizing the effects of an instruction), and for implementations
+    /// of [`Self::validate_region_interfaces`], which must validate the region count before their relationships.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] if `region_count` does not match the region slots of this operation.
+    #[inline]
+    fn validate_region_count(&self, region_count: usize) -> Result<(), ProgramError> {
+        let declared_region_count = self.region_slots().len();
+        if region_count == declared_region_count {
+            return Ok(());
+        }
+        if declared_region_count == 0 {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` declares no region slots but {} regions were attached",
+                self.name(),
+                region_count,
+            )));
+        }
+        Err(ProgramError::MalformedProgram(format!(
+            "operation `{}` declares {} region slots but {} regions were attached",
+            self.name(),
+            declared_region_count,
+            region_count,
+        )))
+    }
+
+    /// Validates the part of the region contract of an application of this [`Operation`] that does not depend on its
+    /// input types. The number of attached [`Region`](crate::Region)s must match [`Self::region_slots`], and the
+    /// declared interfaces of those regions must satisfy any operation-specific relationships (e.g., the two branches
+    /// of a `condition` operation must declare the same input types, and the body of a loop must map its state types
+    /// to themselves). Operation application boundaries (e.g., [`Context::bind`](crate::Context::bind) implementations
+    /// and transform entry points) call this function before inspecting the attached regions, so that operation rules
+    /// receive structurally valid applications, and [`ProgramBuilder`](crate::ProgramBuilder)s call it before
+    /// [`Self::infer_output_types`] when they record an instruction.
+    ///
+    /// Staging calls this function on the original declared interfaces, before it instantiates their type identities or
+    /// specializes their bodies to the application's input types. This complements [`Self::infer_region_input_types`],
+    /// which staging also calls on partially specialized interfaces (i.e., while reconciling regions whose signatures
+    /// depend on earlier ones), and which therefore cannot tell an original interface apart from a specialized one. For
+    /// example, specializing one of two condition branches that declare `f64[extent]` and `f64[3]` to an `f64[3]` input
+    /// would otherwise make their signatures equal and conceal the mismatch that [`Self::infer_output_types`] rejects.
+    ///
+    /// The default implementation only checks the number of attached regions. Implementations that add relationships
+    /// must check that number first. This function does not validate the input types of the application and does not
+    /// replace the mandatory [`Self::infer_output_types`] validation of the final application.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region_interfaces`: Declared interfaces of the attached regions, in slot order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] if the number of attached regions does not match the region slots
+    /// of this operation, and a [`ProgramError::Type`] error if an operation-specific relationship is invalid.
+    #[inline]
+    fn validate_region_interfaces(
+        &self,
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<(), ProgramError> {
+        self.validate_region_count(region_interfaces.len())
+    }
+
+    /// Derives the input [`Type`]s with which each attached [`Region`](crate::Region) will be invoked when this
+    /// [`Operation`] receives `input_types`. An attached region is traced independently with a declared input
+    /// signature. Before importing that region into the caller's [`Program`], staging must rename the signature's
+    /// formal [`TypeIdentity`](crate::TypeIdentity)s to the identities supplied by this particular operation
+    /// application. The mapping is operation-specific. For example, a condition passes every instruction input except
+    /// its predicate to both branches, while a scan passes loop-carried values together with element types derived from
+    /// its stacked inputs.
+    ///
+    /// Each returned entry corresponds to the same-index entry in `region_interfaces`. [`None`] preserves the region's
+    /// declared signature and its existing sharing. [`Some`] provides the concrete region input types from which the
+    /// generic staging machinery derives and applies the necessary type-identity renaming. Implementations must return
+    /// exactly one entry per attached region.
+    #[inline]
+    fn infer_region_input_types(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Option<Vec<Self::Type>>>, TypeError> {
+        let _ = input_types;
+        Ok(vec![None; region_interfaces.len()])
+    }
+
+    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and attached-region
+    /// [`RegionInterface`]s without executing it, validating the complete hypothetical [`Instruction`] that the
+    /// arguments describe.
+    ///
+    /// [`ProgramBuilder`](crate::ProgramBuilder)s never ask their callers to provide region interfaces. They receive
+    /// input atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s, derive
+    /// the interface slice from their own [`Region`](crate::Region) arena, and invoke this function internally. Calling
+    /// this function directly with synthetic [`RegionInterface`] performs a pure hypothetical inference and cannot
+    /// mutate or create a [`Program`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Input [`Type`]s in instruction input order.
+    ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
+    ///     [`Operation`]-defined [`region_slots`](Self::region_slots) order. Region-free operations receive an
+    ///     empty slice and ignore it.
+    fn infer_output_types(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Self::Type>, TypeError>;
+
+    /// Folds this validated [`Operation`] to existing inputs or to constants determined by its output types, without
+    /// executing it. Returns `None` when no folding is possible, or one [`OperationFoldOutput`] per output, in output
+    /// order, when folding is possible: an [`Input`](OperationFoldOutput::Input) replaces the output with the named
+    /// input, and a [`Singleton`](OperationFoldOutput::Singleton) replaces it with the unique value of its inferred
+    /// output type, which the staging boundary materializes as a program constant. An empty replacement vector folds
+    /// a zero-output operation.
+    ///
+    /// Callers must validate the complete application through [`Self::infer_output_types`] before calling this function
+    /// and resolve replacements (i.e., input indices, output count, singleton materialization, and type refinements)
+    /// before applying a fold. Implementations use the actual input types, including refined bounds, rather than only
+    /// stored metadata. Equal types do not imply equal values unless the type's identity contract explicitly guarantees
+    /// it, and a singleton claim must follow from the inferred output type being exact rather than from the rule's own
+    /// arithmetic.
+    ///
+    /// A successful fold guarantees that omitting this operation, including its executable regions, preserves all
+    /// observable behavior, possible failures, and transformation semantics (including differentiation). Effects of
+    /// input producers remain live. Replacement types may refine inferred output types and substitute their identities,
+    /// but callers must propagate those substitutions. An operation that declares deferred work (refer to the
+    /// [Deferred Work](Effects#deferred-work) section of the [`Effects`] documentation) carries a transformation
+    /// obligation that omitting it would discharge, so [`Self::resolve_fold`] declines it before consulting this
+    /// function and implementations need not check it themselves.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Input [`Type`]s in instruction input order.
+    ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
+    ///     [`Operation`]-defined [`region_slots`](Self::region_slots) order. Region-free operations receive an
+    ///     empty slice and ignore it.
+    #[inline]
+    fn fold(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        let _ = (input_types, region_interfaces);
+        Ok(None)
+    }
+
+    /// Applies [`Self::fold`] and resolves its replacements against the already inferred application boundary,
+    /// returning `None` when the rule declines to fold. Input replacements must name existing inputs whose types
+    /// refine the declared outputs, including relationships between input and output identities, and singleton
+    /// replacements must be materializable by the value family `V` as storable program constants. Callers apply
+    /// the returned replacements without further validation. Operations that declare deferred work are never folded.
+    /// This is the application half of the folding contract and is not meant to be overridden (i.e., operations must
+    /// typically only customize [`Self::fold`]).
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Actual input [`Type`]s of the application, in instruction input order.
+    ///   - `region_interfaces`: Boundary [`RegionInterface`]s of the application, as for [`Self::fold`].
+    ///   - `output_types`: Output [`Type`]s inferred for the application, in output order.
+    fn resolve_fold<V: Value<Type = Self::Type>>(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+        output_types: &[Self::Type],
+    ) -> Result<Option<Vec<OperationFoldReplacement<V>>>, TypeError> {
+        // Omitting an operation with deferred work would discharge its unresolved transformation obligation.
+        if self.effects().summary().has_deferred_work() {
+            return Ok(None);
+        }
+
+        let Some(outputs) = self.fold(input_types, region_interfaces)? else {
+            return Ok(None);
+        };
+        check_count!("fold output", outputs, output_types.len(), TypeError);
+
+        let mut replacements = Vec::with_capacity(outputs.len());
+        let mut actual = input_types.to_vec();
+        for (output, output_type) in outputs.iter().zip(output_types) {
+            match *output {
+                OperationFoldOutput::Input(index) => {
+                    let input_type = input_types.get(index).ok_or_else(|| {
+                        TypeError::invalid(format!(
+                            "`{}` fold references input {} but has {} inputs",
+                            self.name(),
+                            index,
+                            input_types.len(),
+                        ))
+                    })?;
+                    actual.push(input_type.clone());
+                    replacements.push(OperationFoldReplacement::Input(index));
+                }
+                OperationFoldOutput::Singleton => {
+                    let constant = V::singleton(output_type).ok_or_else(|| {
+                        TypeError::invalid(format!(
+                            "`{}` fold declares a singleton output but its type `{}` does not determine a value",
+                            self.name(),
+                            output_type,
+                        ))
+                    })?;
+                    constant.validate_as_constant()?;
+                    actual.push(constant.r#type().into_owned());
+                    replacements.push(OperationFoldReplacement::Constant(constant));
+                }
+            }
+        }
+
+        let declared = input_types.iter().chain(output_types).cloned().collect::<Vec<_>>();
+        Self::Type::derive_identity_renaming(&declared, &actual)?;
+        Ok(Some(replacements))
+    }
+
+    /// Describes how this operation supplies region input `input_index` of the attached [`Region`](crate::Region)
+    /// at `region_index`. [`InputRegionProvenance::Input`] records instruction input correspondence rather than
+    /// equal runtime values (e.g., a `scan` operation may supply a slice of a stacked array or an evolving carry).
+    /// Forwarded references preserve complete handle identity and construct any views inside the region.
+    /// [`InputRegionProvenance::Local`] instead declares a region input created by the operation; its type determines
+    /// the reference ownership rules.
+    ///
+    /// This is the input counterpart of [`Self::output_region_provenance`]. For a condition with instruction inputs
+    /// `(predicate, value)`, branch region input `0` corresponds to instruction input `1`, while instruction output `0`
+    /// may come from output `0` of either branch. Analyses use these declarations to carry identities and resource
+    /// roots across boundaries without guessing from equal types or matching positions. Unlike diagnostic
+    /// [`Provenance`](crate::Provenance), these declarations carry semantics used by analyses and transforms.
+    ///
+    /// Provenance declares boundary correspondence only. It does not state which values produce a region input or how
+    /// often a region executes, which [`Self::region_data_flow`] declares on top of it. For example, each body input of
+    /// a `while` loop corresponds to an instruction input, even though the body also receives the outputs of its
+    /// previous iteration.
+    ///
+    /// The default declares no provenance. Executed reference region inputs require an explicit instruction input or
+    /// local origin; local references remain borrowed, cannot escape or be consumed, and gain no initialization or
+    /// access permission from this declaration. Region access policies still apply and executed region effects still
+    /// contribute to the operation. The operation owns initialization and publication of local references as ordinary
+    /// value outputs.
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        let _ = (region_index, input_index);
+        InputRegionProvenance::None
+    }
+
+    /// Returns the attached [`Region`](crate::Region) outputs that may directly supply output `output_index` of
+    /// the parent [`Instruction`]. Each item identifies one attached region and one output within it. Multiple items
+    /// represent alternative sources, such as the corresponding outputs of a condition's two branches, and semantic
+    /// order is preserved. An empty vector means that the operation itself produces the instruction output.
+    ///
+    /// This is the output side counterpart of [`Self::input_region_provenance`]. Analyses can recursively follow the
+    /// returned region outputs to their producers; a path may end at a region input or constant and therefore have no
+    /// producing instruction. The empty default is correct when instruction outputs do not directly forward outputs
+    /// from attached regions. Like [`Self::input_region_provenance`], this declares correspondence only, and
+    /// [`Self::region_data_flow`] declares whether these region outputs are the complete producers of the output.
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
         Vec::new()
+    }
+
+    /// Declares context-independent producer and execution semantics of the attached computation regions, layered
+    /// on top of the boundary correspondence that [`input_region_provenance`](Self::input_region_provenance) and
+    /// [`output_region_provenance`](Self::output_region_provenance) declare. Operations whose regions execute once
+    /// per application, and whose provenance is therefore exactly their data flow, opt in with
+    /// [`RegionDataFlow::Provenance`]. Operations with recurrences (e.g., loops) or bypasses borrow their own
+    /// [`RegionDataFlowRule`](crate::programs::RegionDataFlowRule) through [`RegionDataFlow::Custom`].
+    /// Wrapper operations forward the declaration of the operation they wrap unchanged. The default is
+    /// [`RegionDataFlow::Opaque`]: analyses must not infer single-invocation semantics, the absence of producers, or
+    /// permission to replay the operation. Opaque operations (e.g., kernel calls, whose bodies execute once per grid
+    /// point) may still declare provenance for reference analyses. This contract carries no residual policy, storage,
+    /// reference identity, or execution-context decisions.
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Opaque
+    }
+
+    /// Prunes the boundary of an [`Instruction`] that applies this operation, given which of its outputs are used,
+    /// returning the pruned boundary or [`None`] to keep the instruction whole. A pruning drops the instruction
+    /// inputs and outputs, and the attached-region inputs and outputs, that nothing needs, like the
+    /// [dead code elimination rules](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/partial_eval.py)
+    /// of JAX's higher-order primitives (e.g., `pe.dce_rules[scan_p]`). [`Program::into_pruned`] applies the pruning,
+    /// and [`OperationBoundaryPruning`] describes its contract.
+    ///
+    /// The default keeps every instruction whole, which is always correct. Operations whose attached regions forward
+    /// inputs and outputs positionally override it: a `condition` drops the inputs that neither branch uses, and a
+    /// `scan` drops unused stacked inputs and outputs together with the carries that nothing depends on. Operations
+    /// whose attached regions have coupled boundaries (e.g., the rule regions of a composite, which mirror its primal
+    /// region) keep the default.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Actual [`Type`]s of the inputs of the instruction, aligned with those inputs.
+    ///   - `used_outputs`: Whether each output of the instruction is used. It may mark no output as used when the
+    ///     instruction is retained for its effects.
+    ///   - `regions`: Liveness of the attached regions, which reports the inputs of an attached region that a given
+    ///     set of its used outputs needs.
+    #[inline]
+    fn prune_boundary(
+        &self,
+        input_types: &[Self::Type],
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        let _ = (input_types, used_outputs, regions);
+        Ok(None)
     }
 
     /// Returns `true` if the `output_index`-th output is structurally known to be zero independently
@@ -264,18 +853,199 @@ pub trait Operation<T: Type>: Clone {
         false
     }
 
-    /// Returns the observable [`Effect`](crate::Effect) classes of this [`Operation`]. Refer to the documentation of
-    /// [`Effects`] and [`Effect`](crate::Effect) for the semantics.
+    /// Returns the exact number of leading inputs that establish a fresh lexical capture namespace for the
+    /// `region_index`-th attached [`Region`](crate::Region), or [`None`] when that region inherits the namespace
+    /// active at instructions involving this [`Operation`].
+    ///
+    /// Override this function only for call-like operations that attach independently lifted callees. Return `Some(0)`
+    /// when the attached region establishes a fresh namespace containing no captures. `None` implies inheritance and
+    /// is therefore semantically different. A returned count must not exceed the attached region's input count.
+    /// Conditions, loops, scans, and other nested control flow operations normally inherit their parent's namespace
+    /// and should retain the default.
     #[inline]
-    fn effects(&self) -> Effects {
-        Effects::PURE
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        let _ = region_index;
+        None
     }
 
-    /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation
-    /// simply renders [`Operation::name`]. Operations carrying semantic metadata should override this function and
-    /// use [`OperationFormatter`] for consistent bracketed and indented formatting. Attached [`Region`](crate::Region)s
-    /// are not rendered here. The contextual [`Program`] renderer renders each instruction's attached regions after its
-    /// operation.
+    /// Returns the [`Operation`] input whose reference identity must be preserved by reference-typed output
+    /// `output_index`, or [`None`] when the output has no such identity constraint.
+    ///
+    /// This function constrains the identity of the reference root, not the value stored in that reference. Override
+    /// it for operations with a bypass or zero-iteration path that can return entering state unchanged. For example,
+    /// consider a `while` operation with two reference carries `A` and `B`. An identity-preserving body is valid:
+    ///
+    /// ```text
+    /// input references:  [A, B]
+    /// body references:   [A, B] -> [A, B]
+    /// output references: [A, B]
+    /// ```
+    ///
+    /// The body may update the values stored in `A` and `B`. It must only preserve which root occupies each carry.
+    /// Consequently, this function returns `Some(0)` for output `0` and `Some(1)` for output `1`.
+    ///
+    /// A body that instead exchanges the roots is invalid:
+    ///
+    /// ```text
+    /// input references: [A, B]
+    /// body references:  [A, B] -> [B, A]
+    /// ```
+    ///
+    /// Output `0` would identify `A` after zero iterations, `B` after one iteration, and `A` again after two. Static
+    /// reference analysis therefore could not assign that output one canonical root. Declaring the positional identity
+    /// constraint lets analysis reject the body instead.
+    ///
+    /// Every `while` output has this constraint. Only the carry prefix of a `scan` has it, because stacked sequence
+    /// outputs do not preserve an entering reference identity. Ordinary array and dimension outputs are unaffected.
+    /// Do not use this function to describe ordinary forwarding from an attached region. Instead, use
+    /// [`Self::output_region_provenance`] for that.
+    #[inline]
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        let _ = output_index;
+        None
+    }
+
+    /// Returns whether the `region_index`-th attached [`Region`](crate::Region) may perform an access with the provided
+    /// [`ReferenceAccessMode`] through one of its reference inputs. Here, "through" means that the accessed reference
+    /// root entered the region from the parent instruction rather than being allocated locally inside the region. The
+    /// default permits every access mode.
+    ///
+    /// Override this function only when an attached region has an asymmetric state contract. A `while` operation is
+    /// the canonical example. Its condition region may observe an entering reference `A`, and its body may update and
+    /// return `A`:
+    ///
+    /// ```text
+    /// while state: A
+    ///
+    /// condition(A):
+    ///     value = read(A)
+    ///     return predicate(value)
+    ///
+    /// body(A):
+    ///     add_update(A, 1)
+    ///     return A
+    /// ```
+    ///
+    /// The condition returns only its predicate, so it has no state output through which an updated `A` could be
+    /// published directly. Reference discharge nevertheless accepts a mutating condition by rotating the loop into
+    /// "do-while form" where the condition is discharged once before the loop to produce the initial predicate and
+    /// apply its effects, the predicate becomes a trailing carry, and the rebuilt body runs the original body followed
+    /// by the original condition, publishing the condition's updates through the body's state carries. The condition
+    /// therefore permits [`ReferenceAccessMode::Read`], [`ReferenceAccessMode::Write`],
+    /// [`ReferenceAccessMode::ReadWrite`], [`ReferenceAccessMode::Accumulate`], and
+    /// [`ReferenceAccessMode::AtomicAccumulate`] through its input and rejects only
+    /// [`ReferenceAccessMode::Consume`], because a consumed allocation has no successor
+    /// state for a carry to hold. A `while` implementation consequently reports:
+    ///
+    /// ```text
+    /// condition + read:    true
+    /// condition + write:   true
+    /// condition + consume: false
+    /// body + write:        true
+    /// ```
+    ///
+    /// A condition that mutates and then exits is therefore valid and loses no update:
+    ///
+    /// ```text
+    /// condition(A):
+    ///     swap(A, replacement)
+    ///     return false
+    /// ```
+    ///
+    /// When that condition returns `false`, the loop exits without invoking the body, and the swap it performed is
+    /// still visible because it ran once before the rotated loop. The body does return its state carries, so it
+    /// retains the permissive default.
+    ///
+    /// The policy does not restrict references allocated and consumed entirely within the region. For example, a
+    /// condition may allocate, update, read, and freeze a temporary reference because that root never enters through
+    /// a region input. The policy applies transitively to accesses in the region's nested computations.
+    ///
+    /// This function does not describe how values enter the region; use [`Self::input_region_provenance`] for that.
+    /// It also does not describe reference accesses performed intrinsically by this operation. Instead, use
+    /// [`Self::effects`] for those.
+    #[inline]
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        let _ = (region_index, mode);
+        true
+    }
+
+    /// Returns whether this [`Operation`] defers part of its reference discharge to programs that it traces later
+    /// (e.g., a composite call whose retained rules are traced on demand, which records that its rule programs must be
+    /// discharged when they are traced). Reference discharge (refer to
+    /// [`Program::discharge_references`](crate::Program::discharge_references)) visits such an operation even when its
+    /// program touches no reference, because only its discharge rule can record that obligation. The `false` default
+    /// is correct for every operation whose reference state is visible in its own effects and attached regions.
+    #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        false
+    }
+
+    /// Returns the complete operation-local effect declaration of this [`Operation`] that contains its explicit
+    /// [`EffectClass`](crate::EffectClass)es and its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and
+    /// accesses), all expressed in this operation's input/output index space. Refer to the documentation of [`Effects`]
+    /// for the semantics and per-operation examples. This is the single declaration from which the aggregate
+    /// [`EffectClasses`](crate::EffectClasses) consumed by transforms and lowering (via [`Effects::classes`]),
+    /// the reference facts consumed by reference analysis and discharge, and the retention decision of dead-code
+    /// elimination are derived.
+    ///
+    /// The empty default is correct for pure operations that do not themselves create or access references. This
+    /// declaration describes only effects produced directly by the operation; it does not include effects from attached
+    /// [`Region`](crate::Region)s. Region sealing incorporates effects from attached computation regions into region
+    /// metadata, which is what [`Program::effects`] reports, while program-level reference analysis traverses attached
+    /// regions directly. Consequently, region-bearing operations such as loops and conditionals can keep the empty
+    /// default even when their nested programs are effectful or access references.
+    ///
+    /// Contracts describing how references cross an operation's region boundaries are also separate from this effect
+    /// declaration. Use [`Self::region_capture_input_count`] to establish a region's capture namespace,
+    /// [`Self::reference_output_identity_input`] to state that an output preserves an entering reference identity, and
+    /// [`Self::allows_reference_access_through_region_input`] to restrict which entering roots a region may access.
+    ///
+    /// The returned [`Cow`] borrows at `self`'s lifetime so implementations can hand out shared static declarations
+    /// _or_ borrow declarations stored in their own payloads (e.g., custom-call or kernel operations with
+    /// payload-dependent effects) without cloning on every query.
+    #[inline]
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(Effects::empty())
+    }
+
+    /// Returns this [`Operation`] after simultaneously renaming any [`TypeIdentity`](crate::TypeIdentity)s stored
+    /// in its payload, as specified by the provided [`TypeIdentityRenaming`]. Operations whose payload contains no
+    /// type-identity metadata return `self.clone()`. An operation that stores shapes, output types, or nested
+    /// signature metadata must apply the same renaming as its surrounding program so the payload and atom types
+    /// remain consistent.
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        let _ = renaming;
+        Ok(self.clone())
+    }
+
+    /// Renders this [`Operation`] as part of an [`Instruction`]. The default implementation simply renders
+    /// [`Operation::name`], which is complete only for operations whose payload carries no semantics. Attached
+    /// [`Region`](crate::Region)s are not rendered here. The contextual [`Program`] renderer renders each
+    /// instruction's attached regions after its operation.
+    ///
+    /// # Contract
+    ///
+    /// An implementation whose payload carries _semantics-bearing metadata_ (i.e., any field that changes what the
+    /// operation computes, how a transform rewrites it, or how a backend lowers it, and that is not already recoverable
+    /// from the instruction's rendered input and output atom types) **must** override this function and render that
+    /// metadata, using [`OperationFormatter`] for consistent bracketed and indented formatting. This is a requirement
+    /// rather than a stylistic preference, because a program's rendering doubles as its structural-equivalence
+    /// fingerprint (i.e., two programs that render identically are treated as the same program). Two consumers depend
+    /// on that:
+    ///
+    ///   - The transform cache debugging diagnostic, which compares a freshly derived transform against the artifact
+    ///     retained in a region's transform cache through the complete program rendering. Metadata that does not render
+    ///     is metadata whose corruption or nondeterminism the recheck cannot see.
+    ///   - Rendered-program test assertions, which pin the staged shape of the programs that transforms derive.
+    ///     Metadata that does not render is metadata those assertions silently stop protecting.
+    ///
+    /// Metadata that is fully recoverable from the rendered instruction line (most commonly an output shape or
+    /// data type that the operation only reflects into its inferred output [`Type`]) may be left out, because the
+    /// fingerprint already distinguishes it.
     ///
     /// # Parameters
     ///
@@ -295,24 +1065,62 @@ pub trait Operation<T: Type>: Clone {
     }
 }
 
-impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
+impl<O: Operation> Operation for Box<O> {
+    type Type = O::Type;
+
     #[inline]
     fn name(&self) -> &'static str {
         self.as_ref().name()
     }
 
     #[inline]
+    fn defined_type_identities(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
+        self.as_ref().defined_type_identities()
+    }
+
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        self.as_ref().region_slots()
+    }
+
+    #[inline]
+    fn validate_region_interfaces(
+        &self,
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<(), ProgramError> {
+        self.as_ref().validate_region_interfaces(region_interfaces)
+    }
+
+    #[inline]
+    fn infer_region_input_types(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Option<Vec<Self::Type>>>, TypeError> {
+        self.as_ref().infer_region_input_types(input_types, region_interfaces)
+    }
+
+    #[inline]
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Self::Type>, TypeError> {
         self.as_ref().infer_output_types(input_types, region_interfaces)
     }
 
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        self.as_ref().region_names()
+    fn fold(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        self.as_ref().fold(input_types, region_interfaces)
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        self.as_ref().input_region_provenance(region_index, input_index)
     }
 
     #[inline]
@@ -321,17 +1129,1234 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     }
 
     #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        self.as_ref().region_data_flow()
+    }
+
+    #[inline]
+    fn prune_boundary(
+        &self,
+        input_types: &[Self::Type],
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        Ok(self
+            .as_ref()
+            .prune_boundary(input_types, used_outputs, regions)?
+            .map(|pruning| pruning.map_operation(Box::new)))
+    }
+
+    #[inline]
     fn is_zero(&self, output_index: usize) -> bool {
         self.as_ref().is_zero(output_index)
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        self.as_ref().region_capture_input_count(region_index)
+    }
+
+    #[inline]
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        self.as_ref().reference_output_identity_input(output_index)
+    }
+
+    #[inline]
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        self.as_ref().allows_reference_access_through_region_input(region_index, mode)
+    }
+
+    #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        self.as_ref().defers_reference_discharge()
+    }
+
+    #[inline]
+    fn effects(&self) -> Cow<'_, Effects> {
         self.as_ref().effects()
+    }
+
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Box::new(self.as_ref().rename_type_identities(renaming)?))
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         self.as_ref().render(formatter, indentation)
+    }
+}
+
+/// Names the `T`-typed member [`Operation`] family embedded in a heterogeneous [`Operation`] family. [`Program`]s that
+/// store several kinds of values in one heterogeneous [`Type`] still keep most of their operations narrow. For example,
+/// in a program mixing arrays with first-class runtime dimensions, array-only operations implement `Operation<Type =
+/// ArrayType>` and dimension-only operations implement `Operation<Type = DimensionType>`, while the heterogeneous
+/// operation family merely stores and dispatches them, providing one [`From`] implementation per member family to lift
+/// member operations into it. Those [`From`] implementations cannot, however, answer the reverse question that generic
+/// code needs: *given* the heterogeneous family and a member type `T`, which family is *the* `T`-typed member? [`From`]
+/// is many-to-one (a heterogeneous family is [`From`] many payload types), so the answer must be a type-level function
+/// from `(heterogeneous family, T)` to the member family. The [`Projected`](Self::Projected) associated type is that
+/// function. This trait adds no methods as lifting a member operation into the heterogeneous family remains the
+/// [`From`] trait's job.
+///
+/// A heterogeneous operation family implements this trait once per member kind, pointing at the member family that its
+/// corresponding [`From`] implementation lifts. For example:
+///
+/// ```rust,ignore
+/// impl<A: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayIrOperation<A> {
+///     type Projected = ArrayOperation<A>;
+/// }
+///
+/// impl<A: Value<Type = ArrayType>> OperationProjection<DimensionType> for ArrayIrOperation<A> {
+///     type Projected = DimensionOperation<DimensionValue>;
+/// }
+/// ```
+///
+/// The consumers are the projection adapters that must *name* the member family rather than merely convert into the
+/// heterogeneous one: [`ProjectedContext`](crate::ProjectedContext) defines its member-typed
+/// [`Domain::Operation`](crate::Domain::Operation) as `<C::Operation as OperationProjection<T>>::Projected` so that
+/// member-typed operations bind directly through the heterogeneous parent context, and
+/// [`ProjectedValue`](crate::ProjectedValue)'s blanket [`Value`] implementation derives its domain the same way. Code
+/// that only needs to convert a known operation into the heterogeneous family should keep writing plain `Operation:
+/// From<X>` bounds instead of this trait. Genuinely mixed operations, whose signatures cross member kinds, belong to no
+/// member family and are deliberately not projectable; dispatchers that inspect a heterogeneous operation must classify
+/// their own variants explicitly.
+pub trait OperationProjection<T: Type>: From<Self::Projected> {
+    /// The `T`-typed member [`Operation`] family embedded in this heterogeneous family. This is the operation-side
+    /// counterpart of [`ValueProjection::Projected`](crate::ValueProjection::Projected). Lifting a member operation
+    /// into the heterogeneous family goes through the [`From`] super-trait, and trait coherence guarantees that each
+    /// heterogeneous family names at most one member family per member type `T`.
+    type Projected: Operation<Type = T>;
+}
+
+/// Projection of the values of an [`Operation`] family into the concrete payload operations that they hold, and back,
+/// without naming the family. This is the runtime, type-erased counterpart of [`OperationProjection`]. It looks through
+/// the projected member variants of heterogeneous families at any depth, and it identifies payloads by [`TypeId`].
+///
+/// Code that must recognize or stage a particular payload without naming the family that holds
+/// it uses this trait. For example, a residual policy that saves the outputs of dot products must
+/// recognize a [`DotOperation`](crate::DotOperation) in [`ArrayOperation`](crate::ArrayOperation), in
+/// [`ArrayIrOperation`](crate::ArrayIrOperation) (where it lives inside the [`Array`](crate::ArrayIrOperation::Array)
+/// variant), and in backend families that embed those families as projected members, and the storage of such a policy
+/// describes how to offload a saved residual as a [`TransferToMemoryOperation`](crate::TransferToMemoryOperation)
+/// payload that the planner stages into whichever family the program uses. Borrowed [`TryFrom`] and owned [`From`]
+/// conversions cannot express that, because they require naming each family and each level of nesting, and because
+/// type-erased code cannot name the family at all.
+///
+/// `#[derive(Operation)]` generates the implementation of every derived family:
+///
+///   - A projected member variant delegates to its member family in both directions. Payloads that a member family
+///     constructs are lifted through the family's `From` conversion from that member family, exactly as staging a
+///     member operation would.
+///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
+///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
+///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
+///     such as `CompositeOperation<V, ArrayOperation<V>>` are not exposed.
+///   - [`from_payload`](Self::from_payload) tries the family's own (family-native) variants first, in declaration
+///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
+///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
+///     their instruction boundaries differ from those of their payloads, and the derive rejects two family-native
+///     variants that hold the same constructible payload type.
+///
+/// There is exactly one implementation per family, so a payload held both directly and through a member family (e.g.,
+/// a family-native `ZeroOperation<ArrayType>` next to a member family that also holds one) cannot cause conflicting
+/// implementations. Handwritten families must implement this trait with the same semantics.
+pub trait OperationPayloadProjection {
+    /// Returns the payload operation whose [`TypeId`] is `payload`, if this operation holds one directly or
+    /// through a projected member variant, and [`None`] otherwise. Trait objects, which cannot call the generic
+    /// [`projected_payload`](Self::projected_payload) function, use this function directly.
+    fn project_payload(&self, payload: TypeId) -> Option<&dyn Any>;
+
+    /// Returns the payload operation of type `P`, if this operation holds one directly or through a projected member
+    /// variant, and [`None`] otherwise.
+    #[inline]
+    fn projected_payload<P: 'static>(&self) -> Option<&P>
+    where
+        Self: Sized,
+    {
+        self.project_payload(TypeId::of::<P>()).and_then(|payload| payload.downcast_ref::<P>())
+    }
+
+    /// Returns the value of this family that holds `payload`, or `payload` back unchanged when no variant of this
+    /// family can hold it.
+    fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation>
+    where
+        Self: Sized;
+}
+
+/// Type-erased payload operation (e.g., a [`TransferToMemoryOperation`](crate::TransferToMemoryOperation) value) that
+/// [`OperationPayloadProjection::from_payload`] lifts into an [`Operation`] family. It carries the operation's type
+/// name for diagnostics.
+pub struct ErasedOperation {
+    /// Erased payload operation.
+    operation: Box<dyn Any>,
+
+    /// Name of the operation's type, as reported by [`std::any::type_name`].
+    type_name: &'static str,
+}
+
+impl ErasedOperation {
+    /// Creates a new [`ErasedOperation`] that erases `operation`.
+    #[inline]
+    pub fn new<P: 'static + Operation>(operation: P) -> Self {
+        Self { operation: Box::new(operation), type_name: std::any::type_name::<P>() }
+    }
+
+    /// Returns the name of the erased operation's type.
+    #[inline]
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// Returns the erased operation when its type is `P`, and returns this [`ErasedOperation`] unchanged otherwise.
+    #[inline]
+    pub fn downcast<P: 'static>(self) -> Result<P, Self> {
+        match self.operation.downcast::<P>() {
+            Ok(operation) => Ok(*operation),
+            Err(operation) => Err(Self { operation, type_name: self.type_name }),
+        }
+    }
+}
+
+impl std::fmt::Debug for ErasedOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("ErasedOperation").field(&self.type_name).finish()
+    }
+}
+
+/// Selects and constructs the concrete [`Operation`] staged by one value-level capability for program type `T`.
+///
+/// Capabilities such as [`Mul`](crate::Mul) are declared once through the elementwise capability macro and are
+/// blanket-implemented for every [`Value`]. The same call, for example `left.mul(&right)`, must therefore stage a
+/// different concrete operation depending on the inputs' type family (e.g., multiplying arrays stages the stateless
+/// [`MulOperation`](crate::MulOperation) itself, while multiplying first-class dimensions must stage a
+/// [`DimensionMulOperation`](crate::DimensionMulOperation) whose payload is computed from the input types). This trait
+/// is that selection point. The generated capability implementation calls `<OperationMarker as
+/// OperationProvider<V::Type>>::provide((), &[..input types..])` and binds the returned operation with the declared
+/// operation marker acting as its own family's provider.
+///
+/// The default `Request = ()` needs no construction arguments beyond input types, as used by elementwise capabilities.
+/// A caller can instead pass an operation payload as a request to its context's operation family. For example,
+/// `ZeroOperation::new(output_type)` requests a zero with no inputs. The selected operation may differ from the request
+/// (e.g., heterogeneous families select their member operations, and unsupported families return an error).
+///
+/// Explicit requests use the same payload types as ordinary operation construction. The default unit request keeps
+/// self-provision separate from family selection, including when a family is a single operation.
+///
+/// The default request supports two implementation levels:
+///
+///   - **Self-Provision (Blanket):** A stateless operation that implements [`Operation<Type = T>`](Operation) and
+///     [`Default`] provides itself for `T`, so ordinary homogeneous operation families need no code at all.
+///   - **Per-Type-Family Override:** A type family whose concrete operation carries type-derived metadata implements
+///     this trait for the marker directly (e.g., `impl OperationProvider<DimensionType> for MulOperation`),
+///     constructing the family-specific operation from the input types. Such an override is coherent with the blanket
+///     implementation exactly because the marker does not implement `Operation<Type = T>` for that type family, which
+///     is also precisely the situation that requires providing a different concrete operation.
+///
+/// The contract is deliberately narrow. `input_types` contains exactly the operation's input type descriptors in input
+/// order, callers (i.e., the generated capability implementations) always pass borrowed stack arrays, and provider
+/// implementations validate the arity they support. Selection receives construction metadata and input types, never
+/// runtime values. Region-carrying operations and operations requiring explicit user parameters keep their ordinary
+/// constructors unless their request explicitly carries those arguments.
+pub trait OperationProvider<T: Type, Request = ()> {
+    /// Concrete [`Operation`] type provided for program [`Type`] `T`.
+    type Operation: Operation<Type = T>;
+
+    /// Selects and constructs the [`Operation`] for `request` and its ordered input types. Constructor arguments belong
+    /// in `request`. `input_types` contains only input types and is empty for nullary operations. A family may reject
+    /// requests for operations that it does not support.
+    fn provide(request: Request, input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
+}
+
+impl<O: Default + Operation> OperationProvider<O::Type> for O {
+    type Operation = O;
+
+    #[inline]
+    fn provide(_request: (), _input_types: &[&O::Type]) -> Result<Self::Operation, ProgramError> {
+        Ok(Self::default())
+    }
+}
+
+/// Parent-universe [`Operation`] contract for a payload whose native operation type does not describe
+/// the complete instruction boundary in that parent universe. This is the base-operation counterpart
+/// of [`MemberBatchableOperation`](crate::MemberBatchableOperation) and
+/// [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation).
+///
+/// Most [`Operation`] enum variants do not need this capability. Family-native payloads already implement
+/// `Operation<Type = U>`, while homogeneous member payloads use projected boundary helpers like
+/// [`infer_projected_operation_region_input_types`] and [`infer_projected_operation_output_types`]. A mixed member
+/// needs this trait only when it deliberately retains a native payload type `T` but its enclosing instruction has a
+/// different or mixed `U`-typed signature. Dynamic array constructors and shape-changing collectives are examples.
+/// Their payloads remain canonical array operations, while their [`Instruction`]s additionally consume first-class
+/// dimension inputs.
+///
+/// Implementations own only the boundary-dependent parts of [`Operation`]. Name, [`Region`](crate::Region) slots,
+/// provenance, structural zero classification, effects, and rendering remain properties of the native payload and are
+/// delegated directly by the enclosing operation family.
+pub trait MemberOperation<U: Type>: Operation {
+    /// Declares supplemental output identities in parent universe `U`, following
+    /// [`Operation::defined_type_identities`]. A mixed boundary can use a different identity vocabulary than its
+    /// native payload, so declarations require this explicit parent-universe adapter. The default declares none.
+    ///
+    /// Use this when the instruction's `U`-typed outputs reference an identity that no input carries and that the
+    /// native payload cannot name, because in its own universe the same output is an ordinary value. Identities that
+    /// an input already carries are forwarded by region sealing and must not be declared here; a mixed array
+    /// constructor whose outputs only reference the identities of its first-class dimension inputs therefore keeps the
+    /// default. The declared identities are operation metadata and must follow [`Self::rename_parent_type_identities`].
+    ///
+    /// Region sealing records these definitions in output-occurrence order and rejects a later instruction that
+    /// declares an existing identity without forwarding it from an input.
+    #[inline]
+    fn parent_defined_type_identities(&self) -> Cow<'_, [U::Identity]> {
+        Cow::Borrowed(&[])
+    }
+
+    /// Validates the attached-[`Region`](crate::Region) interfaces of this payload's instruction in parent universe
+    /// `U`, using [`Operation::validate_region_interfaces`] semantics. The default implementation only checks the
+    /// number of attached regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Operation::validate_region_interfaces`].
+    #[inline]
+    fn validate_parent_region_interfaces(&self, region_interfaces: &[RegionInterface<U>]) -> Result<(), ProgramError> {
+        self.validate_region_count(region_interfaces.len())
+    }
+
+    /// Infers attached-[`Region`](crate::Region) input [`Type`]s for this payload's instruction in parent universe `U`.
+    fn infer_parent_region_input_types(
+        &self,
+        input_types: &[U],
+        region_interfaces: &[RegionInterface<U>],
+    ) -> Result<Vec<Option<Vec<U>>>, TypeError>;
+
+    /// Infers output [`Type`]s for this payload's instruction in parent universe `U`.
+    fn infer_parent_output_types(
+        &self,
+        input_types: &[U],
+        region_interfaces: &[RegionInterface<U>],
+    ) -> Result<Vec<U>, TypeError>;
+
+    /// Folds this payload's validated instruction in parent universe `U`, using [`Operation::fold`] semantics. A
+    /// singleton replacement names the enclosing instruction's inferred output type in `U`.
+    #[inline]
+    fn fold_parent(
+        &self,
+        input_types: &[U],
+        region_interfaces: &[RegionInterface<U>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        let _ = (input_types, region_interfaces);
+        Ok(None)
+    }
+
+    /// Prunes the boundary of this payload's instruction in parent universe `U`, using [`Operation::prune_boundary`]
+    /// semantics, given the instruction's actual input types in `U`. The default keeps every instruction whole.
+    #[inline]
+    fn prune_parent_boundary(
+        &self,
+        input_types: &[U],
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        let _ = (input_types, used_outputs, regions);
+        Ok(None)
+    }
+
+    /// Renames parent-universe [`TypeIdentity`](crate::TypeIdentity)s referenced by this payload.
+    fn rename_parent_type_identities(&self, renaming: &TypeIdentityRenaming<U::Identity>) -> Result<Self, TypeError>;
+}
+
+/// Replacement that an [`Operation::fold`] rule selects for one output. Rules return one replacement per output, in
+/// output order, and the staging boundary that applies the fold resolves them through [`Operation::resolve_fold`],
+/// which validates every replacement against the already inferred application boundary before it is applied, so rules
+/// never validate their own selections.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum OperationFoldOutput {
+    /// The output is the input at this index. Returning an input needs no conversion and allocates no new identity;
+    /// the input's type must refine the inferred output type.
+    Input(usize),
+
+    /// The output is the unique value of its inferred output type (e.g., a first-class dimension whose inferred bounds
+    /// are a singleton interval). The value family materializes it through [`Value::singleton`] as a program constant
+    /// of exactly that type, so the constant keeps the inferred output identity.
+    Singleton,
+}
+
+/// Resolved replacement for one folded output, produced by [`Operation::resolve_fold`] from an
+/// [`OperationFoldOutput`] and ready to be applied by the staging boundary that requested the fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationFoldReplacement<V> {
+    /// The output aliases the input at this index.
+    Input(usize),
+
+    /// The output is this materialized constant, whose type is the inferred output type.
+    Constant(V),
+}
+
+/// Pruned boundary of one region-carrying [`Instruction`], as returned by [`Operation::prune_boundary`].
+/// [`Program::into_pruned`] applies it by dropping the instruction inputs and outputs that are not kept
+/// and by attaching pruned copies of the regions, so that regions attached elsewhere are never modified.
+///
+/// The kept boundary of each attached region follows from the region provenance that the operation declares (i.e.,
+/// [`Operation::input_region_provenance`] and [`Operation::output_region_provenance`]). A region input is kept unless
+/// it is supplied by an instruction input that is dropped, and a region output is kept unless every instruction output
+/// that it supplies is dropped. Region inputs that the operation creates itself or that have no declared provenance,
+/// and region outputs that supply no instruction output, are therefore always kept.
+///
+/// A pruning must keep every output of the instruction that is used, and every instruction input that supplies a region
+/// input that is live once only the kept outputs of that region are used (i.e.,
+/// [`RegionLiveness::used_region_inputs`]). Instruction inputs whose region inputs are not live may still be kept,
+/// which is how operations keep region boundaries that must agree (e.g., the two branches of a `condition` operation).
+/// [`Program::into_pruned`] checks both requirements and validates the pruned instruction with
+/// [`Operation::infer_output_types`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OperationBoundaryPruning<O> {
+    /// Operation that applies to the kept inputs and produces the kept outputs (e.g., a `scan` with fewer carries).
+    pub operation: O,
+
+    /// Whether each input of the [`Instruction`] is kept.
+    pub kept_inputs: Vec<bool>,
+
+    /// Whether each output of the [`Instruction`] is kept.
+    pub kept_outputs: Vec<bool>,
+}
+
+impl<O: Operation> OperationBoundaryPruning<O> {
+    /// Returns this [`OperationBoundaryPruning`] with its operation mapped by `function` (e.g., wrapped into the
+    /// variant of the operation family that holds it).
+    #[inline]
+    pub fn map_operation<P, F: FnOnce(O) -> P>(self, function: F) -> OperationBoundaryPruning<P> {
+        OperationBoundaryPruning {
+            operation: function(self.operation),
+            kept_inputs: self.kept_inputs,
+            kept_outputs: self.kept_outputs,
+        }
+    }
+
+    /// Validates that this pruning describes the boundary of `instruction`, whose outputs that `used_outputs`
+    /// marks are used,and that it keeps every used output.
+    pub(crate) fn validate(&self, instruction: &Instruction<O>, used_outputs: &[bool]) -> Result<(), ProgramError> {
+        let name = instruction.operation().name();
+        if self.kept_inputs.len() != instruction.inputs().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the boundary pruning of operation `{}` describes {} inputs but its instruction has {}",
+                name,
+                self.kept_inputs.len(),
+                instruction.inputs().len(),
+            )));
+        }
+
+        if self.kept_outputs.len() != instruction.outputs().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the boundary pruning of operation `{}` describes {} outputs but its instruction has {}",
+                name,
+                self.kept_outputs.len(),
+                instruction.outputs().len(),
+            )));
+        }
+
+        if let Some(output) = (0..used_outputs.len()).find(|&output| used_outputs[output] && !self.kept_outputs[output])
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the boundary pruning of operation `{name}` drops its used output {output}",
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Returns whether each input and each output of each region attached to `instruction` is kept, in attachment
+    /// order, as derived from the kept boundary of the instruction that this pruning describes through the region
+    /// provenance of its operation. A region input is kept unless the instruction input that supplies it is dropped,
+    /// and a region output is kept unless every instruction output that it supplies is dropped.
+    pub(crate) fn kept_region_boundaries<V: Value<Type = O::Type>>(
+        &self,
+        instruction: &Instruction<O>,
+        arena: &RegionArena<V, O>,
+    ) -> Result<(Vec<Vec<bool>>, Vec<Vec<bool>>), ProgramError> {
+        let operation = instruction.operation();
+        let mut kept_inputs = Vec::with_capacity(instruction.regions().len());
+        let mut supplied_outputs = Vec::with_capacity(instruction.regions().len());
+        for (region_index, region) in instruction.regions().iter().enumerate() {
+            let region = RegionRef::new(arena, *region)?;
+            kept_inputs.push(
+                (0..region.input_ids().len())
+                    .map(|input_index| match operation.input_region_provenance(region_index, input_index) {
+                        InputRegionProvenance::Input { index } => self.kept_inputs.get(index).copied().unwrap_or(true),
+                        InputRegionProvenance::Local | InputRegionProvenance::None => true,
+                    })
+                    .collect(),
+            );
+            supplied_outputs.push(vec![None; region.output_ids().len()]);
+        }
+
+        // Each region output records whether some kept instruction output takes its value from it, and outputs that
+        // supply no instruction output at all stay `None` and are kept.
+        for (output_index, kept) in self.kept_outputs.iter().enumerate() {
+            for origin in operation.output_region_provenance(output_index) {
+                if let Some(supplied) = supplied_outputs
+                    .get_mut(origin.region_index)
+                    .and_then(|outputs| outputs.get_mut(origin.output_index))
+                {
+                    *supplied = Some(supplied.unwrap_or(false) || *kept);
+                }
+            }
+        }
+
+        let kept_outputs = supplied_outputs
+            .into_iter()
+            .map(|outputs| outputs.into_iter().map(|supplied| supplied.unwrap_or(true)).collect())
+            .collect();
+        Ok((kept_inputs, kept_outputs))
+    }
+}
+
+/// Validates the region interfaces of a member [`Operation`] through a heterogeneous type boundary, using
+/// [`Operation::validate_region_interfaces`] semantics. Every attached-region [`RegionInterface`] is first
+/// projected to `T`. Projection fails with the heterogeneous type's canonical wrong-member [`TypeError`].
+///
+/// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
+/// transform role. Operation implementations normally call their payload's [`Operation::validate_region_interfaces`]
+/// method directly.
+///
+/// # Parameters
+///
+///   - `operation`: Member operation whose native type is `T`.
+///   - `region_interfaces`: Heterogeneous interfaces of regions attached to the enclosing operation.
+pub fn validate_projected_operation_region_interfaces<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
+    operation: &O,
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<(), ProgramError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    // Check the region count before projecting, so that an unexpected region reports the native count diagnostic
+    // rather than a wrong-member error for one of its types.
+    operation.validate_region_count(region_interfaces.len())?;
+    let (_, region_interfaces) = project_operation_boundary(&[], region_interfaces)?;
+    operation.validate_region_interfaces(&region_interfaces)
+}
+
+/// Infers the region input types of a member [`Operation`] through a heterogeneous type boundary. Every heterogeneous
+/// input and attached-region [`RegionInterface`] is first projected to `T`; the inferred member types are then lifted
+/// back into `U`. Projection fails with the heterogeneous type's canonical wrong-member [`TypeError`].
+///
+/// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
+/// transform role. Operation implementations normally call their payload's [`Operation::infer_region_input_types`]
+/// method directly.
+///
+/// # Parameters
+///
+///   - `operation`: Member operation whose native type is `T`.
+///   - `input_types`: Heterogeneous input types supplied to the enclosing operation.
+///   - `region_interfaces`: Heterogeneous interfaces of regions attached to the enclosing operation.
+pub fn infer_projected_operation_region_input_types<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<Vec<Option<Vec<I>>>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    Ok(operation
+        .infer_region_input_types(&input_types, &region_interfaces)?
+        .into_iter()
+        .map(|types| types.map(|types| types.into_iter().map(I::from).collect()))
+        .collect())
+}
+
+/// Infers the output types of a member [`Operation`] through a heterogeneous type boundary. Every heterogeneous input
+/// and attached-region [`RegionInterface`] is first projected to `T`; the inferred member outputs are then lifted back
+/// into `U`. Projection fails with the heterogeneous type's canonical wrong-member [`TypeError`].
+///
+/// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
+/// transform role. Operation implementations normally call their payload's [`Operation::infer_output_types`] method
+/// directly.
+///
+/// # Parameters
+///
+///   - `operation`: Member operation whose native type is `T`.
+///   - `input_types`: Heterogeneous input types supplied to the enclosing operation.
+///   - `region_interfaces`: Heterogeneous interfaces of regions attached to the enclosing operation.
+pub fn infer_projected_operation_output_types<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<Vec<I>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    Ok(operation.infer_output_types(&input_types, &region_interfaces)?.into_iter().map(I::from).collect())
+}
+
+/// Folds a projected member operation after projecting every input and region interface to its native type.
+/// Input positions are unchanged by projection, so input replacements also apply to the enclosing operation, and a
+/// singleton replacement names the enclosing operation's inferred output type, which projects to the same member.
+/// This function supports projected variants generated by `#[derive(Operation)]`.
+pub fn fold_projected_operation<T: Type, I: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<Option<Vec<OperationFoldOutput>>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    operation.fold(&input_types, &region_interfaces)
+}
+
+/// Prunes the boundary of a projected member [`Operation`]'s instruction after projecting its input types to the
+/// member's native type, using [`Operation::prune_boundary`] semantics. Input and output positions are unchanged by
+/// projection, so the returned pruning also applies to the enclosing operation's instruction once its payload is
+/// wrapped. This function supports projected variants generated by `#[derive(Operation)]`.
+pub fn prune_projected_operation_boundary<T: Type, I: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    used_outputs: &[bool],
+    regions: &mut dyn RegionLiveness,
+) -> Result<Option<OperationBoundaryPruning<O>>, ProgramError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, _) = project_operation_boundary::<T, I>(input_types, &[])?;
+    operation.prune_boundary(&input_types, used_outputs, regions)
+}
+
+/// Projects one member [`Operation`]'s complete inference boundary from the enclosing heterogeneous type `U` to its
+/// native member type `T`. This includes every ordinary input type and both the input and output types of every
+/// attached [`RegionInterface`]. Region effects are structural metadata rather than member-typed values, so they are
+/// preserved unchanged.
+///
+/// Projection is atomic: if any boundary type belongs to another member kind, this function returns that conversion's
+/// [`TypeError`] before the member operation's inference rule runs. The returned collections are owned because the
+/// native inference APIs require `&[T]` and `RegionInterface<T>`, rather than borrowed member views whose containing
+/// values remain typed as `U`.
+///
+/// # Parameters
+///
+///   - `input_types`: Heterogeneous types of the member operation's ordinary inputs.
+///   - `region_interfaces`: Heterogeneous input/output type contracts and effects of its attached regions.
+fn project_operation_boundary<T: Type, U: Type>(
+    input_types: &[U],
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<(Vec<T>, Vec<RegionInterface<T>>), TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    Ok((
+        input_types.iter().map(|r#type| <&T>::try_from(r#type).cloned()).collect::<Result<_, _>>()?,
+        region_interfaces
+            .iter()
+            .map(|interface| {
+                Ok(RegionInterface::new(
+                    interface
+                        .input_types()
+                        .iter()
+                        .map(|r#type| <&T>::try_from(r#type).cloned())
+                        .collect::<Result<_, _>>()?,
+                    interface
+                        .output_types()
+                        .iter()
+                        .map(|r#type| <&T>::try_from(r#type).cloned())
+                        .collect::<Result<_, _>>()?,
+                    interface.effects(),
+                )
+                .with_deferred_work(interface.has_deferred_work()))
+            })
+            .collect::<Result<_, TypeError>>()?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::marker::PhantomData;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType, DimensionBounds, DimensionType,
+        DimensionValue,
+    };
+    use crate::operations::{
+        ConditionOperation, DimensionAddOperation, DimensionPowOperation, ReferenceNewOperation, ScanOperation,
+        SinOperation, StopGradientOperation, TagOperation, ZeroOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::effects::{EffectClass, EffectClasses, ReferenceEffect};
+
+    use super::*;
+
+    /// Test operation that makes every [`Operation`] method's forwarding observable for an arbitrary type family.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ForwardingOperation<T: Type> {
+        /// Whether [`Operation::rename_type_identities`] has been called.
+        renamed: bool,
+
+        /// Type family whose operation contract this fixture implements.
+        marker: PhantomData<fn() -> T>,
+    }
+
+    impl<T: Type> Operation for ForwardingOperation<T> {
+        type Type = T;
+
+        fn name(&self) -> &'static str {
+            "forwarding"
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("body")] }
+        }
+
+        fn infer_region_input_types(
+            &self,
+            input_types: &[T],
+            _region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+            Ok(vec![Some(input_types.to_vec())])
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[T],
+            region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            Ok(input_types.iter().chain(region_interfaces[0].output_types()).cloned().collect())
+        }
+
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+            match region_index {
+                0 => InputRegionProvenance::Input { index: input_index + 1 },
+                1 if input_index == 0 => InputRegionProvenance::Local,
+                _ => InputRegionProvenance::None,
+            }
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            vec![OutputRegionProvenance { region_index: 0, output_index }]
+        }
+
+        fn region_data_flow(&self) -> RegionDataFlow<'_> {
+            RegionDataFlow::Provenance
+        }
+
+        fn prune_boundary(
+            &self,
+            input_types: &[Self::Type],
+            used_outputs: &[bool],
+            regions: &mut dyn RegionLiveness,
+        ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+            let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
+            kept_inputs.resize(input_types.len(), true);
+            Ok(Some(OperationBoundaryPruning {
+                operation: self.clone(),
+                kept_inputs,
+                kept_outputs: used_outputs.to_vec(),
+            }))
+        }
+
+        fn is_zero(&self, output_index: usize) -> bool {
+            output_index == 2
+        }
+
+        fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+            (region_index == 0).then_some(2)
+        }
+
+        fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+            (output_index == 3).then_some(1)
+        }
+
+        fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+            region_index == 0 && mode == ReferenceAccessMode::Read
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(
+                Effects::new(
+                    EffectClasses::single(EffectClass::OrderedIo),
+                    vec![ReferenceEffect::Allocate { output_index: 0 }],
+                )
+                .unwrap(),
+            )
+        }
+
+        fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+            Ok(Self { renamed: true, marker: PhantomData })
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
+            formatter.write_str("forwarded")
+        }
+    }
+
+    /// Test operation over a fixed output boundary whose folding rule returns explicitly selected replacements.
+    #[derive(Clone, Debug)]
+    struct SelectedFoldOperation<T: Type> {
+        /// Output types this operation infers for every application.
+        output_types: Vec<T>,
+
+        /// Replacements returned by [`Operation::fold`].
+        outputs: Vec<OperationFoldOutput>,
+    }
+
+    impl<T: Type> Operation for SelectedFoldOperation<T> {
+        type Type = T;
+
+        fn name(&self) -> &'static str {
+            "selected_fold"
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[T],
+            _region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            Ok(self.output_types.clone())
+        }
+
+        fn fold(
+            &self,
+            _input_types: &[T],
+            _region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+            Ok(Some(self.outputs.clone()))
+        }
+
+        fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+            Ok(self.clone())
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
+            formatter.write_str(self.name())
+        }
+    }
+
+    #[test]
+    fn test_operation_formatter() {
+        // Check that short fields are rendered inline.
+        assert_eq!(
+            std::fmt::from_fn(|formatter| {
+                OperationFormatter::new(formatter, 0, "metadata")?.bracketed(|operation| {
+                    operation.field("mode", "test")?;
+                    operation.field("count", 2)
+                })
+            })
+            .to_string(),
+            "metadata [mode=test, count=2]",
+        );
+
+        // Check that long fields are wrapped over multiple lines.
+        const LONG_VALUE: &str =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(
+            std::fmt::from_fn(|formatter| {
+                OperationFormatter::new(formatter, 0, "metadata")?
+                    .bracketed(|operation| operation.field("value", LONG_VALUE))
+            })
+            .to_string(),
+            format!(
+                indoc! {"
+                    metadata [
+                        value={value},
+                    ]
+                "},
+                value = LONG_VALUE,
+            )
+            .trim_end()
+        );
+
+        // Check that program fields are rendered over multiple lines.
+        let mut builder = ProgramBuilder::<Array, StopGradientOperation<ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        assert_eq!(
+            std::fmt::from_fn(|formatter| {
+                OperationFormatter::new(formatter, 0, "nested")?.bracketed(|operation| {
+                    operation.field("tag", "before")?;
+                    operation.program("body", &program)?;
+                    operation.field("tag", "after")
+                })
+            })
+            .to_string(),
+            indoc! {"
+                nested [
+                    tag=before,
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = stop_gradient %0
+                        in (%1)
+                    },
+                    tag=after,
+                ]
+            "}
+            .trim_end()
+        );
+    }
+
+    #[test]
+    fn test_operation() {
+        /// [`RegionLiveness`] whose attached regions use only their first input.
+        struct FirstInputLiveness;
+
+        impl RegionLiveness for FirstInputLiveness {
+            fn used_region_inputs(
+                &mut self,
+                _region_index: usize,
+                _used_outputs: &[bool],
+            ) -> Result<Vec<bool>, ProgramError> {
+                Ok(vec![true, false])
+            }
+        }
+
+        let operation = StopGradientOperation::<DataType>::new();
+
+        // Check required inference and the default operation contract. The fixture operation is variadic,
+        // so its inference forwards every input type, including for an empty input list.
+        assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(
+            operation.infer_output_types(&[DataType::F64, DataType::I32], &[]),
+            Ok(vec![DataType::F64, DataType::I32]),
+        );
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(Vec::new()));
+        let region_interfaces = [
+            RegionInterface::new(vec![DataType::F32], vec![DataType::F64], EffectClasses::NONE),
+            RegionInterface::new(vec![DataType::I32], vec![DataType::I64], EffectClasses::NONE),
+        ];
+
+        assert_eq!(operation.fold(&[DataType::F64], &[]), Ok(None));
+        assert_eq!(operation.region_slots(), &[]);
+        assert_eq!(operation.region_role(0), None);
+        assert_eq!(operation.validate_region_interfaces(&[]), Ok(()));
+        assert_eq!(
+            operation.validate_region_interfaces(&region_interfaces[..1]),
+            Err(ProgramError::MalformedProgram(
+                "operation `stop_gradient` declares no region slots but 1 regions were attached".to_string(),
+            )),
+        );
+        assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
+        assert_eq!(operation.output_region_provenance(0), Vec::new());
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Opaque));
+        assert!(matches!(operation.prune_boundary(&[DataType::F64], &[false], &mut FirstInputLiveness), Ok(None)));
+        assert_eq!(operation.region_capture_input_count(0), None);
+        assert_eq!(operation.reference_output_identity_input(0), None);
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
+        assert!(!operation.is_zero(0));
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+        assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
+        assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "stop_gradient");
+
+        // Check that `Box<O>` forwards every method rather than silently falling back to a trait default.
+        let operation = Box::new(ForwardingOperation::<DataType> { renamed: false, marker: PhantomData });
+        let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], EffectClasses::NONE)];
+
+        assert_eq!(operation.name(), "forwarding");
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
+        assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
+        assert_eq!(operation.region_role(1), None);
+        assert_eq!(operation.validate_region_interfaces(&region_interfaces), Ok(()));
+        assert_eq!(
+            operation.validate_region_interfaces(&[]),
+            Err(ProgramError::MalformedProgram(
+                "operation `forwarding` declares 1 region slots but 0 regions were attached".to_string(),
+            )),
+        );
+        assert_eq!(
+            operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
+            Ok(vec![Some(vec![DataType::F32])]),
+        );
+        assert_eq!(operation.input_region_provenance(0, 2), InputRegionProvenance::Input { index: 3 });
+        assert_eq!(operation.input_region_provenance(1, 2), InputRegionProvenance::None);
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::Local);
+
+        assert_eq!(
+            operation.infer_output_types(&[DataType::F32], &region_interfaces),
+            Ok(vec![DataType::F32, DataType::F64]),
+        );
+        assert_eq!(
+            operation.output_region_provenance(3),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
+        );
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        let boxed_scan = Box::new(ScanOperation::<ArrayType>::new(2, 3usize));
+        let RegionDataFlow::Custom(expected) = boxed_scan.as_ref().region_data_flow() else {
+            panic!("a scan must declare its custom region data flow");
+        };
+        let RegionDataFlow::Custom(forwarded) = boxed_scan.region_data_flow() else {
+            panic!("boxed operation dispatch must retain its payload's custom region data flow");
+        };
+        assert!(std::ptr::eq(forwarded, expected));
+        assert_eq!(
+            operation.prune_boundary(&[DataType::F32; 3], &[true, false], &mut FirstInputLiveness),
+            Ok(Some(OperationBoundaryPruning {
+                operation: Box::new(ForwardingOperation::<DataType> { renamed: false, marker: PhantomData }),
+                kept_inputs: vec![true, false, true],
+                kept_outputs: vec![true, false],
+            })),
+        );
+        assert!(!operation.is_zero(1));
+        assert!(operation.is_zero(2));
+        assert_eq!(operation.region_capture_input_count(0), Some(2));
+        assert_eq!(operation.region_capture_input_count(1), None);
+        assert_eq!(operation.reference_output_identity_input(3), Some(1));
+        assert_eq!(operation.reference_output_identity_input(2), None);
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
+        assert!(!operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
+        assert_eq!(operation.effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
+        assert_eq!(
+            operation.effects().classes(),
+            EffectClasses::single(EffectClass::OrderedIo).union(EffectClasses::single(EffectClass::OrderedState)),
+        );
+        assert_eq!(
+            operation.rename_type_identities(&TypeIdentityRenaming::new()),
+            Ok(Box::new(ForwardingOperation::<DataType> { renamed: true, marker: PhantomData })),
+        );
+        assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "forwarded",);
+    }
+
+    #[test]
+    fn test_operation_fold_forwarding() {
+        // Boxed operations forward folding to their payload without altering the selected replacements.
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = Box::new(DimensionAddOperation::new(&value, &zero).unwrap());
+        assert_eq!(operation.fold(&[value, zero], &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+    }
+
+    #[test]
+    fn test_operation_resolve_fold_input() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = DimensionAddOperation::new(&value, &zero).unwrap();
+        let inputs = [value, zero];
+        let outputs = operation.infer_output_types(&inputs, &[]).unwrap();
+        assert_eq!(
+            operation.resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Ok(Some(vec![OperationFoldReplacement::Input(0)])),
+        );
+
+        // A rule that declines to fold resolves to nothing.
+        let operation = DimensionAddOperation::new(&inputs[0], &inputs[0]).unwrap();
+        let sum_inputs = [inputs[0].clone(), inputs[0].clone()];
+        let sum_outputs = operation.infer_output_types(&sum_inputs, &[]).unwrap();
+        assert_eq!(operation.resolve_fold::<DimensionValue>(&sum_inputs, &[], &sum_outputs), Ok(None));
+
+        // A replacement must refine the declared output; the zero input cannot replace this positive sum.
+        let selected = |selected| SelectedFoldOperation { output_types: outputs.clone(), outputs: selected };
+        assert_eq!(
+            selected(vec![OperationFoldOutput::Input(1)]).resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Err(TypeError::invalid(format!(
+                "dimension type {} cannot instantiate declared type {}",
+                inputs[1], outputs[0],
+            ))),
+        );
+
+        // Every output needs exactly one replacement, and replacements may only name existing inputs.
+        assert_eq!(
+            selected(Vec::new()).resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Err(TypeError::invalid("expected 1 fold output but got 0")),
+        );
+        assert_eq!(
+            selected(vec![OperationFoldOutput::Input(2)]).resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Err(TypeError::invalid("`selected_fold` fold references input 2 but has 2 inputs")),
+        );
+    }
+
+    #[test]
+    fn test_operation_resolve_fold_singleton() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = DimensionPowOperation::new(&value, &zero).unwrap();
+        let inputs = [value.clone(), zero.clone()];
+        let outputs = operation.infer_output_types(&inputs, &[]).unwrap();
+        assert_eq!(outputs[0].extent(), Some(1));
+        assert_eq!(operation.fold(&inputs, &[]), Ok(Some(vec![OperationFoldOutput::Singleton])));
+
+        // The materialized constant carries the inferred output type, including its identity.
+        assert_eq!(
+            operation.resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Ok(Some(vec![OperationFoldReplacement::Constant(DimensionValue::new(outputs[0].clone(), 1).unwrap())])),
+        );
+
+        // A singleton claim is rejected when the inferred output type admits more than one value.
+        let wide = DimensionType::new("wide", DimensionBounds::new(2, Some(9)).unwrap());
+        let selected =
+            SelectedFoldOperation { output_types: vec![wide.clone()], outputs: vec![OperationFoldOutput::Singleton] };
+        assert_eq!(
+            selected.resolve_fold::<DimensionValue>(&inputs, &[], &[wide.clone()]),
+            Err(TypeError::invalid(format!(
+                "`selected_fold` fold declares a singleton output but its type `{wide}` does not determine a value",
+            ))),
+        );
+
+        // A value family that cannot materialize the type's unique value rejects the claim too.
+        let scalar = ArrayType::scalar(DataType::F32);
+        let selected =
+            SelectedFoldOperation { output_types: vec![scalar.clone()], outputs: vec![OperationFoldOutput::Singleton] };
+        assert_eq!(
+            selected.resolve_fold::<Array>(&[scalar.clone()], &[], &[scalar.clone()]),
+            Err(TypeError::invalid(format!(
+                "`selected_fold` fold declares a singleton output but its type `{scalar}` does not determine a value",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_operation_boundary_pruning_map_operation() {
+        // Mapping the operation (e.g., into the variant of the operation family that holds it) keeps the boundary.
+        let operation = ForwardingOperation::<DataType> { renamed: false, marker: PhantomData };
+        let pruning = OperationBoundaryPruning {
+            operation: operation.clone(),
+            kept_inputs: vec![true, false],
+            kept_outputs: vec![false, true],
+        };
+        assert_eq!(
+            pruning.map_operation(Box::new),
+            OperationBoundaryPruning {
+                operation: Box::new(operation),
+                kept_inputs: vec![true, false],
+                kept_outputs: vec![false, true],
+            },
+        );
+    }
+
+    #[test]
+    fn test_operation_payload_projection() {
+        // Payloads are recognized directly in a family, through the projected array member of an array IR family,
+        // and through trait objects.
+        let sin = ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new());
+        let tag = ArrayIrOperation::<Array>::from(ArrayOperation::<Array>::from(TagOperation::new("residual")));
+        let reference = ArrayIrOperation::<Array>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+        assert!(sin.projected_payload::<SinOperation<ArrayType>>().is_some());
+        assert!(sin.projected_payload::<TagOperation<ArrayType>>().is_none());
+        assert_eq!(tag.projected_payload::<TagOperation<ArrayType>>().map(TagOperation::key), Some("residual"));
+        assert!(tag.projected_payload::<TagOperation<ArrayIrType>>().is_none());
+        assert!(reference.projected_payload::<ReferenceNewOperation<ArrayType, ArrayIrType>>().is_some());
+        let tag: &dyn OperationPayloadProjection = &tag;
+        let tag = tag.project_payload(TypeId::of::<TagOperation<ArrayType>>());
+        assert_eq!(
+            tag.and_then(|tag| tag.downcast_ref::<TagOperation<ArrayType>>()).map(TagOperation::key),
+            Some("residual")
+        );
+
+        // Region-carrying payloads are exposed too when their types mention no generic parameter of their family.
+        let condition = ArrayOperation::<Array>::from(ConditionOperation::<ArrayType>::new());
+        assert!(condition.projected_payload::<ConditionOperation<ArrayType>>().is_some());
+    }
+
+    #[test]
+    fn test_erased_operation() {
+        let payload = ErasedOperation::new(SinOperation::<ArrayType>::new());
+        let type_name = std::any::type_name::<SinOperation<ArrayType>>();
+        assert_eq!(payload.type_name(), type_name);
+        assert_eq!(format!("{payload:?}"), format!("ErasedOperation({type_name:?})"));
+
+        // A failed downcast returns the payload unchanged.
+        let payload = payload.downcast::<TagOperation<ArrayType>>().unwrap_err();
+        assert_eq!(payload.type_name(), type_name);
+        assert_eq!(payload.downcast::<SinOperation<ArrayType>>().unwrap().to_string(), "sin");
+    }
+
+    #[test]
+    fn test_operation_payload_projection_from_payload() {
+        // Native payloads construct their own variants, including in an array IR family.
+        let sin = ArrayOperation::<Array>::from_payload(ErasedOperation::new(SinOperation::<ArrayType>::new()));
+        assert!(matches!(sin, Ok(ArrayOperation::Sin(_))));
+        let reference = ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(ReferenceNewOperation::<
+            ArrayType,
+            ArrayIrType,
+        >::new()));
+        assert!(matches!(reference, Ok(ArrayIrOperation::ReferenceNew(_))));
+        let condition =
+            ArrayOperation::<Array>::from_payload(ErasedOperation::new(ConditionOperation::<ArrayType>::new()));
+        assert!(matches!(condition, Ok(ArrayOperation::Condition(_))));
+
+        // Array payloads construct through the projected array member, whose result the array IR family's `From`
+        // conversion lifts. The mixed `Zero` variant is never constructed directly, so the zero constructor reaches
+        // the array IR family through that same conversion.
+        let tag =
+            ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(TagOperation::<ArrayType>::new("residual")));
+        assert!(matches!(tag, Ok(ArrayIrOperation::Array(ArrayOperation::Tag(_)))));
+        let r#type = ArrayType::scalar(DataType::F64);
+        let zero =
+            ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(ZeroOperation::new(r#type.clone()))).unwrap();
+        assert_eq!(zero.to_string(), ArrayIrOperation::<Array>::from(ZeroOperation::new(r#type)).to_string());
+
+        // Payloads that no variant holds are returned unchanged.
+        let payload = ErasedOperation::new(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+        let payload = ArrayOperation::<Array>::from_payload(payload).unwrap_err();
+        assert_eq!(payload.type_name(), std::any::type_name::<ReferenceNewOperation<ArrayType, ArrayIrType>>());
+    }
+
+    #[test]
+    fn test_fold_projected_operation() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = DimensionAddOperation::new(&value, &zero).unwrap();
+        let inputs = [ArrayIrType::Dimension(value), ArrayIrType::Dimension(zero)];
+        assert_eq!(fold_projected_operation(&operation, &inputs, &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+
+        // Inputs of a different member kind fail projection before the rule runs.
+        let inputs = [inputs[0].clone(), ArrayIrType::Array(ArrayType::scalar(DataType::F32))];
+        assert!(fold_projected_operation(&operation, &inputs, &[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_projected_operation_region_interfaces() {
+        let operation = ForwardingOperation::<ArrayType> { renamed: false, marker: PhantomData };
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let array_interface = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type], EffectClasses::NONE);
+        let dimension_interface =
+            RegionInterface::new(vec![dimension_type.clone()], vec![dimension_type], EffectClasses::NONE);
+        assert_eq!(validate_projected_operation_region_interfaces(&operation, &[array_interface]), Ok(()));
+
+        // An unexpected region reports the native region-count diagnostic, even when its types belong to another
+        // member kind, while a region of the expected count still fails projection.
+        assert_eq!(
+            validate_projected_operation_region_interfaces(
+                &operation,
+                &[dimension_interface.clone(), dimension_interface.clone()],
+            ),
+            Err(ProgramError::MalformedProgram(
+                "operation `forwarding` declares 1 region slots but 2 regions were attached".to_string(),
+            )),
+        );
+        assert!(matches!(
+            validate_projected_operation_region_interfaces(&operation, &[dimension_interface]),
+            Err(ProgramError::Type(_)),
+        ));
+    }
+
+    #[test]
+    fn test_infer_projected_operation_types() {
+        let operation = ForwardingOperation::<ArrayType> { renamed: false, marker: PhantomData };
+        let input_type = ArrayType::scalar(DataType::F32);
+        let region_output_type = ArrayType::scalar(DataType::F64);
+        let input_types = [ArrayIrType::from(input_type.clone())];
+        let region_interfaces = [RegionInterface::new(
+            vec![ArrayIrType::from(input_type.clone())],
+            vec![ArrayIrType::from(region_output_type.clone())],
+            EffectClasses::single(EffectClass::OrderedIo),
+        )];
+        assert_eq!(
+            infer_projected_operation_region_input_types(&operation, &input_types, &region_interfaces),
+            Ok(vec![Some(vec![ArrayIrType::from(input_type.clone())])]),
+        );
+        assert_eq!(
+            infer_projected_operation_output_types(&operation, &input_types, &region_interfaces),
+            Ok(vec![ArrayIrType::from(input_type), ArrayIrType::from(region_output_type)]),
+        );
     }
 }

@@ -1,109 +1,84 @@
-//! Contains types for representing _domains_ and operation-binding _contexts_.
+//! Defines the passive [`Domain`] vocabulary and active [`Context`] protocol used by interpretation, tracing, and
+//! program transforms.
 //!
-//! A [`Domain`] names a type/value universe. A [`Context`] gives operations meaning within that universe. Keeping these
-//! roles separate lets the same domain participate in eager execution, ordinary tracing, batching, differentiation,
-//! partial evaluation, and nested transforms without changing its type, value, constant, or operation families.
+//! A domain selects one coherent family of [`Type`]s, flowing [`Value`]s, stored constants, and [`Operation`]s. It says
+//! what a program may contain, but not what applying an operation does. A context adds that behavior: it lifts stored
+//! constants into flowing values, binds operations, resolves values conservatively, and reports whether its innermost
+//! semantics execute eagerly. Keeping those roles separate lets one program universe participate in eager execution,
+//! staging, batching, differentiation, partial evaluation, and nested combinations of those transforms. Refer to the
+//! documentation of [`Context`] for a rendered diagram of this relationship.
 //!
-//! ```text
-//! ┌─────────┐
-//! │ Domain  │
-//! └────┬────┘
-//!      ├── Type ──────── abstract type metadata
-//!      ├── Value ─────── values flowing through the domain
-//!      ├── Constant ──── payloads stored in staged programs
-//!      └── Operation ─── the closed operation family
-//!           │
-//!           │ adds binding semantics
-//!           ▼
-//!      ┌─────────┐
-//!      │ Context │
-//!      └────┬────┘
-//!           ├── Eager Context ────── interpret each operation now
-//!           ├── Staging Context ──── append each operation as an instruction
-//!           └── Transform Context ── apply an operation rule, then delegate to the parent
-//! ```
+//! # Where Contexts Participate
 //!
-//! # Entry Points
+//!   - Ordinary [`trace`](crate::trace) creates a [`TracingContext`] whose values are symbolic [`Tracer`]s and whose
+//!     binds append instructions to a new [`ProgramBuilder`]. [`Trace::trace`] selects the same path through a named
+//!     domain, while [`infer_output_type`](crate::tracing::infer_output_type) uses it only for abstract outputs.
+//!   - [`Program::interpret`] constructs an [`EagerContext`] and replays a program immediately.
+//!     [`Program::interpret_in_context`] accepts an explicit context, so the same replay can instead stage into an
+//!     enclosing program or pass through a transform.
+//!   - Value-level transform entry points construct their own contexts and feed transform-specific values through the
+//!     same binding protocol. Nested transforms compose by wrapping one context around another.
 //!
-//! Use the free [`trace`](crate::trace) function for ordinary symbolic tracing (or [`Trace::trace`] to name a domain
-//! explicitly) and [`infer_output_type`](crate::tracing::infer_output_type) when only abstract outputs are needed.
-//! Use [`Program::interpret`] for eager replay or [`Program::interpret_in_context`] to replay through a chosen context.
-//! Most transform modules also expose a free value-level entry point and a context capability built on this same bind
-//! protocol.
+//! # Domains and Contexts
 //!
-//! # Domains versus Contexts
+//! [`Domain`] is descriptive. Its associated types form the closed vocabulary shared by a program and every compatible
+//! context. It does not own an active trace, execute operations, or carry mutable builder state.
 //!
-//! [`Domain`] is _descriptive_. It associates one [`Type`], runtime [`Value`], staged constant type, and [`Operation`]
-//! family and provides ordinary tracing conveniences. It does not represent an active trace and does not decide how an
-//! operation is evaluated.
+//! [`Context`] is behavioral. It is a cloneable handle to one active binding semantics. Stateful contexts share their
+//! mutable builders, error slots, or transform state behind internal handles so that values may retain cloned contexts
+//! without forking the active computation.
 //!
-//! [`Context`] is _behavioral_. Its [`Context::bind`] method accepts an operation and flowing values and returns
-//! result values. [`Context::lift`] materializes a staged constant into the flowing value semantics, while
-//! [`Context::resolve`] reports whether a flowing value is concrete, staged, or opaque. Contexts are cloneable
-//! handles. Mutable tracing state is shared behind their internal handles rather than passed as `&mut self`.
+//! # Binding Protocol
 //!
-//! # Eager, Staging, and Transform Contexts
+//! [`Context::lift`] translates a stored [`Domain::Constant`] into the context's flowing [`Domain::Value`].
+//! [`Context::bind`] applies one operation to flowing inputs and receives its application-scoped [`AttachedRegions`]
+//! containing the operation's ordered attached computations. Eager contexts expose those regions to interpretation
+//! rules, staging contexts import or intern them into the destination program, and transform contexts recursively
+//! rewrite them according to the operation's rule.
 //!
-//! [`EagerContext`] is the no-state eager implementation. Binding immediately calls the operation's
-//! [`InterpretableOperation`] implementation, and lifting is the identity when constants and values coincide.
-//! It is the context used by [`Program::interpret`] and by transforms over concrete values.
+//! [`Context::resolve`] is a conservative identity query, not a general concretization API. It may prove that a value
+//! is a stored constant or a live staged atom, but callers must preserve an [`Opaque`](ValueResolution::Opaque) value
+//! when neither fact is safe to establish. [`Context::is_eager`] describes the innermost semantics that ultimately
+//! handles binding, even when several transform contexts wrap it.
 //!
-//! [`StagingContext`] refines [`Context`] for contexts whose flowing value is [`Tracer`]. It exposes a
-//! [`ProgramBuilder`] and records bound operations as instructions.
-//! Ordinary [`TracingContext`] and nested tracing contexts implement this trait.
+//! # Context Families and Composition
 //!
-//! Transform contexts wrap another context and change bind semantics locally. Batching maps an operation over logical
-//! batch axes, differentiation propagates primal/tangent duals, and partial evaluation folds known work or emits
-//! residual work. Each delegates primitive work to its parent, so contexts compose into a stack. For example, this is
-//! what a staged forward-mode differentiation context stack might look like:
+//! [`EagerContext`] binds immediately through [`InterpretableOperation`] and ordinarily lifts constants by identity.
+//! [`StagingContext`] refines [`Context`] for symbolic [`Tracer`] values, exposes the active [`ProgramBuilder`], and
+//! records each bind as an instruction. Transform contexts intercept binds, propagate transform-specific values, and
+//! delegate rewritten primitive work to a parent context.
 //!
-//! ```text
-//!       ┌─────────────────┐
-//!       │ User Operation  │
-//!       └────────┬────────┘
-//!                │ bind
-//!                ▼
-//!   ┌─────────────────────────┐
-//!   │ Differentiation Context │
-//!   └────────────┬────────────┘
-//!                │ delegate primitive work
-//!                ▼
-//! ┌─────────────────────────────┐
-//! │ Partial Evaluation Context  │
-//! └──────────────┬──────────────┘
-//!                │ delegate primitive work
-//!                ▼
-//!       ┌─────────────────┐
-//!       │ Tracing Context │
-//!       └────────┬────────┘
-//!                │ record instructions
-//!                ▼
-//!     ┌─────────────────────┐
-//!     │ Transformed Program │
-//!     └─────────────────────┘
-//! ```
+//! Delegation makes contexts a semantic stack. A differentiation context may delegate residual tangent work through a
+//! partial-evaluation context, which may in turn delegate primitive operations to a tracing context. The outer layers
+//! determine the rewrite, while the innermost eager or staging context determines whether the final operation executes
+//! now or becomes part of a program.
+//!
+//! # Heterogeneous Domains and Projection
+//!
+//! [`ProjectedContext`] presents one member kind of heterogeneous domain as an ordinary context while forwarding
+//! every lift, bind, resolution, and eagerness query to the heterogeneous parent. It preserves symbolic identity and
+//! creates no second interpreter or program. The regions of a bound member operation are member-family programs, so
+//! projection lifts them into the heterogeneous family together with the operation, while operations whose regions mix
+//! several member kinds belong to the family-level operation contract and never reach the projection.
 //!
 //! # Value Resolution
 //!
-//! [`ValueResolution`] is the single conservative query used when a rule needs to inspect a flowing value:
+//! [`ValueResolution`] reports exactly what the resolving context can prove:
 //!
-//! - [`ValueResolution::Concrete`] carries a materialized constant and permits host-side decisions.
-//! - [`ValueResolution::Staged`] carries the corresponding [`AtomId`] in the active builder.
-//! - [`ValueResolution::Opaque`] means the context cannot safely prove either fact.
+//!   - [`ValueResolution::Constant`] carries a payload that may be embedded as a program constant
+//!     but is not necessarily host-inspectable.
+//!   - [`ValueResolution::Staged`] carries the value's [`AtomId`] in the active builder.
+//!   - [`ValueResolution::Opaque`] proves neither fact and requires conservative handling.
 //!
-//! Rules must treat `Opaque` conservatively. In particular, they must not assume that an arbitrary tracer
-//! is concrete or belongs to the current builder.
+//! A rule must never infer concreteness, builder ownership, or staged identity from an opaque result.
 //!
 //! # Extending Contexts
 //!
-//! To define a new backend or value universe, implement [`Domain`] first. Define one closed operation family rather
-//! than coupling operation payload modules to a concrete wrapper enum, and implement [`Context`] only when that
-//! universe has a specific binding semantics.
-//!
-//! To add a staging context, implement [`Context`] with `Value = Tracer<Self>` and then [`StagingContext`], keeping the
-//! builder and error state in shared handles. To add a transform, wrap the narrowest parent context needed, define the
-//! transform's flowing value or tracer, apply operation-owned rules in `bind`, and delegate capture registration and
-//! context capabilities to the parent where appropriate.
+//! Define a new backend or program universe by implementing [`Domain`] and one closed operation family. Implement
+//! [`Context`] only for a concrete binding semantics. A staging implementation uses `Value = Tracer<Self>`, implements
+//! [`StagingContext`], and stores builder and error state in shared handles. A transform context wraps the narrowest
+//! parent context it needs, defines its flowing value, and applies operation-owned rules in [`Context::bind`]. Capture
+//! registration and compatible capabilities delegate to the parent.
 
 use std::cell::RefCell;
 use std::fmt::Debug;
@@ -112,27 +87,19 @@ use std::rc::Rc;
 
 use crate::interpretation::{EagerInterpretationDriver, InterpretableOperation};
 use crate::macros::check_builders;
-use crate::operations::constants::ConstantOperation;
+use crate::operations::{ConstantOperation, GuardOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::ProgramError;
-use crate::programs::atoms::AtomId;
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
-use crate::programs::regions::BindingRegionDriver;
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    AtomId, AttachedRegions, FlatProgram, Operation, OperationProjection, OperationProvider, Program, ProgramBuilder,
+    ProgramError, Provenance, ProvenanceScope, ReferenceIdentity, RegionDriver, Type, Typed, Value,
+    ValueDomainDispatch, ValueProjection,
+};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
-/// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
-/// batching and automatic differentiation. A [`Domain`] is purely the type, value, constant, and operation universe
-/// that a backend or value model understands. It carries no behavior. It does not describe an active tracing run, and
-/// it does not decide what happens when a primitive operation is bound. Active bind handling, and lifting of staged
-/// constants into runtime values, live in [`Context`] implementations. This separation allows the same [`Domain`] to
-/// be reused by ordinary tracing, batching, linearization, and other transformation contexts. A [`Domain`] that can
-/// additionally *apply* operations to values is a [`Context`]. Eager backends do so by implementing [`Context`]
-/// directly (i.e., binding interprets operations over concrete values), while staging contexts bind through
-/// [`StagingContext`]s.
+/// Passive type/value universe shared by program interpretation, tracing, and transformation contexts. A [`Domain`]
+/// selects the [`Type`], flowing [`Value`], stored constant, and [`Operation`] families that may participate in one
+/// program universe. It carries no active builder or binding behavior. Applying operations and lifting stored constants
+/// into flowing values are responsibilities of [`Context`] implementations over that universe.
 pub trait Domain: Sized {
     /// [`Type`]s that this [`Domain`] uses to represent the abstract metadata associated with its [`Value`]s.
     /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only domains can use
@@ -150,24 +117,108 @@ pub trait Domain: Sized {
     type Constant: Value<Type = Self::Type>;
 
     /// [`Operation`] representation supported by this [`Domain`] for ordinary traced [`Program`]s.
-    type Operation: Operation<Self::Type>;
+    type Operation: Operation<Type = Self::Type>;
 }
 
-/// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
-/// Where a [`Domain`] only describes the type, value, constant, and operation universe, a [`Context`] additionally
-/// decides what *binding* a primitive means in this context and how to [`lift`](Context::lift) a staged constant into
-/// a runtime value. There are two flavors:
+/// Projection of a heterogeneous [`Domain`] onto its `T`-typed member kind, which a [`ProjectedContext`] presents as
+/// an ordinary domain. This is the domain-level counterpart of [`ValueProjection`] and [`OperationProjection`]: the
+/// domain's values, constants, and operations each project onto that member kind, and its type family embeds the member
+/// types, which lifting the regions of bound member operations requires. It names these requirements once, so that code
+/// generic over projections bounds `D: DomainProjection<T>` instead of restating them, and it is implemented for every
+/// domain that satisfies them.
+pub trait DomainProjection<T: Type>:
+    Domain<
+        Type: From<T>,
+        Value: ValueProjection<T, Projected: Value<Type = T>>,
+        Constant: ValueProjection<T, Projected: Value<Type = T>>,
+        Operation: OperationProjection<T>,
+    >
+{
+}
+
+impl<T: Type, D> DomainProjection<T> for D where
+    D: Domain<
+            Type: From<T>,
+            Value: ValueProjection<T, Projected: Value<Type = T>>,
+            Constant: ValueProjection<T, Projected: Value<Type = T>>,
+            Operation: OperationProjection<T>,
+        >
+{
+}
+
+/// Projection of an active [`Context`] onto a `T`-typed member context. In addition to the passive [`DomainProjection`]
+/// contract, the member operation family provides [`GuardOperation`] requests, as every [`Context`] requires. Keeping
+/// this requirement here lets passive operation and domain projections remain usable without guard provision.
+/// A provider may reject guards that its family cannot represent.
+pub trait ContextProjection<T: Type>:
+    DomainProjection<T>
+    + Context<
+        Operation: OperationProjection<
+            T,
+            Projected: OperationProvider<
+                T,
+                GuardOperation<T>,
+                Operation = <Self::Operation as OperationProjection<T>>::Projected,
+            >,
+        >,
+    >
+{
+}
+
+impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
+    <C::Operation as OperationProjection<T>>::Projected:
+        OperationProvider<T, GuardOperation<T>, Operation = <C::Operation as OperationProjection<T>>::Projected>
+{
+}
+
+/// Active binding semantics layered on a passive [`Domain`]. A [`Context`] decides how stored constants become flowing
+/// values, what applying an operation means, what identity information can be recovered from a value, and whether the
+/// innermost binding semantics execute eagerly. Eager contexts interpret operations immediately, staging contexts
+/// record instructions, and transform contexts apply operation-owned rules before delegating rewritten work to a
+/// parent.
 ///
-/// - *Eager* contexts, whose flowing [`Domain::Value`] is a concrete value (equal to [`Domain::Constant`]).
-///   [`Context::bind`] interprets the operation immediately and there is no [`ProgramBuilder`] involved anywhere.
-///   Eager backends implement [`Context`] directly. An eager context is also where interpreters and program transforms
-///   synthesize a type's additive or multiplicative identity from metadata alone, via `bind(ZeroOperation, &[])` or
-///   `bind(OneOperation, &[])`).
-/// - [**Staging**](StagingContext) contexts, whose flowing [`Domain::Value`] is a [`Tracer`] into an active
-///   [`ProgramBuilder`]. [`Context::bind`] records the operation as a program instruction. Ordinary tracing appends
-///   the operation to a program. Transform contexts such as batching or linearization intercept the same bind, update
-///   transform-local state, and usually stage rewritten operations into a parent context.
-pub trait Context: Domain + Clone {
+/// # Context Model
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   domain["Domain"] --> families["Type, Value, Constant, and Operation Families"]
+///   domain --> context["Context"]
+///   context --> lift["&lt;code&gt;lift&lt;/code&gt;: Stored Constant to Flowing Value"]
+///   context --> bind["&lt;code&gt;bind&lt;/code&gt;: Apply Operation with Attached Regions"]
+///   context --> resolve["&lt;code&gt;resolve&lt;/code&gt;: Constant, Staged, or Opaque"]
+///   context --> eager_query["&lt;code&gt;is_eager&lt;/code&gt;: Innermost Execution Semantics"]
+///   bind --> eager["Eager Binding"]
+///   bind --> staging["Staging Binding"]
+///   bind --> transform["Transform Binding"]
+///   eager --> interpretation["InterpretableOperation Rule"]
+///   staging --> builder["Append Instruction to Program Builder"]
+///   transform --> rule["Apply Operation-Owned Transform Rule"]
+///   rule --> parent["Delegate Rewritten Primitive Work to Parent Context"]
+///   parent --> terminal["Eventually Execute Eagerly or Stage an Instruction"]
+/// ```
+///
+/// All contexts are cloneable handles. Stateful implementations must ensure that clones share one active builder or
+/// transform state rather than fork it.
+///
+/// # Guard Provision
+///
+/// Every context's operation family provides [`GuardOperation`] requests. Contextual replay (refer to
+/// [`Program::interpret_in_context`]) checks the type relationships of a region boundary or instruction before
+/// specializing the replayed body to them and, when the types leave a relationship unproven, constructs a guard
+/// through [`OperationProvider`] and binds it like any other operation. Stating the requirement here, rather than at
+/// every replay caller, lets `C: Context` alone imply it. Families whose enum stores a guard variant receive the
+/// provider from the blanket `From` implementation, while `#[derive(Operation)]` and
+/// [`impl_guardless_operation!`](crate::impl_guardless_operation) generate a rejecting provider for families that store
+/// no guard, so such a family needs no handwritten provider. An eager context over exact values never invokes a
+/// provider, because concrete values establish their relationships at the boundary and replay constructs no guard for
+/// them (refer to [`needs_guards`](Self::needs_guards)). A guard that replay does construct is enforced by the
+/// family's rule under a transform, by interpretation in an eager context, or by staging, according to the contract in
+/// [the `GuardOperation` documentation](GuardOperation#enforcement).
+#[cfg_attr(doc, ryft_macros::mermaid)]
+pub trait Context:
+    Clone + Domain<Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>>
+{
     /// Lifts a staged [`Program`] constant into this [`Context`]'s runtime value representation. Most eager contexts
     /// use the same representation for [`Domain::Constant`] and [`Domain::Value`], and so this is just an identity
     /// function. Backends that use abstract, lifetime-free constants for compiled programs can either materialize
@@ -181,35 +232,61 @@ pub trait Context: Domain + Clone {
     /// [`Instruction`](crate::Instruction) in their [`ProgramBuilder`], and transform contexts apply the corresponding
     /// transformation rule before forwarding rewritten operations to a parent context.
     ///
-    /// Nested computations belong to an operation application rather than to the operation payload itself. They are
-    /// therefore supplied alongside the operation and its inputs through `driver`, which may provide owned regions,
-    /// borrowed regions from a replayed program, or shared callee programs through one ordered
-    /// [`Region`](crate::Region) namespace. Eager and transform contexts make those regions available to the
-    /// operation's interpretation or transform driver. Staging contexts import or intern them into the destination
-    /// program and attach their [`RegionId`](crate::RegionId)s to the recorded instruction. The resulting sequence must
-    /// match the number and order returned by [`Operation::region_names`].
+    /// Nested computations belong to an operation application rather than to the operation payload itself.
+    /// They are therefore supplied alongside the operation and its inputs as `regions`: anything convertible into
+    /// [`AttachedRegions`], which carries owned regions, borrowed regions from a replayed program, or shared callee
+    /// programs through one ordered [`Region`](crate::Region) namespace. Implementations convert `regions` once and
+    /// hand the concrete [`AttachedRegions`] to a body that is compiled per context rather than per way of supplying
+    /// regions. Eager and transform contexts make those regions available to the operation's interpretation or
+    /// transform driver. Staging contexts import or intern them into the destination program and attach their
+    /// [`RegionId`](crate::RegionId)s to the recorded instruction. The resulting sequence must match the number
+    /// and order returned by [`Operation::region_slots`].
     ///
     /// # Parameters
     ///
     ///   - `operation`: [`Operation`] being applied.
-    ///   - `driver`: Application-scoped [`BindingRegionDriver`] providing the complete ordered
-    ///     [`Region`](crate::Region)s supplied by this [`Operation`] application. Binding consumes the driver because
-    ///     staging may import or intern its roots into the destination [`Program`].
-    ///   - `inputs`: Input values supplied as the operation's operands, in operation-defined order.
-    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    ///   - `regions`: Application-scoped [`AttachedRegions`] (or anything convertible into them) providing the complete
+    ///     ordered [`Region`](crate::Region)s supplied by this [`Operation`] application. Binding consumes them because
+    ///     staging may import or intern their roots into the destination [`Program`].
+    ///   - `inputs`: Input values supplied to the operation, in operation-defined order.
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError>;
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r;
 
-    /// Returns `true` if this [`Context`] is *eager* meaning that its [`bind`](Self::bind) computes concrete values
-    /// immediately so that concretizing extractions such as [`BooleanLike::boolean`](crate::BooleanLike::boolean) on
-    /// values it produces can succeed and, for example, the trip count of a data-dependent loop is decidable while
-    /// differentiating. Transform contexts that wrap other contexts (e.g., batching and forward-mode differentiation)
-    /// delegate to the wrapped context, so that the answer reflects the innermost context that actually executes the
-    /// bound operations.
+    /// Returns `true` if this [`Context`] is *eager* meaning that its [`bind`](Self::bind) function computes
+    /// concrete values immediately so that concretizing extractions such as
+    /// [`Concretizable::concretize`](crate::Concretizable::concretize) on values it produces can succeed and, for
+    /// example, the trip count of a data-dependent loop is decidable while differentiating. Transform contexts that
+    /// wrap other contexts (e.g., batching and forward mode differentiation) delegate to the wrapped context, so that
+    /// the answer reflects the innermost context that actually executes the bound operations.
     fn is_eager(&self) -> bool;
+
+    /// Returns whether replaying a [`Region`](crate::Region) over inputs of types `input_types` in this [`Context`]
+    /// must construct guards for type relationships that the types do not prove. Binding such a guard enforces it,
+    /// which, depending on the context, may interpret, transform, stage, or reject it. Refer to
+    /// [`GuardOperation`'s enforcement contract](GuardOperation#enforcement) for more information. A context that is
+    /// not eager always needs guards, because the body it stages is specialized to relationships that remain unproven
+    /// until runtime. An eager context needs them only when an input type still names an identity, as can happen in a
+    /// transform over an eager parent: the symbolic interface can carry relationships that its types alone do not
+    /// establish. Binding the guard lets that transform enforce or reject the relationship. Exact static types keep
+    /// guard planning off the eager hot path.
+    #[inline]
+    fn needs_guards(&self, input_types: &[Self::Type]) -> bool {
+        !self.is_eager() || input_types.iter().any(|r#type| r#type.identities().next().is_some())
+    }
+
+    /// Returns the currently composed non-semantic [`Provenance`] that [`Instruction`](crate::Instruction)s
+    /// staged through this [`Context`] record. Staging boundaries (i.e., contexts that own the [`ProgramBuilder`]
+    /// instructions are emitted into, such as tracing and partial evaluation contexts) answer from their shared
+    /// [`ProvenanceState`](crate::ProvenanceState), transform wrappers delegate to the context they stage through,
+    /// and terminal eager contexts return [`Provenance::unknown`] because they record no instructions.
+    fn provenance(&self) -> Provenance;
 
     /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible
     /// [`ValueResolution`]s and their semantics.
@@ -219,12 +296,65 @@ pub trait Context: Domain + Clone {
         ValueResolution::Opaque
     }
 
+    /// Resolves the allocation denoted by a reference, without reading its contents. A concrete allocation returns
+    /// its runtime identity while a symbolic allocation returns its canonical root atom in this context. Views and
+    /// forwarded handles resolve to the same root. An opaque result supplies no alias proof and is rejected at a
+    /// reference transform boundary. Transform contexts delegate this query through their underlying reference.
+    ///
+    /// Unlike [`resolve`](Self::resolve), this query identifies mutable storage rather than an individual Single Static
+    /// Assignment (SSA) value. Staging contexts must override it to establish structural root identity (being non-eager
+    /// alone is not a proof).
+    fn reference_identity(&self, value: &Self::Value) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        if let Some(identity) = value.reference_id() {
+            return Ok(Some(ReferenceIdentity::Runtime(identity)));
+        }
+        Ok(match self.resolve(value) {
+            ValueResolution::Constant(value) => value.reference_id().map(ReferenceIdentity::Runtime),
+            _ => None,
+        })
+    }
+
+    /// Invokes `function` with the provided [`Provenance`] entered as the active source _origin_, so that
+    /// [`Instruction`](crate::Instruction)s staged inside it record that they were _generated from_ an existing
+    /// instruction. An origin is where staged work **comes from**, while a scope (i.e., used by the corresponding
+    /// [`with_provenance_scope`](Self::invoke_with_provenance_scope) function) is a fresh label for what that work
+    /// **is**: origins carry already-recorded history forward through transforms, while scopes add new history.
+    ///
+    /// This is the interpretation/replay/transform-facing entry point. A transform replaying one source instruction
+    /// wraps its rule invocation in this call with the source instruction's recorded provenance, and every instruction
+    /// the rule stages then records that source's provenance (verbatim for a one-to-one rewrite, and attached to each
+    /// generated instruction for a one-to-many rewrite). To make that inheritance exact, entering an origin _replaces_
+    /// the active provenance rather than adding to it: scopes entered before this call stop contributing (they describe
+    /// the transform doing the replaying, not the replayed instruction, and return when the closure does), and only
+    /// scopes entered inside the closure fold over the origin. Entering an origin while another origin is already
+    /// active fuses the two, so nested replays record every source involved. Refer to the documentation of
+    /// [`ProvenanceState`](crate::ProvenanceState) for the precise composition semantics. The previous
+    /// state is restored on ordinary return, error return, and panic unwinding.
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R;
+
+    /// Invokes `function` with the provided named [`ProvenanceScope`] entered as the innermost active scope, so that
+    /// [`Instruction`](crate::Instruction)s staged inside it record the scope in their [`Provenance`]. A scope is a
+    /// fresh label for what staged work **is** (i.e., the facility or computation performing the staging), while an
+    /// origin (i.e., used by the corresponding [`with_provenance_origin`](Self::invoke_with_provenance_origin)
+    /// function) is where replayed work **comes from**: scopes add new history, while origins carry already-recorded
+    /// history forward.
+    ///
+    /// This is the producer-facing entry point for code that stages _new_ instructions and wants them labeled (e.g.,
+    /// the differentiation coordinate-basis constructor may enter its `ryft::differentiation::coordinate_basis` scope
+    /// around the primitives it stages). Unlike entering an origin, entering a scope _adds_ one level: it folds over
+    /// whatever provenance is currently active, nesting under enclosing scopes to form `::`-separated paths. The
+    /// previous state is restored on ordinary return, error return, and panic unwinding. Terminal eager contexts run
+    /// the closure directly because they record no instructions; transform wrappers delegate to the context they stage
+    /// through.
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R;
+
     /// Traces `function` into a [`Program`] and interprets that program on the provided `input`. This creates an
     /// ordinary symbolic trace over this context's `(Self::Type, Self::Constant, Self::Operation)` universe through a
     /// fresh [`TracingContext`], simplifies the resulting flat program, and interprets it with the provided concrete
     /// input values. Use this when a caller needs both the staged program and the corresponding concrete output for
     /// the same input. The runtime values flow through `self`, which supplies the concrete value type and the
     /// constant-lifting behavior.
+    #[allow(clippy::type_complexity)]
     fn interpret_and_trace<
         F: FnOnce(Input::To<Tracer<TracingContext<Self::Constant, Self::Operation>>>) -> Result<Output, ProgramError>,
         Input: Parameterized<
@@ -246,7 +376,11 @@ pub trait Context: Domain + Clone {
             Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
-    > {
+    >
+    where
+        TracingContext<Self::Constant, Self::Operation>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
@@ -267,84 +401,92 @@ pub trait Context: Domain + Clone {
         let flat_program = flat_program.into_simplified()?;
         let output_values = flat_program.interpret_in_context(self, input_values)?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
-        let program = Program {
-            input_structure,
-            output_structure,
-            regions: flat_program.regions,
-            entry: flat_program.entry,
-            marker: PhantomData,
-        };
+        let program = flat_program.restructured(input_structure, output_structure)?;
         Ok((output, program))
     }
 }
 
-/// [`Context`] used for a concrete `(type, value, operation)` universe that carries no runtime state and for which,
-/// binding an operation to some input values corresponds to directly interpreting/evaluating/executing that operation
-/// for those input values using the value type's default interpretation context. [`EagerContext`] exists to make direct
-/// interpretation contexts explicit in generic code that otherwise has no backend-owned eager context value to pass
-/// around.
+/// Zero-sized [`Context`] used for a concrete `(type, value, operation)` universe whose operations can be interpreted
+/// directly without backend-owned context state. Values may themselves carry explicit resources, such as reference
+/// allocations, but all state needed to interpret an operation arrives through those values and the attached regions.
+/// [`EagerContext`] makes this direct interpretation mode explicit in generic code that otherwise has no backend-owned
+/// eager context value to pass around.
 ///
 /// The default operation family is [`ConstantOperation`], which is the minimal operation family needed by ordinary
 /// eager value contexts that only materialize constants and expose context capabilities such as zero, one, fill, etc.
 /// Code that binds or batches a richer operation family should still specify `O` explicitly, such as
 /// `EagerContext<V, ArrayOperation<V>>`.
-pub struct EagerContext<V: Value, O: Operation<V::Type> = ConstantOperation<V>> {
+pub struct EagerContext<V: Value, O: Operation<Type = V::Type> = ConstantOperation<V>> {
     /// [`PhantomData`] marker tying this zero-sized context to its associated types.
     marker: PhantomData<fn() -> (V, O)>,
 }
 
-impl<V: Value, O: Operation<V::Type>> EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> EagerContext<V, O> {
     /// Creates a new [`EagerContext`].
-    #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Copy for EagerContext<V, O> {}
+impl<V: Value, O: Operation<Type = V::Type>> Copy for EagerContext<V, O> {}
 
-impl<V: Value, O: Operation<V::Type>> Clone for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Clone for EagerContext<V, O> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> std::fmt::Debug for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> std::fmt::Debug for EagerContext<V, O> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("EagerContext")
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Default for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Default for EagerContext<V, O> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Domain for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Domain for EagerContext<V, O> {
     type Type = V::Type;
     type Value = V;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for EagerContext<V, O> {
+impl<
+    V: Value,
+    O: Operation<Type = V::Type>
+        + InterpretableOperation<Self>
+        + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+> Context for EagerContext<V, O>
+where
+    Self: Domain<Type = V::Type, Value = V, Constant = V, Operation = O>,
+{
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
         Ok(constant)
     }
 
     #[inline]
-    fn bind<P: Into<O>, D: BindingRegionDriver<V, O>>(
+    fn bind<'r, P: Into<O>, R: Into<AttachedRegions<'r, V, O>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        operation.into().interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        let operation = operation.into();
+        let regions = regions.into();
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
+        operation.interpret(self, &EagerInterpretationDriver::new(&regions), inputs)
     }
 
     #[inline]
@@ -353,8 +495,218 @@ impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for
     }
 
     #[inline]
+    fn provenance(&self) -> Provenance {
+        // Terminal eager execution records no instructions, so there is nothing to attach provenance to.
+        // The current provenance is always unknown and entering scopes or origins is a deliberate no-op.
+        Provenance::unknown()
+    }
+
+    #[inline]
     fn resolve(&self, value: &V) -> ValueResolution<V> {
-        ValueResolution::Concrete(value.clone())
+        ValueResolution::Constant(value.clone())
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+        function()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+        function()
+    }
+}
+
+/// [`Context`] adapter that presents one member kind of heterogeneous parent context as an ordinary context of that
+/// member kind. [`Program`]s that mix several value kinds store one heterogeneous [`Type`] / [`Value`] / [`Operation`]
+/// universe, but most operations, transform rules, and capability implementations are written against exactly one
+/// member kind (e.g., array-only rules bind through a context whose values are `Value<Type = ArrayType>`). Without an
+/// adapter, every such rule would need a second, heterogeneous-typed implementation. `ProjectedContext<C, T>` is that
+/// adapter. It *is* a context of the `T`-typed member (its [`Domain`] associated types are the member value, constant,
+/// and operation families selected by [`ValueProjection<T>`] and [`OperationProjection<T>`]), while every actual
+/// effect happens in the heterogeneous parent `C`.
+///
+/// [`bind`](Context::bind) works by round-tripping through the parent. It lifts each member input into the
+/// heterogeneous value family (i.e., using [`ValueProjection::from_projected`]), lifts the member operation into the
+/// heterogeneous operation family (i.e., using the [`From`] super-trait of [`OperationProjection`]), binds *once*
+/// through the parent context, and projects the results back to the member kind (i.e., using
+/// [`ValueProjection::into_projected`]). Staged member values are identity-preserving views of heterogeneous tracers
+/// and so the [`Instruction`](crate::Instruction) recorded in the parent consumes the original Single Static Assignment
+/// (SSA) [`Atom`](crate::Atom)s (i.e., projection adds no copies, no new instructions, and no indirection in the staged
+/// program).
+///
+/// The adapter is deliberately zero-state. It stores its parent and nothing else. It never inspects a staged program,
+/// never reconstructs dependencies, and never carries dimensions, source arrays, identity mappings, or replay
+/// substitutions. Every dependency of a bound operation must therefore arrive as an explicit input, which keeps
+/// the program graph the sole source of data dependencies.
+///
+/// A bound member operation may carry [`Region`](crate::Region)s (e.g., a
+/// [`CompositeOperation`](crate::CompositeOperation) and its primal program). Those regions are programs of the
+/// member family, so every value that they carry is of the member kind by construction, and `bind` lifts them into the
+/// heterogeneous family with [`Program::into_unprojected`] before binding the lifted operation. Higher-order operations
+/// whose regions mix member kinds are family-level operations rather than member operations, so they never reach this
+/// adapter.
+pub struct ProjectedContext<C: Domain, T: Type> {
+    /// Heterogeneous parent [`Domain`] or [`Context`].
+    parent: C,
+
+    /// [`PhantomData`] marker tying this context to its associated type.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<C: Domain, T: Type> ProjectedContext<C, T> {
+    /// Creates a [`ProjectedContext`] view of `parent`.
+    pub const fn new(parent: C) -> Self {
+        Self { parent, marker: PhantomData }
+    }
+
+    /// Returns the parent [`Domain`] or [`Context`].
+    #[inline]
+    pub fn parent(&self) -> &C {
+        &self.parent
+    }
+}
+
+impl<C: ContextProjection<T>, T: Type> ProjectedContext<C, T> {
+    /// Internal helper that binds an already converted parent-family [`Operation`] with its already unprojected
+    /// regions. This is the body of [`Context::bind`] for this context, which only converts its input operation and
+    /// lifts its regions, so that this body is compiled once per projection rather than once per input operation type
+    /// and region driver.
+    fn bind_operation(
+        &self,
+        operation: C::Operation,
+        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        inputs: &[<C::Value as ValueProjection<T>>::Projected],
+    ) -> Result<Vec<<C::Value as ValueProjection<T>>::Projected>, ProgramError> {
+        // `Context::bind` borrows its inputs while embedding a projected member consumes it, so clone each member
+        // representation to construct temporary heterogeneous values for the parent. Keep the common nullary, unary,
+        // and binary cases on the stack; only uncommon wider homogeneous operations allocate an input vector. Symbolic
+        // projected values retain their parent value and therefore preserve SSA identity through this clone. Concrete
+        // eager values ordinarily dispatch through their native member contexts rather than through this adapter.
+        let outputs = match inputs {
+            [] => self.parent.bind(operation, regions, &[]),
+            [input] => {
+                let inputs = [<C::Value as ValueProjection<T>>::from_projected(input.clone())];
+                self.parent.bind(operation, regions, &inputs)
+            }
+            [left, right] => {
+                let inputs = [
+                    <C::Value as ValueProjection<T>>::from_projected(left.clone()),
+                    <C::Value as ValueProjection<T>>::from_projected(right.clone()),
+                ];
+                self.parent.bind(operation, regions, &inputs)
+            }
+            inputs => {
+                let inputs =
+                    inputs.iter().cloned().map(<C::Value as ValueProjection<T>>::from_projected).collect::<Vec<_>>();
+                self.parent.bind(operation, regions, inputs.as_slice())
+            }
+        }?;
+        outputs
+            .into_iter()
+            .map(<C::Value as ValueProjection<T>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+impl<C: Domain + Clone, T: Type> Clone for ProjectedContext<C, T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::new(self.parent.clone())
+    }
+}
+
+impl<C: DomainProjection<T>, T: Type> Domain for ProjectedContext<C, T> {
+    type Type = T;
+    type Value = <C::Value as ValueProjection<T>>::Projected;
+    type Constant = <C::Constant as ValueProjection<T>>::Projected;
+    type Operation = <C::Operation as OperationProjection<T>>::Projected;
+}
+
+impl<C: ContextProjection<T>, T: Type> Context for ProjectedContext<C, T> {
+    #[inline]
+    fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+        self.parent
+            .lift(<C::Constant as ValueProjection<T>>::from_projected(constant))?
+            .into_projected()
+            .map_err(Into::into)
+    }
+
+    #[inline]
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
+        &self,
+        operation: O,
+        regions: R,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        /// Internal helper that lifts the member-family `regions` into parent-family [`Program`]s. The regions of a
+        /// member operation are member-family programs, so every value that they carry is of the member kind, and they
+        /// are lifted into the parent family exactly like the operation itself. This is compiled once per projection
+        /// rather than once per input operation type.
+        #[allow(clippy::type_complexity)]
+        #[inline]
+        fn inner<C: ContextProjection<T>, T: Type>(
+            regions: &AttachedRegions<
+                '_,
+                <C::Constant as ValueProjection<T>>::Projected,
+                <C::Operation as OperationProjection<T>>::Projected,
+            >,
+        ) -> Result<Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, ProgramError> {
+            regions
+                .regions()
+                .map(|region| region.to_program().into_unprojected::<C::Constant, C::Operation>())
+                .collect()
+        }
+
+        // The regions of a member operation are member-family programs, so every value that they carry is
+        // of the member kind, and they are lifted into the parent family exactly like the operation itself.
+        self.bind_operation(operation.into().into(), inner::<C, T>(&regions.into())?, inputs)
+    }
+
+    #[inline]
+    fn is_eager(&self) -> bool {
+        self.parent.is_eager()
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // Projection changes the value vocabulary, not the staging boundary, so provenance state lives with the
+        // heterogeneous parent that actually records instructions.
+        self.parent.provenance()
+    }
+
+    #[inline]
+    fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
+        // Resolution must ask the parent about the original heterogeneous value. For the symbolic values that use this
+        // context through `ProjectedValue`, cloning preserves the same underlying tracer or transform state.
+        let value = <C::Value as ValueProjection<T>>::from_projected(value.clone());
+        match self.parent.resolve(&value) {
+            ValueResolution::Constant(constant) => match constant.into_projected() {
+                Ok(constant) => ValueResolution::Constant(constant),
+                Err(_) => ValueResolution::Opaque,
+            },
+            ValueResolution::Staged(atom) => ValueResolution::Staged(atom),
+            ValueResolution::Opaque => ValueResolution::Opaque,
+        }
+    }
+
+    fn reference_identity(&self, value: &Self::Value) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        self.parent.reference_identity(&<C::Value as ValueProjection<T>>::from_projected(value.clone()))
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent.invoke_with_provenance_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent.invoke_with_provenance_scope(scope, function)
     }
 }
 
@@ -362,18 +714,29 @@ impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for
 /// Binding records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than
 /// interpreting them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
 /// [`input`](StagingContext::input), [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
-/// and [`stage_operation`](StagingContext::stage_operation). Ordinary and nested tracing implement it through
+/// [`stage_nullary_operation`](StagingContext::stage_nullary_operation), and
+/// [`stage_operation`](StagingContext::stage_operation). Ordinary and nested tracing implement it through
 /// [`TracingContext`] and [`NestedTracingContext`](crate::NestedTracingContext), respectively. Transform contexts have
 /// their own flowing value types and delegate rewritten operations to a parent staging context instead of implementing
 /// this trait themselves.
 ///
-/// The flowing value is pinned to [`Tracer<Self>`](Tracer). Every staging context records operation invocations
-/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results.
-pub trait StagingContext: Context<Value = Tracer<Self>> {
+/// The flowing value is pinned to [`Tracer<Self>`](Tracer), with this context as its [`Value::Domain`] and
+/// [`ValueDomainDispatch`] routing capabilities back through it. Every staging context records operation invocations
+/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results. Staging is where the
+/// [`GuardOperation`] provider that every [`Context`] family carries is actually exercised: replaying a region under
+/// a staging context specializes its body and must therefore record its input checks as instructions, which a family
+/// that cannot represent a guard rejects at that point.
+pub trait StagingContext:
+    Context<Value = Tracer<Self>, Value: Value<Type = Self::Type, Domain = Self, Dispatch = ValueDomainDispatch>>
+{
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>>;
 
-    /// Creates a constant [`Tracer`] in this context with the provided constant payload.
+    /// Creates a constant [`Tracer`] in this context with the provided constant payload. Note that this is the
+    /// raw staging primitive and deliberately performs no constant-storage validation. It is meant to be used
+    /// by transform infrastructure that stages values it constructed itself. [`Context::lift`] validates
+    /// [`Value::validate_as_constant`] at the trace boundary instead, and [`Region`](crate::Region) sealing
+    /// re-checks every stored constant at [`build`](ProgramBuilder::build) time as the backstop.
     #[inline]
     fn constant(&self, value: Self::Constant) -> Self::Value {
         let r#type = value.r#type().into_owned();
@@ -419,59 +782,288 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         self.stage_operation::<O, _, Self::Value>(operation, [], &[])
     }
 
-    /// Stages an application of the provided [`Operation`] in this [`StagingContext`] and returns [`Tracer`]s for
-    /// its outputs. The application-scoped [`BindingRegionDriver`] provides the operation's complete ordered region
-    /// sequence. Staging consumes that driver through [`BindingRegionDriver::import_into`] to obtain destination
+    /// Stages an application of the provided [`Operation`] in this [`StagingContext`] and returns [`Tracer`]s for its
+    /// outputs. The application-scoped [`AttachedRegions`] provide the operation's complete ordered region sequence.
+    /// Staging consumes them through [`AttachedRegions::import_into`] to obtain destination
     /// [`RegionId`](crate::RegionId)s (owned region programs are imported, replayed regions preserve source-arena
-    /// sharing, and shared callees are interned by [`Rc`] identity). The resulting identifiers are recorded on the new
-    /// [`Instruction`](crate::Instruction) in the same order.
+    /// sharing, and shared callees are interned by [`Arc`](std::sync::Arc) identity). Staging specializes imported
+    /// bodies when their requested inputs are more precise and reconciles signatures in region order. For example,
+    /// a linear call's transpose must receive the cotangent type of its specialized forward output. Drivers perform
+    /// only structural import and identity instantiation, so each required body specialization happens here once.
+    /// The finalized region identifiers are recorded on the new [`Instruction`](crate::Instruction) in the same
+    /// order after ordinary operation validation.
     ///
     /// # Parameters
     ///
     ///   - `operation`: [`Operation`] being staged.
-    ///   - `driver`: [`BindingRegionDriver`] scoped to this [`Operation`] application.
+    ///   - `regions`: [`AttachedRegions`] (or anything convertible into them) scoped to this [`Operation`] application.
     ///   - `inputs`: Input [`Tracer`]s, in [`Operation`]-defined order.
+    #[inline]
     fn stage_operation<
+        'r,
         O: Into<Self::Operation>,
-        D: BindingRegionDriver<Self::Constant, Self::Operation>,
+        R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>,
         I: std::borrow::Borrow<Self::Value>,
     >(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[I],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
-            .map_err(|error| self.error(error))?;
-        if self.builder().borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
-            let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
-            let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
-            Ok(output_types
-                .into_iter()
-                .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
-                .collect())
-        } else {
-            let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
-                Ok(input_atom_ids) => input_atom_ids,
-                Err(error) => return Err(self.error(error)),
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        /// Internal helper that stages an already converted [`Operation`] in `context`. This is the body of
+        /// [`StagingContext::stage_operation`], which only converts its input operation and regions, so that this body
+        /// is compiled once per staging context and input borrow rather than once per input operation type or way of
+        /// supplying regions. Keep it free of those type parameters: every closure and iterator adapter in it is
+        /// instantiated per distinct signature.
+        fn inner<S: StagingContext, I: std::borrow::Borrow<S::Value>>(
+            context: &S,
+            operation: S::Operation,
+            regions: AttachedRegions<'_, S::Constant, S::Operation>,
+            inputs: &[I],
+        ) -> Result<Vec<S::Value>, ProgramError> {
+            // Every live input atom is local to exactly one builder. Validate that ownership before inspecting
+            // regions or mutating this trace so a foreign tracer cannot alias an unrelated atom with the same
+            // numeric identifier.
+            check_builders!(context.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
+                .map_err(|error| context.error(error))?;
+
+            // Region input identities are instantiated from the instruction input types before the regions enter this
+            // builder. First validate the operation's region contract on the original region interfaces, so that later
+            // zips cannot silently omit either a region or its instantiation request, and so that specialization below
+            // cannot make otherwise mismatched region signatures agree. Region-free operations avoid collecting input
+            // types here as the checked builder path will infer them directly from its atoms.
+            let declared_region_count = operation.region_slots().len();
+            let region_interfaces = regions.region_interfaces();
+            operation.validate_region_interfaces(&region_interfaces).map_err(|error| context.error(error))?;
+            let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
+                (None, Vec::new(), Vec::new())
+            } else {
+                let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+                let region_input_types = operation
+                    .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())
+                    .map_err(|error| context.error(error.into()))?;
+                if region_input_types.len() != declared_region_count {
+                    return Err(context.error(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returned {} region instantiation entries for {} attached regions",
+                        operation.name(),
+                        region_input_types.len(),
+                        declared_region_count,
+                    ))));
+                }
+                (Some(input_types), region_interfaces, region_input_types)
             };
-            let region_ids = driver.import_into(self.builder()).map_err(|error| self.error(error))?;
-            let outputs = {
-                let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, region_ids, inputs) {
-                    Ok(outputs) => outputs.to_vec(),
-                    Err(error) => {
-                        if builder.error.is_none() {
-                            builder.error = Some(error.clone());
+
+            if context.builder().borrow().error.is_some() {
+                // A previously failed trace cannot append atoms, regions, or instructions, but callers still need
+                // correctly typed poison tracers so tracing can continue to the boundary that reports the original
+                // error. Reconstruct each hypothetical instantiated interface without importing it, then run ordinary
+                // output inference.
+                let input_types = input_types.unwrap_or_else(|| {
+                    inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>()
+                });
+                let region_interfaces = regions
+                    .regions()
+                    .zip(&region_input_types)
+                    .map(|(region, input_types)| match input_types {
+                        Some(input_types) => {
+                            // Instantiate the region's type identities at the requested input types when one structural
+                            // substitution expresses them. A valid mixed refinement (e.g., a symbolic `dimension<n>`
+                            // alongside an `f32[3]` that binds `n = 3`) admits none, so keep its declared interface,
+                            // as the healthy path below imports it, and let output inference accept the refined inputs.
+                            // Invalid signatures still return their derivation error.
+                            let renaming = FlatProgram::<S>::region_input_identity_renaming(
+                                region.interface().input_types(),
+                                input_types,
+                            )?;
+                            match renaming {
+                                Some(renaming) => {
+                                    Ok(region.to_program().rename_type_identities(&renaming)?.interface())
+                                }
+                                None => Ok(region.interface()),
+                            }
                         }
-                        return Err(error);
+                        None => Ok(region.interface()),
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                let output_types =
+                    operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
+                Ok(output_types
+                    .into_iter()
+                    .map(|r#type| Tracer::new(context.clone(), TracerState::Poison, r#type))
+                    .collect())
+            } else {
+                // Only a healthy trace consumes the regions and mutates the builder. Importing with the
+                // operation-derived input types makes each attached region boundary agree with this invocation
+                // before `add_instruction` derives its output types and records the final instruction.
+                let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
+                    Ok(input_atom_ids) => input_atom_ids,
+                    Err(error) => return Err(context.error(error)),
+                };
+
+                // Prepare genuine refinements in a separate arena because specializing one region can require replacing
+                // another. For example, specializing a linear call's forward region can change the cotangent shape its
+                // transpose must accept. Importing both the provisional and replacement transpose directly into the
+                // final builder would leave an unreachable region. Import only the finalized reachable closures below,
+                // preserving shared regions. Pure identity renaming uses the regions' ordinary import cache without a
+                // separate arena. Determine which regions require specialization before importing them, because
+                // importing instantiates their type identities, which hides input types that only narrow bounds from
+                // the comparison below. Valid mixed refinements that cannot be specialized (i.e., `None`) lack a
+                // structural substitution, so they are imported with their declared boundaries intact. The
+                // specialization loop below retains them without replaying, and final inference validates them.
+                let requires_specialization = region_interfaces
+                    .iter()
+                    .zip(&region_input_types)
+                    .map(|(interface, requested)| match requested {
+                        Some(requested) => {
+                            FlatProgram::<S>::region_requires_specialization(interface.input_types(), requested)
+                        }
+                        None => Ok(Some(false)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| context.error(error.into()))?;
+                let preparation_builder =
+                    requires_specialization.contains(&Some(true)).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
+                let region_builder = preparation_builder.as_ref().unwrap_or(context.builder());
+                let import_input_types = region_input_types
+                    .iter()
+                    .zip(&requires_specialization)
+                    .map(|(requested, requires_specialization)| requires_specialization.and(requested.clone()))
+                    .collect::<Vec<_>>();
+
+                let mut region_ids =
+                    regions.import_into(region_builder, &import_input_types).map_err(|error| context.error(error))?;
+                let instantiated_region_ids = region_ids.clone();
+
+                // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
+                // reshape, the array portions of its forward and transpose signatures might specialize as follows:
+                //
+                //   - Forward: `Array[n, 4]` -> `Array[2, 2*n]` becomes `Array[4, 4]` -> `Array[2, 8]`
+                //   - Transpose: `Array[2, 2*n] -> Array[n, 4]` becomes `Array[2, 8]` -> `Array[4, 4]`
+                //
+                // The transpose receives the forward output's cotangent. Computing its requested input signature only
+                // from the original symbolic forward interface would leave it stale after the forward is specialized.
+                // Recompute requests from the imported interfaces and visit slots in declaration order, updating later
+                // requests whenever an earlier region changes. The final operation inference still checks the resulting
+                // signatures exactly. Operations without explicit instantiation requests need no reconciliation.
+                if region_input_types.iter().any(Option::is_some) {
+                    let input_types = input_types.as_ref().unwrap();
+                    let mut interfaces = region_ids
+                        .iter()
+                        .map(|id| region_builder.borrow().region_ref(*id).map(|region| region.interface()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| context.error(error))?;
+                    let mut requests = operation
+                        .infer_region_input_types(input_types, &interfaces)
+                        .map_err(|error| context.error(error.into()))?;
+                    if requests.len() != declared_region_count {
+                        return Err(context.error(ProgramError::MalformedProgram(format!(
+                            "operation `{}` returned {} region instantiation entries for {} attached regions",
+                            operation.name(),
+                            requests.len(),
+                            declared_region_count,
+                        ))));
+                    }
+                    let mut specialized_regions = Vec::new();
+                    let mut specialization_failed = false;
+                    for index in 0..region_ids.len() {
+                        let Some(requested) = &requests[index] else { continue };
+                        if interfaces[index].input_types() == requested && requires_specialization[index] != Some(true)
+                        {
+                            continue;
+                        }
+
+                        // Replaying a mixed refinement that admits no structural substitution would erase a shared
+                        // input relationship, so retain every instantiated region instead, as
+                        // `specialize_attached_regions` does.
+                        if FlatProgram::<S>::region_input_identity_renaming(interfaces[index].input_types(), requested)
+                            .map_err(|error| context.error(error.into()))?
+                            .is_none()
+                        {
+                            specialization_failed = true;
+                            break;
+                        }
+
+                        if let Some((_, _, specialized_id)) =
+                            specialized_regions.iter().find(|(source_id, input_types, _)| {
+                                *source_id == region_ids[index] && input_types == requested
+                            })
+                        {
+                            region_ids[index] = *specialized_id;
+                            interfaces[index] = region_builder.borrow().region_ref(*specialized_id)?.interface();
+                        } else {
+                            let source_id = region_ids[index];
+                            let region = region_builder.borrow().region_ref(source_id)?.to_program();
+                            let Ok(specialized) = region.specialize_to_region_input_types(requested) else {
+                                specialization_failed = true;
+                                break;
+                            };
+                            interfaces[index] = specialized.interface();
+                            region_ids[index] = region_builder.borrow_mut().import_program(specialized);
+                            specialized_regions.push((source_id, requested.clone(), region_ids[index]));
+                        }
+
+                        if index + 1 < region_ids.len() {
+                            requests = operation
+                                .infer_region_input_types(input_types, &interfaces)
+                                .map_err(|error| context.error(error.into()))?;
+                            if requests.len() != declared_region_count {
+                                return Err(context.error(ProgramError::MalformedProgram(format!(
+                                    "operation `{}` returned {} region instantiation entries for {} attached regions",
+                                    operation.name(),
+                                    requests.len(),
+                                    declared_region_count,
+                                ))));
+                            }
+                        }
+                    }
+
+                    // Specialization is an optimization. The regions whose type identities were merely instantiated
+                    // keep the declared region signatures, so falling back to them is always sound: the operation's
+                    // final inference below decides whether the inputs may feed them (e.g., control flow operations
+                    // accept value inputs that refine their declared types) and still reports genuine type errors.
+                    // Specialized regions can be unusable even though their declared counterparts are fine. For
+                    // example, a loop body specialized at a sharded carry may return that carry unsharded, so the
+                    // specialized body no longer maps its carries to themselves. Such an application falls back to the
+                    // instantiated regions.
+                    if specialization_failed
+                        || (!specialized_regions.is_empty()
+                            && operation.infer_output_types(input_types, &interfaces).is_err())
+                    {
+                        region_ids = instantiated_region_ids;
                     }
                 }
-            };
-            Ok(outputs.into_iter().map(|atom| self.tracer(atom, None)).collect::<Vec<_>>())
+
+                if preparation_builder.is_some() {
+                    let prepared = region_builder.borrow();
+                    let roots = region_ids.iter().map(|id| prepared.region_ref(*id).unwrap()).collect::<Vec<_>>();
+                    region_ids =
+                        context.builder().borrow_mut().import_regions(&roots).map_err(|error| context.error(error))?;
+                }
+
+                // Snapshot the active provenance and attach it to the recorded instruction. Provenance state lives in
+                // its own cell, separate from the builder, so scope transitions never contend with builder borrows.
+                let provenance = context.provenance();
+                let outputs = {
+                    let mut builder = context.builder().borrow_mut();
+                    match builder.add_instruction_or_fold(operation, region_ids, inputs, Some(provenance)) {
+                        Ok(outputs) => outputs,
+                        Err(error) => {
+                            if builder.error.is_none() {
+                                builder.error = Some(error.clone());
+                            }
+                            return Err(error);
+                        }
+                    }
+                };
+                Ok(outputs.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>())
+            }
         }
+
+        inner(self, operation.into(), regions.into(), inputs)
     }
 }
 
@@ -479,11 +1071,11 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
 /// It represents what, if anything, the context can prove that the value denotes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueResolution<V> {
-    /// The value denotes this concrete constant payload. This is the strongest outcome. Eager [`Context`]s, whose
-    /// flowing values *are* constants, always resolve to [`ValueResolution::Concrete`]. [`StagingContext`]s resolve
-    /// here only for *literal-backed* [`Tracer`]s, whose staged [`Atom`](crate::Atom) is a constant atom in the
-    /// context's [`ProgramBuilder`].
-    Concrete(V),
+    /// The value denotes this program-constant payload. Eager [`Context`]s whose flowing values and constants use the
+    /// same representation always resolve to [`ValueResolution::Constant`]. [`StagingContext`]s resolve here only for
+    /// *literal-backed* [`Tracer`]s whose staged [`Atom`](crate::Atom) is a constant atom in the context's
+    /// [`ProgramBuilder`]. This resolution guarantees that the payload can be embedded as a program constant.
+    Constant(V),
 
     /// The value is a live, staged, value identified by this [`AtomId`] in the resolving context's [`Program`], with no
     /// concrete payload until the traced program runs. The carried [`AtomId`] is a stable identity for the value within
@@ -496,19 +1088,752 @@ pub enum ValueResolution<V> {
 }
 
 impl<V> ValueResolution<V> {
-    /// Returns `true` if this [`ValueResolution`] is [`Concrete`](Self::Concrete).
+    /// Returns `true` if this [`ValueResolution`] is [`Constant`](Self::Constant).
     #[inline]
-    pub fn is_concrete(&self) -> bool {
-        matches!(self, Self::Concrete(_))
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Self::Constant(_))
     }
 
-    /// Returns the concrete constant payload of this [`ValueResolution`] if it is a [`Concrete`](Self::Concrete)
+    /// Returns the program-constant payload of this [`ValueResolution`] if it is a [`Constant`](Self::Constant)
     /// resolution, and [`None`] otherwise.
     #[inline]
-    pub fn into_concrete(self) -> Option<V> {
+    pub fn into_constant(self) -> Option<V> {
         match self {
-            Self::Concrete(constant) => Some(constant),
+            Self::Constant(constant) => Some(constant),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use half::{bf16, f16};
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+    };
+    use crate::differentiation::DifferentiationTracer;
+    use crate::macros::impl_guardless_operation;
+    use crate::operations::{
+        AddOperation, CompareOperation, ComparisonDirection, DimensionAddOperation, NegOperation, OneOperation,
+        WhileOperation, ZeroOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialTracer;
+    use crate::programs::{
+        Atom, AtomId, AttachedRegions, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
+        RegionInterface, RegionReplayMappings, RegionSlot, ReplayRegionDriver, TypeError, TypeIdentityRenaming, Typed,
+        ValueProjection,
+    };
+    use crate::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
+        ProjectedProgramType, ProjectedProgramValue, TestRegionOperation,
+    };
+    use crate::tracing::{DomainTracingContext, Tracer, TracerState, TracingContext};
+
+    use super::*;
+
+    #[test]
+    fn test_domain() {
+        // `EagerContext<Array, ArrayOperation<Array>>` is an eager context over self-describing arrays, so binding a
+        // nullary zero or one operation interprets it directly as a rank-zero array of the requested `ArrayType`.
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::BF16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(bf16::ZERO).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::BF16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(bf16::ONE).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(f16::ZERO).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(f16::ONE).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(0.0f32).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(1.0f32).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(0.0).unwrap()])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(1.0).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_eager_context_binds_and_lifts_values() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let default_context = EagerContext::<Array, ArrayOperation<Array>>::default();
+        assert_eq!(format!("{context:?}"), "EagerContext");
+        assert_eq!(format!("{default_context:?}"), "EagerContext");
+        assert_eq!(context.lift(Array::scalar(2.5).unwrap()), Ok(Array::scalar(2.5).unwrap()));
+        assert_eq!(
+            context.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), [], &[]),
+            Ok(vec![Array::scalar(0.0).unwrap()])
+        );
+        assert_eq!(
+            context.bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(1.0).unwrap()])
+        );
+        assert_eq!(
+            context.bind(AddOperation::new(), Vec::new(), &[Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()]),
+            Ok(vec![Array::scalar(5.5).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_eager_context_bind_validates_and_interprets_shared_callee_programs() {
+        // Shared callee programs bind through the same eager interpretation driver as owned regions. Eager binding
+        // validates the complete attachment count before handing that driver to the operation's interpretation rule.
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let carry = builder.add_input(ArrayType::scalar(DataType::F64));
+            let eight = builder.add_constant(Array::scalar(8.0).unwrap());
+            let predicate = builder
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![carry, eight],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let carry = builder.add_input(ArrayType::scalar(DataType::F64));
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let condition = Arc::new(condition);
+        let body = Arc::new(body);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            context.bind(
+                AddOperation::new(),
+                AttachedRegions::Callees(std::slice::from_ref(&condition)),
+                &[Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `add` declares no region slots but 1 regions were attached",
+        ));
+        assert!(matches!(
+            context.bind(
+                ArrayOperation::While(WhileOperation::new()),
+                AttachedRegions::Callees(&[]),
+                &[Array::scalar(1.0).unwrap()],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `while` declares 2 region slots but 0 regions were attached",
+        ));
+        assert!(matches!(
+            context.bind(
+                ArrayOperation::While(WhileOperation::new()),
+                AttachedRegions::Callees(&[condition.clone(), body.clone(), body.clone()]),
+                &[Array::scalar(1.0).unwrap()],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `while` declares 2 region slots but 3 regions were attached",
+        ));
+        assert_eq!(
+            context.bind(
+                ArrayOperation::While(WhileOperation::new()),
+                AttachedRegions::Callees(&[condition, body]),
+                &[Array::scalar(1.0).unwrap()],
+            ),
+            Ok(vec![Array::scalar(8.0).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_eager_context_provenance_is_a_no_op() {
+        // Terminal eager contexts record no instructions, so there is nothing to attach provenance to. Entering a
+        // scope runs the closure directly, the provenance stays unknown, and execution is unaffected.
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let sum = context
+            .invoke_with_provenance_scope(ProvenanceScope::new("scope"), || {
+                assert_eq!(context.provenance(), Provenance::unknown());
+                context.bind(
+                    AddOperation::new(),
+                    Vec::new(),
+                    &[Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()],
+                )
+            })
+            .unwrap();
+        assert_eq!(sum, vec![Array::scalar(3.0).unwrap()]);
+    }
+
+    #[test]
+    fn test_projected_context_binds_and_lifts_values() {
+        type TestEagerContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+        // The adapter is zero-state. It stores its parent and nothing else.
+        let context = ProjectedContext::<_, ProjectedMemberType<0>>::new(TestEagerContext::new());
+        assert_eq!(
+            size_of::<ProjectedContext<TestEagerContext, ProjectedMemberType<0>>>(),
+            size_of::<TestEagerContext>()
+        );
+        assert!(context.is_eager());
+        assert_eq!(
+            context.bind(ProjectedMemberOperation::Identity, Vec::new(), &[ProjectedMemberValue::<0>(7)]),
+            Ok(vec![ProjectedMemberValue::<0>(7)]),
+        );
+        assert_eq!(context.lift(ProjectedMemberValue::<0>(11)), Ok(ProjectedMemberValue::<0>(11)));
+        assert_eq!(
+            context.resolve(&ProjectedMemberValue::<0>(13)),
+            ValueResolution::Constant(ProjectedMemberValue::<0>(13)),
+        );
+
+        // Attached member regions are lifted into the parent family, whose binding validates them against the lifted
+        // operation's region slots.
+        let mut builder = ProgramBuilder::<ProjectedMemberValue<0>, ProjectedMemberOperation<0>>::new();
+        let input = builder.add_input(ProjectedMemberType);
+        let region = builder
+            .build::<Vec<ProjectedMemberValue<0>>, Vec<ProjectedMemberValue<0>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            context.bind(
+                ProjectedMemberOperation::Identity,
+                vec![region],
+                &[ProjectedMemberValue::<0>(17)],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `projected_member` declares no region slots but 1 regions were attached",
+        ));
+    }
+
+    #[test]
+    fn test_projected_context_binds_region_carrying_operations() {
+        // A member operation's regions are member-family programs, which binding lifts into the parent family,
+        // both when the parent executes the operation and when it stages it.
+        let program = |build: fn(&mut ProgramBuilder<Array, ArrayOperation<Array>>, AtomId) -> AtomId| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let output = build(&mut builder, input);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let condition = program(|builder, carry| {
+            let eight = builder.add_constant(Array::scalar(8.0).unwrap());
+            let direction = ComparisonDirection::LessThan;
+            builder
+                .add_instruction(CompareOperation::new(direction), Vec::new(), vec![carry, eight], None)
+                .unwrap()[0]
+        });
+        let body = program(|builder, carry| {
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0]
+        });
+        let regions = vec![condition, body];
+
+        let eager =
+            ProjectedContext::<_, ArrayType>::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        assert_eq!(
+            eager.bind(ArrayOperation::While(WhileOperation::new()), regions.clone(), &[Array::scalar(1.0).unwrap()]),
+            Ok(vec![Array::scalar(8.0).unwrap()]),
+        );
+
+        type ArrayIrTracer = Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>;
+        let (_, staged) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input: ArrayIrTracer| {
+                let context = ProjectedContext::<_, ArrayType>::new(input.context().clone());
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = context.bind(ArrayOperation::While(WhileOperation::new()), regions, &[input])?.remove(0);
+                Ok::<_, ProgramError>(<ArrayIrTracer as ValueProjection<ArrayType>>::from_projected(output))
+            },
+            ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            staged.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = while %0 [
+                    condition={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const 8.0
+                            %2:bool[] = compare [direction=LessThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_projected_context_stages_without_implicit_dependencies() {
+        type TestTracingContext = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+        let parent = TestTracingContext::new();
+        let input = parent.input(ProjectedProgramType::First(ProjectedMemberType));
+        let input_atom = input.atom_id().unwrap();
+        let input =
+            <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<0>>>::into_projected(input).unwrap();
+        let context = input.domain();
+        let output = context.bind(ProjectedMemberOperation::Identity, Vec::new(), &[input]).unwrap().remove(0);
+
+        assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
+        assert_eq!(context.resolve(&output), ValueResolution::Staged(AtomId::new(1)));
+        let builder = parent.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one projected instruction");
+        };
+        assert_eq!(instruction.inputs(), &[input_atom]);
+        assert_eq!(instruction.outputs(), &[AtomId::new(1)]);
+        assert!(matches!(
+            instruction.operation(),
+            ProjectedProgramOperation::First(ProjectedMemberOperation::Identity)
+        ));
+        assert!(instruction.regions().is_empty());
+    }
+
+    #[test]
+    fn test_projected_context_supports_additional_members() {
+        type TestEagerContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
+        type TestTracingContext = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+        // This is the additional-member extensibility gate. Adding another member kind to a heterogeneous family
+        // requires only that member's family-level type/value conversions and operation-family projection. The generic
+        // projected values for ordinary tracing and both transform carriers remain usable without any changes.
+        fn assert_value<V: Value>() {}
+        assert_value::<ProjectedValue<ProjectedMemberType<1>, Tracer<TestTracingContext>>>();
+        assert_value::<ProjectedValue<ProjectedMemberType<1>, PartialTracer<TestEagerContext>>>();
+        assert_value::<ProjectedValue<ProjectedMemberType<1>, DifferentiationTracer<TestEagerContext>>>();
+
+        let parent = TestTracingContext::new();
+        let input = parent.input(ProjectedProgramType::Second(ProjectedMemberType));
+        let input =
+            <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<1>>>::into_projected(input).unwrap();
+        let output = input.domain().bind(ProjectedMemberOperation::Identity, Vec::new(), &[input]).unwrap().remove(0);
+        assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
+        assert!(matches!(
+            parent.builder().borrow().instructions()[0].operation(),
+            ProjectedProgramOperation::Second(ProjectedMemberOperation::Identity),
+        ));
+    }
+
+    #[test]
+    fn test_staging_context_creates_inputs_constants_and_tracers() {
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = context.builder().clone();
+
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let constant = context.constant(Array::scalar(2.5).unwrap());
+        let builder_typed = context.tracer(AtomId::new(0), None);
+        let cached_typed = context.tracer(AtomId::new(0), Some(ArrayType::scalar(DataType::F64)));
+
+        assert_eq!(input.atom_id(), Ok(AtomId::new(0)));
+        assert_eq!(constant.atom_id(), Ok(AtomId::new(1)));
+        assert_eq!(input.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+
+        let builder = builder.borrow();
+        assert_eq!(builder.input_ids(), &[AtomId::new(0)]);
+        assert!(builder.instructions().is_empty());
+        assert!(matches!(&builder.atoms()[0], Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == Array::scalar(2.5).unwrap()));
+    }
+
+    #[test]
+    fn test_staging_context_stages_nullary_and_regular_operations() {
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = context.builder().clone();
+
+        let mut nullary_outputs =
+            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::F64))).unwrap();
+        assert_eq!(nullary_outputs.len(), 1);
+        let zero = nullary_outputs.remove(0);
+        assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+
+        let lhs = context.input(ArrayType::scalar(DataType::F64));
+        let rhs = context.input(ArrayType::scalar(DataType::F64));
+        let mut add_outputs = context.stage_operation(AddOperation::new(), [], &[&lhs, &rhs]).unwrap();
+        assert_eq!(add_outputs.len(), 1);
+        let sum = add_outputs.remove(0);
+        assert_eq!(sum.atom_id(), Ok(AtomId::new(3)));
+        assert_eq!(sum.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+
+        {
+            let builder = builder.borrow();
+            assert_eq!(builder.instructions().len(), 2);
+            assert_eq!(builder.instructions()[0].inputs(), &[]);
+            assert_eq!(builder.instructions()[0].outputs(), &[AtomId::new(0)]);
+            assert!(builder.instructions()[0].operation().is_zero(0));
+            assert_eq!(builder.instructions()[1].inputs(), &[AtomId::new(1), AtomId::new(2)]);
+            assert_eq!(builder.instructions()[1].outputs(), &[AtomId::new(3)]);
+        }
+
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap())),
+            Ok(Array::scalar(5.5).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_staging_context_records_errors_and_returns_poisoned_outputs_after_failure() {
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = context.builder().clone();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+
+        let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
+        assert_eq!(context.error(first_error.clone()), first_error);
+        assert_eq!(context.error(second_error.clone()), second_error);
+        assert_eq!(builder.borrow().error().cloned(), Some(first_error.clone()));
+
+        let mut outputs = context.stage_operation(NegOperation::new(), Vec::new(), &[&input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.remove(0);
+        assert_eq!(output.state(), &TracerState::Poison);
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(builder.borrow().error().cloned(), Some(first_error));
+
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = context.builder().clone();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let foreign_input = foreign_context.input(ArrayType::scalar(DataType::F64));
+
+        assert!(matches!(
+            context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &foreign_input]),
+            Err(ProgramError::MismatchedProgramBuilders),
+        ));
+        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_staging_context_validates_and_instantiates_region_attachments() {
+        let region = {
+            let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+
+        // Attachment-count mismatches are rejected before inference or import and become the trace's recorded error.
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            context.stage_operation(
+                TestRegionOperation::Staging { region_input_type_count: 1, fail_region_input_inference: false },
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `staging_region` declares 1 region slots but 0 regions were attached",
+        ));
+        assert!(matches!(
+            context.builder().borrow().error(),
+            Some(ProgramError::MalformedProgram(message))
+                if message == "operation `staging_region` declares 1 region slots but 0 regions were attached",
+        ));
+
+        // The operation must return exactly one instantiation request per declared region.
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            context.stage_operation(
+                TestRegionOperation::Staging { region_input_type_count: 0, fail_region_input_inference: false },
+                vec![region.clone()],
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::MalformedProgram(actual))
+            if actual == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
+        ));
+        assert!(matches!(
+            context.builder().borrow().error(),
+            Some(ProgramError::MalformedProgram(actual))
+            if actual == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
+        ));
+
+        // Region-input inference failures are recorded on the builder just like output-inference and import failures.
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let error = ProgramError::Type(TypeError::invalid("failed to infer staging region input types"));
+        assert!(matches!(
+            context.stage_operation(
+                TestRegionOperation::Staging { region_input_type_count: 1, fail_region_input_inference: true },
+                vec![region.clone()],
+                std::slice::from_ref(&input),
+            ),
+            Err(actual) if actual == error,
+        ));
+        assert_eq!(context.builder().borrow().error(), Some(&error));
+
+        // A poisoned trace infers the outputs against the hypothetical instantiated interface but imports and records
+        // nothing, preserving the original builder error.
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let original_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        context.error(original_error.clone());
+        let outputs = context
+            .stage_operation(
+                TestRegionOperation::Staging { region_input_type_count: 1, fail_region_input_inference: false },
+                vec![region],
+                std::slice::from_ref(&input),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].state(), &TracerState::Poison);
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        let builder = context.builder().borrow();
+        assert_eq!(builder.error(), Some(&original_error));
+        assert!(builder.instructions().is_empty());
+        assert!(builder.regions.is_empty());
+
+        // A live trace imports the region only after instantiating its formal input identity from the caller type.
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let formal_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("batch", bounds))]),
+        );
+        let caller_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("caller_batch", bounds))]),
+        );
+        let region = {
+            let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+            let input = builder.add_input(formal_type);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(caller_type.clone());
+        let outputs = context
+            .stage_operation(
+                TestRegionOperation::IdentityInstantiating { dependent_regions: false },
+                vec![region.clone()],
+                std::slice::from_ref(&input),
+            )
+            .unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &caller_type);
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one staged instruction");
+        };
+        let [region_id] = instruction.regions() else {
+            panic!("expected one attached region");
+        };
+        let interface = builder.region_ref(*region_id).unwrap().interface();
+        assert_eq!(interface.input_types(), std::slice::from_ref(&caller_type));
+        assert_eq!(interface.output_types(), std::slice::from_ref(&caller_type));
+        drop(builder);
+
+        // Dependent region inputs follow the specialized forward output. Provisional imports must not leave
+        // unreachable regions, and the two references to one callee must remain one shared final region.
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(ArrayType::new_static(DataType::F64, [3]));
+        let callee = Arc::new(region);
+        let callees = [callee.clone(), callee.clone(), callee];
+        let outputs = context
+            .stage_operation(
+                TestRegionOperation::IdentityInstantiating { dependent_regions: true },
+                AttachedRegions::Callees(&callees),
+                &[input],
+            )
+            .unwrap();
+        let destination = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0].atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let attached = destination.instructions()[0].regions();
+        assert_eq!(attached[1], attached[2]);
+        assert_eq!(destination.output_types(), vec![ArrayType::new_static(DataType::F64, [3])]);
+
+        // All driver forms import nominal identities only. Staging must infer the narrower arithmetic body once,
+        // including when input identity instantiation already made its signature exactly match the request.
+
+        /// Small region family that counts arithmetic inference without requiring an array operation domain.
+        #[derive(Clone)]
+        enum NarrowingOperation {
+            /// Dimension addition whose inference is observed by the test.
+            Add { operation: DimensionAddOperation, inference_count: Arc<AtomicUsize> },
+
+            /// One attached body instantiated from the supplied dimension input.
+            Call,
+        }
+
+        impl Operation for NarrowingOperation {
+            type Type = DimensionType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Add { .. } => "counted_dimension_add",
+                    Self::Call => "dimension_call",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Add { .. } => &[],
+                    Self::Call => const { &[RegionSlot::computation("body")] },
+                }
+            }
+
+            fn infer_region_input_types(
+                &self,
+                inputs: &[DimensionType],
+                _: &[RegionInterface<DimensionType>],
+            ) -> Result<Vec<Option<Vec<DimensionType>>>, TypeError> {
+                Ok(match self {
+                    Self::Add { .. } => vec![],
+                    Self::Call => vec![Some(inputs.to_vec())],
+                })
+            }
+
+            fn infer_output_types(
+                &self,
+                inputs: &[DimensionType],
+                regions: &[RegionInterface<DimensionType>],
+            ) -> Result<Vec<DimensionType>, TypeError> {
+                match self {
+                    Self::Add { operation, inference_count } => {
+                        inference_count.fetch_add(1, Ordering::Relaxed);
+                        operation.infer_output_types(inputs, regions)
+                    }
+                    Self::Call => {
+                        assert_eq!(regions[0].input_types(), inputs);
+                        Ok(regions[0].output_types().to_vec())
+                    }
+                }
+            }
+
+            fn rename_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<DimensionVariable>,
+            ) -> Result<Self, TypeError> {
+                Ok(match self {
+                    Self::Add { operation, inference_count } => Self::Add {
+                        operation: operation.rename_type_identities(renaming)?,
+                        inference_count: inference_count.clone(),
+                    },
+                    Self::Call => Self::Call,
+                })
+            }
+        }
+
+        impl_guardless_operation!(NarrowingOperation);
+
+        /// Stages one narrowed body through the chosen driver and checks its result, inference count, and closure.
+        fn check_narrowed_body(
+            regions: AttachedRegions<'_, DimensionValue, NarrowingOperation>,
+            inference_count: &AtomicUsize,
+        ) {
+            inference_count.store(0, Ordering::Relaxed);
+            let context = TracingContext::<DimensionValue, NarrowingOperation>::new();
+            let input = context.input(DimensionValue::constant(3).unwrap().r#type().into_owned());
+            let outputs = context.stage_operation(NarrowingOperation::Call, regions, &[input]).unwrap();
+            assert_eq!(outputs[0].r#type().bounds(), DimensionBounds::new(5, Some(6)).unwrap());
+            assert_eq!(inference_count.load(Ordering::Relaxed), 1);
+            context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                    vec![outputs[0].atom_id().unwrap()],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+        }
+
+        let inference_count = Arc::new(AtomicUsize::new(0));
+        let dimension = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let two = DimensionValue::constant(2).unwrap();
+        let operation = DimensionAddOperation::new(&dimension, two.r#type().as_ref()).unwrap();
+        let mut builder = ProgramBuilder::<DimensionValue, NarrowingOperation>::new();
+        let input = builder.add_input(dimension);
+        let two = builder.add_constant(two);
+        let output = builder
+            .add_instruction(
+                NarrowingOperation::Add { operation, inference_count: inference_count.clone() },
+                vec![],
+                vec![input, two],
+                None,
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        check_narrowed_body(vec![source.clone()].into(), &inference_count);
+        let callees = [Arc::new(source.clone())];
+        check_narrowed_body(AttachedRegions::Callees(&callees), &inference_count);
+        let mappings = RegionReplayMappings::new();
+        let roots = [source.entry()];
+        check_narrowed_body(
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap().into(),
+            &inference_count,
+        );
+    }
+
+    #[test]
+    fn test_staging_context_resolve() {
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let constant = context.constant(Array::scalar(2.5).unwrap());
+        let mut add_outputs = context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &constant]).unwrap();
+        let sum = add_outputs.remove(0);
+
+        // Literal-backed tracers resolve to their program-constant payload, while inputs and operation outputs
+        // resolve to their staged atoms.
+        assert_eq!(context.resolve(&input), ValueResolution::Staged(AtomId::new(0)));
+        assert_eq!(context.resolve(&constant), ValueResolution::Constant(Array::scalar(2.5).unwrap()));
+        assert_eq!(context.resolve(&sum), ValueResolution::Staged(AtomId::new(2)));
+
+        // Tracers belonging to a different builder are opaque, in both directions.
+        let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let foreign_input = foreign_context.input(ArrayType::scalar(DataType::F64));
+        assert_eq!(context.resolve(&foreign_input), ValueResolution::Opaque);
+        assert_eq!(foreign_context.resolve(&input), ValueResolution::Opaque);
+
+        // Poisoned tracers are opaque even in their own context.
+        let poisoning_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        assert_eq!(foreign_context.error(poisoning_error.clone()), poisoning_error);
+        let mut poisoned_outputs =
+            foreign_context.stage_operation(NegOperation::new(), Vec::new(), &[&foreign_input]).unwrap();
+        let poisoned = poisoned_outputs.remove(0);
+        assert_eq!(poisoned.state(), &TracerState::Poison);
+        assert_eq!(foreign_context.resolve(&poisoned), ValueResolution::Opaque);
     }
 }

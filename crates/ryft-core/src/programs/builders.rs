@@ -1,25 +1,38 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::effects::ReferenceAccessMode;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationFoldReplacement};
 use crate::programs::programs::Program;
-use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
-use crate::programs::types::Typed;
+use crate::programs::provenance::Provenance;
+use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
+use crate::programs::regions::{
+    InputRegionProvenance, Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
+};
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
+
+/// Process-local identity of a live [`ProgramBuilder`] shared by clones of its owning context. Symbolic reference
+/// identities use it to distinguish builders whose atom or capture indices happen to coincide. Current contexts use
+/// their shared builder allocation's address. Retain that allocation while comparing identities because addresses
+/// may be reused after it is dropped.
+pub type ProgramBuilderId = usize;
 
 /// Builder for [`Program`]s. It owns the entry [`Region`] under construction (i.e., its [`Atom`]s, input [`AtomId`]s,
 /// and [`Instruction`]s), the previously added non-entry [`Region`]s together with their callee-interning state, and
 /// an optional [`ProgramError`] that can be used to signal a failure during program construction. Non-entry regions
 /// enter a builder only in sealed form: [`import_region`](Self::import_region) copies complete reachable closures
 /// out of immutable regions, [`import_program`](Self::import_program) moves complete owned programs, and
-/// [`intern_callee`](Self::intern_callee) reuses imports by [`Rc`] identity. A region can therefore never
+/// [`intern_callee`](Self::intern_callee) reuses imports by [`Arc`] identity. A region can therefore never
 /// change after an instruction attaches it.
 #[derive(Clone, Debug, Default)]
 pub struct ProgramBuilder<V: Typed + Parameter, O> {
@@ -35,19 +48,33 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     /// Sealed non-entry [`Region`]s of the [`Program`] being built, in [`RegionId`] order. Regions are appended
     /// to this list with [`Self::import_region`], [`Self::import_program`], and [`Self::intern_callee`], and
     /// [`Instruction`]s reference them by [`RegionId`].
-    pub(crate) regions: Vec<Region<V, O>>,
+    pub(crate) regions: RegionArena<V, O>,
 
-    /// Callee-interning table mapping each imported callee source to its destination root, keyed by [`Rc`] identity
-    /// (i.e., [`Rc::ptr_eq`]). Two imports of the same live source program reuse one callee root, while structurally
-    /// equal but independently built programs remain distinct. Storing the [`Rc`] itself both provides the identity
+    /// Callee-interning table mapping each imported callee source to its destination root, keyed by [`Arc`] identity
+    /// (i.e., [`Arc::ptr_eq`]). Two imports of the same live source program reuse one callee root, while structurally
+    /// equal but independently built programs remain distinct. Storing the [`Arc`] itself both provides the identity
     /// key and keeps the source alive, so a key can never be reused by a later allocation.
-    pub(crate) callees: Vec<(Rc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
+    pub(crate) callees: Vec<(Arc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
+
+    /// [`TypeIdentity`](crate::TypeIdentity)-instantiated shared callees cached by source and caller input [`Type`]s.
+    callee_instantiations: Vec<CalleeInstantiation<V, O>>,
 
     /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
     pub(crate) error: Option<ProgramError>,
+
+    /// Reference alias topology and consumption state of the region under construction, consulted and maintained by
+    /// [`add_instruction`](Self::add_instruction) alone. The legality of one instruction "append" depends on what
+    /// every earlier "append" did and this builder is the only object that spans every "append" of the region (i.e.,
+    /// hand-built programs, capture lifting, and [`splice_program`](Self::splice_program) never involve a staging
+    /// context), so the fold lives here rather than being recomputed from [`Self::instructions`] on every "append".
+    /// One builder constructs exactly one region, so this state needs no region key, and its lifecycle is the region's
+    /// own. It stays empty (and its checks stay one emptiness test each) for reference-free programs, and it
+    /// deliberately excludes [`add_instruction_unchecked`](Self::add_instruction_unchecked) appends. Refer to the
+    /// documentation of [`ReferenceLifetimes`] for the "checked-appends-only" contract.
+    references: ReferenceLifetimes,
 }
 
-impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// Creates a new [`ProgramBuilder`].
     #[inline]
     pub fn new() -> Self {
@@ -55,9 +82,11 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             atoms: Vec::new(),
             input_ids: Vec::new(),
             instructions: Vec::new(),
-            regions: Vec::new(),
+            regions: RegionArena::new(),
             callees: Vec::new(),
+            callee_instantiations: Vec::new(),
             error: None,
+            references: ReferenceLifetimes::default(),
         }
     }
 
@@ -88,11 +117,169 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Returns a borrowed view of the already sealed builder region that corresponds to the provided [`RegionId`].
     #[inline]
     pub fn region_ref(&self, id: RegionId) -> Result<RegionRef<'_, V, O>, ProgramError> {
-        RegionRef::new(self.regions.as_slice(), id)
+        RegionRef::new(&self.regions, id)
             .map_err(|_| ProgramError::MalformedProgram(format!("region {id} is not part of this builder")))
     }
 
-    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`](crate::Type).
+    /// Returns the allocation identity denoted by `atom`, following aliases and nested-region forwarding without
+    /// reading reference contents. Returns `None` when no identity can be established. A non-reference constant that
+    /// reports a runtime identity retains that identity so boundary validation can reject its inconsistent type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `atom_id`: [`AtomId`] of an atom in this builder's namespace.
+    ///   - `builder_id`: Stable identity of this live builder, shared by its owning context's clones and distinct from
+    ///     other live builders. Retain the owning builder while comparing symbolic identities. Refer to
+    ///     [`ProgramBuilderId`] for the lifetime requirements of address-based identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unbound atom or invalid reference forwarding, including nested-region outputs that
+    /// cannot be traced to one external allocation.
+    pub fn reference_identity(
+        &self,
+        atom_id: AtomId,
+        builder_id: ProgramBuilderId,
+    ) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        let value = self.atoms.get(atom_id.index()).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+        if !value.r#type().is_reference() {
+            return Ok(value.as_constant().and_then(Value::reference_id).map(ReferenceIdentity::Runtime));
+        }
+        let (root, constant) = self.resolve_reference(atom_id)?;
+        Ok(match constant {
+            Some(value) => value
+                .capture_index()
+                .map(|index| ReferenceIdentity::Capture { builder: builder_id, index })
+                .or_else(|| value.reference_id().map(ReferenceIdentity::Runtime)),
+            None => Some(ReferenceIdentity::Staged { builder: builder_id, root }),
+        })
+    }
+
+    /// Resolves aliases and nested-region forwarding to a representative atom in this builder and, when present, the
+    /// external constant it denotes. If a nested region returns a captured constant with no corresponding caller atom,
+    /// the representative remains the region operation's result atom. Representative atoms therefore need not be
+    /// identical for aliases of the same constant. Use [`Self::reference_identity`] instead to compare allocations.
+    pub(crate) fn resolve_reference(&self, atom: AtomId) -> Result<(AtomId, Option<&V>), ProgramError> {
+        let value = self.atoms.get(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })?;
+
+        // Follow the alias topology maintained by checked instruction appends before inspecting the producer.
+        let root = self.references.root(atom);
+        if root != atom {
+            return self.resolve_reference(root);
+        }
+
+        // Constants identify external storage directly or through an inherited capture table entry.
+        if let Some(constant) = value.as_constant() {
+            return Ok((atom, Some(constant)));
+        }
+
+        // Locate the defining instruction. An atom without a producer is already its own representative.
+        let Some((instruction, output_index)) = self.instructions.iter().find_map(|instruction| {
+            instruction.outputs().iter().position(|output| *output == atom).map(|index| (instruction, index))
+        }) else {
+            return Ok((atom, None));
+        };
+        let operation = instruction.operation();
+        let provenance = operation.output_region_provenance(output_index);
+
+        // Without region forwarding, use the operation's alias declaration. This also covers unchecked appends,
+        // which do not populate the builder's incremental alias topology. Otherwise, the result starts a new root.
+        if provenance.is_empty() {
+            if let Some(input_index) = operation.reference_output_identity_input(output_index) {
+                let input = instruction.inputs().get(input_index).ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "operation `{}` has an out-of-range reference identity input",
+                        operation.name()
+                    ))
+                })?;
+                return self.resolve_reference(*input);
+            }
+            return Ok((atom, None));
+        }
+
+        // Every possible region output must resolve to the same allocation in the caller's namespace.
+        let mut forwarded: Option<(AtomId, Option<&V>)> = None;
+        for output in provenance {
+            let region_id = instruction.regions().get(output.region_index).copied().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("operation `{}` forwards an unknown region", operation.name()))
+            })?;
+            let region = self.region_ref(region_id)?;
+
+            // Interpret captures using this attachment's explicit capture prefix, rather than assuming that every
+            // capture index refers to the caller's inherited table.
+            let analysis = region.reference_analysis_with_configuration(
+                operation.region_capture_input_count(output.region_index),
+                true,
+                &[],
+            )?;
+            let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
+                Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
+                    // Map a forwarded handle to its instruction input; an operation-owned root cannot escape.
+                    let input_index = match operation.input_region_provenance(output.region_index, input_index) {
+                        InputRegionProvenance::Input { index } => index,
+                        InputRegionProvenance::Local => {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "operation `{}` forwards local reference input {} of region {} through an output",
+                                operation.name(),
+                                input_index,
+                                output.region_index,
+                            )));
+                        }
+                        InputRegionProvenance::None => {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "operation `{}` does not describe a forwarded reference input",
+                                operation.name(),
+                            )));
+                        }
+                    };
+                    let input = instruction.inputs().get(input_index).copied().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "operation `{}` forwards an unknown input",
+                            operation.name(),
+                        ))
+                    })?;
+                    self.resolve_reference(input)?
+                }
+                Some(ReferenceRoot::Constant { value }) => {
+                    // A nested constant may have no caller atom. Keep the result atom as its representative and
+                    // retain the constant so identity comparison can still recognize aliases of external storage.
+                    let owner = region.with_id(value.region())?;
+                    (atom, owner.atoms()[value.atom().index()].as_constant())
+                }
+                _ => {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returns a reference whose allocation is not external to its region",
+                        operation.name(),
+                    )));
+                }
+            };
+
+            // Compare external constants by capture or runtime identity and compare purely symbolic roots by atom.
+            // Different result atoms can still denote the same external allocation.
+            if let Some((previous_atom, previous_constant)) = forwarded {
+                let same_constant = match (previous_constant, resolved.1) {
+                    (Some(previous), Some(current)) => {
+                        previous.capture_index().is_some_and(|index| current.capture_index() == Some(index))
+                            || previous.reference_id().is_some_and(|identity| current.reference_id() == Some(identity))
+                    }
+                    _ => false,
+                };
+                let same_atom = previous_constant.is_none() && resolved.1.is_none() && previous_atom == resolved.0;
+                if !same_constant && !same_atom {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returns references from different allocations",
+                        operation.name(),
+                    )));
+                }
+            }
+            forwarded = Some(resolved);
+        }
+
+        // The empty-provenance case returned above, so a successful traversal always resolved at least one output.
+        Ok(forwarded.unwrap())
+    }
+
+    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
     pub fn add_input(&mut self, r#type: V::Type) -> AtomId {
         let id = self.add_variable(r#type);
@@ -108,7 +295,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         id
     }
 
-    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`](crate::Type).
+    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
     pub fn add_variable(&mut self, r#type: V::Type) -> AtomId {
         let id = AtomId::new(self.atoms.len());
@@ -119,65 +306,82 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Adds an [`Instruction`] to the [`Program`] that is being built, that corresponds to an application of the
     /// provided [`Operation`] with the provided previously sealed regions attached in the operation-defined region
     /// order (region-free operations pass an empty `regions` list) to the provided input [`Atom`]s. The number of
-    /// attached regions must match the operation's declared [`Operation::region_names`] slot count. Output types are
+    /// attached regions must match the operation's declared [`Operation::region_slots`] count. Output types are
     /// inferred through [`Operation::infer_output_types`], with the attached regions' [`RegionInterface`]s derived
-    /// from this builder's arena on the spot; interfaces are never stored, and final [`Self::build`] validation
-    /// derives them again from the frozen arena.
+    /// from this builder's sealed arena on the spot (i.e., [`RegionInterface`]s are never stored).
+    ///
+    /// This checked "append" also enforces reference lifetimes across the region under construction. An application
+    /// that accesses a reference whose alias family an earlier instruction consumed is rejected at the "append" that
+    /// performs it. Construction is the earliest point at which such a misuse can be reported against the call that
+    /// caused it (the eager runtime invalidates a frozen reference's complete alias family and discharge reports what
+    /// its own environment observes, but a program under construction could otherwise record the misuse and surface it
+    /// only much later). Replay and rebuild paths that re-append instructions already accepted once use
+    /// [`add_instruction_unchecked`](Self::add_instruction_unchecked) instead, which is also the hatch for tests that
+    /// deliberately construct malformed programs for testing validation checks. This validation is structural. It sees
+    /// atoms and declared reference effects, never live values, so it cannot detect two inputs or captures bound to the
+    /// same runtime allocation. That runtime aliasing is rejected by
+    /// [`validate_reference_boundary`](crate::validate_reference_boundary) at the public transform boundaries that bind
+    /// concrete values.
+    ///
+    /// Because this builder is generic over every [`Operation`] family, it does not validate the access descriptors of
+    /// [`ReferenceAccessOperation`](crate::ReferenceAccessOperation)s. Built-in access operations type-check their
+    /// transform bindings through [`Operation::infer_output_types`], while the canonical descriptor layout (including
+    /// the rule that consuming accesses apply no transforms) is validated by
+    /// [`validated_reference_access_descriptors`](crate::validated_reference_access_descriptors),
+    /// which [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis),
+    /// [`rewrite_reference_access_transforms`](crate::rewrite_reference_access_transforms),
+    /// and every other descriptor consumer apply before reading any descriptor.
+    ///
+    /// The recorded [`Instruction`] carries the provided non-semantic [`Provenance`], with [`None`] recording
+    /// unknown provenance.
     pub fn add_instruction<P: Into<O>>(
         &mut self,
         operation: P,
         regions: Vec<RegionId>,
         inputs: Vec<AtomId>,
+        provenance: Option<Provenance>,
     ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
-        let region_names = operation.region_names();
-        if regions.len() != region_names.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{}` declares {} region slots but {} regions were attached",
-                operation.name(),
-                region_names.len(),
-                regions.len(),
-            )));
-        }
-        for region in regions.iter().copied() {
-            if region.index() >= self.regions.len() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "instruction references region {region} which has not been sealed yet",
-                )));
-            }
-        }
-        let input_types = inputs
-            .iter()
-            .map(|input| {
-                self.atoms
-                    .get(input.index())
-                    .map(|atom| atom.r#type().into_owned())
-                    .ok_or(ProgramError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let region_interfaces = if regions.is_empty() {
-            Vec::new()
-        } else {
-            let effects = Region::effects(self.regions.as_slice());
-            regions
-                .iter()
-                .map(|region_id| {
-                    let region = &self.regions[region_id.index()];
-                    RegionInterface::new(region.input_types(), region.output_types(), effects[region_id.index()])
+        let (_, _, output_types) = self.validate_instruction(&operation, &regions, &inputs)?;
+        Ok(self.push_instruction(operation, regions, inputs, provenance, output_types))
+    }
+
+    /// Folds a validated operation to existing inputs or constants when [`Operation::fold`] proves equivalence, or
+    /// records it through the same checked construction path as [`Self::add_instruction`]. Input producers remain
+    /// unchanged. A singleton output becomes a new constant atom of the inferred output type. Unlike raw instruction
+    /// construction, returned outputs can alias existing atoms and carry refined types. Region-carrying applications
+    /// remain explicit so their already imported bodies retain a reachable owner.
+    pub fn add_instruction_or_fold<P: Into<O>>(
+        &mut self,
+        operation: P,
+        regions: Vec<RegionId>,
+        inputs: Vec<AtomId>,
+        provenance: Option<Provenance>,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        let operation = operation.into();
+        let (input_types, region_interfaces, output_types) =
+            self.validate_instruction(&operation, &regions, &inputs)?;
+        if regions.is_empty()
+            && let Some(replacements) = operation.resolve_fold::<V>(&input_types, &region_interfaces, &output_types)?
+        {
+            return Ok(replacements
+                .into_iter()
+                .map(|replacement| match replacement {
+                    OperationFoldReplacement::Input(index) => inputs[index],
+                    OperationFoldReplacement::Constant(constant) => self.add_constant(constant),
                 })
-                .collect()
-        };
-        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
-        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(Instruction::new(operation, inputs, outputs, regions));
-        Ok(self.instructions.last().unwrap().outputs.as_slice())
+                .collect());
+        }
+        Ok(self.push_instruction(operation, regions, inputs, provenance, output_types).to_vec())
     }
 
     /// Adds an already-formed [`Instruction`] without inferring output types or allocating output atoms. Prefer
     /// [`add_instruction`](Self::add_instruction) for ordinary staging. This function is for callers that are
     /// rebuilding an existing [`Program`] and have already allocated the instruction outputs in this builder.
     /// The caller is responsible for ensuring that the instruction input and output IDs are bound in this builder
-    /// and that the output atom types match the operation's inferred outputs.
+    /// and that the output atom types match the operation's inferred outputs. It also bypasses the reference-lifetime
+    /// check that [`add_instruction`](Self::add_instruction) performs, which is what lets rebuilds replay already
+    /// accepted programs and lets tests construct deliberately malformed programs for testing validation checks.
     #[inline]
     pub fn add_instruction_unchecked(&mut self, instruction: Instruction<O>) {
         self.instructions.push(instruction);
@@ -185,10 +389,14 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 
     /// Splices the provided [`Program`]'s [`Instruction`]s and live constants into this [`ProgramBuilder`], remapping
     /// its inputs to the caller-provided `inputs` and returning the builder atoms holding the program's outputs, in
-    /// output order. This is a plain relocation and not a re-interpretation or partial evaluation. Every instruction
-    /// and live constant of the provided program is rebuilt verbatim into this builder. It is, for example,
-    /// the reconciliation primitive an unknown-predicate `condition` uses to graft each branch's residual program
-    /// into the reconciled branch it emits during partial evaluation.
+    /// output order. This is a structural relocation and not a re-interpretation or partial evaluation. Boundary
+    /// identities are instantiated from the caller-provided input types, and [`TypeIdentity`](crate::TypeIdentity)s
+    /// defined inside the source graph are replaced with fresh identities for each splice, except identities also
+    /// bound by the source entry inputs. Closed rules retain those caller bindings. Every fresh replacement
+    /// is checked against the source graph, the destination builder, and replacements generated earlier in the same
+    /// splice. Every instruction and live constant is otherwise rebuilt verbatim. Conditional reconstruction, for
+    /// example, uses this relocation to graft partitioned branch programs into their shared known and residual
+    /// signatures when partial evaluation has a known symbolic predicate.
     #[inline]
     pub fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
@@ -198,6 +406,66 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
+        let input_types = inputs
+            .iter()
+            .map(|input| {
+                self.atoms
+                    .get(input.index())
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(ProgramError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut program = program.with_instantiated_type_identities(input_types.as_slice())?;
+
+        // A fresh target must not alias any type identity already live in the destination entry or its sealed regions.
+        let mut unavailable_type_identities = Vec::new();
+        for atom in &self.atoms {
+            let r#type = atom.r#type();
+            unavailable_type_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+        }
+        for region_index in 0..self.regions.len() {
+            let signature = self
+                .regions
+                .type_identity_signature(RegionId::new(region_index))
+                .expect("iterating a region arena by index must produce valid region identifiers");
+            unavailable_type_identities.extend(signature.identities().iter().cloned());
+        }
+
+        // Reserve every source type identity before generating targets, while retaining the internally defined subset
+        // that this splice must rename.
+        let entry_identities = program.type_identity_signature().input_identities();
+        let mut internal_type_identities = Vec::new();
+        for region_index in 0..program.regions().len() {
+            let signature = program
+                .regions()
+                .type_identity_signature(RegionId::new(region_index))
+                .expect("iterating a region arena by index must produce valid region identifiers");
+            unavailable_type_identities.extend(signature.identities().iter().cloned());
+
+            // A closed rule can locally define a dimension also bound by the enclosing entry. Its caller binding
+            // must remain consistent with that rule and the relocated entry input atoms.
+            internal_type_identities.extend(
+                signature
+                    .internal_identities()
+                    .iter()
+                    .filter(|identity| !entry_identities.contains(identity))
+                    .cloned(),
+            );
+        }
+
+        let mut renaming = TypeIdentityRenaming::new();
+        for identity in internal_type_identities {
+            if renaming.replacements().iter().any(|(source, _)| source == &identity) {
+                continue;
+            }
+            let target = renaming.insert_fresh(identity, unavailable_type_identities.as_slice())?;
+            unavailable_type_identities.push(target);
+        }
+
+        if !renaming.is_identity() {
+            program = Cow::Owned(program.rename_type_identities(&renaming)?);
+        }
+
         // The two closures below never run concurrently, but both need `&mut` access to this builder. A `RefCell` lets
         // each take a short-lived mutable borrow without the borrow checker conservatively rejecting the second one.
         // Regions referenced by the relocated instructions are imported through one call-scoped remapping so that a
@@ -218,7 +486,11 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 let operation = instruction.operation().clone();
-                Ok(builder.borrow_mut().add_instruction(operation, regions, inputs.to_vec())?.to_vec())
+                let provenance = instruction.provenance().clone();
+                Ok(builder
+                    .borrow_mut()
+                    .add_instruction(operation, regions, inputs.to_vec(), Some(provenance))?
+                    .to_vec())
             },
         )
     }
@@ -244,7 +516,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         O: Clone,
     {
         if let Some((first, remaining)) = regions.split_first()
-            && remaining.iter().any(|region| !std::ptr::eq(first.regions(), region.regions()))
+            && remaining.iter().any(|region| !std::ptr::eq(first.arena(), region.arena()))
         {
             return Err(ProgramError::MalformedProgram(
                 "all imported regions must belong to the same program".to_string(),
@@ -270,17 +542,21 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         if let Some(mapped) = remapping.get(&region.id()) {
             return *mapped;
         }
+
         let source_id = region.id();
-        let source_regions = region.regions();
         let mut imported = region.region().clone();
         for instruction in &mut imported.instructions {
             for attached in &mut instruction.regions {
-                let nested = RegionRef::new(source_regions, *attached).unwrap();
+                let nested = region.with_id(*attached).unwrap();
                 *attached = self.import_region_with_remapping(nested, remapping);
             }
         }
-        let id = RegionId::new(self.regions.len());
-        self.regions.push(imported);
+
+        // Cloning the source region carries its retained transforms along, and sealing preserves them here, which is
+        // sound because the import copies the source body verbatim and renumbers its attached references onto faithful
+        // copies of the very same descendants. That sharing is what lets one shared callee program be linearized or
+        // transposed once across every program that interns it.
+        let id = self.regions.push_preserving_transform_cache(imported).unwrap();
         remapping.insert(source_id, id);
         id
     }
@@ -293,32 +569,74 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         &mut self,
         program: Program<V, O, Input, Output>,
     ) -> RegionId {
-        let offset = self.regions.len();
-        let Program { mut regions, entry, .. } = program;
-        for region in &mut regions {
-            for instruction in &mut region.instructions {
-                for attached in &mut instruction.regions {
-                    *attached = RegionId::new(attached.index() + offset);
-                }
-            }
-        }
-        self.regions.extend(regions);
+        let Program { regions, entry, .. } = program;
+        let offset = self.regions.append(regions);
         RegionId::new(entry.index() + offset)
     }
 
-    /// Imports `callee` if it has not previously been imported into this builder and otherwise returns the existing
-    /// callee root [`RegionId`]. Callees are identified by [`Rc`] identity, not structural equality, so structurally
-    /// equal but independently built programs remain distinct.
-    pub fn intern_callee(&mut self, callee: &Rc<Program<V, O, Vec<V>, Vec<V>>>) -> RegionId
+    /// Interns `callee`, optionally after instantiating its formal [`TypeIdentity`](crate::TypeIdentity)s for
+    /// `input_types`. Without `input_types`, callees are identified by [`Arc`] identity, not structural equality, so
+    /// structurally equal but independently built [`Program`]s remain distinct. With `input_types`, repeated exact
+    /// instantiations share one imported root. Semantically identical types carrying separately created live identities
+    /// remain distinct because those identities are retained by the imported region's boundary and no per-attachment
+    /// renaming is stored on an [`Instruction`]. An instantiation requiring no renaming reuses the uninstantiated
+    /// callee root.
+    pub fn intern_callee(
+        &mut self,
+        callee: &Arc<Program<V, O, Vec<V>, Vec<V>>>,
+        input_types: Option<&[V::Type]>,
+    ) -> Result<RegionId, ProgramError>
     where
         O: Clone,
     {
-        if let Some((_, id)) = self.callees.iter().find(|(interned, _)| Rc::ptr_eq(interned, callee)) {
-            return *id;
+        // An exact repeated instantiation can immediately reuse its previously imported root. Keep this lookup
+        // separate from the plain-callee cache below because the caller input types are part of this cache key.
+        let cached_region = input_types.and_then(|input_types| {
+            self.callee_instantiations.iter().find_map(|instantiation| {
+                let same_callee = Arc::ptr_eq(&instantiation.callee, callee);
+                let same_input_types = instantiation.input_types == input_types;
+                (same_callee && same_input_types).then_some(instantiation.region)
+            })
+        });
+        if let Some(region) = cached_region {
+            return Ok(region);
         }
-        let id = self.import_region(callee.entry_region_ref());
-        self.callees.push((callee.clone(), id));
-        id
+
+        // Deriving the renaming both validates the requested boundary and determines whether importing the callee
+        // would actually change any live identity. Calls without `input_types` have no instantiation to derive.
+        let renaming = input_types
+            .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types))
+            .transpose()?;
+
+        let non_identity_renaming = renaming.as_ref().filter(|renaming| !renaming.is_identity());
+        let region = if let Some(renaming) = non_identity_renaming {
+            // A non-identity renaming is embedded in the imported region's types, so it requires its own root.
+            self.import_program(callee.rename_type_identities(renaming)?)
+        } else {
+            // No renaming, or an identity renaming, can reuse the one plain root interned for this exact `Arc` callee.
+            let existing_region = self.callees.iter().find_map(|(interned, region)| {
+                let same_callee = Arc::ptr_eq(interned, callee);
+                same_callee.then_some(*region)
+            });
+            if let Some(region) = existing_region {
+                region
+            } else {
+                let region = self.import_region(callee.entry_region_ref());
+                self.callees.push((callee.clone(), region));
+                region
+            }
+        };
+
+        if let Some(input_types) = input_types {
+            // Record even identity-renaming requests so that their next exact call avoids deriving the renaming again.
+            self.callee_instantiations.push(CalleeInstantiation {
+                callee: callee.clone(),
+                input_types: input_types.to_vec(),
+                region,
+            });
+        }
+
+        Ok(region)
     }
 
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
@@ -338,76 +656,9 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         let expected_output_count = output_structure.parameter_count();
         check_count!("output", output_ids, expected_output_count, ProgramError);
 
-        // Check for entry-region well-formedness. Program inputs must be unique variable atoms. Every variable
-        // an instruction consumes must be provided first (i.e., it is a program input or the output of an earlier
-        // instruction, so that instruction order is a valid evaluation order). Every instruction output must be a
-        // fresh variable with exactly one provider. Finally,every program output must be bound. Constants need no
-        // provider and are usable anywhere.
-        let mut input_atoms = vec![false; self.atoms.len()];
-        let mut variable_has_provider = vec![false; self.atoms.len()];
-        for input_id in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-            let Atom::Variable(_) = input else {
-                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
-            };
-            if input_atoms[input_id.index()] {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "program input atom {input_id} appears more than once",
-                )));
-            }
-            input_atoms[input_id.index()] = true;
-            variable_has_provider[input_id.index()] = true;
-        }
-        for instruction in self.instructions.iter() {
-            for input_id in instruction.inputs.iter().copied() {
-                let input = self.atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-                if input.is_variable() && !variable_has_provider[input_id.index()] {
-                    return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
-                }
-            }
-            for output_id in instruction.outputs.iter().copied() {
-                let output = self.atoms.get(output_id.index()).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-                let Atom::Variable(_) = output else {
-                    return Err(ProgramError::MalformedProgram(
-                        "instruction output atom was not a variable".to_string(),
-                    ));
-                };
-                if input_atoms[output_id.index()] {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction output atom {output_id} is a program input",
-                    )));
-                }
-                if variable_has_provider[output_id.index()] {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction output atom {output_id} is produced by more than one instruction",
-                    )));
-                }
-                variable_has_provider[output_id.index()] = true;
-            }
-        }
-        for output_id in output_ids.iter().copied() {
-            let output = self.atoms.get(output_id.index()).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-            if output.is_variable() && !variable_has_provider[output_id.index()] {
-                return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
-            }
-        }
-
-        // Entry instructions may only reference previously added regions (i.e., regions with identifiers strictly
-        // below the entry's own, which is assigned last). Non-entry regions uphold the same property by construction,
-        // because region imports copy them in post-order (i.e., children before parents). Every referenced region
-        // identifier is therefore in range, and the region graph is acyclic, which is what allows the reachability walk
-        // (and any future recursive derivation over regions, such as recursive effect inference) to recurse without
-        // cycle tracking.
+        // The entry is sealed last. `RegionArena::push` verifies that every attached region already exists, preserving
+        // the arena's topological ordering and acyclicity before it publishes the entry and its derived metadata.
         let entry = RegionId::new(self.regions.len());
-        for instruction in &self.instructions {
-            for region in instruction.regions.iter().copied() {
-                if region.index() >= entry.index() {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction references region {region} which has not been sealed yet",
-                    )));
-                }
-            }
-        }
 
         // Check for well-formedness of the region graph. Every region must be reachable from the entry root. Sharing
         // is legal (i.e., several instructions may reference one region), so no ownership uniqueness is enforced.
@@ -415,22 +666,8 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         // to previously sealed regions. The same checks keep the entry region unreferenced, since its identifier is
         // assigned last.
         let mut regions = self.regions;
-        regions.push(Region {
-            atoms: self.atoms,
-            input_ids: self.input_ids,
-            output_ids,
-            instructions: self.instructions,
-        });
-        let mut reachable = vec![false; regions.len()];
-        let mut pending = vec![entry];
-        while let Some(current) = pending.pop() {
-            if std::mem::replace(&mut reachable[current.index()], true) {
-                continue;
-            }
-            for instruction in &regions[current.index()].instructions {
-                pending.extend(instruction.regions.iter().copied());
-            }
-        }
+        regions.push(Region::new(self.atoms, self.input_ids, output_ids, self.instructions))?;
+        let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
         if let Some(unreachable) = reachable.iter().position(|is_reachable| !is_reachable) {
             return Err(ProgramError::MalformedProgram(format!(
                 "region {} is not reachable from the program entry region",
@@ -438,23 +675,2003 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             )));
         }
 
-        // Every instruction's attached-region count must match its operation's declared slot count. The checked
-        // instruction path already enforced this at insertion time for the entry region, but instructions can also
-        // arrive through the unchecked path, and so the final validation re-checks the complete frozen arena.
-        for region in &regions {
-            for instruction in &region.instructions {
-                let declared = instruction.operation().region_names().len();
-                if instruction.regions.len() != declared {
+        Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
+    }
+
+    /// Validates an operation application before folding or mutating the instruction and atom tables.
+    fn validate_instruction(
+        &self,
+        operation: &O,
+        regions: &[RegionId],
+        inputs: &[AtomId],
+    ) -> Result<(Vec<V::Type>, Vec<RegionInterface<V::Type>>, Vec<V::Type>), ProgramError> {
+        self.references.validate(operation, inputs)?;
+        for region in regions.iter().copied() {
+            if region.index() >= self.regions.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "instruction references region {region} which has not been sealed yet",
+                )));
+            }
+        }
+
+        let input_types = inputs
+            .iter()
+            .map(|input| {
+                self.atoms
+                    .get(input.index())
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(ProgramError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let region_interfaces = if regions.is_empty() {
+            Vec::new()
+        } else {
+            regions
+                .iter()
+                .map(|region_id| {
+                    let region = &self.regions[region_id.index()];
+                    let effects = self.regions.effects(*region_id).unwrap();
+                    RegionInterface::new(region.input_types(), region.output_types(), effects.classes())
+                        .with_deferred_work(effects.has_deferred_work())
+                })
+                .collect()
+        };
+
+        operation.validate_region_interfaces(region_interfaces.as_slice())?;
+        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
+        let effects = operation.effects();
+        effects.validate_application(operation.name(), input_types.as_slice(), output_types.as_slice())?;
+
+        // A region-carrying operation must state how references cross its boundaries, because reference analysis and
+        // discharge resolve reference identity through these hooks rather than by inspecting region bodies. Checking
+        // them here reports an inconsistent operation at construction rather than when a transform first needs them.
+        for (region_index, region_id) in regions.iter().copied().enumerate() {
+            let region_input_types = self.regions[region_id.index()].input_types();
+            if let Some(count) = operation.region_capture_input_count(region_index)
+                && count > region_input_types.len()
+            {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{}` declares a capture prefix of {} for region {}, which has {} inputs",
+                    operation.name(),
+                    count,
+                    region_index,
+                    region_input_types.len(),
+                )));
+            }
+
+            // The reference-typed inputs of a dormant rule region are bound by the transform that instantiates the
+            // rule (e.g., the residuals and cotangent destinations of a custom backward rule) rather than by this
+            // application's inputs, so, exactly as the reference analysis does, the check skips rule regions.
+            if matches!(operation.region_role(region_index), Some(RegionRole::Rule | RegionRole::DeferredRule)) {
+                continue;
+            }
+
+            // References require an explicit instruction input or local origin, while ordinary values
+            // carry no allocation ownership.
+            for (input_index, input_type) in region_input_types.iter().enumerate() {
+                if input_type.is_reference()
+                    && operation.input_region_provenance(region_index, input_index) == InputRegionProvenance::None
+                {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` declares {} region slots but {} regions were attached",
-                        instruction.operation().name(),
-                        declared,
-                        instruction.regions.len(),
+                        "operation `{}` passes a reference into region {} input {} without \
+                         declaring which input supplies it",
+                        operation.name(),
+                        region_index,
+                        input_index,
                     )));
                 }
             }
         }
 
-        Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
+        if !regions.is_empty() {
+            for (output_index, output_type) in output_types.iter().enumerate() {
+                let declared = effects.allocation_output_indices().any(|index| index == output_index)
+                    || operation.reference_output_identity_input(output_index).is_some()
+                    || !operation.output_region_provenance(output_index).is_empty();
+                if output_type.is_reference() && !declared {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` produces a reference at output {} without declaring which input \
+                         allocation it preserves or which region output it forwards",
+                        operation.name(),
+                        output_index,
+                    )));
+                }
+            }
+        }
+
+        Ok((input_types, region_interfaces, output_types))
+    }
+
+    /// Records an operation application whose input, region, output, and reference contracts
+    /// have already been validated.
+    fn push_instruction(
+        &mut self,
+        operation: O,
+        regions: Vec<RegionId>,
+        inputs: Vec<AtomId>,
+        provenance: Option<Provenance>,
+        output_types: Vec<V::Type>,
+    ) -> &[AtomId] {
+        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
+        self.instructions.push(
+            Instruction::new(operation, inputs, outputs, regions)
+                .with_provenance(provenance.unwrap_or_else(Provenance::unknown)),
+        );
+
+        // The accepted application is read back off the instruction just appended, which borrows a different field of
+        // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
+        // input list. It runs for an application that declares reference effects or aliases and for one that merely
+        // names a reference-typed value, because a region-carrying operation carrying a reference through its boundary
+        // declares nothing and is recognized only by its identity-forwarding hook.
+        let instruction = self.instructions.last().unwrap();
+        let contains_references = instruction.operation().effects().has_reference_declarations()
+            || instruction
+                .inputs
+                .iter()
+                .chain(instruction.outputs.iter())
+                .any(|atom| self.atoms[atom.index()].r#type().is_reference());
+        if contains_references {
+            self.references.record(
+                instruction.operation(),
+                instruction.inputs.as_slice(),
+                instruction.outputs.as_slice(),
+            );
+        }
+
+        self.instructions.last().unwrap().outputs.as_slice()
+    }
+}
+
+/// [`ProgramBuilder`]-private cache record for one imported [`TypeIdentity`](crate::TypeIdentity) instantiation of a
+/// shared callee. The source [`Arc`] supplies a stable identity key and keeps its allocation alive, `input_types`
+/// identifies the exact instantiated boundary, and `region` points at the corresponding imported root.
+#[derive(Clone, Debug)]
+struct CalleeInstantiation<V: Typed + Parameter, O> {
+    /// Shared source callee.
+    callee: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+
+    /// Complete caller input [`Type`]s. An imported [`Region`] carries these exact live identities in its boundary
+    /// types, so only another invocation with the same types can reuse it.
+    input_types: Vec<V::Type>,
+
+    /// [`RegionId`] of the imported root [`Region`].
+    region: RegionId,
+}
+
+/// [`Reference`](crate::Reference) alias topology and consumption state of a [`Region`] under construction. The
+/// legality of one checked instruction append depends on every earlier checked instruction append, so this is the
+/// incrementally maintained fold owned by the [`ProgramBuilder`] that spans them. Consumption applies to a complete
+/// alias family: each identity-preserving alias is resolved to its root. [`ProgramBuilder::add_instruction_unchecked`]
+/// deliberately bypasses this state.
+#[derive(Clone, Debug, Default)]
+struct ReferenceLifetimes {
+    /// Name of the consuming [`Operation`], per consumed alias-family root.
+    consumed: BTreeMap<AtomId, &'static str>,
+
+    /// Resolved family membership of each derived [`Reference`](crate::Reference) [`Atom`].
+    aliases: BTreeMap<AtomId, ResolvedReferenceAlias>,
+}
+
+impl ReferenceLifetimes {
+    /// Returns the alias-family root of `atom`.
+    #[inline]
+    fn root(&self, atom: AtomId) -> AtomId {
+        self.aliases.get(&atom).map_or(atom, |edge| edge.root)
+    }
+
+    /// Rejects an access to a consumed alias family.
+    fn validate<O: Operation>(&self, operation: &O, inputs: &[AtomId]) -> Result<(), ProgramError> {
+        if self.consumed.is_empty() && self.aliases.is_empty() {
+            return Ok(());
+        }
+        let name = operation.name();
+        let effects = operation.effects();
+        for (input_index, mode) in effects.accesses() {
+            let Some(atom) = inputs.get(input_index) else {
+                continue;
+            };
+            let edge = self.aliases.get(atom);
+            let root = edge.map_or(*atom, |edge| edge.root);
+            if let Some(consumer) = self.consumed.get(&root) {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{}` {} a reference whose alias family `{}` already consumed",
+                    name,
+                    match mode {
+                        ReferenceAccessMode::Read => "reads",
+                        ReferenceAccessMode::Write => "writes",
+                        ReferenceAccessMode::ReadWrite => "reads and writes",
+                        ReferenceAccessMode::Accumulate => "accumulates into",
+                        ReferenceAccessMode::AtomicAccumulate => "atomically accumulates into",
+                        ReferenceAccessMode::Consume => "consumes",
+                    },
+                    consumer,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the consumptions and alias edges performed by one accepted application.
+    fn record<O: Operation>(&mut self, operation: &O, inputs: &[AtomId], outputs: &[AtomId]) {
+        let effects = operation.effects();
+        for (input_index, mode) in effects.accesses() {
+            if mode.is_consuming()
+                && let Some(atom) = inputs.get(input_index)
+            {
+                let root = self.root(*atom);
+                self.consumed.insert(root, operation.name());
+            }
+        }
+        for (output_index, output_atom) in outputs.iter().copied().enumerate() {
+            let Some(input_index) = operation.reference_output_identity_input(output_index) else {
+                continue;
+            };
+            if let Some(input_atom) = inputs.get(input_index) {
+                self.alias(output_atom, *input_atom);
+            }
+        }
+    }
+
+    /// Records `output` as an alias of `input`, resolving the family root eagerly so that every alias of an alias
+    /// records the original root rather than a chain of edges. Every alias edge denotes the complete referenced value:
+    /// narrowing to a part of a reference happens only at access sites, through the transforms that an access applies,
+    /// never through an alias. Consequently, consuming any member of an alias family consumes its root and invalidates
+    /// the whole family.
+    ///
+    /// # Examples
+    ///
+    /// Consider a reference atom `root` that refers to an entire matrix, an atom `whole_alias` produced by an operation
+    /// whose output is an identity alias of `root` (i.e., one for which [`Operation::reference_output_identity_input`]
+    /// names `root`'s input), and an atom `alias_alias` produced the same way from `whole_alias`. In the following
+    /// listing, each line names an atom, the arrow points to what that atom refers to or aliases, and the parenthetical
+    /// shows the family root that this function records for it:
+    ///
+    /// ```text
+    /// root        -> entire matrix
+    /// whole_alias -> root          (records `root`)
+    /// alias_alias -> whole_alias   (records `root`, not `whole_alias`)
+    /// ```
+    ///
+    /// Because both aliases record `root` directly, resolving either one takes a single lookup, and all three atoms
+    /// denote the entire matrix. Consuming `alias_alias` therefore consumes `root` and invalidates `whole_alias` too.
+    fn alias(&mut self, output: AtomId, input: AtomId) {
+        let source = self.aliases.get(&input).copied();
+        let edge = ResolvedReferenceAlias { root: source.map_or(input, |source| source.root) };
+        self.aliases.insert(output, edge);
+    }
+}
+
+/// Resolved alias-family membership of one derived reference atom.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ResolvedReferenceAlias {
+    /// Alias-family root this atom belongs to.
+    root: AtomId,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::fmt::Display;
+    use std::sync::Arc;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
+    };
+    use crate::captures::CaptureReference;
+    use crate::operations::{
+        AddOperation, AssertOperation, AssertionError, CompareOperation, ComparisonDirection, DimensionPowOperation,
+        NegOperation,
+    };
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceEffect};
+    use crate::programs::identities::NoIdentity;
+    use crate::programs::instructions::InstructionId;
+    use crate::programs::operations::{OperationFoldOutput, OperationFormatter};
+    use crate::programs::provenance::ProvenanceScope;
+    use crate::programs::references::ReferenceType;
+    use crate::programs::regions::{OutputRegionProvenance, RegionSlot};
+    use crate::programs::types::TypeError;
+    use crate::programs::values::ValueId;
+    use crate::tests::TestRegionOperation;
+
+    use super::*;
+
+    /// Call and read operations for the builder's reference provenance queries.
+    #[derive(Clone, Debug)]
+    enum ReferenceIdentityOperation {
+        /// Reads the first reference input.
+        Read,
+
+        /// Calls one region, optionally rebinding its capture scope to a leading input prefix.
+        Call(Option<usize>),
+    }
+
+    impl Operation for ReferenceIdentityOperation {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Read => "reference_read",
+                Self::Call(_) => "reference_call",
+            }
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            match self {
+                Self::Call(_) => const { &[RegionSlot::computation("body")] },
+                Self::Read => &[],
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            inputs: &[ArrayIrType],
+            regions: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            match self {
+                Self::Call(_) => Ok(regions[0].output_types().to_vec()),
+                Self::Read => match &inputs[0] {
+                    ArrayIrType::Reference(reference) => Ok(vec![reference.referent().clone().into()]),
+                    _ => Err(TypeError::invalid("expected a reference")),
+                },
+            }
+        }
+
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+            InputRegionProvenance::Input { index: input_index }
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            match self {
+                Self::Call(_) => vec![OutputRegionProvenance { region_index: 0, output_index }],
+                Self::Read => Vec::new(),
+            }
+        }
+
+        fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+            match self {
+                Self::Call(scope) => *scope,
+                Self::Read => None,
+            }
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            match self {
+                Self::Read => Cow::Owned(
+                    Effects::new(
+                        EffectClasses::NONE,
+                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                    )
+                    .unwrap(),
+                ),
+                Self::Call(_) => Cow::Borrowed(Effects::empty()),
+            }
+        }
+    }
+
+    /// Operation fixture with explicit fold outputs, including deliberately malformed replacement contracts.
+    #[derive(Clone)]
+    struct FoldOperation {
+        /// Inferred outputs against which the driver validates replacements.
+        output_types: Vec<ArrayType>,
+
+        /// Replacements returned by the folding rule.
+        replacements: Vec<OperationFoldOutput>,
+    }
+
+    impl Operation for FoldOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "test_fold"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            check_count!("input", input_types, 2, TypeError);
+            check_count!("region", region_interfaces, 0, TypeError);
+            Ok(self.output_types.clone())
+        }
+
+        fn fold(
+            &self,
+            _input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+            Ok(Some(self.replacements.clone()))
+        }
+    }
+
+    #[test]
+    fn test_program_builder() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64).unwrap());
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1], None).unwrap()[0];
+        assert_eq!(builder.input_ids, vec![i0, i1]);
+        assert!(matches!(
+            builder.atoms.get(i0.index()),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert!(matches!(
+            builder.atoms.get(i1.index()),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert!(matches!(
+            builder.atoms.get(c0.index()),
+            Some(Atom::Constant(value)) if *value == Array::scalar(2.0).unwrap()
+        ));
+        assert!(matches!(
+            builder.atoms.get(v0.index()),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert!(matches!(
+            builder.atoms.get(v1.index()),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert_eq!(builder.instructions.len(), 2);
+        assert_eq!(builder.instructions[0].inputs, vec![i0]);
+        assert_eq!(builder.instructions[0].outputs, vec![v0]);
+        assert_eq!(builder.instructions[1].inputs, vec![v0, i1]);
+        assert_eq!(builder.instructions[1].outputs, vec![v1]);
+
+        let program =
+            builder.build::<(Array, Array), Array>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(program.input_ids(), vec![i0, i1]);
+        assert_eq!(program.output_ids(), vec![v1]);
+        assert_eq!(program.instructions().len(), 2);
+        assert_eq!(
+            program.interpret((Array::scalar(2.0f64).unwrap(), Array::scalar(38.0f64).unwrap())),
+            Ok(Array::scalar(36.0f64).unwrap())
+        );
+
+        // `splice_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to
+        // the provided builder atoms and returning the builder atoms for its outputs. The program's `2.0` constant is
+        // dead (i.e., no instruction consumes it), and so only the two reachable instructions are rebuilt.
+        let mut outer = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a0 = outer.add_input(ArrayType::scalar(DataType::F64));
+        let a1 = outer.add_input(ArrayType::scalar(DataType::F64));
+        let outputs = outer.splice_program(&program, &[a0, a1]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outer.instructions.len(), 2);
+        let outer_program =
+            outer.build::<(Array, Array), Array>(outputs, (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(
+            outer_program.interpret((Array::scalar(2.0f64).unwrap(), Array::scalar(38.0f64).unwrap())),
+            Ok(Array::scalar(36.0f64).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_program_builder_rejects_unbound_instruction_inputs() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![AtomId::new(42), AtomId::new(99)], None);
+        assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId::new(42)));
+    }
+
+    #[test]
+    fn test_program_builder_build_returns_error() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.error = Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        assert!(matches!(
+            builder.build::<Array, Array>(Vec::new(), Placeholder, Placeholder),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_program_builder_build_rejects_invalid_input_count() {
+        let builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            builder.build::<Array, ()>(Vec::new(), Placeholder, ()),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_program_builder_build_rejects_invalid_output_count() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            builder.build::<Array, Array>(Vec::new(), Placeholder, Placeholder),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_program_builder_build_rejects_malformed_atom_providers() {
+        let mut duplicate_input_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = duplicate_input_builder.add_input(ArrayType::scalar(DataType::F64));
+        duplicate_input_builder.input_ids.push(input);
+        assert!(matches!(
+            duplicate_input_builder.build::<Vec<Array>, Vec<Array>>(
+                vec![input],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == format!("region input atom {input} appears more than once")
+        ));
+
+        let mut input_output_overlap_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = input_output_overlap_builder.add_input(ArrayType::scalar(DataType::F64));
+        input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::Neg(NegOperation::new()),
+            vec![input],
+            vec![input],
+            Vec::new(),
+        ));
+        assert!(matches!(
+            input_output_overlap_builder.build::<Vec<Array>, Vec<Array>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == format!("instruction output atom {input} is a region input")
+        ));
+
+        let mut duplicate_output_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = duplicate_output_builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = duplicate_output_builder.add_variable(ArrayType::scalar(DataType::F64));
+        duplicate_output_builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::Neg(NegOperation::new()),
+            vec![input],
+            vec![output],
+            Vec::new(),
+        ));
+        duplicate_output_builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::Neg(NegOperation::new()),
+            vec![input],
+            vec![output],
+            Vec::new(),
+        ));
+        assert!(matches!(
+            duplicate_output_builder.build::<Vec<Array>, Vec<Array>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == format!("instruction output atom {output} is produced by more than one instruction")
+        ));
+    }
+
+    #[test]
+    fn test_program_builder_import_region_and_intern_callee() {
+        // A source program with one sealed region attached to its entry instruction.
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = source_builder.import_region(region_program.entry_region_ref());
+        let input = source_builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let source = source_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Fresh borrowed imports copy the complete closure independently: two imports produce two subtrees.
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let first = destination.import_region(source.entry_region_ref());
+        let second = destination.import_region(source.entry_region_ref());
+        assert_ne!(first, second);
+        let imported = destination.regions[first.index()].clone();
+        assert_eq!(imported.instructions()[0].regions().len(), 1);
+        assert_ne!(imported.instructions()[0].regions()[0], first);
+
+        // Callee imports intern by live `Arc` identity (one shared root per live source, while structurally equal
+        // but independently built programs remain distinct).
+        let flat = Arc::new(source.to_flat_program());
+        let equal_but_distinct = Arc::new(flat.as_ref().clone());
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let first = destination.intern_callee(&flat, None).unwrap();
+        let second = destination.intern_callee(&flat, None).unwrap();
+        let third = destination.intern_callee(&equal_but_distinct, None).unwrap();
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+    }
+
+    #[test]
+    fn test_program_builder_type_identity_instantiation_cache_preserves_live_identities() {
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let formal_first = DimensionVariable::new("formal_first", bounds);
+        let formal_second = DimensionVariable::new("formal_second", bounds);
+        let array_type =
+            |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut callee_builder = ProgramBuilder::<ArrayType, TestRegionOperation>::new();
+        let first_input = callee_builder.add_input(array_type(formal_first.clone()));
+        let second_input = callee_builder.add_input(array_type(formal_second.clone()));
+        let callee = Arc::new(
+            callee_builder
+                .build::<Vec<ArrayType>, Vec<ArrayType>>(
+                    vec![first_input, second_input],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap(),
+        );
+
+        // Repeated exact instantiations share, but otherwise-identical callers with separately created identities
+        // remain distinct because each imported region retains those live identities in its boundary.
+        let mut destination = ProgramBuilder::<ArrayType, TestRegionOperation>::new();
+        let caller_a = DimensionVariable::new("caller_a", bounds);
+        let caller_b = DimensionVariable::new("caller_b", bounds);
+        let caller_c = DimensionVariable::new("caller_c", bounds);
+        let caller_d = DimensionVariable::new("caller_d", bounds);
+        let first = destination.intern_callee(&callee, Some(&[array_type(caller_a), array_type(caller_b)])).unwrap();
+        let second_input_types = [array_type(caller_c), array_type(caller_d)];
+        let second = destination.intern_callee(&callee, Some(&second_input_types)).unwrap();
+        let repeated = destination.intern_callee(&callee, Some(&second_input_types)).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second, repeated);
+        assert_eq!(destination.region_ref(second).unwrap().input_types(), second_input_types);
+        let inputs = second_input_types
+            .iter()
+            .cloned()
+            .map(|input_type| destination.add_input(input_type))
+            .collect::<Vec<_>>();
+        let outputs =
+            destination.add_instruction(TestRegionOperation::Call, vec![second], inputs, None).unwrap().to_vec();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| destination.atoms()[output.index()].r#type().into_owned())
+                .collect::<Vec<_>>(),
+            second_input_types,
+        );
+
+        // A type-identity instantiation reuses the plain callee, while a permutation of overlapping identities
+        // does not.
+        let mut destination = ProgramBuilder::<ArrayType, TestRegionOperation>::new();
+        let plain = destination.intern_callee(&callee, None).unwrap();
+        let direct = destination
+            .intern_callee(&callee, Some(&[array_type(formal_first.clone()), array_type(formal_second.clone())]))
+            .unwrap();
+        let permuted = destination
+            .intern_callee(&callee, Some(&[array_type(formal_second), array_type(formal_first)]))
+            .unwrap();
+        assert_eq!(plain, direct);
+        assert_ne!(direct, permuted);
+    }
+
+    #[test]
+    fn test_program_builder_build_multi_region_program() {
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let doubled = region_builder
+            .add_instruction(TestRegionOperation::Add, Vec::new(), vec![region_input, region_input], None)
+            .unwrap()[0];
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        assert_eq!(sealed, RegionId::new(0));
+
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // The regions arena holds the sealed region plus the entry region, and producers resolve per region.
+        assert_eq!(program.regions().len(), 2);
+        assert_eq!(program.entry(), RegionId::new(1));
+        assert_eq!(program.region(sealed).unwrap().input_ids(), &[region_input]);
+        assert!(matches!(
+            program.region(RegionId::new(7)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^7 is out of range",
+        ));
+        let instruction = &program.instructions()[0];
+        assert_eq!(instruction.regions(), &[sealed]);
+        assert_eq!(
+            program.producer(ValueId::new(program.entry(), output)).unwrap(),
+            Some(InstructionId::new(program.entry(), 0)),
+        );
+        assert_eq!(program.producer(ValueId::new(program.entry(), input)).unwrap(), None);
+        assert_eq!(program.producer(ValueId::new(sealed, doubled)).unwrap(), Some(InstructionId::new(sealed, 0)),);
+
+        // Instruction locators resolve against the complete region arena.
+        let instruction = program.instruction(InstructionId::new(program.entry(), 0)).unwrap();
+        assert_eq!(instruction.regions(), &[sealed]);
+        assert!(program.instruction(InstructionId::new(program.entry(), 9)).is_err());
+
+        // The multi-region program clones, maps, and reports effects across every region.
+        let cloned = program.clone();
+        assert_eq!(cloned.regions().len(), 2);
+        let mapped = program.map_operations(|operation| Ok(operation.clone())).unwrap();
+        assert_eq!(mapped.regions().len(), 2);
+        assert_eq!(mapped.instructions()[0].regions(), &[sealed]);
+        assert!(program.effects().classes().is_empty());
+
+        // The region-aware rebuild paths preserve regions. Simplification keeps the live region-carrying instruction
+        // and its region, filtering projects the entry boundary while passing regions through, and relocation imports
+        // the referenced regions into the destination builder.
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.regions().len(), 2);
+        assert_eq!(simplified.instructions()[0].regions(), &[sealed]);
+        let (filtered, live_inputs) = program.filtered(&[input], program.output_ids(), &[]).unwrap();
+        assert_eq!(filtered.regions().len(), 2);
+        assert_eq!(live_inputs, vec![0]);
+        let mut relocation_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let relocation_input = relocation_builder.add_input(ArrayType::scalar(DataType::F64));
+        let relocated_outputs =
+            relocation_builder.splice_program(&program.to_flat_program(), &[relocation_input]).unwrap();
+        let relocated = relocation_builder
+            .build::<Vec<Array>, Vec<Array>>(relocated_outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(relocated.regions().len(), 2);
+        let simplified = program.into_simplified().unwrap();
+        assert_eq!(simplified.regions().len(), 2);
+    }
+
+    #[test]
+    fn test_program_builder_region_ref_and_import_region() {
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = source_builder.import_region(region_program.entry_region_ref());
+        let sealed_ref = source_builder.region_ref(sealed).unwrap();
+        assert_eq!(sealed_ref.id(), sealed);
+        assert_eq!(sealed_ref.input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert!(matches!(
+            source_builder.region_ref(RegionId::new(7)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^7 is not part of this builder",
+        ));
+        let input = source_builder.add_input(ArrayType::scalar(DataType::F64));
+        let first = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let second = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![first],
+                None,
+            )
+            .unwrap()[0];
+        let source = source_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![second], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let imported = destination.import_region(source.entry_region_ref());
+        let imported_region = destination.region_ref(imported).unwrap().region();
+        assert_eq!(imported_region.instructions()[0].regions(), imported_region.instructions()[1].regions());
+        assert_ne!(imported_region.instructions()[0].regions()[0], imported);
+    }
+
+    #[test]
+    fn test_program_builder_reference_identity() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut child = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let captured = child.add_constant(CaptureReference::new(4, reference_type.clone()));
+        let child = child
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![captured],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let child = builder.import_region(child.entry_region_ref());
+        let output = builder
+            .add_instruction(ReferenceIdentityOperation::Call(None), vec![child], Vec::new(), None)
+            .unwrap()[0];
+        assert_eq!(
+            builder.reference_identity(output, 3),
+            Ok(Some(ReferenceIdentity::Capture { builder: 3, index: 4 }))
+        );
+        let direct = builder.add_constant(CaptureReference::new(4, reference_type));
+        assert_eq!(builder.reference_identity(output, 3), builder.reference_identity(direct, 3));
+        assert_ne!(builder.reference_identity(output, 3), builder.reference_identity(direct, 4));
+    }
+
+    #[test]
+    fn test_program_builder_reference_identity_rebinds_explicit_capture_prefixes() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut child = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        child.add_input(reference_type.clone());
+        let captured = child.add_constant(CaptureReference::new(0, reference_type.clone()));
+        let child = child
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![captured],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let input = builder.add_input(reference_type.clone());
+        let inherited = builder.add_constant(CaptureReference::new(0, reference_type));
+        let child = builder.import_region(child.entry_region_ref());
+        let output = builder
+            .add_instruction(ReferenceIdentityOperation::Call(Some(1)), vec![child], vec![input], None)
+            .unwrap()[0];
+        assert_eq!(
+            builder.reference_identity(output, 3),
+            Ok(Some(ReferenceIdentity::Staged { builder: 3, root: input }))
+        );
+        assert_ne!(builder.reference_identity(output, 3), builder.reference_identity(inherited, 3));
+    }
+
+    #[test]
+    fn test_program_builder_resolve_reference_with_inherited_captures() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut child = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let input = child.add_input(reference_type.clone());
+        let captured = child.add_constant(CaptureReference::new(4, reference_type.clone()));
+        child.add_instruction(ReferenceIdentityOperation::Read, Vec::new(), vec![captured], None).unwrap();
+        let child = child
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let input = builder.add_input(reference_type);
+        let child = builder.import_region(child.entry_region_ref());
+        let forwarded = builder
+            .add_instruction(ReferenceIdentityOperation::Call(None), vec![child], vec![input], None)
+            .unwrap()[0];
+        assert_eq!(builder.resolve_reference(forwarded), Ok((input, None)));
+        assert_eq!(
+            builder.reference_identity(forwarded, 3),
+            Ok(Some(ReferenceIdentity::Staged { builder: 3, root: input }))
+        );
+    }
+
+    #[test]
+    fn test_program_builder_import_regions_preserves_sharing() {
+        let mut leaf_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let leaf_input = leaf_builder.add_input(ArrayType::scalar(DataType::F64));
+        let leaf = leaf_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![leaf_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut root_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let nested = root_builder.import_region(leaf.entry_region_ref());
+        let root_input = root_builder.add_input(ArrayType::scalar(DataType::F64));
+        let root_output = root_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![nested],
+                vec![root_input],
+                None,
+            )
+            .unwrap()[0];
+        let root = root_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![root_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Construct two distinct roots in one source arena that both reference the same previously sealed leaf.
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let shared_leaf = source_builder.import_region(leaf.entry_region_ref());
+        let first_root = RegionId::new(source_builder.regions.len());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
+        let second_root = RegionId::new(source_builder.regions.len());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
+        let source_input = source_builder.add_input(ArrayType::scalar(DataType::F64));
+        let source_output = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![first_root, second_root],
+                vec![source_input],
+                None,
+            )
+            .unwrap()[0];
+        let source = source_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![source_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(source.region(first_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
+        assert_eq!(source.region(second_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
+
+        let roots = [source.region_ref(first_root).unwrap(), source.region_ref(second_root).unwrap()];
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let imported = destination.import_regions(&roots).unwrap();
+        assert_ne!(imported[0], imported[1]);
+        assert_eq!(destination.regions.len(), 3);
+        assert_eq!(
+            destination.regions[imported[0].index()].instructions()[0].regions(),
+            destination.regions[imported[1].index()].instructions()[0].regions(),
+        );
+
+        let mut duplicate_destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let duplicate_roots = [source.region_ref(first_root).unwrap(), source.region_ref(first_root).unwrap()];
+        let imported = duplicate_destination.import_regions(&duplicate_roots).unwrap();
+        assert_eq!(imported[0], imported[1]);
+        assert_eq!(duplicate_destination.regions.len(), 2);
+
+        let mut other_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let other_input = other_builder.add_input(ArrayType::scalar(DataType::F64));
+        let other = other_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![other_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut mixed_destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        assert!(matches!(
+            mixed_destination.import_regions(&[source.entry_region_ref(), other.entry_region_ref()]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "all imported regions must belong to the same program",
+        ));
+        assert!(mixed_destination.regions.is_empty());
+    }
+
+    #[test]
+    fn test_program_builder_build_shares_region_across_instructions() {
+        // Sharing is legal: several instructions (and several slots of one instruction) may reference one region.
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let first = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![sealed, sealed],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![first],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![second], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(program.regions().len(), 2);
+        assert_eq!(program.instructions()[0].regions(), &[sealed, sealed]);
+        assert_eq!(program.instructions()[1].regions(), &[sealed]);
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_derives_region_interfaces() {
+        // The region-carrying operation's output types are its first region interface's output types, so an entry
+        // input type that differs from the region output type pins that the builder derived and delivered the
+        // interface (rather than the inference falling back to the operation inputs).
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::I64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), ArrayType::scalar(DataType::I64));
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold() {
+        let scalar = ArrayType::new_static(DataType::F64, []);
+        let mut builder = ProgramBuilder::<Array, FoldOperation>::new();
+        let inputs = vec![builder.add_input(scalar.clone()), builder.add_input(scalar.clone())];
+        let operation = FoldOperation {
+            output_types: vec![scalar.clone(); 2],
+            replacements: vec![OperationFoldOutput::Input(1), OperationFoldOutput::Input(0)],
+        };
+        assert_eq!(
+            builder.add_instruction_or_fold(operation.clone(), Vec::new(), inputs.clone(), None).unwrap(),
+            vec![inputs[1], inputs[0]],
+        );
+        assert_eq!(builder.atoms().len(), 2);
+        assert!(builder.instructions().is_empty());
+        assert!(
+            builder
+                .add_instruction_or_fold(
+                    FoldOperation { output_types: Vec::new(), replacements: Vec::new() },
+                    Vec::new(),
+                    inputs.clone(),
+                    None,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(builder.instructions().is_empty());
+
+        // Folding never bypasses ordinary application validation or accepts malformed output replacements.
+        assert_eq!(
+            builder.add_instruction_or_fold(operation.clone(), Vec::new(), vec![inputs[0]], None),
+            Err(TypeError::invalid("expected 2 inputs but got 1").into()),
+        );
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation {
+                    output_types: vec![scalar.clone(); 2],
+                    replacements: vec![OperationFoldOutput::Input(0)],
+                },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid("expected 2 fold outputs but got 1").into()),
+        );
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar.clone()], replacements: vec![OperationFoldOutput::Input(2)] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid("`test_fold` fold references input 2 but has 2 inputs").into()),
+        );
+
+        // Array types describe shapes rather than contents, so no array output is the singleton of its type.
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar], replacements: vec![OperationFoldOutput::Singleton] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid(
+                "`test_fold` fold declares a singleton output but its type `f64[]` does not determine a value",
+            )
+            .into()),
+        );
+        assert_eq!(builder.atoms().len(), 2);
+        assert!(builder.instructions().is_empty());
+
+        // Raw construction still records the instruction, independently of its folding rule.
+        assert_eq!(builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().len(), 2);
+        assert_eq!(builder.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold_singleton() {
+        // A singleton replacement becomes a new constant atom carrying the inferred output type, and the folded
+        // instruction is never recorded.
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionValue::constant(0).unwrap().r#type().into_owned();
+        let operation = DimensionPowOperation::new(&value, &zero).unwrap();
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = vec![builder.add_input(value), builder.add_input(zero)];
+        let outputs = builder.add_instruction_or_fold(operation, Vec::new(), inputs, None).unwrap();
+        assert_eq!(outputs, vec![AtomId::new(2)]);
+        assert_eq!(builder.atoms().len(), 3);
+        let Atom::Constant(constant) = &builder.atoms()[2] else {
+            panic!("expected the singleton replacement to be recorded as a constant atom");
+        };
+        assert_eq!(constant, &DimensionValue::constant(1).unwrap());
+        assert!(builder.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold_retains_deferred_work() {
+        // Identity whose folding rule would forward its input, optionally declaring deferred work.
+        #[derive(Clone)]
+        struct ForwardingOperation {
+            has_deferred_work: bool,
+        }
+
+        impl Operation for ForwardingOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "forwarding"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(input_types.to_vec())
+            }
+
+            fn fold(
+                &self,
+                _input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+                Ok(Some(vec![OperationFoldOutput::Input(0)]))
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                if self.has_deferred_work {
+                    Cow::Owned(Effects::empty().clone().with_deferred_work())
+                } else {
+                    Cow::Borrowed(Effects::empty())
+                }
+            }
+
+            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+                OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+                    operation.field("has_deferred_work", self.has_deferred_work)?;
+                    Ok(())
+                })
+            }
+        }
+
+        // An ordinary forwarding application folds to its input, while one that declares deferred work is recorded
+        // because omitting it would discharge its unresolved transformation obligation.
+        let mut builder = ProgramBuilder::<Array, ForwardingOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let operation = ForwardingOperation { has_deferred_work: false };
+        assert_eq!(builder.add_instruction_or_fold(operation, Vec::new(), vec![input], None).unwrap(), vec![input]);
+        assert!(builder.instructions().is_empty());
+        let operation = ForwardingOperation { has_deferred_work: true };
+        let outputs = builder.add_instruction_or_fold(operation, Vec::new(), vec![input], None).unwrap();
+        assert_eq!(outputs, vec![AtomId::new(1)]);
+        assert_eq!(builder.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_pins_entry_identities_in_closed_rules() -> Result<(), ProgramError> {
+        /// A closed rule defines its caller's dimension locally and also owns an unrelated private dimension.
+        #[derive(Clone)]
+        enum ClosedRuleOperation {
+            Define(DimensionType),
+            Call(DimensionType),
+        }
+
+        impl Operation for ClosedRuleOperation {
+            type Type = DimensionType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Define(_) => "define",
+                    Self::Call(_) => "closed_rule",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Define(_) => &[],
+                    Self::Call(_) => const { &[RegionSlot::computation("rule")] },
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[DimensionType],
+                regions: &[RegionInterface<DimensionType>],
+            ) -> Result<Vec<DimensionType>, TypeError> {
+                match self {
+                    Self::Define(r#type) => {
+                        check_count!("input", input_types, 0, TypeError);
+                        check_count!("region", regions, 0, TypeError);
+                        Ok(vec![r#type.clone()])
+                    }
+                    Self::Call(r#type) => {
+                        check_count!("input", input_types, 1, TypeError);
+                        check_count!("region", regions, 1, TypeError);
+                        if input_types[0] != *r#type || regions[0].output_types().first() != Some(r#type) {
+                            return Err(TypeError::invalid("closed rule must preserve its caller dimension identity"));
+                        }
+                        Ok(vec![r#type.clone()])
+                    }
+                }
+            }
+
+            fn rename_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<DimensionVariable>,
+            ) -> Result<Self, TypeError> {
+                match self {
+                    Self::Define(r#type) => Ok(Self::Define(r#type.rename_identities(renaming)?)),
+                    Self::Call(r#type) => Ok(Self::Call(r#type.rename_identities(renaming)?)),
+                }
+            }
+        }
+
+        let bounds = DimensionBounds::new(1, Some(4))?;
+        let entry_type = DimensionType::new("entry", bounds);
+        let private_type = DimensionType::new("private", bounds);
+        let mut child = ProgramBuilder::<DimensionValue, ClosedRuleOperation>::new();
+        let child_entry =
+            child.add_instruction(ClosedRuleOperation::Define(entry_type.clone()), Vec::new(), Vec::new(), None)?[0];
+        let child_private =
+            child.add_instruction(ClosedRuleOperation::Define(private_type.clone()), Vec::new(), Vec::new(), None)?[0];
+        let child = child.build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+            vec![child_entry, child_private],
+            Vec::new(),
+            vec![Placeholder; 2],
+        )?;
+        let mut builder = ProgramBuilder::<DimensionValue, ClosedRuleOperation>::new();
+        let input = builder.add_input(entry_type.clone());
+        let child = builder.import_region(child.entry_region_ref());
+        let output =
+            builder.add_instruction(ClosedRuleOperation::Call(entry_type.clone()), vec![child], vec![input], None)?[0];
+        let program = builder.build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+            vec![output],
+            vec![Placeholder],
+            vec![Placeholder],
+        )?;
+
+        // Unchanged and fresh caller input namespaces pin their identities throughout closed rules.
+        // Only genuinely private definitions are freshened, independently for each splice.
+        for caller in [entry_type, DimensionType::new("caller", bounds)] {
+            let mut destination = ProgramBuilder::<DimensionValue, ClosedRuleOperation>::new();
+            let input = destination.add_input(caller.clone());
+            let first = destination.splice_program(&program, &[input])?;
+            let first_program = destination.clone().build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                first.clone(),
+                vec![Placeholder],
+                vec![Placeholder],
+            )?;
+            let caller_name = caller.variable().unwrap().name();
+            assert_eq!(
+                first_program.to_string(),
+                format!(
+                    indoc! {"
+                    lambda %0:dimension<{caller_name} ∈ [1, 4)> .
+                    let %1:dimension<{caller_name} ∈ [1, 4)> = closed_rule %0 [
+                        rule={{
+                            lambda  .
+                            let %0:dimension<{caller_name} ∈ [1, 4)> = define
+                                %1:dimension<private ∈ [1, 4)> = define
+                            in (%0, %1)
+                        }},
+                    ]
+                    in (%1)
+                "},
+                    caller_name = caller_name,
+                )
+                .trim_end(),
+            );
+            let second = destination.splice_program(&program, &[input])?;
+            let relocated = destination.build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                [first, second].concat(),
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )?;
+            assert_eq!(relocated.input_types(), vec![caller.clone()]);
+            assert_eq!(relocated.output_types(), vec![caller.clone(); 2]);
+            let first = relocated.region(relocated.instructions()[0].regions()[0])?;
+            let second = relocated.region(relocated.instructions()[1].regions()[0])?;
+            assert_eq!(first.output_types()[0], caller);
+            assert_eq!(second.output_types()[0], caller);
+            assert_ne!(first.output_types()[1], private_type);
+            assert_ne!(second.output_types()[1], private_type);
+            assert_ne!(first.output_types()[1], second.output_types()[1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_rejects_unrepresented_input_relationships() {
+        let variable = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let mut source = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        source.add_input(dimension_type.clone().into());
+        let array = source.add_input(ArrayType::new(DataType::F32, Shape::new(vec![variable.into()])).into());
+        let source = source
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![array],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // A dimension of extent four contradicts the array extent of three that the source relates to it.
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension =
+            destination.add_constant(ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 4).unwrap()));
+        let array = destination.add_constant(ArrayIrValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        assert_eq!(
+            destination.splice_program(&source, &[dimension, array]),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 4,
+                actual: 3,
+            }))),
+        );
+        assert_eq!(destination.atoms().len(), 2);
+        assert!(destination.input_ids().is_empty());
+        assert!(destination.instructions().is_empty());
+        assert_eq!(destination.regions.len(), 0);
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_preserves_assertions() {
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
+        let mut source = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left_input = source.add_input(left.clone().into());
+        let right_input = source.add_input(right.clone().into());
+        let condition = source
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                Vec::new(),
+                vec![left_input, right_input],
+                None,
+            )
+            .unwrap()[0];
+        source
+            .add_instruction(
+                AssertOperation::new("left <= right").with_labels(vec!["left".to_owned(), "right".to_owned()]),
+                Vec::new(),
+                vec![condition, left_input, right_input],
+                None,
+            )
+            .unwrap();
+        let program = source
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder, Placeholder], vec![])
+            .unwrap();
+
+        // Relocation renames dimension identities while retaining the assertion even though it has no outputs.
+        let renamed_left = DimensionType::new("renamed_left", left.bounds());
+        let renamed_right = DimensionType::new("renamed_right", right.bounds());
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs =
+            [destination.add_input(renamed_left.clone().into()), destination.add_input(renamed_right.clone().into())];
+        let outputs = destination.splice_program(&program, &inputs).unwrap();
+        let relocated = destination
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(relocated.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        assert_eq!(
+            relocated.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_left.clone(), 3).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_right.clone(), 7).unwrap()),
+            ]),
+            Ok(vec![]),
+        );
+
+        // Diagnostic labels remain source metadata, while their observations come from the relocated inputs.
+        let error = relocated
+            .interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_left, 7).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_right, 3).unwrap()),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "left <= right".to_owned(),
+                observations: vec![("left".to_owned(), "7".to_owned()), ("right".to_owned(), "3".to_owned())],
+            }),
+        );
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_preserves_region_sharing() {
+        let mut leaf_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let leaf_input = leaf_builder.add_input(ArrayType::scalar(DataType::F64));
+        let leaf = leaf_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![leaf_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut root_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let nested = root_builder.import_region(leaf.entry_region_ref());
+        let root_input = root_builder.add_input(ArrayType::scalar(DataType::F64));
+        let root_output = root_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![nested],
+                vec![root_input],
+                None,
+            )
+            .unwrap()[0];
+        let root = root_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![root_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Two distinct attached roots share one nested leaf, and both entry instructions reuse those same roots.
+        // Splicing must preserve both levels of sharing through one source-to-destination remapping.
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let shared_leaf = source_builder.import_region(leaf.entry_region_ref());
+        let first_root = RegionId::new(source_builder.regions.len());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
+        let second_root = RegionId::new(source_builder.regions.len());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
+        let source_input = source_builder.add_input(ArrayType::scalar(DataType::F64));
+        let first_output = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![first_root, second_root],
+                vec![source_input],
+                None,
+            )
+            .unwrap()[0];
+        let source_output = source_builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![first_root, second_root],
+                vec![first_output],
+                None,
+            )
+            .unwrap()[0];
+        let source = source_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![source_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(source.region(first_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
+        assert_eq!(source.region(second_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
+
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let destination_input = destination.add_input(ArrayType::scalar(DataType::F64));
+        let outputs = destination.splice_program(&source.to_flat_program(), &[destination_input]).unwrap();
+        let relocated =
+            destination.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(relocated.regions().len(), 4);
+        let relocated_instructions = relocated.instructions();
+        assert_eq!(relocated_instructions[0].regions(), relocated_instructions[1].regions());
+        assert_ne!(relocated_instructions[0].regions()[0], relocated_instructions[0].regions()[1]);
+        let first_nested_regions =
+            relocated.region(relocated_instructions[0].regions()[0]).unwrap().instructions()[0].regions();
+        let second_nested_regions =
+            relocated.region(relocated_instructions[0].regions()[1]).unwrap().instructions()[0].regions();
+        assert_eq!(first_nested_regions, second_nested_regions);
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_preserves_provenance() {
+        // Splicing is a structural relocation, so every relocated instruction keeps its provenance verbatim, including
+        // nested-scope, fused, and unknown shapes, and the destination builder attaches nothing of its own.
+        let nested = Provenance::scope(
+            ProvenanceScope::new("outer"),
+            Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+        );
+        let fused = Provenance::fused([
+            Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+            Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+        ]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated =
+            builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], Some(nested.clone())).unwrap()[0];
+        let summed = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![negated, input], Some(fused.clone()))
+            .unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![summed, summed], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let mut destination = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let destination_input = destination.add_input(ArrayType::scalar(DataType::F64));
+        let outputs = destination.splice_program(&program, &[destination_input]).unwrap();
+        let relocated =
+            destination.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            relocated
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>(),
+            vec![("neg", nested), ("add", fused), ("add", Provenance::unknown())],
+        );
+    }
+
+    #[test]
+    fn test_program_builder_build_rejects_malformed_regions() {
+        // Instruction regions must reference previously sealed regions (which keeps the graph acyclic by
+        // construction). The checked instruction path rejects at insertion time and the unchecked path at build time.
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            builder.add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![RegionId::new(3)],
+                vec![input], None),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "instruction references region ^3 which has not been sealed yet",
+        ));
+        let output = builder.add_variable(ArrayType::scalar(DataType::F64));
+        builder.add_instruction_unchecked(Instruction::new(
+            TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+            vec![input],
+            vec![output],
+            vec![RegionId::new(3)],
+        ));
+        assert!(matches!(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "instruction references region ^3 which has not been sealed yet",
+        ));
+
+        // The attached-region count must match the operation's declared slot count. The checked instruction path
+        // rejects at insertion time and the unchecked path at build time.
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            builder.add_instruction(TestRegionOperation::Add, vec![sealed], vec![input, input], None),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `add` declares no region slots but 1 regions were attached",
+        ));
+        let output = builder.add_variable(ArrayType::scalar(DataType::F64));
+        builder.add_instruction_unchecked(Instruction::new(
+            TestRegionOperation::Add,
+            vec![input, input],
+            vec![output],
+            vec![sealed],
+        ));
+        assert!(matches!(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `add` declares no region slots but 1 regions were attached",
+        ));
+
+        // Every sealed region must be reachable from the entry root.
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        builder.import_region(region_program.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "region ^0 is not reachable from the program entry region",
+        ));
+    }
+
+    #[test]
+    fn test_program_builder_rejects_invalid_effect_declaration_before_mutation() {
+        // One operation stands in for every malformed declaration: its effect declaration is a payload,
+        // so the same fixture can name an out-of-range position or a non-reference endpoint.
+        #[derive(Clone)]
+        struct InvalidReferenceOperation(Effects);
+
+        impl Operation for InvalidReferenceOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "test.invalid_reference"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+
+            fn fold(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+                panic!("invalid effects must be rejected before folding")
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Borrowed(&self.0)
+            }
+        }
+
+        let read = |input_index| {
+            Effects::new(
+                EffectClasses::NONE,
+                vec![ReferenceEffect::Access { input_index, mode: ReferenceAccessMode::Read }],
+            )
+            .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, InvalidReferenceOperation>::new();
+        let array = builder.add_input(ArrayIrType::from(ArrayType::scalar(DataType::F32)));
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let atom_count = builder.atoms.len();
+        let instruction_count = builder.instructions.len();
+
+        // An out-of-range position is rejected before the builder is mutated.
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation(read(1)), Vec::new(), vec![reference], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an accessed input 1 but the application input count is 1"
+                    .to_string(),
+            )),
+        );
+
+        assert_eq!(
+            builder.add_instruction_or_fold(InvalidReferenceOperation(read(1)), Vec::new(), vec![reference], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an accessed input 1 but the application input count is 1"
+                    .to_string(),
+            )),
+        );
+
+        // A declared endpoint must be reference-typed: an access to an array input, an allocation classifying an
+        // array result, and an alias of an array input are all rejected.
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation(read(0)), Vec::new(), vec![array], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an accessed input 0 but it has non-reference type `f32[]`"
+                    .to_string(),
+            )),
+        );
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation(allocation), Vec::new(), vec![array], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` classifies output 0 but it has non-reference type `f32[]`"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(builder.atoms.len(), atom_count);
+        assert_eq!(builder.instructions.len(), instruction_count);
+
+        // A well-typed declaration is accepted.
+        let outputs = builder.add_instruction(InvalidReferenceOperation(read(0)), Vec::new(), vec![reference], None);
+        assert_eq!(outputs.map(|outputs| outputs.len()), Ok(1));
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_rejects_undeclared_region_reference_flow() {
+        // A minimal type family with a reference type, and an operation family with an allocation and a region-carrying
+        // operation that declares none of the reference provenance hooks.
+        #[derive(Clone, Debug, PartialEq)]
+        enum HookType {
+            Value,
+            Reference,
+        }
+
+        impl Display for HookType {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(match self {
+                    Self::Value => "value",
+                    Self::Reference => "reference",
+                })
+            }
+        }
+
+        impl Parameter for HookType {}
+
+        impl Type for HookType {
+            type Identity = NoIdentity;
+            type Refinements = ();
+
+            fn is_compatible_with(&self, other: &Self) -> bool {
+                self == other
+            }
+
+            fn is_refined_by(&self, other: &Self) -> bool {
+                self == other
+            }
+
+            fn is_scalar(&self) -> bool {
+                false
+            }
+
+            fn is_complex(&self) -> bool {
+                false
+            }
+
+            fn is_reference(&self) -> bool {
+                matches!(self, Self::Reference)
+            }
+        }
+
+        /// `ForwardingRegion` forwards complete instruction input values to their corresponding region inputs.
+        #[derive(Clone, Debug)]
+        enum HookOperation {
+            Allocate,
+            Region { capture_input_count: Option<usize> },
+            ForwardingRegion,
+        }
+
+        impl Operation for HookOperation {
+            type Type = HookType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Allocate => "test.allocate",
+                    Self::Region { .. } => "test.region",
+                    Self::ForwardingRegion => "test.forwarding_region",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Allocate => &[],
+                    Self::Region { .. } | Self::ForwardingRegion => const { &[RegionSlot::computation("body")] },
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[HookType],
+                region_interfaces: &[RegionInterface<HookType>],
+            ) -> Result<Vec<HookType>, TypeError> {
+                match self {
+                    Self::Allocate => Ok(vec![HookType::Reference]),
+                    Self::Region { .. } | Self::ForwardingRegion => Ok(region_interfaces[0].output_types().to_vec()),
+                }
+            }
+
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+                match self {
+                    Self::ForwardingRegion => InputRegionProvenance::Input { index: input_index },
+                    _ => InputRegionProvenance::None,
+                }
+            }
+
+            fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+                match self {
+                    Self::Allocate | Self::ForwardingRegion => None,
+                    Self::Region { capture_input_count } => *capture_input_count,
+                }
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                match self {
+                    Self::Allocate => Cow::Owned(
+                        Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
+                    ),
+                    Self::Region { .. } | Self::ForwardingRegion => Cow::Borrowed(Effects::empty()),
+                }
+            }
+        }
+
+        type HookValue = CaptureReference<HookType>;
+        let region_returning_its_input = |input_type: HookType| {
+            let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+            let input = builder.add_input(input_type);
+            builder
+                .build::<Vec<HookValue>, Vec<HookValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let region = HookOperation::Region { capture_input_count: None };
+
+        // A reference-typed region input needs a declared supplying input.
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(region_returning_its_input(HookType::Reference).entry_region_ref());
+        let input = builder.add_input(HookType::Reference);
+        assert_eq!(
+            builder.add_instruction(region.clone(), vec![sealed], vec![input], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.region` passes a reference into region 0 input 0 without declaring which input \
+                 supplies it"
+                    .to_string(),
+            )),
+        );
+
+        // A declared capture prefix must fit the region's inputs.
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(region_returning_its_input(HookType::Value).entry_region_ref());
+        let input = builder.add_input(HookType::Value);
+        assert_eq!(
+            builder.add_instruction(
+                HookOperation::Region { capture_input_count: Some(2) },
+                vec![sealed],
+                vec![input],
+                None,
+            ),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.region` declares a capture prefix of 2 for region 0, which has 1 inputs".to_string(),
+            )),
+        );
+
+        // A reference-typed output of a region-carrying operation needs an identity input or region provenance.
+        let mut region_builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let initial = region_builder.add_input(HookType::Value);
+        let allocated =
+            region_builder.add_instruction(HookOperation::Allocate, Vec::new(), vec![initial], None).unwrap()[0];
+        let allocating_region = region_builder
+            .build::<Vec<HookValue>, Vec<HookValue>>(vec![allocated], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(allocating_region.entry_region_ref());
+        let input = builder.add_input(HookType::Value);
+        assert_eq!(
+            builder.add_instruction(region, vec![sealed], vec![input], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.region` produces a reference at output 0 without declaring which input allocation it \
+                 preserves or which region output it forwards"
+                    .to_string(),
+            )),
+        );
+
+        // A value-only boundary needs no hooks at all.
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(region_returning_its_input(HookType::Value).entry_region_ref());
+        let input = builder.add_input(HookType::Value);
+        assert!(
+            builder
+                .add_instruction(
+                    HookOperation::Region { capture_input_count: Some(1) },
+                    vec![sealed],
+                    vec![input],
+                    None
+                )
+                .is_ok()
+        );
+
+        // A reference-typed region input receives a complete root through the declared input provenance.
+        let mut region_builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        region_builder.add_input(HookType::Reference);
+        let payload = region_builder.add_input(HookType::Value);
+        let forwarding_region = region_builder
+            .build::<Vec<HookValue>, Vec<HookValue>>(vec![payload], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(forwarding_region.entry_region_ref());
+        let reference = builder.add_input(HookType::Reference);
+        let payload = builder.add_input(HookType::Value);
+        assert!(
+            builder
+                .add_instruction(HookOperation::ForwardingRegion, vec![sealed], vec![reference, payload], None,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_reference_lifetimes() {
+        // One operation stands in for every reference primitive and structured identity-forwarding operation. The
+        // lifetime state derives everything it records from the operation itself, so the fixture cannot describe one
+        // contract and be recorded under another.
+        #[derive(Clone)]
+        struct TestReferenceOperation {
+            name: &'static str,
+            effects: Effects,
+            forwarded: Option<(usize, usize)>,
+        }
+
+        impl Operation for TestReferenceOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                self.name
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+
+            fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+                self.forwarded.and_then(|(output, input)| (output == output_index).then_some(input))
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Borrowed(&self.effects)
+            }
+        }
+
+        let access = |name, mode| TestReferenceOperation {
+            name,
+            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Access { input_index: 0, mode }]).unwrap(),
+            forwarded: None,
+        };
+        let alias = |name| TestReferenceOperation { name, effects: Effects::empty().clone(), forwarded: Some((0, 0)) };
+        let allocation = TestReferenceOperation {
+            name: "reference_new",
+            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
+            forwarded: None,
+        };
+        let read = access("reference_read", ReferenceAccessMode::Read);
+        let write = access("reference_write", ReferenceAccessMode::Write);
+        let swap = access("reference_swap", ReferenceAccessMode::ReadWrite);
+        let accumulate = access("reference_add_update", ReferenceAccessMode::Accumulate);
+        let freeze = access("reference_freeze", ReferenceAccessMode::Consume);
+
+        // Allocation records no alias edge. Identity aliases share one root and remain valid consumption handles.
+        let root = AtomId::new(1);
+        let root_alias = AtomId::new(2);
+        let nested_alias = AtomId::new(3);
+        let sibling_alias = AtomId::new(4);
+        let mut lifetimes = ReferenceLifetimes::default();
+        assert_eq!(lifetimes.validate(&read, &[root]), Ok(()));
+        lifetimes.record(&allocation, &[AtomId::new(0)], &[root]);
+        assert_eq!(lifetimes.validate(&freeze, &[root]), Ok(()));
+        lifetimes.record(&alias("rename"), &[root], &[root_alias]);
+        lifetimes.record(&alias("rename"), &[root_alias], &[nested_alias]);
+        lifetimes.record(&alias("rename"), &[root], &[sibling_alias]);
+        assert_eq!(lifetimes.validate(&read, &[nested_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[root_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[nested_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[sibling_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[AtomId::new(9)]), Ok(()));
+
+        // Consumption invalidates every handle in the family and diagnostics name both the invalid access and the
+        // consuming operation.
+        let consumed = |name, action| {
+            format!("`{name}` {action} a reference whose alias family `reference_freeze` already consumed")
+        };
+        lifetimes.record(&freeze, &[sibling_alias], &[]);
+        assert!(matches!(
+            lifetimes.validate(&read, &[root]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "reads"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&write, &[root_alias]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_write", "writes"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&swap, &[root_alias]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == consumed("reference_swap", "reads and writes"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&accumulate, &[root_alias]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == consumed("reference_add_update", "accumulates into"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&freeze, &[root]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_freeze", "consumes"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&freeze, &[nested_alias]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_freeze", "consumes"),
+        ));
+
+        // Structured identity forwarding joins the output to its input's family without declaring reference
+        // effects. Independent roots remain live, and out-of-range access indices remain the arity owner's concern.
+        let mut lifetimes = ReferenceLifetimes::default();
+        let carry = AtomId::new(6);
+        let carrier =
+            TestReferenceOperation { name: "while", effects: Effects::empty().clone(), forwarded: Some((0, 0)) };
+
+        lifetimes.record(&carrier, &[root], &[carry]);
+        lifetimes.record(&freeze, &[root], &[]);
+        assert!(matches!(
+            lifetimes.validate(&read, &[carry]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "reads"),
+        ));
+        assert_eq!(lifetimes.validate(&read, &[AtomId::new(7)]), Ok(()));
+        assert_eq!(lifetimes.validate(&read, &[]), Ok(()));
     }
 }

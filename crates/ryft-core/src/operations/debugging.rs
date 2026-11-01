@@ -1,0 +1,816 @@
+//! Operations that expose intermediate values while a program runs without changing what it computes. Debugging
+//! operations behave as identity functions on their inputs and exist only for their side effects, so they can be
+//! inserted anywhere in a computation, including inside traced and transformed programs, and later removed without
+//! touching the surrounding code. This module provides the following:
+//!
+//!   - The [`Print`] value capability, whose [`print`](Print::print) returns its input unchanged while printing it to
+//!     standard error under a label, and whose [`print_with_effect_class`](Print::print_with_effect_class) selects how
+//!     strongly the print is ordered relative to other I/O.
+//!   - The [`PrintOperation`] that the capability stages. By default, it declares the [`EffectClass::OrderedIo`]
+//!     effect, so dead-code elimination never removes it and prints appear in program order across all participating
+//!     devices. [`EffectClass::DeviceOrderedIo`] keeps program order only among the prints executing on the same
+//!     device, which lets a print inside a `shard_map` body run once per device, and
+//!     [`EffectClass::UnorderedIo`] retains the print without ordering it at all.
+//!
+//! Program transforms treat print operations as identities on their data. Batching prints the whole batch, partial
+//! evaluation prints known inputs when it encounters them and residualizes unknown ones, and differentiation prints
+//! the primal value while passing the tangent through unchanged. Backends decide how the effect is realized. For
+//! example, the XLA backend lowers a print to a host callback that is threaded through a token chain so that ordered
+//! prints stay ordered within one dispatch.
+//!
+//! # Example
+//!
+//! A traced value stages a `print` instruction that prints whenever the program is interpreted or executed. Its output
+//! value is the input, so the print is transparent to consumers:
+//!
+//! ```rust
+//! # use indoc::indoc;
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, EffectClass, Mul, Print, ProgramError, Trace, TracingContext,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+//!     |input| {
+//!         let squared = input.clone().mul(&input)?;
+//!         squared.print_with_effect_class("squared", EffectClass::UnorderedIo)
+//!     },
+//!     ArrayType::scalar(DataType::F64),
+//! )?;
+//!
+//! assert_eq!(
+//!     program.to_string(),
+//!     indoc! {"
+//!         lambda %0:f64[] .
+//!         let %1:f64[] = mul %0 %0
+//!             %2:f64[] = print [label=squared, effect_class=unordered_io] %1
+//!         in (%2)"},
+//! );
+//!
+//! // Interpreting the program prints `squared = 9` to standard error and returns the squared input.
+//! assert_eq!(program.interpret(Array::scalar(3.0_f64)?)?, Array::scalar(9.0_f64)?);
+//! # Ok(())
+//! # }
+//! ```
+
+use std::borrow::Cow;
+use std::fmt::Display;
+use std::marker::PhantomData;
+
+use ryft_macros::capability;
+
+use crate::arrays::{
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType,
+};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::operations::Capability;
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::{
+    EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
+    Value, ValueDomainDispatch, ValueProjection,
+};
+
+/// Canonical operation name for [`PrintOperation`].
+pub const PRINT_OPERATION_NAME: &str = "print";
+
+/// [`Operation`] that returns its input unchanged while printing it to standard error with a label.
+///
+/// By default, [`Operation::effects`] reports [`EffectClass::OrderedIo`], so program transforms never eliminate it as
+/// dead code (even when nothing consumes its output) and preserve its execution order relative to other ordered-I/O
+/// operations across every participating device. [`with_effect_class`](Self::with_effect_class) selects a weaker
+/// contract instead: [`EffectClass::DeviceOrderedIo`] keeps program order only among the ordered I/O executing on
+/// the same device, which allows the print to run once per device inside "shard map" bodies, for example, and
+/// [`EffectClass::UnorderedIo`] retains the print without ordering it relative to other I/O. Partial evaluation places
+/// it on the known side when its input is known (printing at partial-evaluation time under an eager known-side context,
+/// which also makes linearization print during the forward pass), and residualizes it otherwise. Differentiation passes
+/// the tangent through unchanged while printing the primal value. The primitive transposition rule passes the cotangent
+/// through without printing it. Whole-program transposition rejects effectful linear instructions, so reverse
+/// differentiation transposes the print-free tangent program.
+///
+/// Eager interpretation prints directly. Batching re-binds the print over the whole batch through the parent context of
+/// the batching level, so an eager parent prints the batch at once while a staging parent keeps the instruction and its
+/// effect class in the program that it produces. The XLA backend lowers this operation to a StableHLO host-callback
+/// custom call (i.e., `@ryft.print`), using a token chain for ordered I/O to preserve execution order within one
+/// dispatch, including through `if`/`while` regions.
+///
+/// The `T` parameter fixes this payload's type universe, so each concrete [`PrintOperation`] implements exactly one
+/// [`Operation`] contract.
+///
+/// Refer to the documentation of [`Print`] for more information.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PrintOperation<T: Type> {
+    /// Refer to the documentation of [`label`](Self::label) for more information.
+    label: String,
+
+    /// Refer to the documentation of [`effect_class`](Self::effect_class) for more information.
+    effect_class: EffectClass,
+
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: Type> PrintOperation<T> {
+    /// Creates a new [`PrintOperation`] with the provided label and the default [`EffectClass::OrderedIo`] effect.
+    #[inline]
+    pub fn new<L: Into<String>>(label: L) -> Self {
+        Self { label: label.into(), effect_class: EffectClass::OrderedIo, marker: PhantomData }
+    }
+
+    /// Returns this [`PrintOperation`] with its effect class set to the provided `effect_class`. Use
+    /// [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] to select
+    /// the I/O ordering contract described in the type documentation.
+    #[inline]
+    pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
+        self.effect_class = effect_class;
+        self
+    }
+
+    /// Returns the label printed before the input value, separated from it by `: `.
+    #[inline]
+    pub fn label(&self) -> &str {
+        self.label.as_str()
+    }
+
+    /// Returns the [`EffectClass`] declared by this [`PrintOperation`].
+    #[inline]
+    pub fn effect_class(&self) -> EffectClass {
+        self.effect_class
+    }
+}
+
+impl<T: Type> Display for PrintOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<T: Type> Operation for PrintOperation<T> {
+    type Type = T;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        PRINT_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        Ok(vec![input_types[0].clone()])
+    }
+
+    #[inline]
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(EffectClasses::single(self.effect_class)))
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, PRINT_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("label", &self.label)?;
+            if self.effect_class != EffectClass::OrderedIo {
+                operation.field("effect_class", self.effect_class)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        // Interpretation prints directly instead of going through the `Print` capability, because a value whose
+        // capability binds a `PrintOperation` through its own domain would otherwise re-enter this rule when that
+        // domain interprets operations eagerly. Rules that must keep the print in a staged program (e.g., batching)
+        // re-bind it through their parent context instead of interpreting it.
+        check_count!("input", inputs, 1, ProgramError);
+        eprintln!("{}: {}", self.label, inputs[0]);
+        Ok(vec![inputs[0].clone()])
+    }
+}
+
+impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
+    C::Operation: From<PrintOperation<C::Type>>
+{
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<PrintOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for PrintOperation<ArrayType>
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Batching re-binds the print through the parent context over the packed value and keeps the input's batch
+        // metadata, so the whole batch is printed at once. Interpreting the print against the parent instead would
+        // print the parent's input at transformation time and drop the instruction and its effect from the programs
+        // that a staging parent produces.
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(context.forward_to_parent(self.clone().into(), inputs)?.into())
+    }
+}
+
+impl_differentiable_elementwise_operation! {
+    @linear<T>
+    PrintOperation<T>,
+    rule = [@positive],
+}
+
+impl<A: Value<Type = ArrayType>> From<PrintOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: PrintOperation<ArrayIrType>) -> Self {
+        // Array IR tracers print by lifting the type-generic print into the homogeneous array member, preserving
+        // its label and effect class, so that the member's effect declaration and transform rules apply through the
+        // projection.
+        Self::Array(ArrayOperation::Print(
+            PrintOperation::new(operation.label()).with_effect_class(operation.effect_class()),
+        ))
+    }
+}
+
+/// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
+/// effectively an identity function that prints its input to standard error when executed. Because the staged operation
+/// defaults to [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
+/// relative to other ordered print instructions.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait Print<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Returns this value unchanged while printing it to standard error with `label`, and a [`ProgramError`] if the
+    /// value's context fails to bind the operation. Tracing contexts never fail here, because the value is always
+    /// native to its own context, but contexts that execute operations eagerly (e.g., a backend running operation
+    /// by operation) may.
+    #[inline]
+    fn print(self, label: &str) -> Result<Self, ProgramError> {
+        self.print_with_effect_class(label, EffectClass::OrderedIo)
+    }
+
+    /// Returns this value unchanged while printing it with the provided I/O [`EffectClass`], and a [`ProgramError`]
+    /// if the value's context fails to bind the operation.
+    ///
+    /// [`EffectClass::DeviceOrderedIo`] keeps the print ordered only relative to the ordered I/O on the same device,
+    /// and [`EffectClass::UnorderedIo`] lets it run independently of other prints while remaining observable. The
+    /// effect class does not determine whether a backend executes the call inline or asynchronously.
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError>;
+}
+
+impl Print for Array {
+    #[inline]
+    fn print_with_effect_class(self, label: &str, _effect_class: EffectClass) -> Result<Self, ProgramError> {
+        // A concrete `Array` executes eagerly, so it prints immediately, which satisfies the ordering
+        // of every effect class.
+        eprintln!("{label}: {self}");
+        Ok(self)
+    }
+}
+
+impl<A: Value<Type = ArrayType> + Print<ArrayType>> Print<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
+        // A concrete array IR value prints its array member. It uses `ValueDirectDispatch`, so the generic
+        // implementation below never applies to it.
+        let input = <Self as ValueProjection<ArrayType>>::into_projected(self)?;
+        Ok(Self::Array(input.print_with_effect_class(label, effect_class)?))
+    }
+}
+
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<PrintOperation<T>>>>>
+    Print<T> for V
+{
+    #[inline]
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
+        // Any context-carrying value prints by binding a `PrintOperation` through its own context. The
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers without conflicting with concrete implementations.
+        let mut outputs = self.domain().bind(
+            PrintOperation::new(label).with_effect_class(effect_class),
+            Vec::new(),
+            std::slice::from_ref(&self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::{formatdoc, indoc};
+    use pretty_assertions::assert_eq;
+
+    use ryft_macros::Operation;
+
+    use crate::arrays::{
+        Array, ArrayOperation, DataType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension,
+    };
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_type_inference,
+    };
+    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::partial::PartialValue;
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, Typed};
+    use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
+
+    use super::*;
+
+    #[test]
+    fn test_print() {
+        let operation = PrintOperation::<ArrayType>::new("x");
+
+        // Operation identity, accessors, the default ordered-I/O effect, and rendering, which omits the default class.
+        assert_eq!(operation.name(), PRINT_OPERATION_NAME);
+        assert_eq!(operation.label(), "x");
+        assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(operation.to_string(), "print [label=x]");
+    }
+
+    #[test]
+    fn test_print_effect_classes() {
+        // Every non-default class is declared as the operation's effect and rendered, and restoring the default class
+        // omits it from the rendering again.
+        let operation = PrintOperation::<ArrayType>::new("x");
+        for effect_class in [EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo] {
+            let operation = operation.clone().with_effect_class(effect_class);
+            assert_eq!(operation.effect_class(), effect_class);
+            assert_eq!(operation.effects().classes(), EffectClasses::single(effect_class));
+            assert_eq!(operation.to_string(), format!("print [label=x, effect_class={effect_class}]"));
+        }
+        let restored = operation.with_effect_class(EffectClass::UnorderedIo).with_effect_class(EffectClass::OrderedIo);
+        assert_eq!(restored.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(restored.to_string(), "print [label=x]");
+    }
+
+    #[test]
+    fn test_print_type_inference() {
+        check_operation_type_inference!(
+            operation = PrintOperation::<ArrayType>::new("x"),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F64)],
+                output_types = [ArrayType::scalar(DataType::F64)],
+            }, {
+                input_types = [ArrayType::new_static(DataType::I32, [2, 3])],
+                output_types = [ArrayType::new_static(DataType::I32, [2, 3])],
+            }, {
+                input_types = [],
+                error = "expected 1 input but got 0",
+            }, {
+                input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+                error = "expected 1 input but got 2",
+            }],
+        );
+    }
+
+    #[test]
+    fn test_print_interpretation() {
+        let context = EagerContext::<Array>::new();
+        let input = Array::scalar(3.0).unwrap();
+        let operation = PrintOperation::new("x");
+
+        // Standard error capture is not available here; verify the returned value and input validation.
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input.clone(), input]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
+        );
+    }
+
+    #[test]
+    fn test_print_partial_evaluation() {
+        // Known inputs are printed while partially evaluating, and unknown inputs leave the print in the residual.
+        check_operation_partial_evaluation!(
+            operation = PrintOperation::new("x"),
+            cases = [{
+                inputs = [(@known, Array::scalar(3.0).unwrap())],
+                outputs = [(@known, Array::scalar(3.0).unwrap())],
+                residual_instructions = 0,
+            }, {
+                inputs = [(@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.0).unwrap()))],
+                outputs = [(@residual, Array::scalar(3.0).unwrap())],
+                residual_instructions = 1,
+            }],
+        );
+    }
+
+    #[test]
+    fn test_print_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = PrintOperation::new("x"),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_print_batching_staged() {
+        // Batching a staged program re-binds the print over the whole batch instead of printing the input tracer at
+        // batching time, so the batched program keeps the instruction and its effect class.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                PrintOperation::<ArrayType>::new("x").with_effect_class(EffectClass::DeviceOrderedIo),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[2] = print [label=x, effect_class=device_ordered_io] %0
+                in (%1)"},
+        );
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
+    }
+
+    #[test]
+    fn test_print_batching_staged_unused_output() {
+        // A print whose output nothing consumes stays in the batched program because of its effect.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("x"), Vec::new(), vec![input], None)
+            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (batched, _) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[2] = print [label=x] %0
+                in (%0)"},
+        );
+    }
+
+    #[test]
+    fn test_print_batching_under_staging() {
+        // Value-level batching under a staging parent stages the print of the whole batch into the enclosing trace.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input: Tracer<TracingContext<Array, ArrayOperation<Array>>>| {
+                Ok(batch(|item| item.print("x"), input, BatchAxis::new(0), BatchAxis::new(0), None)?)
+            },
+            ArrayType::new_static(DataType::F64, [2, 3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:f64[2, 3] = print [label=x] %0
+                in (%1)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+
+        // Array IR values stage the print through their array member. Array IR batching also stages the batch extent as
+        // a first-class dimension constant, which nothing here consumes.
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| {
+                Ok(batch(
+                    |item| item.print_with_effect_class("x", EffectClass::UnorderedIo),
+                    input,
+                    BatchAxis::new(1),
+                    BatchAxis::new(1),
+                    None,
+                )?)
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:dimension<3> = constant [value=3]
+                    %2:f64[2, 3] = print [label=x, effect_class=unordered_io] %0
+                in (%2)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+    }
+
+    #[test]
+    fn test_print_batching_in_shard_map_bodies() {
+        // Batching a `shard_map` batches its body under a staging parent, so a per-device print in the body prints
+        // the local value of the whole batch and the batched program keeps the `DeviceOrderedIo` effect. The batch
+        // axis is placed on the free mesh axis `y`, which a body with this effect allows.
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| {
+                let output = shard_map(
+                    |local: ShardMapTracer<ArrayIrContext>| {
+                        local.print_with_effect_class("body", EffectClass::DeviceOrderedIo).unwrap()
+                    },
+                    ValueProjection::<ArrayType>::into_projected(input)?,
+                    mesh,
+                    sharding.clone(),
+                    sharding,
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+        )
+        .unwrap();
+        let (batched, _) = program
+            .to_flat_program()
+            .batched_with_threaded_extent(
+                DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["y"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        let global_sharding = "{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}";
+        let global_type = format!("f32[3, 4][sharding={global_sharding}]");
+        let local_type =
+            "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {}], varying_manual={'x'}}]";
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<3>, %1:f32[3, 4] .
+                let %2:{global_type} = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    in_shardings=[{global_sharding}],
+                    out_shardings=[{global_sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}],
+                    global_output_types=[{global_type}],
+                ] %1 [
+                    body={{
+                        lambda %0:{local_type} .
+                        let %1:{local_type} = print [label=body, effect_class=device_ordered_io] %0
+                        in (%1)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
+    }
+
+    #[test]
+    fn test_print_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = PrintOperation::new("x"),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(2.0).unwrap()],
+                tangent_outputs = [Array::scalar(3.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = print [label=x] %0
+                    in (%2, %1)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_print_differentiation_unused_output() {
+        // A print whose output nothing consumes must not perturb the gradient: the JVP rule re-prints the primal and
+        // passes the tangent through, so the effect rides the primal side of the linearization.
+        let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap())
+            .value_and_gradient(|input| {
+                input.clone().print("x").unwrap();
+                input.clone() * input
+            })
+            .unwrap();
+        assert_eq!(value, Array::scalar(9.0).unwrap());
+        assert_eq!(gradient, Array::scalar(6.0).unwrap());
+
+        // Linearizing the same computation partitions its JVP program into primal and tangent stages: the dead print
+        // survives in the primal stage through the partition projections' effect keep-alive, carrying its effect
+        // class with it, and the tangent stage stays print-free.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                input.clone().print("x").unwrap();
+                Ok(input.clone() * input)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let linearization = program.to_flat_program().linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x] %0
+                    %2:f64[] = mul %0 %0
+                in (%2, %0)"},
+        );
+        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                    %3:f64[] = mul %1 %0
+                    %4:f64[] = add %2 %3
+                in (%4)"},
+        );
+        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
+    }
+
+    #[test]
+    fn test_print_transposition() {
+        // Whole-program transposition rejects observable effects before calling the primitive rule.
+        // Check directly that this rule passes the cotangent through without staging another print.
+        let tracing = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let cotangent = tracing.input(ArrayType::scalar(DataType::F64));
+        let mut context = TranspositionContext::new(tracing);
+        let inputs = [PartialValue::Unknown(ArrayType::scalar(DataType::F64))];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert_eq!(
+            PrintOperation::new("x").transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Value(cotangent.clone())],
+                &accumulators,
+            ),
+            Ok(()),
+        );
+        let outputs = context.take_cotangents(&accumulators).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], MaybeZero::Value(output) if output.atom_id() == cotangent.atom_id()));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_array_print() {
+        // A concrete array prints immediately and returns itself unchanged for every effect class. The printed text
+        // goes to standard error, which unit tests cannot capture, so only the returned value is asserted.
+        let array = Array::vector(vec![1.0, 2.0]).unwrap();
+        assert_eq!(array.clone().print("x"), Ok(array.clone()));
+        assert_eq!(array.clone().print_with_effect_class("x", EffectClass::UnorderedIo), Ok(array));
+    }
+
+    #[test]
+    fn test_print_staging() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")?),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x] %0
+                in (%1)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+    }
+
+    #[test]
+    fn test_print_staging_with_effect_class() {
+        // The selected class is recorded on the staged instruction and summarized as the program's effect.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                Ok(input.print_with_effect_class("x", EffectClass::UnorderedIo)?)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x, effect_class=unordered_io] %0
+                in (%1)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+    }
+
+    #[test]
+    fn test_print_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Array IR tracers stage the print as an array-member instruction that keeps its label and effect class,
+        // so the staged program declares the selected effect.
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| input.print_with_effect_class("x", EffectClass::UnorderedIo),
+            ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x, effect_class=unordered_io] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+
+        // A concrete array IR value prints its array member immediately and returns itself unchanged.
+        let value = ArrayIrValue::Array(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.clone().print("x"), Ok(value));
+    }
+
+    #[test]
+    fn test_print_eager_value_domains() {
+        /// Array value that binds its capabilities through an eager domain, as backend values that execute operation
+        /// by operation do (e.g., the XLA backend's arrays).
+        #[derive(Clone, Debug, PartialEq)]
+        struct EagerDomainValue(Array);
+
+        impl Display for EagerDomainValue {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+
+        impl Parameter for EagerDomainValue {}
+
+        impl Typed for EagerDomainValue {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                self.0.r#type()
+            }
+        }
+
+        impl Value for EagerDomainValue {
+            type Dispatch = ValueDomainDispatch;
+            type Domain = EagerContext<Self, EagerDomainOperation>;
+
+            fn domain(&self) -> Self::Domain {
+                EagerContext::new()
+            }
+        }
+
+        /// Print-only family used to verify that capability dispatch through [`EagerContext`] interprets the print
+        /// without re-entering the value's [`Print`] capability. [`Context`] requires its operation family to provide
+        /// [`GuardOperation`](crate::GuardOperation) requests even when execution needs no guard. The derive supplies
+        /// a rejecting provider so this minimal family can serve as the value's domain without a guard variant.
+        /// This test binds print directly over concrete arrays and never requests a guard.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type(ArrayType), constant(EagerDomainValue))]
+        enum EagerDomainOperation {
+            Print(PrintOperation<ArrayType>),
+        }
+
+        // The `Print` capability of a domain-dispatched value binds a `PrintOperation` through its eager domain, which
+        // interprets it. Interpretation prints directly, so it does not re-enter the capability.
+        let value = EagerDomainValue(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        assert_eq!(value.clone().print("x"), Ok(value.clone()));
+        assert_eq!(
+            value.domain().bind(PrintOperation::new("x"), Vec::new(), std::slice::from_ref(&value)),
+            Ok(vec![value]),
+        );
+    }
+}

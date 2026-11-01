@@ -1,0 +1,1326 @@
+use std::ops::Range;
+
+use ryft_macros::Parameter;
+
+use crate::arrays::elements::validate_element_bytes;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::Dimension;
+use crate::arrays::types::layouts::{Layout, Tile, TileDimension, TiledLayout};
+use crate::parameters::Parameter;
+use crate::programs::{ProgramError, TypeError};
+
+/// Checked mapping from a static [`ArrayType`]'s logical indices to its storage addresses. Addressing includes both
+/// logical element offsets and physical byte ranges, and so it is broader than indexing alone. An array without an
+/// explicit [`Layout`] uses dense row-major storage. [`Layout::Strided`] supports positive and negative byte strides,
+/// deriving the base offset that keeps every addressed byte inside the allocation. [`Layout::Tiled`] follows
+/// [XLA's tiled layout semantics](https://openxla.org/xla/tiled_layout), including minor-to-major ordering, nested
+/// tiling, dimension combination, and tile padding semantics.
+///
+/// The [`ArrayType`] is the sole stored source of truth. Construction validates its static shape, layout structure,
+/// non-aliasing storage, and checked storage span without caching parallel shape or layout metadata.
+#[derive(Clone, Debug)]
+pub struct ArrayAddressing {
+    /// Static [`ArrayType`] whose storage is addressed by this [`ArrayAddressing`].
+    r#type: ArrayType,
+}
+
+impl ArrayAddressing {
+    /// Creates a new [`ArrayAddressing`] for the provided [`ArrayType`].
+    pub fn new(r#type: ArrayType) -> Result<Self, ProgramError> {
+        if r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+            return Err(TypeError::invalid(format!(
+                "cannot materialize a value of dynamically sized type `{}`; dynamically shaped values exist only in \
+                 array programs over `ArrayIrOperation`",
+                r#type,
+            ))
+            .into());
+        }
+
+        let addressing = Self { r#type };
+
+        // Validate the logical size.
+        addressing.logical_byte_len_checked()?;
+
+        // Validate the layout.
+        match addressing.r#type.layout() {
+            None => {}
+            Some(Layout::Tiled(layout)) => {
+                let rank = addressing.r#type.rank();
+                if layout.rank() != rank {
+                    return Err(TypeError::invalid(format!(
+                        "tiled layout rank {} does not match array rank {}",
+                        layout.rank(),
+                        rank,
+                    ))
+                    .into());
+                }
+                let mut seen = vec![false; rank];
+                for axis in layout.minor_to_major() {
+                    if *axis >= rank || seen[*axis] {
+                        return Err(TypeError::invalid(format!(
+                            "tiled layout minor-to-major dimensions must be a permutation of 0..{rank}",
+                        ))
+                        .into());
+                    }
+                    seen[*axis] = true;
+                }
+                let mut dimension_count = rank;
+                for (tile_index, tile) in layout.tiles().iter().enumerate() {
+                    if tile.dimensions().is_empty() || tile.dimensions().len() > dimension_count {
+                        return Err(TypeError::invalid(format!(
+                            "tile {} has {} dimensions but the tiled shape has {}",
+                            tile_index,
+                            tile.dimensions().len(),
+                            dimension_count,
+                        ))
+                        .into());
+                    }
+                    let mut sized_count = 0usize;
+                    for (position, dimension) in tile.dimensions().iter().enumerate() {
+                        match dimension {
+                            TileDimension::Sized(0) => {
+                                return Err(TypeError::invalid(format!(
+                                    "tile {tile_index} dimension {position} must have positive size",
+                                ))
+                                .into());
+                            }
+                            TileDimension::Sized(_) => sized_count += 1,
+                            TileDimension::Combined if position + 1 == tile.dimensions().len() => {
+                                return Err(TypeError::invalid(format!(
+                                    "tile {tile_index} cannot combine its most minor dimension",
+                                ))
+                                .into());
+                            }
+                            TileDimension::Combined => {}
+                        }
+                    }
+                    dimension_count = dimension_count - tile.dimensions().len() + 2 * sized_count;
+                }
+            }
+            Some(Layout::Strided(layout)) => {
+                let rank = addressing.r#type.rank();
+                if layout.rank() != rank {
+                    return Err(TypeError::invalid(format!(
+                        "strided layout rank {} does not match array rank {}",
+                        layout.rank(),
+                        rank,
+                    ))
+                    .into());
+                }
+                if addressing.element_count() != 0 && addressing.element_byte_width() != 0 {
+                    let mut axes = layout
+                        .strides()
+                        .iter()
+                        .enumerate()
+                        .filter(|(axis, _)| addressing.dimension(*axis) > 1)
+                        .map(|(axis, stride)| (stride.unsigned_abs(), axis))
+                        .collect::<Vec<_>>();
+                    axes.sort_unstable();
+                    let mut occupied_span = addressing.element_byte_width();
+                    for (stride, axis) in axes {
+                        if stride < occupied_span {
+                            return Err(TypeError::invalid(format!(
+                                "strided layout stride {} on axis {} is smaller than the {}-byte span occupied by more minor axes and may alias array elements",
+                                layout.strides()[axis], axis, occupied_span,
+                            ))
+                            .into());
+                        }
+                        occupied_span = (addressing.dimension(axis) - 1)
+                            .checked_mul(stride)
+                            .and_then(|span| occupied_span.checked_add(span))
+                            .ok_or_else(|| {
+                                TypeError::invalid(format!(
+                                    "physical storage span for array type `{}` cannot be represented",
+                                    addressing.r#type,
+                                ))
+                            })?;
+                    }
+                }
+            }
+        }
+
+        // Validate the physical size.
+        addressing.storage_byte_len_checked()?;
+
+        Ok(addressing)
+    }
+
+    /// Returns the static [`ArrayType`] whose storage is addressed by this descriptor.
+    #[inline]
+    pub fn r#type(&self) -> &ArrayType {
+        &self.r#type
+    }
+
+    /// Returns the number of bytes used by each logical element. Every [`DataType`] occupies a whole number of bytes:
+    /// sub-byte types such as [`DataType::I4`] store one element per byte, holding the value in the low bits with the
+    /// unused high bits set to zero, matching the checked element types in [`elements`](crate::arrays::elements)
+    /// (e.g., [`i4`](crate::arrays::elements::i4) and [`f4e2m1fn`](crate::arrays::elements::f4e2m1fn)). This unpacked
+    /// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+    /// which NumPy and JAX also use. XLA and DLPack's packed default store two 4-bit elements per byte instead, and
+    /// so sub-byte buffers are repacked once where they cross a boundary that expects packing.
+    #[inline]
+    pub fn element_byte_width(&self) -> usize {
+        Self::element_byte_width_for_data_type(self.r#type.data_type())
+    }
+
+    /// Returns the byte width of one element of the provided [`DataType`], which is its [`DataType::bit_width`] rounded
+    /// up to whole bytes. Refer to the documentation of [`element_byte_width`](Self::element_byte_width) for how
+    /// sub-byte elements occupy their bytes.
+    pub const fn element_byte_width_for_data_type(data_type: DataType) -> usize {
+        data_type.bit_width().div_ceil(8)
+    }
+
+    /// Returns the number of logical elements in the addressed array.
+    #[inline]
+    pub fn element_count(&self) -> usize {
+        self.r#type.element_count().unwrap().unwrap()
+    }
+
+    /// Returns the static size of the provided array axis.
+    #[inline]
+    fn dimension(&self, axis: usize) -> usize {
+        match self.r#type.shape().dimensions()[axis] {
+            Dimension::Static(dimension) => dimension,
+            Dimension::Dynamic(_) => unreachable!(),
+        }
+    }
+
+    /// Returns the number of bytes occupied by the encoded logical elements, excluding layout holes and padding.
+    #[inline]
+    pub fn logical_byte_len(&self) -> usize {
+        self.logical_byte_len_checked().unwrap()
+    }
+
+    /// Returns the number of bytes required by the physical storage of the addressed array.
+    #[inline]
+    pub fn storage_byte_len(&self) -> usize {
+        self.storage_byte_len_checked().unwrap()
+    }
+
+    /// Maps the provided logical multi-index to its flat row-major element index.
+    pub fn index(&self, index: &[usize]) -> Result<usize, ProgramError> {
+        self.validate_index(index)?;
+        Ok(self.logical_index_unchecked(|axis| index[axis]))
+    }
+
+    /// Advances a prevalidated logical multi-index by one element in row-major order. Returns `true` when a next
+    /// element exists. At the final element, it resets every coordinate to zero and returns `false`. This traversal
+    /// primitive lets reference kernels retain one rank-sized coordinate buffer without duplicating an odometer or
+    /// physical-layout logic. A rank-zero scalar has one logical index, `[]`, and therefore has no next index.
+    pub fn advance_index(&self, index: &mut [usize]) -> bool {
+        debug_assert_eq!(index.len(), self.r#type.rank());
+        debug_assert!(index.iter().enumerate().all(|(axis, coordinate)| *coordinate < self.dimension(axis)));
+        for axis in (0..index.len()).rev() {
+            index[axis] += 1;
+            if index[axis] < self.dimension(axis) {
+                return true;
+            }
+            index[axis] = 0;
+        }
+        false
+    }
+
+    /// Maps a logical multi-index to the byte range occupied by its element in physical storage.
+    #[inline]
+    pub fn byte_range(&self, index: &[usize]) -> Result<Range<usize>, ProgramError> {
+        self.validate_index(index)?;
+        Ok(self.byte_range_unchecked(index))
+    }
+
+    /// Maps a prevalidated logical multi-index to its physical byte range. Relative to [`Self::byte_range`], this form
+    /// avoids repeating rank and bounds checks inside reference kernels whose operation-level type inference and index
+    /// construction already establish them.
+    #[inline]
+    pub fn byte_range_unchecked(&self, index: &[usize]) -> Range<usize> {
+        debug_assert_eq!(index.len(), self.r#type.rank());
+        debug_assert!(index.iter().enumerate().all(|(axis, coordinate)| *coordinate < self.dimension(axis)));
+        self.byte_range_with_coordinates(|axis| index[axis])
+    }
+
+    /// Maps a prevalidated flat logical row-major index to its physical byte range.
+    pub fn byte_range_for_flat_index(&self, index: usize) -> Range<usize> {
+        debug_assert!(index < self.element_count());
+        let start = self.byte_offset_unchecked(|axis| {
+            let inner = (axis + 1..self.r#type.rank()).fold(1usize, |stride, axis| stride * self.dimension(axis));
+            (index / inner) % self.dimension(axis)
+        });
+        start..start + self.element_byte_width()
+    }
+
+    /// Maps a contiguous flat logical element index range to its corresponding physical byte range. This operation
+    /// returns an error when the logical elements are not stored contiguously in ascending physical address order.
+    /// Use [`Self::ranges`] when the [`Layout`] may split a logical selection across storage ranges.
+    pub fn range(&self, elements: Range<usize>) -> Result<ArrayIndexRange, ProgramError> {
+        let element_count = self.element_count();
+        if elements.start > elements.end || elements.end > element_count {
+            return Err(TypeError::invalid(format!(
+                "array element range {}..{} is out of bounds for {} elements",
+                elements.start, elements.end, element_count,
+            ))
+            .into());
+        }
+        if elements.is_empty() {
+            return Ok(ArrayIndexRange { elements, bytes: 0..0 });
+        }
+        if self.is_dense_row_major() {
+            let element_byte_width = self.element_byte_width();
+            let bytes = elements.start * element_byte_width..elements.end * element_byte_width;
+            return Ok(ArrayIndexRange { elements, bytes });
+        }
+        let first_bytes = self.byte_range_for_flat_index(elements.start);
+        let byte_start = first_bytes.start;
+        let mut byte_end = first_bytes.end;
+        for element in elements.start + 1..elements.end {
+            let element_bytes = self.byte_range_for_flat_index(element);
+            if element_bytes.start != byte_end {
+                return Err(TypeError::invalid(format!(
+                    "logical array element range {}..{} is not contiguous in physical storage",
+                    elements.start, elements.end,
+                ))
+                .into());
+            }
+            byte_end = element_bytes.end;
+        }
+        let bytes = byte_start..byte_end;
+        Ok(ArrayIndexRange { elements, bytes })
+    }
+
+    /// Returns an [`Iterator`] over the contiguous storage ranges covered by a multidimensional slice.
+    /// `axes` contains one [`ArraySliceAxis`] for each logical array axis.
+    #[inline]
+    pub fn ranges<'a>(&'a self, axes: &'a [ArraySliceAxis]) -> Result<ArrayIndexRanges<'a>, ProgramError> {
+        ArrayIndexRanges::new(self, axes)
+    }
+
+    /// Returns `true` when the flat logical row-major element order coincides with dense, gap-free physical storage for
+    /// this [`ArrayAddressing`] instance. This holds for arrays without an explicit [`Layout`], for [`Layout::Strided`]
+    /// layouts whose strides equal the dense row-major byte strides, for [`Layout::Tiled`] layouts with a descending
+    /// minor-to-major permutation and no tiles, and trivially for arrays without payload bytes. Callers can use this
+    /// function to replace per-element addressing with bulk byte ranges and copies.
+    pub fn is_dense_row_major(&self) -> bool {
+        if self.element_count() == 0 || self.element_byte_width() == 0 {
+            return true;
+        }
+        match self.r#type.layout() {
+            None => true,
+            Some(Layout::Strided(layout)) => {
+                // Every dimension is positive here, so the accumulated dense stride stays within the validated
+                // logical byte length and cannot overflow.
+                let mut dense_stride = self.element_byte_width();
+                for axis in (0..self.r#type.rank()).rev() {
+                    let stride = layout.strides()[axis];
+                    if stride < 0 || stride.unsigned_abs() != dense_stride {
+                        return false;
+                    }
+                    dense_stride *= self.dimension(axis);
+                }
+                true
+            }
+            Some(Layout::Tiled(layout)) => {
+                layout.tiles().is_empty() && layout.minor_to_major().iter().rev().copied().eq(0..self.r#type.rank())
+            }
+        }
+    }
+
+    /// Validates that `bytes` is a complete physical storage buffer for this [`ArrayAddressing`] instance's
+    /// [`ArrayType`]. Validation covers the [`Layout`]-derived storage length, every logical element's
+    /// [`DataType`]-specific byte encoding, and the requirement that layout "holes" and tile padding contain
+    /// only zero bytes.
+    pub fn validate_storage_bytes(&self, bytes: &[u8]) -> Result<(), ProgramError> {
+        if bytes.len() != self.storage_byte_len() {
+            return Err(TypeError::invalid(format!(
+                "array type `{}` requires {} physical storage bytes but got {}",
+                self.r#type,
+                self.storage_byte_len(),
+                bytes.len(),
+            ))
+            .into());
+        }
+
+        if self.is_dense_row_major() {
+            // Dense storage has no holes or padding, so its chunks are the element encodings in logical order.
+            // Arrays without payload bytes have nothing to check.
+            if self.element_byte_width() != 0 {
+                for (element, element_bytes) in bytes.chunks_exact(self.element_byte_width()).enumerate() {
+                    validate_element_bytes(self.r#type.data_type(), element, element_bytes)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut logical_nonzero_byte_count = 0usize;
+        for element in 0..self.element_count() {
+            let element_bytes = &bytes[self.byte_range_for_flat_index(element)];
+            validate_element_bytes(self.r#type.data_type(), element, element_bytes)?;
+            logical_nonzero_byte_count += element_bytes.iter().filter(|byte| **byte != 0).count();
+        }
+
+        // Validated layouts have disjoint element ranges. Any nonzero byte not counted inside those ranges must
+        // therefore belong to a layout hole or tile padding.
+        if bytes.iter().filter(|byte| **byte != 0).count() != logical_nonzero_byte_count {
+            return Err(TypeError::invalid("array layout holes and tile padding must contain zero bytes").into());
+        }
+
+        Ok(())
+    }
+
+    /// Returns the checked logical payload byte length, rejecting static element counts or byte lengths
+    /// that do not fit in [`usize`].
+    fn logical_byte_len_checked(&self) -> Result<usize, ProgramError> {
+        self.r#type
+            .element_count()
+            .ok()
+            .flatten()
+            .and_then(|element_count| element_count.checked_mul(self.element_byte_width()))
+            .ok_or_else(|| {
+                TypeError::invalid(format!("array type `{}` requires more bytes than can be represented", self.r#type))
+                    .into()
+            })
+    }
+
+    /// Returns the checked physical storage byte length.
+    fn storage_byte_len_checked(&self) -> Result<usize, ProgramError> {
+        let element_byte_width = self.element_byte_width();
+        if self.element_count() == 0 || element_byte_width == 0 {
+            return Ok(0);
+        }
+        match self.r#type.layout() {
+            None => self.logical_byte_len_checked(),
+            Some(Layout::Strided(layout)) => {
+                let span = layout.strides().iter().enumerate().try_fold(0usize, |span, (axis, stride)| {
+                    (self.dimension(axis) - 1)
+                        .checked_mul(stride.unsigned_abs())
+                        .and_then(|axis_span| span.checked_add(axis_span))
+                        .ok_or_else(|| {
+                            TypeError::invalid(format!(
+                                "physical storage span for array type `{}` cannot be represented",
+                                self.r#type,
+                            ))
+                        })
+                })?;
+                span.checked_add(element_byte_width).ok_or_else(|| {
+                    TypeError::invalid(format!(
+                        "physical storage span for array type `{}` cannot be represented",
+                        self.r#type,
+                    ))
+                    .into()
+                })
+            }
+            Some(Layout::Tiled(layout)) => {
+                let level = layout.tiles().len();
+                let dimension_count = self.tiled_dimension_count(layout, level);
+                let padded_element_count = (0..dimension_count).try_fold(1usize, |count, position| {
+                    count.checked_mul(self.tiled_component(layout, level, position, &|_| 0)?.1)
+                });
+                padded_element_count.and_then(|count| count.checked_mul(element_byte_width)).ok_or_else(|| {
+                    TypeError::invalid(format!(
+                        "physical storage span for array type `{}` cannot be represented",
+                        self.r#type,
+                    ))
+                    .into()
+                })
+            }
+        }
+    }
+
+    /// Validates the provided logical multi-index is within bounds for the underlying array.
+    fn validate_index(&self, index: &[usize]) -> Result<(), ProgramError> {
+        let rank = self.r#type.rank();
+        if index.len() != rank {
+            return Err(TypeError::invalid(format!(
+                "array index rank {} does not match array rank {}",
+                index.len(),
+                rank,
+            ))
+            .into());
+        }
+        for (axis, coordinate) in index.iter().enumerate() {
+            let dimension = self.dimension(axis);
+            if *coordinate >= dimension {
+                return Err(TypeError::invalid(format!(
+                    "array index {coordinate} on axis {axis} is out of bounds for dimension size {dimension}",
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a flat row-major index without validating its coordinates. `coordinate_fn` is called with each logical
+    /// axis and must return the selected coordinate along that axis.
+    fn logical_index_unchecked<CoordinateFn: Fn(usize) -> usize>(&self, coordinate_fn: CoordinateFn) -> usize {
+        let mut index = 0usize;
+        for axis in 0..self.r#type.rank() {
+            index = index * self.dimension(axis) + coordinate_fn(axis);
+        }
+        index
+    }
+
+    /// Returns a physical byte range without validating its coordinates. `coordinate_fn` is called with each logical
+    /// axis and must return the selected coordinate along that axis.
+    fn byte_range_with_coordinates<CoordinateFn: Fn(usize) -> usize>(
+        &self,
+        coordinate_fn: CoordinateFn,
+    ) -> Range<usize> {
+        let start = self.byte_offset_unchecked(coordinate_fn);
+        start..start + self.element_byte_width()
+    }
+
+    /// Returns a physical byte offset without validating its coordinates. `coordinate_fn` is called with each logical
+    /// axis and must return the selected coordinate along that axis.
+    fn byte_offset_unchecked<CoordinateFn: Fn(usize) -> usize>(&self, coordinate_fn: CoordinateFn) -> usize {
+        let element_byte_width = self.element_byte_width();
+        if element_byte_width == 0 {
+            return 0;
+        }
+        match self.r#type.layout() {
+            None => self.logical_index_unchecked(coordinate_fn) * element_byte_width,
+            Some(Layout::Strided(layout)) => {
+                let mut offset = layout.strides().iter().enumerate().fold(0usize, |offset, (axis, stride)| {
+                    if *stride < 0 { offset + (self.dimension(axis) - 1) * stride.unsigned_abs() } else { offset }
+                });
+                for (axis, stride) in layout.strides().iter().enumerate() {
+                    let delta = coordinate_fn(axis) * stride.unsigned_abs();
+                    if *stride < 0 {
+                        offset -= delta;
+                    } else {
+                        offset += delta;
+                    }
+                }
+                offset
+            }
+            Some(Layout::Tiled(layout)) => {
+                let level = layout.tiles().len();
+                let dimension_count = self.tiled_dimension_count(layout, level);
+                let mut element = 0usize;
+                for position in 0..dimension_count {
+                    let (component, bound) = self.tiled_component(layout, level, position, &coordinate_fn).unwrap();
+                    element = element.checked_mul(bound).and_then(|element| element.checked_add(component)).unwrap();
+                }
+                element * element_byte_width
+            }
+        }
+    }
+
+    /// Returns the number of physical dimensions after applying the first `level` nested tiles. Every applied tile
+    /// removes its input dimensions and adds one tile-count and one within-tile dimension per sized tile dimension.
+    fn tiled_dimension_count(&self, layout: &TiledLayout, level: usize) -> usize {
+        layout.tiles()[..level].iter().fold(self.r#type.rank(), |count, tile| {
+            count - tile.dimensions().len()
+                + 2 * tile.dimensions().iter().filter(|dimension| dimension.is_sized()).count()
+        })
+    }
+
+    /// Evaluates the physical coordinate and dimension bound at `position` after applying the first `level` nested
+    /// tiles, with positions ordering physical dimensions from most major to most minor. At level zero, positions map
+    /// logical dimensions through the layout's minor-to-major permutation. Each tile level then passes its untiled
+    /// prefix dimensions through unchanged and replaces the tiled suffix with the tile-count coordinates of all sized
+    /// tile dimensions followed by their within-tile coordinates, where each sized tile dimension first absorbs the
+    /// run of [`TileDimension::Combined`] dimensions immediately preceding it. Returns [`None`] when an intermediate
+    /// coordinate or bound does not fit in [`usize`]. `coordinate_fn` is called with a logical axis and must return
+    /// the selected coordinate along that axis.
+    fn tiled_component<CoordinateFn: Fn(usize) -> usize>(
+        &self,
+        layout: &TiledLayout,
+        level: usize,
+        position: usize,
+        coordinate_fn: &CoordinateFn,
+    ) -> Option<(usize, usize)> {
+        if level == 0 {
+            let axis = layout.minor_to_major()[self.r#type.rank() - 1 - position];
+            return Some((coordinate_fn(axis), self.dimension(axis)));
+        }
+        let tile = &layout.tiles()[level - 1];
+        let prior_count = self.tiled_dimension_count(layout, level - 1);
+        let prefix_count = prior_count - tile.dimensions().len();
+        if position < prefix_count {
+            return self.tiled_component(layout, level - 1, position, coordinate_fn);
+        }
+        let sized_count = tile.dimensions().iter().filter(|dimension| dimension.is_sized()).count();
+        let tiled_position = position - prefix_count;
+        let group = tiled_position % sized_count;
+        let within_tile = tiled_position >= sized_count;
+        let (start, end, tile_size) = Self::tile_group(tile, group);
+        let mut combined_coordinate = 0usize;
+        let mut combined_bound = 1usize;
+        for prior_position in prefix_count + start..prefix_count + end {
+            let (component, bound) = self.tiled_component(layout, level - 1, prior_position, coordinate_fn)?;
+            combined_coordinate = combined_coordinate.checked_mul(bound)?.checked_add(component)?;
+            combined_bound = combined_bound.checked_mul(bound)?;
+        }
+        if within_tile {
+            Some((combined_coordinate % tile_size, tile_size))
+        } else {
+            Some((combined_coordinate / tile_size, combined_bound.div_ceil(tile_size)))
+        }
+    }
+
+    /// Returns the tiled-dimension positions absorbed by the `group`-th sized dimension of `tile` as a `(start, end,
+    /// size)` tuple, where `start..end` spans the combined dimensions preceding the sized dimension together with the
+    /// sized dimension itself.
+    fn tile_group(tile: &Tile, group: usize) -> (usize, usize, usize) {
+        let mut start = 0usize;
+        let mut current_group = 0usize;
+        for (position, dimension) in tile.dimensions().iter().enumerate() {
+            if let TileDimension::Sized(size) = dimension {
+                if current_group == group {
+                    return (start, position + 1, *size);
+                }
+                current_group += 1;
+                start = position + 1;
+            }
+        }
+
+        // Layout validation ensures that every tile ends in a sized dimension, while callers compute `group` modulo
+        // the number of sized dimensions. The loop must therefore return upon visiting the requested sized dimension.
+        unreachable!()
+    }
+}
+
+/// Selection of logical coordinates along one array axis. It selects `start + index * stride` for every `index` in
+/// `0..size`. A [`Range<usize>`] converts to a unit-stride selection of the same coordinates. An empty or reversed
+/// range converts to an empty selection beginning at the range's start.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ArraySliceAxis {
+    /// First selected logical coordinate.
+    start: usize,
+
+    /// Number of selected logical coordinates.
+    size: usize,
+
+    /// Distance between consecutive selected logical coordinates.
+    stride: usize,
+}
+
+impl ArraySliceAxis {
+    /// Creates a new [`ArraySliceAxis`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `start`: first selected logical coordinate.
+    ///   - `size`: number of selected logical coordinates.
+    ///   - `stride`: distance between consecutive selected logical coordinates.
+    pub const fn new(start: usize, size: usize, stride: usize) -> Self {
+        Self { start, size, stride }
+    }
+
+    /// Returns the first selected logical coordinate.
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Returns the number of selected logical coordinates.
+    pub const fn size(self) -> usize {
+        self.size
+    }
+
+    /// Returns the distance between consecutive selected logical coordinates.
+    pub const fn stride(self) -> usize {
+        self.stride
+    }
+}
+
+impl From<Range<usize>> for ArraySliceAxis {
+    #[inline]
+    fn from(range: Range<usize>) -> Self {
+        Self::new(range.start, range.end.saturating_sub(range.start), 1)
+    }
+}
+
+/// One contiguous logical element range in an array and its corresponding physical byte range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayIndexRange {
+    /// Contiguous flat logical element range.
+    elements: Range<usize>,
+
+    /// Physical byte range containing `elements`.
+    bytes: Range<usize>,
+}
+
+impl ArrayIndexRange {
+    /// Returns the contiguous flat logical element range.
+    #[inline]
+    pub fn elements(&self) -> Range<usize> {
+        self.elements.clone()
+    }
+
+    /// Returns the physical byte range containing [`Self::elements`].
+    #[inline]
+    pub fn bytes(&self) -> Range<usize> {
+        self.bytes.clone()
+    }
+}
+
+/// Allocation-free [`Iterator`] over the contiguous [`ArrayIndexRange`]s that make up one logical array slice. Elements
+/// are visited in logical row-major slice order. Consecutive logical elements are coalesced only when their physical
+/// byte ranges are also consecutive in ascending address order, so dense slices use bulk ranges while strided,
+/// permuted, reversed, and tiled layouts split exactly where their storage does.
+///
+/// The iterator borrows its slice metadata and tracks its position as one flat logical slice index. It allocates
+/// nothing, and every fallible rank, bounds, stride, and overflow check happens during construction.
+#[derive(Clone, Debug)]
+pub struct ArrayIndexRanges<'a> {
+    /// [`ArrayAddressing`] used to map each emitted logical range to physical storage.
+    addressing: &'a ArrayAddressing,
+
+    /// Selection along each logical array axis.
+    axes: &'a [ArraySliceAxis],
+
+    /// Total number of logical elements selected by this slice.
+    element_count: usize,
+
+    /// Flat logical slice indices that have not yet been mapped to physical storage.
+    ordinals: Range<usize>,
+
+    /// First non-coalesced element already read while constructing the previous output range.
+    pending: Option<ArrayIndexRange>,
+}
+
+impl<'a> ArrayIndexRanges<'a> {
+    /// Creates a new [`ArrayIndexRanges`] [`Iterator`].
+    fn new(addressing: &'a ArrayAddressing, axes: &'a [ArraySliceAxis]) -> Result<Self, ProgramError> {
+        let rank = addressing.r#type.rank();
+        if axes.len() != rank {
+            return Err(TypeError::invalid(format!(
+                "array selection for rank {} requires {} slice axes but got {}",
+                rank,
+                rank,
+                axes.len(),
+            ))
+            .into());
+        }
+
+        let mut empty = false;
+        for (axis, slice_axis) in axes.iter().enumerate() {
+            if slice_axis.stride == 0 {
+                return Err(
+                    TypeError::invalid(format!("array selection stride must be positive on axis {axis}")).into()
+                );
+            }
+            let dimension = addressing.dimension(axis);
+            if slice_axis.size == 0 {
+                empty = true;
+                if slice_axis.start > dimension {
+                    return Err(TypeError::invalid(format!(
+                        "empty array selection starts at {} on axis {}, past dimension size {}",
+                        slice_axis.start, axis, dimension,
+                    ))
+                    .into());
+                }
+                continue;
+            }
+            let last = (slice_axis.size - 1)
+                .checked_mul(slice_axis.stride)
+                .and_then(|offset| slice_axis.start.checked_add(offset))
+                .ok_or_else(|| {
+                    TypeError::invalid(format!("array selection index calculation overflowed on axis {axis}"))
+                })?;
+            if last >= dimension {
+                return Err(TypeError::invalid(format!(
+                    "array selection reaches index {last} on axis {axis}, past dimension size {dimension}",
+                ))
+                .into());
+            }
+        }
+
+        // A nonempty selection cannot contain more coordinates than the array itself, whose checked element count is
+        // representable. Avoid multiplying irrelevant huge dimensions after any zero selection size.
+        let element_count =
+            if empty { 0 } else { axes.iter().try_fold(1usize, |count, axis| count.checked_mul(axis.size)).unwrap() };
+
+        Ok(Self { addressing, axes, element_count, ordinals: 0..element_count, pending: None })
+    }
+
+    /// Returns the total number of selected logical elements across all emitted ranges.
+    #[inline]
+    pub fn element_count(&self) -> usize {
+        self.element_count
+    }
+
+    /// Maps one flat logical slice ordinal to its single-element logical and physical ranges.
+    fn element_range(&self, ordinal: usize) -> ArrayIndexRange {
+        let coordinate = |axis: usize| {
+            let inner = self.axes[axis + 1..].iter().map(|axis| axis.size).product::<usize>();
+            let position = (ordinal / inner) % self.axes[axis].size;
+            self.axes[axis].start + position * self.axes[axis].stride
+        };
+        let element = self.addressing.logical_index_unchecked(coordinate);
+        let bytes = self.addressing.byte_range_with_coordinates(coordinate);
+        ArrayIndexRange { elements: element..element + 1, bytes }
+    }
+}
+
+impl Iterator for ArrayIndexRanges<'_> {
+    type Item = ArrayIndexRange;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut range =
+            self.pending.take().or_else(|| self.ordinals.next().map(|ordinal| self.element_range(ordinal)))?;
+        while let Some(ordinal) = self.ordinals.next() {
+            let next = self.element_range(ordinal);
+            if next.elements.start == range.elements.end && next.bytes.start == range.bytes.end {
+                range.elements.end = next.elements.end;
+                range.bytes.end = next.bytes.end;
+            } else {
+                self.pending = Some(next);
+                break;
+            }
+        }
+        Some(range)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.ordinals.len() + usize::from(self.pending.is_some());
+        (usize::from(remaining > 0), Some(remaining))
+    }
+}
+
+#[allow(clippy::reversed_empty_ranges)]
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
+    use crate::programs::{ProgramError, TypeError};
+
+    use super::*;
+
+    #[test]
+    fn test_array_addressing() {
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let addressing = ArrayAddressing::new(r#type.clone()).unwrap();
+        assert_eq!(addressing.r#type(), &r#type);
+        assert_eq!(addressing.element_byte_width(), 4);
+        assert_eq!(addressing.element_count(), 6);
+        assert_eq!(addressing.logical_byte_len(), 24);
+        assert_eq!(addressing.storage_byte_len(), 24);
+        assert_eq!(addressing.index(&[0, 0]), Ok(0));
+        assert_eq!(addressing.index(&[1, 2]), Ok(5));
+        assert_eq!(addressing.byte_range(&[1, 2]), Ok(20..24));
+        assert_eq!(addressing.byte_range_unchecked(&[1, 2]), 20..24);
+        let range = addressing.range(1..4).unwrap();
+        assert_eq!(range.elements(), 1..4);
+        assert_eq!(range.bytes(), 4..16);
+        assert!(addressing.is_dense_row_major());
+
+        // Dense storage validates by length and per-element encoding alone.
+        assert_eq!(addressing.validate_storage_bytes(&[0; 24]), Ok(()));
+        assert!(matches!(
+            addressing.validate_storage_bytes(&[0; 23]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array type `f32[2, 3]` requires 24 physical storage bytes but got 23",
+        ));
+        let booleans =
+            ArrayAddressing::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]))).unwrap();
+        assert_eq!(booleans.validate_storage_bytes(&[1, 0]), Ok(()));
+        assert!(matches!(
+            booleans.validate_storage_bytes(&[0, 2]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 1 has invalid `bool` byte encoding [2]",
+        ));
+
+        let mut index = vec![0, 0];
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![0, 1]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![0, 2]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![1, 0]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![1, 1]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![1, 2]);
+        assert!(!addressing.advance_index(&mut index));
+        assert_eq!(index, vec![0, 0]);
+
+        // Scalar and empty shapes have well-defined addressing, including empty shapes whose irrelevant suffix
+        // products would overflow an ordinary row-major-stride calculation.
+        let scalar = ArrayAddressing::new(ArrayType::scalar(DataType::C128)).unwrap();
+        assert_eq!(scalar.element_count(), 1);
+        assert_eq!(scalar.logical_byte_len(), 16);
+        assert_eq!(scalar.storage_byte_len(), 16);
+        assert_eq!(scalar.validate_storage_bytes(&[0; 16]), Ok(()));
+        assert!(!scalar.advance_index(&mut []));
+        assert_eq!(scalar.index(&[]), Ok(0));
+        let empty = ArrayAddressing::new(ArrayType::new(
+            DataType::C128,
+            Shape::new(vec![Dimension::Static(0), Dimension::Static(usize::MAX), Dimension::Static(usize::MAX)]),
+        ))
+        .unwrap();
+        assert_eq!(empty.element_count(), 0);
+        assert_eq!(empty.logical_byte_len(), 0);
+        assert_eq!(empty.storage_byte_len(), 0);
+        assert_eq!(empty.validate_storage_bytes(&[]), Ok(()));
+
+        // Malformed external indices and unmaterializable types fail before payload access.
+        assert!(matches!(
+            addressing.index(&[0]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array index rank 1 does not match array rank 2",
+        ));
+        assert!(matches!(
+            addressing.index(&[2, 0]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array index 2 on axis 0 is out of bounds for dimension size 2",
+        ));
+        assert!(matches!(
+            addressing.range(4..3),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element range 4..3 is out of bounds for 6 elements",
+        ));
+        assert!(matches!(
+            addressing.range(5..7),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element range 5..7 is out of bounds for 6 elements",
+        ));
+        let dynamic = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+        );
+        assert!(matches!(
+            ArrayAddressing::new(dynamic),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot materialize a value of dynamically sized type `f32[dynamic]`; dynamically \
+                               shaped values exist only in array programs over `ArrayIrOperation`",
+        ));
+        let oversized = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(usize::MAX)]));
+        assert!(matches!(
+            ArrayAddressing::new(oversized),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!("array type `c128[{}]` requires more bytes than can be represented", usize::MAX),
+        ));
+
+        // Element counts that overflow before the byte multiplication are rejected instead of panicking.
+        let overflowing_element_count =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]));
+        assert!(matches!(
+            ArrayAddressing::new(overflowing_element_count.clone()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "array type `{overflowing_element_count}` requires more bytes than can be represented",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_array_strided_addressing() {
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+
+        // Positive byte strides preserve an inner contiguous row while leaving a four-byte hole between rows.
+        let positive =
+            ArrayAddressing::new(r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 4])))).unwrap();
+        assert_eq!(positive.logical_byte_len(), 24);
+        assert_eq!(positive.storage_byte_len(), 28);
+        assert_eq!(positive.byte_range(&[0, 0]), Ok(0..4));
+        assert_eq!(positive.byte_range(&[0, 2]), Ok(8..12));
+        assert_eq!(positive.byte_range(&[1, 0]), Ok(16..20));
+        assert_eq!(positive.byte_range(&[1, 2]), Ok(24..28));
+        assert_eq!(positive.range(0..3), Ok(ArrayIndexRange { elements: 0..3, bytes: 0..12 }));
+        assert!(matches!(
+            positive.range(0..6),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "logical array element range 0..6 is not contiguous in physical storage",
+        ));
+
+        // Negative byte strides derive a base offset at the opposite end of storage without changing logical order.
+        let negative =
+            ArrayAddressing::new(r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![-16, 4]))))
+                .unwrap();
+        assert_eq!(negative.storage_byte_len(), 28);
+        assert_eq!(negative.byte_range(&[0, 0]), Ok(16..20));
+        assert_eq!(negative.byte_range(&[0, 2]), Ok(24..28));
+        assert_eq!(negative.byte_range(&[1, 0]), Ok(0..4));
+        assert_eq!(negative.byte_range(&[1, 2]), Ok(8..12));
+
+        // Permuted byte strides make the first logical axis physically minor.
+        let permuted =
+            ArrayAddressing::new(r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])))).unwrap();
+        assert_eq!(permuted.storage_byte_len(), 24);
+        assert_eq!(permuted.byte_range(&[0, 1]), Ok(8..12));
+        assert_eq!(permuted.byte_range(&[1, 0]), Ok(4..8));
+
+        // Only strides that exactly reproduce dense row-major storage qualify for bulk dense addressing.
+        let dense =
+            ArrayAddressing::new(r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))).unwrap();
+        assert!(dense.is_dense_row_major());
+        assert_eq!(dense.range(0..6), Ok(ArrayIndexRange { elements: 0..6, bytes: 0..24 }));
+        assert!(!positive.is_dense_row_major());
+        assert!(!negative.is_dense_row_major());
+        assert!(!permuted.is_dense_row_major());
+
+        // Storage validation covers the physical span, so the hole between rows must be present and zero,
+        // while element bytes may hold any valid encoding.
+        let mut bytes = vec![0; 28];
+        bytes[0..12].fill(0xFF);
+        bytes[16..28].fill(0xFF);
+        assert_eq!(positive.validate_storage_bytes(&bytes), Ok(()));
+        assert_eq!(negative.validate_storage_bytes(&bytes), Ok(()));
+        assert_eq!(dense.validate_storage_bytes(&[0xFF; 24]), Ok(()));
+        assert!(matches!(
+            positive.validate_storage_bytes(&[0; 24]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array type `f32[2, 3][layout=strided{16,4}]` requires 28 physical storage bytes but \
+                               got 24",
+        ));
+        bytes[12] = 1;
+        assert!(matches!(
+            positive.validate_storage_bytes(&bytes),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array layout holes and tile padding must contain zero bytes",
+        ));
+
+        // Invalid ranks, potentially aliasing strides, and unrepresentable storage spans fail at construction.
+        assert!(matches!(
+            ArrayAddressing::new(
+                r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4]))),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "strided layout rank 1 does not match array rank 2",
+        ));
+        assert!(matches!(
+            ArrayAddressing::new(
+                r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 4]))),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "strided layout stride 4 on axis 1 is smaller than the 8-byte span \
+                occupied by more minor axes and may alias array elements",
+        ));
+        let overflowing = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![isize::MAX])));
+        assert!(matches!(
+            ArrayAddressing::new(overflowing),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "physical storage span for array type `f32[3][layout=strided{9223372036854775807}]` \
+                cannot be represented",
+        ));
+    }
+
+    #[test]
+    fn test_array_tiled_addressing() {
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(5)]));
+
+        // A minor-to-major permutation without tiles is column-major and introduces no padding, while a descending
+        // permutation without tiles reproduces dense row-major storage.
+        let permuted = ArrayAddressing::new(
+            matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+        )
+        .unwrap();
+        assert_eq!(permuted.storage_byte_len(), 60);
+        assert_eq!(permuted.byte_range(&[0, 1]), Ok(12..16));
+        assert_eq!(permuted.byte_range(&[1, 0]), Ok(4..8));
+        assert_eq!(permuted.byte_range(&[2, 4]), Ok(56..60));
+        assert!(!permuted.is_dense_row_major());
+        let row_major = ArrayAddressing::new(
+            matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
+        )
+        .unwrap();
+        assert!(row_major.is_dense_row_major());
+        assert_eq!(row_major.range(0..15), Ok(ArrayIndexRange { elements: 0..15, bytes: 0..60 }));
+
+        // A 2-by-2 tile pads the physical shape to 4-by-6 and follows XLA's tile-major, then within-tile order.
+        let tiled = ArrayAddressing::new(matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(
+            vec![1, 0],
+            vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
+        ))))
+        .unwrap();
+        assert_eq!(tiled.logical_byte_len(), 60);
+        assert_eq!(tiled.storage_byte_len(), 96);
+        assert_eq!(tiled.byte_range(&[0, 0]), Ok(0..4));
+        assert_eq!(tiled.byte_range(&[1, 0]), Ok(8..12));
+        assert_eq!(tiled.byte_range(&[0, 2]), Ok(16..20));
+        assert_eq!(tiled.byte_range(&[2, 3]), Ok(68..72));
+        assert_eq!(tiled.byte_range(&[2, 4]), Ok(80..84));
+
+        // Tile padding is part of the physical span and must be zero, while the padded logical elements may hold any
+        // valid encoding.
+        let mut bytes = vec![0; 96];
+        bytes[80..84].fill(0xFF);
+        assert_eq!(tiled.validate_storage_bytes(&bytes), Ok(()));
+        assert_eq!(row_major.validate_storage_bytes(&[0xFF; 60]), Ok(()));
+        bytes[84] = 1;
+        assert!(matches!(
+            tiled.validate_storage_bytes(&bytes),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array layout holes and tile padding must contain zero bytes",
+        ));
+
+        // Repeated tiling may rearrange the within-tile dimensions produced by an earlier tile.
+        let nested = ArrayAddressing::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(8)])).with_layout(
+                Layout::Tiled(TiledLayout::new(
+                    vec![1, 0],
+                    vec![
+                        Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(4)]),
+                        Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(1)]),
+                    ],
+                )),
+            ),
+        )
+        .unwrap();
+        assert_eq!(nested.storage_byte_len(), 128);
+        assert_eq!(nested.byte_range(&[1, 0]), Ok(4..8));
+        assert_eq!(nested.byte_range(&[0, 1]), Ok(8..12));
+
+        // Combined tile dimensions flatten adjacent physical dimensions before ordinary padded tiling is applied.
+        let combined = ArrayAddressing::new(
+            ArrayType::new(
+                DataType::U8,
+                Shape::new(vec![
+                    Dimension::Static(2),
+                    Dimension::Static(7),
+                    Dimension::Static(8),
+                    Dimension::Static(11),
+                    Dimension::Static(10),
+                ]),
+            )
+            .with_layout(Layout::Tiled(TiledLayout::new(
+                vec![4, 3, 2, 1, 0],
+                vec![Tile::new(vec![
+                    TileDimension::Combined,
+                    TileDimension::Combined,
+                    TileDimension::Sized(2),
+                    TileDimension::Combined,
+                    TileDimension::Sized(3),
+                ])],
+            ))),
+        )
+        .unwrap();
+        assert_eq!(combined.logical_byte_len(), 12_320);
+        assert_eq!(combined.storage_byte_len(), 12_432);
+        assert_eq!(combined.byte_range(&[1, 0, 0, 0, 0]), Ok(6216..6217));
+
+        // Invalid permutations, tile dimensions, and padded storage spans fail during descriptor construction.
+        assert!(matches!(
+            ArrayAddressing::new(
+                matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0], Vec::new()))),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "tiled layout rank 1 does not match array rank 2",
+        ));
+        assert!(matches!(
+            ArrayAddressing::new(
+                matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 0], Vec::new()))),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "tiled layout minor-to-major dimensions must be a permutation of 0..2",
+        ));
+        assert!(matches!(
+            ArrayAddressing::new(matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(
+                vec![1, 0],
+                vec![Tile::new(vec![TileDimension::Sized(0)])],
+            )))),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "tile 0 dimension 0 must have positive size",
+        ));
+        assert!(matches!(
+            ArrayAddressing::new(matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(
+                vec![1, 0],
+                vec![Tile::new(vec![TileDimension::Combined])],
+            )))),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "tile 0 cannot combine its most minor dimension",
+        ));
+        assert!(matches!(
+            ArrayAddressing::new(matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(
+                vec![1, 0],
+                vec![Tile::new(vec![
+                    TileDimension::Sized(1),
+                    TileDimension::Sized(1),
+                    TileDimension::Sized(1),
+                ])],
+            )))),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "tile 0 has 3 dimensions but the tiled shape has 2",
+        ));
+        let overflowing = ArrayType::new(DataType::U8, Shape::new(vec![Dimension::Static(usize::MAX)]))
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        assert!(matches!(
+            ArrayAddressing::new(overflowing),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "physical storage span for array type `u8[{}][layout=tiled{{0:T(2)}}]` cannot be represented",
+                    usize::MAX,
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_array_addressing_data_type_widths() {
+        let cases = [
+            (DataType::Token, 0),
+            (DataType::Zero, 0),
+            (DataType::Boolean, 1),
+            (DataType::I1, 1),
+            (DataType::I2, 1),
+            (DataType::I4, 1),
+            (DataType::I8, 1),
+            (DataType::I16, 2),
+            (DataType::I32, 4),
+            (DataType::I64, 8),
+            (DataType::U1, 1),
+            (DataType::U2, 1),
+            (DataType::U4, 1),
+            (DataType::U8, 1),
+            (DataType::U16, 2),
+            (DataType::U32, 4),
+            (DataType::U64, 8),
+            (DataType::F4E2M1FN, 1),
+            (DataType::F6E2M3FN, 1),
+            (DataType::F6E3M2FN, 1),
+            (DataType::F8E3M4, 1),
+            (DataType::F8E4M3, 1),
+            (DataType::F8E4M3FN, 1),
+            (DataType::F8E4M3FNUZ, 1),
+            (DataType::F8E4M3B11FNUZ, 1),
+            (DataType::F8E5M2, 1),
+            (DataType::F8E5M2FNUZ, 1),
+            (DataType::F8E8M0FNU, 1),
+            (DataType::BF16, 2),
+            (DataType::F16, 2),
+            (DataType::F32, 4),
+            (DataType::F64, 8),
+            (DataType::C64, 8),
+            (DataType::C128, 16),
+        ];
+        for (data_type, byte_width) in cases {
+            let addressing =
+                ArrayAddressing::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)]))).unwrap();
+            assert_eq!(addressing.element_byte_width(), byte_width);
+            assert_eq!(addressing.logical_byte_len(), 2 * byte_width);
+            assert_eq!(addressing.storage_byte_len(), 2 * byte_width);
+            assert_eq!(addressing.validate_storage_bytes(&vec![0; 2 * byte_width]), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_array_slice_axis() {
+        let axis = ArraySliceAxis::new(2, 3, 4);
+        assert_eq!(axis.start(), 2);
+        assert_eq!(axis.size(), 3);
+        assert_eq!(axis.stride(), 4);
+        assert_eq!(ArraySliceAxis::from(2..8), ArraySliceAxis::new(2, 6, 1));
+        assert_eq!(ArraySliceAxis::from(8..2), ArraySliceAxis::new(8, 0, 1));
+    }
+
+    #[test]
+    fn test_array_index_ranges() {
+        let addressing = ArrayAddressing::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]),
+        ))
+        .unwrap();
+
+        // A complete selection coalesces into one range, while a partial innermost dimension emits one range per row.
+        let axes: [ArraySliceAxis; 2] = [(0..3).into(), (0..4).into()];
+        let ranges = addressing.ranges(&axes).unwrap();
+        assert_eq!(ranges.element_count(), 12);
+        assert_eq!(ranges.collect::<Vec<_>>(), vec![ArrayIndexRange { elements: 0..12, bytes: 0..48 }],);
+        assert_eq!(
+            addressing
+                .ranges(&[ArraySliceAxis::new(0, 3, 1), ArraySliceAxis::new(1, 2, 1)])
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![
+                ArrayIndexRange { elements: 1..3, bytes: 4..12 },
+                ArrayIndexRange { elements: 5..7, bytes: 20..28 },
+                ArrayIndexRange { elements: 9..11, bytes: 36..44 },
+            ],
+        );
+
+        // A strided outer dimension retains contiguous rows; a strided inner dimension emits individual elements.
+        assert_eq!(
+            addressing
+                .ranges(&[ArraySliceAxis::new(0, 2, 2), ArraySliceAxis::new(0, 4, 1)])
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![ArrayIndexRange { elements: 0..4, bytes: 0..16 }, ArrayIndexRange { elements: 8..12, bytes: 32..48 },],
+        );
+        assert_eq!(
+            addressing
+                .ranges(&[ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(0, 2, 2)])
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![
+                ArrayIndexRange { elements: 0..1, bytes: 0..4 },
+                ArrayIndexRange { elements: 2..3, bytes: 8..12 },
+                ArrayIndexRange { elements: 4..5, bytes: 16..20 },
+                ArrayIndexRange { elements: 6..7, bytes: 24..28 },
+            ],
+        );
+
+        // Coalescing follows physical storage and therefore splits permuted and reversed layouts.
+        let permuted = ArrayAddressing::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+                .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
+        )
+        .unwrap();
+        assert_eq!(
+            permuted.ranges(&[(0..2).into(), (0..3).into()]).unwrap().collect::<Vec<_>>(),
+            vec![
+                ArrayIndexRange { elements: 0..1, bytes: 0..4 },
+                ArrayIndexRange { elements: 1..2, bytes: 8..12 },
+                ArrayIndexRange { elements: 2..3, bytes: 16..20 },
+                ArrayIndexRange { elements: 3..4, bytes: 4..8 },
+                ArrayIndexRange { elements: 4..5, bytes: 12..16 },
+                ArrayIndexRange { elements: 5..6, bytes: 20..24 },
+            ],
+        );
+        let reversed = ArrayAddressing::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
+                .with_layout(Layout::Strided(StridedLayout::new(vec![-4]))),
+        )
+        .unwrap();
+        assert_eq!(
+            reversed.ranges(&[(0..3).into()]).unwrap().collect::<Vec<_>>(),
+            vec![
+                ArrayIndexRange { elements: 0..1, bytes: 8..12 },
+                ArrayIndexRange { elements: 1..2, bytes: 4..8 },
+                ArrayIndexRange { elements: 2..3, bytes: 0..4 },
+            ],
+        );
+
+        // Rank-zero selections contain one element, while any zero selection size yields no ranges.
+        let scalar = ArrayAddressing::new(ArrayType::scalar(DataType::F32)).unwrap();
+        assert_eq!(
+            scalar.ranges(&[]).unwrap().collect::<Vec<_>>(),
+            vec![ArrayIndexRange { elements: 0..1, bytes: 0..4 }],
+        );
+        assert_eq!(
+            addressing
+                .ranges(&[ArraySliceAxis::new(3, 0, 1), ArraySliceAxis::new(0, 4, 1)])
+                .unwrap()
+                .collect::<Vec<_>>(),
+            Vec::<ArrayIndexRange>::new(),
+        );
+
+        // Invalid selection metadata is rejected completely before iteration begins.
+        assert!(matches!(
+            addressing.ranges(&[ArraySliceAxis::new(0, 1, 1)]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array selection for rank 2 requires 2 slice axes but got 1",
+        ));
+        assert!(matches!(
+            addressing.ranges(&[ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 1, 0)]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array selection stride must be positive on axis 1",
+        ));
+        assert!(matches!(
+            addressing.ranges(&[ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(3, 2, 1)]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array selection reaches index 4 on axis 1, past dimension size 4",
+        ));
+        let zero_width =
+            ArrayAddressing::new(ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(usize::MAX)])))
+                .unwrap();
+        assert!(matches!(
+            zero_width.ranges(&[ArraySliceAxis::new(0, usize::MAX, 2)]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array selection index calculation overflowed on axis 0",
+        ));
+    }
+}
