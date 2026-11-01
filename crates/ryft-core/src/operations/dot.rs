@@ -459,7 +459,7 @@ where
             inputs[0].unbatched_type().rank(),
             inputs[1].unbatched_type().rank(),
         )?;
-        check_common_mapped_dimension(DOT_OPERATION_NAME, inputs)?;
+        validate_common_mapped_dimension(DOT_OPERATION_NAME, inputs)?;
 
         // A mixed pair needs a physical batch axis on its replicated input before the logical dimension numbers can be
         // lifted. Insert that axis at position zero through the active policy, so a dynamic mapped extent remains an
@@ -1320,7 +1320,7 @@ where
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         }
 
-        check_common_mapped_dimension(RAGGED_DOT_OPERATION_NAME, inputs)?;
+        validate_common_mapped_dimension(RAGGED_DOT_OPERATION_NAME, inputs)?;
 
         // Both data inputs need the mapped axis at position zero before the logical dimension numbers can be lifted,
         // so a replicated data input is materialized across the mapped extent and a mapped one moves its axis there.
@@ -2225,8 +2225,6 @@ pub(crate) fn infer_dot_output_type(
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates the batching and contracting dimension indices of one input with rank `rank` before inference or metadata
 /// queries index its shape. `operation_name` names the validating operation and `side` names the input in diagnostics.
 fn validate_dot_axes(
@@ -2241,7 +2239,7 @@ fn validate_dot_axes(
     }
     for (role, axes) in [("batching", batching), ("contracting", contracting)] {
         if axes.iter().copied().collect::<BTreeSet<_>>().len() != axes.len() {
-            return Err(TypeError::invalid(format!("`{operation_name}` {side} {role} dimensions must be distinct",)));
+            return Err(TypeError::invalid(format!("`{operation_name}` {side} {role} dimensions must be distinct")));
         }
     }
     if batching.iter().any(|axis| contracting.contains(axis)) {
@@ -2261,10 +2259,10 @@ fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(
     }
 }
 
-/// Checks that every mapped input of the operation named `operation_name` maps the same extent. Comparing the mapped
-/// dimensions validates static extents exactly as [`ArrayBatch::common_batch_size`] does, and it additionally admits a
-/// dynamic mapped extent, which two inputs share exactly when it is the same dimension variable.
-fn check_common_mapped_dimension<V: Value<Type = ArrayType>>(
+/// Validates that every mapped input of the operation named `operation_name` maps the same extent. Comparing the
+/// mapped dimensions validates static extents exactly as [`ArrayBatch::common_batch_size`] does, and it additionally
+/// admits a dynamic mapped extent, which two inputs share exactly when it is the same dimension variable.
+fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
     operation_name: &str,
     inputs: &[ArrayBatch<V>],
 ) -> Result<(), BatchingError> {
@@ -2287,23 +2285,22 @@ fn check_common_mapped_dimension<V: Value<Type = ArrayType>>(
 
 /// Applies the product rule `ẏ = f(ȧ, b) + f(a, ḃ)` of a bilinear dot operation `y = f(a, b)`, where `apply` evaluates
 /// `f`. Structural zero tangents drop their term, so `ẏ` is a structural zero only when both `ȧ` and `ḃ` are. Dense
-/// and ragged dot operations share this rule.
-///
-/// When one factor of a tangent term uses the widened tangent representation, both factors are converted to the output
-/// tangent element type before applying the operation.
-fn bilinear_array_jvp<C, V, Apply, P: DifferentiationPolicy<C>>(
+/// and ragged dot operations share this rule. When one factor of a tangent term uses the widened tangent
+/// representation, both factors are converted to the output tangent element type before applying the operation.
+fn bilinear_array_jvp<C, V, ApplyFn, P: DifferentiationPolicy<C>>(
     context: &DifferentiationContext<C, P>,
     primal: V,
     lhs: &DifferentiationDual<V>,
     rhs: &DifferentiationDual<V>,
-    apply: Apply,
+    apply_fn: ApplyFn,
 ) -> Result<DifferentiationDual<V>, DifferentiationError>
 where
     C: Context<Type = ArrayType, Value = V>,
     V: Value<Type = ArrayType> + ConvertElementType + Add,
-    Apply: Fn(&V, &V) -> Result<V, DifferentiationError>,
+    ApplyFn: Fn(&V, &V) -> Result<V, DifferentiationError>,
 {
     let tangent_type = primal.r#type().tangent()?;
+
     let convert_to_tangent_type = |value: &V| {
         if value.r#type().data_type() == tangent_type.data_type() {
             Ok(value.clone())
@@ -2311,30 +2308,37 @@ where
             value.convert_element_type(tangent_type.data_type()).map_err(DifferentiationError::from)
         }
     };
+
     let apply_tangent = |lhs: &V, rhs: &V| {
         if lhs.r#type().data_type() == rhs.r#type().data_type() {
-            apply(lhs, rhs)
+            apply_fn(lhs, rhs)
         } else {
-            apply(&convert_to_tangent_type(lhs)?, &convert_to_tangent_type(rhs)?)
+            apply_fn(&convert_to_tangent_type(lhs)?, &convert_to_tangent_type(rhs)?)
         }
     };
+
     let lhs_term = lhs
         .tangent()
         .as_value()
         .map(|tangent| apply_tangent(tangent, &context.primal_to_tangent(rhs.primal().clone())?))
         .transpose()?;
+
     let rhs_term = rhs
         .tangent()
         .as_value()
         .map(|tangent| apply_tangent(&context.primal_to_tangent(lhs.primal().clone())?, tangent))
         .transpose()?;
+
     let tangent = match (lhs_term, rhs_term) {
         (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
         (Some(term), None) | (None, Some(term)) => MaybeZero::Value(term),
         (None, None) => MaybeZero::Zero(tangent_type),
     };
+
     DifferentiationDual::new(primal, tangent)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
