@@ -1,9 +1,11 @@
 use proc_macro::TokenStream;
 
+mod capabilities;
 mod helpers;
 mod operations;
 mod parameters;
 
+use capabilities::CapabilityCodeGenerator;
 use operations::OperationCodeGenerator;
 use parameters::ParameterizedCodeGenerator;
 
@@ -64,4 +66,25 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Operation, attributes(ryft))]
 pub fn derive_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_operation_impl(input)
+}
+
+/// Validates the conventions of the capability trait this attribute is applied on and, for every
+/// `projection(Family => Member)` argument, generates the implementation through which the values
+/// of the `Family` universe apply the capability by projecting onto their `Member` values.
+///
+/// The attribute supports the following optional arguments:
+///
+/// ```text
+/// #[capability(crate = "...")]                 // Path through which generated code names `ryft` (by default, `ryft`).
+/// #[capability(projection(Family => Member))]  // Implements the capability for `Family` values (may be repeated).
+/// ```
+///
+/// For example, `#[capability(projection(ArrayIrType => ArrayType))]` implements a capability for array IR values by
+/// projecting them onto their array members. The annotated trait is always emitted unchanged, including when the
+/// attribute reports errors. Refer to the documentation of the `Capability` trait in `ryft-core` for the canonical
+/// reference of this attribute, which covers the checked conventions, the generated projection implementations, and
+/// the supported function signatures.
+#[proc_macro_attribute]
+pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
+    CapabilityCodeGenerator::generate_capability_impl(attributes.into(), input.into()).into()
 }
