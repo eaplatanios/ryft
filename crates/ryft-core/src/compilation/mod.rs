@@ -3,9 +3,9 @@
 //! This module supplies the common JIT lifecycle shared by compiler backends. Core traces typed Ryft programs, manages
 //! runtime captures and structured signatures, coordinates specialization and executable caches, and validates calls.
 //! A backend supplies target-specific options, lowering, executable compilation, and execution through
-//! [`CompilationDomain`]. Backends opt into exact cache identity and serialization through
-//! [`CompilationCacheDomain`]. Backend representations therefore remain outside `ryft-core` while every backend
-//! follows the same lifecycle.
+//! [`CompilationDomain`]s. Backends opt into exact cache identity and serialization through
+//! [`CompilationCacheDomain`]s. Backend representations therefore remain outside `ryft-core`
+//! while every backend follows the same lifecycle.
 //!
 //! # Retained JIT Lifecycle
 //!
@@ -31,20 +31,20 @@
 //!
 //! # Entry Points
 //!
-//! - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [`CompiledFunctionDispatcher`] specializes on explicit
-//!   static host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key.
-//!   Its first call for a specialization traces, lowers, and requests compilation; warm calls dispatch directly to
-//!   the retained executable.
-//! - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
-//!   [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed. Then
-//!   continue with [`CompilationDomain::lower`] and [`CompilationDomain::compile`].
-//! - Domains with transactional external state implement [`StatefulCompilationDomain`]. Invoke their executable
-//!   handles through [`call_function_statefully`] or [`call_function_statefully_async`]; retained dispatchers expose
-//!   the same capability through [`CompiledFunctionDispatcher::call_statefully`] and
-//!   [`CompiledFunctionDispatcher::call_statefully_async`].
+//!   - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [1CompiledFunctionDispatcher`] specializes on
+//!     explicit static host parameters, the dynamic input's parameter structure, and the domain's runtime-derived
+//!     dispatch key. Its first call for a specialization traces, lowers, and requests compilation; warm calls dispatch
+//!     directly to the retained executable.
+//!   - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it
+//!     to [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed.
+//!     Then continue with [`CompilationDomain::lower`] and [`CompilationDomain::compile`].
+//!   - Domains with transactional external state implement [`StatefulCompilationDomain`]. Invoke their executable
+//!     handles through [`call_function_statefully`] or [`call_function_statefully_async`]; retained dispatchers expose
+//!     the same capability through [`CompiledFunctionDispatcher::call_statefully`] and
+//!     [`CompiledFunctionDispatcher::call_statefully_async`].
 //!
-//! Backend-facing crates normally wrap these generic entry points with value- and option-specific APIs. New
-//! backend-neutral code can call them directly.
+//! Backend-facing crates normally wrap these generic entry points with value- and option-specific APIs.
+//! New backend-neutral code can call them directly.
 //!
 //! # Transactional External State
 //!
@@ -66,49 +66,49 @@
 //!
 //! # Lifecycle Handles
 //!
-//! 1. [`StagedFunction`] owns a typed [`ClosedProgram`](crate::captures::ClosedProgram), concrete runtime captures,
-//!    public input and output signatures, output structure, and compilation options. It contains no backend lowering
-//!    or executable, and its [`StagedFunction::call`] method stages a nested call into an active context rather than
-//!    executing at runtime.
-//! 2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
-//!    options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
-//! 3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
-//!    transformations. Pure runtime execution uses [`CompilationDomain::call`]; transactional external state uses
-//!    [`StatefulCompilationDomain::call_statefully_async`].
-//! 4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
-//!    [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed. This runtime-only
-//!    handle gains `Send` and `Sync` structurally whenever its backend fields do.
+//!   1. [`StagedFunction`] owns a typed [`ClosedProgram`](crate::ClosedProgram), concrete runtime captures, public
+//!      input and output signatures, output structure, and compilation options. It contains no backend lowering or
+//!      executable, and its [`StagedFunction::call`] method stages a nested call into an active context rather than
+//!      executing at runtime.
+//!   2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
+//!      options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
+//!   3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
+//!      transformations. Pure runtime execution uses [`CompilationDomain::call`]; transactional external state uses
+//!      [`StatefulCompilationDomain::call_statefully_async`].
+//!   4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
+//!      [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed. This runtime-only
+//!      handle gains [`Send`] and [`Sync`] structurally whenever its backend fields do.
 //!
 //! # Captures and Nested Calls
 //!
-//! Runtime values closed over by a traced closure are not embedded as literal data. A
-//! [`ClosedProgram`](crate::captures::ClosedProgram) keeps them in a side table while the source IR stores typed
-//! [`CaptureReference`](crate::captures::CaptureReference) indices. Before lowering, captures are lifted
-//! as leading flat inputs, and execution supplies arguments in the same `[captures..., public inputs...]` order. This
-//! keeps IR compact, preserves device-resident buffers, and lets compilation depend on capture types rather than
-//! data.
+//! Runtime values closed over by a traced closure are not embedded as literal data.
+//! A [`ClosedProgram`](crate::ClosedProgram) keeps them in a side table while the source IR stores typed
+//! [`CaptureReference`](crate::CaptureReference) indices. Before lowering, captures are lifted as leading flat inputs,
+//! and execution supplies arguments in the same `[captures..., public inputs...]` order. This keeps IR compact,
+//! preserves device-resident buffers, and lets compilation depend on capture types rather than data.
 //!
-//! [`CapturingContext`](crate::captures::CapturingContext) lets ordinary and transform contexts register captures
-//! through their parent. To embed a staged function in a larger trace, an operation family implements
-//! [`CompiledCallOperation`], and that operation then owns how the nested call behaves under lowering, batching,
-//! differentiation, partial evaluation, and interpretation.
+//! [`CapturingContext`](crate::CapturingContext) lets ordinary and transform contexts register captures through their
+//! parent. To embed a staged function in a larger trace, an operation family implements [`CompiledCallOperation`], and
+//! that operation then owns how the nested call behaves under lowering, batching, differentiation, partial evaluation,
+//! and interpretation.
 //!
 //! # Specialization and Caching
 //!
 //! [`CompiledFunctionDispatcher`] keeps one bounded LRU cache of compiled specializations, built on the general
-//! [`SpecializationCache`](crate::specialization::SpecializationCache) primitive and keyed by the static parameters,
-//! the input parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained
-//! executable, while a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
-//! resulting executable. Tracing and lowering are cheap relative to backend compilation, so there are no intermediate
-//! tracing or lowering caches. After an eviction or failure, the miss path simply reruns those stages, and the shared
+//! [`SpecializationCache`](crate::SpecializationCache) primitive and keyed by the static parameters, the input
+//! parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained executable, while a
+//! miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the resulting executable.
+//! Tracing and lowering are cheap relative to backend compilation, so there are no intermediate tracing or lowering
+//! caches. After an eviction or failure, the miss path simply reruns those stages, and the shared
 //! [`CompilationContext`] below still deduplicates the expensive backend compilation.
 //!
-//! That argument does not carry over to eager (op-by-op) dispatch, where a compiled program is reused for every
-//! application of the same operation and the relevant comparison is with _executing_ one small operation rather than
-//! with compiling it. Backends that execute eager operations through compiled programs therefore key applications of
-//! operations directly to compiled programs in front of tracing and lowering, using the operation's identity (refer to
-//! the `#[ryft(dispatch(identity))]` attribute of `#[derive(Operation)]`) together with the input types, like JAX's
-//! `(primitive, params)` dispatch cache. For example, the XLA backend keeps such a cache in each of its sessions.
+//! That argument does not carry over to eager (i.e., operation-by-operation) dispatch, where a compiled program is
+//! reused for every application of the same operation and the relevant comparison is with _executing_ one small
+//! operation rather than with compiling it. Backends that execute eager operations through compiled programs therefore
+//! key applications of operations directly to compiled programs in front of tracing and lowering, using the operation's
+//! identity (refer to the `#[ryft(dispatch(identity))]` attribute of `#[derive(Operation)]`) together with the input
+//! types, like JAX's `(primitive, params)` dispatch cache. For example, the XLA backend keeps such a cache in each of
+//! its sessions.
 //!
 //! Cloned [`CompiledFunctionDispatcher`] handles share one cache, and the dispatcher is usable from multiple threads
 //! whenever its domain, closure, static parameters, and artifact types are thread-safe. Recursive dispatch on one
@@ -116,63 +116,47 @@
 //! different threads deliberately duplicate the cheap frontend work with idempotent inserts and leave the coordination
 //! of backend compilation to the shared context.
 //!
-//! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle,
-//! and it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight
-//! coordination, optional persistent storage, optional distributed exchange, and finally backend compilation. Refer
-//! to [`CompilationContext`] for the rendered tier diagram.
+//! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle, and
+//! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight coordination,
+//! optional persistent storage, optional distributed exchange, and finally backend compilation. Refer to
+//! [`CompilationContext`] for the rendered tier diagram.
 //!
 //! Misses for the same key are single flight, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
-//! among processes according to [`CompilationArtifactExchangePolicy`]. [`JitCacheStatistics`] reports frontend
-//! dispatch activity, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report the activity of
-//! the shared context across the memory, persistent, exchange, and backend compilation tiers.
+//! among processes according to [`CompilationArtifactExchangePolicy`]. [`JitCacheStatistics`] reports frontend dispatch
+//! activity, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report the activity of the
+//! shared context across the memory, persistent, exchange, and backend compilation tiers.
 //!
 //! # Extending Compilation
 //!
-//! Implement [`CompilationDomain`] after defining the backend's [`Domain`](crate::contexts::Domain). The required
-//! contract supplies backend-owned lowered and compiled program types, options, an error, lowering, compilation,
-//! output signatures, and flat execution. Lowering must fold every compile-relevant option, compiler, target, and
-//! topology property into the lowered artifact, which keeps that artifact self-describing for caching and
-//! persistence.
+//! Implement [`CompilationDomain`] after defining the backend's [`Domain`](crate::Domain). The required contract
+//! supplies backend-owned lowered and compiled program types, options, an error, lowering, compilation, output
+//! signatures, and flat execution. Lowering must fold every compile-relevant option, compiler, target, and topology
+//! property into the lowered artifact, which keeps that artifact self-describing for caching and persistence.
 //!
-//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity
-//! from the lowered program alone, and key equality must mean that compiled artifacts are interchangeable. Optional
-//! hooks add persistent keying and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or
-//! memory analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when
-//! staged functions must compose inside other traces.
+//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity from
+//! the lowered program alone, and key equality must mean that compiled artifacts are interchangeable. Optional hooks
+//! add persistent keying and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or memory
+//! analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when staged
+//! functions must compose inside other traces.
 //!
 //! The generic [`CompilationDomain`] methods use [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
-//! [`CallRequest`] as typed backend extension witnesses. These traits keep the structured input and output bounds in
-//! one place and expose only the artifact operations that a backend needs for each transition. Ordinary callers
+//! [`CallRequest`] as typed backend extension witnesses. These traits keep the structured input and output bounds
+//! in one place and expose only the artifact operations that a backend needs for each transition. Ordinary callers
 //! construct a [`CompilationStagingRequest`] or use [`stage_function`], while backend implementations name the witness
 //! traits in their bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or
 //! `reconstruct` functions.
-//!
-//! # Reading Order
-//!
-//! 1. Start with [`CompilationDomain`] for the core/backend ownership boundary.
-//! 2. Read [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and [`CallRequest`] alongside
-//!    [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`] for the typed
-//!    lifecycle.
-//! 3. Read [`ClosedProgram`](crate::captures::ClosedProgram) and
-//!    [`CaptureReference`](crate::captures::CaptureReference) in [`crate::captures`] for capture handling.
-//! 4. Read [`CompilationContext`] for single-flight compilation and cache tiers.
-//! 5. Read [`DiskCache`] and [`CompilationArtifactExchange`] only when adding persistence or distributed sharing.
-//! 6. Continue with a backend crate such as `ryft-xla` for a concrete [`CompilationDomain`] implementation.
 
-// TODO(eaplatanios): Review this module.
-
+pub mod caching;
 pub mod contexts;
-pub mod disk_cache;
 pub mod exchange;
 pub mod function;
 
-pub use contexts::{
-    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome,
-    CompilationCacheStatistics, CompilationContext, CompilationDomain, CompilationEvent, CompilationMissReason,
-    StatefulCompilationDomain,
+pub use caching::{
+    CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
+    CompilationMissReason, DiskCache,
 };
-pub use disk_cache::DiskCache;
+pub use contexts::{AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, StatefulCompilationDomain};
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,

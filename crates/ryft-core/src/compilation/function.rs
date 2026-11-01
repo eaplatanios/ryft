@@ -18,7 +18,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
-use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain, accumulate_duration};
+use crate::compilation::caching::accumulate_duration;
+use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
@@ -1211,7 +1212,7 @@ where
 /// structurally from those field types. Recursive dispatch on one thread of the specialization currently being
 /// produced is rejected with an error. Concurrent cold misses for one specialization on different threads instead
 /// deliberately duplicate the frontend work, because tracing and lowering are cheap and inserts are idempotent, while
-/// the shared [`CompilationContext`](super::contexts::CompilationContext) of the domain still coordinates the expensive
+/// the shared [`CompilationContext`](super::caching::CompilationContext) of the domain still coordinates the expensive
 /// backend compilation.
 ///
 /// # Retained JIT Lifecycle
@@ -1906,7 +1907,8 @@ mod tests {
         DimensionError, DimensionType, DimensionValue, Shape,
     };
     use crate::captures::CaptureReference;
-    use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
+    use crate::compilation::caching::CompilationContext;
+    use crate::compilation::contexts::CompilationCacheDomain;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
