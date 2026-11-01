@@ -94,13 +94,63 @@ pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 // TODO(eaplatanios): Review this.
-/// Defines an experimental portable kernel using canonical `Array` signature annotations.
+/// Defines an experimental portable kernel from the function that it is applied on, whose parameters are annotated
+/// arrays and whose body uses a subset of Rust that is lowered into staged operations, so that no host Rust code runs
+/// while the kernel is traced.
 ///
-/// The current subset supports whole-array and padded tiled access, shape requirements, local arithmetic,
-/// zero tiles, matrix multiplication, and `.sum([axes])` reductions with literal axes. It produces a functional
-/// callable and a same-name module exposing `definition`. Bounded range loops and value-dependent conditionals stage
-/// canonical control-flow regions.
-/// Unbounded control flow and arbitrary host calls are rejected instead of executing as host Rust.
+/// The attribute replaces the function `name` with a callable of the same name and a module `name` that contains a
+/// `definition` function. The callable takes the kernel inputs as `&V` for any `V: KernelCall` (e.g., concrete
+/// `Array`s, which are interpreted, or projected staged values, which bind the kernel call into their context) and
+/// returns the kernel output. The `definition` function takes the `ArrayType` of each input, validates them against
+/// the input annotations and the `requires` constraint, and returns the `KernelDefinition` that the body traces into,
+/// which can be inspected, verified, and compiled independently of the callable.
+///
+/// ```rust,ignore
+/// #[ryft::kernel(requires = left.shape()[0] == right.shape()[0])]
+/// fn add(
+///     #[input(data_type = F32, rank = 1)] left: &Array,
+///     #[input(data_type = F32, rank = 1)] right: &Array,
+///     #[output(data_type = F32, shape = [left.shape()[0]])] output: &mut Array,
+/// ) {
+///     output.store(left.load() + right.load());
+/// }
+/// ```
+///
+/// # Signatures
+///
+/// Kernel functions must be safe, synchronous, and non-generic, and they return nothing. Each parameter is either a
+/// `&Array` input annotated with `#[input(data_type = D, rank = R)]` or the single `&mut Array` output annotated with
+/// `#[output(data_type = D, shape = S)]`, where `D` is a `DataType` variant (e.g., `F32`), `R` is an integer literal,
+/// and `S` is shape metadata. An output annotation may also tile the output with `tile = T` and `boundary = B`, where
+/// `T` is the shape metadata of each tile and `B` is either `masked` (i.e., tiles may extend past the output and only
+/// their in-bounds elements are written) or `in_bounds`. The body of a tiled kernel runs once per output tile on a
+/// parallel grid, and its stores write the tile of the current program.
+///
+/// Shape metadata (i.e., the `shape` and `tile` annotations, the `requires` constraint, loop bounds, tile view shapes,
+/// and `zeros` shapes) consists of integer literals, arrays, input extents written as `input.shape()[axis]` with a
+/// literal axis below the rank of the input, `extent.div_ceil(divisor)`, comparisons, and `&&` and `||`. It is
+/// evaluated from the input types when the definition is built.
+///
+/// # Bodies
+///
+/// Kernel bodies support the following statements and expressions:
+///
+///   - `let` bindings, which may be mutable but cannot shadow other bindings, and assignments, including `+=`, `-=`,
+///     `*=`, and `/=`,
+///   - `reference.load()`, `output.store(value)`, `left.dot(right)`, and `value.sum([axes])` with literal axes,
+///   - `+`, `-`, `*`, and `/` over staged values and scalar literals, and `zeros::<T>(shape)`,
+///   - `for index in start..end` loops over shape metadata bounds, which stage `while` loops with signed 64-bit scalar
+///     indices, and `if` statements over staged boolean predicates, which stage conditions, where both carry the
+///     bindings that their bodies reassign,
+///   - `let [row, column] = output.tile_index();` in tiled kernels and outside loops and conditions, which binds the
+///     coordinates of the current output tile, and
+///   - tile views declared as `let tiles = input.tiles(shape).pad(literal);` and loaded with `tiles.load([indices])`,
+///     where the indices count tiles and the out-of-bounds elements of the loaded tiles take the value of the literal.
+///
+/// Unsuffixed literals take the default Rust types (i.e., `i32` and `f64`), so arithmetic with arrays of other data
+/// types requires suffixed literals (e.g., `2.0f32`). Anything else, including attributes, macros, closures, and
+/// unbounded loops, is rejected with a diagnostic at the offending tokens. A kernel with errors expands to its first
+/// error only.
 ///
 /// # Kernel namespace
 ///
@@ -118,10 +168,11 @@ pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// ```
 ///
 /// The macro cannot infer the namespace from the attribute path because a re-exported procedural attribute cannot see
-/// the path through which it was invoked. The path always names the kernel namespace; a stale override that names the
-/// core crate (e.g., `crate = "ryft_core"`) is not diagnosed by the macro and instead fails with unresolved-path errors
-/// inside the generated code (the first one being that `__private` cannot be found in `ryft_core`). The attribute
-/// also accepts `requires = expression`, a shape requirement over the input annotations that `definition` validates.
+/// the path through which it was invoked. Relative namespace paths resolve in the module that contains the kernel
+/// function, like the other paths in the kernel (e.g., the element type in `zeros::<T>`). The path always names the
+/// kernel namespace. A stale override that names the core crate (e.g., `crate = "ryft_core"`) is not diagnosed by the
+/// macro and instead fails with unresolved-path errors inside the generated code, the first of which is that
+/// `__private` cannot be found in `ryft_core`.
 #[proc_macro_attribute]
 pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
     KernelCodeGenerator::generate_kernel_impl(attributes.into(), input.into()).into()

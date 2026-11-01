@@ -1,0 +1,37 @@
+error: unsupported kernel expression; control flow requires staged lowering and cannot execute as host Rust
+ --> tests/kernels/error_bodies.rs:5:5
+  |
+5 | /     loop {
+6 | |         output.store(0.0f32);
+7 | |     }
+  | |_____^
+
+error: kernel body attributes are unsupported
+  --> tests/kernels/error_bodies.rs:12:5
+   |
+12 |     #[cfg(any())]
+   |     ^^^^^^^^^^^^^
+
+error: kernel locals cannot shadow an existing binding
+  --> tests/kernels/error_bodies.rs:21:9
+   |
+21 |     let input = input.load();
+   |         ^^^^^
+
+error: kernel reduction axes require integer literals
+  --> tests/kernels/error_bodies.rs:30:36
+   |
+30 |     output.store(input.load().sum([input.shape()[0]]));
+   |                                    ^^^^^^^^^^^^^^^^
+
+error: unsupported kernel helper call
+  --> tests/kernels/error_bodies.rs:35:18
+   |
+35 |     output.store(helpers::zeros::<f32>([2]));
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: tile coordinates require a tiled output
+  --> tests/kernels/error_bodies.rs:40:19
+   |
+40 |     let [block] = output.tile_index();
+   |                   ^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,35 @@
+error: unsupported `kernel` argument (expected `crate = "..."` or `requires = ...`)
+ --> tests/kernels/error_signatures.rs:3:34
+  |
+3 | #[kernel(crate = "ryft_kernels", grid = [1])]
+  |                                  ^^^^
+
+error: kernel functions must be safe, synchronous, non-generic, and return through output parameters
+ --> tests/kernels/error_signatures.rs:7:1
+  |
+7 | fn escaping_reference(#[output(data_type = F32, shape = [])] output: &mut Array) -> &mut Array {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: kernel parameters must use the canonical non-generic `Array`
+  --> tests/kernels/error_signatures.rs:12:70
+   |
+12 | fn generic_array(#[output(data_type = F32, shape = [])] output: &mut Array<f32>) {}
+   |                                                                      ^^^^^^^^^^
+
+error: each kernel parameter requires exactly one `input` or `output` annotation
+  --> tests/kernels/error_signatures.rs:15:16
+   |
+15 | fn unannotated(input: &Array, #[output(data_type = F32, shape = [])] output: &mut Array) {}
+   |                ^^^^^^^^^^^^^
+
+error: kernel inputs must use `&Array` and kernel outputs must use `&mut Array`
+  --> tests/kernels/error_signatures.rs:19:48
+   |
+19 |     #[input(data_type = F32, rank = 1)] input: &mut Array,
+   |                                                ^^^^^^^^^^
+
+error: kernels require one `output` parameter
+  --> tests/kernels/error_signatures.rs:25:1
+   |
+25 | fn missing_output(#[input(data_type = F32, rank = 1)] input: &Array) {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

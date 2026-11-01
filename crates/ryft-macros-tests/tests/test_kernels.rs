@@ -104,8 +104,6 @@ fn conditional_accumulate(
 mod relative {
     use kernels_alias as kernels;
 
-    use super::Array;
-
     type Element = f32;
 
     /// Constructs a vector of zeros with the element type `Element`.
