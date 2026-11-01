@@ -2266,8 +2266,7 @@ pub struct XlaOptions {
     /// Optional host-side bound bucketing policy for retained-JIT input signatures.
     pub input_bound_bucketing: Option<XlaInputBoundBucketing>,
 
-    /// Backend representation used to lower grouped generalized dots. Defaults to
-    /// [`RaggedDotLoweringStrategy::Decomposition`].
+    /// Backend representation used to lower ragged dots. Defaults to [`RaggedDotLoweringStrategy::Decomposition`].
     pub ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 }
 
@@ -2353,7 +2352,7 @@ impl XlaOptions {
         self
     }
 
-    /// Selects the backend representation used to lower grouped generalized dots.
+    /// Selects the backend representation used to lower ragged dots.
     #[inline]
     pub fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         self.ragged_dot_lowering_strategy = strategy;

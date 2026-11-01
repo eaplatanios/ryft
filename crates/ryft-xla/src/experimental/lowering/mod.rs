@@ -840,7 +840,7 @@ pub(crate) struct CollectiveLoweringState {
     /// fall back to their portable form when it is absent.
     target_platform: Option<Rc<str>>,
 
-    /// Backend representation used to lower grouped generalized dots in this module.
+    /// Backend representation used to lower ragged dots in this module.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
     /// Module-owned private decompositions used by named StableHLO composites.

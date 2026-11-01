@@ -800,7 +800,7 @@ impl Display for RaggedDotMode {
     }
 }
 
-/// Dimension numbers of a grouped generalized dot operation (i.e., a [`RaggedDotOperation`]). They extend the ordinary
+/// Dimension numbers of a ragged dot operation (i.e., a [`RaggedDotOperation`]). They extend the ordinary
 /// [`DotDimensionNumbers`], which describe the contracting and batching axes, with the axes that carry the groups.
 ///
 ///   - The left-hand side ragged dimension is the single left-hand side axis that the group sizes input partitions
@@ -832,7 +832,7 @@ pub struct RaggedDotDimensionNumbers {
 }
 
 impl RaggedDotDimensionNumbers {
-    /// Creates a grouped dot dimension number specification.
+    /// Creates a ragged dot dimension number specification.
     #[inline]
     pub fn new(
         dot_dimensions: DotDimensionNumbers,
@@ -1001,12 +1001,12 @@ impl RaggedDotDimensionNumbers {
         Ok(mode)
     }
 
-    /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
+    /// Returns the ragged dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
     /// cotangent `ā` of its linear left-hand side `a`, together with the axes of `a` in the order in which that adjoint
-    /// grouped dot emits them. This specification must be a valid non-contracting specification for a left-hand side
+    /// ragged dot emits them. This specification must be a valid non-contracting specification for a left-hand side
     /// with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint computes `ā` as a non-contracting grouped dot of `ȳ` with `b`, whose ragged dimension is the ragged
+    /// The adjoint computes `ā` as a non-contracting ragged dot of `ȳ` with `b`, whose ragged dimension is the ragged
     /// output dimension. It emits the batching axes, the left-hand side result axes, and then the left-hand side
     /// contracting axes sorted by their paired right-hand side axes. Callers must restore the original axis order of
     /// `a` with the inverse permutation.
@@ -1049,12 +1049,12 @@ impl RaggedDotDimensionNumbers {
         (dimensions, output_axes)
     }
 
-    /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to
+    /// Returns the ragged dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to
     /// the cotangent `b̄` of its linear right-hand side `b`, together with the axes of `b` in the order in which that
-    /// adjoint grouped dot emits them. This specification must be a valid non-contracting specification for a
+    /// adjoint ragged dot emits them. This specification must be a valid non-contracting specification for a
     /// left-hand side with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
-    /// The adjoint computes `b̄` as a contracting grouped dot of `a` with `ȳ` over the ragged dimension, so it emits
+    /// The adjoint computes `b̄` as a contracting ragged dot of `a` with `ȳ` over the ragged dimension, so it emits
     /// the group axis, the batching axes, the right-hand side contracting axes sorted by their paired left-hand side
     /// axes, and then the right-hand side result axes. Callers must restore the original axis order of `b` with the
     /// inverse permutation.
@@ -1118,8 +1118,9 @@ impl Display for RaggedDotDimensionNumbers {
 /// Canonical operation name for [`RaggedDotOperation`].
 pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 
-/// Operation type representing a grouped generalized dot product with explicit group sizes. Exactly one left-hand side
-/// dimension is _ragged_. Its role selects one of three modes:
+/// Operation type representing a ragged dot product with explicit group sizes, which is also known as a grouped matrix
+/// multiplication (or grouped GEMM) in mixture-of-experts models. Exactly one left-hand side dimension is _ragged_. Its
+/// role selects one of three modes:
 ///
 ///   - A non-contracting ragged dimension is partitioned into consecutive groups. The corresponding right-hand side
 ///     group dimension selects one right-hand side slice per group, and the grouped products are written back along the
@@ -1131,7 +1132,7 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 ///     but its values do not affect the result.
 ///
 /// `group_sizes` is either a rank-one `[group_count]` array shared by every prefix or an array whose trailing axis is
-/// `group_count` and whose prefix matches the dimensions preceding the ragged position in the grouped dot iteration
+/// `group_count` and whose prefix matches the dimensions preceding the ragged position in the ragged dot iteration
 /// space.
 ///
 /// In non-contracting and contracting modes every size must be non-negative. The eager interpreter rejects negative
@@ -1149,7 +1150,7 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// The operation is linear in either data input separately, while the group sizes are nondifferentiable metadata.
 /// For `y = ragged_dot(a, b, g)` with group sizes `g`, forward mode differentiation therefore computes
 /// `ẏ = ragged_dot(ȧ, b, g) + ragged_dot(a, ḃ, g)`. Transposition is defined only in non-contracting mode, and it
-/// computes `ā` or `b̄` from the output cotangent `ȳ` with another grouped dot followed by the inverse permutation of
+/// computes `ā` or `b̄` from the output cotangent `ȳ` with another ragged dot followed by the inverse permutation of
 /// its output axes.
 ///
 /// Batching accepts any mix of replicated and mapped inputs with mapped axes at any position. It materializes a
@@ -1160,7 +1161,7 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// mapped over axis zero, this also covers replicated inputs and non-leading mapped axes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotOperation {
-    /// Grouped dot dimension number specification.
+    /// Ragged dot dimension number specification.
     dimensions: RaggedDotDimensionNumbers,
 }
 
@@ -1415,8 +1416,8 @@ impl_differentiable_operation! {
         C::Value: ConvertElementType + RaggedDot + Add,
     {
         |operation, context, _driver, inputs| {
-            // A grouped dot is linear in either data input separately. Group sizes are integer metadata and therefore
-            // carry no tangent. The two product rule terms reuse the same grouped dot dimensions.
+            // A ragged dot is linear in either data input separately. Group sizes are integer metadata and therefore
+            // carry no tangent. The two product rule terms reuse the same ragged dot dimensions.
             check_count!("input", inputs, 3, ProgramError);
             let lhs = &inputs[0];
             let rhs = &inputs[1];
@@ -1438,8 +1439,8 @@ impl_differentiable_operation! {
         O: From<ConvertElementTypeOperation<ArrayType>> + From<RaggedDotOperation> + From<TransposeOperation>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Grouped dot transposition is defined only for the non-contracting mode. Each data input adjoint is
-            // another grouped dot followed by the inverse permutation of the axis order that its adjoint dimension
+            // Ragged dot transposition is defined only for the non-contracting mode. Each data input adjoint is
+            // another ragged dot followed by the inverse permutation of the axis order that its adjoint dimension
             // numbers produce.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
@@ -1525,7 +1526,7 @@ impl_differentiable_operation! {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Value-level grouped generalized dot capability.
+/// Value-level ragged dot capability.
 ///
 /// [`RaggedDot`] is the receiver-style entry point for staging or executing [`RaggedDotOperation`], which contracts
 /// two data inputs group by group according to explicit integer `group_sizes`.
@@ -1534,9 +1535,9 @@ impl_differentiable_operation! {
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait RaggedDot<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Computes a grouped generalized dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three
-    /// modes, the metadata shapes, the clipping of cumulative intervals, and the semantics of empty groups and
-    /// uncovered positions.
+    /// Computes a ragged dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three modes, the
+    /// metadata shapes, the clipping of cumulative intervals, and the semantics of empty groups and uncovered
+    /// positions.
     fn ragged_dot_general(
         &self,
         rhs: &Self,
@@ -1568,7 +1569,7 @@ impl RaggedDot for Array {
     }
 }
 
-// Values that carry a context stage a grouped dot through that context. The `ValueDomainDispatch` marker keeps this
+// Values that carry a context stage a ragged dot through that context. The `ValueDomainDispatch` marker keeps this
 // implementation disjoint from eager values, which implement the capability directly.
 impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
     RaggedDot<ArrayType> for V
@@ -1946,7 +1947,7 @@ fn check_common_mapped_dimension<V: Value<Type = ArrayType>>(
 
 /// Applies the product rule `ẏ = f(ȧ, b) + f(a, ḃ)` of a bilinear dot operation `y = f(a, b)`, where `apply` evaluates
 /// `f`. Structural zero tangents drop their term, so `ẏ` is a structural zero only when both `ȧ` and `ḃ` are. Dense
-/// and grouped dot operations share this rule.
+/// and ragged dot operations share this rule.
 ///
 /// When one factor of a tangent term uses the widened tangent representation, both factors are converted to the output
 /// tangent element type before applying the operation.
@@ -2090,10 +2091,10 @@ impl Array {
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 
-    /// Evaluates a grouped generalized dot over the exact physical extents. Each concrete group's raw cumulative
-    /// interval is clipped to the physical ragged extent, the resulting pair of left-hand side and right-hand side
-    /// slices is contracted by the ordinary generalized dot kernel, and the result is written into its output window.
-    /// This keeps temporary storage proportional to one group rather than to a whole input times the group count.
+    /// Evaluates a ragged dot over the exact physical extents. Each concrete group's raw cumulative interval is clipped
+    /// to the physical ragged extent, the resulting pair of left-hand side and right-hand side slices is contracted by
+    /// the ordinary generalized dot kernel, and the result is written into its output window. This keeps temporary
+    /// storage proportional to one group rather than to a whole input times the group count.
     fn ragged_dot_elements<T: NumericArrayElement>(
         &self,
         rhs: &Self,
@@ -4609,7 +4610,7 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_dimension_numbers_lhs_cotangent_dimensions() {
-        // The adjoint is another non-contracting grouped dot whose ragged dimension is the ragged output dimension.
+        // The adjoint is another non-contracting ragged dot whose ragged dimension is the ragged output dimension.
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().lhs_cotangent_dimensions(2, 3),
             (
@@ -4621,7 +4622,7 @@ mod tests {
 
     #[test]
     fn test_ragged_dot_dimension_numbers_rhs_cotangent_dimensions() {
-        // The adjoint is a contracting grouped dot, so it emits the group axis first.
+        // The adjoint is a contracting ragged dot, so it emits the group axis first.
         assert_eq!(
             RaggedDotDimensionNumbers::matmul().rhs_cotangent_dimensions(2, 3),
             (
@@ -5875,7 +5876,7 @@ mod tests {
     fn test_ragged_dot_array_ir() {
         type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // Array IR tracers stage the homogeneous grouped dot as an array member instruction.
+        // Array IR tracers stage the homogeneous ragged dot as an array member instruction.
         let (_, program) = ArrayIrContext::trace(
             |inputs: Vec<Tracer<ArrayIrContext>>| inputs[0].ragged_dot(&inputs[1], &inputs[2]),
             vec![

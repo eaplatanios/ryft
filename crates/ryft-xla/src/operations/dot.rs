@@ -17,11 +17,11 @@ use crate::experimental::lowering::types::{
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
-/// XLA representation used when lowering grouped generalized dots. Selection is compilation-wide through
+/// XLA representation used when lowering ragged dots. Selection is compilation-wide through
 /// [`XlaOptions::with_ragged_dot_lowering_strategy`](crate::XlaOptions::with_ragged_dot_lowering_strategy).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RaggedDotLoweringStrategy {
-    /// Expand grouped dots into masking plus ordinary dense generalized dots. This is the default used by
+    /// Expand ragged dots into masking plus ordinary dense generalized dots. This is the default used by
     /// [`XlaOptions::new`](crate::XlaOptions::new).
     #[default]
     Decomposition,
@@ -302,7 +302,7 @@ fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
 }
 
 impl LowerableOperation for RaggedDotOperation {
-    // Lower grouped dot either to its portable masked-dense decomposition or to the opt-in CHLO instruction.
+    // Lower a ragged dot either to its portable masked-dense decomposition or to the opt-in CHLO instruction.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
