@@ -257,21 +257,22 @@ impl XlaTransformResult {
 }
 
 /// Safe Rust interface for XLA HLO module transforms registered through the PJRT [`XlaTransformExtension`].
-/// Implementations receive the serialized `HloModuleProto` bytes and either return [`XlaTransformResult::Unchanged`]
-/// or replacement serialized `HloModuleProto` bytes. The implementation may be invoked by backend-owned compilation
-/// threads, so the transform is stored behind a mutex and must be [`Send`].
+/// Implementations receive serialized `HloModuleProto` bytes and optional compilation configuration bytes, and either
+/// return [`XlaTransformResult::Unchanged`] or replacement serialized `HloModuleProto` bytes. The implementation may be
+/// invoked by backend-owned compilation threads, so the transform is stored behind a mutex and must be [`Send`].
 pub trait XlaTransform: Send {
     /// Transforms the provided serialized HLO module.
     ///
     /// # Parameters
     ///
     ///   - `module`: Serialized `HloModuleProto` bytes supplied by XLA.
-    fn transform_module(&mut self, module: &[u8]) -> Result<XlaTransformResult, Error>;
+    ///   - `configuration`: Serialized `HloModuleConfigProto` bytes, when supplied by this PJRT plugin.
+    fn transform_module(&mut self, module: &[u8], configuration: Option<&[u8]>) -> Result<XlaTransformResult, Error>;
 }
 
-impl<F: FnMut(&[u8]) -> Result<XlaTransformResult, Error> + Send> XlaTransform for F {
-    fn transform_module(&mut self, module: &[u8]) -> Result<XlaTransformResult, Error> {
-        self(module)
+impl<F: FnMut(&[u8], Option<&[u8]>) -> Result<XlaTransformResult, Error> + Send> XlaTransform for F {
+    fn transform_module(&mut self, module: &[u8], configuration: Option<&[u8]>) -> Result<XlaTransformResult, Error> {
+        self(module, configuration)
     }
 }
 
@@ -399,7 +400,15 @@ unsafe extern "C" fn xla_transform_callback(
     let callback_state = unsafe { &*callback_state };
     let mut state = callback_state.transform_and_buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let module = unsafe { slice_from_c_api((*args).hlo_module.data as *const u8, (*args).hlo_module.size) };
-    let result = catch_unwind(AssertUnwindSafe(|| state.transform.transform_module(module)))
+    let configuration_offset = std::mem::offset_of!(ffi::PJRT_XlaTransform_Args, hlo_module_config);
+    let configuration =
+        if unsafe { (*args).struct_size } >= configuration_offset + size_of::<ffi::PJRT_XlaTransform_string>() {
+            let configuration = unsafe { (*args).hlo_module_config };
+            Some(unsafe { slice_from_c_api(configuration.data.cast(), configuration.size) })
+        } else {
+            None
+        };
+    let result = catch_unwind(AssertUnwindSafe(|| state.transform.transform_module(module, configuration)))
         .unwrap_or_else(|_| Err(Error::internal("XLA transform callback panicked")));
     match result {
         Ok(XlaTransformResult::Unchanged) => unsafe {
@@ -473,6 +482,7 @@ pub(crate) mod ffi {
         pub hlo_module: PJRT_XlaTransform_string,
         pub transformed_hlo_module: PJRT_XlaTransform_string,
         pub changed: bool,
+        pub hlo_module_config: PJRT_XlaTransform_string,
     }
 
     #[repr(C)]
@@ -602,7 +612,11 @@ mod tests {
     struct NoOpTransform;
 
     impl XlaTransform for NoOpTransform {
-        fn transform_module(&mut self, _module: &[u8]) -> Result<XlaTransformResult, Error> {
+        fn transform_module(
+            &mut self,
+            _module: &[u8],
+            _configuration: Option<&[u8]>,
+        ) -> Result<XlaTransformResult, Error> {
             Ok(XlaTransformResult::Unchanged)
         }
     }
@@ -610,8 +624,9 @@ mod tests {
     #[test]
     fn test_xla_transform_callback() {
         let mut registration = super::XlaTransformCallbackRegistration::new(Box::new(
-            |module: &[u8]| -> Result<XlaTransformResult, Error> {
+            |module: &[u8], configuration: Option<&[u8]>| -> Result<XlaTransformResult, Error> {
                 assert_eq!(module, b"input");
+                assert_eq!(configuration, Some(b"configuration".as_slice()));
                 Ok(XlaTransformResult::changed(b"output".to_vec()))
             },
         ));
@@ -629,6 +644,10 @@ mod tests {
             hlo_module: super::ffi::PJRT_XlaTransform_string { data: input.as_ptr() as *const _, size: input.len() },
             transformed_hlo_module: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
             changed: false,
+            hlo_module_config: super::ffi::PJRT_XlaTransform_string {
+                data: b"configuration".as_ptr().cast(),
+                size: 13,
+            },
         };
         unsafe { super::xla_transform_callback(registration.to_c_api(), &mut args as *mut _) };
         assert!(!args.header.has_error);
@@ -647,8 +666,9 @@ mod tests {
         for index in 0..128 {
             let expected = index as u8;
             registrations.push(super::XlaTransformCallbackRegistration::new(Box::new(
-                move |module: &[u8]| -> Result<XlaTransformResult, Error> {
+                move |module: &[u8], configuration: Option<&[u8]>| -> Result<XlaTransformResult, Error> {
                     assert_eq!(module, &[expected]);
+                    assert_eq!(configuration, None);
                     Ok(XlaTransformResult::changed(vec![expected, expected]))
                 },
             )));
@@ -657,7 +677,7 @@ mod tests {
         for (index, registration) in registrations.iter_mut().enumerate() {
             let input = [index as u8];
             let mut args = super::ffi::PJRT_XlaTransform_Args {
-                struct_size: size_of::<super::ffi::PJRT_XlaTransform_Args>(),
+                struct_size: std::mem::offset_of!(super::ffi::PJRT_XlaTransform_Args, hlo_module_config),
                 header: super::ffi::PJRT_XlaTransform_version_and_error {
                     api_version: super::ffi::PJRT_API_XLA_TRANSFORM_EXTENSION_VERSION as i64,
                     data: std::ptr::null_mut(),
@@ -672,6 +692,7 @@ mod tests {
                 },
                 transformed_hlo_module: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
                 changed: false,
+                hlo_module_config: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
             };
             unsafe { super::xla_transform_callback(registration.to_c_api(), &mut args as *mut _) };
             assert!(!args.header.has_error);
@@ -689,7 +710,7 @@ mod tests {
     fn test_xla_transform_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     if plugin.xla_transform_extension().is_ok() {
                         assert!(
                             plugin

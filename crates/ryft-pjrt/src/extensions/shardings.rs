@@ -244,7 +244,7 @@ mod tests {
     fn test_shardings_extension() {
         test_for_each_platform!(|plugin, platform| {
             match platform {
-                TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     assert!(plugin.shardings_extension().is_ok());
                 }
                 _ => {
@@ -275,6 +275,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         };
 
         // Test with a program that does not have any shardings specified.

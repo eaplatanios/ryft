@@ -972,6 +972,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         };
         let executable = client.compile(&program, &compilation_options).unwrap();
         let executable = executable.executable().unwrap();
