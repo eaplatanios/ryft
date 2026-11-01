@@ -300,8 +300,10 @@ pub trait InterpretableOperation<C: Domain>: Operation<Type = C::Type> {
 
 /// Interpretation rule for a member [`Operation`] whose instruction executes in a different parent value universe.
 /// Ordinary [`InterpretableOperation`] implementations describe values of the operation's native type. This trait is
-/// reserved for payloads whose parent instruction additionally consumes or produces other member kinds, such as an
-/// array constructor whose dynamic extents are first-class dimension values.
+/// used when the parent instruction additionally consumes or produces other member kinds, such as an array constructor
+/// whose dynamic extents are first-class dimension values, or when interpretation needs those member kinds internally,
+/// such as a scaled dot product composition, for example, which computes its broadcast and reshape extents in the
+/// parent array IR domain.
 pub trait MemberInterpretableOperation<C: Domain>: Operation {
     /// Interprets this payload using values from its enclosing parent [`Domain`].
     ///

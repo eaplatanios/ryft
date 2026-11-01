@@ -22,46 +22,48 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 }
 
 // TODO(eaplatanios): Review this.
-/// Generates an operation enum's `Operation` contract and its selected semantic dispatchers.
+/// Generates an `Operation` implementation for the enum this macro is applied on, together with the implementations
+/// through which the enum dispatches every other operation contract to the payload of its active variant.
 ///
-/// The derivation applies to enums whose every variant wraps exactly one operation payload, and it makes the enum
-/// behave like whichever payload it holds. It always generates the `Operation` implementation, the
-/// `InterpretableOperation` and `PartiallyEvaluatableOperation` dispatchers, an `OperationProjection` implementation
-/// per projected member variant, `Display`, and the owned `From<Payload>` plus borrowed `TryFrom<&Enum>` payload
-/// conversions. Reference discharge, batching, forward-mode differentiation, and transposition dispatchers, as well as
-/// the payload-delegating `PartialEq`, `Eq`, and `Hash` implementations of `dispatch(identity)`, are generated only
-/// when selected.
+/// Every variant of the enum must wrap exactly one operation payload, which may be stored directly or boxed, and the
+/// enum then behaves like whichever payload it holds. The macro always generates the `Display`, `Operation`,
+/// `InterpretableOperation`, `PartiallyEvaluatableOperation`, and `OperationPayloadProjection` implementations, one
+/// `OperationProjection` implementation per projected member variant, and the owned `From<Payload>` and borrowed
+/// `TryFrom<&Enum>` payload conversions. Unless a variant stores a native `GuardOperation`, it also generates an
+/// `OperationProvider` implementation that rejects guard requests. The payload-delegating `PartialEq`, `Eq`, and
+/// `Hash` implementations, as well as the reference discharge, batching, differentiation, and transposition
+/// dispatchers, are generated only when they are selected through `#[ryft(dispatch(...))]`.
 ///
-/// The `#[ryft(...)]` attribute surface is the following, where enum-level attributes are all optional:
+/// The macro supports the following optional `#[ryft(...)]` attributes:
 ///
 /// ```text
-/// // Enum level:
-/// #[ryft(crate = "...")]                     // Path used to name Ryft items; defaults to `ryft`.
-/// #[ryft(type(T), constant(V))]              // Primary operation type and stored constant type; inferred otherwise.
-/// #[ryft(members(U [, structural(S)]...))]   // Member universes the operation family declares.
+/// // Enum-level attributes:
+/// #[ryft(crate = "...")]                    // Path through which generated code names `ryft` (by default, `ryft`).
+/// #[ryft(type(T), constant(C))]             // Operation type and stored constant type, which are otherwise inferred.
+/// #[ryft(members(U [, structural(S)]...))]  // Member universes of the operation family.
 /// #[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]
 ///
-/// // Variant level:
-/// #[ryft(projected(U [, structural]))]       // Every input and output of the instruction belongs to `U`.
-/// #[ryft(mixed(U [, structural]))]           // The instruction crosses member universes; `U` may be defaulted.
-/// #[ryft(skip_from)]                         // Suppresses only this variant's owned `From<Payload>` conversion.
+/// // Variant-level attributes:
+/// #[ryft(projected(U [, structural]))]      // Every input and output of the instruction belongs to `U`.
+/// #[ryft(mixed(U [, structural]))]          // The instruction crosses member universes, and `U` may be defaulted.
+/// #[ryft(skip_from)]                        // Skips only the owned `From<Payload>` conversion of the variant.
 /// ```
 ///
-/// For example, the following declaration derives an `Operation<Type = DataType>` implementation, the interpretation
-/// and partial-evaluation dispatchers, and the payload conversions for both variants:
+/// For example, the following enum derives an `Operation<Type = ArrayType>` implementation, along with the other
+/// implementations listed above, for both of its variants:
 ///
 /// ```rust,ignore
 /// #[derive(Clone, Debug, Operation)]
-/// enum BackendOperation<V: Value<Type = DataType>> {
-///     Zero(ZeroOperation<DataType>),
+/// enum BackendOperation<V: Value<Type = ArrayType>> {
+///     Zero(ZeroOperation<ArrayType>),
 ///     Constant(ConstantOperation<V>),
 /// }
 /// ```
 ///
-/// Refer to the documentation of `ryft-core`'s `Operation` trait for the canonical derive reference, which covers the
-/// enum-level attributes, operation-type and constant-type inference, the variant-class grammar with its boundary
-/// shapes and transform roles, the generated implementations and their conversion contracts, and the macro's
-/// requirements and limitations.
+/// Refer to the documentation of the `Operation` trait in `ryft-core` for the canonical reference of this macro, which
+/// covers the enum-level attributes, how the operation and constant types are inferred, the grammar of the variant
+/// classes along with their boundary shapes and transform roles, the generated implementations and their contracts,
+/// and the requirements and limitations of the macro.
 #[proc_macro_derive(Operation, attributes(ryft))]
 pub fn derive_operation(input: TokenStream) -> TokenStream {
     operations::generate_operation_impl(input)

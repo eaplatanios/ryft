@@ -13,14 +13,6 @@ compilation. Today, the most complete and usable part of this crate is the
 and Just-In-Time (JIT) compilation APIs. Those pieces are still being actively developed and are not yet ready
 to take a dependency on.
 
-## Roadmap / TODOs
-
-- [ ] How do we handle things like custom differentiation rules for various ops (potentially also the means by which
-  we implement gradient checkpointing / rematerialization)?
-- [ ] How do we handle compositions like `grad(compile_and_execute(f))`?
-- [ ] Add support for an operation like `jax.type_of`.
-- [ ] Add support for an operation like `jax.lax.with_sharding_constraint`.
-
 #### License
 
 <sup>
