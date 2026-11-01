@@ -14,8 +14,8 @@ use crate::tracing::DomainTracingContext;
 // TODO(eaplatanios): Review from here onwards.
 
 /// Staging request consumed by [`CompilationDomain::stage`]. Callers construct requests with
-/// [`CompilationStagingRequest::new`](super::functions::CompilationStagingRequest::new). Refer to the
-/// [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete types.
+/// [`CompilationStagingRequest::new`](crate::CompilationStagingRequest::new). Refer to the [`CompilationDomain`]
+/// documentation for why the domain functions accept request traits rather than concrete types.
 pub trait StagingRequest<C: CompilationDomain>: Sized
 where
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -34,21 +34,17 @@ where
             >,
         >;
 
-    /// Returns the structured abstract input signature.
-    fn input_types(&self) -> &Self::Input;
-
-    /// Returns the fixed compilation options.
-    fn options(&self) -> &C::Options;
-
-    /// Replaces the flat input signature while preserving its parameter structure.
-    fn replace_input_types(&mut self, input_types: Vec<C::Type>) -> Result<(), C::Error>;
-
-    /// Traces this request and normalizes the effective flat output signature.
-    fn trace<NormalizeOutput>(
+    /// Traces this request after normalizing its flat input signature with `normalize_input_types`, and then
+    /// normalizes the resulting flat output signature with `normalize_output_types`. Both functions receive the fixed
+    /// compilation options of the request. Normalized input types must preserve the number of inputs, because they
+    /// are placed back into the parameter structure of the request.
+    fn trace<NormalizeInput, NormalizeOutput>(
         self,
+        normalize_input_types: NormalizeInput,
         normalize_output_types: NormalizeOutput,
     ) -> Result<StagedFunction<C, Self::Input, Self::Output>, C::Error>
     where
+        NormalizeInput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
         NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>;
 }
 
@@ -187,7 +183,8 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
 
     /// Traces a fallible function with explicit runtime captures and their symbolic references. This is the only
     /// staging primitive. Implementations apply all options that affect tracing to the effective input and output
-    /// signatures and retain those same options in the returned artifact.
+    /// signatures through the normalization functions of [`StagingRequest::trace`], which also retains those same
+    /// options in the returned artifact.
     fn stage<Request>(
         &self,
         request: Request,

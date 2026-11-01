@@ -1824,7 +1824,7 @@ mod tests {
         where
             Request: StagingRequest<Self>,
         {
-            request.trace(|_, output_types| Ok(output_types))
+            request.trace(|_, input_types| Ok(input_types), |_, output_types| Ok(output_types))
         }
 
         fn lower<Request>(

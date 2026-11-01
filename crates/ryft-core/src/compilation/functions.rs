@@ -152,28 +152,13 @@ where
     type Input = Input;
     type Output = Output;
 
-    #[inline]
-    fn input_types(&self) -> &Input {
-        &self.input_types
-    }
-
-    #[inline]
-    fn options(&self) -> &C::Options {
-        &self.options
-    }
-
-    fn replace_input_types(&mut self, input_types: Vec<C::Type>) -> Result<(), C::Error> {
-        self.input_types = Input::from_parameters(self.input_types.parameter_structure(), input_types)
-            .map_err(ProgramError::from)
-            .map_err(C::Error::from)?;
-        Ok(())
-    }
-
-    fn trace<NormalizeOutput>(
+    fn trace<NormalizeInput, NormalizeOutput>(
         self,
+        normalize_input_types: NormalizeInput,
         normalize_output_types: NormalizeOutput,
     ) -> Result<StagedFunction<C, Input, Output>, C::Error>
     where
+        NormalizeInput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
         NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
     {
         trace_with_capture_references(
@@ -181,6 +166,7 @@ where
             self.captures,
             self.input_types,
             self.options,
+            normalize_input_types,
             normalize_output_types,
         )
     }
@@ -1681,11 +1667,12 @@ where
 }
 
 /// Constructs a staged function from types already prepared by a compilation domain.
-fn trace_with_capture_references<C, F, Input, Output, NormalizeOutput>(
+fn trace_with_capture_references<C, F, Input, Output, NormalizeInput, NormalizeOutput>(
     function: F,
     captures: Vec<C::Value>,
     input_types: Input,
     options: C::Options,
+    normalize_input_types: NormalizeInput,
     normalize_output_types: NormalizeOutput,
 ) -> Result<StagedFunction<C, Input, Output>, C::Error>
 where
@@ -1701,10 +1688,15 @@ where
     Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
     Output::To<CompilationTracer<C>>:
         Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
+    NormalizeInput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
     NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
+    let input_structure = input_types.parameter_structure();
+    let input_type_values = normalize_input_types(&options, input_types.into_parameters().collect())?;
+    let input_types = Input::from_parameters(input_structure.clone(), input_type_values.iter().cloned())
+        .map_err(ProgramError::from)?;
     let context = DomainTracingContext::<C, C::Value>::new();
     let capture_table = context.captures().clone();
     let builder = context.builder().clone();
@@ -1715,8 +1707,6 @@ where
         .cloned()
         .map(|capture| StagingContext::constant(&context, capture))
         .collect::<Vec<_>>();
-    let input_structure = input_types.parameter_structure();
-    let input_type_values = input_types.parameters().cloned().collect::<Vec<_>>();
     let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
     let outputs = function(capture_references, capture_tracers, inputs)?;
     check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
@@ -1831,16 +1821,18 @@ mod tests {
 
         fn stage<Request>(
             &self,
-            mut request: Request,
+            request: Request,
         ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
         where
             Request: StagingRequest<Self>,
         {
-            if let Some(input_type) = &request.options().staged_input_type {
-                request
-                    .replace_input_types(request.input_types().parameters().map(|_| input_type.clone()).collect())?;
-            }
-            request.trace(|_, output_types| Ok(output_types))
+            request.trace(
+                |options, input_types| match &options.staged_input_type {
+                    Some(input_type) => Ok(input_types.iter().map(|_| input_type.clone()).collect()),
+                    None => Ok(input_types),
+                },
+                |_, output_types| Ok(output_types),
+            )
         }
 
         fn lower<Request>(
@@ -1999,7 +1991,7 @@ mod tests {
         where
             Request: StagingRequest<Self>,
         {
-            request.trace(|_, output_types| Ok(output_types))
+            request.trace(|_, input_types| Ok(input_types), |_, output_types| Ok(output_types))
         }
 
         fn lower<Request>(
@@ -2115,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_staging_request_replace_input_types() {
+    fn test_compilation_staging_request_trace_normalizes_input_types() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
