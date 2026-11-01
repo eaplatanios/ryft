@@ -10,18 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added `#[derive(Operation)]` for operation enums. Its enum-level attributes are `crate = "..."`, `type(T)` and
-  `constant(V)` (which declare a composite family's operation and stored constant types), `members(...)`, and
-  `dispatch(...)`, which selects the payload-delegating `identity` implementations together with the `discharge`,
-  `batching`, `differentiation`, and `transposition` dispatchers. Structural projected member variants (i.e.,
-  `#[ryft(projected(U, structural))]`) are batched by binding their payload once under the policy's
-  `ReplicatedBatchingPolicyProjection`, so their member operation families need no batching rules of their own. The
-  earlier `#[ryft(identity)]`, `#[ryft(type = T)]`, and `#[ryft(constant = V)]` spellings are rejected with diagnostics
-  that name their replacements.
-- Added the `#[mermaid]` attribute, which renders the Mermaid diagrams in rustdoc comments (i.e., ```` ```mermaid ````
-  code fences) in the browser. It is meant to be applied as `#[cfg_attr(doc, ryft_macros::mermaid)]`, and it copies a
-  vendored Mermaid bundle into the rustdoc output directory so that locally built documentation renders offline, with
-  a CDN fallback.
+- Added the `#[derive(Operation)]` macro, which implements `Operation` for enums whose variants each wrap one operation
+  payload, so that the enum behaves like the payload of its active variant. Along with `Operation`, it generates the
+  interpretation, partial evaluation, and projection implementations and the payload conversions (i.e., owned
+  `From<Payload>` and borrowed `TryFrom<&Enum>`). `#[ryft(dispatch(...))]` additionally opts into identity
+  implementations that delegate to the payload (i.e., `PartialEq`, `Eq`, and `Hash`) and into reference discharge,
+  batching, differentiation, and transposition dispatchers. `#[ryft(projected(...))]` and `#[ryft(mixed(...))]`
+  declare how each variant relates to the member universes of the operation family.
+- Added the `#[capability]` attribute macro, which validates the conventions of capability traits and, for each
+  `projection(Family => Member)` argument, implements the capability for values of the `Family` universe by
+  projecting them onto their `Member` values.
+- Added the `#[mermaid]` attribute macro, which renders the [Mermaid](https://mermaid.js.org/) diagrams written in
+  `mermaid` code fences in rustdoc comments, choosing a light or dark diagram theme to match the rustdoc theme. It is
+  meant to be applied as `#[cfg_attr(doc, mermaid)]`. It loads a vendored Mermaid bundle that it writes into the
+  rustdoc output directory and falls back to a CDN when that bundle is unavailable.
 
 ### Fixed
 
