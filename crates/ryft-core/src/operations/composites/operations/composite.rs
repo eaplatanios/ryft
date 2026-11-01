@@ -1723,17 +1723,13 @@ where
                 std::iter::once(&source),
             )?);
         }
-        let carrier = CompositeTransposeOperation {
+        let carrier = CompositeTransposeOperation::from_parts(
+            carrier_rules,
             leading_input_count,
             seed_extent_count,
             input_tangent_types,
-            output_tangent_types: outputs
-                .iter()
-                .map(|output| output.r#type().tangent())
-                .collect::<Result<Vec<_>, _>>()?,
-            rules: carrier_rules,
-            marker: PhantomData,
-        };
+            outputs.iter().map(|output| output.r#type().tangent()).collect::<Result<Vec<_>, _>>()?,
+        );
         let output_tangents = context.tangent().bind(carrier, carrier_regions, &carrier_inputs)?;
         check_count!("output", output_tangents, outputs.len(), ProgramError);
 
@@ -2259,8 +2255,6 @@ where
         })
         .collect::<Result<Vec<_>, _>>()
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {

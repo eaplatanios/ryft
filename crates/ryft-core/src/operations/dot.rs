@@ -1277,12 +1277,11 @@ impl Operation for RaggedDotOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for RaggedDotOperation
 where
     C::Value: RaggedDot,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1294,7 +1293,6 @@ where
     }
 }
 
-// Partial evaluation uses the default fold-or-residualize behavior.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedDotOperation where
     C::Operation: From<RaggedDotOperation>
 {
@@ -1305,20 +1303,22 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOpe
 where
     RaggedDotOperation: InterpretableOperation<C>,
 {
-    // Alignment delegates mapped axis materialization to `ArrayExtentBatchingPolicy::match_axis` and
-    // `ArrayExtentBatchingPolicy::broadcast_input`, so a dynamic mapped extent remains a first-class value. The mapped
-    // axes become a new leading batching pair, and the explicit `group_sizes` keep specifying the groups of every item.
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Alignment delegates mapped axis materialization to `ArrayExtentBatchingPolicy::match_axis` and
+        // `ArrayExtentBatchingPolicy::broadcast_input`, so a dynamic mapped extent remains a first-class value.
+        // The mapped axes become a new leading batching pair, and the explicit `group_sizes` keep specifying the
+        // groups of every item.
         check_count!("input", inputs, 3, ProgramError);
         let mode = self.dimensions.validate(inputs[0].unbatched_type().rank(), inputs[1].unbatched_type().rank())?;
         if inputs.iter().all(|input| input.batch_axis_position().is_none()) {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         }
+
         check_common_mapped_dimension(RAGGED_DOT_OPERATION_NAME, inputs)?;
 
         // Both data inputs need the mapped axis at position zero before the logical dimension numbers can be lifted,
@@ -1361,8 +1361,8 @@ where
                         .chain(std::iter::once(dimension_source(group_sizes.value(), group_sizes_type.dimension(1), 1)))
                         .collect::<Vec<_>>();
 
-                    // The group sizes keep their memory space and manual variation, while each new prefix axis is
-                    // replicated.
+                    // The group sizes keep their memory space and manual variation, while each new prefix axis
+                    // is replicated.
                     let output_rank = prefix_axes.len() + 1;
                     let output_axes = vec![0, prefix_axes.len()];
                     let output_sharding = group_sizes_type
@@ -1397,16 +1397,15 @@ where
 
         // A contracting ragged dimension keeps its leading group output axis ahead of the batch axis.
         let output_axis = if mode == RaggedDotMode::Contracting { 1 } else { 0 };
-        Ok(RaggedDotOperation::new(dimensions).interpret_with_batch_axes(
+
+        RaggedDotOperation::new(dimensions).interpret_with_batch_axes(
             context,
             &[lhs, rhs, group_sizes],
             &[BatchAxis::from_position(output_axis)],
-        )?)
+        )
     }
 }
 
-// A grouped dot is linear in either data input separately. Group sizes are integer metadata and therefore carry no
-// tangent. The two product rule terms reuse the same grouped dot dimensions.
 impl_differentiable_operation! {
     RaggedDotOperation,
     jvp<C>
@@ -1416,6 +1415,8 @@ impl_differentiable_operation! {
         C::Value: ConvertElementType + RaggedDot + Add,
     {
         |operation, context, _driver, inputs| {
+            // A grouped dot is linear in either data input separately. Group sizes are integer metadata and therefore
+            // carry no tangent. The two product rule terms reuse the same grouped dot dimensions.
             check_count!("input", inputs, 3, ProgramError);
             let lhs = &inputs[0];
             let rhs = &inputs[1];
@@ -1448,19 +1449,22 @@ impl_differentiable_operation! {
                 &[],
             )?;
             let mode = operation.dimensions().mode(inputs[0].r#type().rank())?;
+
             if mode != RaggedDotMode::NonContracting {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!("`{RAGGED_DOT_OPERATION_NAME}` transposition is unsupported in `{mode}` mode"),
                 }
                 .into());
             }
+
             let group_sizes = inputs[2].as_known().ok_or_else(|| ProgramError::UnsupportedOperation {
                 message: format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes must be known during transposition"),
             })?;
+
             let linear_index = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
-                // Both data inputs linear is a bilinear product, which is not a linear map in both inputs jointly and
-                // so never appears in a valid pushforward.
                 (true, true) => {
+                    // Both data inputs linear is a bilinear product, which is not a linear map in both inputs jointly
+                    // and so never appears in a valid pushforward.
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "bilinear `{RAGGED_DOT_OPERATION_NAME}` with two linear inputs cannot be transposed",
@@ -1478,9 +1482,11 @@ impl_differentiable_operation! {
             if !accumulators[linear_index].is_needed() {
                 return Ok(());
             }
+
             let MaybeZero::Value(cotangent) = &outputs[0] else {
                 return Ok(());
             };
+
             let left_rank = inputs[0].r#type().rank();
             let right_rank = inputs[1].r#type().rank();
             let (dimensions, output_axes, mut adjoint_inputs) = if linear_index == 0 {
@@ -1493,8 +1499,8 @@ impl_differentiable_operation! {
                 (dimensions, output_axes, [known_lhs.clone(), cotangent.clone(), group_sizes.clone()])
             };
 
-            // An adjoint over widened tangents contracts both data inputs at the cotangent element type, and the result
-            // is converted back to the linear input's cotangent element type.
+            // An adjoint over widened tangents contracts both data inputs at the cotangent element type,
+            // and the result is converted back to the linear input's cotangent element type.
             let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
             for adjoint_input in &mut adjoint_inputs[..2] {
                 if adjoint_input.r#type().data_type() != cotangent.r#type().data_type() {
@@ -1504,16 +1510,20 @@ impl_differentiable_operation! {
             let mut adjoint_outputs =
                 context.stage_operation(RaggedDotOperation::new(dimensions), Vec::new(), &adjoint_inputs)?;
             check_count!("output", adjoint_outputs, 1, ProgramError);
+
             let adjoint_value = adjoint_outputs.remove(0).transpose(Permutation::from(output_axes).inverse()?)?;
             let adjoint_value = if adjoint_value.r#type().data_type() == linear_cotangent_type.data_type() {
                 adjoint_value
             } else {
                 adjoint_value.convert_element_type(linear_cotangent_type.data_type())?
             };
+
             accumulators[linear_index].accumulate(context, MaybeZero::Value(adjoint_value))
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level grouped generalized dot capability.
 ///
