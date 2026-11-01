@@ -2489,10 +2489,10 @@ pub const BUFFER_ATTRS_ATTRIBUTE: &str = "buffer_attrs";
 /// # Example
 ///
 /// ```mlir
-/// "mosaic_gpu.run_scoped"() ({
+/// "mosaic_gpu.run_scoped"() <{buffer_attrs = [#mosaic_gpu.smem_alloc<alignment = 16>]}> ({
 /// ^bb0(%buffer: memref<4xf32, #gpu.address_space<workgroup>>):
 ///   mosaic_gpu.return
-/// }) <{buffer_attrs = [#mosaic_gpu.smem_alloc<alignment = 16>]}> : () -> ()
+/// }) : () -> ()
 /// ```
 pub trait RunScopedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the allocation metadata for the body arguments.
@@ -2544,7 +2544,7 @@ pub const ALIGNMENT_ATTRIBUTE: &str = "alignment";
 /// # Example
 ///
 /// ```mlir
-/// %buffer = mosaic_gpu.alloc_smem <{alignment = 16 : i64}> : memref<4xf32, #gpu.address_space<workgroup>>
+/// %buffer = mosaic_gpu.alloc_smem <alignment = 16> : memref<4xf32, #gpu.address_space<workgroup>>
 /// ```
 pub trait AllocSmemOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional minimum byte alignment.
@@ -3246,8 +3246,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @layout_cast(%arg0: vector<4xf32>) {
-                    %0 = mosaic_gpu.layout_cast x(%arg0 : vector<4xf32>) <{new_layout = \
-                #mosaic_gpu.WGStridedFragLayout<[4], 1>, strict = true}>
+                    %0 = mosaic_gpu.layout_cast x(%arg0 : vector<4xf32>) <new_layout = \
+                #mosaic_gpu.WGStridedFragLayout<[4], 1>, strict = true>
                     return
                   }
                 }
@@ -3313,8 +3313,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @broadcast_in_dim(%arg0: vector<1xf32>) {
-                    %0 = mosaic_gpu.broadcast_in_dim(%arg0 : vector<1xf32>) {broadcast_dimensions = \
-                array<i64: 0>} -> vector<4xf32>
+                    %0 = mosaic_gpu.broadcast_in_dim(%arg0 : vector<1xf32>) <broadcast_dimensions = \
+                [0]> -> vector<4xf32>
                     return
                   }
                 }
@@ -3691,7 +3691,7 @@ mod tests {
                 module {
                   func.func @tmem_alloc(%arg0: memref<i32, #gpu.address_space<workgroup>>) {
                     %0 = mosaic_gpu.tmem_alloc smem_ptr(%arg0 : memref<i32, #gpu.address_space<workgroup>>) \
-                {collective = true, packing = 4 : i32} -> memref<32x64xi8, #mosaic_gpu.tmem>
+                <collective = true, packing = 4> -> memref<32x64xi8, #mosaic_gpu.tmem>
                     return
                   }
                 }
@@ -4171,8 +4171,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @vector_concat(%arg0: vector<2xf32>) {
-                    %0 = mosaic_gpu.vector_concat(%arg0, %arg0 : vector<2xf32>, vector<2xf32>) <{dimension = 0 \
-                : i32}> -> vector<4xf32>
+                    %0 = mosaic_gpu.vector_concat(%arg0, %arg0 : vector<2xf32>, vector<2xf32>) <dimension = 0> \
+                -> vector<4xf32>
                     return
                   }
                 }
@@ -4409,10 +4409,10 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  \"mosaic_gpu.run_scoped\"() ({
+                  \"mosaic_gpu.run_scoped\"() <{buffer_attrs = [#mosaic_gpu.smem_alloc<alignment = 16>]}> ({
                   ^bb0(%arg0: memref<4xf32, #gpu.address_space<workgroup>>):
                     mosaic_gpu.return
-                  }) <{buffer_attrs = [#mosaic_gpu.smem_alloc<alignment = 16>]}> : () -> ()
+                  }) : () -> ()
                 }
             "},
         );
@@ -4442,7 +4442,7 @@ mod tests {
             indoc! {"
                 module {
                   \"mosaic_gpu.alloca_scope\"() ({
-                    %0 = mosaic_gpu.alloc_smem <{alignment = 16 : i64}> : memref<4xf32, #gpu.address_space<workgroup>>
+                    %0 = mosaic_gpu.alloc_smem <alignment = 16> : memref<4xf32, #gpu.address_space<workgroup>>
                     mosaic_gpu.alloca_scope.return
                   }) : () -> ()
                 }

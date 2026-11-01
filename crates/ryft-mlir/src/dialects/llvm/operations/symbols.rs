@@ -1365,7 +1365,7 @@ mod tests {
                     %0 = llvm.mlir.addressof @implementation : !llvm.ptr
                     llvm.return %0 : !llvm.ptr
                   }
-                  llvm.mlir.ifunc internal @selected : !llvm.func<void ()>, !llvm.ptr @resolver {dso_local}
+                  llvm.mlir.ifunc internal @selected : !llvm.func<void ()>, !llvm.ptr @resolver dso_local
                 }
             "},
         );

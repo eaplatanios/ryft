@@ -303,15 +303,9 @@ pub trait MaskedLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.operand_value(1)
     }
 
-    /// Returns the `alignment` attribute.
-    fn alignment(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute("alignment")?.ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing `{}` attribute in `{}`",
-                "alignment",
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional 64-bit signless integer `alignment` attribute. An absent value selects ABI alignment.
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute("alignment")
     }
 
     /// Returns the `nontemporal` attribute.
@@ -334,6 +328,8 @@ pub trait MaskedLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(MaskedLoad);
 
 /// Constructs a new detached `llvm.intr.masked.load` operation.
+///
+/// `alignment` must be a 64-bit signless integer attribute when provided. `None` selects ABI alignment.
 pub fn intr_masked_load<
     'v,
     'c: 'v,
@@ -346,7 +342,7 @@ pub fn intr_masked_load<
     data: V0,
     mask: V1,
     result_type: T0,
-    alignment: AttributeRef<'c, 't>,
+    alignment: Option<AttributeRef<'c, 't>>,
     nontemporal: AttributeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedMaskedLoadOperation<'c, 't>, Error> {
@@ -356,7 +352,9 @@ pub fn intr_masked_load<
     builder = builder.add_operand(data)?;
     builder = builder.add_operand(mask)?;
     builder = builder.add_result(result_type)?;
-    builder = builder.add_attribute("alignment", alignment)?;
+    if let Some(alignment) = alignment {
+        builder = builder.add_attribute("alignment", alignment)?;
+    }
     builder = builder.add_attribute("nontemporal", nontemporal)?;
     builder.build().and_then(|operation| unsafe {
         operation
@@ -390,21 +388,17 @@ pub trait MaskedStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.operand_value(2)
     }
 
-    /// Returns the `alignment` attribute.
-    fn alignment(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute("alignment")?.ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing `{}` attribute in `{}`",
-                "alignment",
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional 64-bit signless integer `alignment` attribute. An absent value selects ABI alignment.
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute("alignment")
     }
 }
 
 mlir_op!(MaskedStore);
 
 /// Constructs a new detached `llvm.intr.masked.store` operation.
+///
+/// `alignment` must be a 64-bit signless integer attribute when provided. `None` selects ABI alignment.
 pub fn intr_masked_store<
     'v,
     'c: 'v,
@@ -417,7 +411,7 @@ pub fn intr_masked_store<
     value: V0,
     data: V1,
     mask: V2,
-    alignment: AttributeRef<'c, 't>,
+    alignment: Option<AttributeRef<'c, 't>>,
     location: L,
 ) -> Result<DetachedMaskedStoreOperation<'c, 't>, Error> {
     let context = location.context();
@@ -426,7 +420,9 @@ pub fn intr_masked_store<
     builder = builder.add_operand(value)?;
     builder = builder.add_operand(data)?;
     builder = builder.add_operand(mask)?;
-    builder = builder.add_attribute("alignment", alignment)?;
+    if let Some(alignment) = alignment {
+        builder = builder.add_attribute("alignment", alignment)?;
+    }
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1436,47 +1432,6 @@ pub fn intr_stack_save<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>
     })
 }
 
-/// Canonical MLIR operation name for [`StripInvariantGroupOperation`].
-pub const STRIP_INVARIANT_GROUP_OPERATION_NAME: &str = "llvm.intr.strip.invariant.group";
-
-/// Operation trait for `llvm.intr.strip.invariant.group`.
-pub trait StripInvariantGroupOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    /// Returns the canonical MLIR operation name.
-    fn operation_name(&self) -> &'static str {
-        STRIP_INVARIANT_GROUP_OPERATION_NAME
-    }
-
-    /// Returns the `pointer` operand.
-    fn pointer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-        self.operand_value(0)
-    }
-
-    /// Returns this operation's result type.
-    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
-        self.result_type(0)
-    }
-}
-
-mlir_op!(StripInvariantGroup);
-
-/// Constructs a new detached `llvm.intr.strip.invariant.group` operation.
-pub fn intr_strip_invariant_group<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: Location<'c, 't>>(
-    pointer: V0,
-    result_type: T0,
-    location: L,
-) -> Result<DetachedStripInvariantGroupOperation<'c, 't>, Error> {
-    let context = location.context();
-    context.load_dialect(DialectHandle::llvm()?)?;
-    let mut builder = OperationBuilder::new(STRIP_INVARIANT_GROUP_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer)?;
-    builder = builder.add_result(result_type)?;
-    builder.build().and_then(|operation| unsafe {
-        operation
-            .cast()
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_strip_invariant_group`"))
-    })
-}
-
 /// Canonical MLIR operation name for [`ThreadlocalAddressOperation`].
 pub const THREAD_LOCAL_ADDRESS_OPERATION_NAME: &str = "llvm.intr.threadlocal.address";
 
@@ -1763,15 +1718,9 @@ pub trait MaskedGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.operand_value(1)
     }
 
-    /// Returns the `alignment` attribute.
-    fn alignment(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute("alignment")?.ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing `{}` attribute in `{}`",
-                "alignment",
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional 64-bit signless integer `alignment` attribute. An absent value selects ABI alignment.
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute("alignment")
     }
 
     /// Returns this operation's result type.
@@ -1783,6 +1732,8 @@ pub trait MaskedGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(MaskedGather);
 
 /// Constructs a new detached `llvm.intr.masked.gather` operation.
+///
+/// `alignment` must be a 64-bit signless integer attribute when provided. `None` selects ABI alignment.
 pub fn intr_masked_gather<
     'v,
     'c: 'v,
@@ -1795,7 +1746,7 @@ pub fn intr_masked_gather<
     pointers: V0,
     mask: V1,
     result_type: T0,
-    alignment: AttributeRef<'c, 't>,
+    alignment: Option<AttributeRef<'c, 't>>,
     location: L,
 ) -> Result<DetachedMaskedGatherOperation<'c, 't>, Error> {
     let context = location.context();
@@ -1804,7 +1755,9 @@ pub fn intr_masked_gather<
     builder = builder.add_operand(pointers)?;
     builder = builder.add_operand(mask)?;
     builder = builder.add_result(result_type)?;
-    builder = builder.add_attribute("alignment", alignment)?;
+    if let Some(alignment) = alignment {
+        builder = builder.add_attribute("alignment", alignment)?;
+    }
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1837,21 +1790,17 @@ pub trait MaskedScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.operand_value(2)
     }
 
-    /// Returns the `alignment` attribute.
-    fn alignment(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute("alignment")?.ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing `{}` attribute in `{}`",
-                "alignment",
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    /// Returns the optional 64-bit signless integer `alignment` attribute. An absent value selects ABI alignment.
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        self.attribute("alignment")
     }
 }
 
 mlir_op!(MaskedScatter);
 
 /// Constructs a new detached `llvm.intr.masked.scatter` operation.
+///
+/// `alignment` must be a 64-bit signless integer attribute when provided. `None` selects ABI alignment.
 pub fn intr_masked_scatter<
     'v,
     'c: 'v,
@@ -1864,7 +1813,7 @@ pub fn intr_masked_scatter<
     value: V0,
     pointers: V1,
     mask: V2,
-    alignment: AttributeRef<'c, 't>,
+    alignment: Option<AttributeRef<'c, 't>>,
     location: L,
 ) -> Result<DetachedMaskedScatterOperation<'c, 't>, Error> {
     let context = location.context();
@@ -1873,7 +1822,9 @@ pub fn intr_masked_scatter<
     builder = builder.add_operand(value)?;
     builder = builder.add_operand(pointers)?;
     builder = builder.add_operand(mask)?;
-    builder = builder.add_attribute("alignment", alignment)?;
+    if let Some(alignment) = alignment {
+        builder = builder.add_attribute("alignment", alignment)?;
+    }
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2199,11 +2150,11 @@ mod tests {
         context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
-        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
         let pointer_type = context.llvm_pointer_type(0).unwrap();
         let mask_type = context.parse_type("vector<4xi1>").unwrap();
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        let alignment = context.integer_attribute(i64_type, 1).as_ref();
         let nontemporal = context.unit_attribute().as_ref();
         module
             .body()
@@ -2212,10 +2163,15 @@ mod tests {
                 let mut block = context.block(&[(pointer_type.as_ref(), location), (mask_type.as_ref(), location)]);
                 let arg_0 = block.argument(0).unwrap();
                 let arg_1 = block.argument(1).unwrap();
-                let op = intr_masked_load(arg_0, arg_1, vector_i32_type, alignment, nontemporal, location).unwrap();
+                let without_alignment =
+                    intr_masked_load(arg_0, arg_1, vector_i32_type, None, nontemporal, location).unwrap();
+                assert_eq!(without_alignment.alignment().unwrap(), None);
+                block.append_operation(without_alignment).unwrap();
+                let op =
+                    intr_masked_load(arg_0, arg_1, vector_i32_type, Some(alignment), nontemporal, location).unwrap();
                 assert_eq!(op.data().unwrap(), arg_0);
                 assert_eq!(op.mask().unwrap(), arg_1);
-                assert_eq!(op.alignment().unwrap(), alignment);
+                assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.nontemporal().unwrap(), nontemporal);
                 assert_eq!(op.output_type().unwrap(), vector_i32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.masked.load");
@@ -2242,8 +2198,9 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_masked_load_test(%arg0: !llvm.ptr, %arg1: vector<4xi1>) -> vector<4xi32> {
-                    %0 = llvm.intr.masked.load %arg0, %arg1 {alignment = 1 : i32, nontemporal} : (!llvm.ptr, vector<4xi1>) -> vector<4xi32>
-                    return %0 : vector<4xi32>
+                    %0 = llvm.intr.masked.load(%arg0, %arg1) <nontemporal> : (!llvm.ptr, vector<4xi1>) -> vector<4xi32>
+                    %1 = llvm.intr.masked.load(%arg0, %arg1), alignment(1) <nontemporal> : (!llvm.ptr, vector<4xi1>) -> vector<4xi32>
+                    return %1 : vector<4xi32>
                   }
                 }
             "},
@@ -2256,11 +2213,11 @@ mod tests {
         context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
-        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
         let pointer_type = context.llvm_pointer_type(0).unwrap();
         let mask_type = context.parse_type("vector<4xi1>").unwrap();
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        let alignment = context.integer_attribute(i64_type, 1).as_ref();
         module
             .body()
             .unwrap()
@@ -2273,11 +2230,14 @@ mod tests {
                 let arg_0 = block.argument(0).unwrap();
                 let arg_1 = block.argument(1).unwrap();
                 let arg_2 = block.argument(2).unwrap();
-                let op = intr_masked_store(arg_0, arg_1, arg_2, alignment, location).unwrap();
+                let without_alignment = intr_masked_store(arg_0, arg_1, arg_2, None, location).unwrap();
+                assert_eq!(without_alignment.alignment().unwrap(), None);
+                block.append_operation(without_alignment).unwrap();
+                let op = intr_masked_store(arg_0, arg_1, arg_2, Some(alignment), location).unwrap();
                 assert_eq!(op.value().unwrap(), arg_0);
                 assert_eq!(op.data().unwrap(), arg_1);
                 assert_eq!(op.mask().unwrap(), arg_2);
-                assert_eq!(op.alignment().unwrap(), alignment);
+                assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.operation_name(), "llvm.intr.masked.store");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
@@ -2304,7 +2264,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_masked_store_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: vector<4xi1>) {
-                    llvm.intr.masked.store %arg0, %arg1, %arg2 {alignment = 1 : i32} : vector<4xi32>, vector<4xi1> into !llvm.ptr
+                    llvm.intr.masked.store(%arg0, %arg1, %arg2) : vector<4xi32>, vector<4xi1> into !llvm.ptr
+                    llvm.intr.masked.store(%arg0, %arg1, %arg2), alignment(1) : vector<4xi32>, vector<4xi1> into !llvm.ptr
                     return
                   }
                 }
@@ -2365,7 +2326,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_matrix_column_major_load_test(%arg0: !llvm.ptr, %arg1: i64) -> vector<4xi32> {
-                    %0 = llvm.intr.matrix.column.major.load %arg0, <stride = %arg1> {columns = 1 : i32, isVolatile = false, rows = 1 : i32} : vector<4xi32> from !llvm.ptr stride i64
+                    %0 = llvm.intr.matrix.column.major.load %arg0, <stride = %arg1>, is_volatile = false, rows = 1, columns = 1 : vector<4xi32> from !llvm.ptr stride i64
                     return %0 : vector<4xi32>
                   }
                 }
@@ -2432,7 +2393,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_matrix_column_major_store_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: i64) {
-                    llvm.intr.matrix.column.major.store %arg0, %arg1, <stride = %arg2> {columns = 1 : i32, isVolatile = false, rows = 1 : i32} : vector<4xi32> to !llvm.ptr stride i64
+                    llvm.intr.matrix.column.major.store %arg0, %arg1, <stride = %arg2>, is_volatile = false, rows = 1, columns = 1 : vector<4xi32> to !llvm.ptr stride i64
                     return
                   }
                 }
@@ -2492,7 +2453,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_matrix_multiply_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>) -> vector<4xf32> {
-                    %0 = llvm.intr.matrix.multiply %arg0, %arg1 {lhs_columns = 1 : i32, lhs_rows = 1 : i32, rhs_columns = 1 : i32} : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+                    %0 = llvm.intr.matrix.multiply %arg0, %arg1, lhs_rows = 1, lhs_columns = 1, rhs_columns = 1 : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
                     return %0 : vector<4xf32>
                   }
                 }
@@ -2545,7 +2506,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_matrix_transpose_test(%arg0: vector<4xf32>) -> vector<4xf32> {
-                    %0 = llvm.intr.matrix.transpose %arg0 {columns = 1 : i32, rows = 1 : i32} : vector<4xf32> into vector<4xf32>
+                    %0 = llvm.intr.matrix.transpose %arg0, rows = 1, columns = 1 : vector<4xf32> into vector<4xf32>
                     return %0 : vector<4xf32>
                   }
                 }
@@ -3165,54 +3126,6 @@ mod tests {
     }
 
     #[test]
-    fn test_intr_strip_invariant_group() {
-        let context = Context::new();
-        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
-        let location = context.unknown_location();
-        let module = context.module(location).unwrap();
-        let pointer_type = context.llvm_pointer_type(0).unwrap();
-        module
-            .body()
-            .unwrap()
-            .append_operation({
-                let mut block = context.block(&[(pointer_type.as_ref(), location)]);
-                let arg_0 = block.argument(0).unwrap();
-                let op = intr_strip_invariant_group(arg_0, pointer_type, location).unwrap();
-                assert_eq!(op.pointer().unwrap(), arg_0);
-                assert_eq!(op.output_type().unwrap(), pointer_type);
-                assert_eq!(op.operation_name(), "llvm.intr.strip.invariant.group");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                let op = block.append_operation(op).unwrap();
-                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
-                func::func(
-                    "llvm_intr_strip_invariant_group_test",
-                    func::FuncAttributes {
-                        arguments: vec![pointer_type.into()],
-                        results: vec![pointer_type.into()],
-                        ..Default::default()
-                    },
-                    block.try_into().unwrap(),
-                    location,
-                )
-                .unwrap()
-            })
-            .unwrap();
-        assert!(module.verify().unwrap());
-        assert_eq!(
-            module.to_string(),
-            indoc! {"
-                module {
-                  func.func @llvm_intr_strip_invariant_group_test(%arg0: !llvm.ptr) -> !llvm.ptr {
-                    %0 = llvm.intr.strip.invariant.group %arg0 : !llvm.ptr
-                    return %0 : !llvm.ptr
-                  }
-                }
-            "},
-        );
-    }
-
-    #[test]
     fn test_intr_thread_local_address() {
         let context = Context::new();
         context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
@@ -3532,11 +3445,11 @@ mod tests {
         context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
-        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
         let mask_type = context.parse_type("vector<4xi1>").unwrap();
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
         let vector_pointer_type = context.parse_type("vector<4x!llvm.ptr>").unwrap();
-        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        let alignment = context.integer_attribute(i64_type, 1).as_ref();
         module
             .body()
             .unwrap()
@@ -3545,10 +3458,13 @@ mod tests {
                     context.block(&[(vector_pointer_type.as_ref(), location), (mask_type.as_ref(), location)]);
                 let arg_0 = block.argument(0).unwrap();
                 let arg_1 = block.argument(1).unwrap();
-                let op = intr_masked_gather(arg_0, arg_1, vector_i32_type, alignment, location).unwrap();
+                let without_alignment = intr_masked_gather(arg_0, arg_1, vector_i32_type, None, location).unwrap();
+                assert_eq!(without_alignment.alignment().unwrap(), None);
+                block.append_operation(without_alignment).unwrap();
+                let op = intr_masked_gather(arg_0, arg_1, vector_i32_type, Some(alignment), location).unwrap();
                 assert_eq!(op.pointers().unwrap(), arg_0);
                 assert_eq!(op.mask().unwrap(), arg_1);
-                assert_eq!(op.alignment().unwrap(), alignment);
+                assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.output_type().unwrap(), vector_i32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.masked.gather");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
@@ -3574,8 +3490,9 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_masked_gather_test(%arg0: vector<4x!llvm.ptr>, %arg1: vector<4xi1>) -> vector<4xi32> {
-                    %0 = llvm.intr.masked.gather %arg0, %arg1 {alignment = 1 : i32} : (vector<4x!llvm.ptr>, vector<4xi1>) -> vector<4xi32>
-                    return %0 : vector<4xi32>
+                    %0 = llvm.intr.masked.gather(%arg0, %arg1) : (vector<4x!llvm.ptr>, vector<4xi1>) -> vector<4xi32>
+                    %1 = llvm.intr.masked.gather(%arg0, %arg1), alignment(1) : (vector<4x!llvm.ptr>, vector<4xi1>) -> vector<4xi32>
+                    return %1 : vector<4xi32>
                   }
                 }
             "},
@@ -3588,11 +3505,11 @@ mod tests {
         context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
-        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
         let mask_type = context.parse_type("vector<4xi1>").unwrap();
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
         let vector_pointer_type = context.parse_type("vector<4x!llvm.ptr>").unwrap();
-        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        let alignment = context.integer_attribute(i64_type, 1).as_ref();
         module
             .body()
             .unwrap()
@@ -3605,11 +3522,14 @@ mod tests {
                 let arg_0 = block.argument(0).unwrap();
                 let arg_1 = block.argument(1).unwrap();
                 let arg_2 = block.argument(2).unwrap();
-                let op = intr_masked_scatter(arg_0, arg_1, arg_2, alignment, location).unwrap();
+                let without_alignment = intr_masked_scatter(arg_0, arg_1, arg_2, None, location).unwrap();
+                assert_eq!(without_alignment.alignment().unwrap(), None);
+                block.append_operation(without_alignment).unwrap();
+                let op = intr_masked_scatter(arg_0, arg_1, arg_2, Some(alignment), location).unwrap();
                 assert_eq!(op.value().unwrap(), arg_0);
                 assert_eq!(op.pointers().unwrap(), arg_1);
                 assert_eq!(op.mask().unwrap(), arg_2);
-                assert_eq!(op.alignment().unwrap(), alignment);
+                assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.operation_name(), "llvm.intr.masked.scatter");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
@@ -3636,7 +3556,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_masked_scatter_test(%arg0: vector<4xi32>, %arg1: vector<4x!llvm.ptr>, %arg2: vector<4xi1>) {
-                    llvm.intr.masked.scatter %arg0, %arg1, %arg2 {alignment = 1 : i32} : vector<4xi32>, vector<4xi1> into vector<4x!llvm.ptr>
+                    llvm.intr.masked.scatter(%arg0, %arg1, %arg2) : vector<4xi32>, vector<4xi1> into vector<4x!llvm.ptr>
+                    llvm.intr.masked.scatter(%arg0, %arg1, %arg2), alignment(1) : vector<4xi32>, vector<4xi1> into vector<4x!llvm.ptr>
                     return
                   }
                 }

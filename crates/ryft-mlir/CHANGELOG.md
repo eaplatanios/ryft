@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Upgraded to the LLVM, StableHLO (v1.24.0), Shardy, and Triton revisions pinned by OpenXLA commit
+  `f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163` and JAX commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`.
 - Changed all `OperationBuilder::add_*` functions to return `Result<Self, Error>` and report context mismatches
   immediately. Callers must now handle each addition's result (for example, using `?` in builder chains). A failed
   addition consumes the builder and destroys its owned regions, including any rejected regions passed to that addition.
@@ -61,17 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   collective root APIs exclude the root-index tensor from their inferred results.
 - Minor performance optimizations for some of the `shardy` dialect builders.
 - Updated GPU target-attachment passes for LLVM's split native registration families while preserving bulk registration.
-- Upgraded to the LLVM, StableHLO (v1.24.0), Shardy, and Triton revisions pinned by OpenXLA commit
-  `f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163` and JAX commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`.
+- Made LLVM masked load, store, gather, and scatter alignments optional `i64` attributes. Omitting alignment selects
+  the element type's ABI alignment.
+- Updated canonical printer expectations for module visibility, function calls, LLVM operations, and Mosaic GPU
+  properties.
+- Updated Index, NVVM, NVGPU, and `sparse_tensor` enum attributes to the LLVM enum attribute syntax.
 
 ### Removed
 
+- Removed the LLVM `strip.invariant.group` operation deleted upstream.
 - Removed the LLVM dialect `TokenTypeRef` and `Context::llvm_token_type` following the upstream MLIR replacement of
   `!llvm.token` with the builtin `token` type, which is now wrapped by the builtin `TokenTypeRef` and
   `Context::token_type`. Note that builtin token values cannot cross function boundaries (producing operations must
   have the MLIR `TokenProducerTrait` and consuming operations must have the `TokenConsumerTrait`).
 - Removed the EmitC `apply` operation wrapper following the upstream removal of the deprecated `emitc.apply`
   operation, whose functionality is covered by the existing `address_of` and `dereference` operation wrappers.
+- Removed the 22 named Linalg elementwise operations deleted upstream. Use `linalg.elementwise` with `ElementwiseKind`.
 - Removed Mosaic GPU `wait` and temporary `arrive_dyn_expect_tx_supported` wrappers removed by the pinned JAX revision.
 
 ## [0.0.2] - 2026-03-02

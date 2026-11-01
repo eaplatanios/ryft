@@ -385,7 +385,7 @@ pub(crate) mod tests {
     };
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{test_cpu_client, test_cpu_plugin};
-    use crate::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
+    use crate::{BufferType, ExecutionDeviceInputs, ExecutionInput, NamedValue, Program};
 
     const TEST_CALL_FRAME_USER_DATA_TYPE_NAME: &str = "ryft.test.ffi.call_frame.user_data";
     const TEST_CALL_FRAME_USER_DATA_TYPE_ID: FfiTypeId = FfiTypeId::new(9_000_001);
@@ -527,6 +527,7 @@ pub(crate) mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         };
         let executable = client.compile(&program, &options).unwrap();
         let execution_context = client.execution_context().unwrap();
@@ -545,7 +546,18 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        let execution = executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None).unwrap();
+        let execution = executable
+            .execute(
+                vec![inputs],
+                vec![],
+                0,
+                Some(execution_context),
+                None,
+                None,
+                None,
+                &[NamedValue::new("runtime_option", 42i64)],
+            )
+            .unwrap();
         assert!(execution.fence().block_until_ready().is_ok());
         assert!(handler.is_none(), "test call-frame handler was never invoked");
         if let Some(panic_payload) = panic_payload {
@@ -706,6 +718,7 @@ pub(crate) mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         };
 
         let executable = client.compile(&program, &options).unwrap();
@@ -744,7 +757,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let execution = executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None).unwrap();
+        let execution =
+            executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None, &[]).unwrap();
         let mut outputs = execution.block_until_ready().unwrap();
         assert_eq!(outputs.len(), 1);
         let mut outputs = outputs.remove(0);

@@ -1092,7 +1092,7 @@ mod tests {
         StorageSpecifierKindAttributeRef,
         CoordinateMemorySize,
         ValueMemorySize,
-        "#sparse_tensor<kind ",
+        "#sparse_tensor.kind<",
     );
 
     sparse_tensor_enum_attribute_tests!(
@@ -1102,7 +1102,7 @@ mod tests {
         SortKindAttributeRef,
         QuickSort,
         HeapSort,
-        "#sparse_tensor<SparseTensorSortAlgorithm ",
+        "#sparse_tensor.SparseTensorSortAlgorithm<",
     );
 
     sparse_tensor_enum_attribute_tests!(
@@ -1112,6 +1112,6 @@ mod tests {
         CoordinateTranslationDirectionAttributeRef,
         DimensionToLevel,
         LevelToDimension,
-        "#sparse_tensor<CrdTransDirection ",
+        "#sparse_tensor.CrdTransDirection<",
     );
 }

@@ -343,7 +343,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_cmpxchg_test(%arg0: !llvm.ptr, %arg1: i32, %arg2: i32) -> !llvm.struct<(i32, i1)> {
-                    %0 = llvm.cmpxchg weak volatile %arg0, %arg1, %arg2 syncscope(\"singlethread\") acquire monotonic {alignment = 4 : i64} : !llvm.ptr, i32
+                    %0 = llvm.cmpxchg weak volatile %arg0, %arg1, %arg2 syncscope(\"singlethread\") acquire monotonic <alignment = 4> : !llvm.ptr, i32
                     return %0 : !llvm.struct<(i32, i1)>
                   }
                 }
@@ -403,7 +403,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_atomicrmw_test(%arg0: !llvm.ptr, %arg1: i32) -> i32 {
-                    %0 = llvm.atomicrmw volatile add %arg0, %arg1 monotonic {alignment = 4 : i64} : !llvm.ptr, i32
+                    %0 = llvm.atomicrmw volatile add %arg0, %arg1 monotonic <alignment = 4> : !llvm.ptr, i32
                     return %0 : i32
                   }
                 }

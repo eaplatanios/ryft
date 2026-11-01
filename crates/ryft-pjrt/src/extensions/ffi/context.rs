@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use crate::extensions::ffi::attributes::FfiAttributes;
 use crate::extensions::ffi::errors::FfiError;
 use crate::extensions::ffi::handlers::{FfiApi, FfiExecutionStage};
 use crate::extensions::ffi::types::FfiTypeId;
@@ -70,7 +71,7 @@ impl FfiUserData {
 /// independently. When adding a field to a native extension struct, its definition must update the `last_field`
 /// argument of `XLA_FFI_DEFINE_STRUCT_TRAITS` to keep the reported ABI size consistent with the struct layout.
 /// These requirements are defined by the [XLA FFI extension contract](
-/// https://github.com/openxla/xla/blob/eb6b90ed013f511eca088c52f541f3c0819f919e/xla/ffi/api/c_api.h#L79).
+/// https://github.com/openxla/xla/blob/f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163/xla/ffi/api/c_api.h#L79).
 #[derive(Copy, Clone)]
 pub struct FfiContextExtension<'o> {
     /// Handle that represents this [`FfiContextExtension`] in the XLA FFI API.
@@ -170,6 +171,15 @@ impl<'o> FfiExecutionContext<'o> {
             return Ok(None);
         }
         unsafe { FfiContextExtension::from_c_api(handle) }.map(Some)
+    }
+
+    /// Returns the per-execution runtime options supplied through [`crate::LoadedExecutable::execute`]. These
+    /// attributes are borrowed from this invocation and are separate from the call frame's static attributes.
+    pub fn custom_options(&self) -> Result<FfiAttributes<'o>, FfiError> {
+        use ffi::XLA_FFI_CustomOptions_Get_Args;
+        let attributes =
+            invoke_xla_ffi_api_error_fn!(self.api, XLA_FFI_CustomOptions_Get, { ctx = self.handle }, { attrs })?;
+        unsafe { FfiAttributes::from_c_api(attributes) }
     }
 
     /// Returns opaque user data from this [`FfiExecutionContext`] for the provided `type_id`.
@@ -314,6 +324,7 @@ impl<'o> FfiExecutionContext<'o> {
 pub(crate) mod ffi {
     use std::marker::{PhantomData, PhantomPinned};
 
+    use crate::extensions::ffi::attributes::ffi::XLA_FFI_Attrs;
     use crate::extensions::ffi::errors::ffi::XLA_FFI_Error;
     use crate::extensions::ffi::handlers::ffi::{XLA_FFI_ExecutionStage, XLA_FFI_InternalExtension};
     use crate::extensions::ffi::types::ffi::XLA_FFI_TypeId;
@@ -363,6 +374,23 @@ pub(crate) mod ffi {
 
     pub type XLA_FFI_InvokeContext_FindExtension =
         unsafe extern "C" fn(args: *mut XLA_FFI_InvokeContext_FindExtension_Args) -> *mut XLA_FFI_Error;
+
+    #[repr(C)]
+    pub struct XLA_FFI_CustomOptions_Get_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub ctx: *mut XLA_FFI_InvokeContext,
+        pub attrs: *const XLA_FFI_Attrs,
+    }
+
+    impl XLA_FFI_CustomOptions_Get_Args {
+        pub fn new(ctx: *mut XLA_FFI_InvokeContext) -> Self {
+            Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), ctx, attrs: std::ptr::null() }
+        }
+    }
+
+    pub type XLA_FFI_CustomOptions_Get =
+        unsafe extern "C" fn(args: *mut XLA_FFI_CustomOptions_Get_Args) -> *mut XLA_FFI_Error;
 
     #[repr(C)]
     pub struct XLA_FFI_InvokeContext_Get_Args {
@@ -714,6 +742,20 @@ mod tests {
                 Err(FfiError::Unimplemented { message, .. })
                     if message == "`XLA_FFI_InvokeContext_FindExtension` is not implemented in the loaded XLA FFI API (version 0.0)",
             ));
+        });
+    }
+
+    #[test]
+    fn test_ffi_execution_context_custom_options() {
+        with_test_ffi_call_frame(|call_frame| {
+            let context = call_frame.context().unwrap();
+            let options = context.custom_options().unwrap();
+            assert_eq!(options.len(), 1);
+            assert!(matches!(
+                options.get("runtime_option").unwrap(),
+                crate::extensions::ffi::FfiAttribute::Scalar { scalar: crate::extensions::ffi::FfiScalar::I64(42) },
+            ));
+            assert_eq!(options.contains_key("scalar_attr"), Ok(false));
         });
     }
 

@@ -696,7 +696,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 format!("{:?}", op),
-                "DetachedCallOperation[%0 = func.call @identity(<<UNKNOWN SSA VALUE>>) {no_inline} : (i32) -> i32\n]",
+                "DetachedCallOperation[%0 = func.call @identity(<<UNKNOWN SSA VALUE>>) <no_inline> : (i32) -> i32\n]",
             );
 
             // Test equality and hashing as a fly-by in here.
@@ -765,7 +765,7 @@ mod tests {
                     return %arg0 : i32
                   }
                   func.func @caller(%arg0: i32) -> i32 {
-                    %0 = call @identity(%arg0) {no_inline} : (i32) -> i32
+                    %0 = call @identity(%arg0) <no_inline> : (i32) -> i32
                     return %0 : i32
                   }
                 }
@@ -894,10 +894,10 @@ mod tests {
                     return %arg0 : f64
                   }
                   func.func @multi_arg(%arg0: f64, %arg1: f64, %arg2: f64) -> f64 {
-                    %0 = call @identity(%arg2) {\
+                    %0 = call @identity(%arg2) <\
                       arg_attrs = [{dummy = \"42\"}], \
                       res_attrs = [{\"42\" = \"dummy\"}]\
-                    } : (f64) -> f64
+                    > : (f64) -> f64
                     %1 = call @identity(%arg1) : (f64) -> f64
                     %2 = call @identity(%arg0) : (f64) -> f64
                     return %2 : f64
@@ -1079,10 +1079,9 @@ mod tests {
                   }
                   func.func @caller(%arg0: f64, %arg1: i64) -> i64 {
                     %f = constant @identity : (f64) -> f64
-                    %0 = call_indirect %f(%arg0) {\
+                    %0 = call_indirect %f(%arg0) \
                       arg_attrs = [{dummy = \"42\"}], \
-                      res_attrs = [{\"42\" = \"dummy\"}]\
-                    } : (f64) -> f64
+                      res_attrs = [{\"42\" = \"dummy\"}] : (f64) -> f64
                     return %arg1 : i64
                   }
                 }

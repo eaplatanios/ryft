@@ -1243,7 +1243,7 @@ mod tests {
     fn test_dimension_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_dimension_attribute(Dimension::X).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<dim x>");
+        test_attribute_display_and_debug(attribute, "#gpu.dim<x>");
     }
 
     #[test]
@@ -1284,7 +1284,7 @@ mod tests {
     fn test_all_reduce_operation_kind_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<all_reduce_op add>");
+        test_attribute_display_and_debug(attribute, "#gpu.all_reduce_op<add>");
     }
 
     #[test]
@@ -1325,7 +1325,7 @@ mod tests {
     fn test_shuffle_mode_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<shuffle_mode xor>");
+        test_attribute_display_and_debug(attribute, "#gpu.shuffle_mode<xor>");
     }
 
     #[test]
@@ -1367,7 +1367,7 @@ mod tests {
     fn test_mma_elementwise_operation_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<mma_element_wise addf>");
+        test_attribute_display_and_debug(attribute, "#gpu.mma_element_wise<addf>");
     }
 
     #[test]
@@ -1415,7 +1415,7 @@ mod tests {
         let context = Context::new();
         let attribute =
             context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<prune_2to4_spmat_flag PRUNE_ONLY>");
+        test_attribute_display_and_debug(attribute, "#gpu.prune_2to4_spmat_flag<PRUNE_ONLY>");
     }
 
     #[test]
@@ -1457,7 +1457,7 @@ mod tests {
     fn test_matrix_transpose_mode_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<mat_transpose_mode NON_TRANSPOSE>");
+        test_attribute_display_and_debug(attribute, "#gpu.mat_transpose_mode<NON_TRANSPOSE>");
     }
 
     #[test]
@@ -1498,7 +1498,7 @@ mod tests {
     fn test_sp_gemm_work_kind_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<spgemm_work_estimation_or_compute_kind WORK_ESTIMATION>");
+        test_attribute_display_and_debug(attribute, "#gpu.spgemm_work_estimation_or_compute_kind<WORK_ESTIMATION>");
     }
 
     #[test]
@@ -1539,7 +1539,7 @@ mod tests {
     fn test_broadcast_type_attribute_display_and_debug() {
         let context = Context::new();
         let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
-        test_attribute_display_and_debug(attribute, "#gpu<broadcast first_active_lane>");
+        test_attribute_display_and_debug(attribute, "#gpu.broadcast<first_active_lane>");
     }
 
     #[test]

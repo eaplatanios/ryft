@@ -18,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 from unittest.mock import patch
@@ -447,7 +448,7 @@ def symbol_tool() -> tuple[str, list[str]]:
 
 
 def missing_symbols(required_symbols: set[str], emitted_symbols: Iterable[str]) -> list[str]:
-    """Returns required symbols that are absent, ignoring duplicate definitions."""
+    """Returns required symbols that are absent from the library."""
     return sorted(required_symbols - set(emitted_symbols))
 
 
@@ -473,7 +474,7 @@ def forbidden_symbols(emitted_symbols: Iterable[str]) -> list[str]:
 
 
 def check_archive_symbols(archive_path: Path, required_symbols: set[str]) -> None:
-    """Checks the built library against the validated source symbols and CPU-only restrictions."""
+    """Checks required exports, unique MLIR C API definitions, and CPU-only restrictions."""
     tool, arguments = symbol_tool()
 
     with tempfile.TemporaryDirectory() as temporary_directory:
@@ -496,10 +497,15 @@ def check_archive_symbols(archive_path: Path, required_symbols: set[str]) -> Non
         )
 
     emitted_symbols = set()
+    mlir_definitions: Counter[str] = Counter()
     for line in completed.stdout.splitlines():
         if not line.strip() or line.rstrip().endswith(":"):
             continue
-        emitted_symbol = line.split()[-1]
+        fields = line.split()
+        emitted_symbol = fields[-1]
+        c_symbol = emitted_symbol.removeprefix("_")
+        if len(fields) >= 2 and fields[-2] == "T" and c_symbol.startswith("mlir"):
+            mlir_definitions[c_symbol] += 1
         if emitted_symbol.startswith("_") and emitted_symbol[1:] in required_symbols:
             emitted_symbol = emitted_symbol[1:]
         emitted_symbols.add(emitted_symbol)
@@ -507,6 +513,9 @@ def check_archive_symbols(archive_path: Path, required_symbols: set[str]) -> Non
     missing = missing_symbols(required_symbols, emitted_symbols)
     if missing:
         raise AssertionError("missing required symbols:\n" + "\n".join(missing))
+    duplicates = sorted(symbol for symbol, count in mlir_definitions.items() if count > 1)
+    if duplicates:
+        raise AssertionError("duplicate MLIR C API definitions:\n" + "\n".join(duplicates))
     forbidden = forbidden_symbols(emitted_symbols)
     if forbidden:
         raise AssertionError("CPU archive defines CUDA-only runtime symbols:\n" + "\n".join(forbidden))
@@ -1070,8 +1079,8 @@ class ContractTests(unittest.TestCase):
             f"validated source and archive contracts with {len(symbols)} required symbols\n",
         )
 
-    def test_main_rejects_missing_and_forbidden_archive_symbols(self) -> None:
-        """Ensures the combined CLI still enforces both sides of the archive symbol contract."""
+    def test_main_rejects_invalid_archive_symbols(self) -> None:
+        """Rejects missing exports, CUDA-only exports, and mixed MLIR C API target families."""
         arguments = self.fixture.args()
         archive_path = arguments.ryft_xla_sys_root / "archive.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
@@ -1081,6 +1090,11 @@ class ContractTests(unittest.TestCase):
         for emitted, message in (
             (symbols - {missing}, "missing required symbols"),
             (symbols | {"cuLaunchKernel"}, "CPU archive defines CUDA-only runtime symbols"),
+            (sorted(symbols) + ["mlirContextCreate"] * 2, "duplicate MLIR C API definitions"),
+            (
+                [f"_{symbol}" for symbol in sorted(symbols)] + ["_mlirContextCreate"] * 2,
+                "duplicate MLIR C API definitions",
+            ),
         ):
             with self.subTest(message=message):
                 completed = subprocess.CompletedProcess(
@@ -1114,7 +1128,7 @@ class ContractTests(unittest.TestCase):
 class SymbolContractTests(unittest.TestCase):
     """Covers the presence and absence symbol contracts."""
 
-    def test_duplicate_definitions_are_accepted(self) -> None:
+    def test_presence_check_ignores_duplicate_definitions(self) -> None:
         self.assertEqual(missing_symbols({"required"}, ["required", "required"]), [])
 
     def test_forbidden_symbols_classifier(self) -> None:

@@ -125,7 +125,7 @@ XLA_DEPENDENCIES = [
     "@stablehlo//:vhlo_capi",
     "@xla//xla/ffi/api:c_api",
     "@xla//xla/mlir_hlo:CAPI",
-    "@xla//xla/mosaic:tpu_dialect_capi_objects",
+    "@xla//xla/mosaic:tpu_dialect_capi",
     "@xla//xla/pjrt/c:pjrt_c_api_abi_version_extension_hdrs",
     "@xla//xla/pjrt/c:pjrt_c_api_ffi_extension_hdrs",
     "@xla//xla/pjrt/c:pjrt_c_api_layouts_extension_hdrs",
