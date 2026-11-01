@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Native builds now use Bazel 8.8.2, CCCL 3.4.0 and XLA's pinned ROCm 10.0.0 multiarch distribution.
 - Updated the ROCm plugin feature, artifact names, environment variables and path accessor to ROCm 10.
 - Removed the obsolete `enable_libnvjitlink_support` Bazel flag following XLA's unconditional nvJitLink support.
+- Removed the CUDA 12 `sm_50` target because the pinned Eigen headers require compute capability 6.0 or newer.
 - Used the shared Bash copy recipe for LLVM operation shards on Windows and preserved copied C++ source bytes.
 - Regenerated native bindings for XLA FFI custom options, split GPU pass registrations and the LLVM C API changes,
   including the additional DI string type character-type argument and removal of obsolete MHLO domain attributes.

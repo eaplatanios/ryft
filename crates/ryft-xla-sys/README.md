@@ -172,8 +172,9 @@ Currently, precompiled binaries are only available for the following target plat
 - **PJRT Plugin for MPS (`jax-mps`):**
     - MacOS `aarch64`
 
-CUDA 12 and CUDA 13 build rows prove that the plugins and their native dependencies compile and link. They do not claim
-GPU execution. Executable Mosaic GPU and cuTile seam probes require the dedicated Linux NVIDIA workflow, a supported
+The CUDA 12 plugin targets compute capability 6.0 or newer, following the pinned Eigen headers' minimum. CUDA 12 and
+CUDA 13 build rows prove that the plugins and their native dependencies compile and link. They do not claim GPU
+execution. Executable Mosaic GPU and cuTile seam probes require the dedicated Linux NVIDIA workflow, a supported
 compute capability, NVIDIA driver r580 or newer, CUDA Toolkit 13.1 or newer, and the pinned cuTile toolchain.
 
 ### Native Archive Contract
