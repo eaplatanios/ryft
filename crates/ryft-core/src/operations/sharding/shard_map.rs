@@ -213,7 +213,7 @@ use crate::programs::{
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena,
     RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
-    ValueProjection, discharge_reference_free_operation,
+    ValueProjection,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
 
@@ -1963,7 +1963,7 @@ where
         let allocations =
             inputs.iter().map(|input| context.boundary_allocation(input)).collect::<Result<Vec<_>, _>>()?;
         if allocations.iter().all(Option::is_none) && !body.contains_references_in_closure() {
-            return discharge_reference_free_operation(self, context, driver, inputs);
+            return context.discharge_reference_free_operation(self, driver, inputs);
         }
         for (second_input_index, allocation) in allocations.iter().enumerate() {
             if let Some(allocation) = allocation

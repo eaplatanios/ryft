@@ -631,7 +631,7 @@ impl OperationCodeGenerator {
                     >>::discharge_references(#receiver, context, driver, inputs)
                 })
             } else {
-                variant.wildcard_arm(quote!(#ryft::discharge_reference_free_operation(self, context, driver, inputs)))
+                variant.wildcard_arm(quote!(context.discharge_reference_free_operation(self, driver, inputs)))
             }
         });
         let (impl_generics, _, where_clause) = generics.split_for_impl();
@@ -960,11 +960,11 @@ impl OperationCodeGenerator {
                         batch_in_parent(#receiver, context, driver, inputs)
                 },
                 OperationVariantClass::ProjectedMember { structural: false, .. } => {
-                    quote!(#ryft::batch_projected_operation(context, #receiver, inputs))
+                    quote!(context.batch_projected_operation(#receiver, inputs))
                 }
                 OperationVariantClass::ProjectedMember { member_type, structural: true } => {
                     quote! {
-                        #ryft::batch_replicated_projected_operation::<#member_type, _, _>(context, #receiver, inputs)
+                        context.batch_replicated_projected_operation::<#member_type>(#receiver, inputs)
                     }
                 }
             })
@@ -1099,7 +1099,7 @@ impl OperationCodeGenerator {
                                 #member_function(#receiver, context, driver, inputs)
                         }),
                         OperationVariantClass::ProjectedMember { structural: true, .. } => {
-                            variant.wildcard_arm(quote!(#ryft::jvp_structural_operation(context, self.clone(), inputs)))
+                            variant.wildcard_arm(quote!(context.jvp_structural_operation(self.clone(), inputs)))
                         }
 
                         // Each output's zero tangent is staged in the computational member universe that the output
@@ -1108,8 +1108,7 @@ impl OperationCodeGenerator {
                         OperationVariantClass::MixedMember { member_type, structural: true } => {
                             let tangent_universes = self.tangent_universes(member_type);
                             variant.wildcard_arm(quote! {
-                                #ryft::jvp_structural_mixed_operation(
-                                    context,
+                                context.jvp_structural_mixed_operation(
                                     self.clone(),
                                     inputs,
                                     |context, primal_inputs, output_type| {
@@ -1253,7 +1252,7 @@ impl OperationCodeGenerator {
                     variant.wildcard_arm(quote!(::std::result::Result::Ok(())))
                 }
                 OperationVariantClass::MixedMember { .. } => variant.arm(quote! {
-                    #ryft::transpose_mixed_operation(context, #receiver, inputs, outputs, accumulators)
+                    context.transpose_mixed_operation(#receiver, inputs, outputs, accumulators)
                 }),
             }
         });
@@ -2449,8 +2448,6 @@ fn is_unconditionally_static(ty: &syn::Type, generics: &syn::Generics) -> bool {
     !mentions(ty.to_token_stream(), &parameters)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -2496,16 +2493,6 @@ mod tests {
     fn generics_rendering(generics: &syn::Generics) -> String {
         let where_clause = &generics.where_clause;
         rendering(&quote!(#generics #where_clause))
-    }
-
-    /// Parses the variant marker in the provided attribute into an [`OperationVariantClass`].
-    fn parse_class(attribute: syn::Attribute, members: &[OperationMember]) -> syn::Result<OperationVariantClass> {
-        let mut class = None;
-        attribute.parse_nested_meta(|meta| {
-            class = Some(OperationVariantClass::parse(&meta, members)?);
-            Ok(())
-        })?;
-        Ok(class.unwrap())
     }
 
     #[test]
@@ -3340,7 +3327,7 @@ mod tests {
                                 >>::discharge_references(operation, context, driver, inputs)
                             },
                             Self::Array(..) => {
-                                ryft::discharge_reference_free_operation(self, context, driver, inputs)
+                                context.discharge_reference_free_operation(self, driver, inputs)
                             },
                             Self::Extension(operation) => {
                                 <Extension as ryft::ReferenceDischargeableOperation<
@@ -3592,11 +3579,10 @@ mod tests {
                                 >>::batch(operation, context, driver, inputs)
                             },
                             Self::Array(operation) => {
-                                ryft::batch_projected_operation(context, operation, inputs)
+                                context.batch_projected_operation(operation, inputs)
                             },
                             Self::Dimension(operation) => {
-                                ryft::batch_replicated_projected_operation::<DimensionType, _, _>(
-                                    context,
+                                context.batch_replicated_projected_operation::<DimensionType>(
                                     operation,
                                     inputs,
                                 )
@@ -3726,7 +3712,7 @@ mod tests {
                                 jvp_in_parent(operation, context, driver, inputs)
                         },
                         Self::Dimension(..) => {
-                            ryft::jvp_structural_operation(context, self.clone(), inputs)
+                            context.jvp_structural_operation(self.clone(), inputs)
                         },
                         Self::Gather(operation) => {
                             <GatherOperation as ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
@@ -3821,8 +3807,7 @@ mod tests {
                 > {
                     match self {
                         Self::Zero(..) => {
-                            ryft::jvp_structural_mixed_operation(
-                                context,
+                            context.jvp_structural_mixed_operation(
                                 self.clone(),
                                 inputs,
                                 |context, primal_inputs, output_type| {
@@ -3940,7 +3925,7 @@ mod tests {
                                 ::std::result::Result::Ok(())
                             },
                             Self::Gather(operation) => {
-                                ryft::transpose_mixed_operation(context, operation, inputs, outputs, accumulators)
+                                context.transpose_mixed_operation(operation, inputs, outputs, accumulators)
                             },
                         }
                     }
@@ -4352,15 +4337,22 @@ mod tests {
             OperationMember { r#type: syn::parse_quote!(ArrayType), structural: false },
             OperationMember { r#type: syn::parse_quote!(DimensionType), structural: true },
         ];
-        let class = |attribute: syn::Attribute, members: &[OperationMember]| match parse_class(attribute, members) {
-            Ok(OperationVariantClass::ProjectedMember { member_type, structural }) => {
-                Ok(("projected", member_type.to_compact_string(), structural))
+        let class = |attribute: syn::Attribute, members: &[OperationMember]| {
+            let mut parsed_class = None;
+            let parsing = attribute.parse_nested_meta(|meta| {
+                parsed_class = Some(OperationVariantClass::parse(&meta, members)?);
+                Ok(())
+            });
+            match parsing.map(|()| parsed_class.unwrap()) {
+                Ok(OperationVariantClass::ProjectedMember { member_type, structural }) => {
+                    Ok(("projected", member_type.to_compact_string(), structural))
+                }
+                Ok(OperationVariantClass::MixedMember { member_type, structural }) => {
+                    Ok(("mixed", member_type.to_compact_string(), structural))
+                }
+                Ok(OperationVariantClass::FamilyNative) => unreachable!(),
+                Err(error) => Err(error.to_string()),
             }
-            Ok(OperationVariantClass::MixedMember { member_type, structural }) => {
-                Ok(("mixed", member_type.to_compact_string(), structural))
-            }
-            Ok(OperationVariantClass::FamilyNative) => unreachable!(),
-            Err(error) => Err(error.to_string()),
         };
 
         // Test parsing both member boundaries with both roles, with explicit and with defaulted member types.

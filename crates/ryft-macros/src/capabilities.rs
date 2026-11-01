@@ -1,6 +1,3 @@
-//! Expansion of the `#[capability]` attribute, which validates the conventions of capability traits and generates the
-//! implementations through which heterogeneous values apply a capability by projecting onto their members.
-
 use std::fmt::Display;
 
 use proc_macro2::TokenStream;
@@ -12,8 +9,6 @@ use crate::helpers::attributes::Attribute;
 use crate::helpers::idents::IdentHelpers;
 use crate::helpers::symbols::Symbol;
 use crate::helpers::tokens::TokensHelpers;
-
-// TODO(eaplatanios): Review this module.
 
 const CRATE_ARGUMENT: Symbol = Symbol::new("crate");
 const PROJECTION_ARGUMENT: Symbol = Symbol::new("projection");
@@ -45,15 +40,15 @@ pub(crate) struct CapabilityCodeGenerator {
 }
 
 impl CapabilityCodeGenerator {
-    /// Generates the `#[capability]` expansion for the provided attribute arguments and annotated trait. The expansion
-    /// always contains the annotated trait itself, followed by one projection implementation per
+    /// Generates the `#[capability]` expansion for the provided attribute arguments and annotated trait.
+    /// The expansion always contains the annotated trait itself, followed by one projection implementation per
     /// `projection(Family => Member)` argument. If any errors are encountered, the projection implementations are
-    /// replaced by a [`compile_error!`] invocation, while the trait is still emitted, so that its uses elsewhere do not
-    /// report additional errors about a missing trait.
+    /// replaced by a [`compile_error!`] invocation, while the trait is still emitted, so that its uses elsewhere
+    /// do not report additional errors about a missing trait.
     ///
     /// As an example, `#[capability(projection(ArrayIrType => ArrayType))]` applied to a capability
-    /// `trait Double<T = <Self as Capability>::Universe>: Capability + Sized` with one required function `double`
-    /// generates the following implementation next to the trait:
+    /// `trait Double<T = <Self as Capability>::Universe>: Capability + Sized` with one required function
+    /// `double` generates the following implementation next to the trait:
     ///
     /// ```ignore
     /// impl<__V> Double<ArrayIrType> for __V
@@ -225,8 +220,8 @@ impl CapabilityCodeGenerator {
     }
 
     /// Generates the implementation of the provided capability for every value of the projection family whose
-    /// `ValueProjection` onto the projection member yields a value that implements the capability itself. Any parts of
-    /// the capability that cannot be projected are reported as errors.
+    /// `ValueProjection` onto the projection member yields a value that implements the capability itself. Any
+    /// parts of the capability that cannot be projected are reported as errors.
     ///
     /// The implementation restates the supertraits and the `where` predicates of the capability as bounds on the
     /// implementing value, with its universe parameter read as the projection family, so that it only applies to the
@@ -469,6 +464,8 @@ struct Projection {
     /// Universe of the member values onto which the heterogeneous values project.
     member: syn::Type,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`VisitMut`] that replaces every bare mention of a type parameter with a replacement type.
 struct TypeParameterReplacer<'r> {

@@ -19,7 +19,6 @@ use ryft_core::{
     RegionInterface, RegionLiveness, RegionRef, RegionSlot, RematerializationOptimizationBarrier, ShardMapOperation,
     Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
     TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero,
-    discharge_positional_region_operation,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -936,7 +935,7 @@ where
             }
             None => None,
         };
-        discharge_positional_region_operation(self, context, driver, inputs, 0, |_, regions| {
+        context.discharge_positional_region_operation(self, driver, inputs, 0, |_, regions| {
             let Some(result_renaming) = result_renaming else { return Ok(self.clone()) };
             check_count!("region", regions, 1, TypeError);
             let input_types = regions[0].input_types();

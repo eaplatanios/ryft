@@ -23,12 +23,11 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
     ParameterizedCodeGenerator::generate_parameterized_impl(input)
 }
 
-// TODO(eaplatanios): Review this.
-/// Generates an `Operation` implementation for the enum this macro is applied on, together with the implementations
+/// Generates an [`Operation`] implementation for the enum this macro is applied on, together with the implementations
 /// through which the enum dispatches every other operation contract to the payload of its active variant.
 ///
-/// Every variant of the enum must wrap exactly one operation payload, which may be stored directly or boxed, and the
-/// enum then behaves like whichever payload it holds. The macro always generates the `Display`, `Operation`,
+/// Every variant of the enum must wrap exactly one operation payload, which may be stored directly or boxed, and
+/// the enum then behaves like whichever payload it holds. The macro always generates the `Display`, `Operation`,
 /// `InterpretableOperation`, `PartiallyEvaluatableOperation`, and `OperationPayloadProjection` implementations, one
 /// `OperationProjection` implementation per projected member variant, and the owned `From<Payload>` and borrowed
 /// `TryFrom<&Enum>` payload conversions. Unless a variant stores a native `GuardOperation`, it also generates an
@@ -71,10 +70,9 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_operation_impl(input)
 }
 
-// TODO(eaplatanios): Review this.
 /// Validates the conventions of the capability trait this attribute is applied on and, for every
-/// `projection(Family => Member)` argument, generates the implementation through which the values of the `Family`
-/// universe apply the capability by projecting onto their `Member` values.
+/// `projection(Family => Member)` argument, generates the implementation through which the values
+/// of the `Family` universe apply the capability by projecting onto their `Member` values.
 ///
 /// The attribute supports the following optional arguments:
 ///

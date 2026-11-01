@@ -66,9 +66,8 @@ use ryft_core::{
     ReshapeOperation, ReshardOperation, ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer,
     TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
     TypeError, Typed, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation,
-    batch, check_count, differentiate_at, discharge_reference_free_operation, impl_guardless_operation,
-    infer_reference_view_type, jvp_projected_operation, transpose_projected_operation,
-};
+    batch, check_count, differentiate_at, impl_guardless_operation,
+    infer_reference_view_type, };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
 /// concrete backend value family looks like from outside `ryft-core` and the domain every register value names.
@@ -831,7 +830,7 @@ where
         // before any rule runs, so only the allocation arm still distinguishes selected from preserved.
         match self {
             Self::Negate | Self::Add(_) | Self::Zero(_) | Self::One | Self::BitExtract | Self::BitInsert => {
-                discharge_reference_free_operation(self, context, driver, inputs)
+                context.discharge_reference_free_operation(self, driver, inputs)
             }
             Self::ReferenceNew(_) => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -2169,7 +2168,7 @@ fn test_downstream_reference_operation_providers_support_value_only_array_ir_fam
             _driver: &D,
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            jvp_projected_operation(context, self, inputs)
+            context.jvp_projected_operation(self, inputs)
         }
     }
 
@@ -2182,7 +2181,7 @@ fn test_downstream_reference_operation_providers_support_value_only_array_ir_fam
             outputs: &[MaybeZero<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
             accumulators: &[CotangentAccumulator],
         ) -> Result<(), DifferentiationError> {
-            transpose_projected_operation(context, self, inputs, outputs, accumulators)
+            context.transpose_projected_operation(self, inputs, outputs, accumulators)
         }
     }
 
@@ -2767,7 +2766,7 @@ mod custom_array_transforms {
                 Self::Core(CoreOperation::ReferenceFreeze(operation)) => {
                     operation.discharge_references(context, driver, inputs)
                 }
-                Self::Core(_) => discharge_reference_free_operation(self, context, driver, inputs),
+                Self::Core(_) => context.discharge_reference_free_operation(self, driver, inputs),
             }
         }
     }
