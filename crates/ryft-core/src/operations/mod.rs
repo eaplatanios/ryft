@@ -236,9 +236,14 @@ pub use trigonometric::{
 /// operation while concrete values only validate it) must be required instead, so that heterogeneous values project it
 /// too. Type parameters that precede the universe must default to `Self` (e.g., a right input declared as
 /// `Rhs = Self`), and they resolve to the heterogeneous value in the implemented capability and to its projection in
-/// the delegated one. The generated code refers to the `ryft` crate, and a `crate = "path"` argument overrides that
-/// path (e.g., for crates that depend on `ryft-core` directly). Capabilities whose array IR implementations are
-/// irregular (e.g., [`Sort`] or [`Gather`]) keep handwritten implementations and use the bare attribute.
+/// the delegated one. The supertraits and `where` predicates of the capability (other than [`Capability`] itself) are
+/// restated as bounds of the generated implementation, with its universe parameter read as `Family`, so that the
+/// implementation applies exactly to the heterogeneous values that satisfy them. The generated functions keep the
+/// `#[cfg]` attributes of their capability functions. The generated code refers to the `ryft` crate, and a
+/// `crate = "path"` argument overrides that path (e.g., for crates that depend on `ryft-core` directly). Each family
+/// may be projected at most once. Capabilities whose array IR implementations are irregular (e.g., [`Sort`] or
+/// [`Gather`]) keep handwritten implementations and use the bare attribute. When the attribute reports errors,
+/// it still emits the annotated trait, so that its uses do not report additional errors.
 ///
 /// ```rust
 /// # extern crate ryft_core as ryft;

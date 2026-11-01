@@ -46,7 +46,7 @@ pub use batching::{
     BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
     RecursiveBatchingDriver, RecursiveBatchingPolicy, ReplicatedBatchingPolicyProjection, batch,
-    batch_projected_operation, batch_replicated_projected_operation, check_batching_rule_consistency,
+    check_batching_rule_consistency,
 };
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::{
@@ -85,9 +85,7 @@ pub use differentiation::{
     SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, TangentActivity,
     TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
     UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture,
-    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_for_transpose_projected_operation,
-    jvp_projected_operation, rematerialize, saved_residuals, transpose_mixed_operation, transpose_projected_operation,
-    unary_elementwise_jvp,
+    WithoutContext, binary_elementwise_jvp, differentiate_at, rematerialize, saved_residuals, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -223,12 +221,11 @@ pub use programs::{
     RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
     TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
     TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch,
-    ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
-    infer_reference_view_type, prune_projected_operation_boundary, rewrite_reference_access_transforms,
-    type_identities_needing_runtime_checks, validate_projected_operation_region_interfaces,
-    validate_reference_boundary, validated_reference_access_descriptors,
+    ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms, fold_projected_operation,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types, infer_reference_view_type,
+    prune_projected_operation_boundary, rewrite_reference_access_transforms, type_identities_needing_runtime_checks,
+    validate_projected_operation_region_interfaces, validate_reference_boundary,
+    validated_reference_access_descriptors,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,

@@ -1538,15 +1538,16 @@ macro_rules! impl_guardless_operation {
 /// two shared rules, selected explicitly at the call site:
 ///
 ///   - `@reference_free` delegates to
-///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation). The operation is replayed
-///     verbatim, executing eagerly or staging according to the parent context. Attached regions are copied unchanged,
-///     and reference instruction inputs or references anywhere in their closures are rejected.
+///     [`discharge_reference_free_operation`](crate::ReferenceDischargeContext::discharge_reference_free_operation).
+///     The operation is replayed verbatim, executing eagerly or staging according to the parent context. Attached
+///     regions are copied unchanged, and reference instruction inputs or references anywhere in their closures are
+///     rejected.
 ///   - `@local_reference` delegates to
-///     [`discharge_local_reference_operation`](crate::discharge_local_reference_operation). Every attached region is
-///     rebuilt to discharge local reference state, including dormant derivative regions. Reference instruction inputs,
-///     reference region inputs, and captures reaching caller allocations are rejected. This rule does not widen
-///     interfaces to thread external state. Each region is rewritten independently, so their signatures need not match.
-///     The operation is rebound with those regions and validates their rebuilt interfaces.
+///     [`discharge_local_reference_operation`](crate::ReferenceDischargeContext::discharge_local_reference_operation).
+///     Every attached region is rebuilt to discharge local reference state, including dormant derivative regions.
+///     Reference instruction inputs, reference region inputs, and captures reaching caller allocations are rejected.
+///     This rule does not widen interfaces to thread external state. Each region is rewritten independently, so their
+///     signatures need not match. The operation is rebound with those regions and validates their rebuilt interfaces.
 ///
 /// The `@reference_free` precondition is _reference freedom_, not effect purity. An operation with ordered
 /// or other effects replays here perfectly well, because replaying it reproduces those effects in the destination
@@ -1614,7 +1615,7 @@ macro_rules! impl_reference_dischargeable_operation {
                 driver: &__D,
                 inputs: &[$crate::ReferenceDischargeValue<__C, __P>],
             ) -> Result<Vec<$crate::ReferenceDischargeValue<__C, __P>>, $crate::ProgramError> {
-                $crate::$function(self, context, driver, inputs)
+                context.$function(self, driver, inputs)
             }
         }
     };

@@ -36,7 +36,7 @@ use crate::programs::{
     OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value, discharge_local_reference_operation,
+    TypeError, TypeIdentityRenaming, Typed, Value,
 };
 use crate::tracing::TracingContext;
 
@@ -931,7 +931,7 @@ where
             });
         }
         match &self.rules {
-            CompositeRules::Attached { .. } => discharge_local_reference_operation(self, context, driver, inputs),
+            CompositeRules::Attached { .. } => context.discharge_local_reference_operation(self, driver, inputs),
             CompositeRules::Retained { rules, batching, kept_outputs, .. } => {
                 let discharged = Self {
                     non_differentiated_count: self.non_differentiated_count,
@@ -943,7 +943,7 @@ where
                     },
                     marker: PhantomData,
                 };
-                discharge_local_reference_operation(&discharged, context, driver, inputs)
+                context.discharge_local_reference_operation(&discharged, driver, inputs)
             }
         }
     }

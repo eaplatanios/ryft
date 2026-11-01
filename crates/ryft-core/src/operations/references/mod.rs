@@ -136,7 +136,7 @@ pub(crate) mod tests {
         ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
         ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
         RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
-        ValueDirectDispatch, discharge_reference_free_operation,
+        ValueDirectDispatch,
     };
 
     use super::*;
@@ -606,7 +606,7 @@ pub(crate) mod tests {
             inputs: &[ReferenceDischargeValue<C, P>],
         ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
             match self {
-                Self::Add => discharge_reference_free_operation(self, context, driver, inputs),
+                Self::Add => context.discharge_reference_free_operation(self, driver, inputs),
                 Self::New(operation) => operation.discharge_references(context, driver, inputs),
                 Self::Read(operation) => operation.discharge_references(context, driver, inputs),
                 Self::Write(operation) => operation.discharge_references(context, driver, inputs),

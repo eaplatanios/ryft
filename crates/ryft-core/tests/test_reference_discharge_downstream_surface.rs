@@ -66,8 +66,8 @@ use ryft_core::{
     ReshapeOperation, ReshardOperation, ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer,
     TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
     TypeError, Typed, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation,
-    batch, check_count, differentiate_at, impl_guardless_operation,
-    infer_reference_view_type, };
+    batch, check_count, differentiate_at, impl_guardless_operation, infer_reference_view_type,
+};
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
 /// concrete backend value family looks like from outside `ryft-core` and the domain every register value names.

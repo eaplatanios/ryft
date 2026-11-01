@@ -18,7 +18,7 @@ use crate::batching::{
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
-    ResidualZeroProvider, TransposableOperation, transpose_projected_operation,
+    ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -1379,7 +1379,7 @@ impl_differentiable_operation! {
 
             // The explicit output extents are shape inputs with no cotangent contribution, so their accumulators are
             // left untouched and default to structural zeros.
-            transpose_projected_operation(context, &projected_operation, array_inputs, outputs, &accumulators[..2])?;
+            context.transpose_projected_operation(&projected_operation, array_inputs, outputs, &accumulators[..2])?;
             Ok(())
         }
     },

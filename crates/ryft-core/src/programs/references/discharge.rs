@@ -68,11 +68,14 @@
 //!    - Every operation implements [`ReferenceDischargeableOperation`], the rule that rewrites one application of that
 //!      operation. Reference primitives rewrite their own accesses, region-carrying operations decide how state is
 //!      added to their region boundaries, and everything else replays unchanged. Three shared rule bodies cover the
-//!      common cases: [`discharge_reference_free_operation`] for operations that touch no reference,
-//!      [`discharge_local_reference_operation`] for operations whose reference state stays within individual regions,
-//!      and [`discharge_positional_region_operation`] for region-carrying operations that forward their inputs to
-//!      their regions positionally, such as a condition or a call. Loop-shaped operations such as `while` and `scan`
-//!      write their own rules on top of the same machinery.
+//!      common cases:
+//!      [`discharge_reference_free_operation`](ReferenceDischargeContext::discharge_reference_free_operation) for
+//!      operations that touch no reference,
+//!      [`discharge_local_reference_operation`](ReferenceDischargeContext::discharge_local_reference_operation) for
+//!      operations whose reference state stays within individual regions, and
+//!      [`discharge_positional_region_operation`](ReferenceDischargeContext::discharge_positional_region_operation) for
+//!      region-carrying operations that forward their inputs to their regions positionally, such as a condition or a
+//!      call. Loop-shaped operations such as `while` and `scan` write their own rules on top of the same machinery.
 //!
 //! # How the Transform Works
 //!
@@ -4232,12 +4235,13 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// the destination exactly as the source performed them. Attached regions are copied into the destination as they
     /// stand, which is the complete rewrite for regions that hold no state to thread, unless an operation in a region
     /// defers part of its discharge (refer to [`Operation::defers_reference_discharge`]). Those regions are rebuilt by
-    /// [`discharge_local_reference_operation`] instead, so that the deferring operation records its discharge. An
-    /// application is rejected as soon as a reference appears among its inputs or anywhere inside an attached region's
-    /// closure. If references are confined to individual regions, [`discharge_local_reference_operation`] rebuilds
-    /// those regions without adding state inputs or outputs. If references cross a region boundary, the operation's
-    /// rule must specify how state is threaded through that boundary. For operations that forward their inputs to their
-    /// regions positionally, use [`discharge_positional_region_operation`].
+    /// [`discharge_local_reference_operation`](Self::discharge_local_reference_operation) instead, so that the
+    /// deferring operation records its discharge. An application is rejected as soon as a reference appears among its
+    /// inputs or anywhere inside an attached region's closure. If references are confined to individual regions,
+    /// [`discharge_local_reference_operation`](Self::discharge_local_reference_operation) rebuilds those regions
+    /// without adding state inputs or outputs. If references cross a region boundary, the operation's rule must specify
+    /// how state is threaded through that boundary. For operations that forward their inputs to their regions
+    /// positionally, use [`discharge_positional_region_operation`](Self::discharge_positional_region_operation).
     ///
     /// # Parameters
     ///
@@ -4292,12 +4296,13 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// need not share an interface or receive the operation's inputs positionally, which allows the same rule to handle
     /// custom derivative operations whose primal and derivative regions have different signatures.
     ///
-    /// Unlike [`discharge_reference_free_operation`], which copies reference-free regions unchanged, this function
-    /// rebuilds every attached region to discharge its local reference state, including derivative regions that are not
-    /// executed by the primal operation. Unlike [`discharge_positional_region_operation`], it does not widen boundaries
-    /// to thread caller state through the regions. Reference inputs, reference region inputs, and region closures that
-    /// reach caller allocations are therefore rejected. The operation is then rebound unchanged with the rebuilt
-    /// regions, so its own interface validation checks their compatibility.
+    /// Unlike [`discharge_reference_free_operation`](Self::discharge_reference_free_operation), which copies
+    /// reference-free regions unchanged, this function rebuilds every attached region to discharge its local
+    /// reference state, including derivative regions that are not executed by the primal operation. Unlike
+    /// [`discharge_positional_region_operation`](Self::discharge_positional_region_operation), it does not widen
+    /// boundaries to thread caller state through the regions. Reference inputs, reference region inputs, and region
+    /// closures that reach caller allocations are therefore rejected. The operation is then rebound unchanged with
+    /// the rebuilt regions, so its own interface validation checks their compatibility.
     ///
     /// # Parameters
     ///
@@ -4384,11 +4389,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// call, whose callee follows nothing. Loop-shaped operations such as `while` and `scan` carry their state
     /// symmetrically through a fixed point and need a rule of their own built on
     /// [`ReferenceDischargeRegionBoundary::symmetric`]. When the application touches no references,
-    /// [`discharge_reference_free_operation`] can replay it unchanged. When reference state is confined to individual
-    /// regions and their interfaces need no additional state inputs or outputs, [`discharge_local_reference_operation`]
-    /// can rebuild them independently without requiring positional forwarding. This function additionally supports
-    /// references crossing the regions' boundaries by explicitly threading their state through a shared positional
-    /// interface.
+    /// [`discharge_reference_free_operation`](Self::discharge_reference_free_operation) can replay it unchanged. When
+    /// reference state is confined to individual regions and their interfaces need no additional state inputs or
+    /// outputs, [`discharge_local_reference_operation`](Self::discharge_local_reference_operation) can rebuild them
+    /// independently without requiring positional forwarding. This function additionally supports references crossing
+    /// the regions' boundaries by explicitly threading their state through a shared positional interface.
     ///
     /// All attached regions receive one shared boundary, which is widened as follows:
     ///

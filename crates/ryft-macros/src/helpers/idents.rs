@@ -22,6 +22,7 @@ mod private {
     impl Sealed for syn::GenericArgument {}
     impl Sealed for syn::CapturedParam {}
     impl Sealed for syn::WherePredicate {}
+    impl Sealed for syn::Signature {}
 }
 
 /// Defines helper functions for working with [`syn::Ident`]s.
@@ -239,6 +240,23 @@ impl IdentHelpers for syn::WherePredicate {
     }
 }
 
+impl IdentHelpers for syn::Signature {
+    fn ident(&self) -> Option<&syn::Ident> {
+        None
+    }
+
+    fn references_ident(&self, ident: &syn::Ident) -> bool {
+        let mut visitor = ReferencesIdentVisitor::new(ident);
+        visitor.visit_signature(self);
+        visitor.referenced
+    }
+
+    fn replace_ident(&mut self, ident: &syn::Ident, replacement: &syn::Path) {
+        let mut visitor = ReplaceIdentVisitor::new(ident, replacement);
+        visitor.visit_signature_mut(self);
+    }
+}
+
 /// Internal helper for implementing [`IdentHelpers::references_ident`].
 struct ReferencesIdentVisitor<'s> {
     ident: &'s syn::Ident,
@@ -363,6 +381,10 @@ impl VisitMut for ReplaceIdentVisitor<'_> {
                 node.ident = replacement_ident.clone();
             });
         }
+
+        // The bounds and the default of the parameter may also mention the replaced identifier (e.g., `U: From<T>`).
+        node.bounds.iter_mut().for_each(|bound| self.visit_type_param_bound_mut(bound));
+        node.default.iter_mut().for_each(|default| self.visit_type_mut(default));
     }
 }
 
@@ -417,6 +439,12 @@ mod tests {
         let field: syn::Field = syn::Field::parse_named.parse2(quote!(value: Option<T>)).unwrap();
         assert!(field.references_ident(&ident_t));
 
+        let referencing_signature: syn::Signature = syn::parse_quote!(fn f<A: Into<T>>(&self, value: A) -> usize);
+        assert!(referencing_signature.references_ident(&ident_t));
+
+        let non_referencing_signature: syn::Signature = syn::parse_quote!(fn f(&self, value: usize) -> usize);
+        assert!(!non_referencing_signature.references_ident(&ident_t));
+
         let path: syn::Path = syn::parse_quote!(P);
         let mut generics = syn::parse2::<syn::DeriveInput>(quote!(
             struct Dummy<T, U>
@@ -446,5 +474,13 @@ mod tests {
         let mut predicate: syn::WherePredicate = syn::parse_quote!(T: Into<Vec<T>>);
         predicate.replace_ident(&ident, &path);
         assert_eq!(predicate.to_compact_string(), "ryft::Placeholder:Into<Vec<ryft::Placeholder>>",);
+
+        // Signatures are rewritten in their generics, inputs, and output, including in paths that start with `T`.
+        let mut signature: syn::Signature = syn::parse_quote!(fn f<A: Into<T>>(&self, value: &T) -> T::Output);
+        signature.replace_ident(&ident, &path);
+        assert_eq!(
+            signature.to_compact_string(),
+            "fnf<A:Into<ryft::Placeholder>>(&self,value:&ryft::Placeholder)->ryft::Placeholder::Output",
+        );
     }
 }

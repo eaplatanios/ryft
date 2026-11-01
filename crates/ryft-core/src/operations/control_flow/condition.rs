@@ -40,7 +40,7 @@ use crate::arrays::{
 };
 use crate::batching::{
     BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    ProgramBatchingOutputAxesPolicy, batch_projected_operation,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
@@ -80,7 +80,6 @@ use crate::programs::{
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceMemberType,
     ReferenceRoot, RegionDataFlow, RegionDriver, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
     TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueProjection,
-    discharge_positional_region_operation,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -627,7 +626,7 @@ impl<
             };
             allocation.map_or(Ok(true), |allocation| context.is_allocation_discharged(allocation))
         })?;
-        discharge_positional_region_operation(self, context, driver, inputs, 1, |_, _| Ok(*self))
+        context.discharge_positional_region_operation(self, driver, inputs, 1, |_, _| Ok(*self))
     }
 }
 
@@ -954,7 +953,7 @@ where
                 Ok(Some(ArrayIrBatch::new(ValueProjection::<ArrayType>::from_projected(stopped), input.batch_axis())?))
             },
             |inputs| {
-                let mut selected = batch_projected_operation(context, &SelectOperation::<ArrayType>::new(), inputs)?;
+                let mut selected = context.batch_projected_operation(&SelectOperation::<ArrayType>::new(), inputs)?;
                 check_count!("output", selected, 1, ProgramError);
                 Ok(selected.remove(0))
             },

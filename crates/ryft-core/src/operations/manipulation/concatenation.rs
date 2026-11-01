@@ -18,7 +18,7 @@ use crate::batching::{
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
-    ResidualZeroProvider, TransposableOperation, transpose_projected_operation,
+    ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -811,8 +811,7 @@ impl_differentiable_operation! {
 
                 // The trailing result extent is a shape input with no cotangent contribution, so its accumulator is
                 // left untouched and defaults to a structural zero.
-                return transpose_projected_operation(
-                    context,
+                return context.transpose_projected_operation(
                     &projected_operation,
                     array_inputs,
                     outputs,

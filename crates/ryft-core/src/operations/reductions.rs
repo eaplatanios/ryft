@@ -71,7 +71,6 @@ use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, Stag
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -927,7 +926,7 @@ where
             )
         {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-            return jvp_projected_operation(context, &operation, inputs);
+            return context.jvp_projected_operation(&operation, inputs);
         }
 
         let output = context.primal().bind_array(self.clone(), std::slice::from_ref(inputs[0].primal()))?;

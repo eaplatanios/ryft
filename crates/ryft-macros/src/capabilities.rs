@@ -3,7 +3,6 @@ use std::fmt::Display;
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::spanned::Spanned;
-use syn::visit_mut::VisitMut;
 
 use crate::helpers::attributes::Attribute;
 use crate::helpers::idents::IdentHelpers;
@@ -129,7 +128,15 @@ impl CapabilityCodeGenerator {
             path if path == &PROJECTION_ARGUMENT => {
                 let content;
                 syn::parenthesized!(content in meta.input);
-                let family = content.parse::<syn::Type>()?;
+                let family = match content.parse::<syn::Type>()? {
+                    syn::Type::Path(syn::TypePath { qself: None, path }) => path,
+                    family => {
+                        return Err(syn::Error::new_spanned(
+                            family,
+                            "the family of a capability projection must be a type path (e.g., `ArrayIrType`)",
+                        ));
+                    }
+                };
                 content.parse::<syn::Token![=>]>()?;
                 let member = content.parse::<syn::Type>()?;
                 if !content.is_empty() {
@@ -289,8 +296,7 @@ impl CapabilityCodeGenerator {
                 predicate.replace_ident(&SELF_TYPE.into(), &value_type);
                 self_parameters.iter().for_each(|parameter| predicate.replace_ident(parameter, &value_type));
                 if let Some(universe_parameter) = universe_parameter {
-                    TypeParameterReplacer::new(&universe_parameter.ident, family)
-                        .visit_where_predicate_mut(&mut predicate);
+                    predicate.replace_ident(&universe_parameter.ident, family);
                 }
                 predicate
             })
@@ -361,11 +367,9 @@ impl CapabilityCodeGenerator {
         member: &syn::Type,
     ) -> syn::Result<TokenStream> {
         let ryft = &self.ryft_crate;
-        let self_type: syn::Type = syn::parse_quote!(Self);
+        let self_type: syn::Path = SELF_TYPE.into();
         let mut signature = function.sig.clone();
-        for parameter in self_parameters {
-            TypeParameterReplacer::new(parameter, &self_type).visit_signature_mut(&mut signature);
-        }
+        self_parameters.iter().for_each(|parameter| signature.replace_ident(parameter, &self_type));
         let projection = quote!(#ryft::ValueProjection::<#member>::into_projected);
 
         let mut inputs = signature.inputs.iter();
@@ -458,40 +462,16 @@ impl CapabilityCodeGenerator {
 
 /// Projection requested by a `projection(Family => Member)` argument of the `#[capability]` attribute.
 struct Projection {
-    /// Universe of the heterogeneous values that apply the capability by projecting onto their members.
-    family: syn::Type,
+    /// Universe of the heterogeneous values that apply the capability by projecting onto their members. This is a type
+    /// path (e.g., `ArrayIrType`), because the universe parameter of the capability is replaced with it in the
+    /// restated predicates, including in paths that start with that parameter (e.g., `T::Item`).
+    family: syn::Path,
 
     /// Universe of the member values onto which the heterogeneous values project.
     member: syn::Type,
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// [`VisitMut`] that replaces every bare mention of a type parameter with a replacement type.
-struct TypeParameterReplacer<'r> {
-    /// Type parameter whose mentions are replaced.
-    parameter: &'r syn::Ident,
-
-    /// Type that replaces every mention of [`TypeParameterReplacer::parameter`].
-    replacement: &'r syn::Type,
-}
-
-impl<'r> TypeParameterReplacer<'r> {
-    /// Creates a new [`TypeParameterReplacer`] that replaces `parameter` with `replacement`.
-    fn new(parameter: &'r syn::Ident, replacement: &'r syn::Type) -> Self {
-        Self { parameter, replacement }
-    }
-}
-
-impl VisitMut for TypeParameterReplacer<'_> {
-    fn visit_type_mut(&mut self, r#type: &mut syn::Type) {
-        if r#type.matches_ident(self.parameter) {
-            *r#type = self.replacement.clone();
-            return;
-        }
-        syn::visit_mut::visit_type_mut(self, r#type);
-    }
-}
 
 /// Helper trait for checking whether [`syn::Type`]s refer to `Self`.
 trait SelfTypeHelpers {
@@ -731,6 +711,10 @@ mod tests {
             (quote!(projection(A => B), projection(A => C)), "duplicate capability projection of family `A`"),
             (quote!(projection), "unexpected end of input, expected parentheses"),
             (quote!(projection(A => B, C)), "`projection(...)` declares exactly one `Family => Member` pair"),
+            (
+                quote!(projection((A, B) => C)),
+                "the family of a capability projection must be a type path (e.g., `ArrayIrType`)",
+            ),
         ] {
             let mut generator = CapabilityCodeGenerator::new();
             generator.extract_arguments(attributes);
@@ -816,6 +800,7 @@ mod tests {
             where
                 Self: Debug + PartialEq<Rhs>,
                 Vec<T>: Default,
+                T::Identity: Clone,
             {
                 fn combine(&self, right: &Rhs) -> Result<Self, ProgramError>;
 
@@ -841,6 +826,7 @@ mod tests {
                     __V: Clone,
                     __V: Debug + PartialEq<__V>,
                     Vec<ArrayIrType>: Default,
+                    ArrayIrType::Identity: Clone,
                 {
                     #[inline]
                     fn combine(&self, right: &Self) -> Result<Self, ProgramError> {
@@ -1007,15 +993,6 @@ mod tests {
             let result = generator.generate_projected_function(&function, &[], &[], &item, &member);
             assert_eq!(result.unwrap_err().to_string(), error);
         }
-    }
-
-    #[test]
-    fn test_type_parameter_replacer() {
-        let parameter: syn::Ident = syn::parse_quote!(Rhs);
-        let replacement: syn::Type = syn::parse_quote!(Self);
-        let mut signature: syn::Signature = syn::parse_quote!(fn f(&self, right: &Rhs, rights: Vec<Rhs>) -> Rhs);
-        TypeParameterReplacer::new(&parameter, &replacement).visit_signature_mut(&mut signature);
-        assert_eq!(rendering(&signature), rendering(&quote!(fn f(&self, right: &Self, rights: Vec<Self>) -> Self)),);
     }
 
     #[test]
