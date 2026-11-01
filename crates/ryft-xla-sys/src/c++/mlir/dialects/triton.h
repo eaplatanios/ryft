@@ -55,6 +55,14 @@ RYFT_XLA_SYS_EXPORT MlirStringRef mlirTritonTtEnumAttrGetValue(
     MlirAttribute attribute,
     enum MlirTritonTtEnumAttribute kind);
 
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsATritonTtCachePolicyAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirTritonTtCachePolicyAttrGet(
+    MlirContext context,
+    MlirStringRef cacheModifier,
+    MlirStringRef evictionPolicy);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirTritonTtCachePolicyAttrGetCacheModifier(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirTritonTtCachePolicyAttrGetEvictionPolicy(MlirAttribute attribute);
+
 #ifdef __cplusplus
 }
 #endif

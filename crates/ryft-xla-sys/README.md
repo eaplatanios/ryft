@@ -87,21 +87,24 @@ potentially different build time and runtime requirements:
 
   Then, you will need to add this path to your `LD_LIBRARY_PATH`: `/usr/lib/nvshmem3/nvidia/nvshmem/lib`.
 
-- **`rocm-7`:** Enables support for loading the PJRT [ROCm 7](https://rocm.docs.amd.com/) plugin for leveraging
+- **`rocm-10`:** Enables support for loading the PJRT [ROCm 10](https://rocm.docs.amd.com/) plugin for leveraging
   ROCm-enabled GPUs by AMD. If this feature is enabled, similar to what happens with the static XLA library,
   the corresponding PJRT plugin can be built from source using Bazel (though that is not supported when using
   `cargo vendor` since it requires network access) or it can be provided as a precompiled archive using the
-  `PJRT_PLUGIN_ROCM_7_LIB` environment variable. Note that, by default this crate will attempt to download
+  `PJRT_PLUGIN_ROCM_10_LIB` environment variable. Note that, by default this crate will attempt to download
   a precompiled plugin from GitHub releases of `ryft`, if one can be found for the target platform and
-  `PJRT_PLUGIN_ROCM_7_LIB` is not set. Note that this plugin has various ROCm runtime dependencies that are not
-  included in the shared library provided by this feature. For Ubuntu, you can install these dependencies using
-  the following commands:
+  `PJRT_PLUGIN_ROCM_10_LIB` is not set. Note that this plugin has various ROCm runtime dependencies that are not
+  included in the shared library provided by this feature. The pinned XLA build uses AMD's ROCm 10.0.0 multiarch
+  distribution. Install a compatible AMD GPU driver, then use the matching runtime distribution with these commands:
 
   ```bash
-  wget https://repo.radeon.com/amdgpu-install/7.2/ubuntu/noble/amdgpu-install_7.2.70200-1_all.deb
-  sudo apt install ./amdgpu-install_7.2.70200-1_all.deb
-  sudo apt update -y
-  sudo apt install rocm rocm-core rocm-device-libs rocm-hip-sdk rocprofiler-sdk
+  wget https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-multiarch-10.0.0.tar.gz
+  sha256sum --check <<'SHA256'
+  1c5e807875d26a2470ecc7323daa5b5b9009208a55c3290ac255a909cde15fc6  therock-dist-linux-multiarch-10.0.0.tar.gz
+  SHA256
+  mkdir -p rocm-10.0.0
+  tar -xzf therock-dist-linux-multiarch-10.0.0.tar.gz -C rocm-10.0.0
+  export LD_LIBRARY_PATH="$PWD/rocm-10.0.0/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   ```
 
 - **`tpu`:** Enables support for loading the PJRT [TPU](https://cloud.google.com/tpu) plugin for leveraging
@@ -162,7 +165,7 @@ Currently, precompiled binaries are only available for the following target plat
     - Linux `aarch64`
     - MacOS `aarch64`
     - Windows `x86_64`
-- **PJRT Plugins for CUDA 12 & 13, ROCm 7, TPUs, and AWS Neuron:**
+- **PJRT Plugins for CUDA 12 & 13, ROCm 10, TPUs, and AWS Neuron:**
     - Linux `x86_64`
 - **PJRT Plugin for Metal (JAX Metal):**
     - MacOS `aarch64`
@@ -190,7 +193,7 @@ shipped in Cargo source packages or native release archives.
 ### Mosaic GPU Contract
 
 The portable archive exposes the pinned Mosaic GPU dialect C API and the `mosaic_gpu-serde` pass. Its Rust constants
-record serde version 8, `MosaicGpuKernelProto` resource version 3, and the `mosaic_gpu_v2` XLA FFI target. Programs
+record serde version 9, `MosaicGpuKernelProto` resource version 4, and the `mosaic_gpu_v2` XLA FFI target. Programs
 cross the compiler boundary as MLIR bytecode; the private wheel functions `MosaicGpuCompile`, `MosaicGpuUnload`, and
 `MosaicGpuClearKernelCache` are not a supported ABI.
 

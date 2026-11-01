@@ -84,7 +84,7 @@ def check_mosaic_surface(jax_root: Path, ryft_mlir_root: Path) -> None:
     )
     interface_names = sorted(set(re.findall(r'AttrInterface<"([^"]+)"', tablegen)))
 
-    expected_counts = {"attributes": 17, "interfaces": 1, "operations": 43, "types": 3}
+    expected_counts = {"attributes": 18, "interfaces": 1, "operations": 46, "types": 3}
     actual_counts = {
         "attributes": len(attribute_names),
         "interfaces": len(interface_names),
@@ -98,7 +98,7 @@ def check_mosaic_surface(jax_root: Path, ryft_mlir_root: Path) -> None:
     attributes_path = Path("src/dialects/mosaic/gpu/attributes.rs")
     types_path = Path("src/dialects/mosaic/gpu/types.rs")
     local_operations = set(
-        re.findall(r'"mosaic_gpu\.([a-z0-9_]+)"', read(ryft_mlir_root, operations_path))
+        re.findall(r'"mosaic_gpu\.([a-z0-9_.]+)"', read(ryft_mlir_root, operations_path))
     )
     local_attribute_text = read(ryft_mlir_root, attributes_path)
     local_attributes = {
@@ -133,7 +133,7 @@ def extract_c_functions(text: str, export_macro: str) -> list[str]:
 
 def extract_dialect_handle_symbols(text: str) -> list[str]:
     """Expands MLIR C dialect-registration declarations to symbol names."""
-    namespaces = re.findall(r"MLIR_DECLARE_CAPI_DIALECT_REGISTRATION\([^,]+,\s*([a-z0-9_]+)\s*\)", text)
+    namespaces = re.findall(r"MLIR_DECLARE_CAPI_DIALECT_REGISTRATION\([^,]+,\s*([a-z0-9_.]+)\s*\)", text)
     return sorted({f"mlirGetDialectHandle__{namespace}__" for namespace in namespaces})
 
 
@@ -535,19 +535,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 OPERATIONS = [
-    "arrive_dyn_expect_tx_supported",
-    "assume_multiple",
-    "async_store_smem",
-    "get_cluster_ref",
-    "mma",
-    "vector_concat",
+    "alloc_smem",
+    "alloca_scope",
+    "alloca_scope.return",
     "arrive",
     "arrive_expect_tx",
+    "assume_multiple",
     "async_load",
+    "async_load_im2col",
     "async_load_tmem",
     "async_prefetch",
     "async_store",
     "async_store_scales_smem_to_tmem",
+    "async_store_smem",
     "async_store_smem_to_tmem",
     "async_store_sparse_metadata_smem_to_tmem",
     "async_store_tmem",
@@ -555,14 +555,17 @@ OPERATIONS = [
     "broadcasted_iota",
     "custom_primitive",
     "debug_print",
+    "get_cluster_ref",
     "initialize_barrier",
     "layout_cast",
+    "mma",
     "multimem_load_reduce",
     "optimization_barrier",
     "print_layout",
     "query_cluster_cancel",
     "reinterpret_cast",
     "return",
+    "run_scoped",
     "slice_smem",
     "slice_tmem",
     "tcgen05_commit_arrive",
@@ -572,9 +575,9 @@ OPERATIONS = [
     "tmem_layout_cast",
     "tmem_relinquish_alloc_permit",
     "try_cluster_cancel",
+    "vector_concat",
     "vector_load",
     "vector_store",
-    "wait",
     "warp_map",
     "wgmma",
     "with_transforms",
@@ -588,14 +591,15 @@ ATTRIBUTES = [
     "MultimemLoadReductionType",
     "OOBFillMode",
     "Replicated",
+    "SmemAlloc",
+    "SmemCluster",
     "SwizzleTransform",
     "SwizzlingMode",
     "TMAReduction",
+    "TMEMLoadReduction",
     "TileTransform",
     "TiledLayout",
     "Tmem",
-    "SmemCluster",
-    "TMEMLoadReduction",
     "WGSplatFragLayout",
     "WGStridedFragLayout",
 ]

@@ -54,7 +54,7 @@ jobs:
             runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
-            device: rocm-7
+            device: rocm-10
             platform: linux_x86_64
             runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: macos
@@ -75,7 +75,7 @@ jobs:
       - name: Check Out Repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           path: "ryft"
 
       # `rules_python` creates virtual environments with DLL symlink targets longer than `MAX_PATH`.
@@ -109,7 +109,7 @@ jobs:
           echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install LLVM 18 & NUMA
-        if: ${{ matrix.config.os == 'linux' && matrix.config.device == 'rocm-7' }}
+        if: ${{ matrix.config.os == 'linux' && matrix.config.device == 'rocm-10' }}
         run: |
           sudo apt purge llvm* clang* lld* -y
           sudo apt autoremove -y
@@ -224,6 +224,15 @@ jobs:
           cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
 
+      # Retain the exact built headers for binding regeneration even when a subsequent compatibility check fails.
+      # Publication still depends on every build and test job succeeding.
+      - name: Upload `ryft-xla-sys` Library
+        if: ${{ matrix.config.device == 'cpu' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
+          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+
       - name: Test `ryft-xla-sys` Library / Check Archive Contents and Reproducibility
         if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -271,13 +280,6 @@ jobs:
             --ryft-mlir-root ../ryft-mlir
           python -m unittest tests/symbol_contract_test.py
 
-      - name: Upload `ryft-xla-sys` Library
-        if: ${{ matrix.config.device == 'cpu' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
-
       - name: Build PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -287,7 +289,7 @@ jobs:
           LIB_PREFIX="${{ matrix.config.os != 'windows' && 'lib' || '' }}"
           LIB_SUFFIX="${{ matrix.config.os == 'linux' && '.so' || '' }}${{ matrix.config.os == 'macos' && '.dylib' || '' }}${{ matrix.config.os == 'windows' && '.dll' || '' }}"
           OUTPUT="${LIB_PREFIX}pjrt-plugin-${{ matrix.config.device }}${LIB_SUFFIX}"
-          bazel build --config=${{ matrix.config.platform }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-7' && '--config=rocm-7' || '' }} //:pjrt-gpu-plugin
+          bazel build --config=${{ matrix.config.platform }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-10' && '--config=rocm-10' || '' }} //:pjrt-gpu-plugin
           cp bazel-bin/libpjrt-gpu-plugin.so $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
 
@@ -339,3 +341,53 @@ jobs:
         with:
           tag_name: ryft-xla-sys-${{ needs.build.outputs.xla_commit_id }}
           files: "*.tar.gz/*.tar.gz"
+
+  verify-release:
+    name: Verify Published Consumer [${{ matrix.config.os }}-${{ matrix.config.architecture }}]
+    needs: ["build", "release"]
+    runs-on: ${{ matrix.config.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: linux
+            architecture: amd64
+            runner: ubuntu-latest
+          - os: linux
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos
+            architecture: arm64
+            runner: macos-26
+          - os: windows
+            architecture: amd64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify Rust Toolchain
+        shell: bash
+        run: |
+          cargo --version
+          rustc --version
+
+      - name: Download Final Published Archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ryft-xla-sys-${{ needs.build.outputs.xla_commit_id }}
+          ARCHIVE_NAME: ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-cpu.tar.gz
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ARCHIVE_NAME" --dir native-release
+          echo "RYFT_XLA_SYS_ARCHIVE=$GITHUB_WORKSPACE/native-release/$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+      - name: Link and Test PJRT Against Published Archive
+        shell: bash
+        run: |
+          if [[ "${{ matrix.config.os }}" == "linux" && "${{ matrix.config.architecture }}" == "arm64" ]]; then
+            export PATH="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+          fi
+          cargo test -p ryft-pjrt --lib

@@ -6,13 +6,13 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "eb6b90ed013f511eca088c52f541f3c0819f919e"
+XLA_COMMIT = "f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163"
 
-XLA_SHA256 = "5220c45488544c2fb645a6d346c7a8e6609c0c9b1bc997e37c8d143aecd22e84"
+XLA_SHA256 = "4c97509bf17c004632011f9c656e9afaa2ea0e432d0f648651301415588073b3"
 
-JAX_COMMIT = "a7606f995e1a92707cbeb257e487fa53e7abe84b"
+JAX_COMMIT = "9564ca1d3df0d312cad4346458b8d41ce5204ff7"
 
-JAX_SHA256 = "041ce581933c9ed263f730e19f784246d659ae800991ebb59ccc1baa39b95acd"
+JAX_SHA256 = "b19d4509c7c07b7e320ec7fca98e55103498b7665b66d2d6814b555b3f7c0031"
 
 http_archive(
     name = "xla",
@@ -140,10 +140,10 @@ load(
     "@rules_ml_toolchain//gpu/cuda:cuda_redist_versions.bzl",
     "REDIST_VERSIONS_TO_BUILD_TEMPLATES",
 )
-load("@xla//third_party/cccl:workspace.bzl", "CCCL_3_2_0_DIST_DICT", "CCCL_GITHUB_VERSIONS_TO_BUILD_TEMPLATES")
+load("@xla//third_party/cccl:workspace.bzl", "CCCL_3_4_0_DIST_DICT", "CCCL_GITHUB_VERSIONS_TO_BUILD_TEMPLATES")
 
 cuda_redist_init_repositories(
-    cuda_redistributions = CUDA_REDISTRIBUTIONS | CCCL_3_2_0_DIST_DICT,
+    cuda_redistributions = CUDA_REDISTRIBUTIONS | CCCL_3_4_0_DIST_DICT,
     redist_versions_to_build_templates = REDIST_VERSIONS_TO_BUILD_TEMPLATES | CCCL_GITHUB_VERSIONS_TO_BUILD_TEMPLATES,
 )
 

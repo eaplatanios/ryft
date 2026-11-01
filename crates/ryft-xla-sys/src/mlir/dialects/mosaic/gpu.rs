@@ -5,10 +5,10 @@ use crate::bindings::{
 };
 
 /// Version of the `stable_mosaic_gpu.version` MLIR bytecode schema supported by the pinned JAX serde pass.
-pub const MOSAIC_GPU_SERDE_VERSION: i32 = 8;
+pub const MOSAIC_GPU_SERDE_VERSION: i32 = 9;
 
 /// Version of the serialized `MosaicGpuKernelProto` resource schema consumed by the pinned JAX runtime.
-pub const MOSAIC_GPU_RESOURCE_SCHEMA_VERSION: i32 = 3;
+pub const MOSAIC_GPU_RESOURCE_SCHEMA_VERSION: i32 = 4;
 
 /// XLA FFI target registered by the pinned JAX Mosaic GPU runtime.
 pub const MOSAIC_GPU_FFI_TARGET: &str = "mosaic_gpu_v2";
@@ -26,9 +26,6 @@ pub enum MlirMosaicGpuEnumAttribute {
 }
 
 unsafe extern "C" {
-    pub fn mlirAttributeIsAMosaicGpuSmemClusterAttr(attribute: MlirAttribute) -> bool;
-    pub fn mlirMosaicGpuSmemClusterAttrGet(context: MlirContext) -> MlirAttribute;
-
     pub fn mlirGetDialectHandle__mosaic_gpu__() -> MlirDialectHandle;
     pub fn mlirDialectRegistryInsertMosaicGpuInlinerExtensions(registry: MlirDialectRegistry);
     pub fn mlirMosaicGpuRegisterSerdePass();
@@ -113,6 +110,14 @@ unsafe extern "C" {
 
     pub fn mlirAttributeIsAMosaicGpuTmemAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirMosaicGpuTmemAttrGet(context: MlirContext) -> MlirAttribute;
+
+    pub fn mlirAttributeIsAMosaicGpuSmemClusterAttr(attribute: MlirAttribute) -> bool;
+    pub fn mlirMosaicGpuSmemClusterAttrGet(context: MlirContext) -> MlirAttribute;
+
+    pub fn mlirMosaicGpuIsASmemAllocAttr(attribute: MlirAttribute) -> bool;
+    pub fn mlirMosaicGpuSmemAllocAttrGet(context: MlirContext, alignment: MlirAttribute) -> MlirAttribute;
+    pub fn mlirMosaicGpuSmemAllocAttrGetAlignment(attribute: MlirAttribute) -> MlirAttribute;
+    pub fn mlirMosaicGpuSmemAllocAttrGetTypeID() -> MlirTypeID;
 }
 
 #[cfg(test)]
@@ -129,6 +134,7 @@ mod tests {
                 mlirMosaicGpuCopyPartitionedAttrGetTypeID(),
                 mlirMosaicGpuCopyReplicatedAttrGetTypeID(),
                 mlirMosaicGpuReplicatedAttrGetTypeID(),
+                mlirMosaicGpuSmemAllocAttrGetTypeID(),
                 mlirMosaicGpuSwizzleTransformAttrGetTypeID(),
                 mlirMosaicGpuTiledLayoutAttrGetTypeID(),
                 mlirMosaicGpuTileTransformAttrGetTypeID(),
