@@ -141,12 +141,14 @@
 //! analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when staged
 //! functions must compose inside other traces.
 //!
-//! The [`CompilationDomain`] functions accept [`StagingRequest`], [`LoweringRequest`], [`CompilationRequest`], and
-//! [`CallRequest`] implementations. These traits keep the structured input and output bounds of each stage in one
-//! place and expose only the operations that a backend needs to complete it. They are also required by a limitation of
-//! the Rust compiler, which [`CompilationDomain`] documents. Ordinary callers construct a [`CompilationStagingRequest`]
+//! Core implements [`CompilationDomain::stage`], which backends must not override. Backends customize staging
+//! through [`CompilationDomain::staged_input_types`] and [`CompilationDomain::staged_output_types`]. The remaining
+//! [`CompilationDomain`] functions accept [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
+//! implementations. These traits keep the structured input and output bounds of each stage in one place and expose
+//! only the operations that a backend needs to complete it. They are also required by a limitation of the Rust
+//! compiler, which [`CompilationDomain`] documents. Ordinary callers construct a [`CompilationStagingRequest`]
 //! or use [`stage`], while backend implementations name the request traits in their bounds and complete each stage
-//! through their `trace`, `into_lowered`, `into_compiled`, or `reconstruct` functions
+//! through their `into_lowered`, `into_compiled`, or `reconstruct` functions.
 
 pub mod caching;
 pub mod contexts;
@@ -159,7 +161,7 @@ pub use caching::{
 };
 pub use contexts::{
     AnalyzableCompilationDomain, CallRequest, CompilationCacheDomain, CompilationDomain, CompilationRequest,
-    LoweringRequest, StagingRequest, StatefulCompilationDomain,
+    LoweringRequest, StatefulCompilationDomain,
 };
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
 use crate::compilation::functions::{
-    CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram, LoweredFunction,
-    ReferenceExecution, StagedFunction,
+    CompilationStagingRequest, CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram,
+    LoweredFunction, ReferenceExecution, StagedFunction,
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -12,41 +12,6 @@ use crate::programs::ProgramError;
 use crate::tracing::DomainTracingContext;
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Staging request consumed by [`CompilationDomain::stage`]. Callers construct requests with
-/// [`CompilationStagingRequest::new`](crate::CompilationStagingRequest::new). Refer to the [`CompilationDomain`]
-/// documentation for why the domain functions accept request traits rather than concrete types.
-pub trait StagingRequest<C: CompilationDomain>: Sized
-where
-    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-{
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<
-            C::Type,
-            Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
-            To<CompilationTracer<C>>: Parameterized<
-                CompilationTracer<C>,
-                To<C::Type> = Self::Output,
-                To<C::Constant> = <Self::Output as Parameterized<C::Type>>::To<C::Constant>,
-            >,
-        >;
-
-    /// Traces this request after normalizing its flat input signature with `normalize_input_types`, and then
-    /// normalizes the resulting flat output signature with `normalize_output_types`. Both functions receive the fixed
-    /// compilation options of the request. Normalized input types must preserve the number of inputs, because they
-    /// are placed back into the parameter structure of the request.
-    fn trace<NormalizeInput, NormalizeOutput>(
-        self,
-        normalize_input_types: NormalizeInput,
-        normalize_output_types: NormalizeOutput,
-    ) -> Result<StagedFunction<C, Self::Input, Self::Output>, C::Error>
-    where
-        NormalizeInput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
-        NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>;
-}
 
 /// Lowering request consumed by [`CompilationDomain::lower`] and implemented by [`StagedFunction`]. Refer to the
 /// [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete types.
@@ -130,24 +95,27 @@ pub trait CallRequest<C: CompilationDomain>: Sized {
 ///   4. [`Self::call`] executes an [`ExecutableFunction`] against structured runtime inputs.
 ///
 /// The domain performs every stage, while staged, lowered, compiled, and executable functions remain passive values.
-/// Each stage is implemented entirely by the backend, including any validation, caching, or runtime conversion that
-/// the backend chooses to apply.
+/// Lowering, compilation, and execution are implemented entirely by the backend, including any validation, caching, or
+/// runtime conversion that the backend chooses to apply. Staging is implemented by core, because only core can trace
+/// Rust closures, and backends customize it through [`Self::staged_input_types`] and [`Self::staged_output_types`].
+/// Backends that cannot execute some staged functions reject them during lowering.
 ///
 /// # Request Traits
 ///
-/// The stage functions accept [`StagingRequest`], [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
-/// implementations rather than the concrete
-/// [`CompilationStagingRequest`](super::functions::CompilationStagingRequest), [`StagedFunction`],
-/// [`LoweredFunction`], and [`CompilationCall`](super::functions::CompilationCall) types. Each request trait carries
-/// the structured input and output bounds of its stage as bounds on its associated types and exposes only the
-/// operations that a backend needs to complete that stage.
+/// [`Self::lower`], [`Self::compile`], and [`Self::call`] accept [`LoweringRequest`], [`CompilationRequest`], and
+/// [`CallRequest`] implementations rather than the concrete [`StagedFunction`], [`LoweredFunction`], and
+/// [`CompilationCall`](super::functions::CompilationCall) types. Each request trait carries the structured input and
+/// output bounds of its stage as bounds on its associated types and exposes only the operations that a backend needs
+/// to complete that stage.
 ///
 /// The request traits also work around a limitation of the Rust compiler (as of version 1.99), and so they cannot be
 /// replaced by explicit bounds on the concrete types. When a trait function bounds an associated type of one of its
 /// generic parameters through a trait whose arguments mention an associated type of `Self` (e.g.,
 /// `Input: Parameterized<Self::Type, Family: ParameterizedFamily<Self::Constant>>`), implementations of that function
 /// for concrete domains fail to compile with an unsatisfied `Input: Parameterized<...>` bound (E0277), even when they
-/// repeat the bound verbatim. Bounds on the associated types of a request trait are not affected.
+/// repeat the bound verbatim. Bounds on the associated types of a request trait are not affected. The same limitation
+/// is why [`Self::stage`] is a provided function that backends must not override. Its default implementation compiles
+/// because it is checked once for a generic domain, but any override for a concrete domain fails with that error.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-defined key for one input specialization of a retained Just-In-Time (JIT) dispatcher.
     type DispatchKey: Clone + Eq + Hash;
@@ -181,19 +149,63 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    /// Traces a fallible function with explicit runtime captures and their symbolic references. This is the only
-    /// staging primitive. Implementations apply all options that affect tracing to the effective input and output
-    /// signatures through the normalization functions of [`StagingRequest::trace`], which also retains those same
-    /// options in the returned artifact.
-    fn stage<Request>(
+    /// Returns the flat input types at which a function is traced, given its declared flat input types and the
+    /// options of its staging request. Backends use this hook to apply options that affect the input signature (e.g.,
+    /// input sharding overrides). The returned types must preserve the number of inputs, because they are placed back
+    /// into the parameter structure of the request. The default implementation returns `input_types` unchanged.
+    #[inline]
+    fn staged_input_types(
         &self,
-        request: Request,
-    ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
+        input_types: Vec<Self::Type>,
+        _options: &Self::Options,
+    ) -> Result<Vec<Self::Type>, Self::Error> {
+        Ok(input_types)
+    }
+
+    /// Returns the flat output types that a staged function declares, given the output types that tracing produced
+    /// and the options of its staging request. Backends use this hook to apply options that affect the output
+    /// signature (e.g., output sharding overrides). The default implementation returns `output_types` unchanged.
+    #[inline]
+    fn staged_output_types(
+        &self,
+        output_types: Vec<Self::Type>,
+        _options: &Self::Options,
+    ) -> Result<Vec<Self::Type>, Self::Error> {
+        Ok(output_types)
+    }
+
+    /// Traces the fallible function of `request`, with its explicit runtime captures and their symbolic references,
+    /// into a staged function. This is the only staging primitive. It applies [`Self::staged_input_types`] before
+    /// tracing and [`Self::staged_output_types`] after tracing, and retains the options of `request` in the returned
+    /// staged function.
+    ///
+    /// Backends must not override this function (refer to the [`CompilationDomain`] documentation for why).
+    #[inline]
+    fn stage<F, Input, Output>(
+        &self,
+        request: CompilationStagingRequest<Self, F, Input, Output>,
+    ) -> Result<StagedFunction<Self, Input, Output>, Self::Error>
     where
-        Request: StagingRequest<Self>,
         Self: Sized,
+        F: FnOnce(
+            Vec<Self::Constant>,
+            Vec<CompilationTracer<Self>>,
+            Input::To<CompilationTracer<Self>>,
+        ) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
+        Input: Parameterized<Self::Type>,
+        Input::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
+        Output: Parameterized<Self::Type>,
+        Output::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
+        Output::To<CompilationTracer<Self>>: Parameterized<
+                CompilationTracer<Self>,
+                To<Self::Type> = Output,
+                To<Self::Constant> = Output::To<Self::Constant>,
+            >,
         DomainTracingContext<Self, Self::Value>:
-            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>;
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
+        request.trace(self)
+    }
 
     /// Lowers a staged function into the program representation of this backend (i.e., [`Self::LoweredProgram`]).
     /// The lowered program must capture every option, compiler, target, and topology property that affects

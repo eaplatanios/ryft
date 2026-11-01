@@ -2,8 +2,9 @@
 //!
 //! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
 //! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
-//! structured signatures. [`CompilationStagingRequest`], [`StagedFunction`], [`LoweredFunction`], and
-//! [`CompilationCall`] implement the request traits through which a [`CompilationDomain`] completes each stage.
+//! structured signatures. [`StagedFunction`], [`LoweredFunction`], and [`CompilationCall`] implement the request
+//! traits through which a [`CompilationDomain`] completes lowering, compilation, and execution, while
+//! [`CompilationStagingRequest`] carries the inputs of [`CompilationDomain::stage`].
 //! [`CompiledFunctionDispatcher`] retains compiled specializations of one Rust closure, and [`jit`] and its variants
 //! construct it.
 
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::captures::{CapturingContext, ClosedProgram};
 use crate::compilation::caching::accumulate_duration;
 use crate::compilation::contexts::{
-    CallRequest, CompilationDomain, CompilationRequest, LoweringRequest, StagingRequest, StatefulCompilationDomain,
+    CallRequest, CompilationDomain, CompilationRequest, LoweringRequest, StatefulCompilationDomain,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
@@ -133,7 +134,7 @@ impl<C: CompilationDomain, F, Input, Output> CompilationStagingRequest<C, F, Inp
     }
 }
 
-impl<C, F, Input, Output> StagingRequest<C> for CompilationStagingRequest<C, F, Input, Output>
+impl<C, F, Input, Output> CompilationStagingRequest<C, F, Input, Output>
 where
     C: CompilationDomain,
     F: FnOnce(
@@ -149,26 +150,52 @@ where
         Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    type Input = Input;
-    type Output = Output;
-
-    fn trace<NormalizeInput, NormalizeOutput>(
-        self,
-        normalize_input_types: NormalizeInput,
-        normalize_output_types: NormalizeOutput,
-    ) -> Result<StagedFunction<C, Input, Output>, C::Error>
-    where
-        NormalizeInput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
-        NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
-    {
-        trace_with_capture_references(
-            self.function,
-            self.captures,
-            self.input_types,
-            self.options,
-            normalize_input_types,
-            normalize_output_types,
-        )
+    /// Traces this request into a staged function through the staging hooks of `domain`. This implements
+    /// [`CompilationDomain::stage`].
+    pub(crate) fn trace(self, domain: &C) -> Result<StagedFunction<C, Input, Output>, C::Error> {
+        let Self { function, captures, input_types, options, .. } = self;
+        validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
+        let input_structure = input_types.parameter_structure();
+        let input_type_values = domain.staged_input_types(input_types.into_parameters().collect(), &options)?;
+        let input_types = Input::from_parameters(input_structure.clone(), input_type_values.iter().cloned())
+            .map_err(ProgramError::from)?;
+        let context = DomainTracingContext::<C, C::Value>::new();
+        let capture_table = context.captures().clone();
+        let builder = context.builder().clone();
+        let capture_references =
+            captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
+        let capture_tracers = capture_references
+            .iter()
+            .cloned()
+            .map(|capture| StagingContext::constant(&context, capture))
+            .collect::<Vec<_>>();
+        let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
+        let outputs = function(capture_references, capture_tracers, inputs)?;
+        check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
+        if let Some(error) = builder.borrow_mut().error.take() {
+            return Err(error.into());
+        }
+        let output_structure = outputs.parameter_structure();
+        let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = domain.staged_output_types(output_types, &options)?;
+        drop(outputs);
+        drop(context);
+        let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
+        let source_program = ClosedProgram::new(program, captures)?;
+        let source_program = source_program.without_unused_captures()?;
+        Ok(StagedFunction {
+            state: Arc::new(StagedFunctionState {
+                source_program,
+                input_types: input_type_values,
+                output_types,
+                output_structure,
+                options: Arc::new(options),
+                lifted_program: OnceLock::new(),
+            }),
+        })
     }
 }
 
@@ -446,7 +473,7 @@ where
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
-        let callee = self.lifted_program()?;
+        let callee = self.callee_program()?;
         let operation = C::Operation::compiled_call_with_type_signature(
             capture_count,
             &callee.input_types(),
@@ -510,13 +537,39 @@ where
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        let callee = self.lifted_program()?;
+        let callee = self.callee_program()?;
         let operation = C::Operation::compiled_call_with_type_signature(
             captures.len(),
             &callee.input_types(),
             &callee.output_types(),
         )?;
         context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
+    }
+
+    /// Returns the lifted program of this function (refer to [`Self::lifted_program`]) for embedding as the callee of
+    /// a nested call. Reference discharge cannot publish a reference that a callee allocates itself, because the caller
+    /// has no allocation that could receive it, so this function rejects such outputs here with a diagnostic that
+    /// names the offending output. Outputs that forward a reference received as an input or capture remain allowed.
+    fn callee_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
+        let callee = self.lifted_program()?;
+        if self.output_types().iter().any(Type::is_reference) {
+            let capture_count = self.state.source_program.captures().len();
+            let analysis = callee.reference_analysis(capture_count)?;
+            for (index, root) in analysis.output_roots().iter().enumerate() {
+                if let Some(root) = root
+                    && analysis.external_source(*root).is_none()
+                {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "output {index} of the called function is a reference that the function allocates itself, \
+                             which a nested call cannot return; allocate the reference in the caller and pass it to \
+                             the function instead",
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(callee)
     }
 
     /// Returns the source program with its runtime captures lifted into leading flat inputs, in the
@@ -1666,76 +1719,6 @@ where
     domain.stage(CompilationStagingRequest::new(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options))
 }
 
-/// Constructs a staged function from types already prepared by a compilation domain.
-fn trace_with_capture_references<C, F, Input, Output, NormalizeInput, NormalizeOutput>(
-    function: F,
-    captures: Vec<C::Value>,
-    input_types: Input,
-    options: C::Options,
-    normalize_input_types: NormalizeInput,
-    normalize_output_types: NormalizeOutput,
-) -> Result<StagedFunction<C, Input, Output>, C::Error>
-where
-    C: CompilationDomain,
-    F: FnOnce(
-        Vec<C::Constant>,
-        Vec<CompilationTracer<C>>,
-        Input::To<CompilationTracer<C>>,
-    ) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<CompilationTracer<C>>,
-    Output::To<CompilationTracer<C>>:
-        Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
-    NormalizeInput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
-    NormalizeOutput: FnOnce(&C::Options, Vec<C::Type>) -> Result<Vec<C::Type>, C::Error>,
-    DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-{
-    validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
-    let input_structure = input_types.parameter_structure();
-    let input_type_values = normalize_input_types(&options, input_types.into_parameters().collect())?;
-    let input_types = Input::from_parameters(input_structure.clone(), input_type_values.iter().cloned())
-        .map_err(ProgramError::from)?;
-    let context = DomainTracingContext::<C, C::Value>::new();
-    let capture_table = context.captures().clone();
-    let builder = context.builder().clone();
-    let capture_references =
-        captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
-    let capture_tracers = capture_references
-        .iter()
-        .cloned()
-        .map(|capture| StagingContext::constant(&context, capture))
-        .collect::<Vec<_>>();
-    let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
-    let outputs = function(capture_references, capture_tracers, inputs)?;
-    check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
-    if let Some(error) = builder.borrow_mut().error.take() {
-        return Err(error.into());
-    }
-    let output_structure = outputs.parameter_structure();
-    let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-    let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-    let output_types = normalize_output_types(&options, output_types)?;
-    drop(outputs);
-    drop(context);
-    let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
-    let source_program = ClosedProgram::new(program, captures)?;
-    let source_program = source_program.without_unused_captures()?;
-    Ok(StagedFunction {
-        state: Arc::new(StagedFunctionState {
-            source_program,
-            input_types: input_type_values,
-            output_types,
-            output_structure,
-            options: Arc::new(options),
-            lifted_program: OnceLock::new(),
-        }),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1819,20 +1802,15 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn stage<Request>(
+        fn staged_input_types(
             &self,
-            request: Request,
-        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
-        where
-            Request: StagingRequest<Self>,
-        {
-            request.trace(
-                |options, input_types| match &options.staged_input_type {
-                    Some(input_type) => Ok(input_types.iter().map(|_| input_type.clone()).collect()),
-                    None => Ok(input_types),
-                },
-                |_, output_types| Ok(output_types),
-            )
+            input_types: Vec<ArrayType>,
+            options: &Self::Options,
+        ) -> Result<Vec<ArrayType>, Self::Error> {
+            match &options.staged_input_type {
+                Some(input_type) => Ok(input_types.iter().map(|_| input_type.clone()).collect()),
+                None => Ok(input_types),
+            }
         }
 
         fn lower<Request>(
@@ -1984,16 +1962,6 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn stage<Request>(
-            &self,
-            request: Request,
-        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, ProgramError>
-        where
-            Request: StagingRequest<Self>,
-        {
-            request.trace(|_, input_types| Ok(input_types), |_, output_types| Ok(output_types))
-        }
-
         fn lower<Request>(
             &self,
             staged: Request,
@@ -2107,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_staging_request_trace_normalizes_input_types() {
+    fn test_compilation_domain_stage_applies_staged_input_types() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };

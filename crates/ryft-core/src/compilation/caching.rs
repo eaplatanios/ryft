@@ -1772,7 +1772,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::contexts::{CallRequest, CompilationDomain, LoweringRequest, StagingRequest};
+    use crate::compilation::contexts::{CallRequest, CompilationDomain, LoweringRequest};
     use crate::compilation::functions::{CompilationTracer, LoweredFunction, StagedFunction, stage};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
@@ -1815,16 +1815,6 @@ mod tests {
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
-        }
-
-        fn stage<Request>(
-            &self,
-            request: Request,
-        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
-        where
-            Request: StagingRequest<Self>,
-        {
-            request.trace(|_, input_types| Ok(input_types), |_, output_types| Ok(output_types))
         }
 
         fn lower<Request>(
