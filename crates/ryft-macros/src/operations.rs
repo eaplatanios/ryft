@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::fmt::Display;
 
-use proc_macro2::TokenStream;
-use quote::{ToTokens, format_ident, quote};
+use proc_macro2::{Span, TokenStream};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
+use syn::spanned::Spanned;
 
 use crate::helpers::attributes::Attribute;
 use crate::helpers::generics::GenericsHelpers;
@@ -31,672 +32,18 @@ const TRANSPOSITION_DISPATCHER: Symbol = Symbol::new("transposition");
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 
-/// Generates the `#[derive(Operation)]` implementations for the provided input. This function also checks for any
-/// errors on the provided input and will generate a [`TokenStream`] that contains a call to [`compile_error!`] if any
-/// errors are encountered. Refer to the documentation of the `Operation` trait in `ryft-core` for information on how
-/// to use this macro.
+/// [`OperationCodeGenerator`]s are used to generate the implementations of the `#[derive(Operation)]` macro.
+/// Each one holds the normalized operation enum that [`OperationParser::normalize_input`] extracts from the provided
+/// [`syn::DeriveInput`]. Refer to the documentation of the `Operation` trait in `ryft-core` for information on how to
+/// use that macro.
 ///
-/// As an example, the generated code for an enum with one native variant and no selected dispatchers typically looks
-/// something like this:
-///
-/// ```ignore
-/// #[doc(hidden)]
-/// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
-/// const _: () = {
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>> ::std::fmt::Display for CustomOperation<V> where ... {
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>> ryft::Operation for CustomOperation<V> where Payload<V>: ryft::Operation<Type = T> {
-///         type Type = T;
-///
-///         fn name(&self) -> &'static str {
-///             match self {
-///                 Self::Payload(operation) => { <Payload<V> as ryft::Operation>::name(operation) },
-///             }
-///         }
-///
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>, __Context> ryft::InterpretableOperation<__Context> for CustomOperation<V> where ... {
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>, __Context> ryft::PartiallyEvaluatableOperation<__Context> for CustomOperation<V>
-///     where
-///         ...
-///     {
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>> ryft::OperationPayloadProjection for CustomOperation<V> {
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>> ryft::OperationProvider<T, ryft::GuardOperation<T>> for CustomOperation<V> where ... {
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<V: Value<Type = T>> ::std::convert::From<Payload<V>> for CustomOperation<V> {
-///         ...
-///     }
-///
-///     #[automatically_derived]
-///     impl<'__operation, V: Value<Type = T>> ::std::convert::TryFrom<&'__operation CustomOperation<V>>
-///         for &'__operation Payload<V>
-///     where
-///         CustomOperation<V>: ryft::Operation,
-///     {
-///         ...
-///     }
-/// };
-/// ```
-///
-/// Projected member variants additionally generate `OperationProjection` implementations, and every dispatcher that is
-/// selected through `#[ryft(dispatch(...))]` generates its implementation inside the same `const` block.
-pub(crate) fn generate_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
-
-    // Replace any instances of `Self` with its fully-qualified path. This is necessary in order to be able to handle
-    // recursive payloads (e.g., control flow operations whose regions are programs over the enclosing enum).
-    replace_self_type(&mut input);
-
-    // Variant markers depend on the enum-level attributes (e.g., a `mixed` marker may take its member type from the
-    // declared member universes), and so we only extract the variants once the enum-level attributes are valid. That
-    // avoids reporting misleading follow-on errors for the variants.
-    let mut parser = OperationParser::new();
-    parser.extract_attributes(&input);
-    if let Some(error) = parser.compile_error() {
-        return error.into();
-    }
-    let operation_enum = parser.normalize_input(&input);
-    if let Some(error) = parser.compile_error() {
-        return error.into();
-    }
-    operation_enum.generate().into()
-}
-
-/// Parser that extracts the [`OperationEnum`] for which `#[derive(Operation)]` generates code from the provided
-/// [`syn::DeriveInput`]. Refer to [`generate_operation_impl`] for information on how it is used.
-struct OperationParser {
-    /// [`syn::Path`] that represents the root `ryft` library path (e.g., `ryft`). This is customizable via the
-    /// `#[ryft(crate = "...")]` attribute and it is meant to support libraries that build on top of `ryft` and may
-    /// want to export `ryft` types as part of their namespace. This is similar to the `#[serde(crate = "...")]`
-    /// attribute. You can refer to [its documentation](https://serde.rs/container-attrs.html#crate) for more
-    /// information.
-    ryft_crate: syn::Path,
-
-    /// Primary operation type, which is either declared through `#[ryft(type(T))]` or inferred from the unique
-    /// `Value<Type = T>` bound of the generic parameters of the enum. This is [`None`] only if the type could not be
-    /// determined, in which case an error has been reported.
-    operation_type: Option<syn::Type>,
-
-    /// Program constant type declared through `#[ryft(constant(C))]`. This is [`None`] for enums whose program
-    /// constant type is instead inferred from their `Value<Type = T>` generic parameters.
-    program_constant_type: Option<syn::Type>,
-
-    /// [`OperationMember`]s declared through `#[ryft(members(...))]`, in declaration order. This is empty when the enum
-    /// declares no member universes, in which case every member variant must name its own member type.
-    members: Vec<OperationMember>,
-
-    /// [`Dispatchers`] selected through `#[ryft(dispatch(...))]`. This is [`None`] when the enum selects none.
-    dispatchers: Option<Dispatchers>,
-
-    /// Errors accumulated in this [`OperationParser`]. The way error handling works in this parser is that we collect
-    /// errors as we encounter them, and keep going as far as we can with the information that is available, before
-    /// raising them. That is meant to enable a smoother development experience when working with `ryft` by reducing
-    /// the amount of trial and error required to get something work (i.e., users do not need to keep trying, fixing
-    /// one error at a time; they get to see multiple errors at once, when there are multiple).
-    errors: Vec<syn::Error>,
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-impl OperationParser {
-    /// Creates a new [`OperationParser`] that has not extracted any information yet.
-    fn new() -> Self {
-        Self {
-            ryft_crate: DEFAULT_RYFT_CRATE.into(),
-            operation_type: None,
-            program_constant_type: None,
-            members: Vec::new(),
-            dispatchers: None,
-            errors: Vec::new(),
-        }
-    }
-
-    /// Adds an error to this [`OperationParser`] with the specified message spanning the provided tokens. This is only
-    /// meant to be used internally by this parser as a convenient helper for collecting errors.
-    ///
-    /// # Parameters
-    ///
-    ///   - `tokens`: Tokens that the error spans.
-    ///   - `message`: Message describing the error.
-    fn add_error<T: ToTokens, U: Display>(&mut self, tokens: T, message: U) {
-        self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
-    }
-
-    /// Returns a [`TokenStream`] that represents a [`compile_error!`] invocation that contains information about the
-    /// [`syn::Error`]s that have been collected by this [`OperationParser`] so far. If there are no errors, then this
-    /// function returns [`None`].
-    fn compile_error(&self) -> Option<TokenStream> {
-        self.errors
-            .iter()
-            .cloned()
-            .reduce(|mut combined_error, error| {
-                combined_error.combine(error);
-                combined_error
-            })
-            .map(|error| error.into_compile_error())
-    }
-
-    /// Extracts the `#[ryft(...)]` attributes that are attached to the provided [`syn::DeriveInput`] and checks for
-    /// unknown enum-level attributes. This function sets [`OperationParser::ryft_crate`],
-    /// [`OperationParser::program_constant_type`], [`OperationParser::members`], and [`OperationParser::dispatchers`]
-    /// if it is able to successfully extract them. It also sets [`OperationParser::operation_type`], which is either
-    /// declared explicitly through `#[ryft(type(T), constant(C))]` (both of which must be declared together) or
-    /// inferred from the unique `Value<Type = T>` bound of the generic parameters of the enum.
-    fn extract_attributes(&mut self, input: &syn::DeriveInput) {
-        let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
-        input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
-            attr.parse_nested_meta(|meta| match &meta.path {
-                path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
-                path if path == &TYPE_ATTRIBUTE => {
-                    Self::extract_type_attribute(&meta, TYPE_ATTRIBUTE, &mut self.operation_type)
-                }
-                path if path == &CONSTANT_ATTRIBUTE => {
-                    Self::extract_type_attribute(&meta, CONSTANT_ATTRIBUTE, &mut self.program_constant_type)
-                }
-                path if path == &MEMBERS_ATTRIBUTE => self.extract_members_attribute(&meta),
-                path if path == &DISPATCH_ATTRIBUTE => self.extract_dispatch_attribute(&meta),
-                path if path == &IDENTITY_DISPATCHER => {
-                    Err(meta.error("the `identity` attribute was replaced by the `dispatch(identity)` dispatcher"))
-                }
-                _ => Err(meta.error(format_args!(
-                    "invalid `#[ryft(...)]` attribute `{}`; only `crate`, `type(...)`, `constant(...)`, \
-                     `members(...)`, and `dispatch(...)` are supported here",
-                    meta.path.to_compact_string(),
-                ))),
-            })
-            .unwrap_or_else(|error| self.errors.push(error));
-        });
-
-        if let Some(ryft_crate) = ryft_crate.get() {
-            self.ryft_crate = ryft_crate;
-        }
-
-        // An attribute that fails to parse also stops the parsing of the attributes that follow it in the same list,
-        // and so we only determine the operation type if all attributes were parsed, to avoid follow-on errors.
-        if !self.errors.is_empty() {
-            return;
-        }
-        match (&self.operation_type, &self.program_constant_type) {
-            (Some(_), Some(_)) => {}
-            (None, None) => {
-                let mut operation_types = Vec::<syn::Type>::new();
-                for (_, operation_type) in value_parameters(&input.generics) {
-                    if !operation_types.iter().any(|existing_type| existing_type.tokens_eq(&operation_type)) {
-                        operation_types.push(operation_type);
-                    }
-                }
-                match operation_types.as_slice() {
-                    [operation_type] => self.operation_type = Some(operation_type.clone()),
-                    [] => self.add_error(
-                        &input.ident,
-                        "could not infer an operation type because no generic parameter is bounded by \
-                         `Value<Type = T>`",
-                    ),
-                    _ => self.add_error(
-                        &input.generics,
-                        "could not infer a unique operation type because multiple distinct `Value<Type = T>` bounds \
-                         are present",
-                    ),
-                }
-            }
-            _ => self.add_error(
-                &input.ident,
-                "explicit operation-family declarations must specify both `type(...)` and `constant(...)`",
-            ),
-        }
-    }
-
-    /// Extracts the single [`syn::Type`] declared by a `#[ryft(type(T))]` or a `#[ryft(constant(C))]` attribute into
-    /// `declared_type`. The type is parsed locally (rather than through the shared `name = value` attribute grammar) so
-    /// that any complete Rust type, including generic, qualified, and tuple types, fits inside the parentheses.
-    ///
-    /// # Parameters
-    ///
-    ///   - `meta`: Nested meta item whose path is `name`.
-    ///   - `name`: Name of the attribute being extracted (i.e., `type` or `constant`), which is used in diagnostics.
-    ///   - `declared_type`: Destination for the declared type, which must not have been set by an earlier attribute.
-    fn extract_type_attribute(
-        meta: &syn::meta::ParseNestedMeta,
-        name: Symbol,
-        declared_type: &mut Option<syn::Type>,
-    ) -> syn::Result<()> {
-        if meta.input.peek(syn::Token![=]) {
-            return Err(meta.error(format_args!("the `{name} = ...` attribute form was replaced by `{name}(...)`")));
-        }
-        if declared_type.is_some() {
-            return Err(meta.error(format_args!("duplicate ryft attribute `{name}(...)`")));
-        }
-        let error = || meta.error(format_args!("`#[ryft({name}(...))]` must declare exactly one type"));
-        if !meta.input.peek(syn::token::Paren) {
-            return Err(error());
-        }
-        let content;
-        syn::parenthesized!(content in meta.input);
-        match content.parse::<syn::Type>() {
-            Ok(parsed_type) if content.is_empty() => {
-                *declared_type = Some(parsed_type);
-                Ok(())
-            }
-            _ => Err(error()),
-        }
-    }
-
-    /// Extracts the [`OperationMember`]s declared by a `#[ryft(members(...))]` attribute into
-    /// [`OperationParser::members`]. Declaring the members of an operation family lets `mixed` variant markers default
-    /// their member type, lets the member types of all variant markers be validated against the family, and gives the
-    /// generated structural mixed forward mode arms the member types they need to classify each output.
-    fn extract_members_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
-        if !self.members.is_empty() {
-            return Err(meta.error("duplicate ryft attribute `members(...)`"));
-        }
-        let content;
-        syn::parenthesized!(content in meta.input);
-        let members = syn::punctuated::Punctuated::<OperationMember, syn::Token![,]>::parse_terminated(&content)?;
-        if members.is_empty() {
-            return Err(meta.error("`#[ryft(members(...))]` must declare at least one member universe"));
-        }
-        for (index, member) in members.iter().enumerate() {
-            if members.iter().take(index).any(|other| other.r#type.tokens_eq(&member.r#type)) {
-                return Err(syn::Error::new_spanned(
-                    &member.r#type,
-                    format_args!("duplicate ryft member universe `{}`", member.r#type.to_compact_string()),
-                ));
-            }
-        }
-        self.members = members.into_iter().collect();
-        Ok(())
-    }
-
-    /// Extracts the [`Dispatchers`] selected by a `#[ryft(dispatch(...))]` attribute into
-    /// [`OperationParser::dispatchers`]. Dispatchers may be listed in any order, but by convention `identity` is listed
-    /// first.
-    fn extract_dispatch_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
-        if self.dispatchers.is_some() {
-            return Err(meta.error("duplicate ryft attribute `dispatch(...)`"));
-        }
-        let content;
-        let fork = meta.input.fork();
-        syn::parenthesized!(content in fork);
-        if content.is_empty() {
-            return Err(meta.error("`#[ryft(dispatch(...))]` must select at least one dispatcher"));
-        }
-        let mut dispatchers = Dispatchers::default();
-        meta.parse_nested_meta(|meta| {
-            let selected = match &meta.path {
-                path if path == &IDENTITY_DISPATCHER => &mut dispatchers.identity,
-                path if path == &DISCHARGE_DISPATCHER => &mut dispatchers.discharge,
-                path if path == &BATCHING_DISPATCHER => &mut dispatchers.batching,
-                path if path == &DIFFERENTIATION_DISPATCHER => &mut dispatchers.differentiation,
-                path if path == &TRANSPOSITION_DISPATCHER => &mut dispatchers.transposition,
-                _ => {
-                    return Err(meta.error(format_args!(
-                        "invalid `#[ryft(dispatch(...))]` dispatcher `{}`; only `identity`, `discharge`, `batching`, \
-                         `differentiation`, and `transposition` are supported here",
-                        meta.path.to_compact_string(),
-                    )));
-                }
-            };
-            if *selected {
-                return Err(meta.error(format_args!("duplicate ryft dispatcher `{}`", meta.path.to_compact_string())));
-            }
-            *selected = true;
-            Ok(())
-        })?;
-        self.dispatchers = Some(dispatchers);
-        Ok(())
-    }
-
-    /// Extracts the [`OperationVariant`]s that are contained in the provided [`syn::DeriveInput`]. This function also
-    /// checks that the input is an enum, because the operation derivation does not support structs or unions.
-    fn extract_variants(&mut self, input: &syn::DeriveInput) -> Vec<OperationVariant> {
-        let syn::Data::Enum(data) = &input.data else {
-            self.add_error(&input.ident, "the `#[derive(Operation)]` macro only supports enums");
-            return Vec::new();
-        };
-        data.variants.iter().filter_map(|variant| self.extract_variant(&input.generics, variant)).collect()
-    }
-
-    /// Extracts one [`OperationVariant`] from the provided [`syn::Variant`]. This function also checks that the variant
-    /// is a tuple variant with exactly one payload field and that the payload field has no `#[ryft(...)]` attributes,
-    /// returning [`None`] if the variant has no usable payload.
-    ///
-    /// # Parameters
-    ///
-    ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
-    ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
-    fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        /// Extracts the inner type from a `Box<T>` type expression. This recognizes any type path whose final path
-        /// segment is `Box` with exactly one type argument (e.g., `Box<T>` or `std::boxed::Box<T>`) and returns that
-        /// type argument. For all other types, this function returns [`None`].
-        fn extract_box_type(ty: &syn::Type) -> Option<syn::Type> {
-            let syn::Type::Path(syn::TypePath { qself: None, path }) = ty else {
-                return None;
-            };
-            let segment = path.segments.last()?;
-            if segment.ident != "Box" {
-                return None;
-            }
-            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-                return None;
-            };
-            match arguments.args.iter().collect::<Vec<_>>().as_slice() {
-                [syn::GenericArgument::Type(inner_ty)] => Some(inner_ty.clone()),
-                _ => None,
-            }
-        }
-
-        let (class, generate_from) = self.extract_variant_attributes(variant);
-        let field = match &variant.fields {
-            syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
-            _ => {
-                self.add_error(
-                    &variant.ident,
-                    "operation enum variants must be tuple variants with exactly one payload field",
-                );
-                return None;
-            }
-        };
-        field.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
-            self.add_error(
-                attr,
-                "operation field attributes are not supported; put operation member-class attributes on the \
-                 enclosing variant",
-            )
-        });
-
-        // Bare generic payloads (e.g., the `Extension` payload of an `Extension(Extension)` variant) get no generated
-        // conversions, because a `From<Extension>` implementation would overlap with the concrete payload conversions
-        // whenever `Extension` is instantiated as one of the concrete payload types.
-        let is_generic_extension = field
-            .ty
-            .ident()
-            .is_some_and(|ident| generics.type_params().any(|parameter| parameter.ident == *ident));
-        let (payload_type, is_boxed) = match extract_box_type(&field.ty) {
-            Some(payload_type) => (payload_type, true),
-            None => (field.ty.clone(), false),
-        };
-        Some(OperationVariant {
-            ident: variant.ident.clone(),
-            class,
-            program_payload_type: payload_type.clone(),
-            payload_type,
-            is_boxed,
-            is_generic_extension,
-            generate_from,
-        })
-    }
-
-    /// Extracts the [`OperationVariantClass`] and the conversion policy declared for the provided [`syn::Variant`]
-    /// through its `#[ryft(...)]` attributes. Variants without a class marker are family-native. The conversion policy
-    /// is `false` when the variant declares `#[ryft(skip_from)]`, which suppresses only its generated `From<Payload>`
-    /// implementation so that a handwritten normalizing conversion can be used instead. Its borrowed `TryFrom`
-    /// projection is still generated.
-    fn extract_variant_attributes(&mut self, variant: &syn::Variant) -> (OperationVariantClass, bool) {
-        let mut class = None::<OperationVariantClass>;
-        let mut generate_from = true;
-        variant.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
-            attr.parse_nested_meta(|meta| match &meta.path {
-                path if path == &SKIP_FROM_ATTRIBUTE && !generate_from => {
-                    Err(meta.error("duplicate ryft operation variant attribute `skip_from`"))
-                }
-                path if path == &SKIP_FROM_ATTRIBUTE => {
-                    generate_from = false;
-                    Ok(())
-                }
-                path if path == &PROJECTED_ATTRIBUTE || path == &MIXED_ATTRIBUTE => {
-                    let candidate = OperationVariantClass::parse(&meta, &self.members)?;
-                    match &class {
-                        Some(existing) if std::mem::discriminant(existing) == std::mem::discriminant(&candidate) => {
-                            Err(meta
-                                .error(format_args!("duplicate ryft operation variant class `{}`", candidate.name())))
-                        }
-                        Some(existing) => Err(meta.error(format_args!(
-                            "contradictory ryft operation variant classes `{}` and `{}`",
-                            existing.name(),
-                            candidate.name(),
-                        ))),
-                        None => {
-                            class = Some(candidate);
-                            Ok(())
-                        }
-                    }
-                }
-                path if path == &STRUCTURAL_ROLE => Err(meta.error(
-                    "the `structural` operation variant class was replaced by the `projected(U, structural)` role form",
-                )),
-                _ => Err(meta.error(format_args!(
-                    "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, and \
-                     `skip_from` are supported here",
-                    meta.path.to_compact_string(),
-                ))),
-            })
-            .unwrap_or_else(|error| self.errors.push(error));
-        });
-        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from)
-    }
-
-    /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload conversions and
-    /// projections, reporting errors otherwise. Every variant other than a bare generic extension receives its own
-    /// borrowed `TryFrom<&Enum>` conversion (and usually also an owned `From<Payload>` conversion) for its payload
-    /// type, and so a payload type may be held by at most one such variant. That also keeps the payload construction
-    /// of `OperationPayloadProjection::from_payload` unambiguous. Payload types are compared by their tokens, and so
-    /// payload types that only overlap for some instantiation of the generic parameters of the enum (e.g.,
-    /// `Operation<V>` and `Operation<C>`) are left to the coherence checks of the compiler. Similarly, a projected
-    /// member type may be declared by at most one variant, because `OperationProjection<U>` names one canonical
-    /// projected family.
-    fn check_for_conflicting_variants(&mut self, variants: &[OperationVariant]) {
-        let mut payload_types = HashSet::new();
-        let mut member_types = HashSet::new();
-        for variant in variants {
-            if !variant.is_generic_extension && !payload_types.insert(variant.payload_type.to_compact_string()) {
-                self.add_error(
-                    &variant.ident,
-                    format_args!(
-                        "operation family holds payload type `{}` in more than one variant",
-                        variant.payload_type.to_compact_string(),
-                    ),
-                );
-            }
-            if let Some(member_type) = variant.class.projected_member_type()
-                && !member_types.insert(member_type.to_compact_string())
-            {
-                self.add_error(
-                    &variant.ident,
-                    format_args!(
-                        "operation family declares member type `{}` more than once",
-                        member_type.to_compact_string(),
-                    ),
-                );
-            }
-        }
-    }
-
-    /// Normalizes the provided [`syn::DeriveInput`] into the [`OperationEnum`] from which all implementations are
-    /// generated. This function extracts the [`OperationVariant`]s, checks them for conflicts, and computes the
-    /// generics, the self types, and the payload types of the generated implementations.
-    ///
-    /// The implementations that operate on programs (i.e., interpretation, partial evaluation, reference discharge,
-    /// batching, and differentiation) have a single value space. For enums whose program constant type is inferred,
-    /// the first `Value<Type = T>` parameter is the program constant type and the second one is the capture constant
-    /// type, while any later parameters carry payload-specific metadata. These program-shaped implementations
-    /// therefore substitute every `Value<Type = T>` parameter after the first two with the first one. Refer to the
-    /// documentation of the `Operation` trait in `ryft-core` for more information on how the value types of the
-    /// generated implementations are inferred.
-    ///
-    /// This function must only be called after [`OperationParser::extract_attributes`] has completed without errors,
-    /// which guarantees that [`OperationParser::operation_type`] is set.
-    fn normalize_input(&mut self, input: &syn::DeriveInput) -> OperationEnum {
-        // Variants whose markers fail to parse fall back to the family-native class, and so we only check for
-        // conflicting variants if all variants were extracted without errors, to avoid follow-on errors.
-        let mut variants = self.extract_variants(input);
-        if self.errors.is_empty() {
-            self.check_for_conflicting_variants(&variants);
-        }
-
-        let ryft = &self.ryft_crate;
-        let operation_type = self.operation_type.clone().unwrap();
-        let ident = input.ident.clone();
-        let generics = input.generics.without_defaults();
-        let (_, type_generics, _) = generics.split_for_impl();
-        let self_type: syn::Type = syn::parse_quote!(#ident #type_generics);
-
-        // Enums with an explicit constant type have no generic program constant parameter. For all other enums, the
-        // operation type was inferred from their `Value<Type = T>` parameters, and so there is at least one of them.
-        let mut operation_value_parameters = value_parameters(&generics)
-            .into_iter()
-            .filter(|(_, value_type)| value_type.tokens_eq(&operation_type))
-            .map(|(parameter, _)| parameter.clone())
-            .collect::<Vec<_>>();
-        operation_value_parameters.dedup();
-        let (program_constant_type, program_constant_parameter, has_separate_runtime_value_type) =
-            match &self.program_constant_type {
-                Some(program_constant_type) => (program_constant_type.clone(), None, true),
-                None => {
-                    let parameter = operation_value_parameters[0].clone();
-                    (syn::parse_quote!(#parameter), Some(parameter), operation_value_parameters.len() == 1)
-                }
-            };
-        let substituted_parameters = match &program_constant_parameter {
-            Some(_) => operation_value_parameters.iter().skip(2).collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
-        let program_constant_path = program_constant_parameter.clone().map(syn::Path::from);
-        let substitute_type = |ty: &syn::Type| {
-            let mut ty = ty.clone();
-            substituted_parameters
-                .iter()
-                .for_each(|parameter| ty.replace_ident(parameter, program_constant_path.as_ref().unwrap()));
-            ty
-        };
-        let substitute_generics = |generics: &syn::Generics| {
-            substituted_parameters.iter().fold(generics.clone(), |generics, parameter| {
-                generics.with_concrete_param(parameter, program_constant_path.as_ref().unwrap())
-            })
-        };
-
-        // Every payload must implement the operation contract of its class, and we add one predicate per distinct
-        // payload contract. Family-native payloads use the primary operation type, projected member payloads use their
-        // member type, and mixed member payloads use `MemberOperation` for their parent boundary.
-        let mut payload_contracts = HashSet::new();
-        let payload_predicates = variants
-            .iter()
-            .filter_map(|variant| {
-                let payload_type = &variant.payload_type;
-                let predicate: syn::WherePredicate = match &variant.class {
-                    OperationVariantClass::FamilyNative => {
-                        syn::parse_quote!(#payload_type: #ryft::Operation<Type = #operation_type>)
-                    }
-                    OperationVariantClass::ProjectedMember { member_type, .. } => {
-                        syn::parse_quote!(#payload_type: #ryft::Operation<Type = #member_type>)
-                    }
-                    OperationVariantClass::MixedMember { .. } => {
-                        syn::parse_quote!(#payload_type: #ryft::MemberOperation<#operation_type>)
-                    }
-                };
-                payload_contracts.insert(predicate.to_compact_string()).then_some(predicate)
-            })
-            .collect::<Vec<_>>();
-
-        // Every projected member type must share the type identities of the primary operation type and must convert to
-        // and from it, so that the projected boundary helpers can move types between the two universes.
-        let mut member_types = HashSet::new();
-        let member_predicates = variants
-            .iter()
-            .filter_map(|variant| variant.class.projected_member_type())
-            .filter(|member_type| member_types.insert(member_type.to_compact_string()))
-            .flat_map(|member_type| -> [syn::WherePredicate; 3] {
-                [
-                    syn::parse_quote! {
-                        #member_type: #ryft::Type<
-                            Identity = <#operation_type as #ryft::Type>::Identity,
-                        >
-                    },
-                    syn::parse_quote!(#operation_type: ::std::convert::From<#member_type>),
-                    syn::parse_quote! {
-                        for<'__member_type> &'__member_type #member_type: ::std::convert::TryFrom<
-                            &'__member_type #operation_type,
-                            Error = #ryft::TypeError,
-                        >
-                    },
-                ]
-            })
-            .collect::<Vec<_>>();
-
-        // The interpretation, reference discharge, batching, and differentiation rule traits carry `Operation<Type =
-        // C::Type>` as their super-trait, and so the per-payload rule predicates of those dispatchers already imply the
-        // payload `Operation` predicates and do not restate them.
-        let operation_generics =
-            generics.with_where_predicates(&[payload_predicates, member_predicates.clone()].concat());
-        let dispatcher_generics = substitute_generics(&generics.with_where_predicates(&member_predicates));
-        let program_generics = substitute_generics(&operation_generics);
-        let program_self_type = substitute_type(&self_type);
-        variants.iter_mut().for_each(|variant| {
-            variant.program_payload_type = substitute_type(&variant.payload_type);
-            if let OperationVariantClass::ProjectedMember { member_type, .. }
-            | OperationVariantClass::MixedMember { member_type, .. } = &mut variant.class
-            {
-                *member_type = substitute_type(member_type);
-            }
-        });
-        let members = self
-            .members
-            .iter()
-            .map(|member| OperationMember { r#type: substitute_type(&member.r#type), structural: member.structural })
-            .collect();
-
-        OperationEnum {
-            ryft_crate: self.ryft_crate.clone(),
-            operation_type,
-            members,
-            dispatchers: self.dispatchers.unwrap_or_default(),
-            ident,
-            generics,
-            operation_generics,
-            dispatcher_generics,
-            program_generics,
-            self_type,
-            program_self_type,
-            program_constant_type,
-            program_constant_parameter,
-            has_separate_runtime_value_type,
-            variants,
-        }
-    }
-}
-
-/// Normalized operation enum for which `#[derive(Operation)]` generates code. This is extracted from the provided
-/// [`syn::DeriveInput`] by [`OperationParser::normalize_input`].
-///
-/// Some of the generated implementations operate on programs whose operation family is this enum (e.g.,
-/// interpretation and batching) and are therefore _program-shaped_. Program-shaped implementations have a single
-/// value space, and so they use the program-shaped generics, self type, and payload types, in which payload-specific
-/// value parameters are substituted with the program constant parameter. Refer to
-/// [`OperationParser::normalize_input`] for more information.
-struct OperationEnum {
-    /// [`syn::Path`] that represents the root `ryft` library path. Refer to [`OperationParser::ryft_crate`] for more
-    /// information.
+/// Some of the generated implementations operate on programs whose operation family is this enum (e.g., interpretation
+/// and batching) and are therefore _program-shaped_. Program-shaped implementations have a single value space, and so
+/// they use the program-shaped generics, self type, and payload types, in which payload-specific value parameters are
+/// substituted with the constant parameter. Refer to [`OperationParser::normalize_input`] for more information.
+pub(crate) struct OperationCodeGenerator {
+    /// [`syn::Path`] that represents the root `ryft` library path.
+    /// Refer to [`OperationParser::ryft_crate`] for more information.
     ryft_crate: syn::Path,
 
     /// Primary operation type, which is the `Operation::Type` of the generated `Operation` implementation.
@@ -718,34 +65,35 @@ struct OperationEnum {
     generics: syn::Generics,
 
     /// [`syn::Generics`] used by the generated `Operation` implementation and by the implementations that require it.
-    /// These extend [`OperationEnum::generics`] with one `Operation` predicate per distinct payload contract and with
-    /// the type conversion predicates of every projected member type.
+    /// These extend [`OperationCodeGenerator::generics`] with one `Operation` predicate per distinct payload contract
+    /// and with the type conversion predicates of every projected member type.
     operation_generics: syn::Generics,
 
-    /// Program-shaped [`syn::Generics`] used by the interpretation, reference discharge, batching, and
-    /// differentiation dispatchers. These omit the payload `Operation` predicates of
-    /// [`OperationEnum::operation_generics`], because the per-payload rule predicates of these dispatchers imply them.
+    /// Program-shaped [`syn::Generics`] used by the interpretation, reference discharge, batching, and differentiation
+    /// dispatchers. These omit the payload `Operation` predicates of [`OperationCodeGenerator::operation_generics`],
+    /// because the per-payload rule predicates of these dispatchers imply them.
     dispatcher_generics: syn::Generics,
 
-    /// Program-shaped form of [`OperationEnum::operation_generics`], used by the partial evaluation dispatcher.
+    /// Program-shaped form of [`OperationCodeGenerator::operation_generics`], used by the partial evaluation
+    /// dispatcher.
     program_generics: syn::Generics,
 
     /// Type of the enum, using all of its generic parameters.
     self_type: syn::Type,
 
-    /// Program-shaped form of [`OperationEnum::self_type`].
+    /// Program-shaped form of [`OperationCodeGenerator::self_type`].
     program_self_type: syn::Type,
 
     /// Type of the constants that are stored in programs whose operation family is this enum.
-    program_constant_type: syn::Type,
+    constant_type: syn::Type,
 
-    /// Generic parameter named by [`OperationEnum::program_constant_type`], whose bounds generated runtime value types
+    /// Generic parameter named by [`OperationCodeGenerator::constant_type`], whose bounds generated runtime value types
     /// inherit. This is [`None`] for enums that declare an explicit constant type, because such a type has no
     /// one-to-one generic source.
-    program_constant_parameter: Option<syn::Ident>,
+    constant_parameter: Option<syn::Ident>,
 
     /// Boolean flag indicating whether the generated interpretation and transposition implementations use a runtime
-    /// value type that is distinct from [`OperationEnum::program_constant_type`]. This is the case for enums that
+    /// value type that is distinct from [`OperationCodeGenerator::constant_type`]. This is the case for enums that
     /// declare an explicit constant type and for enums with a single `Value<Type = T>` parameter.
     has_separate_runtime_value_type: bool,
 
@@ -753,14 +101,118 @@ struct OperationEnum {
     variants: Vec<OperationVariant>,
 }
 
-impl OperationEnum {
-    /// Generates all implementations for this [`OperationEnum`], including the dispatchers that are selected through
-    /// `#[ryft(dispatch(...))]`, wrapped in a single `const` block. The implementations are generated in the order in
-    /// which `ryft` places the implementations of an operation: the formatting and identity implementations, followed
-    /// by `Operation`, `ReferenceDischargeableOperation`, `InterpretableOperation`, `PartiallyEvaluatableOperation`,
-    /// `BatchableOperation`, `DifferentiableOperation`, `TransposableOperation`, `OperationProjection`,
-    /// `OperationPayloadProjection`, `OperationProvider`, and finally the payload conversions. Refer to
-    /// [`generate_operation_impl`] for an example of the generated code.
+impl OperationCodeGenerator {
+    /// Generates the `#[derive(Operation)]` implementations for the provided input. This function also checks for any
+    /// errors on the provided input and will generate a [`TokenStream`] that contains a call to [`compile_error!`] if
+    /// any errors are encountered. Refer to the documentation of the `Operation` trait in `ryft-core` for information
+    /// on how to use this macro.
+    ///
+    /// As an example, the generated code for an enum with one native variant and no selected dispatchers typically
+    /// looks something like this:
+    ///
+    /// ```ignore
+    /// #[doc(hidden)]
+    /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
+    /// const _: () = {
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>> ::std::fmt::Display for CustomOperation<V> where ... {
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>> ryft::Operation for CustomOperation<V>
+    ///     where
+    ///         Payload<V>: ryft::Operation<Type = T>,
+    ///     {
+    ///         type Type = T;
+    ///
+    ///         fn name(&self) -> &'static str {
+    ///             match self {
+    ///                 Self::Payload(operation) => { <Payload<V> as ryft::Operation>::name(operation) },
+    ///             }
+    ///         }
+    ///
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>, __Context> ryft::InterpretableOperation<__Context> for CustomOperation<V>
+    ///     where
+    ///         ...
+    ///     {
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>, __Context> ryft::PartiallyEvaluatableOperation<__Context> for CustomOperation<V>
+    ///     where
+    ///         ...
+    ///     {
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>> ryft::OperationPayloadProjection for CustomOperation<V> {
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>> ryft::OperationProvider<T, ryft::GuardOperation<T>> for CustomOperation<V>
+    ///     where
+    ///         ...
+    ///     {
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<V: Value<Type = T>> ::std::convert::From<Payload<V>> for CustomOperation<V> {
+    ///         ...
+    ///     }
+    ///
+    ///     #[automatically_derived]
+    ///     impl<'__operation, V: Value<Type = T>> ::std::convert::TryFrom<&'__operation CustomOperation<V>>
+    ///         for &'__operation Payload<V>
+    ///     where
+    ///         CustomOperation<V>: ryft::Operation,
+    ///     {
+    ///         ...
+    ///     }
+    /// };
+    /// ```
+    ///
+    /// Projected member variants additionally generate `OperationProjection` implementations, and every dispatcher that
+    /// is selected through `#[ryft(dispatch(...))]` generates its implementation inside the same `const` block.
+    pub(crate) fn generate_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+        let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
+
+        // Replace any instances of `Self` with its fully-qualified path. This is necessary in order to be able to
+        // handle recursive payloads (e.g., control flow operations whose regions are programs over the enclosing enum).
+        replace_self_type(&mut input);
+
+        // Variant markers depend on the enum-level attributes (e.g., a `mixed` marker may take its member type from the
+        // declared member universes), and so we only extract the variants once the enum-level attributes are valid.
+        // That avoids reporting misleading follow-on errors for the variants.
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        if let Some(error) = parser.compile_error() {
+            return error.into();
+        }
+        let generator = parser.normalize_input(&input);
+        if let Some(error) = parser.compile_error() {
+            return error.into();
+        }
+        generator.generate().into()
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Generates all implementations for this [`OperationCodeGenerator`], including the dispatchers that are selected
+    /// through `#[ryft(dispatch(...))]`, wrapped in a single `const` block. The implementations are generated in the
+    /// order in which `ryft` places the implementations of an operation: the formatting and identity implementations,
+    /// followed by `Operation`, `ReferenceDischargeableOperation`, `InterpretableOperation`,
+    /// `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`, `TransposableOperation`,
+    /// `OperationProjection`, `OperationPayloadProjection`, `OperationProvider`, and finally the payload conversions.
+    /// Refer to [`OperationCodeGenerator::generate_operation_impl`] for an example of the generated code.
     fn generate(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let self_type = &self.self_type;
@@ -825,17 +277,17 @@ impl OperationEnum {
     fn generate_identity_impls(&self) -> TokenStream {
         let self_type = &self.self_type;
         let mut payload_type_names = HashSet::new();
-        let payload_types = self
+        let payload_variants = self
             .variants
             .iter()
-            .map(|variant| &variant.payload_type)
-            .filter(|payload_type| payload_type_names.insert(payload_type.to_compact_string()))
+            .filter(|variant| payload_type_names.insert(variant.payload_type.to_compact_string()))
             .collect::<Vec<_>>();
         let bounded_generics = |bound: TokenStream| {
             let mut generics = self.generics.clone();
             let where_clause = generics.make_where_clause();
-            for payload_type in &payload_types {
-                where_clause.predicates.push(syn::parse_quote!(#payload_type: #bound));
+            for variant in &payload_variants {
+                let payload_type = &variant.payload_type;
+                where_clause.predicates.push(syn::parse_quote_spanned!(variant.span => #payload_type: #bound));
             }
             generics
         };
@@ -1144,7 +596,7 @@ impl OperationEnum {
         where_clause.predicates.extend(self.variants.iter().filter(|variant| delegates(variant)).map(
             |variant| -> syn::WherePredicate {
                 let payload_type = &variant.program_payload_type;
-                syn::parse_quote! {
+                syn::parse_quote_spanned! { variant.span =>
                     #payload_type: #ryft::ReferenceDischargeableOperation<__ParentContext, __ReferenceDischargePolicy>
                 }
             },
@@ -1193,22 +645,21 @@ impl OperationEnum {
     /// `interpret_projected_operation`, which projects their inputs into an eager context of their member universe and
     /// lifts their outputs back.
     ///
-    /// The context value type is the program constant type for enums with two or more `Value<Type = T>` parameters.
-    /// Otherwise, it is a distinct runtime value type, named by a generated `__InterpretationValue` type parameter that
-    /// inherits the bounds of the program constant parameter, and the context must be able to lift program constants
-    /// into it.
+    /// The context value type is the constant type for enums with two or more `Value<Type = T>` parameters. Otherwise,
+    /// it is a distinct runtime value type, named by a generated `__InterpretationValue` type parameter that inherits
+    /// the bounds of the constant parameter, and the context must be able to lift constants into it.
     fn generate_interpretation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
-        let program_constant_type = &self.program_constant_type;
+        let constant_type = &self.constant_type;
         let self_type = &self.program_self_type;
         let context_value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
         let mut generics = self.dispatcher_generics.clone();
         generics.params.push(syn::parse_quote!(__Context));
 
         // A separate runtime value type is named by a generated type parameter rather than by the value projection of
-        // the context, so that the bounds of the program constant parameter can be renamed onto it, including bounds on
-        // its associated types (e.g., `V::Item: Bound`), which cannot be expressed on a projection.
+        // the context, so that the bounds of the constant parameter can be renamed onto it, including bounds on its
+        // associated types (e.g., `V::Item: Bound`), which cannot be expressed on a projection.
         let value_type: syn::Type = if self.has_separate_runtime_value_type {
             generics.params.push(syn::parse_quote!(__InterpretationValue));
             syn::parse_quote!(__InterpretationValue)
@@ -1222,24 +673,28 @@ impl OperationEnum {
             });
             where_clause
                 .predicates
-                .extend(self.program_constant_parameter_predicates(&format_ident!("__InterpretationValue")));
+                .extend(self.constant_parameter_predicates(&format_ident!("__InterpretationValue")));
             where_clause.predicates.push(syn::parse_quote! {
-                __Context: #ryft::Constant<#value_type, #program_constant_type>
+                __Context: #ryft::Constant<#value_type, #constant_type>
             });
         } else {
             where_clause.predicates.push(syn::parse_quote! {
-                __Context: #ryft::Domain<Type = #operation_type, Value = #program_constant_type>
+                __Context: #ryft::Domain<Type = #operation_type, Value = #constant_type>
             });
         }
         for variant in &self.variants {
             let payload_type = &variant.program_payload_type;
             match &variant.class {
-                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
-                    #payload_type: #ryft::InterpretableOperation<__Context>
-                }),
-                OperationVariantClass::MixedMember { .. } => where_clause.predicates.push(syn::parse_quote! {
-                    #payload_type: #ryft::MemberInterpretableOperation<__Context>
-                }),
+                OperationVariantClass::FamilyNative => {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::InterpretableOperation<__Context>
+                    })
+                }
+                OperationVariantClass::MixedMember { .. } => {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::MemberInterpretableOperation<__Context>
+                    })
+                }
                 OperationVariantClass::ProjectedMember { member_type, .. } => {
                     let member_value_type: syn::Type = syn::parse_quote! {
                         <#value_type as #ryft::ValueProjection<#member_type>>::Projected
@@ -1260,7 +715,7 @@ impl OperationEnum {
                             Operation = #payload_type,
                         >
                     });
-                    where_clause.predicates.push(syn::parse_quote! {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
                         #payload_type: #ryft::InterpretableOperation<
                             #ryft::EagerContext<#member_value_type, #payload_type>,
                         >
@@ -1309,7 +764,7 @@ impl OperationEnum {
     fn generate_partial_evaluation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
-        let program_constant_type = &self.program_constant_type;
+        let constant_type = &self.constant_type;
         let self_type = &self.program_self_type;
         let value_type: syn::Type =
             syn::parse_quote!(#ryft::PartialEvaluationValue<<__Context as #ryft::Domain>::Value>);
@@ -1320,14 +775,14 @@ impl OperationEnum {
         generics.params.push(syn::parse_quote!(__Context));
         let where_clause = generics.make_where_clause();
         where_clause.predicates.push(syn::parse_quote! {
-            __Context: #ryft::Context<Type = #operation_type, Constant = #program_constant_type, Operation = #self_type>
+            __Context: #ryft::Context<Type = #operation_type, Constant = #constant_type, Operation = #self_type>
         });
-        where_clause.predicates.extend(self.variants.iter().filter(|variant| delegates(variant)).map(
-            |variant| -> syn::WherePredicate {
-                let payload_type = &variant.program_payload_type;
-                syn::parse_quote!(#payload_type: #ryft::PartiallyEvaluatableOperation<__Context>)
-            },
-        ));
+        where_clause
+            .predicates
+            .extend(self.variants.iter().filter(|variant| delegates(variant)).map(|variant| -> syn::WherePredicate {
+            let payload_type = &variant.program_payload_type;
+            syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::PartiallyEvaluatableOperation<__Context>)
+        }));
         let arms = self.variants.iter().map(|variant| {
             if delegates(variant) {
                 let payload_type = &variant.program_payload_type;
@@ -1360,21 +815,21 @@ impl OperationEnum {
         }
     }
 
-    /// Generates the `BatchableOperation` dispatcher. Enums whose program constant type is inferred stay generic over
-    /// their batching policy, which lets array families support every array batching mode that their payload rules
-    /// support, while enums with an explicit constant type use the canonical batching policy that `BatchableType`
-    /// selects for their primary operation type. Family-native variants delegate to the batching rules
-    /// of their payloads, and mixed member variants delegate to the parent-universe rules of their payloads.
-    /// Computational projected member variants are batched through `batch_projected_operation`, which applies the
-    /// member batching rule of the payload under the projected batching policy. Structural projected member variants
-    /// are instead bound once in the parent context through `batch_replicated_projected_operation`, which requires the
-    /// batching policy to implement `ReplicatedBatchingPolicyProjection` for their member type.
+    /// Generates the `BatchableOperation` dispatcher. Enums whose constant type is inferred stay generic over their
+    /// batching policy, which lets array families support every array batching mode that their payload rules support,
+    /// while enums with an explicit constant type use the canonical batching policy that `BatchableType` selects for
+    /// their primary operation type. Family-native variants delegate to the batching rules of their payloads, and mixed
+    /// member variants delegate to the parent-universe rules of their payloads. Computational projected member variants
+    /// are batched through `batch_projected_operation`, which applies the member batching rule of the payload under the
+    /// projected batching policy. Structural projected member variants are instead bound once in the parent context
+    /// through `batch_replicated_projected_operation`, which requires the batching policy to implement
+    /// `ReplicatedBatchingPolicyProjection` for their member type.
     fn generate_batching_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
-        let program_constant_type = &self.program_constant_type;
+        let constant_type = &self.constant_type;
         let self_type = &self.program_self_type;
-        let has_explicit_constant_type = self.program_constant_parameter.is_none();
+        let has_explicit_constant_type = self.constant_parameter.is_none();
         let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
         let policy: syn::Type = syn::parse_quote!(__BatchingPolicy);
         let batch_type: syn::Type = syn::parse_quote!(<#policy as #ryft::BatchingPolicy<__ParentContext>>::Batch);
@@ -1384,7 +839,7 @@ impl OperationEnum {
         where_clause.predicates.push(syn::parse_quote! {
             __ParentContext: #ryft::Context<
                 Type = #operation_type,
-                Constant = #program_constant_type,
+                Constant = #constant_type,
                 Operation = #self_type,
             >
         });
@@ -1401,16 +856,20 @@ impl OperationEnum {
         for variant in &self.variants {
             let payload_type = &variant.program_payload_type;
             match &variant.class {
-                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
-                    #payload_type: #ryft::BatchableOperation<__ParentContext, #policy>
-                }),
-                OperationVariantClass::MixedMember { .. } => where_clause.predicates.push(syn::parse_quote! {
-                    #payload_type: #ryft::MemberBatchableOperation<__ParentContext, #policy>
-                }),
+                OperationVariantClass::FamilyNative => {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::BatchableOperation<__ParentContext, #policy>
+                    })
+                }
+                OperationVariantClass::MixedMember { .. } => {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::MemberBatchableOperation<__ParentContext, #policy>
+                    })
+                }
                 OperationVariantClass::ProjectedMember { member_type, structural } => {
                     let projection_predicates: [syn::WherePredicate; 4] = [
                         syn::parse_quote! {
-                            #program_constant_type: #ryft::ValueProjection<
+                            #constant_type: #ryft::ValueProjection<
                                 #member_type,
                                 Projected: #ryft::Value<Type = #member_type>,
                             >
@@ -1452,7 +911,7 @@ impl OperationEnum {
                         where_clause.predicates.push(syn::parse_quote! {
                             #ryft::ProjectedContext<__ParentContext, #member_type>: #ryft::Context<Type = #member_type>
                         });
-                        where_clause.predicates.push(syn::parse_quote! {
+                        where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
                             #payload_type: #ryft::BatchableOperation<
                                 #ryft::ProjectedContext<__ParentContext, #member_type>,
                                 <#policy as #ryft::BatchingPolicyProjection<__ParentContext, #member_type>>::Projected,
@@ -1507,19 +966,19 @@ impl OperationEnum {
 
     /// Generates the `DifferentiableOperation` dispatcher, which implements both `jvp` and `jvp_for_transpose`. The
     /// dispatcher is generic over a differentiation context that is pinned to the primary operation type, to the
-    /// program constant type, and to the enum itself as its operation family. Family-native variants delegate to the
-    /// forward mode rules of their payloads, and computational member variants delegate to the parent-universe rules
-    /// of their payloads. Structural member variants are constant with respect to their inputs and so their arms are
-    /// generated directly. A structural projected member stages its primal with a symbolic zero tangent, while a
-    /// structural mixed member stages its primal together with one member zero tangent per output, over the same
-    /// inputs, so that the runtime extents that those inputs carry stay available to both. Both stage the operation
-    /// again without regions, and so they reject payloads that declare regions. Higher-order rules request
-    /// nested differentiation through their instruction-scoped driver, whose concrete implementation establishes the
-    /// required `Program::jvp` and `Program::linearize` bounds at its construction site.
+    /// constant type, and to the enum itself as its operation family. Family-native variants delegate to the forward
+    /// mode rules of their payloads, and computational member variants delegate to the parent-universe rules of their
+    /// payloads. Structural member variants are constant with respect to their inputs. A structural projected member is
+    /// differentiated by `jvp_structural_operation`, which stages its primal with symbolic zero tangents, while a
+    /// structural mixed member is differentiated by `jvp_structural_mixed_operation`, which also stages one member zero
+    /// tangent per output, through `stage_member_zero_tangent` for each computational member universe of the enum.
+    /// Higher-order rules request nested differentiation through
+    /// their instruction-scoped driver, whose concrete implementation establishes the required `Program::jvp` and
+    /// `Program::linearize` bounds at its construction site.
     fn generate_differentiation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
-        let program_constant_type = &self.program_constant_type;
+        let constant_type = &self.constant_type;
         let self_type = &self.program_self_type;
         let mut generics = self.dispatcher_generics.clone();
         generics.params.push(syn::parse_quote!(__DifferentiationContext));
@@ -1527,7 +986,7 @@ impl OperationEnum {
         where_clause.predicates.push(syn::parse_quote! {
             __DifferentiationContext: #ryft::Context<
                 Type = #operation_type,
-                Constant = #program_constant_type,
+                Constant = #constant_type,
                 Operation = #self_type,
             >
         });
@@ -1552,23 +1011,22 @@ impl OperationEnum {
         for variant in &self.variants {
             let payload_type = &variant.program_payload_type;
             match &variant.class {
-                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
-                    #payload_type: #ryft::DifferentiableOperation<__DifferentiationContext>
-                }),
+                OperationVariantClass::FamilyNative => {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::DifferentiableOperation<__DifferentiationContext>
+                    })
+                }
                 OperationVariantClass::ProjectedMember { structural: false, .. }
                 | OperationVariantClass::MixedMember { structural: false, .. } => {
-                    where_clause.predicates.push(syn::parse_quote! {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
                         #payload_type: #ryft::MemberDifferentiableOperation<__DifferentiationContext>
                     });
                 }
                 OperationVariantClass::ProjectedMember { structural: true, .. } => {}
 
-                // A structural mixed member needs its member view of the declared parent output types and, for every
-                // computational member universe that an output may belong to, a zero constructor and a type view.
+                // A structural mixed member needs a zero constructor and a type view for every computational member
+                // universe that an output may belong to.
                 OperationVariantClass::MixedMember { member_type, structural: true } => {
-                    where_clause
-                        .predicates
-                        .push(syn::parse_quote!(#payload_type: #ryft::MemberOperation<#operation_type>));
                     for tangent_universe in self.tangent_universes(member_type) {
                         let tangent_predicates: [syn::WherePredicate; 3] = [
                             syn::parse_quote!(#tangent_universe: #ryft::DifferentiableType),
@@ -1609,21 +1067,6 @@ impl OperationEnum {
                     let payload_type = &variant.program_payload_type;
                     let receiver = variant.receiver();
 
-                    // Structural arms bind the payload again without any regions, and so they reject payloads that
-                    // declare regions instead of reporting a misleading region count error from the binding.
-                    let region_check = quote! {
-                        if !<#payload_type as #ryft::Operation>::region_slots(#receiver).is_empty() {
-                            return ::std::result::Result::Err(
-                                #ryft::ProgramError::UnsupportedOperation {
-                                    message: ::std::format!(
-                                        "structural operation `{}` must not declare regions",
-                                        <#payload_type as #ryft::Operation>::name(#receiver),
-                                    ),
-                                }
-                                .into(),
-                            );
-                        }
-                    };
                     match &variant.class {
                         OperationVariantClass::FamilyNative => variant.arm(quote! {
                             <#payload_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::
@@ -1634,78 +1077,35 @@ impl OperationEnum {
                             <#payload_type as #ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
                                 #member_function(#receiver, context, driver, inputs)
                         }),
-                        OperationVariantClass::ProjectedMember { structural: true, .. } => variant.arm(quote! {
-                            #region_check
-                            let primal_inputs = inputs
-                                .iter()
-                                .map(|input| input.primal().clone())
-                                .collect::<::std::vec::Vec<_>>();
-                            context
-                                .primal()
-                                .bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?
-                                .into_iter()
-                                .map(#ryft::DifferentiationDual::new_with_zero_tangent)
-                                .collect()
-                        }),
+                        OperationVariantClass::ProjectedMember { structural: true, .. } => {
+                            variant.wildcard_arm(quote!(#ryft::jvp_structural_operation(context, self.clone(), inputs)))
+                        }
 
                         // Each output's zero tangent is staged in the computational member universe that the output
                         // belongs to, and an output outside every such universe (e.g., a structural member output) has
                         // a zero differential space and so it receives a symbolic zero tangent instead.
                         OperationVariantClass::MixedMember { member_type, structural: true } => {
-                            let tangent_universe_branches =
-                                self.tangent_universes(member_type).into_iter().map(|tangent_universe| {
-                                    quote! {
-                                        if let ::std::result::Result::Ok(output_type) =
-                                            <&#tangent_universe as ::std::convert::TryFrom<&#operation_type>>::try_from(
-                                                &output_type,
-                                            )
-                                        {
-                                            let tangent_type =
-                                                <#tangent_universe as #ryft::DifferentiableType>::tangent(output_type)?;
-                                            let tangent_inputs = primal_inputs
-                                                .iter()
-                                                .map(|value| context.primal_to_tangent(value.clone()))
-                                                .collect::<::std::result::Result<::std::vec::Vec<_>, _>>()?;
-                                            let mut tangents = context.tangent().bind(
-                                                <#self_type as ::std::convert::From<
-                                                    #ryft::ZeroOperation<#tangent_universe>,
-                                                >>::from(#ryft::ZeroOperation::new(tangent_type)),
-                                                ::std::vec::Vec::new(),
-                                                tangent_inputs.as_slice(),
-                                            )?;
-                                            #ryft::check_count!("output", tangents, 1, ProgramError);
-                                            return #ryft::DifferentiationDual::new(
-                                                primal,
-                                                #ryft::MaybeZero::Value(tangents.remove(0)),
-                                            )
-                                            .map_err(::std::convert::Into::into);
-                                        }
-                                    }
-                                });
-                            variant.arm(quote! {
-                                #region_check
-                                let primal_inputs = inputs
-                                    .iter()
-                                    .map(|input| input.primal().clone())
-                                    .collect::<::std::vec::Vec<_>>();
-                                let input_types = primal_inputs
-                                    .iter()
-                                    .map(|input| #ryft::Typed::r#type(input).into_owned())
-                                    .collect::<::std::vec::Vec<_>>();
-                                let output_types = <#payload_type as #ryft::MemberOperation<#operation_type>>::
-                                    infer_parent_output_types(#receiver, input_types.as_slice(), &[])?;
-                                let primals = context
-                                    .primal()
-                                    .bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?;
-                                #ryft::check_count!("output", primals, output_types.len(), ProgramError);
-                                primals
-                                    .into_iter()
-                                    .zip(output_types)
-                                    .map(|(primal, output_type)| {
-                                        #(#tangent_universe_branches)*
-                                        #ryft::DifferentiationDual::new_with_zero_tangent(primal)
-                                    })
-                                    .collect()
+                            let tangent_universes = self.tangent_universes(member_type);
+                            variant.wildcard_arm(quote! {
+                                #ryft::jvp_structural_mixed_operation(
+                                    context,
+                                    self.clone(),
+                                    inputs,
+                                    |context, primal_inputs, output_type| {
+                                        #(
+                                            if let ::std::option::Option::Some(tangent) =
+                                                #ryft::stage_member_zero_tangent::<#tangent_universes, _, _>(
+                                                    context,
+                                                    primal_inputs,
+                                                    output_type,
+                                                )?
+                                            {
+                                                return ::std::result::Result::Ok(::std::option::Option::Some(tangent));
+                                            }
+                                        )*
+                                        ::std::result::Result::Ok(::std::option::Option::None)
+                                    },
+                                )
                             })
                         }
                     }
@@ -1735,11 +1135,11 @@ impl OperationEnum {
     }
 
     /// Generates the `TransposableOperation` dispatcher. Enums with a separate runtime value type (refer to
-    /// [`OperationEnum::has_separate_runtime_value_type`]) transpose over a generated `__TranspositionValue` parameter
-    /// that inherits the bounds of the program constant parameter, while all other enums transpose over their program
+    /// [`OperationCodeGenerator::has_separate_runtime_value_type`]) transpose over a generated `__TranspositionValue`
+    /// parameter that inherits the bounds of the constant parameter, while all other enums transpose over their
     /// constant type. Family-native variants delegate to the transposition rules of their payloads. Computational
-    /// projected member variants delegate to `MemberTransposableOperation::transpose_in_parent`, which preserves
-    /// access to cotangent accumulators that the value family of the member may not be able to represent. Mixed member
+    /// projected member variants delegate to `MemberTransposableOperation::transpose_in_parent`, which preserves access
+    /// to cotangent accumulators that the value family of the member may not be able to represent. Mixed member
     /// variants are transposed through `transpose_mixed_operation`, and structural projected member variants contribute
     /// no cotangents. Higher-order rules request nested program transposition through their instruction-scoped driver,
     /// whose concrete implementation establishes the required `Program::transpose_with_respect_to` bounds.
@@ -1752,14 +1152,14 @@ impl OperationEnum {
             generics.params.push(syn::parse_quote!(__TranspositionValue));
             syn::parse_quote!(__TranspositionValue)
         } else {
-            self.program_constant_type.clone()
+            self.constant_type.clone()
         };
         let where_clause = generics.make_where_clause();
         if self.has_separate_runtime_value_type {
             where_clause.predicates.push(syn::parse_quote!(#value_type: #ryft::Value<Type = #operation_type>));
             where_clause
                 .predicates
-                .extend(self.program_constant_parameter_predicates(&format_ident!("__TranspositionValue")));
+                .extend(self.constant_parameter_predicates(&format_ident!("__TranspositionValue")));
         }
         where_clause
             .predicates
@@ -1767,11 +1167,13 @@ impl OperationEnum {
         for variant in &self.variants {
             let payload_type = &variant.payload_type;
             match &variant.class {
-                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
-                    #payload_type: #ryft::TransposableOperation<#value_type, #self_type>
-                }),
+                OperationVariantClass::FamilyNative => {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::TransposableOperation<#value_type, #self_type>
+                    })
+                }
                 OperationVariantClass::ProjectedMember { structural: false, .. } => {
-                    where_clause.predicates.push(syn::parse_quote! {
+                    where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
                         #payload_type: #ryft::MemberTransposableOperation<#value_type, #self_type>
                     });
                 }
@@ -1892,7 +1294,7 @@ impl OperationEnum {
                 generics
                     .make_where_clause()
                     .predicates
-                    .push(syn::parse_quote!(#payload_type: #ryft::OperationPayloadProjection));
+                    .push(syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::OperationPayloadProjection));
                 projection_arms.push(quote! {
                     Self::#variant_ident(operation) => {
                         <#payload_type as #ryft::OperationPayloadProjection>::project_payload(#receiver, payload)
@@ -2015,47 +1417,57 @@ impl OperationEnum {
         let (try_from_impl_generics, _, try_from_where_clause) = try_from_generics.split_for_impl();
         let operation = variant.construct(quote!(operation));
         let receiver = variant.receiver();
+
+        // Only the implementation headers are spanned at the variant, so that conflicting implementations (e.g., of a
+        // payload type that is held by several variants) point at it. The bodies keep the call site span, so that
+        // lints on generated code (e.g., the unreachable fallback arm of a single variant enum) are not reported in
+        // user code.
+        let from_body = quote! {
+            fn from(operation: #payload_type) -> Self {
+                #operation
+            }
+        };
+        let try_from_body = quote! {
+            type Error = #ryft::TypeError;
+
+            fn try_from(value: &'__operation #self_type) -> ::std::result::Result<Self, #ryft::TypeError> {
+                match value {
+                    #enum_ident::#variant_ident(operation) => ::std::result::Result::Ok(#receiver),
+                    _ => ::std::result::Result::Err(#ryft::TypeError::invalid(::std::format!(
+                        "cannot project operation `{}` into a `{}` payload",
+                        <#self_type as #ryft::Operation>::name(value),
+                        #payload_name,
+                    ))),
+                }
+            }
+        };
         let from_impl = variant.generate_from.then(|| {
-            quote! {
+            quote_spanned! { variant.span =>
                 #[automatically_derived]
                 impl #impl_generics ::std::convert::From<#payload_type> for #self_type #where_clause {
-                    fn from(operation: #payload_type) -> Self {
-                        #operation
-                    }
+                    #from_body
                 }
             }
         });
-        quote! {
-            #from_impl
-
+        let try_from_impl = quote_spanned! { variant.span =>
             #[automatically_derived]
             impl #try_from_impl_generics ::std::convert::TryFrom<&'__operation #self_type>
                 for &'__operation #payload_type
             #try_from_where_clause
             {
-                type Error = #ryft::TypeError;
-
-                fn try_from(value: &'__operation #self_type) -> ::std::result::Result<Self, #ryft::TypeError> {
-                    match value {
-                        #enum_ident::#variant_ident(operation) => ::std::result::Result::Ok(#receiver),
-                        _ => ::std::result::Result::Err(#ryft::TypeError::invalid(::std::format!(
-                            "cannot project operation `{}` into a `{}` payload",
-                            <#self_type as #ryft::Operation>::name(value),
-                            #payload_name,
-                        ))),
-                    }
-                }
+                #try_from_body
             }
-        }
+        };
+        quote!(#from_impl #try_from_impl)
     }
 
-    /// Returns the `where` predicates that copy the declared bounds of [`OperationEnum::program_constant_parameter`]
+    /// Returns the `where` predicates that copy the declared bounds of [`OperationCodeGenerator::constant_parameter`]
     /// (i.e., both its inline bounds and the `where` predicates whose bounded type references it) onto the provided
-    /// generated type parameter, renaming every mention of the program constant parameter in them. That way, a
-    /// generated runtime value type inherits the capability requirements that the enum declares for its program
-    /// constant parameter. This function returns no predicates for enums that declare an explicit constant type.
-    fn program_constant_parameter_predicates(&self, value_parameter: &syn::Ident) -> Vec<syn::WherePredicate> {
-        let Some(parameter) = &self.program_constant_parameter else {
+    /// generated type parameter, renaming every mention of the constant parameter in them. That way, a generated
+    /// runtime value type inherits the capability requirements that the enum declares for its constant parameter. This
+    /// function returns no predicates for enums that declare an explicit constant type.
+    fn constant_parameter_predicates(&self, value_parameter: &syn::Ident) -> Vec<syn::WherePredicate> {
+        let Some(parameter) = &self.constant_parameter else {
             return Vec::new();
         };
         let value_path = syn::Path::from(value_parameter.clone());
@@ -2099,6 +1511,566 @@ impl OperationEnum {
                     .map(|member| member.r#type.clone()),
             )
             .collect()
+    }
+}
+
+/// Parser that extracts the [`OperationCodeGenerator`] of an operation enum from the provided [`syn::DeriveInput`].
+/// Refer to [`OperationCodeGenerator::generate_operation_impl`] for information on how it is used.
+struct OperationParser {
+    /// [`syn::Path`] that represents the root `ryft` library path (e.g., `ryft`). This is customizable via the
+    /// `#[ryft(crate = "...")]` attribute and it is meant to support libraries that build on top of `ryft` and may
+    /// want to export `ryft` types as part of their namespace. This is similar to the `#[serde(crate = "...")]`
+    /// attribute. You can refer to [its documentation](https://serde.rs/container-attrs.html#crate) for more
+    /// information.
+    ryft_crate: syn::Path,
+
+    /// Primary operation type, which is either declared through `#[ryft(type(T))]` or inferred from the unique
+    /// `Value<Type = T>` bound of the generic parameters of the enum. This is [`None`] only if the type could not be
+    /// determined, in which case an error has been reported.
+    operation_type: Option<syn::Type>,
+
+    /// Constant type declared through `#[ryft(constant(C))]`. This is [`None`] for enums whose constant type is instead
+    /// inferred from their `Value<Type = T>` generic parameters.
+    constant_type: Option<syn::Type>,
+
+    /// [`OperationMember`]s declared through `#[ryft(members(...))]`, in declaration order. This is empty when the enum
+    /// declares no member universes, in which case every member variant must name its own member type.
+    members: Vec<OperationMember>,
+
+    /// [`Dispatchers`] selected through `#[ryft(dispatch(...))]`. This is [`None`] when the enum selects none.
+    dispatchers: Option<Dispatchers>,
+
+    /// Errors accumulated in this [`OperationParser`]. The way error handling works in this parser is that we collect
+    /// errors as we encounter them, and keep going as far as we can with the information that is available, before
+    /// raising them. That is meant to enable a smoother development experience when working with `ryft` by reducing
+    /// the amount of trial and error required to get something work (i.e., users do not need to keep trying, fixing
+    /// one error at a time; they get to see multiple errors at once, when there are multiple).
+    errors: Vec<syn::Error>,
+}
+
+impl OperationParser {
+    /// Creates a new [`OperationParser`] that has not extracted any information yet.
+    fn new() -> Self {
+        Self {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            operation_type: None,
+            constant_type: None,
+            members: Vec::new(),
+            dispatchers: None,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Adds an error to this [`OperationParser`] with the specified message spanning the provided tokens. This is only
+    /// meant to be used internally by this parser as a convenient helper for collecting errors.
+    ///
+    /// # Parameters
+    ///
+    ///   - `tokens`: Tokens that the error spans.
+    ///   - `message`: Message describing the error.
+    fn add_error<T: ToTokens, U: Display>(&mut self, tokens: T, message: U) {
+        self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
+    }
+
+    /// Returns a [`TokenStream`] that represents a [`compile_error!`] invocation that contains information about the
+    /// [`syn::Error`]s that have been collected by this [`OperationParser`] so far. If there are no errors, then this
+    /// function returns [`None`].
+    fn compile_error(&self) -> Option<TokenStream> {
+        self.errors
+            .iter()
+            .cloned()
+            .reduce(|mut combined_error, error| {
+                combined_error.combine(error);
+                combined_error
+            })
+            .map(|error| error.into_compile_error())
+    }
+
+    /// Extracts the `#[ryft(...)]` attributes that are attached to the provided [`syn::DeriveInput`]
+    /// and checks for unknown enum-level attributes. This function sets [`OperationParser::ryft_crate`],
+    /// [`OperationParser::constant_type`], [`OperationParser::members`], and [`OperationParser::dispatchers`] if it is
+    /// able to successfully extract them. It also sets [`OperationParser::operation_type`], which is either declared
+    /// explicitly through `#[ryft(type(T), constant(C))]` (both of which must be declared together) or inferred from
+    /// the unique `Value<Type = T>` bound of the generic parameters of the enum.
+    fn extract_attributes(&mut self, input: &syn::DeriveInput) {
+        let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
+        input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
+            attr.parse_nested_meta(|meta| match &meta.path {
+                path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
+                path if path == &TYPE_ATTRIBUTE => {
+                    Self::extract_type_attribute(&meta, TYPE_ATTRIBUTE, &mut self.operation_type)
+                }
+                path if path == &CONSTANT_ATTRIBUTE => {
+                    Self::extract_type_attribute(&meta, CONSTANT_ATTRIBUTE, &mut self.constant_type)
+                }
+                path if path == &MEMBERS_ATTRIBUTE => self.extract_members_attribute(&meta),
+                path if path == &DISPATCH_ATTRIBUTE => self.extract_dispatch_attribute(&meta),
+                path if path == &IDENTITY_DISPATCHER => {
+                    Err(meta.error("the `identity` attribute was replaced by the `dispatch(identity)` dispatcher"))
+                }
+                _ => Err(meta.error(format_args!(
+                    "invalid `#[ryft(...)]` attribute `{}`; only `crate`, `type(...)`, `constant(...)`, \
+                     `members(...)`, and `dispatch(...)` are supported here",
+                    meta.path.to_compact_string(),
+                ))),
+            })
+            .unwrap_or_else(|error| self.errors.push(error));
+        });
+
+        if let Some(ryft_crate) = ryft_crate.get() {
+            self.ryft_crate = ryft_crate;
+        }
+
+        // An attribute that fails to parse also stops the parsing of the attributes that follow it in the same list,
+        // and so we only determine the operation type if all attributes were parsed, to avoid follow-on errors.
+        if !self.errors.is_empty() {
+            return;
+        }
+        match (&self.operation_type, &self.constant_type) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                let mut operation_types = Vec::<syn::Type>::new();
+                for (_, operation_type) in value_parameters(&input.generics) {
+                    if !operation_types.iter().any(|existing_type| existing_type.tokens_eq(&operation_type)) {
+                        operation_types.push(operation_type);
+                    }
+                }
+                match operation_types.as_slice() {
+                    [operation_type] => self.operation_type = Some(operation_type.clone()),
+                    [] => self.add_error(
+                        &input.ident,
+                        "could not infer an operation type because no generic parameter is bounded by \
+                         `Value<Type = T>`",
+                    ),
+                    _ => self.add_error(
+                        &input.generics,
+                        "could not infer a unique operation type because multiple distinct `Value<Type = T>` bounds \
+                         are present",
+                    ),
+                }
+            }
+            _ => self.add_error(
+                &input.ident,
+                "explicit operation-family declarations must specify both `type(...)` and `constant(...)`",
+            ),
+        }
+    }
+
+    /// Extracts the single [`syn::Type`] declared by a `#[ryft(type(T))]` or a `#[ryft(constant(C))]` attribute into
+    /// `declared_type`. The type is parsed locally (rather than through the shared `name = value` attribute grammar) so
+    /// that any complete Rust type, including generic, qualified, and tuple types, fits inside the parentheses.
+    ///
+    /// # Parameters
+    ///
+    ///   - `meta`: Nested meta item whose path is `name`.
+    ///   - `name`: Name of the attribute being extracted (i.e., `type` or `constant`), which is used in diagnostics.
+    ///   - `declared_type`: Destination for the declared type, which must not have been set by an earlier attribute.
+    fn extract_type_attribute(
+        meta: &syn::meta::ParseNestedMeta,
+        name: Symbol,
+        declared_type: &mut Option<syn::Type>,
+    ) -> syn::Result<()> {
+        if meta.input.peek(syn::Token![=]) {
+            return Err(meta.error(format_args!("the `{name} = ...` attribute form was replaced by `{name}(...)`")));
+        }
+        if declared_type.is_some() {
+            return Err(meta.error(format_args!("duplicate ryft attribute `{name}(...)`")));
+        }
+        let error = || meta.error(format_args!("`#[ryft({name}(...))]` must declare exactly one type"));
+        if !meta.input.peek(syn::token::Paren) {
+            return Err(error());
+        }
+        let content;
+        syn::parenthesized!(content in meta.input);
+        match content.parse::<syn::Type>() {
+            Ok(parsed_type) if content.is_empty() => {
+                *declared_type = Some(parsed_type);
+                Ok(())
+            }
+            _ => Err(error()),
+        }
+    }
+
+    /// Extracts the [`OperationMember`]s declared by a `#[ryft(members(...))]` attribute into
+    /// [`OperationParser::members`]. Declaring the members of an operation family lets `mixed` variant markers default
+    /// their member type, lets the member types of all variant markers be validated against the family, and gives the
+    /// generated structural mixed forward mode arms the member types they need to classify each output.
+    fn extract_members_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
+        if !self.members.is_empty() {
+            return Err(meta.error("duplicate ryft attribute `members(...)`"));
+        }
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let members = syn::punctuated::Punctuated::<OperationMember, syn::Token![,]>::parse_terminated(&content)?;
+        if members.is_empty() {
+            return Err(meta.error("`#[ryft(members(...))]` must declare at least one member universe"));
+        }
+        for (index, member) in members.iter().enumerate() {
+            if members.iter().take(index).any(|other| other.r#type.tokens_eq(&member.r#type)) {
+                return Err(syn::Error::new_spanned(
+                    &member.r#type,
+                    format_args!("duplicate ryft member universe `{}`", member.r#type.to_compact_string()),
+                ));
+            }
+        }
+        self.members = members.into_iter().collect();
+        Ok(())
+    }
+
+    /// Extracts the [`Dispatchers`] selected by a `#[ryft(dispatch(...))]` attribute into
+    /// [`OperationParser::dispatchers`]. Dispatchers may be listed in any order, but by convention `identity` is listed
+    /// first.
+    fn extract_dispatch_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
+        if self.dispatchers.is_some() {
+            return Err(meta.error("duplicate ryft attribute `dispatch(...)`"));
+        }
+        let content;
+        let fork = meta.input.fork();
+        syn::parenthesized!(content in fork);
+        if content.is_empty() {
+            return Err(meta.error("`#[ryft(dispatch(...))]` must select at least one dispatcher"));
+        }
+        let mut dispatchers = Dispatchers::default();
+        meta.parse_nested_meta(|meta| {
+            let selected = match &meta.path {
+                path if path == &IDENTITY_DISPATCHER => &mut dispatchers.identity,
+                path if path == &DISCHARGE_DISPATCHER => &mut dispatchers.discharge,
+                path if path == &BATCHING_DISPATCHER => &mut dispatchers.batching,
+                path if path == &DIFFERENTIATION_DISPATCHER => &mut dispatchers.differentiation,
+                path if path == &TRANSPOSITION_DISPATCHER => &mut dispatchers.transposition,
+                _ => {
+                    return Err(meta.error(format_args!(
+                        "invalid `#[ryft(dispatch(...))]` dispatcher `{}`; only `identity`, `discharge`, `batching`, \
+                         `differentiation`, and `transposition` are supported here",
+                        meta.path.to_compact_string(),
+                    )));
+                }
+            };
+            if *selected {
+                return Err(meta.error(format_args!("duplicate ryft dispatcher `{}`", meta.path.to_compact_string())));
+            }
+            *selected = true;
+            Ok(())
+        })?;
+        self.dispatchers = Some(dispatchers);
+        Ok(())
+    }
+
+    /// Extracts the [`OperationVariant`]s that are contained in the provided [`syn::DeriveInput`]. This function also
+    /// checks that the input is an enum, because the operation derivation does not support structs or unions.
+    fn extract_variants(&mut self, input: &syn::DeriveInput) -> Vec<OperationVariant> {
+        let syn::Data::Enum(data) = &input.data else {
+            self.add_error(&input.ident, "the `#[derive(Operation)]` macro only supports enums");
+            return Vec::new();
+        };
+        data.variants.iter().filter_map(|variant| self.extract_variant(&input.generics, variant)).collect()
+    }
+
+    /// Extracts one [`OperationVariant`] from the provided [`syn::Variant`]. This function also checks that the variant
+    /// is a tuple variant with exactly one payload field and that the payload field has no `#[ryft(...)]` attributes,
+    /// returning [`None`] if the variant has no usable payload.
+    ///
+    /// # Parameters
+    ///
+    ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
+    ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
+    fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
+        /// Extracts the inner type from a `Box<T>` type expression. This recognizes any type path whose final path
+        /// segment is `Box` with exactly one type argument (e.g., `Box<T>` or `std::boxed::Box<T>`) and returns that
+        /// type argument. For all other types, this function returns [`None`].
+        fn extract_box_type(ty: &syn::Type) -> Option<syn::Type> {
+            let syn::Type::Path(syn::TypePath { qself: None, path }) = ty else {
+                return None;
+            };
+            let segment = path.segments.last()?;
+            if segment.ident != "Box" {
+                return None;
+            }
+            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return None;
+            };
+            match arguments.args.iter().collect::<Vec<_>>().as_slice() {
+                [syn::GenericArgument::Type(inner_ty)] => Some(inner_ty.clone()),
+                _ => None,
+            }
+        }
+
+        let (class, generate_from) = self.extract_variant_attributes(variant);
+        let field = match &variant.fields {
+            syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
+            _ => {
+                self.add_error(
+                    &variant.ident,
+                    "operation enum variants must be tuple variants with exactly one payload field",
+                );
+                return None;
+            }
+        };
+        field.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
+            self.add_error(
+                attr,
+                "operation field attributes are not supported; put operation member-class attributes on the \
+                 enclosing variant",
+            )
+        });
+
+        // Bare generic payloads (e.g., the `Extension` payload of an `Extension(Extension)` variant) get no generated
+        // conversions, because a `From<Extension>` implementation would overlap with the concrete payload conversions
+        // whenever `Extension` is instantiated as one of the concrete payload types.
+        let is_generic_extension = field
+            .ty
+            .ident()
+            .is_some_and(|ident| generics.type_params().any(|parameter| parameter.ident == *ident));
+        let (payload_type, is_boxed) = match extract_box_type(&field.ty) {
+            Some(payload_type) => (payload_type, true),
+            None => (field.ty.clone(), false),
+        };
+        Some(OperationVariant {
+            ident: variant.ident.clone(),
+            span: field.ty.span(),
+            class,
+            program_payload_type: payload_type.clone(),
+            payload_type,
+            is_boxed,
+            is_generic_extension,
+            generate_from,
+        })
+    }
+
+    /// Extracts the [`OperationVariantClass`] and the conversion policy declared for the provided [`syn::Variant`]
+    /// through its `#[ryft(...)]` attributes. Variants without a class marker are family-native. The conversion policy
+    /// is `false` when the variant declares `#[ryft(skip_from)]`, which suppresses only its generated `From<Payload>`
+    /// implementation so that a handwritten normalizing conversion can be used instead. Its borrowed `TryFrom`
+    /// projection is still generated.
+    fn extract_variant_attributes(&mut self, variant: &syn::Variant) -> (OperationVariantClass, bool) {
+        let mut class = None::<OperationVariantClass>;
+        let mut generate_from = true;
+        variant.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
+            attr.parse_nested_meta(|meta| match &meta.path {
+                path if path == &SKIP_FROM_ATTRIBUTE && !generate_from => {
+                    Err(meta.error("duplicate ryft operation variant attribute `skip_from`"))
+                }
+                path if path == &SKIP_FROM_ATTRIBUTE => {
+                    generate_from = false;
+                    Ok(())
+                }
+                path if path == &PROJECTED_ATTRIBUTE || path == &MIXED_ATTRIBUTE => {
+                    let candidate = OperationVariantClass::parse(&meta, &self.members)?;
+                    match &class {
+                        Some(existing) if std::mem::discriminant(existing) == std::mem::discriminant(&candidate) => {
+                            Err(meta
+                                .error(format_args!("duplicate ryft operation variant class `{}`", candidate.name())))
+                        }
+                        Some(existing) => Err(meta.error(format_args!(
+                            "contradictory ryft operation variant classes `{}` and `{}`",
+                            existing.name(),
+                            candidate.name(),
+                        ))),
+                        None => {
+                            class = Some(candidate);
+                            Ok(())
+                        }
+                    }
+                }
+                path if path == &STRUCTURAL_ROLE => Err(meta.error(
+                    "the `structural` operation variant class was replaced by the `projected(U, structural)` role form",
+                )),
+                _ => Err(meta.error(format_args!(
+                    "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, and \
+                     `skip_from` are supported here",
+                    meta.path.to_compact_string(),
+                ))),
+            })
+            .unwrap_or_else(|error| self.errors.push(error));
+        });
+        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from)
+    }
+
+    /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload conversions and
+    /// projections, reporting errors otherwise. Every variant other than a bare generic extension receives its own
+    /// borrowed `TryFrom<&Enum>` conversion (and usually also an owned `From<Payload>` conversion) for its payload
+    /// type, and so a payload type may be held by at most one such variant. That also keeps the payload construction
+    /// of `OperationPayloadProjection::from_payload` unambiguous. Payload types are compared by their tokens, and so
+    /// payload types that only overlap for some instantiation of the generic parameters of the enum (e.g.,
+    /// `Operation<V>` and `Operation<C>`) are left to the coherence checks of the compiler. Similarly, a projected
+    /// member type may be declared by at most one variant, because `OperationProjection<U>` names one canonical
+    /// projected family.
+    fn check_for_conflicting_variants(&mut self, variants: &[OperationVariant]) {
+        let mut payload_types = HashSet::new();
+        let mut member_types = HashSet::new();
+        for variant in variants {
+            if !variant.is_generic_extension && !payload_types.insert(variant.payload_type.to_compact_string()) {
+                self.add_error(
+                    &variant.ident,
+                    format_args!(
+                        "operation family holds payload type `{}` in more than one variant",
+                        variant.payload_type.to_compact_string(),
+                    ),
+                );
+            }
+            if let Some(member_type) = variant.class.projected_member_type()
+                && !member_types.insert(member_type.to_compact_string())
+            {
+                self.add_error(
+                    &variant.ident,
+                    format_args!(
+                        "operation family declares member type `{}` more than once",
+                        member_type.to_compact_string(),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Normalizes the provided [`syn::DeriveInput`] into the [`OperationCodeGenerator`] from which all implementations
+    /// are generated. This function extracts the [`OperationVariant`]s, checks them for conflicts, and computes the
+    /// generics, the self types, and the payload types of the generated implementations.
+    ///
+    /// The implementations that operate on programs (i.e., interpretation, partial evaluation, reference discharge,
+    /// batching, and differentiation) have a single value space. For enums whose constant type is inferred, the first
+    /// `Value<Type = T>` parameter is the constant type and the second one is the capture constant type, while any
+    /// later parameters carry payload-specific metadata. These program-shaped implementations therefore substitute
+    /// every `Value<Type = T>` parameter after the first two with the first one. Refer to the documentation of the
+    /// `Operation` trait in `ryft-core` for more information on how the value types of the generated implementations
+    /// are inferred.
+    ///
+    /// This function must only be called after [`OperationParser::extract_attributes`] has completed without errors,
+    /// which guarantees that [`OperationParser::operation_type`] is set.
+    fn normalize_input(&mut self, input: &syn::DeriveInput) -> OperationCodeGenerator {
+        // Variants whose markers fail to parse fall back to the family-native class, and so we only check for
+        // conflicting variants if all variants were extracted without errors, to avoid follow-on errors.
+        let mut variants = self.extract_variants(input);
+        if self.errors.is_empty() {
+            self.check_for_conflicting_variants(&variants);
+        }
+
+        let ryft = &self.ryft_crate;
+        let operation_type = self.operation_type.clone().unwrap();
+        let ident = input.ident.clone();
+        let generics = input.generics.without_defaults();
+        let (_, type_generics, _) = generics.split_for_impl();
+        let self_type: syn::Type = syn::parse_quote!(#ident #type_generics);
+
+        // Enums with an explicit constant type have no generic constant parameter. For all other enums, the operation
+        // type was inferred from their `Value<Type = T>` parameters, and so there is at least one of them.
+        let mut operation_value_parameters = value_parameters(&generics)
+            .into_iter()
+            .filter(|(_, value_type)| value_type.tokens_eq(&operation_type))
+            .map(|(parameter, _)| parameter.clone())
+            .collect::<Vec<_>>();
+        operation_value_parameters.dedup();
+        let (constant_type, constant_parameter, has_separate_runtime_value_type) = match &self.constant_type {
+            Some(constant_type) => (constant_type.clone(), None, true),
+            None => {
+                let parameter = operation_value_parameters[0].clone();
+                (syn::parse_quote!(#parameter), Some(parameter), operation_value_parameters.len() == 1)
+            }
+        };
+        let substituted_parameters = match &constant_parameter {
+            Some(_) => operation_value_parameters.iter().skip(2).collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        let constant_path = constant_parameter.clone().map(syn::Path::from);
+        let substitute_type = |ty: &syn::Type| {
+            let mut ty = ty.clone();
+            substituted_parameters
+                .iter()
+                .for_each(|parameter| ty.replace_ident(parameter, constant_path.as_ref().unwrap()));
+            ty
+        };
+        let substitute_generics = |generics: &syn::Generics| {
+            substituted_parameters.iter().fold(generics.clone(), |generics, parameter| {
+                generics.with_concrete_param(parameter, constant_path.as_ref().unwrap())
+            })
+        };
+
+        // Every payload must implement the operation contract of its class, and we add one predicate per distinct
+        // payload contract. Family-native payloads use the primary operation type, projected member payloads use their
+        // member type, and mixed member payloads use `MemberOperation` for their parent boundary.
+        let mut payload_contracts = HashSet::new();
+        let payload_predicates = variants
+            .iter()
+            .filter_map(|variant| {
+                let payload_type = &variant.payload_type;
+                let predicate: syn::WherePredicate = match &variant.class {
+                    OperationVariantClass::FamilyNative => syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::Operation<Type = #operation_type>
+                    },
+                    OperationVariantClass::ProjectedMember { member_type, .. } => {
+                        syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::Operation<Type = #member_type>)
+                    }
+                    OperationVariantClass::MixedMember { .. } => syn::parse_quote_spanned! { variant.span =>
+                        #payload_type: #ryft::MemberOperation<#operation_type>
+                    },
+                };
+                payload_contracts.insert(predicate.to_compact_string()).then_some(predicate)
+            })
+            .collect::<Vec<_>>();
+
+        // Every projected member type must share the type identities of the primary operation type and must convert to
+        // and from it, so that the projected boundary helpers can move types between the two universes.
+        let mut member_types = HashSet::new();
+        let member_predicates = variants
+            .iter()
+            .filter_map(|variant| variant.class.projected_member_type())
+            .filter(|member_type| member_types.insert(member_type.to_compact_string()))
+            .flat_map(|member_type| -> [syn::WherePredicate; 3] {
+                [
+                    syn::parse_quote! {
+                        #member_type: #ryft::Type<
+                            Identity = <#operation_type as #ryft::Type>::Identity,
+                        >
+                    },
+                    syn::parse_quote!(#operation_type: ::std::convert::From<#member_type>),
+                    syn::parse_quote! {
+                        for<'__member_type> &'__member_type #member_type: ::std::convert::TryFrom<
+                            &'__member_type #operation_type,
+                            Error = #ryft::TypeError,
+                        >
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        // The interpretation, reference discharge, batching, and differentiation rule traits carry `Operation<Type =
+        // C::Type>` as their super-trait, and so the per-payload rule predicates of those dispatchers already imply the
+        // payload `Operation` predicates and do not restate them.
+        let operation_generics =
+            generics.with_where_predicates(&[payload_predicates, member_predicates.clone()].concat());
+        let dispatcher_generics = substitute_generics(&generics.with_where_predicates(&member_predicates));
+        let program_generics = substitute_generics(&operation_generics);
+        let program_self_type = substitute_type(&self_type);
+        variants.iter_mut().for_each(|variant| {
+            variant.program_payload_type = substitute_type(&variant.payload_type);
+            if let OperationVariantClass::ProjectedMember { member_type, .. }
+            | OperationVariantClass::MixedMember { member_type, .. } = &mut variant.class
+            {
+                *member_type = substitute_type(member_type);
+            }
+        });
+        let members = self
+            .members
+            .iter()
+            .map(|member| OperationMember { r#type: substitute_type(&member.r#type), structural: member.structural })
+            .collect();
+
+        OperationCodeGenerator {
+            ryft_crate: self.ryft_crate.clone(),
+            operation_type,
+            members,
+            dispatchers: self.dispatchers.unwrap_or_default(),
+            ident,
+            generics,
+            operation_generics,
+            dispatcher_generics,
+            program_generics,
+            self_type,
+            program_self_type,
+            constant_type,
+            constant_parameter,
+            has_separate_runtime_value_type,
+            variants,
+        }
     }
 }
 
@@ -2165,6 +2137,11 @@ struct OperationVariant {
     /// Identifier of this [`OperationVariant`].
     ident: syn::Ident,
 
+    /// [`Span`] of the payload type of this [`OperationVariant`], which spans the generated code that is specific to
+    /// this variant (e.g., its payload bounds and its match arms), so that compiler errors in that code point at the
+    /// variant instead of at the `#[derive(Operation)]` attribute.
+    span: Span,
+
     /// [`OperationVariantClass`] of this [`OperationVariant`].
     class: OperationVariantClass,
 
@@ -2172,7 +2149,7 @@ struct OperationVariant {
     payload_type: syn::Type,
 
     /// Program-shaped form of [`OperationVariant::payload_type`], which is used by the program-shaped implementations.
-    /// Refer to [`OperationEnum`] for more information.
+    /// Refer to [`OperationCodeGenerator`] for more information.
     program_payload_type: syn::Type,
 
     /// Boolean flag indicating whether the payload is stored as `Box<Payload>`.
@@ -2207,13 +2184,13 @@ impl OperationVariant {
     /// Returns a match arm that binds the payload of this [`OperationVariant`] as `operation` and evaluates `body`.
     fn arm(&self, body: TokenStream) -> TokenStream {
         let ident = &self.ident;
-        quote!(Self::#ident(operation) => { #body },)
+        quote_spanned!(self.span => Self::#ident(operation) => { #body },)
     }
 
     /// Returns a match arm that matches this [`OperationVariant`] without binding its payload and evaluates `body`.
     fn wildcard_arm(&self, body: TokenStream) -> TokenStream {
         let ident = &self.ident;
-        quote!(Self::#ident(..) => { #body },)
+        quote_spanned!(self.span => Self::#ident(..) => { #body },)
     }
 
     /// Returns `true` if this [`OperationVariant`] stores a native guard of the enclosing family, which is a
@@ -2462,16 +2439,16 @@ mod tests {
         parser
     }
 
-    /// Parses the provided derive input and normalizes it into an [`OperationEnum`] like [`generate_operation_impl`]
-    /// does, asserting that no errors are reported along the way.
-    fn normalize(tokens: TokenStream) -> OperationEnum {
+    /// Parses the provided derive input and normalizes it into an [`OperationCodeGenerator`] like
+    /// [`OperationCodeGenerator::generate_operation_impl`] does, asserting that no errors are reported along the way.
+    fn normalize(tokens: TokenStream) -> OperationCodeGenerator {
         let mut input = syn::parse2(tokens).unwrap();
         replace_self_type(&mut input);
         let mut parser = OperationParser::new();
         parser.extract_attributes(&input);
-        let operation_enum = parser.normalize_input(&input);
+        let generator = parser.normalize_input(&input);
         assert_eq!(errors(&parser), Vec::<String>::new());
-        operation_enum
+        generator
     }
 
     /// Returns the messages of the errors that the provided [`OperationParser`] has accumulated.
@@ -2528,7 +2505,7 @@ mod tests {
         assert_eq!(errors(&parser), Vec::<String>::new());
         assert_eq!(parser.ryft_crate.to_compact_string(), "wrapped::ryft");
         assert_eq!(parser.operation_type.as_ref().unwrap().to_compact_string(), "DataType");
-        assert!(parser.program_constant_type.is_none());
+        assert!(parser.constant_type.is_none());
         assert!(parser.dispatchers.is_some());
 
         // Test declaring the operation type and the constant type explicitly, possibly across several attributes.
@@ -2540,7 +2517,7 @@ mod tests {
         assert_eq!(errors(&parser), Vec::<String>::new());
         assert_eq!(parser.ryft_crate.to_compact_string(), "ryft");
         assert_eq!(parser.operation_type.as_ref().unwrap().to_compact_string(), "ArrayIrType");
-        assert_eq!(parser.program_constant_type.as_ref().unwrap().to_compact_string(), "ArrayIrValue<A>");
+        assert_eq!(parser.constant_type.as_ref().unwrap().to_compact_string(), "ArrayIrValue<A>");
         assert_eq!(parser.members.len(), 1);
         assert!(parser.dispatchers.is_none());
 
@@ -2602,7 +2579,7 @@ mod tests {
         });
         assert_eq!(errors(&parser), Vec::<String>::new());
         assert_eq!(parser.operation_type.as_ref().unwrap().to_compact_string(), "<AasProjection<ArrayType>>::Family");
-        assert_eq!(parser.program_constant_type.as_ref().unwrap().to_compact_string(), "(ArrayIrValue<A>,Vec<u8>)");
+        assert_eq!(parser.constant_type.as_ref().unwrap().to_compact_string(), "(ArrayIrValue<A>,Vec<u8>)");
 
         // Test using invalid type attributes.
         for (attribute, error) in [
@@ -2884,8 +2861,8 @@ mod tests {
             }
         });
         assert_eq!(operation.operation_type.to_compact_string(), "DataType");
-        assert_eq!(operation.program_constant_type.to_compact_string(), "V");
-        assert_eq!(operation.program_constant_parameter.as_ref().unwrap().to_string(), "V");
+        assert_eq!(operation.constant_type.to_compact_string(), "V");
+        assert_eq!(operation.constant_parameter.as_ref().unwrap().to_string(), "V");
         assert!(!operation.has_separate_runtime_value_type);
         assert_eq!(operation.generics.to_compact_string(), "<V,C,Extension,F>");
         assert_eq!(operation.self_type.to_compact_string(), "Operation<V,C,Extension,F>");
@@ -2933,8 +2910,8 @@ mod tests {
             }),
         );
 
-        // Test normalizing an enum whose types are declared explicitly, which has no program constant parameter and
-        // whose projected member types add type conversion predicates.
+        // Test normalizing an enum whose types are declared explicitly, which has no constant parameter and whose
+        // projected member types add type conversion predicates.
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), members(ArrayType), dispatch(batching))]
             enum Operation<A: Value<Type = ArrayType>> {
@@ -2943,8 +2920,8 @@ mod tests {
             }
         });
         assert_eq!(operation.operation_type.to_compact_string(), "ArrayIrType");
-        assert_eq!(operation.program_constant_type.to_compact_string(), "ArrayIrValue<A>");
-        assert!(operation.program_constant_parameter.is_none());
+        assert_eq!(operation.constant_type.to_compact_string(), "ArrayIrValue<A>");
+        assert!(operation.constant_parameter.is_none());
         assert!(operation.has_separate_runtime_value_type);
         assert_eq!(operation.members.len(), 1);
         assert!(operation.dispatchers.batching);
@@ -2965,7 +2942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate() {
+    fn test_operation_code_generator_generate() {
         /// Returns the names of the traits that the provided `const` block of generated code implements.
         fn implemented_traits(tokens: TokenStream) -> Vec<String> {
             let generated: syn::ItemConst = syn::parse2(tokens).unwrap();
@@ -3033,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_identity_impls() {
+    fn test_operation_code_generator_generate_identity_impls() {
         // The implementations are bounded by each distinct payload type rather than by the generic parameters, compare
         // mismatched variants as unequal, and hash the variant discriminant before the payload.
         let operation = normalize(quote! {
@@ -3107,7 +3084,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_operation_dispatcher() {
+    fn test_operation_code_generator_generate_operation_dispatcher() {
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
@@ -3287,7 +3264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_reference_discharge_dispatcher() {
+    fn test_operation_code_generator_generate_reference_discharge_dispatcher() {
         // Native and generic extension payloads delegate to their own discharge rules, while member payloads replay
         // the complete enum through the reference-free replay path.
         let operation = normalize(quote! {
@@ -3353,7 +3330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_interpretation_dispatcher() {
+    fn test_operation_code_generator_generate_interpretation_dispatcher() {
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
@@ -3431,8 +3408,8 @@ mod tests {
             }),
         );
 
-        // Test generating the dispatcher of an enum whose two inferred value parameters make the program constant type
-        // the value type of the interpretation context.
+        // Test generating the dispatcher of an enum whose two inferred value parameters make the constant type the
+        // value type of the interpretation context.
         let operation = normalize(quote! {
             enum Operation<V: Value<Type = ArrayType>, C: Value<Type = ArrayType>> {
                 Constant(ConstantOperation<V>),
@@ -3451,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_partial_evaluation_dispatcher() {
+    fn test_operation_code_generator_generate_partial_evaluation_dispatcher() {
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
@@ -3510,7 +3487,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_batching_dispatcher() {
+    fn test_operation_code_generator_generate_batching_dispatcher() {
         // Test generating the dispatcher of an enum with an explicit constant type, which uses the canonical batching
         // policy of its primary type. Computational projected members apply their member batching rules under the
         // projected policy, while structural projected members are bound once under the replicated projection.
@@ -3654,7 +3631,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_differentiation_dispatcher() {
+    fn test_operation_code_generator_generate_differentiation_dispatcher() {
         // Native payloads use their own forward mode rules, computational member payloads use their parent-universe
         // rules, and structural projected payloads stage their primals with symbolic zero tangents.
         let operation = normalize(quote! {
@@ -3722,28 +3699,8 @@ mod tests {
                             <ArrayOperation<A> as ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
                                 jvp_in_parent(operation, context, driver, inputs)
                         },
-                        Self::Dimension(operation) => {
-                            if !<DimensionOperation as ryft::Operation>::region_slots(operation).is_empty() {
-                                return ::std::result::Result::Err(
-                                    ryft::ProgramError::UnsupportedOperation {
-                                        message: ::std::format!(
-                                            "structural operation `{}` must not declare regions",
-                                            <DimensionOperation as ryft::Operation>::name(operation),
-                                        ),
-                                    }
-                                    .into(),
-                                );
-                            }
-                            let primal_inputs = inputs
-                                .iter()
-                                .map(|input| input.primal().clone())
-                                .collect::<::std::vec::Vec<_>>();
-                            context
-                                .primal()
-                                .bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?
-                                .into_iter()
-                                .map(ryft::DifferentiationDual::new_with_zero_tangent)
-                                .collect()
+                        Self::Dimension(..) => {
+                            ryft::jvp_structural_operation(context, self.clone(), inputs)
                         },
                         Self::Gather(operation) => {
                             <GatherOperation as ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
@@ -3765,7 +3722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_differentiation_dispatcher_structural_mixed_members() {
+    fn test_operation_code_generator_generate_differentiation_dispatcher_structural_mixed_members() {
         // Declaring the members of a family and abbreviating its mixed markers generates exactly the same code as
         // naming the member type on every marker.
         let explicit = normalize(quote! {
@@ -3788,7 +3745,8 @@ mod tests {
         );
 
         // A structural mixed payload stages one member zero tangent per output, in the computational member universe
-        // that the output belongs to, and so it needs a zero constructor and a type view for each such universe.
+        // that the output belongs to, and so it tries every such universe and needs a zero constructor and a type view
+        // for each of them.
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             #[ryft(members(ArrayType, TableType, structural(DimensionType)))]
@@ -3802,7 +3760,6 @@ mod tests {
         assert_eq!(
             predicates.skip(4).collect::<Vec<_>>(),
             [
-                quote!(ZeroOperation<ArrayType>: ryft::MemberOperation<ArrayIrType>),
                 quote!(ArrayType: ryft::DifferentiableType),
                 quote!(Operation<A>: ::std::convert::From<ryft::ZeroOperation<ArrayType>>),
                 quote!(for<'__t> &'__t ArrayType: ::std::convert::TryFrom<&'__t ArrayIrType, Error = ryft::TypeError>),
@@ -3837,85 +3794,33 @@ mod tests {
                     ryft::DifferentiationError,
                 > {
                     match self {
-                        Self::Zero(operation) => {
-                            if !<ZeroOperation<ArrayType> as ryft::Operation>::region_slots(operation).is_empty() {
-                                return ::std::result::Result::Err(
-                                    ryft::ProgramError::UnsupportedOperation {
-                                        message: ::std::format!(
-                                            "structural operation `{}` must not declare regions",
-                                            <ZeroOperation<ArrayType> as ryft::Operation>::name(operation),
-                                        ),
-                                    }
-                                    .into(),
-                                );
-                            }
-                            let primal_inputs = inputs
-                                .iter()
-                                .map(|input| input.primal().clone())
-                                .collect::<::std::vec::Vec<_>>();
-                            let input_types = primal_inputs
-                                .iter()
-                                .map(|input| ryft::Typed::r#type(input).into_owned())
-                                .collect::<::std::vec::Vec<_>>();
-                            let output_types = <ZeroOperation<ArrayType> as ryft::MemberOperation<ArrayIrType>>::
-                                infer_parent_output_types(operation, input_types.as_slice(), &[])?;
-                            let primals = context
-                                .primal()
-                                .bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?;
-                            ryft::check_count!("output", primals, output_types.len(), ProgramError);
-                            primals
-                                .into_iter()
-                                .zip(output_types)
-                                .map(|(primal, output_type)| {
-                                    if let ::std::result::Result::Ok(output_type) =
-                                        <&ArrayType as ::std::convert::TryFrom<&ArrayIrType>>::try_from(&output_type)
+                        Self::Zero(..) => {
+                            ryft::jvp_structural_mixed_operation(
+                                context,
+                                self.clone(),
+                                inputs,
+                                |context, primal_inputs, output_type| {
+                                    if let ::std::option::Option::Some(tangent) =
+                                        ryft::stage_member_zero_tangent::<ArrayType, _, _>(
+                                            context,
+                                            primal_inputs,
+                                            output_type,
+                                        )?
                                     {
-                                        let tangent_type =
-                                            <ArrayType as ryft::DifferentiableType>::tangent(output_type)?;
-                                        let tangent_inputs = primal_inputs
-                                            .iter()
-                                            .map(|value| context.primal_to_tangent(value.clone()))
-                                            .collect::<::std::result::Result<::std::vec::Vec<_>, _>>()?;
-                                        let mut tangents = context.tangent().bind(
-                                            <Operation<A> as ::std::convert::From<
-                                                ryft::ZeroOperation<ArrayType>,
-                                            >>::from(ryft::ZeroOperation::new(tangent_type)),
-                                            ::std::vec::Vec::new(),
-                                            tangent_inputs.as_slice(),
-                                        )?;
-                                        ryft::check_count!("output", tangents, 1, ProgramError);
-                                        return ryft::DifferentiationDual::new(
-                                            primal,
-                                            ryft::MaybeZero::Value(tangents.remove(0)),
-                                        )
-                                        .map_err(::std::convert::Into::into);
+                                        return ::std::result::Result::Ok(::std::option::Option::Some(tangent));
                                     }
-                                    if let ::std::result::Result::Ok(output_type) =
-                                        <&TableType as ::std::convert::TryFrom<&ArrayIrType>>::try_from(&output_type)
+                                    if let ::std::option::Option::Some(tangent) =
+                                        ryft::stage_member_zero_tangent::<TableType, _, _>(
+                                            context,
+                                            primal_inputs,
+                                            output_type,
+                                        )?
                                     {
-                                        let tangent_type =
-                                            <TableType as ryft::DifferentiableType>::tangent(output_type)?;
-                                        let tangent_inputs = primal_inputs
-                                            .iter()
-                                            .map(|value| context.primal_to_tangent(value.clone()))
-                                            .collect::<::std::result::Result<::std::vec::Vec<_>, _>>()?;
-                                        let mut tangents = context.tangent().bind(
-                                            <Operation<A> as ::std::convert::From<
-                                                ryft::ZeroOperation<TableType>,
-                                            >>::from(ryft::ZeroOperation::new(tangent_type)),
-                                            ::std::vec::Vec::new(),
-                                            tangent_inputs.as_slice(),
-                                        )?;
-                                        ryft::check_count!("output", tangents, 1, ProgramError);
-                                        return ryft::DifferentiationDual::new(
-                                            primal,
-                                            ryft::MaybeZero::Value(tangents.remove(0)),
-                                        )
-                                        .map_err(::std::convert::Into::into);
+                                        return ::std::result::Result::Ok(::std::option::Option::Some(tangent));
                                     }
-                                    ryft::DifferentiationDual::new_with_zero_tangent(primal)
-                                })
-                                .collect()
+                                    ::std::result::Result::Ok(::std::option::Option::None)
+                                },
+                            )
                         },
                     }
                 }
@@ -3924,7 +3829,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_transposition_dispatcher() {
+    fn test_operation_code_generator_generate_transposition_dispatcher() {
         // Native payloads use their own transposition rules, computational projected payloads use their
         // parent-universe rules, structural projected payloads contribute no cotangents, and mixed payloads are
         // transposed through the shared mixed adapter.
@@ -4018,7 +3923,7 @@ mod tests {
         );
 
         // Test generating the dispatcher of an enum with two inferred value parameters, which transposes over its
-        // program constant type instead of over a separate transposition value type.
+        // constant type instead of over a separate transposition value type.
         let operation = normalize(quote! {
             enum Operation<V: Value<Type = ArrayType>, C: Value<Type = ArrayType>> {
                 Constant(ConstantOperation<V>),
@@ -4032,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_operation_projection_impl() {
+    fn test_operation_code_generator_generate_operation_projection_impl() {
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>> {
@@ -4066,7 +3971,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_payload_projection_impl() {
+    fn test_operation_code_generator_generate_payload_projection_impl() {
         // Mixed payloads project like native ones but are never constructed, native payloads are constructed before the
         // projected member even though the member is declared first, and the generic-dependent payload and the generic
         // extension neither project nor are constructed.
@@ -4149,7 +4054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_guard_provider_impl() {
+    fn test_operation_code_generator_generate_guard_provider_impl() {
         // A family without a native guard variant rejects guard requests of its primary type under the bounds of its
         // generated `Operation` implementation.
         // A projected member guard belongs to the member universe, and so it does not count as a native guard.
@@ -4204,7 +4109,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_generate_conversion_impls() {
+    fn test_operation_code_generator_generate_conversion_impls() {
         let operation = normalize(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Zero(ZeroOperation<ArrayType>),
@@ -4254,9 +4159,9 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_enum_program_constant_parameter_predicates() {
-        // Every mention of the program constant parameter is renamed, including mentions inside its bounds and in
-        // associated type projections, while predicates that do not bound the parameter are not copied.
+    fn test_operation_code_generator_constant_parameter_predicates() {
+        // Every mention of the constant parameter is renamed, including mentions inside its bounds and in associated
+        // type projections, while predicates that do not bound the parameter are not copied.
         let operation = normalize(quote! {
             enum Operation<V: Value<Type = ArrayType> + PartialEq<V>, U>
             where
@@ -4269,7 +4174,7 @@ mod tests {
         });
         assert_eq!(
             operation
-                .program_constant_parameter_predicates(&format_ident!("RuntimeValue"))
+                .constant_parameter_predicates(&format_ident!("RuntimeValue"))
                 .iter()
                 .map(rendering)
                 .collect::<Vec<_>>(),
@@ -4284,18 +4189,18 @@ mod tests {
             .collect::<Vec<_>>(),
         );
 
-        // Enums with an explicit constant type have no program constant parameter whose bounds could be copied.
+        // Enums with an explicit constant type have no constant parameter whose bounds could be copied.
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType> + Clone> {
                 Add(AddOperation<ArrayIrType>),
             }
         });
-        assert!(operation.program_constant_parameter_predicates(&format_ident!("RuntimeValue")).is_empty());
+        assert!(operation.constant_parameter_predicates(&format_ident!("RuntimeValue")).is_empty());
     }
 
     #[test]
-    fn test_operation_enum_tangent_universes() {
+    fn test_operation_code_generator_tangent_universes() {
         let operation = normalize(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue), members(ArrayType, structural(DimensionType), TableType))]
             enum Operation {
