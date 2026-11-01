@@ -1,5 +1,5 @@
 interface:
   display_name: "Upgrade XLA"
-  short_description: "Upgrade the `ryft` dependency on XLA to a newer commit of the OpenXLA repository."
+  short_description: "Upgrade Ryft's OpenXLA dependency and native bindings."
   icon_small: "./assets/open-xla-logo.png"
   icon_large: "./assets/open-xla-logo.png"
