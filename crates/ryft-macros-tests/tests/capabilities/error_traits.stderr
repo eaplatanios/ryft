@@ -1,0 +1,53 @@
+error: capability traits must declare a type parameter that defaults to `<Self as Capability>::Universe`
+ --> tests/capabilities/error_traits.rs:4:7
+  |
+4 | trait MissingUniverse: Capability {}
+  |       ^^^^^^^^^^^^^^^
+
+error: the universe parameter `T` of a capability must not be bounded, because host types are their own universes
+ --> tests/capabilities/error_traits.rs:7:23
+  |
+7 | trait BoundedUniverse<T: Type = <Self as Capability>::Universe>: Capability {}
+  |                       ^
+
+error: capability traits must have `Capability` as a supertrait
+  --> tests/capabilities/error_traits.rs:10:7
+   |
+10 | trait MissingCapabilitySupertrait<T = <Self as Capability>::Universe>: Sized {}
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: projected capabilities only support type parameters that precede the universe parameter and default to `Self`
+  --> tests/capabilities/error_traits.rs:13:28
+   |
+13 | trait UnsupportedParameter<Stored = Array, T = <Self as Capability>::Universe>: Capability + Sized {
+   |                            ^^^^^^^^^^^^^^
+
+error: projected capabilities only support functions
+  --> tests/capabilities/error_traits.rs:19:5
+   |
+19 |     type Output;
+   |     ^^^^^^^^^^^^
+
+error: projected capability functions must take `&self`
+  --> tests/capabilities/error_traits.rs:21:5
+   |
+21 |     fn by_value(self) -> Result<Self, ProgramError>;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: projected capability inputs that mention `Self` must be `&Self`, `&[Self]`, or `Option<&Self>`
+  --> tests/capabilities/error_traits.rs:23:33
+   |
+23 |     fn by_vector(&self, others: Vec<Self>) -> Result<Self, ProgramError>;
+   |                                 ^^^^^^^^^
+
+error: projected capability functions must return a `Result`
+  --> tests/capabilities/error_traits.rs:25:29
+   |
+25 |     fn infallible(&self) -> Self;
+   |                             ^^^^
+
+error: projected capability functions must return `Self`, `Vec<Self>`, tuples of those, or types that do not mention `Self`
+  --> tests/capabilities/error_traits.rs:27:34
+   |
+27 |     fn optional(&self) -> Result<Option<Self>, ProgramError>;
+   |                                  ^^^^^^^^^^^^
