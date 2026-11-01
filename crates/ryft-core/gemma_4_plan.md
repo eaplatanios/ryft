@@ -993,10 +993,10 @@ the model stays in `bf16`.
 
 > **Status: the core of this section is implemented.** Since this section was written, the
 > exact primitive set it proposed has landed: `ScaledDotOperation`
-> ([crates/ryft-core/src/operations/quantization/scaled_dot.rs](crates/ryft-core/src/operations/quantization/scaled_dot.rs))
+> ([crates/ryft-core/src/operations/quantization.rs](crates/ryft-core/src/operations/quantization.rs))
 > with interpretation, partial-evaluation, forward-differentiation (bilinear with scales held
 > fixed), and batching rules; the `BlockQuantize` composition
-> ([crates/ryft-core/src/operations/quantization/block.rs](crates/ryft-core/src/operations/quantization/block.rs))
+> ([crates/ryft-core/src/operations/quantization.rs](crates/ryft-core/src/operations/quantization.rs))
 > covering both the NVFP4 recipe (`f4e2m1fn` elements + `f8e4m3fn` scales, `max_abs / 6.0`)
 > and the OCP MX recipe (`f8e8m0fnu` power-of-two scales with the spec-prescribed clamping);
 > and the two-path XLA lowering (`lower_scaled_dot_to_mlir` in
@@ -1422,7 +1422,7 @@ sketch hoped, minus the config struct (quantization regime is expressed directly
 `(element_type, scale_type, block_size)` triple):
 
 ```rust
-// crates/ryft-core/src/operations/quantization/block.rs (implemented)
+// crates/ryft-core/src/operations/quantization.rs (implemented)
 pub trait BlockQuantize: Sized {
     /// Quantizes `self` into `(elements, scales)` per block of `block_size` trailing-dimension
     /// values. `f8e4m3fn` scales select the NVFP4 recipe; `f8e8m0fnu` scales select the OCP MX
@@ -1435,7 +1435,7 @@ pub trait BlockQuantize: Sized {
     ) -> Result<(Self, Self), ProgramError>;
 }
 
-// crates/ryft-core/src/operations/quantization/scaled_dot.rs (implemented)
+// crates/ryft-core/src/operations/quantization.rs (implemented)
 pub trait ScaledDot: Sized {
     /// Block-scaled matrix product of `self` `[b?, m, k]` (scaled by `lhs_scales`
     /// `[b?, m, k / block_size]`) and `rhs` `[b?, n, k]` (scaled by `rhs_scales`), dequantizing
@@ -1768,9 +1768,9 @@ A consolidated list of every external source cited in this document, grouped by 
   windows, dropout, bias, and sequence lengths.
 - [`crates/ryft-core/src/operations/dot.rs`](crates/ryft-core/src/operations/dot.rs) —
   `DotOperation`.
-- [`crates/ryft-core/src/operations/quantization/scaled_dot.rs`](crates/ryft-core/src/operations/quantization/scaled_dot.rs) —
+- [`crates/ryft-core/src/operations/quantization.rs`](crates/ryft-core/src/operations/quantization.rs) —
   the block-scaled `ScaledDotOperation` (§4).
-- [`crates/ryft-core/src/operations/quantization/block.rs`](crates/ryft-core/src/operations/quantization/block.rs) —
+- [`crates/ryft-core/src/operations/quantization.rs`](crates/ryft-core/src/operations/quantization.rs) —
   the `BlockQuantize` NVFP4/MX quantization recipes (§4).
 - [`crates/ryft-core/src/arrays/types/data.rs:694`](crates/ryft-core/src/arrays/types/data.rs:694) —
   the `DataType` enum entries for `F4E2M1FN`, `F8E4M3FN`, `F8E5M2`, `F8E8M0FNU`, and friends.
