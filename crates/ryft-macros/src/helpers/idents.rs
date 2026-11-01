@@ -368,11 +368,13 @@ impl VisitMut for ReplaceIdentVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use quote::{ToTokens, quote};
+    use quote::quote;
     use syn::parse::Parser;
 
-    use super::IdentHelpers;
     use crate::helpers::generics::GenericsHelpers;
+    use crate::helpers::tokens::TokensHelpers;
+
+    use super::IdentHelpers;
 
     #[test]
     fn test_matches_ident() {
@@ -439,13 +441,10 @@ mod tests {
 
         let mut ty: syn::Type = syn::parse_quote!(Option<T>);
         ty.replace_ident(&ident, &path);
-        assert_eq!(ty.to_token_stream().to_string().replace(' ', ""), "Option<ryft::Placeholder>");
+        assert_eq!(ty.to_compact_string(), "Option<ryft::Placeholder>");
 
         let mut predicate: syn::WherePredicate = syn::parse_quote!(T: Into<Vec<T>>);
         predicate.replace_ident(&ident, &path);
-        assert_eq!(
-            predicate.to_token_stream().to_string().replace(' ', ""),
-            "ryft::Placeholder:Into<Vec<ryft::Placeholder>>",
-        );
+        assert_eq!(predicate.to_compact_string(), "ryft::Placeholder:Into<Vec<ryft::Placeholder>>",);
     }
 }

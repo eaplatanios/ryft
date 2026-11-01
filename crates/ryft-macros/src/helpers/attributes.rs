@@ -149,8 +149,10 @@ mod tests {
     use quote::{ToTokens, quote};
     use syn::parse::Parser;
 
-    use super::{Attribute, AttributeValue};
     use crate::helpers::symbols::Symbol;
+    use crate::helpers::tokens::TokensHelpers;
+
+    use super::{Attribute, AttributeValue};
 
     #[test]
     fn test_attribute() {
@@ -242,10 +244,7 @@ mod tests {
         })
         .parse2(quote!(crate = "ryft::core"))
         .unwrap();
-        assert_eq!(
-            path.expect("expected path to be parsed").to_token_stream().to_string().replace(' ', ""),
-            "ryft::core",
-        );
+        assert_eq!(path.expect("expected path to be parsed").to_compact_string(), "ryft::core",);
 
         // Test `syn::ExprPath::from_meta`.
         let mut expr_path = None;
@@ -276,7 +275,7 @@ mod tests {
             predicates
                 .expect("expected where predicates to be parsed")
                 .iter()
-                .map(|predicate| predicate.to_token_stream().to_string().replace(' ', ""))
+                .map(|predicate| predicate.to_compact_string())
                 .collect::<Vec<_>>(),
             vec!["T:Clone", "U:Default"],
         );
@@ -289,10 +288,7 @@ mod tests {
         })
         .parse2(quote!(crate = Vec<ryft::Placeholder>))
         .unwrap();
-        assert_eq!(
-            ty.expect("expected type to be parsed").to_token_stream().to_string().replace(' ', ""),
-            "Vec<ryft::Placeholder>",
-        );
+        assert_eq!(ty.expect("expected type to be parsed").to_compact_string(), "Vec<ryft::Placeholder>",);
 
         let error = syn::meta::parser(|meta| {
             let _ = syn::Ident::from_meta(&Symbol::new("crate"), &meta)?;

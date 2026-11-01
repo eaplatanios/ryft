@@ -1,4 +1,4 @@
-use ryft::{ArrayOperation, ArrayType, ZeroOperation};
+use ryft::{ArrayOperation, ArrayType, ConstantOperation, Value, ZeroOperation};
 
 #[derive(ryft::Operation)]
 #[ryft(type(ArrayType), constant(Array))]
@@ -17,6 +17,13 @@ enum BadVariantsOperation {
 enum DuplicatePayloadTypeOperation {
     Zero(ZeroOperation<ArrayType>),
     BoxedZero(Box<ZeroOperation<ArrayType>>),
+}
+
+#[derive(ryft::Operation)]
+enum DuplicateGenericPayloadTypeOperation<V: Value<Type = ArrayType>> {
+    Constant(ConstantOperation<V>),
+    #[ryft(skip_from)]
+    OtherConstant(ConstantOperation<V>),
 }
 
 #[derive(ryft::Operation)]

@@ -768,6 +768,26 @@ fn test_operation_type_inference() {
     let y = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, one], None).unwrap()[0];
     let program = builder.build::<Array, Array>(vec![y], Placeholder, Placeholder).unwrap();
     assert_eq!(program.interpret(Array::scalar(2f32).unwrap()), Ok(Array::scalar(3f32).unwrap()));
+
+    /// Family with a single value parameter whose where-clause bounds an associated type of that parameter, which the
+    /// generated interpretation dispatcher renames onto its separate runtime value type.
+    #[derive(Clone, Debug, Operation)]
+    enum AssociatedBoundFamily<V: Value<Type = ArrayType>>
+    where
+        V::Type: Clone,
+    {
+        Add(AddOperation<ArrayType>),
+        Constant(ConstantOperation<V>),
+    }
+
+    let mut builder = ProgramBuilder::<Array, AssociatedBoundFamily<Array>>::new();
+    let x = builder.add_input(ArrayType::scalar(DataType::F32));
+    let one = builder
+        .add_instruction(ConstantOperation::new(Array::scalar(1f32).unwrap()), Vec::new(), Vec::new(), None)
+        .unwrap()[0];
+    let y = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, one], None).unwrap()[0];
+    let program = builder.build::<Array, Array>(vec![y], Placeholder, Placeholder).unwrap();
+    assert_eq!(program.interpret(Array::scalar(2f32).unwrap()), Ok(Array::scalar(3f32).unwrap()));
 }
 
 #[test]

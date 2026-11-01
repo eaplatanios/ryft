@@ -184,10 +184,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     heterogeneous-value generic. Heterogeneous families declare them explicitly because their stored constants
 ///     live in a member universe, so no single `Value<Type = T>` bound mentions the heterogeneous type the family's
 ///     instructions actually flow.
-///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T`
-///     from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
+///   - If the generic type parameters of the enum have exactly one distinct bound of the form `Value<Type = T>`,
+///     declared either inline or in a `where` clause whose bounded type is the parameter itself, the derivation infers
+///     `T` from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
 ///     ArrayType>`. Multiple generic parameters may use the same `T`. For example, `V: Value<Type = ArrayType>,
-///     C: Value<Type = ArrayType>` still infers `ArrayType`.
+///     C: Value<Type = ArrayType>` still infers `ArrayType`. Bounds on any other type (e.g., `Vec<V>: Value<Type =
+///     T>`) are not considered.
 ///   - If no `Value<Type = T>` bound is present, or if multiple distinct operation types are present (e.g., `Value<Type
 ///     = DataType>` and `Value<Type = ArrayType>`), the derivation macro cannot choose an operation type and reports a
 ///     compilation error. In those cases, the caller must split the enum by operation type or implement [`Operation`]
@@ -202,7 +204,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
 ///     implementation is generic over a runtime value `V` and an interpretation context. The generated implementations
 ///     require that context to be a [`Constant`](crate::Constant) provider that can lift captured constants from `C`
-///     into `V`.
+///     into `V`, and require `V` to satisfy every bound that the enum declares for `C`, including bounds on its
+///     associated types (e.g., `C::Item: Bound`).
 ///   - For enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as both the
 ///     runtime value type and the nested program constant type for direct program interpretation. Later value
 ///     parameters remain payload-specific metadata; when a dispatcher needs to instantiate a direct-linear operation
@@ -273,8 +276,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     reports default evidence; the payload family needs no batching rules or member policy of its own. A structural
 ///     role alone never implies replication, so a family whose policy does not implement the replicated projection
 ///     fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
-///     generic over its array batching mode, while an explicitly declared family uses the canonical policy named
-///     by [`BatchableType`](crate::BatchableType).
+///     generic over its batching policy (e.g., over every array batching mode that its payload rules support), while
+///     an explicitly declared family uses the canonical policy named by [`BatchableType`](crate::BatchableType).
 ///   - `differentiation` delegates native variants to the payload's own forward mode rule and computational member
 ///     variants to [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation), and generates the
 ///     structural arms described under [Variant Classes](#variant-classes) directly.
@@ -331,6 +334,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     Batching is the one transform the structural role does not cover for a mixed boundary, because a mixed signature
 ///     cannot be projected into one member kind. A structural mixed payload therefore still implements
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation), normally as a replicated-inputs-only rule.
+///     Structural payloads of either boundary must be region-free, because their generated forward mode arms stage
+///     the operation again without regions. These arms reject a payload that declares regions with
+///     [`ProgramError::UnsupportedOperation`].
 ///
 /// ### Defaulting The Member Type
 ///
@@ -415,9 +421,11 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     projected operation family. Several operations in the same member universe should first be collected into that
 ///     family rather than declared as separate outer variants. Mixed-boundary variants do not claim that projection,
 ///     so they may repeat a member type freely.
-///   - A payload type that [`OperationPayloadProjection::from_payload`] constructs (i.e., one that is `'static`
-///     independently of the enum's generic parameters) may be held by at most one family-native variant, so that
-///     construction is unambiguous.
+///   - A payload type may be held by at most one variant other than bare generic payload variants, because every such
+///     variant receives its own borrowed `TryFrom<&Enum>` conversion, which also keeps the payload construction of
+///     [`OperationPayloadProjection::from_payload`] unambiguous. Payload types are compared by their tokens, and so
+///     payload types that only coincide for some instantiation of the enum's generic parameters (e.g., `Payload<V>`
+///     and `Payload<C>`) are rejected by the compiler's coherence checks instead.
 ///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the

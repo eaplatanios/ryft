@@ -10,6 +10,7 @@ use crate::helpers::hygiene::const_block;
 use crate::helpers::idents::IdentHelpers;
 use crate::helpers::receivers::replace_self_type;
 use crate::helpers::symbols::Symbol;
+use crate::helpers::tokens::TokensHelpers;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
@@ -222,7 +223,7 @@ impl OperationParser {
                 _ => Err(meta.error(format_args!(
                     "invalid `#[ryft(...)]` attribute `{}`; only `crate`, `type(...)`, `constant(...)`, \
                      `members(...)`, and `dispatch(...)` are supported here",
-                    token_string(&meta.path),
+                    meta.path.to_compact_string(),
                 ))),
             })
             .unwrap_or_else(|error| self.errors.push(error));
@@ -242,7 +243,7 @@ impl OperationParser {
             (None, None) => {
                 let mut operation_types = Vec::<syn::Type>::new();
                 for (_, operation_type) in value_bounds(&input.generics) {
-                    if !operation_types.iter().any(|existing_type| type_tokens_equal(existing_type, &operation_type)) {
+                    if !operation_types.iter().any(|existing_type| existing_type.tokens_eq(&operation_type)) {
                         operation_types.push(operation_type);
                     }
                 }
@@ -317,10 +318,10 @@ impl OperationParser {
             return Err(meta.error("`#[ryft(members(...))]` must declare at least one member universe"));
         }
         for (index, member) in members.iter().enumerate() {
-            if members.iter().take(index).any(|other| type_tokens_equal(&other.r#type, &member.r#type)) {
+            if members.iter().take(index).any(|other| other.r#type.tokens_eq(&member.r#type)) {
                 return Err(syn::Error::new_spanned(
                     &member.r#type,
-                    format_args!("duplicate ryft member universe `{}`", token_string(&member.r#type)),
+                    format_args!("duplicate ryft member universe `{}`", member.r#type.to_compact_string()),
                 ));
             }
         }
@@ -353,12 +354,12 @@ impl OperationParser {
                     return Err(meta.error(format_args!(
                         "invalid `#[ryft(dispatch(...))]` dispatcher `{}`; only `identity`, `discharge`, `batching`, \
                          `differentiation`, and `transposition` are supported here",
-                        token_string(&meta.path),
+                        meta.path.to_compact_string(),
                     )));
                 }
             };
             if *selected {
-                return Err(meta.error(format_args!("duplicate ryft dispatcher `{}`", token_string(&meta.path))));
+                return Err(meta.error(format_args!("duplicate ryft dispatcher `{}`", meta.path.to_compact_string())));
             }
             *selected = true;
             Ok(())
@@ -488,7 +489,7 @@ impl OperationParser {
                 _ => Err(meta.error(format_args!(
                     "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, and \
                      `skip_from` are supported here",
-                    token_string(&meta.path),
+                    meta.path.to_compact_string(),
                 ))),
             })
             .unwrap_or_else(|error| self.errors.push(error));
@@ -509,23 +510,23 @@ impl OperationParser {
         let mut payload_types = HashSet::new();
         let mut member_types = HashSet::new();
         for variant in variants {
-            if !variant.is_generic_extension && !payload_types.insert(token_string(&variant.payload_type)) {
+            if !variant.is_generic_extension && !payload_types.insert(variant.payload_type.to_compact_string()) {
                 self.add_error(
                     &variant.ident,
                     format_args!(
                         "operation family holds payload type `{}` in more than one variant",
-                        token_string(&variant.payload_type),
+                        variant.payload_type.to_compact_string(),
                     ),
                 );
             }
             if let Some(member_type) = variant.class.projected_member_type()
-                && !member_types.insert(token_string(member_type))
+                && !member_types.insert(member_type.to_compact_string())
             {
                 self.add_error(
                     &variant.ident,
                     format_args!(
                         "operation family declares member type `{}` more than once",
-                        token_string(member_type),
+                        member_type.to_compact_string(),
                     ),
                 );
             }
@@ -565,7 +566,7 @@ impl OperationParser {
         // operation type was inferred from their `Value<Type = T>` parameters, and so there is at least one of them.
         let mut value_parameters = value_bounds(&generics)
             .into_iter()
-            .filter(|(_, value_type)| type_tokens_equal(value_type, &operation_type))
+            .filter(|(_, value_type)| value_type.tokens_eq(&operation_type))
             .map(|(parameter, _)| parameter.clone())
             .collect::<Vec<_>>();
         value_parameters.dedup();
@@ -614,7 +615,7 @@ impl OperationParser {
                         syn::parse_quote!(#payload_type: #ryft::MemberOperation<#operation_type>)
                     }
                 };
-                payload_contracts.insert(token_string(&predicate)).then_some(predicate)
+                payload_contracts.insert(predicate.to_compact_string()).then_some(predicate)
             })
             .collect::<Vec<_>>();
 
@@ -624,7 +625,7 @@ impl OperationParser {
         let member_predicates = variants
             .iter()
             .filter_map(|variant| variant.class.projected_member_type())
-            .filter(|member_type| member_types.insert(token_string(member_type)))
+            .filter(|member_type| member_types.insert(member_type.to_compact_string()))
             .flat_map(|member_type| -> [syn::WherePredicate; 3] {
                 [
                     syn::parse_quote! {
@@ -828,7 +829,7 @@ impl OperationEnum {
             .variants
             .iter()
             .map(|variant| &variant.payload_type)
-            .filter(|payload_type| payload_type_names.insert(token_string(payload_type)))
+            .filter(|payload_type| payload_type_names.insert(payload_type.to_compact_string()))
             .collect::<Vec<_>>();
         let bounded_generics = |bound: TokenStream| {
             let mut generics = self.generics.clone();
@@ -1193,8 +1194,9 @@ impl OperationEnum {
     /// lifts their outputs back.
     ///
     /// The context value type is the program constant type for enums with two or more `Value<Type = T>` parameters.
-    /// Otherwise, it is a distinct runtime value type that inherits the bounds of the program constant parameter, and
-    /// the context must be able to lift program constants into it.
+    /// Otherwise, it is a distinct runtime value type, named by a generated `__InterpretationValue` type parameter that
+    /// inherits the bounds of the program constant parameter, and the context must be able to lift program constants
+    /// into it.
     fn generate_interpretation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -1359,8 +1361,9 @@ impl OperationEnum {
     }
 
     /// Generates the `BatchableOperation` dispatcher. Enums whose program constant type is inferred stay generic over
-    /// their array batching mode, while enums with an explicit constant type use the canonical batching policy that
-    /// `BatchableType` selects for their primary operation type. Family-native variants delegate to the batching rules
+    /// their batching policy, which lets array families support every array batching mode that their payload rules
+    /// support, while enums with an explicit constant type use the canonical batching policy that `BatchableType`
+    /// selects for their primary operation type. Family-native variants delegate to the batching rules
     /// of their payloads, and mixed member variants delegate to the parent-universe rules of their payloads.
     /// Computational projected member variants are batched through `batch_projected_operation`, which applies the
     /// member batching rule of the payload under the projected batching policy. Structural projected member variants
@@ -1373,17 +1376,8 @@ impl OperationEnum {
         let self_type = &self.program_self_type;
         let has_explicit_constant_type = self.program_constant_parameter.is_none();
         let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
-        let (policy, batch_type): (syn::Type, syn::Type) = if has_explicit_constant_type {
-            (
-                syn::parse_quote!(__BatchingPolicy),
-                syn::parse_quote!(<__BatchingPolicy as #ryft::BatchingPolicy<__ParentContext>>::Batch),
-            )
-        } else {
-            (
-                syn::parse_quote!(#ryft::ArrayBatchingPolicy<__P>),
-                syn::parse_quote!(#ryft::ArrayBatch<#parent_value_type>),
-            )
-        };
+        let policy: syn::Type = syn::parse_quote!(__BatchingPolicy);
+        let batch_type: syn::Type = syn::parse_quote!(<#policy as #ryft::BatchingPolicy<__ParentContext>>::Batch);
         let mut generics = self.dispatcher_generics.clone();
         generics.params.push(syn::parse_quote!(__ParentContext));
         let where_clause = generics.make_where_clause();
@@ -1401,12 +1395,9 @@ impl OperationEnum {
             where_clause
                 .predicates
                 .push(syn::parse_quote!(#operation_type: #ryft::BatchableType<Policy = #policy>));
-            where_clause.predicates.push(syn::parse_quote!(#policy: #ryft::BatchingPolicy<__ParentContext>));
-        } else {
-            where_clause
-                .predicates
-                .push(syn::parse_quote!(__P: #ryft::ArrayExtentBatchingPolicy<__ParentContext>));
         }
+        where_clause.predicates.push(syn::parse_quote!(#policy: #ryft::BatchingPolicy<__ParentContext>));
+
         for variant in &self.variants {
             let payload_type = &variant.program_payload_type;
             match &variant.class {
@@ -1497,11 +1488,7 @@ impl OperationEnum {
                 }
             })
         });
-        if has_explicit_constant_type {
-            generics.params.push(syn::parse_quote!(__BatchingPolicy));
-        } else {
-            generics.params.push(syn::parse_quote!(__P));
-        }
+        generics.params.push(syn::parse_quote!(__BatchingPolicy));
         let (impl_generics, _, where_clause) = generics.split_for_impl();
         quote! {
             #[automatically_derived]
@@ -1525,7 +1512,8 @@ impl OperationEnum {
     /// of their payloads. Structural member variants are constant with respect to their inputs and so their arms are
     /// generated directly. A structural projected member stages its primal with a symbolic zero tangent, while a
     /// structural mixed member stages its primal together with one member zero tangent per output, over the same
-    /// inputs, so that the runtime extents that those inputs carry stay available to both. Higher-order rules request
+    /// inputs, so that the runtime extents that those inputs carry stay available to both. Both stage the operation
+    /// again without regions, and so they reject payloads that declare regions. Higher-order rules request
     /// nested differentiation through their instruction-scoped driver, whose concrete implementation establishes the
     /// required `Program::jvp` and `Program::linearize` bounds at its construction site.
     fn generate_differentiation_dispatcher(&self) -> TokenStream {
@@ -1620,6 +1608,22 @@ impl OperationEnum {
                 let arms = self.variants.iter().map(|variant| {
                     let payload_type = &variant.program_payload_type;
                     let receiver = variant.receiver();
+
+                    // Structural arms bind the payload again without any regions, and so they reject payloads that
+                    // declare regions instead of reporting a misleading region count error from the binding.
+                    let region_check = quote! {
+                        if !<#payload_type as #ryft::Operation>::region_slots(#receiver).is_empty() {
+                            return ::std::result::Result::Err(
+                                #ryft::ProgramError::UnsupportedOperation {
+                                    message: ::std::format!(
+                                        "structural operation `{}` must not declare regions",
+                                        <#payload_type as #ryft::Operation>::name(#receiver),
+                                    ),
+                                }
+                                .into(),
+                            );
+                        }
+                    };
                     match &variant.class {
                         OperationVariantClass::FamilyNative => variant.arm(quote! {
                             <#payload_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::
@@ -1630,20 +1634,19 @@ impl OperationEnum {
                             <#payload_type as #ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
                                 #member_function(#receiver, context, driver, inputs)
                         }),
-                        OperationVariantClass::ProjectedMember { structural: true, .. } => {
-                            variant.wildcard_arm(quote! {
-                                let primal_inputs = inputs
-                                    .iter()
-                                    .map(|input| input.primal().clone())
-                                    .collect::<::std::vec::Vec<_>>();
-                                context
-                                    .primal()
-                                    .bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?
-                                    .into_iter()
-                                    .map(#ryft::DifferentiationDual::new_with_zero_tangent)
-                                    .collect()
-                            })
-                        }
+                        OperationVariantClass::ProjectedMember { structural: true, .. } => variant.arm(quote! {
+                            #region_check
+                            let primal_inputs = inputs
+                                .iter()
+                                .map(|input| input.primal().clone())
+                                .collect::<::std::vec::Vec<_>>();
+                            context
+                                .primal()
+                                .bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?
+                                .into_iter()
+                                .map(#ryft::DifferentiationDual::new_with_zero_tangent)
+                                .collect()
+                        }),
 
                         // Each output's zero tangent is staged in the computational member universe that the output
                         // belongs to, and an output outside every such universe (e.g., a structural member output) has
@@ -1680,6 +1683,7 @@ impl OperationEnum {
                                     }
                                 });
                             variant.arm(quote! {
+                                #region_check
                                 let primal_inputs = inputs
                                     .iter()
                                     .map(|input| input.primal().clone())
@@ -2000,7 +2004,7 @@ impl OperationEnum {
         let self_type = &self.self_type;
         let variant_ident = &variant.ident;
         let payload_type = &variant.payload_type;
-        let payload_name = token_string(payload_type);
+        let payload_name = payload_type.to_compact_string();
         let (impl_generics, _, where_clause) = self.generics.split_for_impl();
         let mut try_from_generics = self.generics.clone();
         try_from_generics.params.insert(0, syn::parse_quote!('__operation));
@@ -2091,7 +2095,7 @@ impl OperationEnum {
             .chain(
                 self.members
                     .iter()
-                    .filter(|member| !member.structural && !type_tokens_equal(&member.r#type, member_type))
+                    .filter(|member| !member.structural && !member.r#type.tokens_eq(member_type))
                     .map(|member| member.r#type.clone()),
             )
             .collect()
@@ -2331,14 +2335,13 @@ impl OperationVariantClass {
                         "the `{class}` operation variant class accepts one member type and an optional role",
                     )));
                 }
-                if !members.is_empty() && !members.iter().any(|member| type_tokens_equal(&member.r#type, &member_type))
-                {
+                if !members.is_empty() && !members.iter().any(|member| member.r#type.tokens_eq(&member_type)) {
                     return Err(syn::Error::new_spanned(
                         &member_type,
                         format_args!(
                             "the `{class}` operation variant class declares member type `{}`, which the operation \
                              family does not declare in `#[ryft(members(...))]`",
-                            token_string(&member_type),
+                            member_type.to_compact_string(),
                         ),
                     ));
                 }
@@ -2442,19 +2445,6 @@ fn is_generic_independent(ty: &syn::Type, generics: &syn::Generics) -> bool {
     !mentions(ty.to_token_stream(), &parameters)
 }
 
-/// Returns `true` if the provided [`syn::Type`]s have the same token representation. Given that procedural macros are
-/// executed before type checking and inference is performed by the Rust compiler, token equality is the strongest type
-/// equality that we can check for here (e.g., type aliases cannot be resolved).
-fn type_tokens_equal(left: &syn::Type, right: &syn::Type) -> bool {
-    token_string(left) == token_string(right)
-}
-
-/// Returns the compact string representation of the provided tokens, without any whitespace, which is used both for
-/// comparing tokens and for rendering code fragments in diagnostics (e.g., `Box<Operation>`).
-fn token_string<T: ToTokens>(tokens: &T) -> String {
-    tokens.to_token_stream().to_string().replace(' ', "")
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -2490,7 +2480,7 @@ mod tests {
     /// code can be compared against expected code that is written in the usual `rustfmt` style.
     fn rendering<T: ToTokens>(tokens: &T) -> String {
         let rendering =
-            [",>", ",)", ",]", ",{", ",}"].iter().fold(token_string(tokens), |rendering, trailing_comma| {
+            [",>", ",)", ",]", ",{", ",}"].iter().fold(tokens.to_compact_string(), |rendering, trailing_comma| {
                 rendering.replace(trailing_comma, &trailing_comma[1..])
             });
         rendering.strip_suffix(',').map(str::to_string).unwrap_or(rendering)
@@ -2533,8 +2523,8 @@ mod tests {
             enum Operation<V: Value<Type = DataType>, C> where C: ryft::Value<Type = DataType> {}
         });
         assert_eq!(errors(&parser), Vec::<String>::new());
-        assert_eq!(token_string(&parser.ryft_crate), "wrapped::ryft");
-        assert_eq!(token_string(parser.operation_type.as_ref().unwrap()), "DataType");
+        assert_eq!(parser.ryft_crate.to_compact_string(), "wrapped::ryft");
+        assert_eq!(parser.operation_type.as_ref().unwrap().to_compact_string(), "DataType");
         assert!(parser.program_constant_type.is_none());
         assert!(parser.dispatchers.is_some());
 
@@ -2545,9 +2535,9 @@ mod tests {
             enum Operation<A: Value<Type = ArrayType>> {}
         });
         assert_eq!(errors(&parser), Vec::<String>::new());
-        assert_eq!(token_string(&parser.ryft_crate), "ryft");
-        assert_eq!(token_string(parser.operation_type.as_ref().unwrap()), "ArrayIrType");
-        assert_eq!(token_string(parser.program_constant_type.as_ref().unwrap()), "ArrayIrValue<A>");
+        assert_eq!(parser.ryft_crate.to_compact_string(), "ryft");
+        assert_eq!(parser.operation_type.as_ref().unwrap().to_compact_string(), "ArrayIrType");
+        assert_eq!(parser.program_constant_type.as_ref().unwrap().to_compact_string(), "ArrayIrValue<A>");
         assert_eq!(parser.members.len(), 1);
         assert!(parser.dispatchers.is_none());
 
@@ -2608,8 +2598,8 @@ mod tests {
             enum Operation<A: Value<Type = ArrayType>> {}
         });
         assert_eq!(errors(&parser), Vec::<String>::new());
-        assert_eq!(token_string(parser.operation_type.as_ref().unwrap()), "<AasProjection<ArrayType>>::Family");
-        assert_eq!(token_string(parser.program_constant_type.as_ref().unwrap()), "(ArrayIrValue<A>,Vec<u8>)");
+        assert_eq!(parser.operation_type.as_ref().unwrap().to_compact_string(), "<AasProjection<ArrayType>>::Family");
+        assert_eq!(parser.program_constant_type.as_ref().unwrap().to_compact_string(), "(ArrayIrValue<A>,Vec<u8>)");
 
         // Test using invalid type attributes.
         for (attribute, error) in [
@@ -2644,7 +2634,7 @@ mod tests {
             parser
                 .members
                 .iter()
-                .map(|member| (token_string(&member.r#type), member.structural))
+                .map(|member| (member.r#type.to_compact_string(), member.structural))
                 .collect::<Vec<_>>(),
             vec![("ArrayType".to_string(), false), ("DimensionType".to_string(), true)],
         );
@@ -2763,14 +2753,14 @@ mod tests {
         // Test extracting a plain payload, a boxed payload with a class marker, and a generic extension payload.
         let zero = variants[0].as_ref().unwrap();
         assert!(matches!(zero.class, OperationVariantClass::FamilyNative));
-        assert_eq!(token_string(&zero.payload_type), "ZeroOperation<DataType>");
-        assert_eq!(token_string(&zero.program_payload_type), "ZeroOperation<DataType>");
+        assert_eq!(zero.payload_type.to_compact_string(), "ZeroOperation<DataType>");
+        assert_eq!(zero.program_payload_type.to_compact_string(), "ZeroOperation<DataType>");
         assert!(!zero.is_boxed);
         assert!(!zero.is_generic_extension);
         assert!(zero.generate_from);
         let array = variants[1].as_ref().unwrap();
         assert!(matches!(array.class, OperationVariantClass::ProjectedMember { structural: false, .. }));
-        assert_eq!(token_string(&array.payload_type), "ArrayOperation<V>");
+        assert_eq!(array.payload_type.to_compact_string(), "ArrayOperation<V>");
         assert!(array.is_boxed);
         assert!(!array.is_generic_extension);
         assert!(!array.generate_from);
@@ -2890,19 +2880,19 @@ mod tests {
                 Extension(Extension),
             }
         });
-        assert_eq!(token_string(&operation.operation_type), "DataType");
-        assert_eq!(token_string(&operation.program_constant_type), "V");
+        assert_eq!(operation.operation_type.to_compact_string(), "DataType");
+        assert_eq!(operation.program_constant_type.to_compact_string(), "V");
         assert_eq!(operation.program_constant_parameter.as_ref().unwrap().to_string(), "V");
         assert!(!operation.has_separate_runtime_value_type);
-        assert_eq!(token_string(&operation.generics), "<V,C,Extension,F>");
-        assert_eq!(token_string(&operation.self_type), "Operation<V,C,Extension,F>");
-        assert_eq!(token_string(&operation.program_self_type), "Operation<V,C,Extension,V>");
+        assert_eq!(operation.generics.to_compact_string(), "<V,C,Extension,F>");
+        assert_eq!(operation.self_type.to_compact_string(), "Operation<V,C,Extension,F>");
+        assert_eq!(operation.program_self_type.to_compact_string(), "Operation<V,C,Extension,V>");
         assert_eq!(
-            token_string(&operation.variants[0].payload_type),
+            operation.variants[0].payload_type.to_compact_string(),
             "WhileOperation<DataType,F,Operation<V,C,Extension,F>>",
         );
         assert_eq!(
-            token_string(&operation.variants[0].program_payload_type),
+            operation.variants[0].program_payload_type.to_compact_string(),
             "WhileOperation<DataType,V,Operation<V,C,Extension,V>>",
         );
         assert_eq!(
@@ -2949,14 +2939,14 @@ mod tests {
                 Array(ArrayOperation<A>),
             }
         });
-        assert_eq!(token_string(&operation.operation_type), "ArrayIrType");
-        assert_eq!(token_string(&operation.program_constant_type), "ArrayIrValue<A>");
+        assert_eq!(operation.operation_type.to_compact_string(), "ArrayIrType");
+        assert_eq!(operation.program_constant_type.to_compact_string(), "ArrayIrValue<A>");
         assert!(operation.program_constant_parameter.is_none());
         assert!(operation.has_separate_runtime_value_type);
         assert_eq!(operation.members.len(), 1);
         assert!(operation.dispatchers.batching);
         assert!(!operation.dispatchers.identity);
-        assert_eq!(token_string(&operation.program_self_type), "Operation<A>");
+        assert_eq!(operation.program_self_type.to_compact_string(), "Operation<A>");
         assert_eq!(
             generics_rendering(&operation.operation_generics),
             rendering(&quote! {
@@ -3375,29 +3365,29 @@ mod tests {
             rendering(&operation.generate_interpretation_dispatcher()),
             rendering(&quote! {
                 #[automatically_derived]
-                impl<A: Value<Type = ArrayType>, __Context> ryft::InterpretableOperation<__Context> for Operation<A>
+                impl<A: Value<Type = ArrayType>, __Context, __InterpretationValue>
+                    ryft::InterpretableOperation<__Context> for Operation<A>
                 where
                     ArrayType: ryft::Type<Identity = <ArrayIrType as ryft::Type>::Identity>,
                     ArrayIrType: ::std::convert::From<ArrayType>,
                     for<'__member_type> &'__member_type ArrayType:
                         ::std::convert::TryFrom<&'__member_type ArrayIrType, Error = ryft::TypeError>,
-                    __Context: ryft::Domain<Type = ArrayIrType>,
-                    __Context: ryft::Constant<<__Context as ryft::Domain>::Value, ArrayIrValue<A>>,
+                    __Context: ryft::Domain<Type = ArrayIrType, Value = __InterpretationValue>,
+                    __Context: ryft::Constant<__InterpretationValue, ArrayIrValue<A>>,
                     AddOperation<ArrayIrType>: ryft::InterpretableOperation<__Context>,
-                    <__Context as ryft::Domain>::Value:
-                        ryft::ValueProjection<ArrayType, Projected: ryft::Value<Type = ArrayType>>,
+                    __InterpretationValue: ryft::ValueProjection<ArrayType, Projected: ryft::Value<Type = ArrayType>>,
                     ryft::EagerContext<
-                        <<__Context as ryft::Domain>::Value as ryft::ValueProjection<ArrayType>>::Projected,
+                        <__InterpretationValue as ryft::ValueProjection<ArrayType>>::Projected,
                         ArrayOperation<A>,
                     >: ryft::Domain<
                         Type = ArrayType,
-                        Value = <<__Context as ryft::Domain>::Value as ryft::ValueProjection<ArrayType>>::Projected,
-                        Constant = <<__Context as ryft::Domain>::Value as ryft::ValueProjection<ArrayType>>::Projected,
+                        Value = <__InterpretationValue as ryft::ValueProjection<ArrayType>>::Projected,
+                        Constant = <__InterpretationValue as ryft::ValueProjection<ArrayType>>::Projected,
                         Operation = ArrayOperation<A>,
                     >,
                     ArrayOperation<A>: ryft::InterpretableOperation<
                         ryft::EagerContext<
-                            <<__Context as ryft::Domain>::Value as ryft::ValueProjection<ArrayType>>::Projected,
+                            <__InterpretationValue as ryft::ValueProjection<ArrayType>>::Projected,
                             ArrayOperation<A>,
                         >,
                     >,
@@ -3618,7 +3608,7 @@ mod tests {
         );
 
         // Test generating the dispatcher of an enum whose constant type is inferred, which stays generic over its
-        // array batching mode.
+        // batching policy.
         let operation = normalize(quote! {
             enum Operation<V: Value<Type = ArrayType>> {
                 Constant(ConstantOperation<V>),
@@ -3628,29 +3618,29 @@ mod tests {
             rendering(&operation.generate_batching_dispatcher()),
             rendering(&quote! {
                 #[automatically_derived]
-                impl<V: Value<Type = ArrayType>, __ParentContext, __P>
-                    ryft::BatchableOperation<__ParentContext, ryft::ArrayBatchingPolicy<__P>> for Operation<V>
+                impl<V: Value<Type = ArrayType>, __ParentContext, __BatchingPolicy>
+                    ryft::BatchableOperation<__ParentContext, __BatchingPolicy> for Operation<V>
                 where
                     __ParentContext: ryft::Context<Type = ArrayType, Constant = V, Operation = Operation<V>>,
                     Operation<V>: ryft::Operation<Type = ArrayType>,
-                    __P: ryft::ArrayExtentBatchingPolicy<__ParentContext>,
-                    ConstantOperation<V>: ryft::BatchableOperation<__ParentContext, ryft::ArrayBatchingPolicy<__P>>,
+                    __BatchingPolicy: ryft::BatchingPolicy<__ParentContext>,
+                    ConstantOperation<V>: ryft::BatchableOperation<__ParentContext, __BatchingPolicy>,
                     __ParentContext: ryft::Zero<<__ParentContext as ryft::Domain>::Value>,
                 {
-                    fn batch<__D: ryft::BatchingDriver<__ParentContext, ryft::ArrayBatchingPolicy<__P>>>(
+                    fn batch<__D: ryft::BatchingDriver<__ParentContext, __BatchingPolicy>>(
                         &self,
-                        context: &ryft::BatchingContext<__ParentContext, ryft::ArrayBatchingPolicy<__P>>,
+                        context: &ryft::BatchingContext<__ParentContext, __BatchingPolicy>,
                         driver: &__D,
-                        inputs: &[ryft::ArrayBatch<<__ParentContext as ryft::Domain>::Value>],
+                        inputs: &[<__BatchingPolicy as ryft::BatchingPolicy<__ParentContext>>::Batch],
                     ) -> ::std::result::Result<
-                        ::std::vec::Vec<ryft::ArrayBatch<<__ParentContext as ryft::Domain>::Value>>,
+                        ::std::vec::Vec<<__BatchingPolicy as ryft::BatchingPolicy<__ParentContext>>::Batch>,
                         ryft::BatchingError,
                     > {
                         match self {
                             Self::Constant(operation) => {
                                 <ConstantOperation<V> as ryft::BatchableOperation<
                                     __ParentContext,
-                                    ryft::ArrayBatchingPolicy<__P>,
+                                    __BatchingPolicy,
                                 >>::batch(operation, context, driver, inputs)
                             },
                         }
@@ -3729,7 +3719,18 @@ mod tests {
                             <ArrayOperation<A> as ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
                                 jvp_in_parent(operation, context, driver, inputs)
                         },
-                        Self::Dimension(..) => {
+                        Self::Dimension(operation) => {
+                            if !<DimensionOperation as ryft::Operation>::region_slots(operation).is_empty() {
+                                return ::std::result::Result::Err(
+                                    ryft::ProgramError::UnsupportedOperation {
+                                        message: ::std::format!(
+                                            "structural operation `{}` must not declare regions",
+                                            <DimensionOperation as ryft::Operation>::name(operation),
+                                        ),
+                                    }
+                                    .into(),
+                                );
+                            }
                             let primal_inputs = inputs
                                 .iter()
                                 .map(|input| input.primal().clone())
@@ -3834,6 +3835,17 @@ mod tests {
                 > {
                     match self {
                         Self::Zero(operation) => {
+                            if !<ZeroOperation<ArrayType> as ryft::Operation>::region_slots(operation).is_empty() {
+                                return ::std::result::Result::Err(
+                                    ryft::ProgramError::UnsupportedOperation {
+                                        message: ::std::format!(
+                                            "structural operation `{}` must not declare regions",
+                                            <ZeroOperation<ArrayType> as ryft::Operation>::name(operation),
+                                        ),
+                                    }
+                                    .into(),
+                                );
+                            }
                             let primal_inputs = inputs
                                 .iter()
                                 .map(|input| input.primal().clone())
@@ -4240,47 +4252,29 @@ mod tests {
 
     #[test]
     fn test_operation_enum_program_constant_parameter_predicates() {
+        // Every mention of the program constant parameter is renamed, including mentions inside its bounds and in
+        // associated type projections, while predicates that do not bound the parameter are not copied.
         let operation = normalize(quote! {
-            enum Operation<V: Value<Type = ArrayType> + Clone, U>
+            enum Operation<V: Value<Type = ArrayType> + PartialEq<V>, U>
             where
                 Wrapper<V>: Bound,
-                V::Item: Other,
-                U: Unrelated,
+                V::Item: Other<V>,
+                U: Unrelated<V>,
             {
                 Constant(ConstantOperation<V>),
             }
         });
-        let value_type: syn::Type = syn::parse_quote!(RuntimeValue);
         assert_eq!(
             operation
-                .program_constant_parameter_predicates(&value_type)
+                .program_constant_parameter_predicates(&format_ident!("RuntimeValue"))
                 .iter()
                 .map(rendering)
                 .collect::<Vec<_>>(),
             [
                 quote!(RuntimeValue: Value<Type = ArrayType>),
-                quote!(RuntimeValue: Clone),
+                quote!(RuntimeValue: PartialEq<RuntimeValue>),
                 quote!(Wrapper<RuntimeValue>: Bound),
-                quote!(RuntimeValue::Item: Other),
-            ]
-            .iter()
-            .map(rendering)
-            .collect::<Vec<_>>(),
-        );
-
-        // Qualified value types replace bare mentions of the parameter but cannot extend associated type projections.
-        let value_type: syn::Type = syn::parse_quote!(<__Context as ryft::Domain>::Value);
-        assert_eq!(
-            operation
-                .program_constant_parameter_predicates(&value_type)
-                .iter()
-                .map(rendering)
-                .collect::<Vec<_>>(),
-            [
-                quote!(<__Context as ryft::Domain>::Value: Value<Type = ArrayType>),
-                quote!(<__Context as ryft::Domain>::Value: Clone),
-                quote!(Wrapper<<__Context as ryft::Domain>::Value>: Bound),
-                quote!(V::Item: Other),
+                quote!(RuntimeValue::Item: Other<RuntimeValue>),
             ]
             .iter()
             .map(rendering)
@@ -4294,7 +4288,7 @@ mod tests {
                 Add(AddOperation<ArrayIrType>),
             }
         });
-        assert!(operation.program_constant_parameter_predicates(&value_type).is_empty());
+        assert!(operation.program_constant_parameter_predicates(&format_ident!("RuntimeValue")).is_empty());
     }
 
     #[test]
@@ -4309,7 +4303,7 @@ mod tests {
             operation
                 .tangent_universes(&syn::parse_quote!(TableType))
                 .iter()
-                .map(token_string)
+                .map(TokensHelpers::to_compact_string)
                 .collect::<Vec<_>>(),
             vec!["TableType", "ArrayType"],
         );
@@ -4323,7 +4317,7 @@ mod tests {
             operation
                 .tangent_universes(&syn::parse_quote!(ArrayType))
                 .iter()
-                .map(token_string)
+                .map(TokensHelpers::to_compact_string)
                 .collect::<Vec<_>>(),
             vec!["ArrayType"],
         );
@@ -4332,10 +4326,10 @@ mod tests {
     #[test]
     fn test_operation_member_parse() {
         let member: OperationMember = syn::parse_quote!(ArrayType<Static>);
-        assert_eq!(token_string(&member.r#type), "ArrayType<Static>");
+        assert_eq!(member.r#type.to_compact_string(), "ArrayType<Static>");
         assert!(!member.structural);
         let member: OperationMember = syn::parse_quote!(structural(DimensionType));
-        assert_eq!(token_string(&member.r#type), "DimensionType");
+        assert_eq!(member.r#type.to_compact_string(), "DimensionType");
         assert!(member.structural);
 
         // Test parsing invalid members.
@@ -4426,10 +4420,10 @@ mod tests {
         ];
         let class = |attribute: syn::Attribute, members: &[OperationMember]| match parse_class(attribute, members) {
             Ok(OperationVariantClass::ProjectedMember { member_type, structural }) => {
-                Ok(("projected", token_string(&member_type), structural))
+                Ok(("projected", member_type.to_compact_string(), structural))
             }
             Ok(OperationVariantClass::MixedMember { member_type, structural }) => {
-                Ok(("mixed", token_string(&member_type), structural))
+                Ok(("mixed", member_type.to_compact_string(), structural))
             }
             Ok(OperationVariantClass::FamilyNative) => unreachable!(),
             Err(error) => Err(error.to_string()),
@@ -4503,7 +4497,10 @@ mod tests {
         let member_type: syn::Type = syn::parse_quote!(ArrayType);
         let projected = OperationVariantClass::ProjectedMember { member_type: member_type.clone(), structural: true };
         let mixed = OperationVariantClass::MixedMember { member_type, structural: false };
-        assert_eq!(projected.projected_member_type().map(token_string), Some("ArrayType".to_string()));
+        assert_eq!(
+            projected.projected_member_type().map(TokensHelpers::to_compact_string),
+            Some("ArrayType".to_string()),
+        );
         assert!(mixed.projected_member_type().is_none());
         assert!(OperationVariantClass::FamilyNative.projected_member_type().is_none());
     }
@@ -4520,7 +4517,7 @@ mod tests {
         assert_eq!(
             value_bounds(&input.generics)
                 .into_iter()
-                .map(|(parameter, value_type)| (parameter.to_string(), token_string(&value_type)))
+                .map(|(parameter, value_type)| (parameter.to_string(), value_type.to_compact_string()))
                 .collect::<Vec<_>>(),
             vec![("V".to_string(), "T".to_string()), ("W".to_string(), "DataType".to_string())],
         );
@@ -4536,17 +4533,5 @@ mod tests {
         assert!(!is_generic_independent(&syn::parse_quote!(Box<[(u8, fn(V))]>), &generics));
         assert!(!is_generic_independent(&syn::parse_quote!(BorrowedOperation<'a>), &generics));
         assert!(!is_generic_independent(&syn::parse_quote!(&'static str), &generics));
-    }
-
-    #[test]
-    fn test_type_tokens_equal() {
-        assert!(type_tokens_equal(&syn::parse_quote!(Vec<Vec<u8>>), &syn::parse_quote!(Vec<Vec<u8>>)));
-        assert!(!type_tokens_equal(&syn::parse_quote!(Vec<u8>), &syn::parse_quote!(std::vec::Vec<u8>)));
-    }
-
-    #[test]
-    fn test_token_string() {
-        assert_eq!(token_string(&quote!(Box<ArrayOperation<V>>)), "Box<ArrayOperation<V>>");
-        assert_eq!(token_string(&quote!(ryft::Value<Type = T>)), "ryft::Value<Type=T>");
     }
 }

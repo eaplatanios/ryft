@@ -11,6 +11,7 @@ use crate::helpers::idents::IdentHelpers;
 use crate::helpers::paths::PathHelpers;
 use crate::helpers::receivers::replace_self_type;
 use crate::helpers::symbols::Symbol;
+use crate::helpers::tokens::TokensHelpers;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
@@ -262,7 +263,7 @@ impl CodeGenerator {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid `#[ryft(...)]` attribute: `{}`; these are the attributes that are supported here: {:?}",
-                    meta.path.to_token_stream().to_string().replace(' ', ""),
+                    meta.path.to_compact_string(),
                     VALID_CONTAINER_ATTRIBUTES,
                 ))),
             })
