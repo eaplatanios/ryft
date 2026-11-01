@@ -153,13 +153,17 @@ impl DiagramRenderer {
     /// Renders the documentation of the provided attribute, returning [`None`] when the attribute stays unchanged
     /// (i.e., when it is not a literal documentation attribute or when none of its documentation lines is rewritten).
     fn render_attribute(&mut self, attribute: &syn::Attribute) -> syn::Result<Option<String>> {
-        let Some(documentation) = documentation(attribute) else {
-            if matches!(self.block, EnclosingBlock::Diagram { .. }) {
-                return Err(syn::Error::new_spanned(
-                    attribute,
-                    "only literal documentation attributes may appear inside a `mermaid` diagram",
-                ));
-            }
+        let documentation = if let syn::Meta::NameValue(syn::MetaNameValue { path, value, .. }) = &attribute.meta
+            && path.is_ident("doc")
+            && let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }) = value
+        {
+            literal.value()
+        } else if matches!(self.block, EnclosingBlock::Diagram { .. }) {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "only literal documentation attributes may appear inside a `mermaid` diagram",
+            ));
+        } else {
             return Ok(None);
         };
         let rendered = documentation
@@ -179,7 +183,7 @@ impl DiagramRenderer {
                 let loader = if self.has_diagrams { String::new() } else { Self::loader(indentation) + "\n" };
                 self.block = EnclosingBlock::Diagram {
                     opening,
-                    attribute: attribute.clone(),
+                    attribute: attribute.to_token_stream(),
                     indentation: indentation.to_string(),
                 };
                 self.has_diagrams = true;
@@ -255,8 +259,6 @@ impl Parse for AnnotatedItem {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Block of Markdown documentation that encloses a documentation line.
 enum EnclosingBlock {
     /// The line is not inside a fenced code block.
@@ -265,9 +267,9 @@ enum EnclosingBlock {
     /// The line is inside a fenced code block that `opening` opened and whose lines are preserved verbatim.
     Code { opening: CodeFence },
 
-    /// The line is inside a Mermaid diagram that `opening` opened in `attribute` (kept for diagnostics), and the HTML
-    /// lines that are generated for that diagram start with `indentation`.
-    Diagram { opening: CodeFence, attribute: syn::Attribute, indentation: String },
+    /// The line is inside a Mermaid diagram that `opening` opened in the attribute whose tokens are `attribute`
+    /// (kept for diagnostics), and the HTML lines that are generated for that diagram start with `indentation`.
+    Diagram { opening: CodeFence, attribute: TokenStream, indentation: String },
 }
 
 /// Line that opens or closes a fenced Markdown code block.
@@ -302,26 +304,12 @@ impl CodeFence {
     }
 }
 
-/// Returns the text of `attribute` if it is a documentation attribute with a string literal value (e.g., a `///`
-/// comment), and [`None`] otherwise.
-fn documentation(attribute: &syn::Attribute) -> Option<String> {
-    match &attribute.meta {
-        syn::Meta::NameValue(syn::MetaNameValue {
-            path,
-            value: syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }),
-            ..
-        }) if path.is_ident("doc") => Some(literal.value()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::process;
 
     use indoc::formatdoc;
     use pretty_assertions::assert_eq;
-    use syn::parse_quote;
 
     use super::*;
 
@@ -332,7 +320,13 @@ mod tests {
         let AnnotatedItem { attributes, rest } = syn::parse2(rendered).unwrap();
         attributes
             .iter()
-            .map(|attribute| documentation(attribute).unwrap_or_else(|| attribute.to_token_stream().to_string()))
+            .map(|attribute| match &attribute.meta {
+                syn::Meta::NameValue(syn::MetaNameValue {
+                    value: syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }),
+                    ..
+                }) => literal.value(),
+                _ => attribute.to_token_stream().to_string(),
+            })
             .chain([rest.to_string()])
             .collect::<Vec<_>>()
             .join("\n")
@@ -419,8 +413,8 @@ mod tests {
 
     #[test]
     fn test_diagram_renderer_render_diagrams_with_other_code_blocks() {
-        // Other code blocks, including one whose content looks like a Mermaid fence, are preserved verbatim, and
-        // diagrams may also be fenced with tildes and closed by longer fences.
+        // Other code blocks, including one whose content looks like a Mermaid fence, are preserved verbatim,
+        // and diagrams may also be fenced with tildes and closed by longer fences.
         let item = quote! {
             /// ````text
             /// ```mermaid
@@ -564,6 +558,18 @@ mod tests {
             ),
             "only literal documentation attributes may appear inside a `mermaid` diagram",
         );
+        assert_eq!(
+            error(
+                quote!(),
+                quote! {
+                    /// ```mermaid
+                    #[doc = concat!("flowchart LR")]
+                    /// ```
+                    struct Graph;
+                },
+            ),
+            "only literal documentation attributes may appear inside a `mermaid` diagram",
+        );
 
         // The item is still emitted unchanged when an error is reported.
         let item = quote! {
@@ -592,16 +598,16 @@ mod tests {
         // The bundle is written into an existing rustdoc output directory.
         fs::create_dir(target.join("doc")).unwrap();
         DiagramRenderer::install_bundle(&target).unwrap();
-        assert!(fs::read(&path).unwrap() == BUNDLE);
+        assert_eq!(fs::read(&path).unwrap(), BUNDLE);
 
         // An existing file is only replaced when its size differs from that of the bundle.
         let placeholder = vec![0u8; BUNDLE.len()];
         fs::write(&path, &placeholder).unwrap();
         DiagramRenderer::install_bundle(&target).unwrap();
-        assert!(fs::read(&path).unwrap() == placeholder);
+        assert_eq!(fs::read(&path).unwrap(), placeholder);
         fs::write(&path, "stale").unwrap();
         DiagramRenderer::install_bundle(&target).unwrap();
-        assert!(fs::read(&path).unwrap() == BUNDLE);
+        assert_eq!(fs::read(&path).unwrap(), BUNDLE);
 
         fs::remove_dir_all(&target).unwrap();
     }
@@ -630,14 +636,5 @@ mod tests {
         assert!(CodeFence { marker: '`', length: 5 }.closes(opening));
         assert!(!CodeFence { marker: '`', length: 3 }.closes(opening));
         assert!(!CodeFence { marker: '~', length: 4 }.closes(opening));
-    }
-
-    #[test]
-    fn test_documentation() {
-        assert_eq!(documentation(&parse_quote!(#[doc = " Line."])), Some(" Line.".to_string()));
-        assert_eq!(documentation(&parse_quote!(#[doc = "First.\nSecond."])), Some("First.\nSecond.".to_string()));
-        assert_eq!(documentation(&parse_quote!(#[doc = concat!("Line.")])), None);
-        assert_eq!(documentation(&parse_quote!(#[doc(hidden)])), None);
-        assert_eq!(documentation(&parse_quote!(#[derive(Debug)])), None);
     }
 }
