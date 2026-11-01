@@ -11,8 +11,8 @@ use crate::extensions::multi_slice::MultiSliceConfig;
 use crate::protos::CompilationOptions;
 use crate::{
     Api, Buffer, BufferType, Chunk, Client, ComputationId, CopyToDeviceStream, Device, DeviceAssignment, Error, Event,
-    Plugin, ReplicaId, SerializedDeviceAssignment, Topology, Value, hash_map_from_c_api, invoke_pjrt_api_error_fn,
-    slice_from_c_api, str_from_c_api,
+    NamedValue, Plugin, ReplicaId, SerializedDeviceAssignment, Topology, Value, hash_map_from_c_api,
+    invoke_pjrt_api_error_fn, slice_from_c_api, str_from_c_api,
 };
 
 /// Program that can be compiled using a PJRT [`Client`]. Programs can be provided in multiple formats though not all
@@ -843,6 +843,7 @@ impl<'c> LoadedExecutable<'c> {
     ///     In that case, the callers are responsible for separately launching execution on all participating devices
     ///     specified at compile time. Note that not all PJRT [`Plugin`]s or [`LoadedExecutable`]s support overriding
     ///     the execution device.
+    ///   - `custom_options`: Per-execution runtime options. PJRT copies these values if it retains them after the call.
     pub fn execute<'l>(
         &self,
         inputs: Vec<ExecutionDeviceInputs<'c, 'l>>,
@@ -852,6 +853,7 @@ impl<'c> LoadedExecutable<'c> {
         call_location: Option<&str>,
         incarnation_ids: Option<HashMap<usize, usize>>,
         device: Option<&Device<'c>>,
+        custom_options: &[NamedValue],
     ) -> Result<Execution<Vec<ExecutionDeviceOutputs<'c>>>, Error> {
         use ffi::PJRT_LoadedExecutable_Execute_Args;
 
@@ -989,6 +991,9 @@ impl<'c> LoadedExecutable<'c> {
             });
         });
 
+        // PJRT copies these values before returning, so the borrowed named values and this array outlive
+        // the native call.
+        let custom_options = custom_options.iter().map(|option| unsafe { option.to_c_api() }).collect::<Vec<_>>();
         let mut options = ffi::PJRT_ExecuteOptions::new(
             send_callback_ptrs.as_mut_ptr(),
             receive_callback_ptrs.as_mut_ptr(),
@@ -1006,6 +1011,8 @@ impl<'c> LoadedExecutable<'c> {
             std::ptr::null_mut(),
             hlo_output_callback_infos.as_mut_ptr(),
             hlo_output_callback_count,
+            custom_options.as_ptr(),
+            custom_options.len(),
         );
 
         // We prepare the input buffer handles array. This is an array of `Buffer` handle arrays where the outer
@@ -2903,6 +2910,8 @@ pub(crate) mod ffi {
         pub use_major_to_minor_data_layout_for_callbacks: bool,
         pub hlo_output_callbacks: *mut PJRT_HloOutputCallbackInfo,
         pub num_hlo_output_callbacks: usize,
+        pub custom_options: *const PJRT_NamedValue,
+        pub num_custom_options: usize,
     }
 
     impl PJRT_ExecuteOptions {
@@ -2923,6 +2932,8 @@ pub(crate) mod ffi {
             multi_slice_config: *mut PJRT_MultiSlice_Config,
             hlo_output_callbacks: *mut PJRT_HloOutputCallbackInfo,
             num_hlo_output_callbacks: usize,
+            custom_options: *const PJRT_NamedValue,
+            num_custom_options: usize,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -2943,6 +2954,8 @@ pub(crate) mod ffi {
                 use_major_to_minor_data_layout_for_callbacks: false,
                 hlo_output_callbacks,
                 num_hlo_output_callbacks,
+                custom_options,
+                num_custom_options,
             }
         }
     }
@@ -3149,6 +3162,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         }
     }
 
@@ -3578,7 +3592,7 @@ mod tests {
             };
 
             // Execute the test program using our two input tensors.
-            let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None, &[]).unwrap();
 
             // Wait for the asynchronous execution to complete through its shared fence. Clones observe the
             // recorded completion result without attempting to consume the PJRT events a second time.
@@ -3626,7 +3640,7 @@ mod tests {
             owner: PhantomData,
         });
         assert!(matches!(
-            alias.execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None),
+            alias.execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None, &[]),
             Err(Error::MissingFunction { .. }),
         ));
         assert_eq!(alias.execution_counts.get(), None);
@@ -3634,7 +3648,7 @@ mod tests {
         // Failed queries are not cached, so a later execution retries them and caches the successful result.
         alias.api = executable.api;
         let execution = alias
-            .execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None)
+            .execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None, &[])
             .unwrap();
         assert_eq!(execution.block_until_ready().unwrap().len(), 1);
         assert_eq!(alias.execution_counts.get(), Some(&(1, 1)));
@@ -3671,7 +3685,7 @@ mod tests {
         };
         let initial = client.compile(&initial_program, &test_compilation_options()).unwrap();
         let mut initial_outputs = initial
-            .execute(vec![ExecutionDeviceInputs::default()], vec![], 0, None, None, None, None)
+            .execute(vec![ExecutionDeviceInputs::default()], vec![], 0, None, None, None, None, &[])
             .unwrap()
             .block_until_ready()
             .unwrap();
@@ -3679,7 +3693,7 @@ mod tests {
         assert_eq!(token.element_type(), Ok(BufferType::Token));
         let inputs = [ExecutionInput { buffer: Arc::new(token), donatable: false }];
         let execution = executable
-            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None, &[])
             .unwrap();
         let mut outputs = execution.block_until_ready().unwrap();
         assert_eq!(outputs.len(), 1);
@@ -3689,7 +3703,7 @@ mod tests {
         assert_eq!(token.ready().unwrap().ready(), Ok(true));
         let inputs = [ExecutionInput { buffer: Arc::new(token), donatable: false }];
         let execution = executable
-            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None, &[])
             .unwrap();
         assert_eq!(execution.block_until_ready().unwrap()[0].outputs[0].element_type(), Ok(BufferType::Token));
     }
@@ -3762,6 +3776,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                     ))
                     .unwrap();
             });
@@ -3789,6 +3804,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                     ))
                     .unwrap();
             });
@@ -3821,6 +3837,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                     ))
                     .unwrap();
             });
@@ -3908,7 +3925,16 @@ mod tests {
                 let inputs =
                     [ExecutionInput { buffer: Arc::new(manager.retrieve_buffer(0).unwrap()), donatable: false }];
                 let execution = executable
-                    .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+                    .execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
                     .unwrap();
                 manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
                 assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
@@ -4243,7 +4269,7 @@ mod tests {
 
         // `LoadedExecutable::execute` expects a `Vec` of inputs per device.
         assert!(matches!(
-            executable.execute(Vec::new(), vec![], 0, None, None, None, None),
+            executable.execute(Vec::new(), vec![], 0, None, None, None, None, &[]),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected inputs for 2 device(s) but got inputs for 0 device(s)",
         ));
@@ -4264,7 +4290,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs[..1], ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, vec![], 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None, &[]),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 2 input(s) for each device but got 1 for device 1",
         ));
@@ -4280,7 +4306,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, vec![], 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None, &[]),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 1 send callback(s) for each device but got 0 for device 1",
         ));
@@ -4296,7 +4322,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, vec![], 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None, &[]),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 1 receive callback(s) for each device but got 0 for device 1",
         ));
@@ -4307,7 +4333,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, vec![], 0, None, Some("invalid\0location"), None, None),
+            executable.execute(inputs, vec![], 0, None, Some("invalid\0location"), None, None, &[]),
             Err(Error::InvalidArgument { message, .. }) if message == "nul byte found in provided data at position: 7",
         ));
 
@@ -4327,7 +4353,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, vec![], 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None, &[]),
             Err(Error::InvalidArgument { message, .. })
                 if message == "input 0 is not marked consistently across all devices as donatable or non-donatable",
         ));
@@ -4401,7 +4427,7 @@ mod tests {
                     };
 
                     // Execute the test program using our two input tensors.
-                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None, &[]).unwrap();
 
                     // Wait for the asynchronous execution to complete.
                     let mut outputs = execution.block_until_ready().unwrap();
@@ -4503,7 +4529,7 @@ mod tests {
                     };
 
                     // Execute the test program using our input tensor.
-                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None, &[]).unwrap();
 
                     // Wait for the asynchronous execution to complete.
                     let mut outputs = execution.block_until_ready().unwrap();
@@ -4619,7 +4645,7 @@ mod tests {
                     };
 
                     // Execute the test program.
-                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None, &[]).unwrap();
 
                     // Wait for the asynchronous execution to complete.
                     let mut outputs = execution.block_until_ready().unwrap();

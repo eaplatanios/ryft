@@ -753,7 +753,7 @@ mod tests {
                         assert!(serialized_topology.proto().is_ok());
                         let deserialized = client.deserialize_topology(serialized_topology.data());
                         match platform {
-                            TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                            TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                                 let deserialized = deserialized.unwrap();
                                 assert_eq!(deserialized.platform_name(), topology.platform_name());
                                 assert_eq!(deserialized.platform_version(), topology.platform_version());
@@ -787,7 +787,7 @@ mod tests {
                         assert!(!attributes.is_empty());
                         assert!(fingerprint.is_ok());
                     }
-                    TestPlatform::Rocm7 => {
+                    TestPlatform::Rocm10 => {
                         assert_eq!(platform_name, "rocm");
                         assert!(!attributes.is_empty());
                         assert!(fingerprint.is_ok());
