@@ -1001,8 +1001,6 @@ impl RaggedDotDimensionNumbers {
         Ok(mode)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
     /// cotangent `ā` of its linear left-hand side `a`, together with the axes of `a` in the order in which that adjoint
     /// grouped dot emits them. This specification must be a valid non-contracting specification for a left-hand side
@@ -1051,8 +1049,8 @@ impl RaggedDotDimensionNumbers {
         (dimensions, output_axes)
     }
 
-    /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to the
-    /// cotangent `b̄` of its linear right-hand side `b`, together with the axes of `b` in the order in which that
+    /// Returns the grouped dot dimension numbers that map the output cotangent `ȳ` of `y = ragged_dot(a, b, g)` to
+    /// the cotangent `b̄` of its linear right-hand side `b`, together with the axes of `b` in the order in which that
     /// adjoint grouped dot emits them. This specification must be a valid non-contracting specification for a
     /// left-hand side with rank `lhs_rank` and a right-hand side with rank `rhs_rank`.
     ///
@@ -1116,6 +1114,8 @@ impl Display for RaggedDotDimensionNumbers {
         formatter.write_str(")")
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`RaggedDotOperation`].
 pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";

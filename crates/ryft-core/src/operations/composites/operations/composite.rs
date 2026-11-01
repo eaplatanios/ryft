@@ -171,7 +171,7 @@ pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V
     /// that the batching levels of a call with retained rules prepended to its inputs.
     non_differentiated_count: usize,
 
-    /// [`CompositeRules`]s attached to this [`CompositeOperation`].
+    /// Derivative rules of this [`CompositeOperation`].
     rules: CompositeRules<V::Type, S>,
 
     /// [`PhantomData`] marker tying this [`Operation`] to the operation family `O` in which it is valid.
@@ -1825,22 +1825,22 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Derivative rules of a [`CompositeOperation`], in one of its two representations.
+/// Derivative rules of a [`CompositeOperation`], in one of the two representations that its documentation describes.
+/// Attached rules are regions of the call, so the call records only which rule regions it has. Retained rules are
+/// traced on demand by their source `S`, so the call also records the state that tracing them depends on (i.e., how
+/// the call was batched over types `T`, whether it was discharged, and which outputs it keeps).
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CompositeRules<T, S> {
     /// Rule programs attached as rule regions that follow the primal region.
     Attached {
-        /// Forward mode rule, whose explicit form is a `"jvp"` rule region.
+        /// Forward mode differentiation rule, whose explicit form is a `"jvp"` rule region.
         jvp_rule: CompositeJvpRule,
 
         /// Whether the call has `"forward"` and `"backward"` reverse mode rule regions.
         has_vjp_rule: bool,
     },
 
-    /// Rules retained by a source and traced lazily, together with the call state that their specializations depend
-    /// on.
+    /// Rules retained by a source and traced lazily, together with the call state that their specializations depend on.
     Retained {
         /// Source of the retained rules.
         rules: S,
@@ -1848,27 +1848,26 @@ enum CompositeRules<T, S> {
         /// Batching applied to the call after it was staged, or [`None`] for an unbatched call.
         batching: Option<CustomRuleBatching<T>>,
 
-        /// Whether the call's reference state was discharged, which discharges its rule programs as well (refer to
-        /// [`CustomRuleDefinition::with_reference_discharge`](crate::CustomRuleDefinition::with_reference_discharge)).
+        /// Whether the call's reference state was discharged, which discharges its rule programs as well.
         discharged: bool,
 
         /// Whether each output of the rules is an output of the call, or [`None`] when the call returns every output
-        /// of its rules. Pruning the unused outputs of a call (refer to [`Operation::prune_boundary`]) prunes them
-        /// from its primal region and records them here, because its rules are traced for the complete output
-        /// structure: the rule specializations of the call project the kept outputs, and its reverse mode carrier
-        /// keeps every output of the forward rule, whose pruned outputs then receive structural zero seeds.
+        /// of its rules. Pruning the unused outputs of a call prunes them from its primal region and records them here,
+        /// because its rules are traced for the complete output structure: the rule specializations of the call project
+        /// the kept outputs, and its reverse mode carrier keeps every output of the forward rule, whose pruned outputs
+        /// then receive structural zero seeds.
         kept_outputs: Option<Vec<bool>>,
     },
 }
 
-/// Validates the reference contract of [`CompositeOperation`] over one primal boundary. A reference-typed input is
-/// accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that every
-/// attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a reference, so
-/// an active reference input would have a derivative that no user-supplied rule can express). No output may be a
-/// reference, because a rule region would then have to produce that output's tangent reference or consume its
-/// cotangent reference, and a user-supplied rule can neither allocate nor receive one. The call applies this contract
-/// during type inference, so it holds for every constructed call, and its derivative rules apply it again to the
-/// replayed inputs as defense in depth.
+/// Validates the reference contract of [`CompositeOperation`] over one primal boundary. A reference-typed input
+/// is accepted only in the leading `non_differentiated_count` positions, which correspond to _plumbing_ that every
+/// attached rule region receives unchanged (the rule interfaces define no tangent or cotangent slot for a reference,
+/// so an active reference input would have a derivative that no user-supplied rule can express). No output may be a
+/// reference, because a rule region would then have to produce that output's tangent reference or consume its cotangent
+/// reference, and a user-supplied rule can neither allocate nor receive one. The call applies this contract during type
+/// inference, so it holds for every constructed call, and its derivative rules apply it again to the replayed inputs as
+/// defense in depth.
 ///
 /// # Parameters
 ///
@@ -1894,8 +1893,8 @@ fn validate_composite_reference_boundary<T: Type>(
         .find(|(_, r#type)| r#type.is_reference())
     {
         return Err(TypeError::invalid(format!(
-            "`{name}` accepts reference inputs only in its leading non-differentiated segment; move input {index} \
-             of type `{type}` before the differentiated inputs",
+            "`{name}` accepts reference inputs only in its leading non-differentiated segment; \
+             move input {index} of type `{type}` before the differentiated inputs",
         )));
     }
     if let Some((index, r#type)) = output_types.iter().enumerate().find(|(_, r#type)| r#type.is_reference()) {
@@ -1952,11 +1951,12 @@ fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
     Ok(())
 }
 
-/// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose leading
-/// `non_differentiated_count` inputs `p` are not differentiated. This is the forward mode rule for both attached JVP
-/// regions and retained JVP specializations of [`CompositeOperation`]. A fused [`DifferentiationContext`] replays the
-/// rule directly, while a partitioned one replays its known and tangent parts in their own contexts. Structural zero
-/// output tangents are recovered from literal zeros and zero-producing instructions of the rule.
+/// Replays the flat custom Jacobian-Vector Product (JVP) rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an
+/// operation whose leading `non_differentiated_count` inputs `p` are not differentiated. This is the forward mode rule
+/// for both attached JVP regions and retained JVP specializations of [`CompositeOperation`]. A fused
+/// [`DifferentiationContext`] replays the rule directly, while a partitioned one replays its known and tangent parts
+/// in their own contexts. Structural zero output tangents are recovered from literal zeros and zero-producing
+/// instructions of the rule.
 ///
 /// # Parameters
 ///
@@ -1968,8 +1968,7 @@ fn validate_composite_replay<C: Context<Type: DifferentiableType>>(
 ///     the primal outputs followed by their tangents.
 ///   - `inputs`: Input [`DifferentiationDual`]s aligned with the operation's inputs.
 ///   - `tangent_activity`: Whether `jvp_region` takes the tangent of each differentiated input, or [`None`] when it
-///     takes every one of them. A region that takes only the active tangents materializes the structural zeros
-///     itself.
+///     takes every one of them. A region that takes only the active tangents materializes the structural zeros itself.
 fn replay_custom_jvp_rule<
     C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>
         + Zero<C::Value>,
@@ -2002,15 +2001,15 @@ where
     let input_count = inputs.len();
     if non_differentiated_count > input_count {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` non-differentiated input count {non_differentiated_count} exceeds input count \
-             {input_count}",
+            "`{operation_name}` non-differentiated input count {non_differentiated_count} \
+             exceeds input count {input_count}",
         ))
         .into());
     }
     let differentiated_inputs = &inputs[non_differentiated_count..];
 
-    // The rule region is replayed directly rather than differentiated, so the replayed inputs are validated as defense
-    // in depth (refer to the documentation of `validate_composite_replay`).
+    // The rule region is replayed directly rather than differentiated, so the replayed inputs are validated
+    // as defense in depth.
     validate_composite_replay(
         operation_name,
         non_differentiated_count,
@@ -2022,7 +2021,8 @@ where
         Some(tangent_activity) => {
             if tangent_activity.len() != differentiated_inputs.len() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "`{operation_name}` has {} differentiated inputs but {} tangent activity flags",
+                    "`{}` has {} differentiated inputs but {} tangent activity flags",
+                    operation_name,
                     differentiated_inputs.len(),
                     tangent_activity.len(),
                 ))
@@ -2097,15 +2097,15 @@ where
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Differentiates the primal region at slot 0 of a composite call in forward mode, which is the forward mode rule of a
-/// call whose JVP is derived from its primal (i.e., [`CompositeJvpRule::Derived`]). The derivative is taken with
-/// respect to the differentiated inputs with active tangents, while the leading `non_differentiated_count` inputs,
-/// which must have zero tangents, parameterize the derivative.
+/// Differentiates the primal region at slot `0` of a composite call in forward mode, which is the forward mode rule
+/// of a call whose Jacobian-Vector Product (JVP) is derived from its primal (i.e., [`CompositeJvpRule::Derived`]).
+/// The derivative is taken with respect to the differentiated inputs with active tangents, while the leading
+/// `non_differentiated_count` inputs, which must have zero tangents, parameterize the derivative.
 ///
-/// The derivative is inlined unless `call` is provided, in which case it is staged as a derived call of the rules
-/// that [`CustomRuleSpecializer::derived`] derives from the call's rules (refer to the documentation of the derivation
-/// for why): a fused context stages one call that computes the outputs and their tangents, while a partitioned context
-/// computes the outputs with the call itself and stages a pushforward call on its tangent side.
+/// The derivative is inlined unless `call` is provided, in which case it is staged as a derived call of the rules that
+/// [`CustomRuleSpecializer::derived`] derives from the call's rules: a fused context stages one call that computes the
+/// outputs and their tangents, while a partitioned context computes the outputs with the call itself and stages a
+/// pushforward call on its tangent side.
 ///
 /// # Parameters
 ///
@@ -2125,8 +2125,6 @@ fn differentiate_primal_region<C, P, D, S>(
     call: Option<&CompositeOperation<C::Constant, C::Operation, S>>,
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<
             Type: DifferentiableType + Eq + Hash,
             Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -2135,6 +2133,8 @@ where
     P: DifferentiationPolicy<C>,
     D: DifferentiationDriver<C>,
     S: CustomRuleSpecializer<C::Constant, C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     let primal_region = driver.region(0)?;
     let output_types = primal_region.output_types();
@@ -2173,8 +2173,8 @@ where
         )?);
     }
 
-    // A derived call has the rules derived from the call's rules for this activity pattern, and the derivative of the
-    // call's primal region (or its tangent half) as its own primal region. Without active tangents, there is no
+    // A derived call has the rules derived from the call's rules for this activity pattern, and the derivative of
+    // the call's primal region (or its tangent half) as its own primal region. Without active tangents, there is no
     // derivative to batch, so it is inlined.
     let call = call.filter(|_| !input_indices.is_empty());
     let derived_call = |kind: CustomRuleDerivationKind| match call {
@@ -2194,8 +2194,8 @@ where
         _ => Ok(None),
     };
 
-    // Pairs the tangents of one derivative path with the outputs that `slots` flags, in output order, leaving the other
-    // outputs without a tangent.
+    // Pairs the tangents of one derivative path with the outputs that `slots` flags, in output order,
+    // leaving the other outputs without a tangent.
     let distribute = |tangents: Vec<C::Value>, slots: &[bool]| {
         check_count!("output", tangents, slots.iter().filter(|&&has_slot| has_slot).count(), ProgramError);
         let mut tangents = tangents.into_iter();
@@ -2204,8 +2204,8 @@ where
 
     // A fused differentiation context stages primal and tangent work in the same context, so the fused JVP program
     // replays there directly. Otherwise, the linearized primal replays in the primal context and its tangent map
-    // replays in the tangent context over the residuals. Each path pairs its tangents with the outputs that it gives a
-    // tangent slot. The derivative program's slots follow `output_activity`, and the linearization reports its own.
+    // replays in the tangent context over the residuals. Each path pairs its tangents with the outputs that it gives
+    // a tangent slot. The derivative program's slots follow `output_activity`, and the linearization reports its own.
     let (outputs, output_tangents): (Vec<_>, Vec<Option<C::Value>>) =
         if std::ptr::eq(context.primal(), context.tangent()) {
             let program = jvp_program;
@@ -2219,9 +2219,10 @@ where
             (outputs, distribute(output_tangents, &output_activity)?)
         } else if let Some(call) = call.filter(|_| primal_region.effects() == EffectsSummary::PURE) {
             // The known side computes the outputs with the call itself, and the tangent side stages a pushforward call
-            // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is only
-            // valid for a pure primal, because the effects of any other primal (e.g., reference updates, or reference reads that
-            // later effects would change) must run once, when the known side runs, so it is linearized inline instead.
+            // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is
+            // only valid for a pure primal, because the effects of any other primal (e.g., reference updates, or
+            // reference reads that later effects would change) must run once, when the known side runs, so it is
+            // linearized inline instead.
             let pushforward =
                 jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
             let outputs = context.primal().bind(call.clone(), vec![primal_region.to_program()], primals.as_slice())?;
@@ -2232,8 +2233,8 @@ where
             let output_tangents = context.tangent().bind(operation, vec![pushforward], tangent_inputs.as_slice())?;
             (outputs, distribute(output_tangents, &output_activity)?)
         } else {
-            // A structural zero output tangent depends on no input tangent, so no live output loses its slot. The
-            // position check rejects a linearization that would silently turn a live tangent into a zero.
+            // A structural zero output tangent depends on no input tangent, so no live output loses its slot.
+            // The position check rejects a linearization that would silently turn a live tangent into a zero.
             let linearization = driver.linearize_program(primal_region, &input_indices, Some(&[]))?;
             linearization.tangent_output_positions(&output_liveness)?;
             let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
@@ -2258,6 +2259,8 @@ where
         })
         .collect::<Result<Vec<_>, _>>()
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
