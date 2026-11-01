@@ -1526,18 +1526,16 @@ impl_differentiable_operation! {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Value-level ragged dot capability.
-///
-/// [`RaggedDot`] is the receiver-style entry point for staging or executing [`RaggedDotOperation`], which contracts
-/// two data inputs group by group according to explicit integer `group_sizes`.
+/// Value-level ragged dot product capability. [`RaggedDot`] is the receiver-style entry point for staging or executing
+/// [`RaggedDotOperation`], which contracts two data inputs group by group according to explicit integer `group_sizes`.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait RaggedDot<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Computes a ragged dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three modes, the
-    /// metadata shapes, the clipping of cumulative intervals, and the semantics of empty groups and uncovered
-    /// positions.
+    /// Computes a ragged dot product using explicit `group_sizes`. Refer to the documentation of [`RaggedDotOperation`]
+    /// for information on the three modes, the metadata shapes, the clipping of cumulative intervals, and the semantics
+    /// of empty groups and uncovered positions.
     fn ragged_dot_general(
         &self,
         rhs: &Self,
@@ -1545,8 +1543,8 @@ pub trait RaggedDot<T = <Self as Capability>::Universe>: Capability + Sized {
         dimensions: &RaggedDotDimensionNumbers,
     ) -> Result<Self, ProgramError>;
 
-    /// Computes the basic non-contracting form `[M, K] × [G, K, N] → [M, N]`. Refer to [`RaggedDotOperation`] for the
-    /// behavior of empty groups and uncovered rows.
+    /// Computes the basic non-contracting form `[M, K] × [G, K, N] → [M, N]`. Refer to the documentation of
+    /// [`RaggedDotOperation`] for information on the behavior of empty groups and uncovered rows.
     #[inline]
     fn ragged_dot(&self, rhs: &Self, group_sizes: &Self) -> Result<Self, ProgramError> {
         self.ragged_dot_general(rhs, group_sizes, &RaggedDotDimensionNumbers::matmul())
