@@ -106,20 +106,19 @@ impl Buffer<'_> {
             return Err(Error::invalid_argument("serialized descriptors must not be empty"));
         }
 
-        let mut callback_state = Box::new(CopyToRemoteHostCallbackState {
-            api: (*self).api(),
-            serialized_descriptor: serialized_descriptor.to_vec(),
-            on_done: Some(on_done),
-        });
+        let callback_state = Box::new(CopyToRemoteHostCallbackState { api: (*self).api(), on_done: Some(on_done) });
 
-        let serialized_descriptor = if callback_state.serialized_descriptor.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            callback_state.serialized_descriptor.as_mut_ptr() as *mut std::ffi::c_char
-        };
+        unsafe extern "C" fn descriptor_destructor(data: *mut *mut std::ffi::c_char, size: *mut usize) {
+            unsafe {
+                let data = Box::from_raw(data);
+                let size = Box::from_raw(size);
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut((*data).cast::<u8>(), *size)));
+            }
+        }
 
-        let serialized_descriptor = Box::into_raw(Box::new(serialized_descriptor));
-        let serialized_descriptor_size = Box::into_raw(Box::new(callback_state.serialized_descriptor.len()));
+        let descriptor = serialized_descriptor.to_vec().into_boxed_slice();
+        let serialized_descriptor_size = Box::into_raw(Box::new(descriptor.len()));
+        let serialized_descriptor = Box::into_raw(Box::new(Box::into_raw(descriptor).cast::<std::ffi::c_char>()));
         let callback_state = Box::into_raw(callback_state);
 
         let result = invoke_pjrt_api_void_fn!(
@@ -134,13 +133,13 @@ impl Buffer<'_> {
                     user_arg: callback_state as *mut std::ffi::c_void,
                     on_done: Some(on_done_callback::<F>),
                 },
+                descriptor_destructor = Some(descriptor_destructor),
             },
         );
 
         if result.is_err() {
             unsafe {
-                drop(Box::from_raw(serialized_descriptor));
-                drop(Box::from_raw(serialized_descriptor_size));
+                descriptor_destructor(serialized_descriptor, serialized_descriptor_size);
                 drop(Box::from_raw(callback_state));
             }
         }
@@ -166,6 +165,8 @@ impl Client<'_> {
     ///   - `destination_devices`: IDs of the destination [`Device`]s for each [`Buffer`].
     ///   - `transfer_keys`: Transfer rendezvous keys that correspond to each [`Buffer`].
     ///     Each key must match the receiver-side key for the same transfer.
+    ///   - `incarnation_ids`: Last known live task IDs paired with their incarnation IDs. Duplicate task IDs use
+    ///     the first incarnation. An empty slice omits the snapshot.
     ///
     /// # Returns
     ///
@@ -176,6 +177,7 @@ impl Client<'_> {
         buffers: &[&Buffer<'_>],
         destination_devices: &[GlobalDeviceId],
         transfer_keys: &[CrossHostTransferKey],
+        incarnation_ids: &[(i32, i64)],
     ) -> Result<Vec<Event<()>>, Error> {
         use ffi::PJRT_Transfers_PJRT_Client_CrossHostSendBuffers_Args;
 
@@ -197,6 +199,8 @@ impl Client<'_> {
         let transfer_keys = transfer_keys.as_ptr() as *const ffi::PJRT_Cross_Host_Transfer_Key;
         let mut send_events = vec![std::ptr::null_mut(); buffers.len()];
 
+        let task_ids = incarnation_ids.iter().map(|(task_id, _)| *task_id).collect::<Vec<_>>();
+        let incarnation_ids = incarnation_ids.iter().map(|(_, incarnation_id)| *incarnation_id).collect::<Vec<_>>();
         let extension = self.api().cross_host_transfers_extension()?;
         invoke_pjrt_api_error_fn!(
             @extension ffi::PJRT_CrossHostTransfers_Extension => extension,
@@ -208,6 +212,9 @@ impl Client<'_> {
                 dst_global_device_ids = destination_devices,
                 transfer_keys = transfer_keys,
                 send_events = send_events.as_mut_ptr(),
+                num_tasks = task_ids.len(),
+                task_ids = task_ids.as_ptr(),
+                incarnation_ids = incarnation_ids.as_ptr(),
             },
         )?;
 
@@ -231,6 +238,8 @@ impl Client<'_> {
     ///   - `source_devices`: IDs of the source [`Device`]s for each [`Buffer`].
     ///   - `transfer_keys`: Transfer rendezvous keys that correspond to each [`Buffer`].
     ///     Each key must match the sender-side key for the same transfer.
+    ///   - `incarnation_ids`: Last known live task IDs paired with their incarnation IDs. Duplicate task IDs use
+    ///     the first incarnation. An empty slice omits the snapshot.
     ///
     /// # Returns
     ///
@@ -242,6 +251,7 @@ impl Client<'_> {
         device: &Device<'_>,
         source_devices: &[GlobalDeviceId],
         transfer_keys: &[CrossHostTransferKey],
+        incarnation_ids: &[(i32, i64)],
     ) -> Result<Vec<Buffer<'c>>, Error> {
         use ffi::PJRT_Transfers_PJRT_Client_CrossHostReceiveBuffers_Args;
 
@@ -272,6 +282,8 @@ impl Client<'_> {
         let mut layouts = vec![std::ptr::null_mut(); dimensions.len()];
         let mut buffers = vec![std::ptr::null_mut(); dimensions.len()];
 
+        let task_ids = incarnation_ids.iter().map(|(task_id, _)| *task_id).collect::<Vec<_>>();
+        let incarnation_ids = incarnation_ids.iter().map(|(_, incarnation_id)| *incarnation_id).collect::<Vec<_>>();
         let extension = self.api().cross_host_transfers_extension()?;
         invoke_pjrt_api_error_fn!(
             @extension ffi::PJRT_CrossHostTransfers_Extension => extension,
@@ -287,6 +299,9 @@ impl Client<'_> {
                 src_global_device_ids = source_devices,
                 transfer_keys = transfer_keys,
                 buffers = buffers.as_mut_ptr(),
+                num_tasks = task_ids.len(),
+                task_ids = task_ids.as_ptr(),
+                incarnation_ids = incarnation_ids.as_ptr(),
             },
         )?;
 
@@ -312,6 +327,7 @@ impl Client<'_> {
     ///   - `notifier`: Callback function that will be invoked by PJRT with an optional [`Error`], serialized
     ///     descriptors, and an optional Rust cancel notifier closure so that the caller can coordinate with
     ///     the sender _out-of-band_.
+    ///   - `allow_cancel_notifier`: Enables the backend cancellation notifier when `true`.
     #[deprecated(note = "The descriptor-based PJRT cross-host transfer API wrapper has been deprecated in favor of \
         a new API exposed via [`Client::cross_host_send_buffers`] and [`Client::cross_host_receive_buffers`].")]
     pub fn make_cross_host_receive_buffers<
@@ -323,6 +339,7 @@ impl Client<'_> {
         dimensions: &[&[i64]],
         device: &Device<'_>,
         notifier: F,
+        allow_cancel_notifier: bool,
     ) -> Result<Vec<Buffer<'c>>, Error> {
         use ffi::PJRT_Transfers_PJRT_Client_MakeCrossHostReceiveBuffers_Args;
 
@@ -456,6 +473,7 @@ impl Client<'_> {
                 layouts = layouts.as_mut_ptr(),
                 device = device.to_c_api(),
                 notifier = notifier,
+                allow_cancel_notifier = allow_cancel_notifier,
             },
             { buffers, num_buffers },
         )
@@ -514,31 +532,30 @@ impl Api {
     }
 }
 
-#[allow(deprecated)]
 /// Internal state used by the deprecated [`Buffer::copy_to_remote_host`] function.
+#[allow(deprecated)]
 struct CopyToRemoteHostCallbackState<F: FnOnce(Option<Error>, bool)> {
-    serialized_descriptor: Vec<u8>,
     on_done: Option<F>,
     api: Api,
 }
 
-#[allow(deprecated)]
 /// Callback that can be passed to a cross-host send cancellation notifier and which
 /// is invoked once cancel propagation has been processed by PJRT.
+#[allow(deprecated)]
 pub type CrossHostOnCanceledCallback = Box<dyn FnOnce(Option<Error>) + 'static>;
 
-#[allow(deprecated)]
 /// Rust closure wrapper for the deprecated PJRT cross-host send cancel notifier.
 /// The closure receives the following arguments:
 ///
 ///   - `serialized_descriptor`: Descriptor that identifies the receive slot to cancel.
 ///   - `reason`: Cancellation reason represented as a PJRT [`Error`].
 ///   - `on_canceled`: Optional callback that will be invoked once PJRT acknowledges the cancellation propagation.
+#[allow(deprecated)]
 pub type CrossHostSendCancellationNotifierCallback =
     Box<dyn FnOnce(&str, Error, Option<CrossHostOnCanceledCallback>) + 'static>;
 
-#[allow(deprecated)]
 /// Internal state used by the deprecated [`Client::make_cross_host_receive_buffers`] function.
+#[allow(deprecated)]
 struct CrossHostReceiveBuffersNotifierState<
     F: FnOnce(Option<Error>, &[&str], Option<CrossHostSendCancellationNotifierCallback>),
 > {
@@ -555,7 +572,7 @@ pub(crate) mod ffi {
     use crate::events::ffi::PJRT_Event;
     use crate::ffi::PJRT_Extension_Base;
 
-    pub const PJRT_API_CROSS_HOST_TRANSFERS_EXTENSION_VERSION: usize = 5;
+    pub const PJRT_API_CROSS_HOST_TRANSFERS_EXTENSION_VERSION: usize = 8;
 
     pub type PJRT_Global_Device_Id = i32;
     pub type PJRT_Cross_Host_Transfer_Key = i64;
@@ -570,6 +587,9 @@ pub(crate) mod ffi {
         pub dst_global_device_ids: *const PJRT_Global_Device_Id,
         pub transfer_keys: *const PJRT_Cross_Host_Transfer_Key,
         pub send_events: *mut *mut PJRT_Event,
+        pub num_tasks: usize,
+        pub task_ids: *const std::ffi::c_int,
+        pub incarnation_ids: *const i64,
     }
 
     impl PJRT_Transfers_PJRT_Client_CrossHostSendBuffers_Args {
@@ -580,6 +600,9 @@ pub(crate) mod ffi {
             dst_global_device_ids: *const PJRT_Global_Device_Id,
             transfer_keys: *const PJRT_Cross_Host_Transfer_Key,
             send_events: *mut *mut PJRT_Event,
+            num_tasks: usize,
+            task_ids: *const std::ffi::c_int,
+            incarnation_ids: *const i64,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -590,6 +613,9 @@ pub(crate) mod ffi {
                 dst_global_device_ids,
                 transfer_keys,
                 send_events,
+                num_tasks,
+                task_ids,
+                incarnation_ids,
             }
         }
     }
@@ -611,6 +637,9 @@ pub(crate) mod ffi {
         pub src_global_device_ids: *const PJRT_Global_Device_Id,
         pub transfer_keys: *const PJRT_Cross_Host_Transfer_Key,
         pub buffers: *mut *mut PJRT_Buffer,
+        pub num_tasks: usize,
+        pub task_ids: *const std::ffi::c_int,
+        pub incarnation_ids: *const i64,
     }
 
     impl PJRT_Transfers_PJRT_Client_CrossHostReceiveBuffers_Args {
@@ -626,6 +655,9 @@ pub(crate) mod ffi {
             src_global_device_ids: *const PJRT_Global_Device_Id,
             transfer_keys: *const PJRT_Cross_Host_Transfer_Key,
             buffers: *mut *mut PJRT_Buffer,
+            num_tasks: usize,
+            task_ids: *const std::ffi::c_int,
+            incarnation_ids: *const i64,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -640,6 +672,9 @@ pub(crate) mod ffi {
                 src_global_device_ids,
                 transfer_keys,
                 buffers,
+                num_tasks,
+                task_ids,
+                incarnation_ids,
             }
         }
     }
@@ -692,6 +727,7 @@ pub(crate) mod ffi {
         pub notifier: PJRT_Transfers_CrossHostRecvNotifierInfo,
         pub buffers: *mut *mut PJRT_Buffer,
         pub num_buffers: usize,
+        pub allow_cancel_notifier: bool,
     }
 
     impl PJRT_Transfers_PJRT_Client_MakeCrossHostReceiveBuffers_Args {
@@ -705,6 +741,7 @@ pub(crate) mod ffi {
             layouts: *mut *mut PJRT_Buffer_MemoryLayout,
             device: *mut PJRT_Device,
             notifier: PJRT_Transfers_CrossHostRecvNotifierInfo,
+            allow_cancel_notifier: bool,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -719,6 +756,7 @@ pub(crate) mod ffi {
                 notifier,
                 buffers: std::ptr::null_mut(),
                 num_buffers: 0,
+                allow_cancel_notifier,
             }
         }
     }
@@ -736,6 +774,9 @@ pub(crate) mod ffi {
         pub on_done: Option<PJRT_Transfers_CrossHostRemoteSendCallback>,
     }
 
+    pub type PJRT_Transfers_DescriptorDestructor =
+        Option<unsafe extern "C" fn(data: *mut *mut std::ffi::c_char, size: *mut usize)>;
+
     #[repr(C)]
     pub struct PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice_Args {
         pub struct_size: usize,
@@ -745,6 +786,7 @@ pub(crate) mod ffi {
         pub serialized_descriptor: *mut *mut std::ffi::c_char,
         pub serialized_descriptor_size: *mut usize,
         pub on_done: PJRT_Transfers_CrossHostRemoteSendCallbackInfo,
+        pub descriptor_destructor: PJRT_Transfers_DescriptorDestructor,
     }
 
     impl PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice_Args {
@@ -754,6 +796,7 @@ pub(crate) mod ffi {
             serialized_descriptor: *mut *mut std::ffi::c_char,
             serialized_descriptor_size: *mut usize,
             on_done: PJRT_Transfers_CrossHostRemoteSendCallbackInfo,
+            descriptor_destructor: PJRT_Transfers_DescriptorDestructor,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -763,6 +806,7 @@ pub(crate) mod ffi {
                 serialized_descriptor,
                 serialized_descriptor_size,
                 on_done,
+                descriptor_destructor,
             }
         }
     }
@@ -784,14 +828,108 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::tests::{TestPlatform, test_for_each_platform};
     use crate::{BufferType, Error};
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_buffer_copy_to_remote_host_descriptor_lifetime() {
+        unsafe extern "C" fn copy(args: *mut super::ffi::PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice_Args) {
+            unsafe {
+                let args = &*args;
+                let descriptor = *args.serialized_descriptor;
+                let size = *args.serialized_descriptor_size;
+                args.on_done.on_done.unwrap()(std::ptr::null_mut(), true, args.on_done.user_arg);
+                // Completion releases the callback state. The descriptor must remain valid until its own destructor.
+                assert_eq!(crate::slice_from_c_api(descriptor.cast::<u8>(), size), b"descriptor");
+                args.descriptor_destructor.unwrap()(args.serialized_descriptor, args.serialized_descriptor_size);
+            }
+        }
+
+        let mut extension: super::ffi::PJRT_CrossHostTransfers_Extension = unsafe { std::mem::zeroed() };
+        extension.base.struct_size = size_of::<super::ffi::PJRT_CrossHostTransfers_Extension>();
+        extension.base.extension_type = crate::ffi::PJRT_Extension_Type_CrossHostTransfers;
+        extension.PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice = Some(copy);
+        let mut api: crate::ffi::PJRT_Api = unsafe { std::mem::zeroed() };
+        api.struct_size = size_of::<crate::ffi::PJRT_Api>();
+        api.extension_start = &mut extension.base;
+        let api = unsafe { crate::Api::from_c_api(&api).unwrap() };
+        let buffer = std::mem::ManuallyDrop::new(unsafe {
+            crate::Buffer::from_c_api(std::ptr::dangling_mut::<u8>().cast(), api, std::ptr::dangling_mut::<u8>().cast())
+                .unwrap()
+        });
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_callback = completed.clone();
+        assert_eq!(
+            buffer.copy_to_remote_host(b"descriptor", move |error, enqueued| {
+                assert_eq!(error, None);
+                assert!(enqueued);
+                completed_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            Ok(())
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_client_cross_host_send_buffers_incarnation_ids() {
+        /// Live task snapshot observed by the mock native send call.
+        #[derive(Default)]
+        struct Snapshot {
+            task_ids: Vec<i32>,
+            incarnation_ids: Vec<i64>,
+        }
+
+        unsafe extern "C" fn send(
+            args: *mut super::ffi::PJRT_Transfers_PJRT_Client_CrossHostSendBuffers_Args,
+        ) -> *mut crate::errors::ffi::PJRT_Error {
+            unsafe {
+                let args = &*args;
+                let snapshot = &mut *args.client.cast::<Snapshot>();
+                snapshot.task_ids = crate::slice_from_c_api(args.task_ids, args.num_tasks).to_vec();
+                snapshot.incarnation_ids = crate::slice_from_c_api(args.incarnation_ids, args.num_tasks).to_vec();
+            }
+            // Leave the event output null so the wrapper reports the malformed mock response without taking ownership.
+            std::ptr::null_mut()
+        }
+
+        let mut extension = super::ffi::PJRT_CrossHostTransfers_Extension {
+            base: crate::ffi::PJRT_Extension_Base {
+                struct_size: size_of::<super::ffi::PJRT_CrossHostTransfers_Extension>(),
+                extension_type: crate::ffi::PJRT_Extension_Type_CrossHostTransfers,
+                next: std::ptr::null_mut(),
+            },
+            PJRT_Transfers_PJRT_Client_MakeCrossHostReceiveBuffers: None,
+            PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice: None,
+            PJRT_Transfers_PJRT_Client_CrossHostReceiveBuffers: None,
+            PJRT_Transfers_PJRT_Client_CrossHostSendBuffers: Some(send),
+        };
+        let mut api: crate::ffi::PJRT_Api = unsafe { std::mem::zeroed() };
+        api.struct_size = size_of::<crate::ffi::PJRT_Api>();
+        api.extension_start = &mut extension.base;
+        let api = unsafe { crate::Api::from_c_api(&api).unwrap() };
+        let mut snapshot = Snapshot::default();
+        let client_handle = (&mut snapshot as *mut Snapshot).cast();
+        let client =
+            std::mem::ManuallyDrop::new(unsafe { crate::Client::from_c_api(client_handle, api, None).unwrap() });
+        let buffer = std::mem::ManuallyDrop::new(unsafe {
+            crate::Buffer::from_c_api(std::ptr::dangling_mut::<u8>().cast(), api, client_handle).unwrap()
+        });
+        assert!(matches!(
+            client.cross_host_send_buffers(&[&buffer], &[4], &[17], &[(3, 91), (5, 92)]),
+            Err(Error::InvalidArgument { .. }),
+        ));
+        assert_eq!(snapshot.task_ids, vec![3, 5]);
+        assert_eq!(snapshot.incarnation_ids, vec![91, 92]);
+    }
 
     #[test]
     fn test_cross_host_transfers_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     assert!(plugin.cross_host_transfers_extension().is_ok());
                     assert!(client.cross_host_transfers_extension().is_ok());
                 }
@@ -809,40 +947,40 @@ mod tests {
     fn test_cross_host_transfers() {
         test_for_each_platform!(|_plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     let device = client.addressable_devices().unwrap().remove(0);
                     let buffer = client.buffer(&[1u8, 2u8], BufferType::U8, [4], None, device.clone(), None).unwrap();
                     let buffers = [&buffer];
                     assert!(matches!(
-                        client.cross_host_send_buffers(&buffers, &[], &[]),
+                        client.cross_host_send_buffers(&buffers, &[], &[], &[]),
                         Err(Error::InvalidArgument { .. })
                     ));
                     assert!(matches!(
-                        client.cross_host_send_buffers(&buffers, &[0], &[]),
+                        client.cross_host_send_buffers(&buffers, &[0], &[], &[]),
                         Err(Error::InvalidArgument { .. })
                     ));
                     assert!(matches!(
-                        client.cross_host_send_buffers(&buffers, &[], &[42i64]),
+                        client.cross_host_send_buffers(&buffers, &[], &[42i64], &[]),
                         Err(Error::InvalidArgument { .. })
                     ));
                     assert!(matches!(
-                        client.cross_host_send_buffers(&buffers, &[0], &[42i64]),
+                        client.cross_host_send_buffers(&buffers, &[0], &[42i64], &[]),
                         Err(Error::InvalidArgument { .. })
                     ));
                     assert!(matches!(
-                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[], &[]),
+                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[], &[], &[]),
                         Err(Error::InvalidArgument { .. }),
                     ));
                     assert!(matches!(
-                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[0], &[]),
+                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[0], &[], &[]),
                         Err(Error::InvalidArgument { .. }),
                     ));
                     assert!(matches!(
-                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[], &[42i64]),
+                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[], &[42i64], &[]),
                         Err(Error::InvalidArgument { .. }),
                     ));
                     assert!(matches!(
-                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[0], &[42i64]),
+                        client.cross_host_receive_buffers(&[BufferType::U8], &[&[2i64]], &device, &[0], &[42i64], &[]),
                         Err(Error::InvalidArgument { .. }),
                     ));
                 }
@@ -858,10 +996,10 @@ mod tests {
     fn test_cross_host_transfers_deprecated() {
         test_for_each_platform!(|_plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     let device = client.addressable_devices().unwrap().remove(0);
                     assert!(matches!(
-                        client.make_cross_host_receive_buffers(&[], &[], &device, |_error, _descriptors, _cancel_notifier| {}),
+                        client.make_cross_host_receive_buffers(&[], &[], &device, |_error, _descriptors, _cancel_notifier| {}, false),
                         Ok(received_buffers) if received_buffers.is_empty(),
                     ));
                     assert!(matches!(
@@ -870,6 +1008,7 @@ mod tests {
                             &[],
                             &device,
                             |_error, _descriptors, _cancel_notifier| {},
+                            false,
                         ),
                         Err(Error::InvalidArgument { .. }),
                     ));
