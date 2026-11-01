@@ -1790,8 +1790,8 @@ mod tests {
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot apply forward-mode differentiation to a `composite` call of `sine` that \
-                               has only reverse-mode rules; it supports only reverse-mode differentiation (e.g., \
+                if message == "cannot apply forward mode differentiation to a `composite` call of `sine` that \
+                               has only reverse mode rules; it supports only reverse mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
         ));
     }
@@ -2461,8 +2461,8 @@ mod tests {
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot apply forward-mode differentiation to a `composite` call that has only \
-                               reverse-mode rules; it supports only reverse-mode differentiation (e.g., `vjp`, \
+                if message == "cannot apply forward mode differentiation to a `composite` call that has only \
+                               reverse mode rules; it supports only reverse mode differentiation (e.g., `vjp`, \
                                `value_and_gradient`, or `jacobian_reverse`)",
         ));
     }
