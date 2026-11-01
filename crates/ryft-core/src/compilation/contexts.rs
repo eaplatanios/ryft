@@ -1,12 +1,3 @@
-//! Compilation domain contracts.
-//!
-//! [`CompilationDomain`] is the boundary between backend-neutral compilation machinery and a concrete backend, and its
-//! optional extensions add transactional external state ([`StatefulCompilationDomain`]), compiled program caching
-//! ([`CompilationCacheDomain`]), and compiled program analysis ([`AnalyzableCompilationDomain`]). Caching domains
-//! share their compiled programs through a [`CompilationContext`](super::caching::CompilationContext).
-
-// TODO(eaplatanios): Review this module.
-
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -20,6 +11,8 @@ use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::tracing::DomainTracingContext;
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four semantic stages:
 ///
@@ -32,7 +25,7 @@ use crate::tracing::DomainTracingContext;
 /// remain passive values. Each function owns its complete backend-specific transition, including any validation,
 /// caching, or runtime conversion policy that the backend chooses to apply.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
-    /// Backend-defined key for one input specialization of a retained JIT dispatcher.
+    /// Backend-defined key for one input specialization of a retained Just-In-Time (JIT) dispatcher.
     type DispatchKey: Clone + Eq + Hash;
 
     /// Backend-specific lowered program representation produced by [`Self::lower`].
@@ -45,30 +38,28 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// compiler flags, etc., are all represented as part of this type.
     type Options;
 
-    /// Backend-specific error type. Staging and call boundary errors flow through it as [`ProgramError`]s, which is
-    /// why it requires [`From<ProgramError>`].
+    /// Backend-specific error type. Staging and call boundary errors flow through it as [`ProgramError`]s,
+    /// which is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Derives the effective staged input types and their dispatch key from one runtime input signature.
+    /// Derives the effective staged input types and their dispatch key from one runtime input signature. Most domains
+    /// return the input types unchanged and use them as the key. Backends may instead apply a semantics preserving
+    /// dispatch policy such as bounded shape bucketing. The returned key must compare equal exactly when the returned
+    /// effective types are interchangeable for tracing, lowering, compilation, and calls.
     ///
-    /// Most domains return the input types unchanged and use them as the key. Backends may instead apply a semantics
-    /// preserving dispatch policy such as bounded shape bucketing. The returned key must compare equal exactly when the
-    /// returned effective types are interchangeable for tracing, lowering, compilation, and calls.
-    ///
-    /// The effective types are returned as a shared slice so that key construction on the hot path of retained
-    /// dispatch never clones the type vector deeply. Domains whose key embeds the effective types (e.g., exact
-    /// dispatch) share one allocation between the key and the returned signature, and the caller clones individual
-    /// types only on a specialization miss, when it prepares the staging request.
+    /// The effective types are returned as a shared slice so that key construction on the hot path of retained dispatch
+    /// never clones the type vector deeply. Domains whose key embeds the effective types (e.g., exact dispatch) share
+    /// one allocation between the key and the returned signature, and the caller clones individual types only on a
+    /// specialization miss, when it prepares the staging request.
     fn dispatch_signature(
         &self,
         input_types: Vec<Self::Type>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    /// Traces a fallible function with explicit runtime captures and their symbolic references.
-    ///
-    /// This is the only staging primitive. Implementations apply all options that affect tracing to the effective
-    /// input and output signatures and retain those same options in the returned artifact.
+    /// Traces a fallible function with explicit runtime captures and their symbolic references. This is the only
+    /// staging primitive. Implementations apply all options that affect tracing to the effective input and output
+    /// signatures and retain those same options in the returned artifact.
     fn stage<Request>(
         &self,
         request: Request,
@@ -79,11 +70,10 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>;
 
-    /// Performs the complete backend-specific lowering transition.
-    ///
-    /// The returned lowered artifact must be self-describing. Every option, compiler, target, and topology property
-    /// that affects compilation must be folded into [`Self::LoweredProgram`] during this transition, because caching
-    /// backends derive compiled program identity from the lowered program alone.
+    /// Performs the complete backend-specific lowering transition. The returned lowered artifact must be
+    /// self-describing. Every option, compiler, target, and topology property that affects compilation must be folded
+    /// into [`Self::LoweredProgram`] during this transition, because caching backends derive compiled program identity
+    /// from the lowered program alone.
     fn lower<Request>(
         &self,
         staged: Request,
