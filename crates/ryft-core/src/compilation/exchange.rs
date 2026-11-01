@@ -41,11 +41,15 @@ pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the number of processes participating in the exchange.
     fn process_count(&self) -> usize;
 
-    /// Verifies that every process is participating in the same compilation round.
+    /// Verifies that this process is compatible with the leader for `key`, before the leader compiles the program or a
+    /// follower waits for its artifact.
     ///
-    /// Implementations should compare `key`, the process count, and any launch or backend compatibility identity that
-    /// the transport owns before allowing the leader to compile or followers to wait for an artifact. The default
-    /// validates only the local process coordinates so that simple transports remain usable.
+    /// A process calls this function only for compilations that miss its in-memory cache. Processes may therefore call
+    /// it for different keys and in different orders, skip a key that another process compiles, or call it again for a
+    /// key whose program they evicted. Implementations must address each round by `key` rather than by call order, and
+    /// the leader must not wait for followers. Implementations should compare `key`, the process count, and any launch
+    /// or backend compatibility identity that the transport owns. The default validates only the local process
+    /// coordinates so that simple transports remain usable.
     fn preflight(&self, _key: &[u8], _timeout: Duration) -> Result<(), CompilationExchangeError> {
         if self.process_count() == 0 {
             return Err(CompilationExchangeError::Incompatible {
@@ -61,6 +65,9 @@ pub trait CompilationArtifactExchange: Send + Sync {
     }
 
     /// Publishes `artifact` for `key` so that follower processes can receive it.
+    ///
+    /// Publication must not wait for followers to receive the artifact, because a follower may never call
+    /// [`Self::receive`] for `key`.
     fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationExchangeError>;
 
     /// Publishes a terminal leader failure for `key` so that followers do not wait until their deadline.
@@ -77,6 +84,11 @@ pub trait CompilationArtifactExchange: Send + Sync {
     ///
     /// `Ok(None)` means that no artifact became available before the deadline. Transport and protocol failures,
     /// including terminal failures published by the leader, are returned explicitly.
+    ///
+    /// A follower calls this function only when it cannot restore the artifact from a cheaper tier, so a follower whose
+    /// persistent cache already holds the artifact never receives it. Implementations must therefore not require every
+    /// follower to receive each published artifact, which rules out transports that implement [`Self::publish`] and
+    /// this function as a collective operation such as a broadcast in which every process must take part.
     fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError>;
 }
 

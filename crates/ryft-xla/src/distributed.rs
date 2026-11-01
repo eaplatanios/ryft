@@ -38,7 +38,7 @@ const DEFAULT_ARTIFACT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_ARTIFACT_SIZE: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PREFLIGHT_KEY_SIZE: usize = 64 * 1024 * 1024;
 const LAUNCH_ID_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-const ARTIFACT_EXCHANGE_SCHEMA_VERSION: u32 = 2;
+const ARTIFACT_EXCHANGE_SCHEMA_VERSION: u32 = 3;
 const LAUNCH_ID_KEY: &[u8] = b"ryft/distributed-launch/v1/id";
 
 #[derive(Serialize, Deserialize)]
@@ -50,14 +50,14 @@ struct CompilationArtifactManifest {
     failure: Option<String>,
 }
 
+/// Announcement that the leader publishes in its preflight for one persistent compilation key.
 #[derive(Serialize, Deserialize)]
 struct CompilationPreflightManifest {
+    /// Exchange protocol version of the leader.
     schema_version: u32,
-    sequence: u64,
-    process_index: u64,
+
+    /// Number of processes that the leader expects to participate in the exchange.
     process_count: u64,
-    key_size: u64,
-    key_checksum: [u8; 32],
 }
 
 struct DistributedRuntimeState {
@@ -76,7 +76,6 @@ struct DistributedCompilationArtifactExchange {
     chunk_size: usize,
     maximum_artifact_size: usize,
     maximum_preflight_key_size: usize,
-    preflight_sequence: AtomicU64,
 }
 
 impl DistributedCompilationArtifactExchange {
@@ -95,12 +94,15 @@ impl DistributedCompilationArtifactExchange {
         self.key(key, format!("chunk/{index:016x}").as_bytes())
     }
 
-    fn preflight_key(&self, sequence: u64, process_index: usize, suffix: &[u8]) -> Vec<u8> {
-        let mut key = b"ryft/compiled-artifact-preflight/v1/".to_vec();
-        key.extend_from_slice(&self.runtime.launch_id);
-        key.extend_from_slice(format!("/{sequence:016x}/{process_index:016x}/").as_bytes());
-        key.extend_from_slice(suffix);
-        key
+    /// Stores `value` under `key` unless a value is already stored there, in which case the stored value is kept.
+    ///
+    /// The coordination store never overwrites values, and the leader legitimately writes the same record more than
+    /// once, for example when it compiles a program again after evicting it from its in-memory cache.
+    fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<(), CompilationExchangeError> {
+        match self.runtime.key_value_store.put(key, value) {
+            Ok(()) | Err(ryft_pjrt::Error::AlreadyExists { .. }) => Ok(()),
+            Err(error) => Err(Self::failed(error.to_string())),
+        }
     }
 
     fn failed(message: impl Into<String>) -> CompilationExchangeError {
@@ -118,6 +120,9 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
     }
 
     fn preflight(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationExchangeError> {
+        // Preflight rounds are addressed by the compilation key rather than by call order, because each process
+        // preflights only the compilations that miss its own in-memory cache. The leader announces every key that it
+        // is about to compile without waiting for anyone, and each follower waits for the announcement of its own key.
         if self.process_count == 0 || self.process_index >= self.process_count {
             return Err(CompilationExchangeError::Incompatible {
                 message: "exchange process coordinates are invalid".to_string(),
@@ -133,71 +138,51 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             });
         }
 
-        let sequence = self.preflight_sequence.fetch_add(1, Ordering::Relaxed);
-        self.runtime
-            .key_value_store
-            .put(&self.preflight_key(sequence, self.process_index, b"key"), key)
-            .map_err(|error| Self::failed(error.to_string()))?;
-        let manifest = CompilationPreflightManifest {
-            schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
-            sequence,
-            process_index: self.process_index as u64,
-            process_count: self.process_count as u64,
-            key_size: key.len() as u64,
-            key_checksum: Sha256::digest(key).into(),
-        };
-        let manifest = serde_json::to_vec(&manifest)
-            .map_err(|error| Self::failed(format!("failed to encode compilation preflight manifest: {error}")))?;
-        self.runtime
-            .key_value_store
-            .put(&self.preflight_key(sequence, self.process_index, b"manifest"), manifest.as_slice())
-            .map_err(|error| Self::failed(error.to_string()))?;
+        if self.process_index == 0 {
+            let manifest = CompilationPreflightManifest {
+                schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
+                process_count: self.process_count as u64,
+            };
+            let manifest = serde_json::to_vec(&manifest)
+                .map_err(|error| Self::failed(format!("failed to encode compilation preflight manifest: {error}")))?;
+            // The key is written before the manifest so that a follower that observes the manifest also finds the key.
+            self.put_if_absent(&self.key(key, b"preflight/key"), key)?;
+            return self.put_if_absent(&self.key(key, b"preflight/manifest"), manifest.as_slice());
+        }
 
         let start = Instant::now();
-        for process_index in 0..self.process_count {
+        let get = |suffix: &[u8]| -> Result<Vec<u8>, CompilationExchangeError> {
             let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationExchangeError::TimedOut)?;
-            let manifest = self
-                .runtime
-                .key_value_store
-                .get(&self.preflight_key(sequence, process_index, b"manifest"), remaining)
-                .map_err(|error| match error {
-                    ryft_pjrt::Error::NotFound { .. } | ryft_pjrt::Error::DeadlineExceeded { .. } => {
-                        CompilationExchangeError::TimedOut
-                    }
-                    error => Self::failed(error.to_string()),
-                })?;
-            let manifest: CompilationPreflightManifest = serde_json::from_slice(manifest.as_slice())
-                .map_err(|error| Self::failed(format!("failed to decode compilation preflight manifest: {error}")))?;
-            if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION
-                || manifest.sequence != sequence
-                || manifest.process_index != process_index as u64
-                || manifest.process_count != self.process_count as u64
-            {
-                return Err(CompilationExchangeError::Incompatible {
-                    message: format!("process {process_index} reported incompatible compilation coordinates"),
-                });
-            }
-            if manifest.key_size != key.len() as u64 || manifest.key_checksum != <[u8; 32]>::from(Sha256::digest(key)) {
-                return Err(CompilationExchangeError::Incompatible {
-                    message: format!("process {process_index} reported a different persistent compilation key"),
-                });
-            }
-            let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationExchangeError::TimedOut)?;
-            let participant_key = self
-                .runtime
-                .key_value_store
-                .get(&self.preflight_key(sequence, process_index, b"key"), remaining)
-                .map_err(|error| match error {
-                    ryft_pjrt::Error::NotFound { .. } | ryft_pjrt::Error::DeadlineExceeded { .. } => {
-                        CompilationExchangeError::TimedOut
-                    }
-                    error => Self::failed(error.to_string()),
-                })?;
-            if participant_key.as_slice() != key {
-                return Err(CompilationExchangeError::Incompatible {
-                    message: format!("process {process_index} reported a different persistent compilation key"),
-                });
-            }
+            self.runtime.key_value_store.get(&self.key(key, suffix), remaining).map_err(|error| match error {
+                ryft_pjrt::Error::NotFound { .. } | ryft_pjrt::Error::DeadlineExceeded { .. } => {
+                    CompilationExchangeError::TimedOut
+                }
+                error => Self::failed(error.to_string()),
+            })
+        };
+        let manifest = get(b"preflight/manifest")?;
+        let manifest: CompilationPreflightManifest = serde_json::from_slice(manifest.as_slice())
+            .map_err(|error| Self::failed(format!("failed to decode compilation preflight manifest: {error}")))?;
+        if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION {
+            return Err(CompilationExchangeError::Incompatible {
+                message: format!(
+                    "process 0 uses compilation artifact exchange schema {}, but this process uses schema {}",
+                    manifest.schema_version, ARTIFACT_EXCHANGE_SCHEMA_VERSION,
+                ),
+            });
+        }
+        if manifest.process_count != self.process_count as u64 {
+            return Err(CompilationExchangeError::Incompatible {
+                message: format!(
+                    "process 0 expects {} processes, but this process expects {}",
+                    manifest.process_count, self.process_count,
+                ),
+            });
+        }
+        if get(b"preflight/key")?.as_slice() != key {
+            return Err(CompilationExchangeError::Incompatible {
+                message: "process 0 announced a different persistent compilation key with the same digest".to_string(),
+            });
         }
         Ok(())
     }
@@ -209,6 +194,21 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 artifact.len(),
                 self.maximum_artifact_size,
             )));
+        }
+        // Every artifact published for one key is interchangeable, so a key whose artifact is already published (e.g.,
+        // because the leader compiled it again after evicting it) needs no new publication. A terminal failure that
+        // was already published for the key cannot be replaced, because the store never overwrites values.
+        match self.runtime.key_value_store.try_get(&self.key(key, b"manifest")) {
+            Ok(manifest) => {
+                let manifest: CompilationArtifactManifest = serde_json::from_slice(manifest.as_slice())
+                    .map_err(|error| Self::failed(format!("failed to decode artifact manifest: {error}")))?;
+                return match manifest.failure {
+                    None => Ok(()),
+                    Some(_) => Err(Self::failed("a terminal failure was already published for this compilation key")),
+                };
+            }
+            Err(ryft_pjrt::Error::NotFound { .. }) => {}
+            Err(error) => return Err(Self::failed(error.to_string())),
         }
         for (index, chunk) in artifact.chunks(self.chunk_size).enumerate() {
             self.runtime
@@ -241,10 +241,8 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         };
         let manifest = serde_json::to_vec(&manifest)
             .map_err(|error| Self::failed(format!("failed to encode artifact failure: {error}")))?;
-        self.runtime
-            .key_value_store
-            .put(&self.key(key, b"manifest"), manifest.as_slice())
-            .map_err(|error| Self::failed(error.to_string()))
+        // An artifact or failure that was already published for this key stays authoritative.
+        self.put_if_absent(&self.key(key, b"manifest"), manifest.as_slice())
     }
 
     fn receive(&self, key: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
@@ -428,12 +426,17 @@ impl DistributedRuntime {
     /// Creates a chunked, checksummed compilation-artifact exchange over this runtime's coordination store.
     ///
     /// The returned exchange keeps both the distributed client and coordinator service alive. A manifest is published
-    /// only after every bounded chunk, so followers never accept a partially published artifact. Before compilation,
-    /// every process participates in an ordered preflight round that compares the exact persistent compilation key and
-    /// process count. The XLA persistent key includes platform and plugin versions, compiler identity, and logical
-    /// topology, so those compatibility properties are checked before process zero compiles. Distributed compilation
-    /// calls must occur in the same order on every process; launch-order disagreement reaches the bounded preflight
-    /// timeout instead of waiting indefinitely.
+    /// only after every bounded chunk, so followers never accept a partially published artifact. Every record is
+    /// addressed by the persistent compilation key, so processes may compile programs in different orders, skip
+    /// programs that their in-memory caches already hold, or compile programs that no other process compiles (e.g.,
+    /// eager operations that only process zero runs).
+    ///
+    /// Before process zero compiles a program, its preflight announces the persistent compilation key and the
+    /// process count without waiting for any other process. A follower that misses its in-memory cache waits for that
+    /// announcement before it waits for the artifact, and rejects a process count that disagrees with its own. The
+    /// XLA persistent key includes platform and plugin versions, compiler identity, and logical topology, so a
+    /// follower whose compatibility properties differ from those of process zero never observes an announcement for
+    /// its key. Its preflight then times out, and the configured exchange policy decides whether it compiles locally.
     pub fn compilation_artifact_exchange(
         &self,
         process_index: usize,
@@ -446,7 +449,6 @@ impl DistributedRuntime {
             chunk_size: DEFAULT_ARTIFACT_CHUNK_SIZE,
             maximum_artifact_size: DEFAULT_MAX_ARTIFACT_SIZE,
             maximum_preflight_key_size: DEFAULT_MAX_PREFLIGHT_KEY_SIZE,
-            preflight_sequence: AtomicU64::new(0),
         })
     }
 
@@ -468,11 +470,11 @@ mod tests {
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use ryft_core::CompilationArtifactExchange;
+    use ryft_core::{CompilationArtifactExchange, CompilationExchangeError};
     use ryft_pjrt::{
         ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
         KeyValueStore, load_cpu_plugin,
@@ -547,7 +549,6 @@ mod tests {
             chunk_size: 3,
             maximum_artifact_size: 16,
             maximum_preflight_key_size: 16,
-            preflight_sequence: AtomicU64::new(0),
         };
 
         exchange.publish(b"program", b"abcdefgh").unwrap();
@@ -555,7 +556,7 @@ mod tests {
         exchange.publish_failure(b"failed-program", "backend compilation failed").unwrap();
         assert!(matches!(
             exchange.receive(b"failed-program", Duration::from_secs(1)),
-            Err(ryft_core::compilation::CompilationExchangeError::Failed { message })
+            Err(CompilationExchangeError::Failed { message })
                 if message.contains("backend compilation failed"),
         ));
         assert!(exchange.publish(b"too-large", &[0; 17]).is_err());
@@ -593,22 +594,62 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_artifact_preflight_rejects_key_disagreement() {
+    fn test_compilation_artifact_preflight_times_out_on_key_disagreement() {
         let Some(address) = loopback_address() else {
             return;
         };
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap();
-        let first = runtime.compilation_artifact_exchange(0, 2);
-        let second = runtime.compilation_artifact_exchange(1, 2);
+        let leader = runtime.compilation_artifact_exchange(0, 2);
+        let follower = runtime.compilation_artifact_exchange(1, 2);
 
-        thread::scope(|scope| {
-            let first = scope.spawn(move || first.preflight(b"first-key", Duration::from_secs(1)));
-            let second = scope.spawn(move || second.preflight(b"second-key", Duration::from_secs(1)));
-            for result in [first.join().unwrap(), second.join().unwrap()] {
-                assert!(matches!(result, Err(ryft_core::compilation::CompilationExchangeError::Incompatible { .. })));
-            }
-        });
+        // The leader never waits, while a follower whose key differs never observes an announcement for its key.
+        assert_eq!(leader.preflight(b"first-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(
+            follower.preflight(b"second-key", Duration::from_millis(20)),
+            Err(CompilationExchangeError::TimedOut),
+        );
+    }
+
+    #[test]
+    fn test_compilation_artifact_preflight_is_independent_of_call_order() {
+        let Some(address) = loopback_address() else {
+            return;
+        };
+        let plugin = load_cpu_plugin().unwrap();
+        let runtime = DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap();
+        let leader = runtime.compilation_artifact_exchange(0, 2);
+        let follower = runtime.compilation_artifact_exchange(1, 2);
+
+        // The leader compiles programs that the follower skips (e.g., because its in-memory cache already holds them),
+        // compiles one program twice (e.g., after evicting it), and the follower preflights in a different order.
+        for key in [b"first-key".as_slice(), b"second-key", b"third-key", b"first-key"] {
+            assert_eq!(leader.preflight(key, Duration::from_secs(1)), Ok(()));
+        }
+        assert_eq!(follower.preflight(b"third-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(follower.preflight(b"first-key", Duration::from_secs(1)), Ok(()));
+
+        // Publishing an already published artifact again is a no-op that keeps the first artifact.
+        leader.publish(b"first-key", b"first-executable").unwrap();
+        leader.publish(b"first-key", b"recompiled-executable").unwrap();
+        let received = follower.receive(b"first-key", Duration::from_secs(1)).unwrap();
+        assert_eq!(received, Some(b"first-executable".to_vec()));
+
+        // A published terminal failure stays authoritative for its key.
+        leader.publish_failure(b"second-key", "backend compilation failed").unwrap();
+        leader.publish_failure(b"second-key", "backend compilation failed again").unwrap();
+        assert_eq!(
+            leader.publish(b"second-key", b"second-executable"),
+            Err(CompilationExchangeError::Failed {
+                message: "a terminal failure was already published for this compilation key".to_string(),
+            }),
+        );
+        assert_eq!(
+            follower.receive(b"second-key", Duration::from_secs(1)),
+            Err(CompilationExchangeError::Failed {
+                message: "compilation producer failed: backend compilation failed".to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -618,16 +659,16 @@ mod tests {
         };
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap();
-        let first = runtime.compilation_artifact_exchange(0, 2);
-        let second = runtime.compilation_artifact_exchange(1, 3);
+        let leader = runtime.compilation_artifact_exchange(0, 2);
+        let follower = runtime.compilation_artifact_exchange(1, 3);
 
-        thread::scope(|scope| {
-            let first = scope.spawn(move || first.preflight(b"key", Duration::from_secs(1)));
-            let second = scope.spawn(move || second.preflight(b"key", Duration::from_secs(1)));
-            for result in [first.join().unwrap(), second.join().unwrap()] {
-                assert!(matches!(result, Err(ryft_core::compilation::CompilationExchangeError::Incompatible { .. })));
-            }
-        });
+        assert_eq!(leader.preflight(b"key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(
+            follower.preflight(b"key", Duration::from_secs(1)),
+            Err(CompilationExchangeError::Incompatible {
+                message: "process 0 expects 2 processes, but this process expects 3".to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -665,7 +706,6 @@ mod tests {
             chunk_size: 3,
             maximum_artifact_size: 16,
             maximum_preflight_key_size: 16,
-            preflight_sequence: AtomicU64::new(0),
         };
 
         let publish_invalid = |key: &[u8], first: &[u8], second: &[u8]| {
