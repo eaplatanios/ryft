@@ -196,7 +196,7 @@ impl<'s> TryFrom<&'s str> for SymbolVisibility {
             "public" => Ok(Self::Public),
             "private" => Ok(Self::Private),
             "nested" => Ok(Self::Nested),
-            _ => Err(format!("'{value}' is not a valid MLIR symbol visibility")),
+            _ => Err(format!("`{value}` is not a valid MLIR symbol visibility")),
         }
     }
 }

@@ -487,6 +487,7 @@ pub(crate) mod tests {
                           api_version = 4 : i32,
                           backend_config = {
                             array_attr = array<i32: 1, 2, 3>,
+                            bytes_attr = \"\\00\\FF\\80\",
                             dictionary_attr = {
                               nested_array_attr = array<i32: 4, 5>,
                               nested_dictionary_attr = {

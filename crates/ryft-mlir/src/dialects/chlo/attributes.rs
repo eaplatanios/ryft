@@ -6,7 +6,7 @@ use crate::{Attribute, Context, DialectHandle, Error};
 mlir_enum_attribute!(
     rust_name = Precision,
     mlir_name = Precision,
-    description = "CHLO precision for grouped dot products",
+    description = "CHLO precision for ragged dot products",
     variants = {
         Default => "DEFAULT",
         High => "HIGH",

@@ -272,7 +272,7 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 return Ok(Vec::new());
             }
             return Err(Error::invalid_argument(format!(
-                "invalid '{SWITCH_CASE_VALUES_ATTRIBUTE}' attribute in `cf::switch`"
+                "invalid `{SWITCH_CASE_VALUES_ATTRIBUTE}` attribute in `cf::switch`"
             )));
         };
         let mut case_values =
@@ -285,7 +285,7 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         for count in case_operand_counts {
             let count = usize::try_from(count).map_err(|_| {
                 Error::invalid_argument(format!(
-                    "invalid '{SWITCH_CASE_OPERAND_COUNTS_ATTRIBUTE}' attribute in `cf::switch`"
+                    "invalid `{SWITCH_CASE_OPERAND_COUNTS_ATTRIBUTE}` attribute in `cf::switch`"
                 ))
             })?;
             branches.push(SwitchBranch {
@@ -294,13 +294,13 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                     .next()
                     .ok_or_else(|| {
                         Error::invalid_argument(format!(
-                            "invalid '{SWITCH_CASE_VALUES_ATTRIBUTE}' attribute in `cf::switch`"
+                            "invalid `{SWITCH_CASE_VALUES_ATTRIBUTE}` attribute in `cf::switch`"
                         ))
                     })??
                     .cast::<IntegerAttributeRef>()
                     .ok_or_else(|| {
                         Error::invalid_argument(format!(
-                            "invalid '{SWITCH_CASE_VALUES_ATTRIBUTE}' attribute in `cf::switch`"
+                            "invalid `{SWITCH_CASE_VALUES_ATTRIBUTE}` attribute in `cf::switch`"
                         ))
                     })?,
                 successor: case_successors

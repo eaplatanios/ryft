@@ -13,7 +13,7 @@ pub trait BatchNormOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn feature_index(&self) -> Result<u32, Error> {
         u32::try_from(self.integer_attribute(BATCH_NORM_FEATURE_INDEX_ATTRIBUTE)?.signless_value()).map_err(|_| {
             Error::invalid_argument(format!(
-                "invalid '{}' attribute in `stable_hlo::{}`",
+                "invalid `{}` attribute in `stable_hlo::{}`",
                 BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
                 self.name()
             ))
