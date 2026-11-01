@@ -146,11 +146,13 @@
 //! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided
 //! context and preserve symbolic zeros where possible. Implement [`MemberDifferentiableOperation`] when a homogeneous
 //! member operation needs values from its projection's parent context while constructing its derivative. Ordinary
-//! homogeneous projected rules should forward their named hooks through [`jvp_projected_operation`] and
-//! [`jvp_for_transpose_projected_operation`]. The context's [`rule`](DifferentiationContext::rule) identifies the
-//! selection inherited by recursive drivers; explicit hook calls do not change it. Implement [`TransposableOperation`]
-//! for linear primitives that may occur in a homogeneous pushforward. A member payload whose parent instruction has a
-//! mixed signature needs no separate rule, because [`transpose_mixed_operation`] delegates that instruction's
+//! homogeneous projected rules should forward their named hooks through
+//! [`jvp_projected_operation`](DifferentiationContext::jvp_projected_operation) and
+//! [`jvp_for_transpose_projected_operation`](DifferentiationContext::jvp_for_transpose_projected_operation). The
+//! context's [`rule`](DifferentiationContext::rule) identifies the selection inherited by recursive drivers; explicit
+//! hook calls do not change it. Implement [`TransposableOperation`] for linear primitives that may occur in a
+//! homogeneous pushforward. A member payload whose parent instruction has a mixed signature needs no separate rule,
+//! because [`transpose_mixed_operation`](TranspositionContext::transpose_mixed_operation) delegates that instruction's
 //! member-typed data inputs, wherever they sit in its input list, to that same homogeneous rule. Higher-order
 //! [`Operation`] logic belongs with the operation whose instruction attaches to the nested [`Region`](crate::Region).
 //! Wrapper operation enums should provide family dispatch and forward to those payload rules.
@@ -196,8 +198,7 @@ pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,
     DifferentiationTracer, ForwardModeDifferentiate, FusedDifferentiationPolicy, Linearization, LinearizationContext,
     LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy,
-    ProjectedDifferentiationPolicy, Pushforward, TangentActivity, jvp_for_transpose_projected_operation,
-    jvp_projected_operation,
+    ProjectedDifferentiationPolicy, Pushforward, TangentActivity,
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
@@ -216,7 +217,6 @@ pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
     CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,
     TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
-    transpose_mixed_operation, transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 pub use zeros::ResidualZeroProvider;

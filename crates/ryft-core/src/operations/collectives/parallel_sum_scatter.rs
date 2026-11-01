@@ -1053,7 +1053,7 @@ mod tests {
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiableType, DifferentiationTracer, transpose_mixed_operation};
+    use crate::differentiation::{DifferentiableType, DifferentiationTracer};
     use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::assertions::AssertionError;
     use crate::operations::collectives::tests::{batch_collective, collective_program};
@@ -1097,14 +1097,9 @@ mod tests {
             PartialValue::Unknown(DimensionValue::constant(4).unwrap().r#type().into_owned().into()),
         ];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
-        transpose_mixed_operation(
-            &mut context,
-            &operation,
-            &inputs,
-            &[MaybeZero::Value(output_cotangent)],
-            &accumulators,
-        )
-        .unwrap();
+        context
+            .transpose_mixed_operation(&operation, &inputs, &[MaybeZero::Value(output_cotangent)], &accumulators)
+            .unwrap();
         let cotangents = context.take_cotangents(&accumulators).unwrap();
         let [MaybeZero::Value(array), MaybeZero::Zero(_)] = cotangents.as_slice() else {
             panic!("expected an array cotangent and a structural-zero extent cotangent");
@@ -2232,14 +2227,14 @@ mod tests {
             PartialValue::Unknown(DimensionValue::constant(3).unwrap().r#type().into_owned().into()),
         ];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
-        transpose_mixed_operation(
-            &mut context,
-            &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
-            &inputs,
-            &[MaybeZero::Value(output_cotangent)],
-            &accumulators,
-        )
-        .unwrap();
+        context
+            .transpose_mixed_operation(
+                &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
+                &inputs,
+                &[MaybeZero::Value(output_cotangent)],
+                &accumulators,
+            )
+            .unwrap();
         let cotangents = context.take_cotangents(&accumulators).unwrap();
         let [MaybeZero::Value(array), MaybeZero::Zero(_)] = cotangents.as_slice() else {
             panic!("expected an array cotangent and a structural-zero extent cotangent");

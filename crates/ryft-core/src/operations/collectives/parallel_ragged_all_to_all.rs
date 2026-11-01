@@ -10,12 +10,11 @@ use crate::arrays::{
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
-    batch_projected_operation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
 };
 use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
@@ -1502,7 +1501,7 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-        batch_projected_operation(context, self, inputs)
+        context.batch_projected_operation(self, inputs)
     }
 }
 
@@ -1528,7 +1527,7 @@ impl<
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-        jvp_projected_operation(context, &operation, inputs)
+        context.jvp_projected_operation(&operation, inputs)
     }
 }
 

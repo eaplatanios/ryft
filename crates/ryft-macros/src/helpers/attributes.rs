@@ -37,7 +37,7 @@ impl<V> Attribute<V> {
         V: AttributeValue,
     {
         if self.value.is_some() {
-            Err(syn::Error::new_spanned(&meta.path, format!("duplicate ryft attribute '{}'", self.name)))
+            Err(syn::Error::new_spanned(&meta.path, format!("duplicate ryft attribute `{}`", self.name)))
         } else {
             self.tokens = (&meta.path).into_token_stream();
             self.value = Some(V::from_meta(&self.name, meta)?);
@@ -77,7 +77,7 @@ impl AttributeValue for bool {
 impl AttributeValue for syn::LitStr {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         if &meta.path != name {
-            return Err(meta.error("cannot parse attribute value from a 'ParseNestedMeta' with a different path"));
+            return Err(meta.error("cannot parse attribute value from a `ParseNestedMeta` with a different path"));
         }
 
         let expression: syn::Expr = meta.value()?.parse()?;
@@ -98,7 +98,7 @@ impl AttributeValue for syn::LitStr {
             }
             _ => Err(syn::Error::new_spanned(
                 expression,
-                format!("expected ryft '{name}' attribute to be a string: `{name} = \"...\"`"),
+                format!("expected ryft `{name}` attribute to be a string: `{name} = \"...\"`"),
             )),
         }
     }
@@ -107,27 +107,39 @@ impl AttributeValue for syn::LitStr {
 impl AttributeValue for syn::Ident {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
-        string.parse().map_err(|_| {
-            syn::Error::new_spanned(&string, format!("failed to parse identifier: '{:?}'", string.value()))
-        })
+        string.parse().map_err(|error| syn::Error::new_spanned(&string, error))
     }
 }
 
 impl AttributeValue for syn::Path {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
-        string
-            .parse()
-            .map_err(|_| syn::Error::new_spanned(&string, format!("failed to parse path: '{:?}'", string.value())))
+        string.parse().map_err(|error| syn::Error::new_spanned(&string, error))
+    }
+}
+
+impl AttributeValue for syn::Type {
+    fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
+        if &meta.path != name {
+            return Err(meta.error("cannot parse attribute value from a `ParseNestedMeta` with a different path"));
+        }
+        meta.value()?.parse()
+    }
+}
+
+impl AttributeValue for syn::Expr {
+    fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
+        if &meta.path != name {
+            return Err(meta.error("cannot parse attribute value from a `ParseNestedMeta` with a different path"));
+        }
+        meta.value()?.parse()
     }
 }
 
 impl AttributeValue for syn::ExprPath {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
-        string.parse().map_err(|_| {
-            syn::Error::new_spanned(&string, format!("failed to parse expression path: '{:?}'", string.value()))
-        })
+        string.parse().map_err(|error| syn::Error::new_spanned(&string, error))
     }
 }
 
@@ -141,22 +153,15 @@ impl AttributeValue for Vec<syn::WherePredicate> {
     }
 }
 
-impl AttributeValue for syn::Type {
-    fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
-        let string = syn::LitStr::from_meta(name, meta)?;
-        string
-            .parse()
-            .map_err(|_| syn::Error::new_spanned(&string, format!("failed to parse type: '{:?}'", string.value())))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use quote::{ToTokens, quote};
     use syn::parse::Parser;
 
-    use super::{Attribute, AttributeValue};
     use crate::helpers::symbols::Symbol;
+    use crate::helpers::tokens::TokensHelpers;
+
+    use super::{Attribute, AttributeValue};
 
     #[test]
     fn test_attribute() {
@@ -175,7 +180,7 @@ mod tests {
                 .parse2(quote!(crate = "alt_ryft"))
                 .unwrap_err()
                 .to_string()
-                .contains("duplicate ryft attribute 'crate'")
+                .contains("duplicate ryft attribute `crate`")
         );
 
         assert!(
@@ -227,7 +232,7 @@ mod tests {
             .parse2(quote!(crate = 42))
             .unwrap_err()
             .to_string()
-            .contains("expected ryft 'crate' attribute to be a string")
+            .contains("expected ryft `crate` attribute to be a string")
         );
 
         // Test `syn::Ident::from_meta`.
@@ -248,10 +253,7 @@ mod tests {
         })
         .parse2(quote!(crate = "ryft::core"))
         .unwrap();
-        assert_eq!(
-            path.expect("expected path to be parsed").to_token_stream().to_string().replace(' ', ""),
-            "ryft::core",
-        );
+        assert_eq!(path.expect("expected path to be parsed").to_compact_string(), "ryft::core",);
 
         // Test `syn::ExprPath::from_meta`.
         let mut expr_path = None;
@@ -282,7 +284,7 @@ mod tests {
             predicates
                 .expect("expected where predicates to be parsed")
                 .iter()
-                .map(|predicate| predicate.to_token_stream().to_string().replace(' ', ""))
+                .map(|predicate| predicate.to_compact_string())
                 .collect::<Vec<_>>(),
             vec!["T:Clone", "U:Default"],
         );
@@ -293,11 +295,45 @@ mod tests {
             ty = Some(syn::Type::from_meta(&Symbol::new("crate"), &meta)?);
             Ok(())
         })
-        .parse2(quote!(crate = "Vec<ryft::Placeholder>"))
+        .parse2(quote!(crate = Vec<ryft::Placeholder>))
+        .unwrap();
+        assert_eq!(ty.expect("expected type to be parsed").to_compact_string(), "Vec<ryft::Placeholder>",);
+
+        // Test `syn::Expr::from_meta`.
+        let mut expression = None;
+        syn::meta::parser(|meta| {
+            expression = Some(syn::Expr::from_meta(&Symbol::new("requires"), &meta)?);
+            Ok(())
+        })
+        .parse2(quote!(requires = left.shape()[0] == right.shape()[0]))
         .unwrap();
         assert_eq!(
-            ty.expect("expected type to be parsed").to_token_stream().to_string().replace(' ', ""),
-            "Vec<ryft::Placeholder>",
+            expression.expect("expected expression to be parsed").to_compact_string(),
+            "left.shape()[0]==right.shape()[0]",
         );
+
+        let error = syn::meta::parser(|meta| {
+            let _ = syn::Ident::from_meta(&Symbol::new("crate"), &meta)?;
+            Ok(())
+        })
+        .parse2(quote!(crate = ""))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected end of input, expected identifier");
+
+        let error = syn::meta::parser(|meta| {
+            let _ = syn::Path::from_meta(&Symbol::new("crate"), &meta)?;
+            Ok(())
+        })
+        .parse2(quote!(crate = ""))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected end of input, expected identifier");
+
+        let error = syn::meta::parser(|meta| {
+            let _ = syn::ExprPath::from_meta(&Symbol::new("crate"), &meta)?;
+            Ok(())
+        })
+        .parse2(quote!(crate = ""))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected end of input, expected identifier");
     }
 }

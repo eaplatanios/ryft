@@ -17,7 +17,7 @@ use crate::batching::{
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -955,7 +955,7 @@ where
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation: <C::Operation as OperationProjection<ArrayType>>::Projected = self.clone().into();
-            return jvp_projected_operation(destinations, &operation, inputs);
+            return destinations.jvp_projected_operation(&operation, inputs);
         }
 
         let output_primal = destinations

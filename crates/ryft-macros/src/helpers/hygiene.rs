@@ -15,12 +15,12 @@ use quote::quote;
 ///
 /// # Parameters
 ///
-///   * `ryft_path` - Optional [`syn::Path`] specifying the path in which the `ryft` library should be imported from.
+///   - `ryft_path`: Optional [`syn::Path`] specifying the path in which the `ryft` library should be imported from.
 ///     This does not generally need to be provided as `ryft` will always be used by default. However, you may want to
 ///     use this if you have wrapped `ryft` in some other library and would like to import it from there instead. This
 ///     function will include a `use ryft as _ryft;` expression in the beginning of the wrapped block if you do not
 ///     provide a custom `ryft_path`. If you do, `ryft` in this expression will be replaced with the provided path.
-///   * `code` - [`TokenStream`] to wrap in a `const _: () = { ... }` block.
+///   - `code`: [`TokenStream`] to wrap in a `const _: () = { ... }` block.
 pub fn const_block(code: TokenStream) -> TokenStream {
     quote! {
         #[doc(hidden)]

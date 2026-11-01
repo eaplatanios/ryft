@@ -13,7 +13,7 @@ use crate::helpers::spans::with_span;
 ///
 /// # Parameters
 ///
-///   * `input` - [`DeriveInput`] for which to replace instances of the `Self` type. Note that this function
+///   - `input`: [`DeriveInput`] for which to replace instances of the `Self` type. Note that this function
 ///     will mutate this [`DeriveInput`] instance directly. Note also that only structs and enums are supported.
 ///     [`DeriveInput`] instances that correspond to unions will be ignored by this function.
 pub fn replace_self_type(input: &mut syn::DeriveInput) {
@@ -273,7 +273,7 @@ impl ReplaceSelf<'_> {
 
 #[cfg(test)]
 mod tests {
-    use quote::ToTokens;
+    use crate::helpers::tokens::TokensHelpers;
 
     use super::replace_self_type;
 
@@ -291,7 +291,7 @@ mod tests {
             }
         };
         replace_self_type(&mut input);
-        let rendered = input.to_token_stream().to_string().replace(' ', "");
+        let rendered = input.to_compact_string();
         assert!(!rendered.contains("Self"));
         assert!(rendered.contains("Node<T>:Clone"));
         assert!(rendered.contains("T:Into<<Node<T>>::Assoc>"));
@@ -311,7 +311,7 @@ mod tests {
         };
 
         replace_self_type(&mut input);
-        let rendered = input.to_token_stream().to_string().replace(' ', "");
+        let rendered = input.to_compact_string();
         assert!(!rendered.contains("Self"));
         assert!(rendered.contains("T:From<<Message<T>>::Assoc>"));
         assert!(rendered.contains("One(Message<T>)"));

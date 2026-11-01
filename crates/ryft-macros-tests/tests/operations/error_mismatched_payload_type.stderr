@@ -1,0 +1,8 @@
+error[E0271]: type mismatch resolving `<StopGradientOperation<ArrayType> as Operation>::Type == DataType`
+ --> tests/operations/error_mismatched_payload_type.rs:4:35
+  |
+4 |   enum BadOperation<V: Value<Type = DataType>> {
+  |  ___________________________________^
+5 | |     Zero(ZeroOperation<DataType>),
+6 | |     StopGradient(StopGradientOperation<ArrayType>),
+  | |______________________________________^ expected `DataType`, found `ArrayType`

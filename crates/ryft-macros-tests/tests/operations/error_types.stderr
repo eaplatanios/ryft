@@ -1,0 +1,41 @@
+error: could not infer an operation type because no generic parameter is bounded by `Value<Type = T>`
+ --> tests/operations/error_types.rs:4:6
+  |
+4 | enum MissingTypeOperation {
+  |      ^^^^^^^^^^^^^^^^^^^^
+
+error: could not infer a unique operation type because multiple distinct `Value<Type = T>` bounds are present
+ --> tests/operations/error_types.rs:9:28
+  |
+9 | enum AmbiguousTypeOperation<A: Value<Type = ArrayType>, D: Value<Type = DimensionType>> {
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: explicit operation-family declarations must specify both `type(...)` and `constant(...)`
+  --> tests/operations/error_types.rs:16:6
+   |
+16 | enum MissingConstantOperation {
+   |      ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `#[ryft(type(...))]` must declare exactly one type
+  --> tests/operations/error_types.rs:21:8
+   |
+21 | #[ryft(type(ArrayType, DimensionType), constant(Array))]
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: duplicate ryft attribute `type(...)`
+  --> tests/operations/error_types.rs:27:25
+   |
+27 | #[ryft(type(ArrayType), type(ArrayType), constant(Array))]
+   |                         ^^^^
+
+error: the `type = ...` attribute form was replaced by `type(...)`
+  --> tests/operations/error_types.rs:33:8
+   |
+33 | #[ryft(type = ArrayType, constant(Array))]
+   |        ^^^^
+
+error: the `constant = ...` attribute form was replaced by `constant(...)`
+  --> tests/operations/error_types.rs:39:25
+   |
+39 | #[ryft(type(ArrayType), constant = Array)]
+   |                         ^^^^^^^^

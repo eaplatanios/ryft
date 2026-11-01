@@ -222,7 +222,6 @@ pub use discharge::{
     ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeRegionResult,
     ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeTargets,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceSource,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
 };
 pub use operations::{
     ReferenceAccessDescriptor, ReferenceAccessOperation, rewrite_reference_access_transforms,

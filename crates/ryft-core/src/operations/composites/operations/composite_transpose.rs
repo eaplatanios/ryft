@@ -32,7 +32,7 @@ use crate::programs::{
     Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramBuilder, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionInterface, RegionSlot, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, discharge_local_reference_operation, discharge_reference_free_operation,
+    TypeRefinements, Typed, Value,
 };
 use crate::tracing::TracingContext;
 
@@ -639,7 +639,7 @@ where
         }
 
         match &self.rules {
-            CompositeTransposeRules::Attached => discharge_local_reference_operation(self, context, driver, inputs),
+            CompositeTransposeRules::Attached => context.discharge_local_reference_operation(self, driver, inputs),
             CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, deferred_forward, .. } => {
                 let discharged = Self {
                     rules: CompositeTransposeRules::Retained {
@@ -653,7 +653,7 @@ where
                     },
                     ..self.clone()
                 };
-                discharge_reference_free_operation(&discharged, context, driver, inputs)
+                context.discharge_reference_free_operation(&discharged, driver, inputs)
             }
         }
     }
