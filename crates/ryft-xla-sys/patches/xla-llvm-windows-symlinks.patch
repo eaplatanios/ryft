@@ -1,0 +1,16 @@
+diff --git a/third_party/llvm/toolchains.patch b/third_party/llvm/toolchains.patch
+--- a/third_party/llvm/toolchains.patch
++++ b/third_party/llvm/toolchains.patch
+@@ -89,3 +89,12 @@
+ +            cmd = "printf '#define GET_OP_DEFS_{}\\n' > \"$@\" && cat \"$<\" >> \"$@\"".format(i),
+          )
+      return copies
++diff --git a/utils/bazel/configure.bzl b/utils/bazel/configure.bzl
++--- a/utils/bazel/configure.bzl
+++++ b/utils/bazel/configure.bzl
++@@ -202 +202,4 @@
++-        return repository_ctx.repo_metadata(reproducible = True)
+++        # Bazel 8.8 rewrites reproducible repositories' cross-repo links to relative
+++        # paths, which break when Windows resolves them through the execroot junction.
+++        # Keep the LLVM overlay's original absolute junctions on Windows.
+++        return repository_ctx.repo_metadata(reproducible = not repository_ctx.os.name.startswith("windows"))

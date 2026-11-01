@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Removed the obsolete `enable_libnvjitlink_support` Bazel flag following XLA's unconditional nvJitLink support.
 - Removed the CUDA 12 `sm_50` target because the pinned Eigen headers require compute capability 6.0 or newer.
 - Used the shared Bash copy recipe for LLVM operation shards on Windows and preserved copied C++ source bytes.
+- Retained absolute junctions in the Windows LLVM source overlay by opting it out of Bazel's reproducible repository
+  contents caching, whose relative link rewriting made sources inaccessible through the execroot junction.
 - Regenerated native bindings for XLA FFI custom options, split GPU pass registrations and the LLVM C API changes,
   including the additional DI string type character-type argument and removal of obsolete MHLO domain attributes.
 - Synchronized XLA Protobuf fields, enums and optional-presence semantics, including BLASLt algorithm configurations,
