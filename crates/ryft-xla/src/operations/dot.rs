@@ -1183,7 +1183,13 @@ mod tests {
         let group_sizes_values = [1_i32, 0, 3];
         let lhs = Array::matrix(5, 2, lhs_values.to_vec()).unwrap();
         let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 2, 1]), &rhs_values).unwrap();
-        let eager = lhs.ragged_dot(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
+        let eager = lhs
+            .ragged_dot(
+                &rhs,
+                &Array::vector(group_sizes_values.to_vec()).unwrap(),
+                &RaggedDotDimensionNumbers::matmul(),
+            )
+            .unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![12.0, 32.0, 50.0, 68.0, 0.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -1210,9 +1216,7 @@ mod tests {
         let group_sizes_values = [2_i32, 0, 3];
         let lhs = Array::matrix(2, 5, lhs_values.to_vec()).unwrap();
         let rhs = Array::matrix(5, 1, rhs_values.to_vec()).unwrap();
-        let eager = lhs
-            .ragged_dot_general(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap(), &dimensions)
-            .unwrap();
+        let eager = lhs.ragged_dot(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap(), &dimensions).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![50.0, 200.0, 0.0, 0.0, 500.0, 1_100.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -1237,7 +1241,13 @@ mod tests {
         let group_sizes_values = [u64::MAX, u64::MAX, 2, 1];
         let lhs = Array::matrix(4, 2, lhs_values.to_vec()).unwrap();
         let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [4, 2, 1]), &rhs_values).unwrap();
-        let eager = lhs.ragged_dot(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
+        let eager = lhs
+            .ragged_dot(
+                &rhs,
+                &Array::vector(group_sizes_values.to_vec()).unwrap(),
+                &RaggedDotDimensionNumbers::matmul(),
+            )
+            .unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![2.0, 4.0, 6.0, 8.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);

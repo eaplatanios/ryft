@@ -302,7 +302,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             _ => {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "{} has no forward-mode (i.e., JVP) rule",
+                        "{} has no forward mode (i.e., JVP) rule",
                         describe_composite(COMPOSITE_OPERATION_NAME, self.name())
                     ),
                 }
@@ -489,7 +489,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         let Some(forward) = self.definition().vjp().map(|vjp| vjp.forward()) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{} has no reverse-mode forward rule",
+                    "{} has no reverse mode forward rule",
                     describe_composite(COMPOSITE_OPERATION_NAME, self.name())
                 ),
             }

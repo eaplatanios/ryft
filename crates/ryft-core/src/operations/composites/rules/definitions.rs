@@ -1613,12 +1613,12 @@ mod tests {
         assert!(matches!(
             reference.jvp_specialization(key.clone()),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`composite` `cube` has no forward-mode (i.e., JVP) rule",
+                if message == "`composite` `cube` has no forward mode (i.e., JVP) rule",
         ));
         assert!(matches!(
             reference.forward_specialization(key),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`composite` `cube` has no reverse-mode forward rule",
+                if message == "`composite` `cube` has no reverse mode forward rule",
         ));
         assert!(matches!(
             reference.backward_specialization(backward_key(
@@ -1785,7 +1785,7 @@ mod tests {
                 vec![true],
             )),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`composite` `cube` has no forward-mode (i.e., JVP) rule",
+                if message == "`composite` `cube` has no forward mode (i.e., JVP) rule",
         ));
         assert_eq!(
             call_jvp(&registration, Array::scalar(2f64).unwrap(), Array::scalar(1f64).unwrap()),
