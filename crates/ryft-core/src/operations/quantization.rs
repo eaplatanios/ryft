@@ -32,7 +32,7 @@
 
 use std::fmt::Display;
 
-use ryft_macros::{Parameterized, capability};
+use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayMemberType,
@@ -73,7 +73,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Random, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::rounding::{Floor, Round};
-use crate::parameters::Parameter;
+use crate::parameters::Parameterized;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed,
@@ -1484,7 +1484,7 @@ impl BlockScaledDotConfiguration {
 
     /// Returns this configuration with stochastic (`true`) or nearest (`false`) rounding of the output
     /// cotangents in quantized backward contractions. Stochastic rounding requires
-    /// [`BlockScaledDotInputs::random_state`].
+    /// the `random_state` input of [`BlockScaledDot::call`].
     #[inline]
     pub fn with_stochastic_gradient_rounding(mut self, stochastic_gradient_rounding: bool) -> Self {
         self.stochastic_gradient_rounding = stochastic_gradient_rounding;
@@ -1611,100 +1611,6 @@ impl BlockScaledDotConfiguration {
     }
 }
 
-/// Inputs of a [`BlockScaledDot`] call. Only the left and right inputs are differentiable, and the other leaves
-/// receive structural zero cotangents.
-#[derive(Clone, Debug, PartialEq, Parameterized)]
-pub struct BlockScaledDotInputs<P: Parameter> {
-    /// Left input of the generalized dot product.
-    pub lhs: P,
-
-    /// Right input of the generalized dot product.
-    pub rhs: P,
-
-    /// Optional rank-0 global scale of the left input (refer to [`BlockScaledGlobalScaling::Provided`]).
-    pub lhs_global_scale: Option<P>,
-
-    /// Optional rank-0 global scale of the right input (refer to [`BlockScaledGlobalScaling::Provided`]).
-    pub rhs_global_scale: Option<P>,
-
-    /// Optional rank-0 global scale of the output cotangents in quantized backward contractions (refer to
-    /// [`BlockScaledGlobalScaling::Provided`]).
-    pub gradient_global_scale: Option<P>,
-
-    /// Random generator state (refer to [`Random`]) that seeds stochastic gradient rounding, which must be present
-    /// exactly when [`BlockScaledDotConfiguration::stochastic_gradient_rounding`] is enabled. The call does not return
-    /// an advanced state, so every call needs a fresh state (e.g., split from the caller's generator), or it repeats
-    /// the same rounding noise.
-    pub random_state: Option<P>,
-}
-
-impl<P: Parameter> BlockScaledDotInputs<P> {
-    /// Creates block-scaled dot product inputs without global scales or a random generator state.
-    #[inline]
-    pub fn new(lhs: P, rhs: P) -> Self {
-        Self {
-            lhs,
-            rhs,
-            lhs_global_scale: None,
-            rhs_global_scale: None,
-            gradient_global_scale: None,
-            random_state: None,
-        }
-    }
-
-    /// Returns these inputs with the provided global scale of the left input.
-    #[inline]
-    pub fn with_lhs_global_scale(mut self, global_scale: P) -> Self {
-        self.lhs_global_scale = Some(global_scale);
-        self
-    }
-
-    /// Returns these inputs with the provided global scale of the right input.
-    #[inline]
-    pub fn with_rhs_global_scale(mut self, global_scale: P) -> Self {
-        self.rhs_global_scale = Some(global_scale);
-        self
-    }
-
-    /// Returns these inputs with the provided global scale of the output cotangents, which requires quantized backward
-    /// contractions.
-    #[inline]
-    pub fn with_gradient_global_scale(mut self, global_scale: P) -> Self {
-        self.gradient_global_scale = Some(global_scale);
-        self
-    }
-
-    /// Returns these inputs with the provided random generator state.
-    #[inline]
-    pub fn with_random_state(mut self, random_state: P) -> Self {
-        self.random_state = Some(random_state);
-        self
-    }
-
-    /// Returns the present leaves in field order.
-    fn into_values(self) -> Vec<P> {
-        [Some(self.lhs), Some(self.rhs), self.lhs_global_scale, self.rhs_global_scale, self.gradient_global_scale]
-            .into_iter()
-            .chain([self.random_state])
-            .flatten()
-            .collect()
-    }
-
-    /// Rebuilds inputs with the presence pattern of `self` from `values` in field order.
-    fn with_values<Q: Parameter>(&self, values: Vec<Q>) -> BlockScaledDotInputs<Q> {
-        let mut values = values.into_iter();
-        let mut next_if = |present: bool| if present { values.next() } else { None };
-        BlockScaledDotInputs {
-            lhs: next_if(true).unwrap(),
-            rhs: next_if(true).unwrap(),
-            lhs_global_scale: next_if(self.lhs_global_scale.is_some()),
-            rhs_global_scale: next_if(self.rhs_global_scale.is_some()),
-            gradient_global_scale: next_if(self.gradient_global_scale.is_some()),
-            random_state: next_if(self.random_state.is_some()),
-        }
-    }
-}
-
 /// Differentiable block-scaled generalized dot product, built by [`block_scaled_dot`]. It quantizes its
 /// unquantized inputs with [`BlockQuantize`] and contracts them with [`ScaledDot`] in its primal, and its reverse
 /// mode rule implements a quantization-aware gradient policy, which is how models train with block-scaled formats
@@ -1721,15 +1627,15 @@ where
     function: Composite<
         D::Constant,
         D::Operation,
-        BlockScaledDotInputs<DomainTracer<D>>,
+        (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
         DomainTracer<D>,
         DefaultJvp,
         SymbolicZeroVjp<
             D::Constant,
             D::Operation,
-            BlockScaledDotInputs<DomainTracer<D>>,
+            (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
             DomainTracer<D>,
-            BlockScaledDotInputs<DomainTracer<D>>,
+            (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
         >,
     >,
 }
@@ -1746,7 +1652,7 @@ where
         &self.configuration
     }
 
-    /// Validates `inputs`, aligns their manual variation, and stages one block-scaled dot product call, whose output
+    /// Validates the inputs, aligns their manual variation, and stages one block-scaled dot product call, whose output
     /// has the [accumulation type](BlockScaledDotConfiguration::accumulation_type) and the shape of the corresponding
     /// [`Dot`] output.
     ///
@@ -1762,11 +1668,33 @@ where
     /// contractions. A random generator state must be present exactly when stochastic gradient rounding is enabled
     /// and must have a generator state type (refer to [`RandomAlgorithm::from_state_type`]).
     ///
+    /// Only `lhs` and `rhs` are differentiable. The global scales and random state receive structural zero cotangents.
+    ///
+    /// # Parameters
+    ///
+    ///   - `lhs`: Left input of the generalized dot product.
+    ///   - `rhs`: Right input of the generalized dot product.
+    ///   - `lhs_global_scale`: Optional rank-0 global scale of the left input.
+    ///   - `rhs_global_scale`: Optional rank-0 global scale of the right input.
+    ///   - `gradient_global_scale`: Optional rank-0 global scale of the output cotangents in quantized backward
+    ///     contractions.
+    ///   - `random_state`: Optional random generator state (refer to [`Random`]) that seeds stochastic gradient rounding.
+    ///     The call does not return an advanced state, so each call needs a fresh state (e.g., split from the caller's
+    ///     generator), or it repeats the same rounding noise.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if the inputs do not meet these requirements or if a composed operation fails while
     /// tracing or evaluating a rule.
-    pub fn call<C, V>(&self, inputs: BlockScaledDotInputs<V>) -> Result<V, ProgramError>
+    pub fn call<C, V>(
+        &self,
+        lhs: V,
+        rhs: V,
+        lhs_global_scale: Option<V>,
+        rhs_global_scale: Option<V>,
+        gradient_global_scale: Option<V>,
+        random_state: Option<V>,
+    ) -> Result<V, ProgramError>
     where
         C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
@@ -1774,12 +1702,12 @@ where
                 SymbolicZeroVjp<
                     D::Constant,
                     D::Operation,
-                    BlockScaledDotInputs<DomainTracer<D>>,
+                    (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
                     DomainTracer<D>,
-                    BlockScaledDotInputs<DomainTracer<D>>,
+                    (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
                 >,
                 DomainTracer<D>,
-                BlockScaledDotInputs<DomainTracer<D>>,
+                (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
                 DomainTracer<D>,
             >,
     {
@@ -1787,9 +1715,9 @@ where
         // nothing. The rules validate the shapes when the composite traces its primal, after alignment.
         let configuration = &self.configuration;
         let global_scales = [
-            ("left", inputs.lhs_global_scale.as_ref(), configuration.lhs_format),
-            ("right", inputs.rhs_global_scale.as_ref(), configuration.rhs_format),
-            ("gradient", inputs.gradient_global_scale.as_ref(), configuration.gradient_format),
+            ("left", lhs_global_scale.as_ref(), configuration.lhs_format),
+            ("right", rhs_global_scale.as_ref(), configuration.rhs_format),
+            ("gradient", gradient_global_scale.as_ref(), configuration.gradient_format),
         ];
         for (name, global_scale, format) in global_scales {
             let Some(global_scale) = global_scale else { continue };
@@ -1810,7 +1738,7 @@ where
             }
         }
         let requires_random_state = configuration.stochastic_gradient_rounding;
-        if inputs.random_state.is_some() != requires_random_state {
+        if random_state.is_some() != requires_random_state {
             return Err(TypeError::invalid(if requires_random_state {
                 "`block_scaled_dot` stochastic gradient rounding requires a random generator state"
             } else {
@@ -1818,17 +1746,27 @@ where
             })
             .into());
         }
-        if let Some(random_state) = &inputs.random_state {
+        if let Some(random_state) = &random_state {
             RandomAlgorithm::from_state_type(&random_state.r#type())?;
         }
-        if inputs.gradient_global_scale.is_some() && !configuration.quantized_backward() {
+        if gradient_global_scale.is_some() && !configuration.quantized_backward() {
             return Err(TypeError::invalid(
                 "`block_scaled_dot` gradient global scales require quantized backward contractions",
             )
             .into());
         }
-        let aligned = ManualVariationAlignment::align_manual_variation(&inputs.clone().into_values())?;
-        self.function.call(inputs.with_values(aligned))
+        // Each vector contains zero or one value, preserving the presence of each optional input in the composite's
+        // parameter structure without a separate input type.
+        let inputs = (
+            lhs,
+            rhs,
+            [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state]
+                .map(|input| input.into_iter().collect::<Vec<_>>()),
+        );
+        let structure = inputs.parameter_structure();
+        let values = inputs.into_parameters().collect::<Vec<_>>();
+        let aligned = ManualVariationAlignment::align_manual_variation(&values)?;
+        self.function.call(<(V, V, [Vec<V>; 4])>::from_parameters(structure, aligned)?)
     }
 }
 
@@ -1863,7 +1801,7 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{
-/// #     Array, ArrayOperation, BlockScaleFormat, BlockScaledDotConfiguration, BlockScaledDotInputs, DataType,
+/// #     Array, ArrayOperation, BlockScaleFormat, BlockScaledDotConfiguration, DataType,
 /// #     DotDimensionNumbers, EagerContext, Reduce, ReductionKind, Transpose, block_scaled_dot, differentiate_at,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1874,12 +1812,12 @@ where
 /// let function = block_scaled_dot::<EagerContext<Array, ArrayOperation<Array>>>(configuration)?;
 /// let lhs = Array::matrix(1, 4, vec![6.0f32, 3.0, 1.5, 0.5])?;
 /// let rhs = Array::matrix(4, 1, vec![1.0f32, 6.0, 2.0, 0.5])?;
-/// let output = function.call(BlockScaledDotInputs::new(lhs.clone(), rhs.clone()))?;
+/// let output = function.call(lhs.clone(), rhs.clone(), None, None, None, None)?;
 /// assert_eq!(output.to_f64s(), vec![27.25]);
 ///
 /// // NVFP4 gradients use unquantized backward contractions by default.
 /// let (lhs_gradient, rhs_gradient) = differentiate_at((lhs.clone(), rhs.clone())).gradient(|(lhs, rhs)| {
-///     function.call(BlockScaledDotInputs::new(lhs, rhs))?.reduce(&[0, 1], ReductionKind::Sum)
+///     function.call(lhs, rhs, None, None, None, None)?.reduce(&[0, 1], ReductionKind::Sum)
 /// })?;
 /// assert_eq!(lhs_gradient, rhs.transpose(vec![1, 0])?);
 /// assert_eq!(rhs_gradient, lhs.transpose(vec![1, 0])?);
@@ -1924,25 +1862,52 @@ where
     let primal_configuration = configuration.clone();
     let forward_configuration = configuration.clone();
     let backward_configuration = configuration.clone();
-    let primal = move |inputs: BlockScaledDotInputs<DomainTracer<D>>| -> Result<_, ProgramError> {
-        BlockScaledDotRules::new(&primal_configuration, &inputs)?.forward(&inputs)
+    let primal = move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
+        DomainTracer<D>,
+        DomainTracer<D>,
+        [Vec<DomainTracer<D>>; 4],
+    )|
+          -> Result<_, ProgramError> {
+        BlockScaledDotRules::new(&primal_configuration, &lhs, &rhs)?.forward(
+            &lhs,
+            &rhs,
+            lhs_global_scale.first(),
+            rhs_global_scale.first(),
+        )
     };
-    let forward = move |inputs: BlockScaledDotInputs<DomainTracer<D>>| -> Result<_, ProgramError> {
-        let output = BlockScaledDotRules::new(&forward_configuration, &inputs)?.forward(&inputs)?;
-        Ok((output, inputs))
-    };
-    let backward = move |inputs: BlockScaledDotInputs<DomainTracer<D>>,
+    let forward =
+        move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4])| -> Result<_, ProgramError> {
+            let (lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]) = &inputs;
+            let output = BlockScaledDotRules::new(&forward_configuration, lhs, rhs)?.forward(
+                lhs,
+                rhs,
+                lhs_global_scale.first(),
+                rhs_global_scale.first(),
+            )?;
+            Ok((output, inputs))
+        };
+    let backward = move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
                          seed: MaybeZero<DomainTracer<D>>|
           -> Result<_, ProgramError> {
-        let zero = |value: &DomainTracer<D>| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?));
-        let mut cotangents = inputs.clone().into_values().iter().map(zero).collect::<Result<Vec<_>, _>>()?;
+        let mut cotangents = inputs
+            .clone()
+            .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?;
         if let MaybeZero::Value(seed) = seed {
-            let (lhs_cotangent, rhs_cotangent) =
-                BlockScaledDotRules::new(&backward_configuration, &inputs)?.backward(&inputs, &seed)?;
-            cotangents[0] = MaybeZero::Value(lhs_cotangent);
-            cotangents[1] = MaybeZero::Value(rhs_cotangent);
+            let (lhs, rhs, [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state]) = &inputs;
+            let (lhs_cotangent, rhs_cotangent) = BlockScaledDotRules::new(&backward_configuration, lhs, rhs)?
+                .backward(
+                    lhs,
+                    rhs,
+                    lhs_global_scale.first(),
+                    rhs_global_scale.first(),
+                    gradient_global_scale.first(),
+                    random_state.first(),
+                    &seed,
+                )?;
+            cotangents.0 = MaybeZero::Value(lhs_cotangent);
+            cotangents.1 = MaybeZero::Value(rhs_cotangent);
         }
-        Ok(inputs.with_values(cotangents))
+        Ok(cotangents)
     };
     Ok(BlockScaledDot {
         configuration,
@@ -2033,13 +1998,14 @@ struct BlockScaledDotRules<'o> {
 }
 
 impl<'o> BlockScaledDotRules<'o> {
-    /// Validates the shapes of `inputs` against `configuration` and computes their normalization.
+    /// Validates the shapes of `lhs` and `rhs` against `configuration` and computes their normalization.
     fn new<V: Value<Type = ArrayType>>(
         configuration: &'o BlockScaledDotConfiguration,
-        inputs: &BlockScaledDotInputs<V>,
+        lhs: &V,
+        rhs: &V,
     ) -> Result<Self, ProgramError> {
-        let lhs_type = inputs.lhs.r#type();
-        let rhs_type = inputs.rhs.r#type();
+        let lhs_type = lhs.r#type();
+        let rhs_type = rhs.r#type();
         for (name, r#type) in [("left", &lhs_type), ("right", &rhs_type)] {
             if !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
@@ -2182,7 +2148,13 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 
     /// Computes the primal output.
-    fn forward<V>(&self, inputs: &BlockScaledDotInputs<V>) -> Result<V, ProgramError>
+    fn forward<V>(
+        &self,
+        lhs: &V,
+        rhs: &V,
+        lhs_global_scale: Option<&V>,
+        rhs_global_scale: Option<&V>,
+    ) -> Result<V, ProgramError>
     where
         V: Value<Type = ArrayType>
             + Abs
@@ -2199,10 +2171,10 @@ impl<'o> BlockScaledDotRules<'o> {
         V::Domain: Fill<f64, V>,
     {
         let configuration = self.configuration;
-        let lhs = self.normalize(&inputs.lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
-        let rhs = self.normalize(&inputs.rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
-        let lhs_global_scale = self.global_scale(configuration.lhs_format, inputs.lhs_global_scale.as_ref())?;
-        let rhs_global_scale = self.global_scale(configuration.rhs_format, inputs.rhs_global_scale.as_ref())?;
+        let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
+        let rhs = self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
+        let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale)?;
+        let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale)?;
         let lhs = self.quantize(&lhs, configuration.lhs_format, 2, false, lhs_global_scale, None)?;
         let rhs =
             self.quantize(&rhs, configuration.rhs_format, 2, configuration.tiled_rhs_scales, rhs_global_scale, None)?;
@@ -2213,7 +2185,16 @@ impl<'o> BlockScaledDotRules<'o> {
     }
 
     /// Computes the cotangents of the left and right inputs for the output cotangent `seed`.
-    fn backward<V>(&self, inputs: &BlockScaledDotInputs<V>, seed: &V) -> Result<(V, V), ProgramError>
+    fn backward<V>(
+        &self,
+        lhs: &V,
+        rhs: &V,
+        lhs_global_scale: Option<&V>,
+        rhs_global_scale: Option<&V>,
+        gradient_global_scale: Option<&V>,
+        random_state: Option<&V>,
+        seed: &V,
+    ) -> Result<(V, V), ProgramError>
     where
         V: Value<Type = ArrayType>
             + Abs
@@ -2238,22 +2219,23 @@ impl<'o> BlockScaledDotRules<'o> {
         V::Domain: Fill<f64, V> + Iota<V>,
     {
         self.validate_extents(true)?;
+        let lhs_type = lhs.r#type().cotangent()?.data_type();
+        let rhs_type = rhs.r#type().cotangent()?.data_type();
         let configuration = self.configuration;
         let [batch, m, k] = self.lhs_canonical_shape;
         let [_, n, _] = self.rhs_canonical_shape;
-        let lhs = self.normalize(&inputs.lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
-        let rhs = self.normalize(&inputs.rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
+        let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
+        let rhs = self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
         let seed = seed.convert_element_type(self.compute_type)?.reshape(Shape::new(vec![
             Dimension::Static(batch),
             Dimension::Static(m),
             Dimension::Static(n),
         ]))?;
-        let lhs_global_scale = self.global_scale(configuration.lhs_format, inputs.lhs_global_scale.as_ref())?;
-        let rhs_global_scale = self.global_scale(configuration.rhs_format, inputs.rhs_global_scale.as_ref())?;
+        let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale)?;
+        let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale)?;
         let (lhs_cotangent, rhs_cotangent) = if configuration.quantized_backward() {
-            let gradient_global_scale =
-                self.global_scale(configuration.gradient_format, inputs.gradient_global_scale.as_ref())?;
-            let (noise, weight_gradient_noise) = match &inputs.random_state {
+            let gradient_global_scale = self.global_scale(configuration.gradient_format, gradient_global_scale)?;
+            let (noise, weight_gradient_noise) = match random_state {
                 Some(state) => {
                     let noise_type = |shape: [usize; 3]| ArrayType::new_static(self.compute_type, shape);
                     let (state, noise) = state.random_uniform(&noise_type([batch, m, n]))?;
@@ -2327,8 +2309,6 @@ impl<'o> BlockScaledDotRules<'o> {
             let rhs_cotangent = mask(rhs_cotangent, &rhs, configuration.rhs_format, rhs_global_scale)?;
             (lhs_cotangent, rhs_cotangent)
         };
-        let lhs_type = inputs.lhs.r#type().cotangent()?.data_type();
-        let rhs_type = inputs.rhs.r#type().cotangent()?.data_type();
         Ok((
             self.denormalize(&lhs_cotangent, &self.lhs_permutation, &self.lhs_shape, lhs_type)?,
             self.denormalize(&rhs_cotangent, &self.rhs_permutation, &self.rhs_shape, rhs_type)?,
@@ -5635,7 +5615,7 @@ mod tests {
             let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[state, 0u64]).unwrap();
             let (_, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
                 .with_captures(state)
-                .vjp(|(lhs, rhs), state| function.call(BlockScaledDotInputs::new(lhs, rhs).with_random_state(state)))
+                .vjp(|(lhs, rhs), state| function.call(lhs, rhs, None, None, None, Some(state)))
                 .unwrap();
             pullback.apply_materialized(seed.clone()).unwrap()
         };
@@ -5686,9 +5666,7 @@ mod tests {
         let expected_lhs = quantize(&rank_three(&seed), vec![2], Some(&input_gradient_noise))
             .dot(&weight, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
             .unwrap();
-        let rules =
-            BlockScaledDotRules::new(function.configuration(), &BlockScaledDotInputs::new(lhs.clone(), rhs.clone()))
-                .unwrap();
+        let rules = BlockScaledDotRules::new(function.configuration(), &lhs, &rhs).unwrap();
         let expected_rhs =
             quantize(&rules.hadamard_transform(&rank_three(&seed), 32).unwrap(), vec![1], Some(&weight_gradient_noise))
                 .dot(
@@ -5705,42 +5683,6 @@ mod tests {
         };
         close(&lhs_cotangent, &expected_lhs);
         close(&rhs_cotangent, &expected_rhs);
-    }
-
-    #[test]
-    fn test_block_scaled_dot_inputs() {
-        let lhs = Array::matrix(1, 2, vec![1.0f32, 2.0]).unwrap();
-        let rhs = Array::matrix(2, 1, vec![3.0f32, 4.0]).unwrap();
-        let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap();
-        let inputs = BlockScaledDotInputs::new(lhs.clone(), rhs.clone());
-        assert_eq!(
-            inputs,
-            BlockScaledDotInputs {
-                lhs: lhs.clone(),
-                rhs: rhs.clone(),
-                lhs_global_scale: None,
-                rhs_global_scale: None,
-                gradient_global_scale: None,
-                random_state: None,
-            },
-        );
-
-        // Each builder sets its own optional leaf.
-        assert_eq!(
-            inputs
-                .with_lhs_global_scale(Array::scalar(2.0f32).unwrap())
-                .with_rhs_global_scale(Array::scalar(3.0f32).unwrap())
-                .with_gradient_global_scale(Array::scalar(4.0f32).unwrap())
-                .with_random_state(state.clone()),
-            BlockScaledDotInputs {
-                lhs,
-                rhs,
-                lhs_global_scale: Some(Array::scalar(2.0f32).unwrap()),
-                rhs_global_scale: Some(Array::scalar(3.0f32).unwrap()),
-                gradient_global_scale: Some(Array::scalar(4.0f32).unwrap()),
-                random_state: Some(state),
-            },
-        );
     }
 
     #[test]
@@ -5766,17 +5708,18 @@ mod tests {
         )
         .unwrap();
         let expected = lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap();
-        assert_eq!(function.call(BlockScaledDotInputs::new(lhs.clone(), rhs.clone())), Ok(expected.clone()));
+        assert_eq!(function.call(lhs.clone(), rhs.clone(), None, None, None, None), Ok(expected.clone()));
 
         // A provided global scale divides its input before quantization and multiplies the product afterwards, so a
         // doubled input with a global scale of `2` quantizes exactly and yields the doubled product.
         assert_eq!(
             function.call(
-                BlockScaledDotInputs::new(
-                    lhs.mul(&Array::matrix(2, 8, vec![2.0f32; 16]).unwrap()).unwrap(),
-                    rhs.clone(),
-                )
-                .with_lhs_global_scale(Array::scalar(2.0f32).unwrap()),
+                lhs.mul(&Array::matrix(2, 8, vec![2.0f32; 16]).unwrap()).unwrap(),
+                rhs.clone(),
+                Some(Array::scalar(2.0f32).unwrap()),
+                None,
+                None,
+                None,
             ),
             Ok(expected.mul(&Array::matrix(2, 3, vec![2.0f32; 6]).unwrap()).unwrap()),
         );
@@ -5790,7 +5733,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            function.call(BlockScaledDotInputs::new(lhs.clone(), rhs.clone())),
+            function.call(lhs.clone(), rhs.clone(), None, None, None, None),
             Ok(expected.convert_element_type(DataType::F64).unwrap()),
         );
         let function = block_scaled_dot::<EagerArrayContext>(
@@ -5799,7 +5742,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            function.call(BlockScaledDotInputs::new(lhs.clone(), rhs.clone())),
+            function.call(lhs.clone(), rhs.clone(), None, None, None, None),
             Ok(expected.convert_element_type(DataType::F16).unwrap()),
         );
 
@@ -5811,7 +5754,7 @@ mod tests {
         )
         .unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(lhs, rhs): (Tracer<_>, Tracer<_>)| function.call(BlockScaledDotInputs::new(lhs, rhs)),
+            |(lhs, rhs): (Tracer<_>, Tracer<_>)| function.call(lhs, rhs, None, None, None, None),
             (ArrayType::new_static(DataType::F32, [2, 8]), ArrayType::new_static(DataType::F32, [8, 3])),
         )
         .unwrap();
@@ -5944,7 +5887,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            function.call(BlockScaledDotInputs::new(lhs, rhs)),
+            function.call(lhs, rhs, None, None, None, None),
             Ok(expected.convert_element_type(DataType::BF16).unwrap()),
         );
     }
@@ -5958,7 +5901,7 @@ mod tests {
         ))
         .unwrap();
         let (output_type, program) = DomainTracingContext::<EagerArrayContext>::trace(
-            |(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)),
+            |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None),
             (ArrayType::new_static(DataType::BF16, [2, 8]), ArrayType::new_static(DataType::BF16, [8, 4])),
         )
         .unwrap();
@@ -6105,7 +6048,7 @@ mod tests {
         let rhs = cyclic_matrix(8, 3, &[1.0, 6.0, 2.0, 0.5, 3.0]);
         let seed = cyclic_matrix(2, 3, &[1.0, -2.0, 0.5]);
         let (_, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
-            .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
             .unwrap();
         let (_, expected_pullback) = differentiate_at((lhs.clone(), rhs.clone()))
             .vjp(|(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()))
@@ -6118,11 +6061,7 @@ mod tests {
         let (_, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
             .with_captures(global_scale)
             .vjp(|(lhs, rhs), global_scale| {
-                function.call(
-                    BlockScaledDotInputs::new(lhs, rhs)
-                        .with_lhs_global_scale(global_scale.clone())
-                        .with_rhs_global_scale(global_scale),
-                )
+                function.call(lhs, rhs, Some(global_scale.clone()), Some(global_scale), None, None)
             })
             .unwrap();
         let (lhs_cotangent, rhs_cotangent) = pullback.apply_materialized(seed).unwrap();
@@ -6166,7 +6105,7 @@ mod tests {
         let rhs = signs(&[2, 3, 4, 5], 0.9);
         let seed = signs(&[3, 2, 5], 1.4);
         let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
-            .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
             .unwrap();
         let (expected_output, expected_pullback) =
             differentiate_at((lhs, rhs)).vjp(|(lhs, rhs)| lhs.dot(&rhs, &dimensions)).unwrap();
@@ -6188,7 +6127,7 @@ mod tests {
         let rhs = cyclic_matrix(8, 4, &[1.0, 6.0, 2.0, 0.5, 3.0]);
         let seed = cyclic_matrix(4, 4, &[1.0, -2.0, 0.5, 3.0, -6.0]);
         let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
-            .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
             .unwrap();
         let (expected_output, expected_pullback) = differentiate_at((lhs, rhs))
             .vjp(|(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()))
@@ -6201,12 +6140,57 @@ mod tests {
         let rhs = cyclic_matrix(8, 4, &[1.0]);
         assert!(matches!(
             differentiate_at((lhs.clone(), rhs.clone()))
-                .jvp((lhs, rhs), |(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs))),
+                .jvp((lhs, rhs), |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "cannot apply forward mode differentiation to a `composite` call of `block_scaled_dot` \
                                that has only reverse mode rules; it supports only reverse mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
         ));
+    }
+
+    #[test]
+    fn test_block_scaled_dot_quantized_differentiation_optional_inputs() {
+        // Distinct provided scales exercise all optional positions. Every normalized value and seed is exactly `6`,
+        // so quantization is exact and the live cotangents equal the unquantized dot product's cotangents.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let function = block_scaled_dot::<EagerArrayContext>(
+            BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
+                .with_quantized_backward(true)
+                .with_stochastic_gradient_rounding(true),
+        )
+        .unwrap();
+        let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap();
+        let (output, pullback) = differentiate_at((
+            cyclic_matrix(4, 8, &[12.0]),
+            cyclic_matrix(8, 4, &[18.0]),
+            Array::scalar(2.0f32).unwrap(),
+            Array::scalar(3.0f32).unwrap(),
+            Array::scalar(4.0f32).unwrap(),
+            state,
+        ))
+        .vjp(|(lhs, rhs, lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state)| {
+            function.call(
+                lhs,
+                rhs,
+                Some(lhs_global_scale),
+                Some(rhs_global_scale),
+                Some(gradient_global_scale),
+                Some(random_state),
+            )
+        })
+        .unwrap();
+        assert_eq!(output, cyclic_matrix(4, 4, &[1728.0]));
+        assert_eq!(
+            pullback.apply(cyclic_matrix(4, 4, &[24.0])),
+            Ok((
+                MaybeZero::Value(cyclic_matrix(4, 8, &[1728.0])),
+                MaybeZero::Value(cyclic_matrix(8, 4, &[1152.0])),
+                MaybeZero::Zero(ArrayType::scalar(DataType::F32)),
+                MaybeZero::Zero(ArrayType::scalar(DataType::F32)),
+                MaybeZero::Zero(ArrayType::scalar(DataType::F32)),
+                MaybeZero::Zero(ArrayType::new_static(DataType::Zero, [2])),
+            )),
+        );
     }
 
     #[test]
@@ -6245,9 +6229,7 @@ mod tests {
                     ShardMapTracer<ArrayIrContext>,
                     ShardMapTracer<ArrayIrContext>,
                     ShardMapTracer<ArrayIrContext>,
-                )| {
-                    function.call(BlockScaledDotInputs::new(lhs, rhs).with_random_state(state)).unwrap()
-                },
+                )| { function.call(lhs, rhs, None, None, None, Some(state)).unwrap() },
                 (
                     ValueProjection::<ArrayType>::into_projected(lhs)?,
                     ValueProjection::<ArrayType>::into_projected(rhs)?,
@@ -6272,7 +6254,7 @@ mod tests {
                 Array::matrix(16, 16, rhs.clone()).unwrap(),
             ))
             .with_captures(state.clone())
-            .vjp(|(lhs, rhs), state| reference.call(BlockScaledDotInputs::new(lhs, rhs).with_random_state(state)))
+            .vjp(|(lhs, rhs), state| reference.call(lhs, rhs, None, None, None, Some(state)))
             .unwrap();
             let (lhs_cotangent, rhs_cotangent) =
                 pullback.apply_materialized(Array::matrix(16, 16, seed.to_vec()).unwrap()).unwrap();
@@ -6315,7 +6297,7 @@ mod tests {
         .unwrap();
         let lhs = cyclic_matrix(2, 8, &[6.0, 1.0, 0.5, 2.0, 3.0, 4.0, 1.5]);
         let rhs = cyclic_matrix(8, 3, &[1.0, 6.0, 2.0, 0.5, 3.0]);
-        let expected = function.call(BlockScaledDotInputs::new(lhs.clone(), rhs.clone())).unwrap();
+        let expected = function.call(lhs.clone(), rhs.clone(), None, None, None, None).unwrap();
         let stacked = |value: &Array| {
             let mut r#type = value.r#type().into_owned();
             r#type = r#type.with_inserted_dimension(0, Dimension::Static(2)).unwrap();
@@ -6323,7 +6305,7 @@ mod tests {
         };
         assert_eq!(
             batch(
-                |(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)),
+                |(lhs, rhs)| function.call(lhs, rhs, None, None, None, None),
                 (stacked(&lhs), rhs),
                 (BatchAxis::new(0), BatchAxis::replicated()),
                 BatchAxis::new(0),
@@ -6383,32 +6365,32 @@ mod tests {
         let lhs = cyclic_matrix(2, 8, &[1.0]);
         let rhs = cyclic_matrix(8, 3, &[1.0]);
         assert_eq!(
-            function.call(BlockScaledDotInputs::new(cyclic_matrix(2, 6, &[1.0]), cyclic_matrix(6, 3, &[1.0]))),
+            function.call(cyclic_matrix(2, 6, &[1.0]), cyclic_matrix(6, 3, &[1.0]), None, None, None, None),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` contracting extent 6 is not a positive multiple of block size 4",
             ))),
         );
         assert_eq!(
-            function.call(
-                BlockScaledDotInputs::new(lhs.clone(), rhs.clone())
-                    .with_lhs_global_scale(Array::vector(vec![1.0f32]).unwrap()),
-            ),
+            function.call(lhs.clone(), rhs.clone(), Some(Array::vector(vec![1.0f32]).unwrap()), None, None, None),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` left global scale must be a rank-0 real floating-point array but got `f32[1]`",
             ))),
         );
         assert_eq!(
             function.call(
-                BlockScaledDotInputs::new(lhs.clone(), rhs.clone()).with_random_state(
-                    Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap(),
-                ),
+                lhs.clone(),
+                rhs.clone(),
+                None,
+                None,
+                None,
+                Some(Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap()),
             ),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` random generator states require stochastic gradient rounding",
             ))),
         );
         assert_eq!(
-            function.call(BlockScaledDotInputs::new(Array::matrix(2, 8, vec![1i32; 16]).unwrap(), rhs)),
+            function.call(Array::matrix(2, 8, vec![1i32; 16]).unwrap(), rhs, None, None, None, None),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` left input must have a real floating-point element type but got `i32`",
             ))),
@@ -6420,8 +6402,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             current.call(
-                BlockScaledDotInputs::new(lhs.clone(), cyclic_matrix(8, 3, &[1.0]))
-                    .with_rhs_global_scale(Array::scalar(1.0f32).unwrap()),
+                lhs.clone(),
+                cyclic_matrix(8, 3, &[1.0]),
+                None,
+                Some(Array::scalar(1.0f32).unwrap()),
+                None,
+                None,
             ),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` right global scale requires provided global scaling and a format with `f8e4m3fn` \
@@ -6433,8 +6419,12 @@ mod tests {
         // state type.
         assert_eq!(
             function.call(
-                BlockScaledDotInputs::new(lhs.clone(), cyclic_matrix(8, 3, &[1.0]))
-                    .with_gradient_global_scale(Array::scalar(1.0f32).unwrap()),
+                lhs.clone(),
+                cyclic_matrix(8, 3, &[1.0]),
+                None,
+                None,
+                Some(Array::scalar(1.0f32).unwrap()),
+                None,
             ),
             Err(ProgramError::from(TypeError::invalid(
                 "`block_scaled_dot` gradient global scales require quantized backward contractions",
@@ -6448,8 +6438,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             rounding.call(
-                BlockScaledDotInputs::new(lhs.clone(), cyclic_matrix(8, 3, &[1.0]))
-                    .with_random_state(Array::vector(vec![1u32, 0]).unwrap()),
+                lhs.clone(),
+                cyclic_matrix(8, 3, &[1.0]),
+                None,
+                None,
+                None,
+                Some(Array::vector(vec![1u32, 0]).unwrap()),
             ),
             Err(ProgramError::from(TypeError::invalid(
                 "random generator states must have type `u64[2]` (i.e., for `three_fry`) or `u64[3]` (i.e., for \
@@ -6465,11 +6459,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            function.call(BlockScaledDotInputs::new(lhs.clone(), cyclic_matrix(8, 3, &[1.0]))),
+            function.call(lhs.clone(), cyclic_matrix(8, 3, &[1.0]), None, None, None, None),
             Ok(Array::matrix(2, 3, vec![8.0f32; 6]).unwrap()),
         );
         let (_, pullback) = differentiate_at((lhs, cyclic_matrix(8, 3, &[1.0])))
-            .vjp(|(lhs, rhs)| function.call(BlockScaledDotInputs::new(lhs, rhs)))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
             .unwrap();
         assert_eq!(
             pullback.apply_materialized(cyclic_matrix(2, 3, &[1.0])),
@@ -6487,8 +6481,8 @@ mod tests {
         let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
             .with_quantized_backward(true)
             .with_tiled_rhs_scales(true);
-        let inputs = BlockScaledDotInputs::new(cyclic_matrix(4, 8, &[1.0]), cyclic_matrix(8, 4, &[1.0]));
-        let rules = BlockScaledDotRules::new(&configuration, &inputs).unwrap();
+        let (lhs, rhs) = (cyclic_matrix(4, 8, &[1.0]), cyclic_matrix(8, 4, &[1.0]));
+        let rules = BlockScaledDotRules::new(&configuration, &lhs, &rhs).unwrap();
         let weight = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [1, 8, 8]),
             &(0..64).map(|index| (index as f64 * 0.91).cos() * (1.0 + (index / 16) as f64)).collect::<Vec<_>>(),
@@ -6511,8 +6505,8 @@ mod tests {
         // is `diag(s) · H / 4` for the Sylvester Hadamard matrix `H` and the sign vector of NVIDIA Transformer Engine.
         // The matrix is orthogonal.
         let configuration = BlockScaledDotConfiguration::nvfp4_training(DotDimensionNumbers::matmul());
-        let inputs = BlockScaledDotInputs::new(cyclic_matrix(16, 16, &[1.0]), cyclic_matrix(16, 16, &[1.0]));
-        let rules = BlockScaledDotRules::new(&configuration, &inputs).unwrap();
+        let (lhs, rhs) = (cyclic_matrix(16, 16, &[1.0]), cyclic_matrix(16, 16, &[1.0]));
+        let rules = BlockScaledDotRules::new(&configuration, &lhs, &rhs).unwrap();
         let basis = Array::from_elements::<f32>(
             ArrayType::new_static(DataType::F32, [1, 16, 16]),
             &(0..256).map(|index| if index % 17 == 0 { 1.0 } else { 0.0 }).collect::<Vec<_>>(),
