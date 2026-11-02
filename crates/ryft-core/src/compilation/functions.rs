@@ -1750,8 +1750,10 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
+    use std::fmt::{Display, Formatter};
     use std::hash::{Hash, Hasher};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1765,12 +1767,12 @@ pub(crate) mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::compilation::caching::CompilationContext;
-    use crate::compilation::contexts::{CompilationCacheDomain, Compile};
+    use crate::compilation::contexts::{CompilationCacheDomain, Compile, jit};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
-    use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, Type, TypeError};
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::{EmptyRegionDriver, Operation, Type, TypeError, ValueDirectDispatch};
 
     use super::*;
 
@@ -2002,6 +2004,137 @@ pub(crate) mod tests {
                     )
                 },
             )
+        }
+    }
+
+    /// Compilation domain whose runtime values carry it, which lets the global entry points recover it from their
+    /// inputs. It lowers and compiles to the lifted program itself, counts compilations, and executes programs by
+    /// interpreting every instruction as a negation, which is the only operation that these tests stage.
+    #[derive(Clone, Debug)]
+    pub(crate) struct CarriedDomain {
+        /// Number of backend compilations, shared by every clone of this domain.
+        compilations: Arc<AtomicUsize>,
+    }
+
+    impl CarriedDomain {
+        pub(crate) fn new() -> Self {
+            Self { compilations: Arc::new(AtomicUsize::new(0)) }
+        }
+
+        pub(crate) fn compilation_count(&self) -> usize {
+            self.compilations.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn scalar(&self, value: f64) -> CarriedArray {
+            CarriedArray { array: Array::scalar(value).unwrap(), domain: self.clone() }
+        }
+    }
+
+    // Clones of one domain share their compilation counter, which identifies the domain instance.
+    impl PartialEq for CarriedDomain {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.compilations, &other.compilations)
+        }
+    }
+
+    impl Domain for CarriedDomain {
+        type Type = ArrayType;
+        type Value = CarriedArray;
+        type Constant = CaptureReference<ArrayType>;
+        type Operation = ArrayOperation<Array>;
+    }
+
+    impl CompilationDomain for CarriedDomain {
+        type DispatchKey = Arc<[ArrayType]>;
+        type LoweredProgram = FlatCompilationProgram<Self>;
+        type CompiledProgram = FlatCompilationProgram<Self>;
+        type Options = CarriedOptions;
+        type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayType>,
+            _options: &CarriedOptions,
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), ProgramError> {
+            let input_types: Arc<[ArrayType]> = input_types.into();
+            Ok((input_types.clone(), input_types))
+        }
+
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), ProgramError> {
+            Ok((staged.lifted_program()?.as_ref().clone(), staged.output_types().to_vec()))
+        }
+
+        fn compile(
+            &self,
+            program: &Self::LoweredProgram,
+        ) -> Result<(Arc<Self::CompiledProgram>, Vec<ArrayType>), ProgramError> {
+            self.compilations.fetch_add(1, Ordering::Relaxed);
+            Ok((Arc::new(program.clone()), program.output_types()))
+        }
+
+        fn execute(
+            &self,
+            program: &Self::CompiledProgram,
+            inputs: Vec<CarriedArray>,
+        ) -> Result<Vec<CarriedArray>, ProgramError> {
+            let outputs = program.interpret_with(
+                inputs.into_iter().map(|input| input.array).collect(),
+                |_, capture| Err(ProgramError::MalformedProgram(format!("unexpected capture {}", capture.index()))),
+                |_, inputs: &[Array]| Ok(vec![-inputs[0].clone()]),
+            )?;
+            Ok(outputs.into_iter().map(|array| CarriedArray { array, domain: self.clone() }).collect())
+        }
+    }
+
+    impl StatefulCompilationDomain for CarriedDomain {
+        fn execute_statefully(
+            &self,
+            program: &Self::CompiledProgram,
+            inputs: Vec<CarriedArray>,
+        ) -> ReferenceExecution<Vec<CarriedArray>, ProgramError> {
+            ReferenceExecution::ready(self.execute(program, inputs))
+        }
+    }
+
+    /// Opaque [`CarriedDomain`] options that tests compare to verify that entry points retain them.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub(crate) struct CarriedOptions {
+        /// Arbitrary marker that distinguishes explicit options from the default ones.
+        pub(crate) marker: usize,
+    }
+
+    /// [`Array`] that carries the [`CarriedDomain`] in which it was produced.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct CarriedArray {
+        /// Array that holds the value.
+        array: Array,
+
+        /// Domain recovered by [`Value::domain`].
+        domain: CarriedDomain,
+    }
+
+    impl Display for CarriedArray {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            Display::fmt(&self.array, formatter)
+        }
+    }
+
+    impl Parameter for CarriedArray {}
+
+    impl Typed for CarriedArray {
+        type Type = ArrayType;
+
+        fn r#type(&self) -> Cow<'_, ArrayType> {
+            self.array.r#type()
+        }
+    }
+
+    impl Value for CarriedArray {
+        type Dispatch = ValueDirectDispatch;
+        type Domain = CarriedDomain;
+
+        fn domain(&self) -> CarriedDomain {
+            self.domain.clone()
         }
     }
 
@@ -2509,6 +2642,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_compiled_function_dispatcher_domain() {
+        // An explicit dispatcher reports its domain from construction.
+        let domain = CarriedDomain::new();
+        let explicit: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            domain.jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
+        assert_eq!(explicit.domain(), Some(&domain));
+
+        // An inferred dispatcher reports no domain until a call through any clone selects one, which all clones then
+        // share and which clearing the cache does not reset.
+        let inferred: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
+        let clone = inferred.clone();
+        assert_eq!(inferred.domain(), None);
+        assert_eq!(clone.call((), domain.scalar(1.0)), Ok(domain.scalar(1.0)));
+        assert_eq!(inferred.domain(), Some(&domain));
+        inferred.clear_cache();
+        assert_eq!(clone.domain(), Some(&domain));
+    }
+
+    #[test]
     fn test_compiled_function_dispatcher_invalidate_static() {
         let domain = TestDomain::new();
         let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
@@ -2558,6 +2711,45 @@ pub(crate) mod tests {
         assert_eq!(function.call((), ()), Ok(()));
         assert_eq!(domain.compilation_count(), 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_with_inferred_domain() {
+        // Later calls never select another domain, so inputs from another domain execute on the selected one, both on
+        // warm calls and on the cold calls that follow cache clearing.
+        let first_domain = CarriedDomain::new();
+        let second_domain = CarriedDomain::new();
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
+        assert_eq!(function.call((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
+        assert_eq!(function.call((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
+        function.clear_cache();
+        assert_eq!(function.call((), second_domain.scalar(3.0)), Ok(first_domain.scalar(-3.0)));
+        assert_eq!(first_domain.compilation_count(), 2);
+        assert_eq!(second_domain.compilation_count(), 0);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_with_inferred_domain_and_empty_inputs() {
+        // Empty inputs carry no domain, so they fail before tracing until a nonempty call selects one.
+        let domain = CarriedDomain::new();
+        let traces = AtomicUsize::new(0);
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), Vec<ArrayType>, Vec<ArrayType>> =
+            jit(|(), inputs: Vec<CompilationTracer<CarriedDomain>>| {
+                traces.fetch_add(1, Ordering::Relaxed);
+                Ok(inputs)
+            });
+        assert!(matches!(
+            function.call((), Vec::new()),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "compilation requires an input leaf to infer a domain; use an explicit domain for \
+                               empty inputs",
+        ));
+        assert_eq!(function.domain(), None);
+        assert_eq!(traces.load(Ordering::Relaxed), 0);
+        assert_eq!(function.call((), vec![domain.scalar(1.0)]), Ok(vec![domain.scalar(1.0)]));
+        assert_eq!(function.call((), Vec::new()), Ok(Vec::new()));
+        assert_eq!(traces.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -2685,6 +2877,31 @@ pub(crate) mod tests {
         assert_eq!(function.call(false, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().traces, 3);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_retains_inferred_domain_after_tracing_failure() {
+        // The first nonempty call selects the domain before tracing, so a failed trace still fixes it for retries.
+        let first_domain = CarriedDomain::new();
+        let second_domain = CarriedDomain::new();
+        let attempts = AtomicUsize::new(0);
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit(|(), input: CompilationTracer<CarriedDomain>| {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(ProgramError::InvalidArgument { message: "expected trace failure".into() })
+                } else {
+                    Ok(input)
+                }
+            });
+        assert!(matches!(
+            function.call((), first_domain.scalar(1.0)),
+            Err(ProgramError::InvalidArgument { message }) if message == "expected trace failure",
+        ));
+        assert_eq!(function.domain(), Some(&first_domain));
+        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.call((), second_domain.scalar(2.0)), Ok(first_domain.scalar(2.0)));
+        assert_eq!(first_domain.compilation_count(), 1);
+        assert_eq!(second_domain.compilation_count(), 0);
     }
 
     #[test]
@@ -2862,6 +3079,70 @@ pub(crate) mod tests {
         assert!(statistics.traces >= 1 && statistics.traces <= 2);
         assert_eq!(statistics.traces, statistics.dispatch_misses);
         assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_concurrent_domain_inference() {
+        // Racing first calls through clones with inputs from different domains select one domain, which then executes
+        // both calls.
+        let first_domain = CarriedDomain::new();
+        let second_domain = CarriedDomain::new();
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
+
+        let barrier = std::sync::Barrier::new(2);
+        let (first_output, second_output) = std::thread::scope(|scope| {
+            let first_call = scope.spawn(|| {
+                barrier.wait();
+                function.clone().call((), first_domain.scalar(1.0))
+            });
+            let second_call = scope.spawn(|| {
+                barrier.wait();
+                function.clone().call((), second_domain.scalar(2.0))
+            });
+            (first_call.join().unwrap(), second_call.join().unwrap())
+        });
+
+        // Same-key cold misses may still duplicate production (refer to the concurrent cold misses test), but only on
+        // the selected domain.
+        let selected_domain = function.domain().unwrap();
+        let unselected_domain = if selected_domain == &first_domain { &second_domain } else { &first_domain };
+        assert!(selected_domain == &first_domain || selected_domain == &second_domain);
+        assert_eq!(first_output, Ok(selected_domain.scalar(1.0)));
+        assert_eq!(second_output, Ok(selected_domain.scalar(2.0)));
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(selected_domain.compilation_count() as u64, function.statistics().traces);
+        assert_eq!(unselected_domain.compilation_count(), 0);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_statefully_async() {
+        let first_domain = CarriedDomain::new();
+        let second_domain = CarriedDomain::new();
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
+        assert_eq!(
+            function.call_statefully_async((), first_domain.scalar(1.0)).r#await(),
+            Ok(first_domain.scalar(-1.0))
+        );
+        assert_eq!(function.domain(), Some(&first_domain));
+        assert_eq!(
+            function.call_statefully_async((), second_domain.scalar(2.0)).r#await(),
+            Ok(first_domain.scalar(-2.0)),
+        );
+        assert_eq!(function.statistics().dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_statefully() {
+        let first_domain = CarriedDomain::new();
+        let second_domain = CarriedDomain::new();
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
+        assert_eq!(function.call_statefully((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
+        assert_eq!(function.domain(), Some(&first_domain));
+        assert_eq!(function.call_statefully((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
+        assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]

@@ -424,56 +424,201 @@ where
     CompiledFunctionDispatcher::inferred(function, options, capacity)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType};
-    use crate::compilation::functions::tests::{TestDomain, TestOptions, compile_from_one_call_site};
+    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::compilation::functions::tests::{
+        CarriedArray, CarriedDomain, CarriedOptions, TestDomain, compile_from_one_call_site,
+    };
     use crate::compilation::functions::{CompilationTracer, CompiledFunctionDispatcher};
     use crate::operations::NegOperation;
 
     use super::*;
 
     #[test]
-    fn test_compile_stage_distinguishes_computations_from_one_call_site() {
-        let domain = TestDomain::new();
+    fn test_compile_stage() {
+        let domain = CarriedDomain::new();
+        let options = CarriedOptions { marker: 1 };
+        let staged: StagedFunction<CarriedDomain, ArrayType, ArrayType> = domain
+            .stage(
+                |input: CompilationTracer<CarriedDomain>| input.unary(NegOperation::new()),
+                ArrayType::scalar(DataType::F64),
+                options.clone(),
+            )
+            .unwrap();
+        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(staged.options(), &options);
+        assert_eq!(
+            staged.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(domain.compilation_count(), 0);
+    }
 
+    #[test]
+    fn test_compile_stage_distinguishes_computations_from_one_call_site() {
+        // Staging keys nothing on the Rust call site, so closures from one call site that capture different host
+        // values produce distinct programs, which the compilation cache keeps apart.
+        let domain = TestDomain::new();
         let identity = compile_from_one_call_site(&domain, false);
         let negate = compile_from_one_call_site(&domain, true);
-
         assert_eq!(
-            identity.executable_function().call(&domain, Array::scalar(3.0).unwrap()).unwrap(),
-            Array::scalar(3.0).unwrap()
+            identity.executable_function().call(&domain, Array::scalar(3.0).unwrap()),
+            Ok(Array::scalar(3.0).unwrap())
         );
         assert_eq!(
-            negate.executable_function().call(&domain, Array::scalar(3.0).unwrap()).unwrap(),
-            Array::scalar(-3.0).unwrap()
+            negate.executable_function().call(&domain, Array::scalar(3.0).unwrap()),
+            Ok(Array::scalar(-3.0).unwrap())
         );
         assert_eq!(domain.compilation_count(), 2);
     }
 
     #[test]
+    fn test_compile_jit() {
+        let domain = CarriedDomain::new();
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            domain.jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
+        assert_eq!(function.domain(), Some(&domain));
+        assert_eq!(function.options(), &CarriedOptions::default());
+        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
+        assert_eq!(domain.compilation_count(), 0);
+        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
+        assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_compile_jit_with_options() {
+        let domain = CarriedDomain::new();
+        let options = CarriedOptions { marker: 1 };
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            domain.jit_with_options(|(), input: CompilationTracer<CarriedDomain>| Ok(input), options.clone());
+        assert_eq!(function.domain(), Some(&domain));
+        assert_eq!(function.options(), &options);
+        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
+        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+    }
+
+    #[test]
     fn test_compile_jit_with_options_and_capacity() {
-        let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = domain
+        let domain = CarriedDomain::new();
+        let options = CarriedOptions { marker: 1 };
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, bool, ArrayType, ArrayType> = domain
             .jit_with_options_and_capacity(
-                |negate, input: CompilationTracer<TestDomain>| {
+                |negate, input: CompilationTracer<CarriedDomain>| {
                     Ok(if negate { input.unary(NegOperation::new()) } else { input })
                 },
-                TestOptions::default(),
+                options.clone(),
                 1,
             );
+        assert_eq!(function.domain(), Some(&domain));
+        assert_eq!(function.options(), &options);
+        assert_eq!(function.cache_capacity(), 1);
 
-        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
-        function.call(true, Array::scalar(1.0).unwrap()).unwrap();
-        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
-
+        // Alternating static values evict the only retained specialization, so every call traces and compiles again.
+        assert_eq!(function.call(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.call(true, domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
+        assert_eq!(function.call(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 3);
-        assert_eq!(function.statistics().traces, 3);
-        assert_eq!(domain.compilation_count(), 2, "the global exact compilation cache should reuse the evicted entry");
+        assert_eq!(domain.compilation_count(), 3);
+    }
+
+    #[test]
+    fn test_stage() {
+        let domain = CarriedDomain::new();
+        let options = CarriedOptions { marker: 1 };
+        let staged: StagedFunction<CarriedDomain, ArrayType, ArrayType> = stage(
+            |input: CompilationTracer<CarriedDomain>| input.unary(NegOperation::new()),
+            domain.scalar(2.0),
+            options.clone(),
+        )
+        .unwrap();
+        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(staged.options(), &options);
+        assert_eq!(
+            staged.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // The staged function runs on fresh tracers and is compiled through the domain recovered from its inputs.
+        assert_eq!(domain.compilation_count(), 0);
+        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        assert_eq!(compiled.executable_function().call(&domain, domain.scalar(3.0)), Ok(domain.scalar(-3.0)));
+        assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_stage_rejects_inputs_without_leaves() {
+        assert!(matches!(
+            stage::<CarriedArray, _, Vec<ArrayType>, _>(
+                |inputs| inputs,
+                Vec::<CarriedArray>::new(),
+                CarriedOptions::default(),
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "staging requires an input leaf to infer a domain; use an explicit domain for empty \
+                               inputs",
+        ));
+    }
+
+    #[test]
+    fn test_jit() {
+        let first_domain = CarriedDomain::new();
+        let second_domain = CarriedDomain::new();
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), Vec<ArrayType>, ArrayType> =
+            jit(|(), inputs: Vec<CompilationTracer<CarriedDomain>>| Ok(inputs[0].unary(NegOperation::new())));
+        assert_eq!(function.domain(), None);
+        assert_eq!(function.options(), &CarriedOptions::default());
+        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
+
+        // The first input leaf of the first call selects the domain, even when other leaves carry another domain.
+        assert_eq!(
+            function.call((), vec![first_domain.scalar(2.0), second_domain.scalar(3.0)]),
+            Ok(first_domain.scalar(-2.0)),
+        );
+        assert_eq!(function.domain(), Some(&first_domain));
+        assert_eq!(first_domain.compilation_count(), 1);
+        assert_eq!(second_domain.compilation_count(), 0);
+    }
+
+    #[test]
+    fn test_jit_with_options() {
+        let domain = CarriedDomain::new();
+        let options = CarriedOptions { marker: 1 };
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit_with_options(|(), input: CompilationTracer<CarriedDomain>| Ok(input), options.clone());
+        assert_eq!(function.domain(), None);
+        assert_eq!(function.options(), &options);
+        assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
+        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.domain(), Some(&domain));
+    }
+
+    #[test]
+    fn test_jit_with_options_and_capacity() {
+        let domain = CarriedDomain::new();
+        let options = CarriedOptions { marker: 1 };
+        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+            jit_with_options_and_capacity(|(), input: CompilationTracer<CarriedDomain>| Ok(input), options.clone(), 1);
+        assert_eq!(function.domain(), None);
+        assert_eq!(function.options(), &options);
+        assert_eq!(function.cache_capacity(), 1);
+        assert_eq!(function.call((), domain.scalar(2.0)), Ok(domain.scalar(2.0)));
+        assert_eq!(function.domain(), Some(&domain));
     }
 }
