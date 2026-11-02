@@ -208,10 +208,10 @@ mod tests {
         pub(super) capture_count: usize,
 
         /// Lowered output types.
-        pub(super) output_types: Vec<ArrayType>,
+        output_types: Vec<ArrayType>,
 
         /// Options of the staged program, which compilation consults.
-        pub(super) options: TestOptions,
+        options: TestOptions,
     }
 
     /// Compiled program of [`TestDomain`].

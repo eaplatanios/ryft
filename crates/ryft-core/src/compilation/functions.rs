@@ -1688,10 +1688,8 @@ pub(super) fn accumulate_duration(duration: Duration, counter: &AtomicU64) {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
-    use std::fmt::{Display, Formatter};
     use std::hash::{Hash, Hasher};
     use std::rc::Rc;
     use std::sync::Barrier;
@@ -1703,23 +1701,18 @@ mod tests {
     use ryft_macros::Operation;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionError, DimensionType, DimensionValue, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionError,
+        DimensionType, DimensionValue, Shape,
     };
     use crate::captures::CaptureReference;
-    use crate::compilation::caching::CompilationContext;
-    use crate::compilation::contexts::{CompilationCacheDomain, Compile, jit};
+    use crate::compilation::contexts::{Compile, jit};
     use crate::compilation::tests::{
-        CarriedArray, CarriedDomain, CarriedOptions, TestCompiledProgram, TestDomain, TestLoweredProgram, TestOptions,
-        compile_from_one_call_site,
+        CarriedDomain, CarriedOptions, TestCompiledProgram, TestDomain, TestOptions, compile_from_one_call_site,
     };
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
-    use crate::parameters::Parameter;
-    use crate::programs::{
-        EmptyRegionDriver, Operation, RegionInterface, RegionSlot, Type, TypeError, ValueDirectDispatch,
-    };
+    use crate::programs::{EmptyRegionDriver, Operation, RegionInterface, RegionSlot, TypeError};
 
     use super::*;
 
