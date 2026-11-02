@@ -591,7 +591,7 @@ fn execute_slice(
     let execution_inputs = buffers.into_iter().map(ExecutionInput::from).collect::<Vec<_>>();
     let inputs = ExecutionDeviceInputs::from(execution_inputs.as_slice());
     let mut device_outputs = executable
-        .execute(vec![inputs], vec![], 0, None, None, None, None)
+        .execute(vec![inputs], vec![], 0, None, None, None, None, &[])
         .unwrap()
         .block_until_ready()
         .unwrap()

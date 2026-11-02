@@ -7043,7 +7043,6 @@ mod tests {
                 ArrayType::new_static(DataType::I64, [3]),
                 ArrayType::new_static(DataType::F64, [3]),
             ],
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -8718,7 +8717,6 @@ mod tests {
         let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].greater_than(&inputs[1]).unwrap()],
             vec![values.r#type().into_owned(), limits.r#type().into_owned()],
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -8787,7 +8785,6 @@ mod tests {
                     vec![]
                 },
                 vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
-                &domain,
                 XlaOptions::new(mesh.clone()),
             )
             .unwrap()
@@ -8850,7 +8847,6 @@ mod tests {
                     vec![]
                 },
                 vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
-                &domain,
                 XlaOptions::new(mesh.clone()),
             )
             .unwrap()
@@ -8965,7 +8961,6 @@ mod tests {
                 vec![]
             },
             vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -9582,7 +9577,6 @@ mod tests {
                         ArrayType::scalar(DataType::I32),
                         ArrayType::new_static(DataType::F64, [index_count, 4]),
                     ],
-                    &domain,
                     XlaOptions::new(mesh.clone()),
                 )
                 .unwrap()
@@ -9886,7 +9880,6 @@ mod tests {
                 vec![outputs.into_iter().next().unwrap().into_value()]
             },
             vec![input_type, indices_type],
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -10014,7 +10007,6 @@ mod tests {
                     vec![outputs.into_iter().next().unwrap().into_value()]
                 },
                 staged_types.clone(),
-                &domain,
                 XlaOptions::new(mesh.clone()),
             )
             .unwrap()
@@ -10208,7 +10200,6 @@ mod tests {
                 ArrayType::scalar(DataType::I32),
                 ArrayType::scalar(DataType::I32),
             ],
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -10541,7 +10532,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             dynamic_type,
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -10873,10 +10863,9 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let options = XlaOptions::new(mesh.clone());
-        let staged =
-            crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), &engine, options)
-                .unwrap()
-                .into_inner();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
+            .unwrap()
+            .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
@@ -10916,7 +10905,6 @@ mod tests {
             let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
                 |x| x.sin().unwrap(),
                 input_type.clone(),
-                &engine,
                 XlaOptions::new(mesh.clone()),
             )
             .unwrap()
@@ -10945,7 +10933,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |input| input,
             input_type.clone(),
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -10958,7 +10945,6 @@ mod tests {
             crate::jit::stage::<_, ArrayType, ArrayType>(
                 |input| input,
                 input_type.clone(),
-                &domain,
                 XlaOptions { donation_flags: Some(vec![true]), ..XlaOptions::new(mesh.clone()) },
             )
             .unwrap()
@@ -10974,14 +10960,9 @@ mod tests {
         // signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
         let boolean_staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            crate::jit::stage::<_, ArrayType, ArrayType>(
-                |input| input,
-                boolean_type,
-                &domain,
-                XlaOptions::new(mesh.clone()),
-            )
-            .unwrap()
-            .into_inner();
+            crate::jit::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, XlaOptions::new(mesh.clone()))
+                .unwrap()
+                .into_inner();
         let boolean_lowered = boolean_staged.lower(&domain).unwrap();
         assert_ne!(
             domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
@@ -11016,7 +10997,6 @@ mod tests {
         let staged = crate::jit::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
             |(value, zero)| (zero, value),
             (value_type.clone(), zero_type.clone()),
-            &domain,
             options,
         )
         .unwrap()
@@ -11128,7 +11108,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |input| associative_scan(&input, 1, false, &|left, right| left.max(right)).unwrap(),
             dynamic_type,
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -11514,7 +11493,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             declared_type,
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -11569,7 +11547,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             sharded_type,
-            &domain,
             XlaOptions::new(mesh),
         )
         .unwrap()
@@ -11880,7 +11857,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             input_type.clone(),
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -11952,7 +11928,6 @@ mod tests {
             let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
                 |input| input.clone() + input,
                 input_type,
-                &domain,
                 XlaOptions::new(mesh.clone()),
             )
             .unwrap()
@@ -13547,14 +13522,10 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
-            |x| x.sin().unwrap(),
-            input_type,
-            &domain,
-            XlaOptions::new(mesh),
-        )
-        .unwrap()
-        .into_inner();
+        let staged =
+            crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, XlaOptions::new(mesh))
+                .unwrap()
+                .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
@@ -13603,8 +13574,7 @@ mod tests {
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
         let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
-            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-                &domain,
+            StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
                 add_capture,
                 vec![XlaValue::Array(capture.clone())],
                 ArrayIrType::Array(input_type.clone()),
@@ -13754,7 +13724,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
-            &first_domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()
@@ -13770,14 +13739,10 @@ mod tests {
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         )
         .domain();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
-            |x| x.sin().unwrap(),
-            input_type,
-            &second_domain,
-            XlaOptions::new(mesh),
-        )
-        .unwrap()
-        .into_inner();
+        let staged =
+            crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, XlaOptions::new(mesh))
+                .unwrap()
+                .into_inner();
         let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&second_domain).unwrap().compile(&second_domain).unwrap();
         let statistics = second_domain.compilation_context().statistics();
@@ -13833,7 +13798,6 @@ mod tests {
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
-            &producer,
             XlaOptions::new(mesh.clone()).with_donate(true),
         )
         .unwrap()
@@ -13854,14 +13818,10 @@ mod tests {
             ),
         )
         .domain();
-        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
-            |x| x.sin().unwrap(),
-            input_type,
-            &consumer,
-            XlaOptions::new(mesh),
-        )
-        .unwrap()
-        .into_inner();
+        let staged =
+            crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, XlaOptions::new(mesh))
+                .unwrap()
+                .into_inner();
         let lowered = staged.lower(&consumer).unwrap();
 
         // The resolved executable loads cleanly and reports matching boundary types, so only the compile-time
@@ -14264,9 +14224,7 @@ mod tests {
             Ok(input)
         }
         assert!(matches!(
-            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-                &domain,
-                forward,
+            StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type.clone(),
                 XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
@@ -14288,9 +14246,7 @@ mod tests {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
-            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-                &domain,
-                allocate,
+            StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(allocate,
                 Vec::new(),
                 ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
                 XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
@@ -14306,9 +14262,7 @@ mod tests {
         // Forwarding an external reference through an output is rejected by the same contract when lowered, because
         // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
-            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-                &domain,
-                forward,
+            StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type,
                 XlaOptions::new(mesh.clone()),
@@ -14343,8 +14297,7 @@ mod tests {
 
         // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
         // did not receive the requested input shardings before staging.
-        let staged = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-            &domain,
+        let staged = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             scalar_type.clone(),
@@ -14360,7 +14313,7 @@ mod tests {
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
         let staged =
-            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(&domain, forward, Vec::new(), input_types, options)
+            StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(forward, Vec::new(), input_types, options)
                 .unwrap();
         assert!(staged.lower(&domain).is_ok());
     }
@@ -17781,7 +17734,6 @@ mod tests {
                 vec![output.unwrap()]
             },
             vec![input.r#type().into_owned()],
-            &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap()

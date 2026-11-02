@@ -192,8 +192,9 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
 /// this domain when they are constructed. The global [`stage`] and [`jit`] functions infer their domain from runtime
 /// input values instead.
 pub trait Compile: CompilationDomain {
-    /// Stages an infallible capture-free function through this domain with the given input types and options.
-    /// Use [`StagedFunction::stage`] when the function is fallible or closes over runtime captures.
+    /// Stages an infallible capture-free function for this domain with the given input types and options. Staging
+    /// depends only on the types of this domain, so `self` only selects the domain type. Use [`StagedFunction::stage`]
+    /// when the function is fallible or closes over runtime captures.
     #[inline]
     fn stage<Input, Output, F>(
         &self,
@@ -215,7 +216,7 @@ pub trait Compile: CompilationDomain {
         DomainTracingContext<Self, Self::Value>:
             StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
     {
-        StagedFunction::stage(self, |_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
+        StagedFunction::stage(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
     }
 
     /// Constructs a retained Just-In-Time (JIT) compilation dispatcher for `function` through this domain with default

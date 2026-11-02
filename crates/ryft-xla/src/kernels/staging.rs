@@ -1381,8 +1381,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            &domain,
+        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
             program.input_types(),

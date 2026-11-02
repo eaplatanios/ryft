@@ -142,7 +142,7 @@ fn try_same_mesh<'o>(
     };
 
     let staged: crate::jit::StagedXlaFunction<'_, ArrayType, ArrayType> =
-        crate::jit::stage(|input| input, bare_input_type, engine, xla_options).map_err(|error| {
+        crate::jit::stage(|input| input, bare_input_type, xla_options).map_err(|error| {
             ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") }
         })?;
     let compiled = engine.compile_staged_function(staged).map_err(|error| match error {

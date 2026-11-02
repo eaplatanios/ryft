@@ -133,8 +133,7 @@ impl KernelAotBundle {
         let facts = XlaKernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            domain,
+        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
             },
@@ -431,8 +430,7 @@ pub(crate) mod tests {
         } else {
             vec![]
         };
-        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            domain,
+        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, captures: Vec<CompilationTracer<XlaDomain<'c>>>, inputs| {
                 // Returning the capture retains a real capture slot without introducing unrelated operations.
                 Ok(if captures.is_empty() { inputs } else { captures })

@@ -33,6 +33,7 @@ pub(crate) mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            compiler_variant: None,
         }
     }
 

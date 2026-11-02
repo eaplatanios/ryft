@@ -1373,8 +1373,7 @@ mod cutile {
         .unwrap();
         let producer = XlaSession::new(client);
         let domain = producer.domain();
-        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            &domain,
+        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
@@ -1754,8 +1753,7 @@ mod tuning {
                 input.block_until_ready().map_err(error)?;
             }
             let binding = self.bindings.iter().find(|(candidate, _)| candidate == schedule).unwrap().1.clone();
-            let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-                &self.domain,
+            let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
                 |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
                     Ok(stage_kernel(inputs[0].context(), &self.case.definition, &inputs)?)
                 },
@@ -2307,8 +2305,7 @@ mod triton {
         .unwrap();
         let producer = XlaSession::new(client);
         let domain = producer.domain();
-        let staged = StagedFunction::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            &domain,
+        let staged = StagedFunction::<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },

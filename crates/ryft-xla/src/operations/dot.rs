@@ -1302,7 +1302,9 @@ mod tests {
                 &ragged_dot_cpu_compilation_options(),
             ),
             Err(Error::Unimplemented { message, .. })
-                if message == "HLO opcode `ragged-dot` is not supported by XLA:CPU ThunkEmitter",
+                if message
+                    == "HLO opcode `ragged-dot` is not supported by XLA:CPU ThunkEmitter. Standalone elemental and \
+                        reduction operations must be wrapped into fusions by FusionWrapper.",
         ));
     }
 

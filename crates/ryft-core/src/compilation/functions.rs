@@ -48,18 +48,16 @@ pub struct StagedProgram<C: CompilationDomain> {
     lifted_program: OnceLock<Arc<FlatProgram<C>>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: CompilationDomain> StagedProgram<C> {
     /// Traces the fallible flat `function` into an owned [`StagedProgram`]. `function` receives the symbolic references
     /// of `captures`, tracers for those captures, and one tracer per entry of `input_types`, and returns flat output
     /// tracers. This is the only staging primitive. It traces at exactly `input_types` and retains `options` for
-    /// lowering and compilation. On success, this constructor invokes `function` exactly once. Typed callers typically
-    /// use [`StagedFunction::stage`] instead.
+    /// lowering and compilation. On success, this constructor invokes `function` exactly once. Staging depends only
+    /// on the types of the domain `C`, not on any domain instance, which is first needed for lowering. Typed callers
+    /// typically use [`StagedFunction::stage`] instead.
     ///
     /// # Parameters
     ///
-    ///   - `_domain`: Domain whose type, constant, operation, and runtime value families the trace uses.
     ///   - `function`: Fallible closure to trace with symbolic captures and flat inputs.
     ///   - `captures`: Runtime values to register in the source program's capture table.
     ///   - `input_types`: Flat abstract public input signature.
@@ -69,9 +67,7 @@ impl<C: CompilationDomain> StagedProgram<C> {
     ///
     /// Returns errors from capture validation, the closure, or program construction. Foreign output tracers and handles
     /// that escape the trace are rejected during finalization.
-    #[inline]
     pub fn stage<F>(
-        _domain: &C,
         function: F,
         captures: Vec<C::Value>,
         input_types: Vec<C::Type>,
@@ -190,12 +186,10 @@ impl<C: CompilationDomain> StagedProgram<C> {
     }
 }
 
-/// Staged, unlowered form of one compiled function.
-///
-/// A staged function is the first callable package in the lifecycle. It pairs an owned [`StagedProgram`] with the
-/// exact public input and output container structures that typed calls need. It can be inspected, lowered by its
-/// domain, or embedded as a staged-call boundary in an enclosing trace. No backend lowering or executable compilation
-/// has happened yet.
+/// Staged, unlowered form of one compiled function. A staged function is the first callable package in the lifecycle.
+/// It pairs an owned [`StagedProgram`] with the exact public input and output container structures that typed calls
+/// need. It can be inspected, lowered by its domain, or embedded as a staged-call boundary in an enclosing trace.
+/// No backend lowering or executable compilation has happened yet.
 pub struct StagedFunction<
     C: CompilationDomain,
     Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
@@ -203,35 +197,6 @@ pub struct StagedFunction<
 > {
     /// Shared immutable staging metadata. Staged-handle clones are therefore constant-time even for large programs.
     state: Arc<StagedFunctionState<C, Input, Output>>,
-}
-
-/// Shared immutable state of a [`StagedFunction`].
-struct StagedFunctionState<
-    C: CompilationDomain,
-    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
-> {
-    /// Owned flat staging artifact, including runtime captures, signatures, and options.
-    program: StagedProgram<C>,
-
-    /// Input parameter structure used to reconstruct typed tracer inputs and abstract signatures.
-    input_structure: Input::ParameterStructure,
-
-    /// Output parameter structure used to reconstruct structured values.
-    output_structure: Output::ParameterStructure,
-}
-
-impl<C, Input, Output> Clone for StagedFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant>,
-{
-    fn clone(&self) -> Self {
-        Self { state: self.state.clone() }
-    }
 }
 
 impl<C, Input, Output> StagedFunction<C, Input, Output>
@@ -242,13 +207,13 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
-    /// Traces a fallible typed `function` through `domain`, retaining its exact input and output container structures.
-    /// The function receives symbolic capture constants, capture tracers, and structured input tracers. Runtime
-    /// captures and compilation options are owned by the resulting [`StagedProgram`].
+    /// Traces a fallible typed `function` for the domain `C`, retaining its exact input and output container
+    /// structures. The function receives symbolic capture constants, capture tracers, and structured input tracers.
+    /// Runtime captures and compilation options are owned by the resulting [`StagedProgram`]. Like
+    /// [`StagedProgram::stage`], staging depends only on the types of `C`, not on any domain instance.
     ///
     /// # Parameters
     ///
-    ///   - `domain`: Domain whose flat staging primitive records the function.
     ///   - `function`: Fallible closure to trace once with symbolic captures and inputs.
     ///   - `captures`: Runtime values to register in the source program's capture table.
     ///   - `input_types`: Structured abstract public input signature.
@@ -258,7 +223,6 @@ where
     ///
     /// Returns errors from tracing or reconstructing the structured inputs.
     pub fn stage<F>(
-        domain: &C,
         function: F,
         captures: Vec<C::Value>,
         input_types: Input,
@@ -279,8 +243,7 @@ where
         // before flattening, and record the output structure while the closure still owns its structured results.
         let input_structure = input_types.parameter_structure();
         let mut output_structure = None;
-        let program = StagedProgram::stage(
-            domain,
+        let program = StagedProgram::<C>::stage(
             |capture_constants, capture_tracers, inputs| {
                 let inputs = Input::To::<CompilationTracer<C>>::from_parameters(input_structure.clone(), inputs)
                     .map_err(ProgramError::from)?;
@@ -331,6 +294,8 @@ where
     pub fn input_structure(&self) -> &Input::ParameterStructure {
         &self.state.input_structure
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Reconstructs the structured abstract input signature retained by this function.
     pub fn input_signature(&self) -> Result<Input, ParameterError>
@@ -522,6 +487,36 @@ where
         let (lowered_program, output_types) = domain.lower(self.staged_program())?;
         Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
     }
+}
+
+impl<C, Input, Output> Clone for StagedFunction<C, Input, Output>
+where
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { state: self.state.clone() }
+    }
+}
+
+/// Shared immutable state of a [`StagedFunction`].
+struct StagedFunctionState<
+    C: CompilationDomain,
+    Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+    Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
+> {
+    /// Owned flat staging artifact, including runtime captures, signatures, and options.
+    program: StagedProgram<C>,
+
+    /// Input parameter structure used to reconstruct typed tracer inputs and abstract signatures.
+    input_structure: Input::ParameterStructure,
+
+    /// Output parameter structure used to reconstruct structured values.
+    output_structure: Output::ParameterStructure,
 }
 
 /// Backend lowering of a [`StagedFunction`], ready for executable compilation.
@@ -1345,8 +1340,7 @@ where
                 .map_err(ProgramError::from)?;
         statistics.traces.fetch_add(1, Ordering::Relaxed);
         let tracing_start = Instant::now();
-        let staged = StagedFunction::stage(
-            domain,
+        let staged = StagedFunction::<C, Input, Output>::stage(
             |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
             Vec::new(),
             input_types,
@@ -2078,24 +2072,20 @@ pub(crate) mod tests {
         let input_type = ArrayType::scalar(DataType::F64);
         let capture = Array::scalar(7.0).unwrap();
         let invocations = Cell::new(0);
-        let staged = {
-            let domain = TestDomain::new();
-            StagedProgram::stage(
-                &domain,
-                |_, mut captures, mut inputs| {
-                    invocations.set(invocations.get() + 1);
-                    Ok(vec![captures.remove(0), inputs.remove(0)])
-                },
-                vec![capture.clone()],
-                vec![input_type.clone()],
-                TestOptions::default(),
-            )
-            .unwrap()
-        };
+        let staged = StagedProgram::<TestDomain>::stage(
+            |_, mut captures, mut inputs| {
+                invocations.set(invocations.get() + 1);
+                Ok(vec![captures.remove(0), inputs.remove(0)])
+            },
+            vec![capture.clone()],
+            vec![input_type.clone()],
+            TestOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(invocations.get(), 1);
 
-        // The flat artifact owns its captures and can be lowered after the domain that staged it is gone.
+        // The flat artifact owns its captures, so any domain instance can lower it.
         assert_eq!(staged.source_program().captures(), &[capture]);
         assert_eq!(staged.input_types(), &[input_type.clone()]);
         assert_eq!(staged.output_types(), &[input_type.clone(), input_type]);
@@ -2112,9 +2102,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_staged_program_stage_propagates_closure_error() {
-        let domain = TestDomain::new();
-        let result = StagedProgram::stage(
-            &domain,
+        let result = StagedProgram::<TestDomain>::stage(
             |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
             Vec::new(),
             vec![ArrayType::scalar(DataType::F64)],
@@ -2126,9 +2114,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_staged_program_stage_prunes_unused_captures() {
-        let domain = TestDomain::new();
-        let staged = StagedProgram::stage(
-            &domain,
+        let staged = StagedProgram::<TestDomain>::stage(
             |_, _, inputs| Ok(inputs),
             vec![Array::scalar(7.0).unwrap()],
             vec![ArrayType::scalar(DataType::F64)],
@@ -2142,8 +2128,7 @@ pub(crate) mod tests {
     #[test]
     fn test_staged_program_stage_rejects_escaped_tracers() {
         let retained = RefCell::new(None);
-        let result = StagedProgram::stage(
-            &TestDomain::new(),
+        let result = StagedProgram::<TestDomain>::stage(
             |_, _, mut inputs| {
                 *retained.borrow_mut() = Some(inputs.remove(0));
                 Ok(Vec::new())
@@ -2161,7 +2146,6 @@ pub(crate) mod tests {
         let input_types = (vec![Vec::new(), Vec::new()], ArrayType::scalar(DataType::F64));
         let staged: StagedFunction<TestDomain, (Vec<Vec<ArrayType>>, ArrayType), (Vec<Vec<ArrayType>>, ArrayType)> =
             StagedFunction::stage(
-                &domain,
                 |_, _, (_, input)| Ok((vec![Vec::new(), Vec::new(), Vec::new()], input)),
                 Vec::new(),
                 input_types.clone(),
@@ -2255,7 +2239,6 @@ pub(crate) mod tests {
     fn test_compiled_function() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
-            &domain,
             |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
             vec![Array::scalar(7.0).unwrap()],
             (),
@@ -2295,7 +2278,6 @@ pub(crate) mod tests {
     fn test_compiled_function_into_executable_function() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
-            &domain,
             |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
             vec![Array::scalar(7.0).unwrap()],
             (),

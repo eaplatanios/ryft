@@ -533,8 +533,7 @@ impl<'c, 't> Lowering<'c, 't> {
                 pointer,
                 Some(mask),
                 Some(other),
-                tt::CacheModifier::None,
-                tt::EvictionPolicy::Normal,
+                None,
                 false,
                 self.r#type(DataType::F32, &reference.shape)?,
                 self.location,
@@ -550,15 +549,7 @@ impl<'c, 't> Lowering<'c, 't> {
         value: Native<'c, 't>,
     ) -> Result<(), Error> {
         let (pointer, mask) = self.pointers(block, reference)?;
-        block.append_operation(tt::store(
-            pointer,
-            value,
-            Some(mask),
-            tt::CacheModifier::None,
-            tt::EvictionPolicy::Normal,
-            false,
-            self.location,
-        )?)?;
+        block.append_operation(tt::store(pointer, value, Some(mask), None, false, self.location)?)?;
         Ok(())
     }
 

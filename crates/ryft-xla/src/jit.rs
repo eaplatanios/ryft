@@ -670,8 +670,7 @@ where
         Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
 {
     let input_types = with_input_shardings(input_types, &options)?;
-    let staged = StagedFunction::<_, In, Out>::stage(
-        domain,
+    let staged = StagedFunction::<XlaDomain<'_>, In, Out>::stage(
         |_, capture_tracers, inputs| function(capture_tracers, inputs),
         captures,
         input_types,
@@ -1574,7 +1573,7 @@ where
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
-    let staged = stage_with_flat_captures::<F, In, Out>(function, captures, input_types, domain, options)?;
+    let staged = stage_with_flat_captures::<F, In, Out>(function, captures, input_types, options)?;
     domain.compile_staged_function(staged)
 }
 
@@ -1586,10 +1585,9 @@ where
 /// staged handle later with [`XlaDomain::compile_staged_function`] when direct execution is needed. `options` are
 /// applied to the abstract input signature before tracing and retained for subsequent lowering and compilation.
 #[track_caller]
-pub fn stage<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn stage<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
 ) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
 where
@@ -1613,7 +1611,7 @@ where
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
-    stage_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, domain, options)
+    stage_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
 }
 
 /// Same as [`stage`] but makes runtime arrays explicit captures of the staged program.
@@ -1622,11 +1620,10 @@ where
 /// [`compile_with_captures`]. Captures are retained on the staged handle and threaded through `jit_call` boundaries
 /// when the handle is staged into outer traces via [`StagedXlaFunction::call`].
 #[track_caller]
-pub fn stage_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn stage_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<XlaArray<'c>>,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
 ) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
 where
@@ -1654,17 +1651,15 @@ where
         |_, capture_tracers, inputs| Ok(function(capture_tracers, inputs)),
         captures,
         input_types,
-        domain,
         options,
     )
 }
 
 #[track_caller]
-fn stage_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+fn stage_with_flat_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<XlaArray<'c>>,
     input_types: In,
-    domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
 ) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
 where
@@ -1711,8 +1706,7 @@ where
         lift_tracers::<Out>(function(capture_references, capture_tracers, inputs)?)
     };
     let input_types = with_input_shardings(input_types, &options)?;
-    let function = StagedFunction::<_, XlaProgramParameters<In>, XlaProgramParameters<Out>>::stage(
-        domain,
+    let function = StagedFunction::<XlaDomain<'_>, XlaProgramParameters<In>, XlaProgramParameters<Out>>::stage(
         function,
         captures,
         input_types,
@@ -3116,8 +3110,7 @@ mod tests {
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-            &domain,
+        let staged = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type),
@@ -3156,8 +3149,7 @@ mod tests {
 
         // A nested call may return the external reference that it receives, because that reference never crosses the
         // ABI as an output of the enclosing program.
-        let inner = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-            &domain,
+        let inner = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             reference_type.clone(),
@@ -3204,8 +3196,7 @@ mod tests {
 
         // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
         // call is rejected with a diagnostic that names the offending output.
-        let inner = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
-            &domain,
+        let inner = StagedFunction::<XlaDomain<'_>, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type.clone()),
@@ -6440,13 +6431,9 @@ mod tests {
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let inner_for_outer = inner.clone();
-        let outer: StagedXlaFunction<'_, ArrayType, ArrayType> = stage(
-            move |x| inner_for_outer.call(x).unwrap(),
-            input_type.clone(),
-            &engine,
-            XlaOptions::new(mesh.clone()),
-        )
-        .unwrap();
+        let outer: StagedXlaFunction<'_, ArrayType, ArrayType> =
+            stage(move |x| inner_for_outer.call(x).unwrap(), input_type.clone(), XlaOptions::new(mesh.clone()))
+                .unwrap();
         let outer_program = outer.source_program().program();
         assert_eq!(
             outer_program
@@ -7133,7 +7120,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
-            stage(|x| x.sin().unwrap(), input_type.clone(), &engine, XlaOptions::new(mesh.clone())).unwrap();
+            stage(|x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(engine.cache_size(), 0, "staging must not compile a PJRT executable");
 
         let staged_compiled = engine.compile_staged_function(staged).unwrap();
@@ -7184,7 +7171,6 @@ mod tests {
             |captures, x| (x + captures[0].clone()).sin().unwrap(),
             vec![bias],
             input_type.clone(),
-            &engine,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
@@ -7224,7 +7210,7 @@ mod tests {
 
         let options = XlaOptions::new(mesh).with_in_shardings(vec![sharding]);
         let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
-            stage(|x| x.sin().unwrap(), input_type, &engine, options).unwrap();
+            stage(|x| x.sin().unwrap(), input_type, options).unwrap();
         let ArrayIrType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
             panic!("public staged input should remain an array");
         };
@@ -7248,7 +7234,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         let inner: StagedXlaFunction<'_, ArrayType, ArrayType> =
-            stage(|x| x.sin().unwrap(), input_type.clone(), &engine, XlaOptions::new(mesh.clone())).unwrap();
+            stage(|x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
         let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| inner.call(x.clone()).unwrap() + inner.call(x).unwrap(),
             input_type.clone(),
