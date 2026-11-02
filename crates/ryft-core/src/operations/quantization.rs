@@ -58,7 +58,7 @@ use crate::operations::composites::builders::{Composite, CompositeCallContext, c
 use crate::operations::composites::configurations::{CompositeVjp, DefaultJvp, SymbolicZeroVjp};
 use crate::operations::composites::rules::definitions::CustomRuleDefinition;
 use crate::operations::constants::constant::DimensionConstant;
-use crate::operations::constants::fill::Fill;
+use crate::operations::constants::fill::{DynamicFill, Fill};
 use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_max::DimensionMax;
@@ -126,9 +126,14 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// keeps quantization intact under compilers that fold a conversion to a narrow type into a following conversion back,
 /// as the XLA backend does on GPUs, where JAX places optimization barriers for the same reason.
 ///
+/// Homogeneous arrays, including projected array views, require static shapes. Array IR values additionally support
+/// runtime extents through dimension arithmetic and assertions. Use the parent array IR value for dynamic shapes.
+/// Blanket implementations compose the required numerical and shape capabilities. Values covered by these blanket
+/// implementations cannot supply another implementation of this capability.
+///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
-#[capability(projection(ArrayIrType => ArrayType))]
+#[capability]
 pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Quantizes `self` into a pair `(elements, scales)`, with one scale per block of `block_size` consecutive values
     /// along the last dimension. `elements` has the shape of `self` and element type `element_type`, while `scales` has
@@ -166,15 +171,17 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized 
     /// type up to the rounding of the noise addition at the compute type. Results past the largest finite magnitude of
     /// the element type saturate to it. The spacing is computed exactly from the exponent bits of `x`.
     ///
-    /// `self` must be an `f32` or `f64` array with a static shape of rank at least one, `block_size` must be at least
-    /// two, `block_axes` must name at least one distinct axis, and the extent of every block axis must be a positive
-    /// multiple of `block_size`, because [`ScaledDot`] requires non-empty scales whose blocks have at least two values
-    /// along each contracting dimension. A `global_scale` must be a rank-0 array of the data type of `self` and
-    /// requires `f8e4m3fn` scales, because power of two scales already span the range of their element types (JAX
-    /// likewise rejects global scales for MX formats). A `rounding_noise` array must have the data type and shape
-    /// of `self`. Returns a [`ProgramError`] if these requirements are not met, if `element_type` is not one of
-    /// `f4e2m1fn`, `f8e4m3fn`, and `f8e5m2`, if `scale_type` is not one of `f8e4m3fn` and `f8e8m0fnu`, or if a
-    /// composed operation fails.
+    /// `self` must be an `f32` or `f64` array of rank at least one, `block_size` must be at least two, `block_axes`
+    /// must name at least one distinct axis, and the extent of every block axis must be a positive multiple of
+    /// `block_size`, because [`ScaledDot`] requires non-empty scales whose blocks have at least two values along
+    /// each contracting dimension. A `global_scale` must be a rank-0 array of the data type of `self` and requires
+    /// `f8e4m3fn` scales, because power of two scales already span the range of their element types (JAX likewise
+    /// rejects global scales for MX formats). A `rounding_noise` array must have the data type and shape of `self`.
+    /// Returns a [`ProgramError`] if these requirements are not met, if `element_type` is not one of `f4e2m1fn`,
+    /// `f8e4m3fn`, and `f8e5m2`, if `scale_type` is not one of `f8e4m3fn` and `f8e8m0fnu`, or if a composed operation
+    /// fails. Homogeneous arrays require static shapes. Array IR values assert unknown block extents at runtime before
+    /// reshaping, and preserve dynamic non-block extents, including empty ones. Known violations are rejected before
+    /// composing operations.
     ///
     /// # Parameters
     ///
@@ -224,87 +231,23 @@ where
         // Every value with the capabilities used by the recipe, which include both the concrete reference `Array`
         // backend and the transform tracers, quantizes through this composition. All validation happens before the
         // first operation, so that rejected requests stage nothing.
-        let element_format = BlockElementFormat::new(element_type)?;
-        let (smallest_scale, largest_scale) = match scale_type {
-            DataType::F8E4M3FN => ((-9.0f64).exp2(), 448.0),
-            DataType::F8E8M0FNU => ((-126.0f64).exp2(), 127.0f64.exp2()),
-            scale_type => {
-                return Err(TypeError::invalid(format!(
-                    "`block_quantize` does not support scale data type `{scale_type}`",
-                ))
-                .into());
-            }
-        };
-
         let input_type = self.r#type().into_owned();
-        let compute_type = input_type.data_type();
-        if !matches!(compute_type, DataType::F32 | DataType::F64) {
-            return Err(TypeError::invalid(format!(
-                "`block_quantize` expects an `f32` or `f64` input but got `{compute_type}`",
-            ))
-            .into());
-        }
-
+        let global_scale_type = global_scale.map(|value| value.r#type().into_owned());
+        let noise_type = rounding_noise.map(|value| value.r#type().into_owned());
+        let (element_format, block_axes) = validate_block_quantize_inputs(
+            &input_type,
+            block_size,
+            element_type,
+            scale_type,
+            block_axes.into(),
+            global_scale_type.as_ref(),
+            noise_type.as_ref(),
+        )?;
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid("`block_quantize` input must have a static shape").into());
         };
-
         let dimensions = shape.dimensions().to_vec();
-        if dimensions.is_empty() {
-            return Err(TypeError::invalid("`block_quantize` does not support rank-0 inputs").into());
-        }
-
-        if block_size < 2 {
-            return Err(TypeError::invalid(format!(
-                "`block_quantize` block size must be at least 2 but got {block_size}"
-            ))
-            .into());
-        }
-
-        let block_axes = block_axes.into().normalize(dimensions.len())?;
-        if block_axes.is_empty() {
-            return Err(TypeError::invalid("`block_quantize` requires at least one block axis").into());
-        }
-
-        for &axis in &block_axes {
-            let size = dimensions[axis];
-            if size == 0 || size % block_size != 0 {
-                return Err(TypeError::invalid(format!(
-                    "`block_quantize` block dimension {axis} size {size} is not a positive multiple of block size \
-                     {block_size}",
-                ))
-                .into());
-            }
-        }
-
-        if let Some(global_scale) = global_scale {
-            if scale_type != DataType::F8E4M3FN {
-                return Err(TypeError::invalid(format!(
-                    "`block_quantize` global scales require `f8e4m3fn` scales but got `{scale_type}` scales",
-                ))
-                .into());
-            }
-
-            let global_scale_type = global_scale.r#type();
-            if global_scale_type.rank() != 0 || global_scale_type.data_type() != compute_type {
-                return Err(TypeError::invalid(format!(
-                    "`block_quantize` global scale must be a rank-0 `{compute_type}` array but got \
-                     `{global_scale_type}`",
-                ))
-                .into());
-            }
-        }
-
-        if let Some(rounding_noise) = rounding_noise {
-            let noise_type = rounding_noise.r#type();
-            if noise_type.data_type() != compute_type || noise_type.shape() != input_type.shape() {
-                return Err(TypeError::invalid(format!(
-                    "`block_quantize` rounding noise must have the data type and shape of the input `{input_type}` \
-                     but got `{noise_type}`",
-                ))
-                .into());
-            }
-        }
+        let compute_type = input_type.data_type();
 
         // Splitting every block axis into a pair of `(block_count, block_size)` dimensions keeps the row-major element
         // order, so each block is the set of values that share all block counts. Reducing the block size dimensions
@@ -330,8 +273,6 @@ where
             compute_type,
             Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
         );
-
-        let element_value_type = ArrayType::new(compute_type, input_type.shape().clone());
         let domain = self.domain();
 
         // A global scale divides the input before anything else, so the block scales describe the globally scaled
@@ -353,25 +294,10 @@ where
         // simplification on GPUs) therefore cannot change the result, because the rounding is explicit.
         let block_max =
             input.reshape(Shape::new(block_dimensions))?.abs()?.reduce(&reduction_axes, ReductionKind::Max)?;
-        let stored_scales = if scale_type == DataType::F8E4M3FN {
-            // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type,
-            // and the clamped scale rounds to the nearest `f8e4m3fn` value.
-            let scales = block_max.div(&domain.fill(&scale_value_type, element_format.max)?)?.clamp(
-                &domain.fill(&ArrayType::scalar(compute_type), smallest_scale)?,
-                &domain.fill(&ArrayType::scalar(compute_type), largest_scale)?,
-            )?;
-            round_to_floating_point_grid(&scales, -6, 3, None, &|value| domain.fill(&scale_value_type, value))?
-        } else {
-            // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
-            // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
-            // blocks whose maxima are not finite to the largest scale.
-            binade_scale(&block_max, &|value| domain.fill(&scale_value_type, value))?
-                .mul(&domain.fill(&scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
-                .clamp(
-                    &domain.fill(&ArrayType::scalar(compute_type), smallest_scale)?,
-                    &domain.fill(&ArrayType::scalar(compute_type), largest_scale)?,
-                )?
-        };
+        let stored_scales =
+            quantize_block_scales(&block_max, element_format, scale_type, &scale_value_type, &|r#type, value| {
+                domain.fill(r#type, value)
+            })?;
         let scales = stored_scales.convert_element_type(scale_type)?;
 
         // The elements are divided by the stored scales, which are exactly the values that `ScaledDot` dequantizes
@@ -384,31 +310,219 @@ where
         let expanded_scales =
             stored_scales.broadcast(expanded_type, scale_axes.as_slice())?.reshape(input_type.shape().clone())?;
         let quotients = input.div(&expanded_scales)?;
+        let elements = quantize_block_elements(&quotients, element_format, rounding_noise, &|r#type, value| {
+            domain.fill(r#type, value)
+        })?;
+        Ok((elements.convert_element_type(element_type)?, scales))
+    }
+}
 
-        // The quotients are clamped to the finite range of the element type before rounding, which saturates infinite
-        // values rather than dividing infinite spacings, and the largest magnitude is on the grid, so rounding to the
-        // nearest value keeps the clamped quotients in range. Stochastic rounding can still step past the largest
-        // magnitude when adding noise just below one rounds up to the next integer, so its result is clamped again.
-        let quotients = quotients.clamp(
-            &domain.fill(&ArrayType::scalar(compute_type), -element_format.max)?,
-            &domain.fill(&ArrayType::scalar(compute_type), element_format.max)?,
+impl<V> BlockQuantize<ArrayIrType> for V
+where
+    V: Value<Type = ArrayIrType>
+        + Assert
+        + DimensionSize
+        + DynamicBroadcast
+        + DynamicReshape
+        + ValueProjection<ArrayType>
+        + ValueProjection<DimensionType>,
+    V::Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicFill<f64, V>,
+    <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType>
+        + Abs
+        + Add
+        + And
+        + BlockQuantize
+        + Clamp
+        + ConvertElementType
+        + Div
+        + Floor
+        + Mul
+        + Reduce
+        + Round,
+    <<V as ValueProjection<ArrayType>>::Projected as Value>::Domain:
+        Fill<f64, <V as ValueProjection<ArrayType>>::Projected>,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + Div + Rem,
+{
+    fn block_quantize_with_options<A: Into<Axes>>(
+        &self,
+        block_size: usize,
+        element_type: DataType,
+        scale_type: DataType,
+        block_axes: A,
+        global_scale: Option<&Self>,
+        rounding_noise: Option<&Self>,
+    ) -> Result<(Self, Self), ProgramError> {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+
+        // Static shapes delegate to the homogeneous composition, which validates the request itself, so that static
+        // array IR values stage exactly what homogeneous arrays stage. Runtime shape work is needed only when the
+        // input has dynamic extents, including dynamic axes outside its blocks.
+        if input_type.static_shape().is_some() {
+            let project = |value: &Self| ValueProjection::<ArrayType>::into_projected(value.clone());
+            let global_scale = global_scale.map(project).transpose()?;
+            let rounding_noise = rounding_noise.map(project).transpose()?;
+            let (elements, scales) = project(self)?.block_quantize_with_options(
+                block_size,
+                element_type,
+                scale_type,
+                block_axes,
+                global_scale.as_ref(),
+                rounding_noise.as_ref(),
+            )?;
+            return Ok((
+                <V as ValueProjection<ArrayType>>::from_projected(elements),
+                <V as ValueProjection<ArrayType>>::from_projected(scales),
+            ));
+        }
+
+        // Everything decidable from the types is validated before the first operation, so that rejected requests
+        // stage nothing. Only the extents of dynamic block axes are left to the runtime assertions below.
+        let array_type = |value: &Self| -> Result<ArrayType, ProgramError> {
+            Ok(<&ArrayType>::try_from(value.r#type().as_ref())?.clone())
+        };
+        let global_scale_type = global_scale.map(array_type).transpose()?;
+        let noise_type = rounding_noise.map(array_type).transpose()?;
+        let (element_format, block_axes) = validate_block_quantize_inputs(
+            input_type,
+            block_size,
+            element_type,
+            scale_type,
+            block_axes.into(),
+            global_scale_type.as_ref(),
+            noise_type.as_ref(),
         )?;
-        let elements = round_to_floating_point_grid(
-            &quotients,
-            element_format.min_exponent,
-            element_format.mantissa_bits,
-            rounding_noise,
-            &|value| domain.fill(&element_value_type, value),
-        )?;
-        let elements = match rounding_noise {
-            Some(_) => elements.clamp(
-                &domain.fill(&ArrayType::scalar(compute_type), -element_format.max)?,
-                &domain.fill(&ArrayType::scalar(compute_type), element_format.max)?,
-            )?,
-            None => elements,
+
+        // Every axis contributes its extent as a first-class dimension value (a constant for a static axis), which
+        // the dynamic reshapes, broadcasts, and fills below take in place of the static extents of the homogeneous
+        // composition. The block size stays static even when its block count is dynamic.
+        let context = self.domain();
+        let block_size_value = context.dimension_constant(block_size)?;
+        let divisor = ValueProjection::<DimensionType>::into_projected(block_size_value.clone())?;
+        let input_dimensions =
+            (0..input_type.rank()).map(|axis| self.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+
+        // As in the homogeneous composition, every block axis is split into a pair of `(block_count, block_size)`
+        // dimensions. `scale_axes` maps every scale axis to its position in the blocked shape, and `reduction_axes`
+        // collects the positions of the block size dimensions.
+        let mut zero = None;
+        let mut block_dimensions = Vec::with_capacity(input_type.rank() + block_axes.len());
+        let mut scale_dimensions = Vec::with_capacity(input_type.rank());
+        let mut scale_axes = Vec::with_capacity(input_type.rank());
+        let mut reduction_axes = Vec::with_capacity(block_axes.len());
+        for (axis, dimension) in input_dimensions.iter().enumerate() {
+            scale_axes.push(block_dimensions.len());
+            if block_axes.contains(&axis) {
+                let count = match input_type.dimension(axis).value() {
+                    // Static block extents were validated above, so their block counts are constants.
+                    Some(extent) => context.dimension_constant(extent / block_size)?,
+
+                    // Dynamic block extents must be positive multiples of the block size, like static ones, and are
+                    // asserted before any operation that relies on that. The dynamic reshapes between the input and
+                    // blocked shapes keep their own element-count checks, because shape types cannot prove that `n`
+                    // equals `(n / b) * b` from these assertions (they only compare static factors and dynamic
+                    // dimension identities). Those checks then always pass, while these assertions report
+                    // violations per axis and also reject empty blocks, which reshaping alone would accept.
+                    None => {
+                        if zero.is_none() {
+                            zero =
+                                Some(ValueProjection::<DimensionType>::into_projected(context.dimension_constant(0)?)?);
+                        }
+                        let zero = zero.as_ref().unwrap();
+                        let extent = ValueProjection::<DimensionType>::into_projected(dimension.clone())?;
+                        extent.compare(zero, ComparisonDirection::GreaterThan)?.assert(
+                            &format!("block extent of axis {axis} must be positive"),
+                            &[("extent", dimension.clone())],
+                        )?;
+                        extent.rem(&divisor)?.compare(zero, ComparisonDirection::Equal)?.assert(
+                            &format!("block extent of axis {axis} must be divisible by block size"),
+                            &[("extent", dimension.clone())],
+                        )?;
+                        ValueProjection::<DimensionType>::from_projected(extent.div(&divisor)?)
+                    }
+                };
+                scale_dimensions.push(count.clone());
+                block_dimensions.push(count);
+                reduction_axes.push(block_dimensions.len());
+                block_dimensions.push(block_size_value.clone());
+            } else {
+                scale_dimensions.push(dimension.clone());
+                block_dimensions.push(dimension.clone());
+            }
+        }
+
+        // A global scale divides the input before anything else, so the block scales describe the globally scaled
+        // values. The scalar is broadcast to the runtime input extents, keeping its placement, and the division aligns
+        // its manual variation with that of the input.
+        let input = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        let input = match global_scale {
+            Some(global_scale) => {
+                let expanded = global_scale.dynamic_broadcast(&input_dimensions, &[])?;
+                input.div(&ValueProjection::<ArrayType>::into_projected(expanded)?)?
+            }
+            None => input,
         };
 
-        Ok((elements.convert_element_type(element_type)?, scales))
+        // The maximum magnitude of each block determines its scale, which the shared recipe computes at the input
+        // precision. Fills with the scale shape take one dimension value per dynamic scale axis, in axis order.
+        let input = <V as ValueProjection<ArrayType>>::from_projected(input);
+        let blocked = ValueProjection::<ArrayType>::into_projected(input.dynamic_reshape(&block_dimensions)?)?;
+        let block_max = blocked.abs()?.reduce(&reduction_axes, ReductionKind::Max)?;
+        let scale_value_type = ArrayType::new(input_type.data_type(), block_max.r#type().shape().clone());
+        let scale_dynamic_dimensions = scale_dimensions
+            .iter()
+            .zip(scale_value_type.shape().dimensions())
+            .filter(|(_, dimension)| dimension.value().is_none())
+            .map(|(value, _)| value.clone())
+            .collect::<Vec<_>>();
+
+        // The recipes fill only scalars, which need no dimension values and are staged as plain constants like in the
+        // homogeneous composition, and arrays with the shape of the values that they combine with.
+        let projected_context = block_max.domain();
+        let stored_scales =
+            quantize_block_scales(&block_max, element_format, scale_type, &scale_value_type, &|r#type, value| {
+                if r#type.rank() == 0 {
+                    return projected_context.fill(r#type, value);
+                }
+                debug_assert_eq!(r#type.shape(), scale_value_type.shape());
+                let scales = context.dynamic_fill(r#type, value, &scale_dynamic_dimensions)?;
+                Ok(ValueProjection::<ArrayType>::into_projected(scales)?)
+            })?;
+        let scales = stored_scales.convert_element_type(scale_type)?;
+
+        // The elements are divided by the stored scales, which are exactly the values that dequantization multiplies
+        // them by. Each scale is repeated over its block size dimensions and the blocked shape is merged back into the
+        // input shape, keeping the placement and manual variation of the scales.
+        let expanded = <V as ValueProjection<ArrayType>>::from_projected(stored_scales)
+            .dynamic_broadcast(&block_dimensions, &scale_axes)?
+            .dynamic_reshape(&input_dimensions)?;
+        let expanded = ValueProjection::<ArrayType>::into_projected(expanded)?;
+        let input = ValueProjection::<ArrayType>::into_projected(input)?;
+        let quotients = input.div(&expanded)?;
+
+        // The shared recipe saturates and rounds the quotients, filling arrays with the input shape.
+        let rounding_noise = rounding_noise
+            .map(|value| ValueProjection::<ArrayType>::into_projected(value.clone()))
+            .transpose()?;
+        let input_dynamic_dimensions = input_dimensions
+            .iter()
+            .zip(input_type.shape().dimensions())
+            .filter(|(_, dimension)| dimension.value().is_none())
+            .map(|(value, _)| value.clone())
+            .collect::<Vec<_>>();
+        let elements =
+            quantize_block_elements(&quotients, element_format, rounding_noise.as_ref(), &|r#type, value| {
+                if r#type.rank() == 0 {
+                    return projected_context.fill(r#type, value);
+                }
+                debug_assert_eq!(r#type.shape(), input_type.shape());
+                let elements = context.dynamic_fill(r#type, value, &input_dynamic_dimensions)?;
+                Ok(ValueProjection::<ArrayType>::into_projected(elements)?)
+            })?;
+        Ok((
+            <V as ValueProjection<ArrayType>>::from_projected(elements.convert_element_type(element_type)?),
+            <V as ValueProjection<ArrayType>>::from_projected(scales),
+        ))
     }
 }
 
@@ -2437,6 +2551,158 @@ struct QuantizedInput<V> {
     global_scale: Option<V>,
 }
 
+/// Validates the statically decidable requirements of block quantization before composing operations.
+fn validate_block_quantize_inputs(
+    input_type: &ArrayType,
+    block_size: usize,
+    element_type: DataType,
+    scale_type: DataType,
+    block_axes: Axes,
+    global_scale: Option<&ArrayType>,
+    rounding_noise: Option<&ArrayType>,
+) -> Result<(BlockElementFormat, Vec<usize>), ProgramError> {
+    let element_format = BlockElementFormat::new(element_type)?;
+    if !matches!(scale_type, DataType::F8E4M3FN | DataType::F8E8M0FNU) {
+        return Err(
+            TypeError::invalid(format!("`block_quantize` does not support scale data type `{scale_type}`")).into()
+        );
+    }
+    let compute_type = input_type.data_type();
+    if !matches!(compute_type, DataType::F32 | DataType::F64) {
+        return Err(TypeError::invalid(format!(
+            "`block_quantize` expects an `f32` or `f64` input but got `{compute_type}`",
+        ))
+        .into());
+    }
+    if input_type.rank() == 0 {
+        return Err(TypeError::invalid("`block_quantize` does not support rank-0 inputs").into());
+    }
+    if block_size < 2 {
+        return Err(
+            TypeError::invalid(format!("`block_quantize` block size must be at least 2 but got {block_size}")).into()
+        );
+    }
+    let block_axes = block_axes.normalize(input_type.rank())?;
+    if block_axes.is_empty() {
+        return Err(TypeError::invalid("`block_quantize` requires at least one block axis").into());
+    }
+    for &axis in &block_axes {
+        if let Some(size) = input_type.dimension(axis).value()
+            && (size == 0 || size % block_size != 0)
+        {
+            return Err(TypeError::invalid(format!(
+                "`block_quantize` block dimension {axis} size {size} is not a positive multiple of block size \
+                 {block_size}",
+            ))
+            .into());
+        }
+    }
+    if let Some(global_scale_type) = global_scale {
+        if scale_type != DataType::F8E4M3FN {
+            return Err(TypeError::invalid(format!(
+                "`block_quantize` global scales require `f8e4m3fn` scales but got `{scale_type}` scales",
+            ))
+            .into());
+        }
+        if global_scale_type.rank() != 0 || global_scale_type.data_type() != compute_type {
+            return Err(TypeError::invalid(format!(
+                "`block_quantize` global scale must be a rank-0 `{compute_type}` array but got \
+                 `{global_scale_type}`",
+            ))
+            .into());
+        }
+    }
+    if let Some(noise_type) = rounding_noise
+        && (noise_type.data_type() != compute_type || noise_type.shape() != input_type.shape())
+    {
+        return Err(TypeError::invalid(format!(
+            "`block_quantize` rounding noise must have the data type and shape of the input `{input_type}` \
+             but got `{noise_type}`",
+        ))
+        .into());
+    }
+    Ok((element_format, block_axes))
+}
+
+/// Computes the stored block scales at the input precision, sharing the numerical recipe across shape universes.
+fn quantize_block_scales<V, F>(
+    block_max: &V,
+    element_format: BlockElementFormat,
+    scale_type: DataType,
+    scale_value_type: &ArrayType,
+    fill: &F,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
+    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
+{
+    let compute_type = block_max.r#type().data_type();
+    let (smallest_scale, largest_scale) = match scale_type {
+        DataType::F8E4M3FN => ((-9.0f64).exp2(), 448.0),
+        DataType::F8E8M0FNU => ((-126.0f64).exp2(), 127.0f64.exp2()),
+        _ => unreachable!("scale type was validated before composing operations"),
+    };
+    let stored_scales = if scale_type == DataType::F8E4M3FN {
+        // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type,
+        // and the clamped scale rounds to the nearest `f8e4m3fn` value.
+        let scales = block_max.div(&fill(scale_value_type, element_format.max)?)?.clamp(
+            &fill(&ArrayType::scalar(compute_type), smallest_scale)?,
+            &fill(&ArrayType::scalar(compute_type), largest_scale)?,
+        )?;
+        round_to_floating_point_grid(&scales, -6, 3, None, &|value| fill(scale_value_type, value))?
+    } else {
+        // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
+        // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
+        // blocks whose maxima are not finite to the largest scale.
+        binade_scale(block_max, &|value| fill(scale_value_type, value))?
+            .mul(&fill(scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
+            .clamp(
+                &fill(&ArrayType::scalar(compute_type), smallest_scale)?,
+                &fill(&ArrayType::scalar(compute_type), largest_scale)?,
+            )?
+    };
+    Ok(stored_scales)
+}
+
+/// Saturates and rounds the scaled elements using the same arithmetic for static and runtime shapes.
+fn quantize_block_elements<V, F>(
+    quotients: &V,
+    element_format: BlockElementFormat,
+    rounding_noise: Option<&V>,
+    fill: &F,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
+    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
+{
+    let compute_type = quotients.r#type().data_type();
+    let element_value_type = ArrayType::new(compute_type, quotients.r#type().shape().clone());
+    // The quotients are clamped to the finite range of the element type before rounding, which saturates infinite
+    // values rather than dividing infinite spacings, and the largest magnitude is on the grid, so rounding to the
+    // nearest value keeps the clamped quotients in range. Stochastic rounding can still step past the largest
+    // magnitude when adding noise just below one rounds up to the next integer, so its result is clamped again.
+    let quotients = quotients.clamp(
+        &fill(&ArrayType::scalar(compute_type), -element_format.max)?,
+        &fill(&ArrayType::scalar(compute_type), element_format.max)?,
+    )?;
+    let elements = round_to_floating_point_grid(
+        &quotients,
+        element_format.min_exponent,
+        element_format.mantissa_bits,
+        rounding_noise,
+        &|value| fill(&element_value_type, value),
+    )?;
+    let elements = match rounding_noise {
+        Some(_) => elements.clamp(
+            &fill(&ArrayType::scalar(compute_type), -element_format.max)?,
+            &fill(&ArrayType::scalar(compute_type), element_format.max)?,
+        )?,
+        None => elements,
+    };
+
+    Ok(elements)
+}
+
 /// Rounds the `f32` or `f64` `value` to the grid of a narrow floating-point type whose normal values have
 /// `mantissa_bits` explicit mantissa bits and whose smallest normal value is `2^min_exponent`, below which the grid
 /// spacing stays constant (i.e., subnormal values). Rounding is to the nearest grid value with ties to even, or
@@ -2892,6 +3158,307 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantize_dynamic_extents() {
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                let (elements, scales) = inputs[0].block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU)?;
+                Ok(vec![elements, scales])
+            },
+            vec![ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])))],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[n] .
+                let %1:dimension<4> = constant [value=4]
+                    %2:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %3:dimension<0> = constant [value=0]
+                    %4:bool[] = compare [direction=GreaterThan] %2 %3
+                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %4 %2
+                    %5:dimension<n % 4 ∈ [0, 4)> = dimension_rem %2 %1
+                    %6:bool[] = compare [direction=Equal] %5 %3
+                    () = assert [
+                        message="block extent of axis 0 must be divisible by block size",
+                        labels=["extent"],
+                    ] %6 %2
+                    %7:dimension<n / 4 ∈ [0, 3)> = dimension_div %2 %1
+                    %8:f32[n / 4, 4] = reshape %0 %7 %1
+                    %9:f32[n / 4, 4] = abs %8
+                    %10:f32[n / 4] = reduce [kind=max, axes=[1]] %9
+                    %11:u32[n / 4] = convert_element_type [data_type=u32, bitcast=true] %10
+                    %12:f32[] = constant [value=inf]
+                    %13:f32[n / 4] = broadcast [output_axes=[]] %12 %7
+                    %14:u32[n / 4] = convert_element_type [data_type=u32, bitcast=true] %13
+                    %15:u32[n / 4] = and %11 %14
+                    %16:f32[n / 4] = convert_element_type [data_type=f32, bitcast=true] %15
+                    %17:f32[] = constant [value=0.00390625]
+                    %18:f32[n / 4] = broadcast [output_axes=[]] %17 %7
+                    %19:f32[n / 4] = mul %16 %18
+                    %20:f32[] = constant [value=1.1754944e-38]
+                    %21:f32[] = constant [value=1.7014118e38]
+                    %22:f32[n / 4] = clamp %20 %19 %21
+                    %23:f8e8m0fnu[n / 4] = convert_element_type [data_type=f8e8m0fnu] %22
+                    %24:f32[n / 4, 4] = broadcast [output_axes=[0]] %22 %7 %1
+                    %25:f32[n] = reshape %24 %2
+                    %26:f32[n] = div %0 %25
+                    %27:f32[] = constant [value=-448.0]
+                    %28:f32[] = constant [value=448.0]
+                    %29:f32[n] = clamp %27 %26 %28
+                    %30:u32[n] = convert_element_type [data_type=u32, bitcast=true] %29
+                    %31:f32[] = constant [value=inf]
+                    %32:f32[n] = broadcast [output_axes=[]] %31 %2
+                    %33:u32[n] = convert_element_type [data_type=u32, bitcast=true] %32
+                    %34:u32[n] = and %30 %33
+                    %35:f32[n] = convert_element_type [data_type=f32, bitcast=true] %34
+                    %36:f32[] = constant [value=0.015625]
+                    %37:f32[n] = broadcast [output_axes=[]] %36 %2
+                    %38:f32[] = constant [value=inf]
+                    %39:f32[n] = broadcast [output_axes=[]] %38 %2
+                    %40:f32[n] = clamp %37 %35 %39
+                    %41:f32[] = constant [value=0.125]
+                    %42:f32[n] = broadcast [output_axes=[]] %41 %2
+                    %43:f32[n] = mul %40 %42
+                    %44:f32[n] = div %29 %43
+                    %45:f32[n] = round %44
+                    %46:f32[n] = mul %45 %43
+                    %47:f8e4m3fn[n] = convert_element_type [data_type=f8e4m3fn] %46
+                in (%47, %23)
+            "#}
+            .trim_end(),
+        );
+        let evaluation =
+            program.partially_evaluate(&[PartialValue::Unknown(program.input_types()[0].clone())]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[n], %1:f32[], %2:f32[], %3:f32[], %4:f32[], %5:f32[], %6:f32[], %7:f32[], %8:f32[], %9:f32[], %10:f32[] .
+                let %11:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %12:dimension<0> = const 0
+                    %13:bool[] = compare [direction=GreaterThan] %11 %12
+                    %14:dimension<4> = const 4
+                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %13 %11
+                    %15:dimension<n % 4 ∈ [0, 4)> = dimension_rem %11 %14
+                    %16:bool[] = compare [direction=Equal] %15 %12
+                    () = assert [
+                        message="block extent of axis 0 must be divisible by block size",
+                        labels=["extent"],
+                    ] %16 %11
+                    %17:dimension<n / 4 ∈ [0, 3)> = dimension_div %11 %14
+                    %18:f32[n / 4, 4] = reshape %0 %17 %14
+                    %19:f32[n / 4, 4] = abs %18
+                    %20:f32[n / 4] = reduce [kind=max, axes=[1]] %19
+                    %21:u32[n / 4] = convert_element_type [data_type=u32, bitcast=true] %20
+                    %22:f32[n / 4] = broadcast [output_axes=[]] %1 %17
+                    %23:u32[n / 4] = convert_element_type [data_type=u32, bitcast=true] %22
+                    %24:u32[n / 4] = and %21 %23
+                    %25:f32[n / 4] = convert_element_type [data_type=f32, bitcast=true] %24
+                    %26:f32[n / 4] = broadcast [output_axes=[]] %2 %17
+                    %27:f32[n / 4] = mul %25 %26
+                    %28:f32[n / 4] = clamp %3 %27 %4
+                    %29:f32[n / 4, 4] = broadcast [output_axes=[0]] %28 %17 %14
+                    %30:f32[n] = reshape %29 %11
+                    %31:f32[n] = div %0 %30
+                    %32:f32[n] = clamp %5 %31 %6
+                    %33:f32[n] = broadcast [output_axes=[]] %8 %11
+                    %34:u32[n] = convert_element_type [data_type=u32, bitcast=true] %32
+                    %35:f32[n] = broadcast [output_axes=[]] %7 %11
+                    %36:u32[n] = convert_element_type [data_type=u32, bitcast=true] %35
+                    %37:u32[n] = and %34 %36
+                    %38:f32[n] = convert_element_type [data_type=f32, bitcast=true] %37
+                    %39:f32[n] = broadcast [output_axes=[]] %9 %11
+                    %40:f32[n] = clamp %33 %38 %39
+                    %41:f32[n] = broadcast [output_axes=[]] %10 %11
+                    %42:f32[n] = mul %40 %41
+                    %43:f32[n] = div %32 %42
+                    %44:f32[n] = round %43
+                    %45:f32[n] = mul %44 %42
+                    %46:f8e4m3fn[n] = convert_element_type [data_type=f8e4m3fn] %45
+                    %47:f8e8m0fnu[n / 4] = convert_element_type [data_type=f8e8m0fnu] %28
+                in (%46, %47)
+            "#}.trim_end(),
+        );
+        let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0]).unwrap();
+        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        let expected = vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)];
+        assert_eq!(program.interpret(vec![ArrayIrValue::Array(input.clone())]), Ok(expected.clone()));
+        assert_eq!(
+            evaluation.interpret(
+                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                &[ArrayIrValue::Array(input)]
+            ),
+            Ok(expected)
+        );
+        let input = Array::vector(vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
+        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(input)]),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
+        );
+        for (values, message) in [
+            (vec![], "block extent of axis 0 must be positive"),
+            (vec![1.0f32; 6], "block extent of axis 0 must be divisible by block size"),
+        ] {
+            let extent = values.len();
+            let input = ArrayIrValue::Array(Array::vector(values).unwrap());
+            let expected = ProgramError::from(AssertionError::Failed {
+                message: message.to_string(),
+                observations: vec![("extent".to_string(), extent.to_string())],
+            });
+            assert_eq!(program.interpret(vec![input.clone()]), Err(expected.clone()));
+            assert_eq!(
+                evaluation.interpret(&EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(), &[input]),
+                Err(expected)
+            );
+        }
+
+        // Replaying the dynamic program through batching keeps one shared extent for every mapped row.
+        let input = Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
+        let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
+        assert_eq!(
+            batch(
+                |input| program.interpret_in_context(&input.domain(), vec![input]),
+                ArrayIrValue::Array(input),
+                BatchAxis::new(0),
+                vec![BatchAxis::new(0); 2],
+                None,
+            ),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_dynamic_non_block_extents() {
+        let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input: Tracer<_>| {
+                let (elements, scales) = input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU)?;
+                Ok(vec![elements, scales])
+            },
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(4)]),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f64[batch, 4] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<batch ∈ [0, 3)> = dimension_size [axis=0] %0
+                    %3:dimension<4> = constant [value=4]
+                    %4:dimension<2> = constant [value=2]
+                    %5:f64[batch, 2, 2] = reshape [requires_runtime_assertion=false] %0 %2 %4 %1
+                    %6:f64[batch, 2, 2] = abs %5
+                    %7:f64[batch, 2] = reduce [kind=max, axes=[2]] %6
+                    %8:u64[batch, 2] = convert_element_type [data_type=u64, bitcast=true] %7
+                    %9:f64[] = constant [value=inf]
+                    %10:dimension<2> = constant [value=2]
+                    %11:f64[batch, 2] = broadcast [output_axes=[]] %9 %2 %10
+                    %12:u64[batch, 2] = convert_element_type [data_type=u64, bitcast=true] %11
+                    %13:u64[batch, 2] = and %8 %12
+                    %14:f64[batch, 2] = convert_element_type [data_type=f64, bitcast=true] %13
+                    %15:f64[] = constant [value=3.0517578125e-5]
+                    %16:dimension<2> = constant [value=2]
+                    %17:f64[batch, 2] = broadcast [output_axes=[]] %15 %2 %16
+                    %18:f64[batch, 2] = mul %14 %17
+                    %19:f64[] = constant [value=1.1754943508222875e-38]
+                    %20:f64[] = constant [value=1.7014118346046923e38]
+                    %21:f64[batch, 2] = clamp %19 %18 %20
+                    %22:f8e8m0fnu[batch, 2] = convert_element_type [data_type=f8e8m0fnu] %21
+                    %23:f64[batch, 2, 2] = broadcast [output_axes=[0, 1]] %21 %2 %4 %1
+                    %24:f64[batch, 4] = reshape [requires_runtime_assertion=false] %23 %2 %3
+                    %25:f64[batch, 4] = div %0 %24
+                    %26:f64[] = constant [value=-57344.0]
+                    %27:f64[] = constant [value=57344.0]
+                    %28:f64[batch, 4] = clamp %26 %25 %27
+                    %29:u64[batch, 4] = convert_element_type [data_type=u64, bitcast=true] %28
+                    %30:f64[] = constant [value=inf]
+                    %31:dimension<4> = constant [value=4]
+                    %32:f64[batch, 4] = broadcast [output_axes=[]] %30 %2 %31
+                    %33:u64[batch, 4] = convert_element_type [data_type=u64, bitcast=true] %32
+                    %34:u64[batch, 4] = and %29 %33
+                    %35:f64[batch, 4] = convert_element_type [data_type=f64, bitcast=true] %34
+                    %36:f64[] = constant [value=6.103515625e-5]
+                    %37:dimension<4> = constant [value=4]
+                    %38:f64[batch, 4] = broadcast [output_axes=[]] %36 %2 %37
+                    %39:f64[] = constant [value=inf]
+                    %40:dimension<4> = constant [value=4]
+                    %41:f64[batch, 4] = broadcast [output_axes=[]] %39 %2 %40
+                    %42:f64[batch, 4] = clamp %38 %35 %41
+                    %43:f64[] = constant [value=0.25]
+                    %44:dimension<4> = constant [value=4]
+                    %45:f64[batch, 4] = broadcast [output_axes=[]] %43 %2 %44
+                    %46:f64[batch, 4] = mul %42 %45
+                    %47:f64[batch, 4] = div %28 %46
+                    %48:f64[batch, 4] = round %47
+                    %49:f64[batch, 4] = mul %48 %46
+                    %50:f8e5m2[batch, 4] = convert_element_type [data_type=f8e5m2] %49
+                in (%50, %22)
+            "#}
+            .trim_end(),
+        );
+        let input = Array::matrix(2, 4, vec![3.0f64, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5]).unwrap();
+        let (elements, scales) = input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(input)),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
+        );
+        let input = Array::matrix(0, 4, vec![] as Vec<f64>).unwrap();
+        let (elements, scales) = input.block_quantize(2, DataType::F8E5M2, DataType::F8E8M0FNU).unwrap();
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(input)),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_dynamic_validation() {
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input: Tracer<_>| {
+                assert_eq!(
+                    input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
+                    Err(TypeError::invalid(
+                        "`block_quantize` block dimension 1 size 6 is not a positive multiple of block size 4",
+                    )
+                    .into()),
+                );
+                assert_eq!(
+                    input.block_quantize_with_options(
+                        4,
+                        DataType::F4E2M1FN,
+                        DataType::F8E4M3FN,
+                        [0],
+                        Some(&input),
+                        None,
+                    ),
+                    Err(TypeError::invalid(
+                        "`block_quantize` global scale must be a rank-0 `f32` array but got `f32[n, 6]`",
+                    )
+                    .into()),
+                );
+                Ok(input)
+            },
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(6)]),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 6] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_block_quantize_sharding() {
         // Inside a manual region, the elements and scales of a varying input keep its variation for both recipes,
         // because the scales are broadcast back over their blocks with their own variation rather than to an invariant
@@ -3169,6 +3736,145 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantize_sharding_dynamic_extents() {
+        // Inside a manual region, the dynamic composition keeps the variation of a varying input in its elements and
+        // scales like the static one, while its dimension values stay invariant. The invariant global scale is
+        // broadcast to the runtime input extents and aligned with the input by the division.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let global_scale_type =
+            ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let (output_types, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |(input, global_scale): (Tracer<_>, Tracer<_>)| {
+                    let (elements, scales) = input.block_quantize_with_options(
+                        4,
+                        DataType::F4E2M1FN,
+                        DataType::F8E4M3FN,
+                        [-1],
+                        Some(&global_scale),
+                        None,
+                    )?;
+                    Ok(vec![elements, scales])
+                },
+                (ArrayIrType::Array(input_type.clone()), ArrayIrType::Array(global_scale_type)),
+                vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            )
+            .unwrap();
+        assert_eq!(
+            output_types[0],
+            ArrayIrType::Array(
+                ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Dynamic(extent)]))
+                    .with_sharding(input_type.sharding().cloned())
+                    .unwrap()
+            ),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[][sharding={mesh<['x'=2:manual]>, []}] .
+                let %2:dimension<4> = constant [value=4]
+                    %3:dimension<n ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %4:dimension<0> = constant [value=0]
+                    %5:bool[] = compare [direction=GreaterThan] %3 %4
+                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %5 %3
+                    %6:dimension<n % 4 ∈ [0, 4)> = dimension_rem %3 %2
+                    %7:bool[] = compare [direction=Equal] %6 %4
+                    () = assert [
+                        message="block extent of axis 0 must be divisible by block size",
+                        labels=["extent"],
+                    ] %7 %3
+                    %8:dimension<n / 4 ∈ [0, 3)> = dimension_div %3 %2
+                    %9:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_axes=[]] %1 %3
+                    %10:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %9
+                    %11:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %0 %10
+                    %12:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = reshape %11 %8 %2
+                    %13:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = abs %12
+                    %14:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reduce [kind=max, axes=[1]] %13
+                    %15:f32[] = constant [value=6.0]
+                    %16:f32[n / 4] = broadcast [output_axes=[]] %15 %8
+                    %17:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %16
+                    %18:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %17
+                    %19:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %14 %18
+                    %20:f32[] = constant [value=0.001953125]
+                    %21:f32[] = constant [value=448.0]
+                    %22:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %20
+                    %23:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %22
+                    %24:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %21
+                    %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %24
+                    %26:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %23 %19 %25
+                    %27:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %26
+                    %28:f32[] = constant [value=inf]
+                    %29:f32[n / 4] = broadcast [output_axes=[]] %28 %8
+                    %30:u32[n / 4] = convert_element_type [data_type=u32, bitcast=true] %29
+                    %31:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %30
+                    %32:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %31
+                    %33:u32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %27 %32
+                    %34:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %33
+                    %35:f32[] = constant [value=0.015625]
+                    %36:f32[n / 4] = broadcast [output_axes=[]] %35 %8
+                    %37:f32[] = constant [value=inf]
+                    %38:f32[n / 4] = broadcast [output_axes=[]] %37 %8
+                    %39:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %36
+                    %40:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %39
+                    %41:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %38
+                    %42:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %41
+                    %43:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %40 %34 %42
+                    %44:f32[] = constant [value=0.125]
+                    %45:f32[n / 4] = broadcast [output_axes=[]] %44 %8
+                    %46:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %45
+                    %47:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %46
+                    %48:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %43 %47
+                    %49:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %26 %48
+                    %50:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %49
+                    %51:f32[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %50 %48
+                    %52:f8e4m3fn[n / 4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f8e4m3fn] %51
+                    %53:f32[n / 4, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast [output_axes=[0]] %51 %8 %2
+                    %54:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape %53 %3
+                    %55:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %11 %54
+                    %56:f32[] = constant [value=-6.0]
+                    %57:f32[] = constant [value=6.0]
+                    %58:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %56
+                    %59:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %58
+                    %60:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %57
+                    %61:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %60
+                    %62:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %59 %55 %61
+                    %63:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=u32, bitcast=true] %62
+                    %64:f32[] = constant [value=inf]
+                    %65:f32[n] = broadcast [output_axes=[]] %64 %3
+                    %66:u32[n] = convert_element_type [data_type=u32, bitcast=true] %65
+                    %67:u32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=u32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %66
+                    %68:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %67
+                    %69:u32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %63 %68
+                    %70:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f32, bitcast=true] %69
+                    %71:f32[] = constant [value=1.0]
+                    %72:f32[n] = broadcast [output_axes=[]] %71 %3
+                    %73:f32[] = constant [value=inf]
+                    %74:f32[n] = broadcast [output_axes=[]] %73 %3
+                    %75:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %72
+                    %76:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %75
+                    %77:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %74
+                    %78:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %77
+                    %79:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = clamp %76 %70 %78
+                    %80:f32[] = constant [value=0.5]
+                    %81:f32[n] = broadcast [output_axes=[]] %80 %3
+                    %82:f32[n][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast [output_type=f32[n][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %81
+                    %83:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name="x"] %82
+                    %84:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %79 %83
+                    %85:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = div %62 %84
+                    %86:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = round %85
+                    %87:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %86 %84
+                    %88:f4e2m1fn[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=f4e2m1fn] %87
+                in (%88, %52)
+            "#}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_block_quantize_with_options() {
         // Blocks along the leading axis quantize like the transposed input with blocks along its last axis.
         let input = Array::matrix(
@@ -3396,6 +4102,141 @@ mod tests {
                 in (%59, %31)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_dynamic_extents() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(9)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(0, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Dynamic(columns)]));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, global_scale, noise): (Tracer<_>, Tracer<_>, Tracer<_>)| {
+                let (elements, scales) = input.block_quantize_with_options(
+                    4,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    [-1, 0],
+                    Some(&global_scale),
+                    Some(&noise),
+                )?;
+                Ok(vec![elements, scales])
+            },
+            (
+                ArrayIrType::Array(input_type.clone()),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::Array(input_type),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[rows, columns], %1:f32[], %2:f32[rows, columns] .
+                let %3:dimension<4> = constant [value=4]
+                    %4:dimension<rows ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %5:dimension<columns ∈ [0, 9)> = dimension_size [axis=1] %0
+                    %6:dimension<0> = constant [value=0]
+                    %7:bool[] = compare [direction=GreaterThan] %4 %6
+                    () = assert [message="block extent of axis 0 must be positive", labels=["extent"]] %7 %4
+                    %8:dimension<rows % 4 ∈ [0, 4)> = dimension_rem %4 %3
+                    %9:bool[] = compare [direction=Equal] %8 %6
+                    () = assert [
+                        message="block extent of axis 0 must be divisible by block size",
+                        labels=["extent"],
+                    ] %9 %4
+                    %10:dimension<rows / 4 ∈ [0, 3)> = dimension_div %4 %3
+                    %11:bool[] = compare [direction=GreaterThan] %5 %6
+                    () = assert [message="block extent of axis 1 must be positive", labels=["extent"]] %11 %5
+                    %12:dimension<columns % 4 ∈ [0, 4)> = dimension_rem %5 %3
+                    %13:bool[] = compare [direction=Equal] %12 %6
+                    () = assert [
+                        message="block extent of axis 1 must be divisible by block size",
+                        labels=["extent"],
+                    ] %13 %5
+                    %14:dimension<columns / 4 ∈ [0, 3)> = dimension_div %5 %3
+                    %15:f32[rows, columns] = broadcast [output_axes=[]] %1 %4 %5
+                    %16:f32[rows, columns] = div %0 %15
+                    %17:f32[rows / 4, 4, columns / 4, 4] = reshape %16 %10 %3 %14 %3
+                    %18:f32[rows / 4, 4, columns / 4, 4] = abs %17
+                    %19:f32[rows / 4, columns / 4] = reduce [kind=max, axes=[1, 3]] %18
+                    %20:f32[] = constant [value=6.0]
+                    %21:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %20 %10 %14
+                    %22:f32[rows / 4, columns / 4] = div %19 %21
+                    %23:f32[] = constant [value=0.001953125]
+                    %24:f32[] = constant [value=448.0]
+                    %25:f32[rows / 4, columns / 4] = clamp %23 %22 %24
+                    %26:u32[rows / 4, columns / 4] = convert_element_type [data_type=u32, bitcast=true] %25
+                    %27:f32[] = constant [value=inf]
+                    %28:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %27 %10 %14
+                    %29:u32[rows / 4, columns / 4] = convert_element_type [data_type=u32, bitcast=true] %28
+                    %30:u32[rows / 4, columns / 4] = and %26 %29
+                    %31:f32[rows / 4, columns / 4] = convert_element_type [data_type=f32, bitcast=true] %30
+                    %32:f32[] = constant [value=0.015625]
+                    %33:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %32 %10 %14
+                    %34:f32[] = constant [value=inf]
+                    %35:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %34 %10 %14
+                    %36:f32[rows / 4, columns / 4] = clamp %33 %31 %35
+                    %37:f32[] = constant [value=0.125]
+                    %38:f32[rows / 4, columns / 4] = broadcast [output_axes=[]] %37 %10 %14
+                    %39:f32[rows / 4, columns / 4] = mul %36 %38
+                    %40:f32[rows / 4, columns / 4] = div %25 %39
+                    %41:f32[rows / 4, columns / 4] = round %40
+                    %42:f32[rows / 4, columns / 4] = mul %41 %39
+                    %43:f8e4m3fn[rows / 4, columns / 4] = convert_element_type [data_type=f8e4m3fn] %42
+                    %44:f32[rows / 4, 4, columns / 4, 4] = broadcast [output_axes=[0, 2]] %42 %10 %3 %14 %3
+                    %45:f32[rows, columns] = reshape %44 %4 %5
+                    %46:f32[rows, columns] = div %16 %45
+                    %47:f32[] = constant [value=-6.0]
+                    %48:f32[] = constant [value=6.0]
+                    %49:f32[rows, columns] = clamp %47 %46 %48
+                    %50:u32[rows, columns] = convert_element_type [data_type=u32, bitcast=true] %49
+                    %51:f32[] = constant [value=inf]
+                    %52:f32[rows, columns] = broadcast [output_axes=[]] %51 %4 %5
+                    %53:u32[rows, columns] = convert_element_type [data_type=u32, bitcast=true] %52
+                    %54:u32[rows, columns] = and %50 %53
+                    %55:f32[rows, columns] = convert_element_type [data_type=f32, bitcast=true] %54
+                    %56:f32[] = constant [value=1.0]
+                    %57:f32[rows, columns] = broadcast [output_axes=[]] %56 %4 %5
+                    %58:f32[] = constant [value=inf]
+                    %59:f32[rows, columns] = broadcast [output_axes=[]] %58 %4 %5
+                    %60:f32[rows, columns] = clamp %57 %55 %59
+                    %61:f32[] = constant [value=0.5]
+                    %62:f32[rows, columns] = broadcast [output_axes=[]] %61 %4 %5
+                    %63:f32[rows, columns] = mul %60 %62
+                    %64:f32[rows, columns] = div %49 %63
+                    %65:f32[rows, columns] = add %64 %2
+                    %66:f32[rows, columns] = floor %65
+                    %67:f32[rows, columns] = mul %66 %63
+                    %68:f32[] = constant [value=-6.0]
+                    %69:f32[] = constant [value=6.0]
+                    %70:f32[rows, columns] = clamp %68 %67 %69
+                    %71:f4e2m1fn[rows, columns] = convert_element_type [data_type=f4e2m1fn] %70
+                in (%71, %43)
+            "#}
+            .trim_end(),
+        );
+        let input = Array::matrix(4, 8, (0..32).map(|index| index as f32 / 3.0 - 5.0).collect()).unwrap();
+        let global_scale = Array::scalar(2.0f32).unwrap();
+        let noise = Array::matrix(4, 8, vec![0.75f32; 32]).unwrap();
+        let (elements, scales) = input
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                [-1, 0],
+                Some(&global_scale),
+                Some(&noise),
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(input),
+                ArrayIrValue::Array(global_scale),
+                ArrayIrValue::Array(noise),
+            )),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
         );
     }
 
