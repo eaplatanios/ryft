@@ -224,7 +224,7 @@ pub trait Compile: CompilationDomain {
     /// outputs wrapped in [`Ok`]. Staging, lowering, and compilation happen on the first call for each specialization.
     /// Refer to [`CompiledFunctionDispatcher`] for the dispatch semantics.
     #[inline]
-    fn jit<Static, Input, Output, F>(&self, function: F) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
+    fn jit<Static, Input, Output, F>(&self, function: F) -> CompiledFunctionDispatcher<Self, Static, Input, Output, F>
     where
         Self::Type: Eq + Hash,
         Self::Options: Default,
@@ -250,7 +250,7 @@ pub trait Compile: CompilationDomain {
         &self,
         function: F,
         options: Self::Options,
-    ) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
+    ) -> CompiledFunctionDispatcher<Self, Static, Input, Output, F>
     where
         Self::Type: Eq + Hash,
         Static: Clone + Debug + Eq + Hash,
@@ -276,7 +276,7 @@ pub trait Compile: CompilationDomain {
         function: F,
         options: Self::Options,
         capacity: usize,
-    ) -> CompiledFunctionDispatcher<Self, F, Static, Input, Output>
+    ) -> CompiledFunctionDispatcher<Self, Static, Input, Output, F>
     where
         Self::Type: Eq + Hash,
         Static: Clone + Debug + Eq + Hash,
@@ -351,7 +351,7 @@ where
 /// or support a nullary function. Refer to [`CompiledFunctionDispatcher`] for shared domain selection and dispatch
 /// semantics.
 #[inline]
-pub fn jit<C, Static, Input, Output, F>(function: F) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
+pub fn jit<C, Static, Input, Output, F>(function: F) -> CompiledFunctionDispatcher<C, Static, Input, Output, F>
 where
     C: CompilationDomain<Options: Default>,
     C::Type: Eq + Hash,
@@ -379,7 +379,7 @@ where
 pub fn jit_with_options<C, Static, Input, Output, F>(
     function: F,
     options: C::Options,
-) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
+) -> CompiledFunctionDispatcher<C, Static, Input, Output, F>
 where
     C: CompilationDomain,
     C::Type: Eq + Hash,
@@ -408,7 +408,7 @@ pub fn jit_with_options_and_capacity<C, Static, Input, Output, F>(
     function: F,
     options: C::Options,
     capacity: usize,
-) -> CompiledFunctionDispatcher<C, F, Static, Input, Output>
+) -> CompiledFunctionDispatcher<C, Static, Input, Output, F>
 where
     C: CompilationDomain,
     C::Type: Eq + Hash,
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn test_compile_jit() {
         let domain = CarriedDomain::new();
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             domain.jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
         assert_eq!(function.domain(), Some(&domain));
         assert_eq!(function.options(), &CarriedOptions::default());
@@ -497,7 +497,7 @@ mod tests {
     fn test_compile_jit_with_options() {
         let domain = CarriedDomain::new();
         let options = CarriedOptions { marker: 1 };
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             domain.jit_with_options(|(), input: CompilationTracer<CarriedDomain>| Ok(input), options.clone());
         assert_eq!(function.domain(), Some(&domain));
         assert_eq!(function.options(), &options);
@@ -509,7 +509,7 @@ mod tests {
     fn test_compile_jit_with_options_and_capacity() {
         let domain = CarriedDomain::new();
         let options = CarriedOptions { marker: 1 };
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, bool, ArrayType, ArrayType> = domain
+        let function: CompiledFunctionDispatcher<CarriedDomain, bool, ArrayType, ArrayType, _> = domain
             .jit_with_options_and_capacity(
                 |negate, input: CompilationTracer<CarriedDomain>| {
                     Ok(if negate { input.unary(NegOperation::new()) } else { input })
@@ -578,7 +578,7 @@ mod tests {
     fn test_jit() {
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), Vec<ArrayType>, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), Vec<ArrayType>, ArrayType, _> =
             jit(|(), inputs: Vec<CompilationTracer<CarriedDomain>>| Ok(inputs[0].unary(NegOperation::new())));
         assert_eq!(function.domain(), None);
         assert_eq!(function.options(), &CarriedOptions::default());
@@ -598,7 +598,7 @@ mod tests {
     fn test_jit_with_options() {
         let domain = CarriedDomain::new();
         let options = CarriedOptions { marker: 1 };
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit_with_options(|(), input: CompilationTracer<CarriedDomain>| Ok(input), options.clone());
         assert_eq!(function.domain(), None);
         assert_eq!(function.options(), &options);
@@ -611,7 +611,7 @@ mod tests {
     fn test_jit_with_options_and_capacity() {
         let domain = CarriedDomain::new();
         let options = CarriedOptions { marker: 1 };
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit_with_options_and_capacity(|(), input: CompilationTracer<CarriedDomain>| Ok(input), options.clone(), 1);
         assert_eq!(function.domain(), None);
         assert_eq!(function.options(), &options);

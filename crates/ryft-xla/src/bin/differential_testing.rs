@@ -165,6 +165,7 @@ fn collective_compilation_options(partition_count: usize) -> CompilationOptions 
         target_config: None,
         allow_in_place_mlir_modification: false,
         matrix_unit_operand_precision: Precision::Default as i32,
+        ..Default::default()
     }
 }
 
@@ -243,7 +244,7 @@ fn execute_collective_inputs(
         executable.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<Vec<_>, _>>()?;
     let arguments = XlaArray::into_execute_arguments(arrays, execution_device_ids.as_slice())?;
     let outputs = executable
-        .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
+        .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])?
         .block_until_ready()?;
     let mut observations = Vec::new();
     for (participant, output) in outputs.into_iter().enumerate() {

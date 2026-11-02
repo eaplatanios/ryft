@@ -10553,7 +10553,7 @@ mod tests {
             for _ in 0..2 {
                 // Both launches use the same bounded executable. The second also proves that replay does not
                 // accidentally specialize or recompile the program for the concrete logical size.
-                let output = compiled.executable_function().execute(&domain, XlaValue::Array(input.clone())).unwrap();
+                let output = compiled.executable().execute(&domain, XlaValue::Array(input.clone())).unwrap();
                 let XlaValue::Array(output) = output else {
                     panic!("array-only compiled function returned a first-class dimension");
                 };
@@ -10570,7 +10570,7 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> = domain
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
             .jit_with_options(
                 move |(), inputs| trace_data_derived(extent.clone(), inputs),
                 XlaOptions::new(mesh.clone()),
@@ -10878,7 +10878,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let array = compiled.executable_function().execute(&engine, XlaValue::Array(source)).unwrap();
+        let array = compiled.executable().execute(&engine, XlaValue::Array(source)).unwrap();
         let XlaValue::Array(array) = array else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -10970,7 +10970,7 @@ mod tests {
         );
 
         let input = XlaArray::from_host_buffer(&domain, input_type, mesh, []).unwrap();
-        let output = compiled.executable_function().execute(&domain, XlaValue::Array(input)).unwrap();
+        let output = compiled.executable().execute(&domain, XlaValue::Array(input)).unwrap();
         let XlaValue::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -11017,10 +11017,8 @@ mod tests {
         .unwrap();
         let zero = XlaArray::from_host_buffer(&domain, zero_type.clone(), mesh, []).unwrap();
 
-        let (zero_output, value_output) = compiled
-            .executable_function()
-            .execute(&domain, (XlaValue::Array(value), XlaValue::Array(zero)))
-            .unwrap();
+        let (zero_output, value_output) =
+            compiled.executable().execute(&domain, (XlaValue::Array(value), XlaValue::Array(zero))).unwrap();
         let XlaValue::Array(zero_output) = zero_output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -11123,7 +11121,7 @@ mod tests {
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = compiled.executable_function().execute(&domain, XlaValue::Array(input)).unwrap();
+            let output = compiled.executable().execute(&domain, XlaValue::Array(input)).unwrap();
             let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -11520,7 +11518,7 @@ mod tests {
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = compiled.executable_function().execute(&domain, XlaValue::Array(input)).unwrap();
+            let output = compiled.executable().execute(&domain, XlaValue::Array(input)).unwrap();
             let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -11876,7 +11874,7 @@ mod tests {
         )
         .unwrap();
         let call = || {
-            let output = compiled.executable_function().execute(&domain, XlaValue::Array(input.clone())).unwrap();
+            let output = compiled.executable().execute(&domain, XlaValue::Array(input.clone())).unwrap();
             let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -12047,7 +12045,7 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> =
             domain.jit_with_options(move |(), inputs| trace(extent.clone(), inputs), XlaOptions::new(mesh.clone()));
 
         let call = |size: i64| {
@@ -13140,7 +13138,7 @@ mod tests {
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = domain
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, (), ArrayIrType, ArrayIrType, _> = domain
             .jit_with_options(
                 |(), input| trace(input),
                 XlaOptions::new(mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
@@ -13582,8 +13580,8 @@ mod tests {
             )
             .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let compiled_analysis = domain.analyze(compiled.executable_function()).unwrap();
-        assert_eq!(domain.analyze(compiled.executable_function()).unwrap(), compiled_analysis);
+        let compiled_analysis = domain.analyze(compiled.executable()).unwrap();
+        assert_eq!(domain.analyze(compiled.executable()).unwrap(), compiled_analysis);
 
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         let restored = domain.deserialize_program(bytes.as_slice()).unwrap().unwrap();

@@ -165,7 +165,7 @@ impl KernelAotBundle {
                 .collect(),
             lowering_duration,
             compilation_duration,
-            analysis: domain.analyze(compiled.executable_function())?,
+            analysis: domain.analyze(compiled.executable())?,
         };
         let bundle = Self {
             definition: definition.clone(),

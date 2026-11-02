@@ -1400,7 +1400,7 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         compiled
-            .executable_function()
+            .executable()
             .execute(&domain, inputs)
             .unwrap()
             .into_iter()

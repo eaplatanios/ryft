@@ -318,10 +318,10 @@ fn measure<'c>(
     let start = Instant::now();
     let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(&domain).unwrap();
     let compile = start.elapsed();
-    let memory = domain.analyze(compiled.executable_function()).unwrap().memory;
+    let memory = domain.analyze(compiled.executable()).unwrap().memory;
     let inputs = (XlaValue::Array(inputs.0), XlaValue::Array(inputs.1), XlaValue::Array(inputs.2));
     let execute = || {
-        let (up, down) = compiled.executable_function().execute(domain, inputs.clone()).unwrap();
+        let (up, down) = compiled.executable().execute(domain, inputs.clone()).unwrap();
         let gradients = [up, down].map(|gradient| ValueProjection::<ArrayType>::into_projected(gradient).unwrap());
         gradients.iter().for_each(|gradient| gradient.block_until_ready().unwrap());
         gradients

@@ -192,7 +192,7 @@ fn call_workload<'c>(
     compiled: &BenchmarkCompiledFunction<'c>,
     input: XlaArray<'c>,
 ) -> Result<XlaArray<'c>, Box<dyn std::error::Error>> {
-    match compiled.executable_function().execute(domain, XlaValue::Array(input))? {
+    match compiled.executable().execute(domain, XlaValue::Array(input))? {
         XlaValue::Array(output) => Ok(output),
         XlaValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
         XlaValue::Reference(_) => Err("compilation benchmark produced a reference".into()),

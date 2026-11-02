@@ -218,7 +218,7 @@ pub struct JittedXlaFunction<
 {
     /// Array IR domain dispatcher hidden behind the public array projection boundary.
     function:
-        CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+        CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>, F>,
 }
 
 impl<'c, F, Static, In, Out> Clone for JittedXlaFunction<'c, F, Static, In, Out>
@@ -229,7 +229,7 @@ where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>:
+    CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>, F>:
         Clone,
 {
     #[inline]
@@ -391,7 +391,7 @@ pub struct StatefulJittedXlaFunction<
     Out::Family: ParameterizedFamily<XlaConstant>,
 {
     /// Backend-neutral dispatcher retaining heterogeneous runtime values and compiled specializations.
-    function: CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, In, Out>,
+    function: CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, In, Out, F>,
 }
 
 impl<'c, F, Static, In, Out> Clone for StatefulJittedXlaFunction<'c, F, Static, In, Out>
@@ -402,7 +402,7 @@ where
     In::Family: ParameterizedFamily<XlaConstant>,
     Out: Parameterized<ArrayIrType>,
     Out::Family: ParameterizedFamily<XlaConstant>,
-    CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, In, Out>: Clone,
+    CoreCompiledFunctionDispatcher<XlaDomain<'c>, Static, In, Out, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -583,7 +583,7 @@ where
     /// Returns the runtime-only executable handle.
     #[inline]
     pub fn executable_function(&self) -> &ExecutableFunction<XlaDomain<'c>, In, Out> {
-        self.function.executable_function()
+        self.function.executable()
     }
 
     /// Executes synchronously and returns public outputs after the reference transaction completes.
@@ -596,7 +596,7 @@ where
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
     ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
-        self.function.executable_function().execute_statefully_and_wait(domain, inputs)
+        self.function.executable().execute_statefully_and_wait(domain, inputs)
     }
 
     /// Submits a stateful call and returns its non-cancelling completion-bearing result.
@@ -608,14 +608,14 @@ where
         domain: &XlaDomain<'c>,
         inputs: In::To<XlaStatefulValue<'c>>,
     ) -> StatefulExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
-        self.function.executable_function().execute_statefully(domain, inputs)
+        self.function.executable().execute_statefully(domain, inputs)
     }
 
     /// Returns the public flat output types, excluding the hidden final-state output suffix that reference
     /// discharge appends for mutated external references.
     #[inline]
     pub fn output_types(&self) -> &[ArrayIrType] {
-        self.function.executable_function().output_types()
+        self.function.executable().output_types()
     }
 }
 
@@ -901,7 +901,7 @@ impl<'c> XlaDomain<'c> {
             });
         }
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
-        executable.function.validate_flat_input_count(flat_inputs.as_slice())?;
+        executable.function.validate_input_count(flat_inputs.len())?;
         for (expected, actual) in executable.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
             crate::experimental::domains::validate_xla_input_type(
                 <&ArrayType>::try_from(expected).map_err(ProgramError::from)?,
@@ -922,10 +922,11 @@ impl<'c> XlaDomain<'c> {
             executable.function.compiled_program().output_types(),
             flat_outputs.as_slice(),
         )?;
-        let outputs = executable
-            .function
-            .reconstruct_outputs(flat_outputs.into_iter().map(XlaValue::Array).collect())
-            .map_err(XlaDomainError::from)?;
+        let outputs = XlaProgramParameterValues::<Out, XlaValue<'c>>::from_parameters(
+            executable.function.output_structure().clone(),
+            flat_outputs.into_iter().map(XlaValue::Array),
+        )
+        .map_err(ProgramError::from)?;
         Ok(Execution::new(project_arrays::<Out>(outputs)?, fence))
     }
 
@@ -1090,13 +1091,13 @@ where
     /// Returns a runtime-only handle that omits staged and lowered transform metadata.
     #[inline]
     pub fn executable_function(&self) -> ExecutableXlaFunction<'c, In, Out> {
-        ExecutableXlaFunction { function: self.function.executable_function().clone() }
+        ExecutableXlaFunction { function: self.function.executable().clone() }
     }
 
     /// Consumes this transformable handle and returns its runtime-only executable state.
     #[inline]
     pub fn into_executable_function(self) -> ExecutableXlaFunction<'c, In, Out> {
-        ExecutableXlaFunction { function: self.function.into_executable_function() }
+        ExecutableXlaFunction { function: self.function.into_executable() }
     }
 
     /// Returns the staged function this executable was compiled from.
@@ -3179,8 +3180,7 @@ mod tests {
         let input = XlaValue::Array(
             XlaArray::from_host_buffer(&domain, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap(),
         );
-        let (XlaValue::Array(typed), XlaValue::Array(flat)) =
-            compiled.executable_function().execute(&domain, input).unwrap()
+        let (XlaValue::Array(typed), XlaValue::Array(flat)) = compiled.executable().execute(&domain, input).unwrap()
         else {
             panic!("capture-only calls must return arrays");
         };

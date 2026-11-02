@@ -1009,10 +1009,10 @@ impl<Static, Structure, Key> SpecializationKey<Static, Structure, Key> {
 #[cfg_attr(doc, ryft_macros::mermaid)]
 pub struct CompiledFunctionDispatcher<
     C: CompilationDomain<Type: Eq + Hash>,
-    F,
     Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<C::Type>,
     Output: Parameterized<C::Type>,
+    F,
 > where
     Input::Family: ParameterizedFamily<C::Constant>,
     Input::ParameterStructure: Eq + Hash,
@@ -1022,10 +1022,7 @@ pub struct CompiledFunctionDispatcher<
     state: Arc<CompiledFunctionDispatcherState<C, F, Static, Input, Output>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<C, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
-    for CompiledFunctionDispatcher<C, F, Static, Input, Output>
+impl<C, Static: Clone + Debug + Eq + Hash, Input, Output, F> CompiledFunctionDispatcher<C, Static, Input, Output, F>
 where
     C: CompilationDomain,
     C::Type: Eq + Hash,
@@ -1035,27 +1032,14 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
-    fn clone(&self) -> Self {
-        Self { state: self.state.clone() }
-    }
-}
-
-impl<C, F, Static: Clone + Debug + Eq + Hash, Input, Output> CompiledFunctionDispatcher<C, F, Static, Input, Output>
-where
-    C: CompilationDomain,
-    C::Type: Eq + Hash,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant>,
-    Input::ParameterStructure: Eq + Hash,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant>,
-{
-    /// Creates a dispatcher for `function` that retains at most `capacity` specializations.
+    /// Creates a [`CompiledFunctionDispatcher`] for `function` that retains at most `capacity` specializations.
+    #[inline]
     pub(crate) fn new(domain: &C, function: F, options: C::Options, capacity: usize) -> Self {
         Self::from_domain(DispatcherDomain::Explicit(domain.clone()), function, options, capacity)
     }
 
-    /// Creates a dispatcher that selects its domain from its first non-empty invocation.
+    /// Creates a [`CompiledFunctionDispatcher`] that selects its domain from its first non-empty invocation.
+    #[inline]
     pub(crate) fn inferred(function: F, options: C::Options, capacity: usize) -> Self
     where
         C::Value: Value<Domain = C>,
@@ -1068,7 +1052,8 @@ where
         )
     }
 
-    /// Creates the shared dispatcher state with an explicit or deferred domain selection.
+    /// Creates a [`CompiledFunctionDispatcher`] with an explicit or deferred domain selection.
+    #[inline]
     fn from_domain(domain: DispatcherDomain<C>, function: F, options: C::Options, capacity: usize) -> Self {
         Self {
             state: Arc::new(CompiledFunctionDispatcherState {
@@ -1083,16 +1068,15 @@ where
     }
 
     /// Returns this dispatcher with the types at which its runtime inputs are staged (which also determine their
-    /// dispatch keys and compiled signatures) declared in the structure of its inputs, as JAX's `abstracted_axes`
-    /// does. A `Some` leaf stages its input at that type instead of at the input's own type, so that one
-    /// specialization serves every runtime input whose type refines it, and a `None` leaf keeps its input exact (as in
-    /// [`Parameterized::replace_parameters`]).
-    /// For example, declaring `Some(dimension<n ∈ [1, 9)>)` for a first-class dimension input reuses one
-    /// specialization for every extent from 1 to 8. Inputs declared with one shared identity (e.g., two `dimension<n>`
-    /// inputs, or a `dimension<n>` input and an `f32[n]` input) must agree at runtime. Every call validates its inputs
-    /// against the declared types before dispatching, and rejects a violation (including inputs whose structure
-    /// differs from the declaration) rather than producing another specialization. The declared types are created
-    /// once by the caller, so their identities, and thus the dispatch keys, are stable across calls.
+    /// dispatch keys and compiled signatures) declared in the structure of its inputs, as JAX's `abstracted_axes` does.
+    /// A [`Some`] leaf stages its input at that type instead of at the input's own type, so that one specialization
+    /// serves every runtime input whose type refines it, and a [`None`] leaf keeps its input exact. For example,
+    /// declaring `Some(dimension<n ∈ [1, 9)>)` for a first-class dimension input reuses one specialization for every
+    /// extent from `1` to `8`. Inputs declared with one shared identity (e.g., two `dimension<n>` inputs, or a
+    /// `dimension<n>` input and an `f32[n]` input) must agree at runtime. Every call validates its inputs against the
+    /// declared types before dispatching, and rejects a violation (including inputs whose structure differs from the
+    /// declaration) rather than producing another specialization. The declared types are created once by the caller,
+    /// so their identities, and thus the dispatch keys, are stable across calls.
     ///
     /// # Errors
     ///
@@ -1125,8 +1109,9 @@ where
         }
     }
 
-    /// Returns the declared staged input types of this dispatcher (refer to [`Self::with_staged_input_types`]), or
-    /// [`None`] when every input is staged at its own type.
+    /// Returns the declared staged input types of this dispatcher, or [`None`] when every input is staged at its own
+    /// type. Refer to the documentation of [`Self::with_staged_input_types`] for more information.
+    #[inline]
     pub fn staged_input_types(&self) -> Option<Input::To<Option<C::Type>>>
     where
         Input::Family: ParameterizedFamily<Option<C::Type>>,
@@ -1171,7 +1156,10 @@ where
         self.state.specializations.clear();
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Invalidates every retained specialization for `static_parameters` and returns the number removed.
+    #[inline]
     pub fn invalidate_static(&self, static_parameters: &Static) -> usize {
         self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
     }
@@ -1413,6 +1401,23 @@ where
             input_types[index] = staged_type.clone();
         }
         Ok(input_types)
+    }
+}
+
+impl<C, Static: Clone + Debug + Eq + Hash, Input, Output, F> Clone
+    for CompiledFunctionDispatcher<C, Static, Input, Output, F>
+where
+    C: CompilationDomain,
+    C::Type: Eq + Hash,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Input::ParameterStructure: Eq + Hash,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { state: self.state.clone() }
     }
 }
 
@@ -2333,7 +2338,7 @@ pub(crate) mod tests {
 
         // Eager dimension values have static types, so by default each runtime extent gets its own specialization,
         // which separately created values of that extent share because static types have no identity.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), ArrayIrType, ArrayIrType, _> =
             domain.jit(zeros);
         assert_eq!(function.call((), three.clone()), Ok(three_zeros.clone()));
         assert_eq!(function.call((), four.clone()), Ok(four_zeros.clone()));
@@ -2348,7 +2353,7 @@ pub(crate) mod tests {
         // Declaring a symbolic staged type for the input makes calls with different runtime extents share one staged
         // input type, and therefore one retained trace, lowering, and compiled specialization, while still producing
         // outputs with different logical shapes.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), ArrayIrType, ArrayIrType, _> =
             domain.jit(zeros).with_staged_input_types(Some(extent_type.clone().into())).unwrap();
         assert_eq!(function.staged_input_types(), Some(Some(extent_type.clone().into())));
         assert_eq!(function.call((), three), Ok(three_zeros));
@@ -2375,7 +2380,7 @@ pub(crate) mod tests {
         assert_eq!(function.specialization_count(), 1);
 
         // Staged input types must be declared before the dispatcher is shared.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), ArrayIrType, ArrayIrType, _> =
             domain.jit(zeros);
         let _clone = function.clone();
         assert!(matches!(
@@ -2420,7 +2425,7 @@ pub(crate) mod tests {
 
         // Distinct declared identities abstract each input independently, so calls that differ only in their runtime
         // extents share one specialization.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> = domain
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
             .jit(zeros)
             .with_staged_input_types(vec![Some(rows.clone().into()), Some(columns.clone().into())])
             .unwrap();
@@ -2435,7 +2440,7 @@ pub(crate) mod tests {
         assert_eq!(function.specialization_count(), 1);
 
         // One declared identity shared by both inputs requires their runtime extents to agree.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> = domain
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
             .jit(zeros)
             .with_staged_input_types(vec![Some(rows.clone().into()), Some(rows.clone().into())])
             .unwrap();
@@ -2456,7 +2461,7 @@ pub(crate) mod tests {
 
         // A `None` leaf keeps its input exact, so only calls that also agree on that input's extent share one
         // specialization.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> =
             domain.jit(zeros).with_staged_input_types(vec![Some(rows.clone().into()), None]).unwrap();
         assert_eq!(function.staged_input_types(), Some(vec![Some(rows.clone().into()), None]));
         for (rows_extent, columns_extent) in [(2, 3), (3, 3), (2, 4)] {
@@ -2470,7 +2475,7 @@ pub(crate) mod tests {
         assert_eq!(function.specialization_count(), 2);
 
         // Inputs must have the structure of the declaration, which otherwise would apply its leaves to other inputs.
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, (), Vec<ArrayIrType>, ArrayIrType, _> =
             domain.jit(zeros).with_staged_input_types(vec![Some(rows.clone().into())]).unwrap();
         assert!(matches!(
             function.call((), extents(2, 3)),
@@ -2484,13 +2489,13 @@ pub(crate) mod tests {
     fn test_compiled_function_dispatcher_domain() {
         // An explicit dispatcher reports its domain from construction.
         let domain = CarriedDomain::new();
-        let explicit: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let explicit: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             domain.jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
         assert_eq!(explicit.domain(), Some(&domain));
 
         // An inferred dispatcher reports no domain until a call through any clone selects one, which all clones then
         // share and which clearing the cache does not reset.
-        let inferred: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let inferred: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
         let clone = inferred.clone();
         assert_eq!(inferred.domain(), None);
@@ -2503,7 +2508,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_invalidate_static() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
@@ -2521,7 +2526,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
@@ -2542,7 +2547,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_with_empty_inputs() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), (), ()> = domain.jit(|(), ()| Ok(()));
+        let function: CompiledFunctionDispatcher<TestDomain, (), (), (), _> = domain.jit(|(), ()| Ok(()));
 
         assert!(function.domain().is_some());
         assert_eq!(domain.compilation_count(), 0);
@@ -2558,7 +2563,7 @@ pub(crate) mod tests {
         // warm calls and on the cold calls that follow cache clearing.
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
         assert_eq!(function.call((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
         assert_eq!(function.call((), second_domain.scalar(2.0)), Ok(first_domain.scalar(-2.0)));
@@ -2573,7 +2578,7 @@ pub(crate) mod tests {
         // Empty inputs carry no domain, so they fail before tracing until a non-empty call selects one.
         let domain = CarriedDomain::new();
         let traces = AtomicUsize::new(0);
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), Vec<ArrayType>, Vec<ArrayType>> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), Vec<ArrayType>, Vec<ArrayType>, _> =
             jit(|(), inputs: Vec<CompilationTracer<CarriedDomain>>| {
                 traces.fetch_add(1, Ordering::Relaxed);
                 Ok(inputs)
@@ -2596,7 +2601,7 @@ pub(crate) mod tests {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             domain.jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), options);
 
         assert!(matches!(
@@ -2619,7 +2624,7 @@ pub(crate) mod tests {
         }
 
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, CollidingStatic, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, CollidingStatic, ArrayType, ArrayType, _> =
             domain.jit(|static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
                 Ok(if static_parameters.0 { input.unary(NegOperation::new()) } else { input })
             });
@@ -2639,7 +2644,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_partitions_input_structures() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, (), Vec<ArrayType>, ArrayType, _> =
             domain.jit(|(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
                 inputs.drain(..1).next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
@@ -2659,7 +2664,7 @@ pub(crate) mod tests {
         // container arity. Key reuse across these calls would therefore silently return the first call's staged
         // behavior for the second call's structurally different input.
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<Vec<ArrayType>>, Vec<ArrayType>> =
+        let function: CompiledFunctionDispatcher<TestDomain, (), Vec<Vec<ArrayType>>, Vec<ArrayType>, _> =
             domain.jit(|(), inputs: Vec<Vec<CompilationTracer<TestDomain>>>| {
                 if inputs.len() == 1 {
                     Ok(inputs.into_iter().next().unwrap())
@@ -2682,7 +2687,7 @@ pub(crate) mod tests {
         // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
         // specialization regardless of construction order, and replay must bind flat inputs to the same leaves.
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, (), BTreeMap<&'static str, ArrayType>, ArrayType, _> =
             domain.jit(|(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
                 inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
@@ -2698,7 +2703,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_retries_tracing_failures() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|fail, input: CompilationTracer<TestDomain>| {
                 if fail {
                     Err(ProgramError::InvalidArgument { message: "expected trace failure".into() })
@@ -2724,7 +2729,7 @@ pub(crate) mod tests {
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
         let attempts = AtomicUsize::new(0);
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| {
                 if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                     Err(ProgramError::InvalidArgument { message: "expected trace failure".into() })
@@ -2747,7 +2752,7 @@ pub(crate) mod tests {
     fn test_compiled_function_dispatcher_call_retries_lowering_and_compilation_failures() {
         let lowering_domain = TestDomain::new();
         let lowering_options = TestOptions { fail_lowering: true, ..TestOptions::default() };
-        let lowering_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+        let lowering_function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             lowering_domain.jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), lowering_options);
         for _ in 0..2 {
             assert!(matches!(
@@ -2761,7 +2766,7 @@ pub(crate) mod tests {
 
         let compilation_domain = TestDomain::new();
         let compilation_options = TestOptions { fail_compilation: true, ..TestOptions::default() };
-        let compilation_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+        let compilation_function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             compilation_domain
                 .jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), compilation_options);
         for _ in 0..2 {
@@ -2781,7 +2786,7 @@ pub(crate) mod tests {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             domain.jit_with_options(|(), input: CompilationTracer<TestDomain>| Ok(input), options);
 
         for _ in 0..2 {
@@ -2804,7 +2809,7 @@ pub(crate) mod tests {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(move |_, input: CompilationTracer<TestDomain>| {
                 if let Some(call) = closure_recursive.borrow().as_ref() {
                     call()?;
@@ -2828,7 +2833,7 @@ pub(crate) mod tests {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(move |nested, input: CompilationTracer<TestDomain>| {
                 if nested {
                     if let Some(call) = closure_recursive.borrow().as_ref() {
@@ -2848,9 +2853,9 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_isolates_dispatchers() {
         let domain = TestDomain::new();
-        let first: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+        let first: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             domain.jit(|(), input: CompilationTracer<TestDomain>| Ok(input));
-        let second: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+        let second: CompiledFunctionDispatcher<TestDomain, (), ArrayType, ArrayType, _> =
             domain.jit(|(), input: CompilationTracer<TestDomain>| Ok(input));
 
         assert_eq!(first.call((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
@@ -2865,7 +2870,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_concurrent_warm_calls() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
@@ -2892,7 +2897,7 @@ pub(crate) mod tests {
     #[test]
     fn test_compiled_function_dispatcher_call_concurrent_cold_misses() {
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });
@@ -2926,7 +2931,7 @@ pub(crate) mod tests {
         // both calls.
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input));
 
         let barrier = std::sync::Barrier::new(2);
@@ -2958,7 +2963,7 @@ pub(crate) mod tests {
     fn test_compiled_function_dispatcher_call_statefully_async() {
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
         assert_eq!(
             function.call_statefully_async((), first_domain.scalar(1.0)).r#await(),
@@ -2976,7 +2981,7 @@ pub(crate) mod tests {
     fn test_compiled_function_dispatcher_call_statefully() {
         let first_domain = CarriedDomain::new();
         let second_domain = CarriedDomain::new();
-        let function: CompiledFunctionDispatcher<CarriedDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<CarriedDomain, (), ArrayType, ArrayType, _> =
             jit(|(), input: CompilationTracer<CarriedDomain>| Ok(input.unary(NegOperation::new())));
         assert_eq!(function.call_statefully((), first_domain.scalar(1.0)), Ok(first_domain.scalar(-1.0)));
         assert_eq!(function.domain(), Some(&first_domain));
@@ -2988,9 +2993,9 @@ pub(crate) mod tests {
     fn test_compiled_function_dispatcher_send_and_sync() {
         fn assert_send_and_sync<T: Send + Sync>() {}
         fn assert_dispatcher_send_and_sync<F: Send + Sync>(
-            _function: &CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>,
+            _function: &CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, F>,
         ) {
-            assert_send_and_sync::<CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>>();
+            assert_send_and_sync::<CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, F>>();
         }
 
         assert_send_and_sync::<StagedFunction<TestDomain, ArrayType, ArrayType>>();
@@ -2998,7 +3003,7 @@ pub(crate) mod tests {
         assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
 
         let domain = TestDomain::new();
-        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, bool, ArrayType, ArrayType, _> =
             domain.jit(|negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegOperation::new()) } else { input })
             });

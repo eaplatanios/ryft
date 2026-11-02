@@ -1393,8 +1393,8 @@ mod cutile {
         let runtime = runtime_session.domain();
         let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
         let executable = compiled
-            .executable_function()
-            .with_compiled_program(Arc::new(restored), compiled.executable_function().output_types().to_vec());
+            .executable()
+            .with_compiled_program(Arc::new(restored), compiled.executable().output_types().to_vec());
         let mut arrays = case
             .input_types
             .iter()
@@ -1764,7 +1764,7 @@ mod tuning {
             .map_err(error)?;
             // The existing lower/compile path performs real adapter admission before artifact lookup.
             let compiled = staged.lower(&self.domain).map_err(error)?.compile(&self.domain).map_err(error)?;
-            self.executable = Some(compiled.executable_function().clone());
+            self.executable = Some(compiled.executable().clone());
             Ok(())
         }
 
@@ -2321,8 +2321,8 @@ mod triton {
         let runtime = session.domain();
         let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
         let executable = compiled
-            .executable_function()
-            .with_compiled_program(Arc::new(restored), compiled.executable_function().output_types().to_vec());
+            .executable()
+            .with_compiled_program(Arc::new(restored), compiled.executable().output_types().to_vec());
         let inputs = case
             .input_types
             .iter()
