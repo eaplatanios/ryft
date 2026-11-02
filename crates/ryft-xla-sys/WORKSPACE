@@ -21,6 +21,7 @@ http_archive(
         "//patches:xla-fp6-nan-predicate.patch",
         "//patches:xla-llvm-sharded-op-defs.patch",
         "//patches:xla-llvm-windows-symlinks.patch",
+        "//patches:xla-xnnpack-integer-min-max.patch",
     ],
     sha256 = XLA_SHA256,
     strip_prefix = "xla-{commit}".format(commit = XLA_COMMIT),
