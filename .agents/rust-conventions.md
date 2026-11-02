@@ -73,6 +73,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   reference is obtained by binding the `Cow` and calling `.as_ref()`.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
+- Define context-dependent frontend APIs on the corresponding context or domain capability. Global convenience
+  functions should recover the context from input values instead of taking an explicit context argument. Keep the
+  explicit functions available for empty inputs and deliberate context selection.
 - When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
   reparameterized form (e.g., `Input::To<T>`) instead of introducing a separate generic metadata type that is
   only coupled by matching `ParameterStructure`s.
