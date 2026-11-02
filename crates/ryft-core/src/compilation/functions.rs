@@ -952,7 +952,7 @@ where
     /// that carries the completion of the whole invocation.
     ///
     /// The returned completion owns error observation but not cancellation. The semantics of submission and of the
-    /// publication of reference state are defined by [`StatefulCompilationDomain::execute_statefully_async`].
+    /// publication of reference state are defined by [`StatefulCompilationDomain::execute_statefully`].
     pub fn call_statefully_async(
         &self,
         domain: &C,
@@ -966,7 +966,7 @@ where
             Err(error) => return ReferenceExecution::ready(Err(error.into())),
         };
         domain
-            .execute_statefully_async(self.compiled_program(), inputs)
+            .execute_statefully(self.compiled_program(), inputs)
             .and_then(|outputs| self.reconstruct_outputs(outputs).map_err(C::Error::from))
     }
 
