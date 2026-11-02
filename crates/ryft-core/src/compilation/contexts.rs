@@ -96,17 +96,15 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ) -> Result<Vec<Self::Value>, Self::Error>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Optional execution capability for compiled functions that bind external mutable references. Implementations must
 /// keep hidden state results out of the outputs that they return and preserve their reference transaction guarantees
 /// even when the public output has no leaves or fails reconstruction.
 pub trait StatefulCompilationDomain: CompilationDomain {
     /// Executes a compiled program that binds external mutable references and returns its flat outputs together with
-    /// the completion of the whole invocation, without waiting for that completion. The parameters are the same as for
-    /// [`CompilationDomain::execute`]. Callers use [`ExecutableFunction::call_statefully_async`] rather than calling
-    /// this function directly.
-    fn execute_statefully_async(
+    /// the completion of the whole invocation, _without_ waiting for that completion. The parameters are the same as
+    /// for [`CompilationDomain::execute`]. Callers use [`ExecutableFunction::call_statefully_async`] rather than
+    /// calling this function directly.
+    fn execute_statefully(
         &self,
         program: &Self::CompiledProgram,
         inputs: Vec<Self::Value>,
@@ -114,7 +112,6 @@ pub trait StatefulCompilationDomain: CompilationDomain {
 }
 
 /// Optional capability for caching backend-compiled programs in a [`CompilationContext`](crate::CompilationContext).
-///
 /// Cache identity is derived from the lowered program alone. [`CompilationDomain::lower`] folds every option, compiler,
 /// target, and topology property that affects compilation into [`CompilationDomain::LoweredProgram`], so key equality
 /// always means that compiled programs are interchangeable.
@@ -122,15 +119,13 @@ pub trait CompilationCacheDomain: CompilationDomain {
     /// Exact structural cache key for interchangeable compiled programs.
     type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    /// Constructs the exact cache key for `program`.
+    /// Constructs the exact compilation cache key for `program`.
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error>;
 
-    /// Returns stable canonical bytes for persistent cache identity, or [`None`] when this domain does not support
-    /// persistent executable caching.
-    ///
-    /// These bytes must remain stable across processes that may share the cache and must cover the complete
-    /// computation, options, compiler and backend versions, and target topology. Core hashes them only to obtain safe
-    /// filenames and does not add any missing semantic state.
+    /// Returns stable canonical bytes for persistent compilation cache identity, or [`None`] when this domain does not
+    /// support persistent executable caching. These bytes must remain stable across processes that may share the cache
+    /// and must cover the complete computation, options, compiler and backend versions, and target topology. Core
+    /// hashes them only to obtain safe filenames and does not add any missing semantic state.
     #[inline]
     fn persistent_cache_key(&self, _key: &Self::CacheKey) -> Option<Vec<u8>> {
         None
@@ -148,6 +143,8 @@ pub trait CompilationCacheDomain: CompilationDomain {
         Ok(None)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Optional capability for inspecting a compiled program without recompiling it.
 ///
