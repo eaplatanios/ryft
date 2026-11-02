@@ -1,7 +1,7 @@
 #[cfg(any(
     feature = "cuda-12",
     feature = "cuda-13",
-    feature = "rocm-7",
+    feature = "rocm-10",
     feature = "tpu",
     feature = "neuron",
     feature = "metal",
@@ -19,9 +19,9 @@ pub fn pjrt_cuda_13_plugin_path() -> PathBuf {
     PathBuf::from(env!("RYFT_PJRT_PLUGIN_CUDA_13"))
 }
 
-#[cfg(feature = "rocm-7")]
-pub fn pjrt_rocm_7_plugin_path() -> PathBuf {
-    PathBuf::from(env!("RYFT_PJRT_PLUGIN_ROCM_7"))
+#[cfg(feature = "rocm-10")]
+pub fn pjrt_rocm_10_plugin_path() -> PathBuf {
+    PathBuf::from(env!("RYFT_PJRT_PLUGIN_ROCM_10"))
 }
 
 #[cfg(feature = "tpu")]

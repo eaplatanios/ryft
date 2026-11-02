@@ -169,7 +169,7 @@ mod tests {
     fn test_stream_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     assert!(plugin.stream_extension().is_ok());
                     assert!(client.stream_extension().is_ok());
                 }
@@ -186,7 +186,7 @@ mod tests {
         test_for_each_platform!(|plugin, client, platform| {
             let device = client.addressable_devices().unwrap()[0].clone();
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     assert!(device.stream_for_external_ready_events().is_ok());
                 }
                 _ => {
@@ -204,7 +204,7 @@ mod tests {
                     assert!(matches!(plugin.stream_extension(), Err(Error::Unimplemented { .. })));
                     assert!(matches!(client.stream_extension(), Err(Error::Unimplemented { .. })));
                 }
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     let device = client.addressable_devices().unwrap()[0].clone();
                     let buffer =
                         client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4], None, device.clone(), None).unwrap();

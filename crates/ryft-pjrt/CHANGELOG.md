@@ -48,15 +48,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and return an owned serialized `HloModuleMetadataProto` trace, releasing the plugin-owned trace storage.
 - Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
   launcher behind the `cuda-12` and `cuda-13` features.
-- Introduced `Error::MissingFunction`.
+- Added `Error::MissingFunction`.
+- Added per-execution `custom_options` to `LoadedExecutable::execute` and `FfiExecutionContext::custom_options` for
+  reading them from an XLA FFI invocation, separately from static call attributes.
+- Added optional recording handlers to `GpuCustomCallTypedHandler` and explicit recording capability detection for
+  GPU custom call registrations.
+- Added optional serialized `HloModuleConfigProto` input to `XlaTransform::transform_module`, preserving compatibility
+  with callbacks invoked by plugins whose argument struct predates that field.
+- Added live task incarnation snapshots to cross-host send/receive APIs and explicit cancellation notifier admission
+  to the deprecated receive API. Deprecated sends now provide the native descriptor destructor and keep descriptor
+  data alive independently from completion callback state.
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.115` and XLA FFI bindings for version `0.4`, including
+- Updated our PJRT C API bindings for version `0.117` and XLA FFI bindings for version `0.5`, including
   GPU handler traits, the recording stage, invocation extensions, and preservation of native FFI error codes.
   FFI state access now rejects both execution and recording stages before calling native code, and invocation
   extensions validate their generic header before exposing borrowed backend data. `FfiHandlerBundle::new` now requires
   a `record` argument, and `GpuCustomCallTypedHandler::new` now requires a `traits` argument.
+- Updated ROCm support to version 10 with the `rocm-10` feature and `load_rocm_10_plugin` loader.
 - Renamed `GpuClientOptions::use_tfrt_gpu_client` to `use_async_dispatch` to reflect upstream's asynchronous host
   dispatch behavior in the Stream Executor client. The serialized native option key remains `use_tfrt_gpu_client`.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
@@ -91,8 +101,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   allocations, avoiding fence allocations and callback registrations for already completed successful executions,
   and allocating event waker storage only when a pending event is polled.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
+- Corrected `Topology::proto` and `SerializedTopology::proto` to return the complete `protos::Topology` envelope,
+  preserving platform metadata and its opaque `Any` payload. Removed the obsolete `TopologyProto` enum and the
+  platform-specific decoder guessing that rejected valid CPU topologies or silently misidentified them as GPU data.
 - Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures,
   distinguishing unavailable functions from native calls that return an unimplemented status.
+- Error buffers now pass their layout through the new `device_layout` field.
 
 ### Fixed
 

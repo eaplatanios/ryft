@@ -49,6 +49,14 @@ impl GpuCustomCallExtension {
             (*self.handle).base.struct_size >= offset + size_of::<bool>() && (*self.handle).custom_call_handles_traits
         }
     }
+
+    /// Returns whether the plugin supports GPU custom call recording handlers.
+    pub fn supports_recording(&self) -> bool {
+        unsafe {
+            let offset = std::mem::offset_of!(ffi::PJRT_Gpu_Custom_Call_Extension, custom_call_handles_record);
+            (*self.handle).base.struct_size >= offset + size_of::<bool>() && (*self.handle).custom_call_handles_record
+        }
+    }
 }
 
 unsafe impl Send for GpuCustomCallExtension {}
@@ -169,12 +177,18 @@ impl Api {
                         handler_initialize = std::ptr::null_mut(),
                         handler_execute = handler.execute,
                         traits = 0,
+                        handler_record = std::ptr::null_mut(),
                     },
                 )
             }
             GpuCustomCallHandler::Typed(handler) => {
                 if handler.traits.bits() != 0 && !extension.supports_handler_traits() {
                     return Err(Error::unimplemented("the GPU custom call extension does not support handler traits"));
+                }
+                if handler.record.is_some() && !extension.supports_recording() {
+                    return Err(Error::unimplemented(
+                        "the GPU custom call extension does not support recording handlers",
+                    ));
                 }
                 invoke_pjrt_api_error_fn!(
                     @extension ffi::PJRT_Gpu_Custom_Call_Extension => extension,
@@ -194,6 +208,9 @@ impl Api {
                             .unwrap_or(std::ptr::null_mut()),
                         handler_execute = handler.execute.to_c_api() as *mut std::ffi::c_void,
                         traits = handler.traits.bits(),
+                        handler_record = handler.record
+                            .map(|handler| handler.to_c_api() as *mut std::ffi::c_void)
+                            .unwrap_or(std::ptr::null_mut()),
                     },
                 )
             }
@@ -215,8 +232,8 @@ pub enum GpuCustomCallHandler {
     /// Typed [XLA FFI](https://openxla.org/xla/custom_call#xla-ffi) handler that provides type-safe buffer bindings
     /// structured attribute decoding from any backend-specific configuration, and access to the current execution
     /// context (e.g., stream, scratch allocator, etc.) through an XLA FFI call frame. Furthermore, it supports up to
-    /// four separate handler stages (i.e., _instantiation_, _preparation_, _initialization_, and _execution_), of which
-    /// only the _execution_ stage is required.
+    /// five separate handler stages (i.e., _instantiation_, _preparation_, _initialization_, _execution_, and
+    /// _recording_), of which only the _execution_ stage is required.
     Typed(GpuCustomCallTypedHandler),
 }
 
@@ -320,6 +337,9 @@ pub struct GpuCustomCallTypedHandler {
     execute: FfiHandler,
 
     /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
+    record: Option<FfiHandler>,
+
+    /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
     traits: FfiHandlerTraits,
 }
 
@@ -351,6 +371,8 @@ impl GpuCustomCallTypedHandler {
     ///     stream it obtains from the execution context, but it *must not* attempt to dereference any input device
     ///     buffers. This also means that it cannot have host-side control flow depend on the runtime values of those
     ///     buffers.
+    ///   - `record`: Optional handler for command-buffer recording. Registration fails if the plugin does not
+    ///     support recording handlers.
     ///   - `traits`: Behavioral [`FfiHandlerTraits`] advertised during registration. Registration fails if the plugin
     ///     cannot honor nonempty traits.
     pub fn new(
@@ -358,9 +380,10 @@ impl GpuCustomCallTypedHandler {
         prepare: Option<FfiHandler>,
         initialize: Option<FfiHandler>,
         execute: FfiHandler,
+        record: Option<FfiHandler>,
         traits: FfiHandlerTraits,
     ) -> Self {
-        Self { instantiate, prepare, initialize, execute, traits }
+        Self { instantiate, prepare, initialize, execute, record, traits }
     }
 }
 
@@ -369,13 +392,13 @@ unsafe impl Sync for GpuCustomCallTypedHandler {}
 
 impl From<FfiHandler> for GpuCustomCallTypedHandler {
     fn from(value: FfiHandler) -> Self {
-        Self::new(None, None, None, value, FfiHandlerTraits::NONE)
+        Self::new(None, None, None, value, None, FfiHandlerTraits::NONE)
     }
 }
 
 impl From<FfiHandler> for GpuCustomCallHandler {
     fn from(value: FfiHandler) -> Self {
-        Self::Typed(GpuCustomCallTypedHandler::new(None, None, None, value, FfiHandlerTraits::NONE))
+        Self::Typed(GpuCustomCallTypedHandler::new(None, None, None, value, None, FfiHandlerTraits::NONE))
     }
 }
 
@@ -390,7 +413,7 @@ pub(crate) mod ffi {
     use crate::errors::ffi::PJRT_Error;
     use crate::ffi::PJRT_Extension_Base;
 
-    pub const PJRT_API_GPU_EXTENSION_VERSION: usize = 3;
+    pub const PJRT_API_GPU_EXTENSION_VERSION: usize = 4;
 
     #[repr(C)]
     #[derive(Copy, Clone, Debug)]
@@ -404,6 +427,7 @@ pub(crate) mod ffi {
         pub handler_initialize: *mut std::ffi::c_void,
         pub handler_execute: *mut std::ffi::c_void,
         pub traits: u32,
+        pub handler_record: *mut std::ffi::c_void,
     }
 
     impl PJRT_Gpu_Register_Custom_Call_Args {
@@ -416,6 +440,7 @@ pub(crate) mod ffi {
             handler_initialize: *mut std::ffi::c_void,
             handler_execute: *mut std::ffi::c_void,
             traits: u32,
+            handler_record: *mut std::ffi::c_void,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -427,6 +452,7 @@ pub(crate) mod ffi {
                 handler_initialize,
                 handler_execute,
                 traits,
+                handler_record,
             }
         }
     }
@@ -439,6 +465,7 @@ pub(crate) mod ffi {
         pub base: PJRT_Extension_Base,
         pub PJRT_Gpu_Register_Custom_Call: Option<PJRT_Gpu_Register_Custom_Call>,
         pub custom_call_handles_traits: bool,
+        pub custom_call_handles_record: bool,
     }
 }
 
@@ -494,6 +521,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         };
         let executable = client.compile(&program, &options).unwrap();
         let device = executable.addressable_devices().unwrap()[0].clone();
@@ -518,16 +546,44 @@ mod tests {
             ],
             ..Default::default()
         };
-        let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+        let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None, &[]).unwrap();
         let outputs = execution.block_until_ready().unwrap().remove(0);
         assert_eq!(outputs.outputs.len(), 1);
+    }
+
+    #[test]
+    fn test_gpu_custom_call_extension_supports_recording() {
+        let mut api: crate::ffi::PJRT_Api = unsafe { std::mem::zeroed() };
+        api.struct_size = size_of::<crate::ffi::PJRT_Api>();
+        let api = unsafe { crate::Api::from_c_api(&api).unwrap() };
+        let mut handle = super::ffi::PJRT_Gpu_Custom_Call_Extension {
+            base: crate::ffi::PJRT_Extension_Base {
+                struct_size: size_of::<super::ffi::PJRT_Gpu_Custom_Call_Extension>(),
+                extension_type: crate::ffi::PJRT_Extension_Type_Gpu_Custom_Call,
+                next: std::ptr::null_mut(),
+            },
+            PJRT_Gpu_Register_Custom_Call: None,
+            custom_call_handles_traits: true,
+            custom_call_handles_record: true,
+        };
+        let extension = unsafe { super::GpuCustomCallExtension::from_c_api(&handle.base, api).unwrap() };
+        assert!(extension.supports_recording());
+        let handle = &mut handle as *mut super::ffi::PJRT_Gpu_Custom_Call_Extension;
+        unsafe { (*handle).custom_call_handles_record = false };
+        assert!(!extension.supports_recording());
+        unsafe {
+            (*handle).custom_call_handles_record = true;
+            (*handle).base.struct_size =
+                std::mem::offset_of!(super::ffi::PJRT_Gpu_Custom_Call_Extension, custom_call_handles_record);
+        }
+        assert!(!extension.supports_recording());
     }
 
     #[test]
     fn test_gpu_custom_call_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     assert!(plugin.gpu_custom_call_extension().is_ok());
                     assert!(client.gpu_custom_call_extension().is_ok());
                 }
@@ -543,7 +599,7 @@ mod tests {
     fn test_client_register_untyped_gpu_custom_call() {
         test_for_each_platform!(|_plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     // We use an atomic counter to track the number of times our custom call function is invoked.
                     static CALLBACK_INVOCATIONS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -591,7 +647,7 @@ mod tests {
     fn test_client_register_typed_gpu_custom_call() {
         test_for_each_platform!(|_plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
                     // We use an atomic counter to track the number of times our custom call function is invoked.
                     static CALLBACK_INVOCATIONS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

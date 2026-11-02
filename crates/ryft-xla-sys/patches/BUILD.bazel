@@ -2,4 +2,7 @@ exports_files([
     "jax-mosaic-c-api-visibility.patch",
     "jax-mosaic-gpu-runtime-symbols.patch",
     "xla-fp6-nan-predicate.patch",
+    "xla-llvm-sharded-op-defs.patch",
+    "xla-llvm-windows-symlinks.patch",
+    "xla-xnnpack-integer-min-max.patch",
 ])

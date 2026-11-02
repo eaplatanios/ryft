@@ -115,16 +115,16 @@ pub trait CmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn predicate(&self) -> Result<ComparisonPredicate, Error> {
         self.attribute(CMP_PREDICATE_ATTRIBUTE)?
             .and_then(|attribute| match attribute.to_string().as_str() {
-                "#index<cmp_predicate eq>" => Some(ComparisonPredicate::Equal),
-                "#index<cmp_predicate ne>" => Some(ComparisonPredicate::NotEqual),
-                "#index<cmp_predicate slt>" => Some(ComparisonPredicate::SignedLessThan),
-                "#index<cmp_predicate sle>" => Some(ComparisonPredicate::SignedLessThanOrEqual),
-                "#index<cmp_predicate sgt>" => Some(ComparisonPredicate::SignedGreaterThan),
-                "#index<cmp_predicate sge>" => Some(ComparisonPredicate::SignedGreaterThanOrEqual),
-                "#index<cmp_predicate ult>" => Some(ComparisonPredicate::UnsignedLessThan),
-                "#index<cmp_predicate ule>" => Some(ComparisonPredicate::UnsignedLessThanOrEqual),
-                "#index<cmp_predicate ugt>" => Some(ComparisonPredicate::UnsignedGreaterThan),
-                "#index<cmp_predicate uge>" => Some(ComparisonPredicate::UnsignedGreaterThanOrEqual),
+                "#index.cmp_predicate<eq>" => Some(ComparisonPredicate::Equal),
+                "#index.cmp_predicate<ne>" => Some(ComparisonPredicate::NotEqual),
+                "#index.cmp_predicate<slt>" => Some(ComparisonPredicate::SignedLessThan),
+                "#index.cmp_predicate<sle>" => Some(ComparisonPredicate::SignedLessThanOrEqual),
+                "#index.cmp_predicate<sgt>" => Some(ComparisonPredicate::SignedGreaterThan),
+                "#index.cmp_predicate<sge>" => Some(ComparisonPredicate::SignedGreaterThanOrEqual),
+                "#index.cmp_predicate<ult>" => Some(ComparisonPredicate::UnsignedLessThan),
+                "#index.cmp_predicate<ule>" => Some(ComparisonPredicate::UnsignedLessThanOrEqual),
+                "#index.cmp_predicate<ugt>" => Some(ComparisonPredicate::UnsignedGreaterThan),
+                "#index.cmp_predicate<uge>" => Some(ComparisonPredicate::UnsignedGreaterThanOrEqual),
                 _ => None,
             })
             .ok_or_else(|| Error::invalid_argument("invalid `pred` attribute in `index::cmp`"))
@@ -155,16 +155,16 @@ pub fn cmp<
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
             context.parse_attribute(match predicate {
-                ComparisonPredicate::Equal => "#index<cmp_predicate eq>",
-                ComparisonPredicate::NotEqual => "#index<cmp_predicate ne>",
-                ComparisonPredicate::SignedLessThan => "#index<cmp_predicate slt>",
-                ComparisonPredicate::SignedLessThanOrEqual => "#index<cmp_predicate sle>",
-                ComparisonPredicate::SignedGreaterThan => "#index<cmp_predicate sgt>",
-                ComparisonPredicate::SignedGreaterThanOrEqual => "#index<cmp_predicate sge>",
-                ComparisonPredicate::UnsignedLessThan => "#index<cmp_predicate ult>",
-                ComparisonPredicate::UnsignedLessThanOrEqual => "#index<cmp_predicate ule>",
-                ComparisonPredicate::UnsignedGreaterThan => "#index<cmp_predicate ugt>",
-                ComparisonPredicate::UnsignedGreaterThanOrEqual => "#index<cmp_predicate uge>",
+                ComparisonPredicate::Equal => "#index.cmp_predicate<eq>",
+                ComparisonPredicate::NotEqual => "#index.cmp_predicate<ne>",
+                ComparisonPredicate::SignedLessThan => "#index.cmp_predicate<slt>",
+                ComparisonPredicate::SignedLessThanOrEqual => "#index.cmp_predicate<sle>",
+                ComparisonPredicate::SignedGreaterThan => "#index.cmp_predicate<sgt>",
+                ComparisonPredicate::SignedGreaterThanOrEqual => "#index.cmp_predicate<sge>",
+                ComparisonPredicate::UnsignedLessThan => "#index.cmp_predicate<ult>",
+                ComparisonPredicate::UnsignedLessThanOrEqual => "#index.cmp_predicate<ule>",
+                ComparisonPredicate::UnsignedGreaterThan => "#index.cmp_predicate<ugt>",
+                ComparisonPredicate::UnsignedGreaterThanOrEqual => "#index.cmp_predicate<uge>",
             })?,
         )?
         .add_operand(lhs)?

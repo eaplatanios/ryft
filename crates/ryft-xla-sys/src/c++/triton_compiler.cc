@@ -330,9 +330,9 @@ void RYFT_XLA_Triton_Compile_Args_Destroy(RYFT_XLA_Triton_Compile_Args* args) {
 
 RYFT_XLA_Triton_Versions RYFT_XLA_Triton_Get_Versions() {
   RYFT_XLA_Triton_Versions versions{};
-  versions.xla = mlirStringRefCreateFromCString("eb6b90ed013f511eca088c52f541f3c0819f919e");
-  versions.jax = mlirStringRefCreateFromCString("a7606f995e1a92707cbeb257e487fa53e7abe84b");
-  versions.triton = mlirStringRefCreateFromCString("a77e7c793abc0d0c923a9afb275058e2fe57a198");
+  versions.xla = mlirStringRefCreateFromCString("f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163");
+  versions.jax = mlirStringRefCreateFromCString("9564ca1d3df0d312cad4346458b8d41ce5204ff7");
+  versions.triton = mlirStringRefCreateFromCString("2122e24efc1886bfa36337c1f5b07c47d827b1d4");
   versions.rocm_device_libs = mlirStringRefCreateFromCString("53996464fa8d94b182ac4aaa7dc3a109ab524f45");
   std::string assembler_version = "unavailable";
 #if defined(RYFT_TRITON_COMPILER)

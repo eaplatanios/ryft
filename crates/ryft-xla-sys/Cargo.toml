@@ -58,12 +58,12 @@ cuda-12 = []
 # to the internet during the build process.
 cuda-13 = []
 
-# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [ROCm 7](https://rocm.docs.amd.com/) plugin that
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [ROCm 10](https://rocm.docs.amd.com/) plugin that
 # enables using ROCm-supported accelerators. Note that if an appropriate `pjrt-plugin` archive is not found at the
-# location specified by the `PJRT_PLUGIN_ROCM_7_LIB` environment variable, then an attempt will be made to build it
+# location specified by the `PJRT_PLUGIN_ROCM_10_LIB` environment variable, then an attempt will be made to build it
 # from source using Bazel. However, this is not supported when using `cargo vendor` because it requires having access
 # to the internet during the build process.
-rocm-7 = []
+rocm-10 = []
 
 # Includes support for the [PJRT](https://openxla.org/xla/pjrt) [TPU](https://cloud.google.com/tpu) plugin that enables
 # using Google TPUs. Note that this plugin is only supported on Linux and is distributed as a precompiled binary, so if

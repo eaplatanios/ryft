@@ -87,21 +87,24 @@ potentially different build time and runtime requirements:
 
   Then, you will need to add this path to your `LD_LIBRARY_PATH`: `/usr/lib/nvshmem3/nvidia/nvshmem/lib`.
 
-- **`rocm-7`:** Enables support for loading the PJRT [ROCm 7](https://rocm.docs.amd.com/) plugin for leveraging
+- **`rocm-10`:** Enables support for loading the PJRT [ROCm 10](https://rocm.docs.amd.com/) plugin for leveraging
   ROCm-enabled GPUs by AMD. If this feature is enabled, similar to what happens with the static XLA library,
   the corresponding PJRT plugin can be built from source using Bazel (though that is not supported when using
   `cargo vendor` since it requires network access) or it can be provided as a precompiled archive using the
-  `PJRT_PLUGIN_ROCM_7_LIB` environment variable. Note that, by default this crate will attempt to download
+  `PJRT_PLUGIN_ROCM_10_LIB` environment variable. Note that, by default this crate will attempt to download
   a precompiled plugin from GitHub releases of `ryft`, if one can be found for the target platform and
-  `PJRT_PLUGIN_ROCM_7_LIB` is not set. Note that this plugin has various ROCm runtime dependencies that are not
-  included in the shared library provided by this feature. For Ubuntu, you can install these dependencies using
-  the following commands:
+  `PJRT_PLUGIN_ROCM_10_LIB` is not set. Note that this plugin has various ROCm runtime dependencies that are not
+  included in the shared library provided by this feature. The pinned XLA build uses AMD's ROCm 10.0.0 multiarch
+  distribution. Install a compatible AMD GPU driver, then use the matching runtime distribution with these commands:
 
   ```bash
-  wget https://repo.radeon.com/amdgpu-install/7.2/ubuntu/noble/amdgpu-install_7.2.70200-1_all.deb
-  sudo apt install ./amdgpu-install_7.2.70200-1_all.deb
-  sudo apt update -y
-  sudo apt install rocm rocm-core rocm-device-libs rocm-hip-sdk rocprofiler-sdk
+  wget https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-multiarch-10.0.0.tar.gz
+  sha256sum --check <<'SHA256'
+  1c5e807875d26a2470ecc7323daa5b5b9009208a55c3290ac255a909cde15fc6  therock-dist-linux-multiarch-10.0.0.tar.gz
+  SHA256
+  mkdir -p rocm-10.0.0
+  tar -xzf therock-dist-linux-multiarch-10.0.0.tar.gz -C rocm-10.0.0
+  export LD_LIBRARY_PATH="$PWD/rocm-10.0.0/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   ```
 
 - **`tpu`:** Enables support for loading the PJRT [TPU](https://cloud.google.com/tpu) plugin for leveraging
@@ -162,15 +165,16 @@ Currently, precompiled binaries are only available for the following target plat
     - Linux `aarch64`
     - MacOS `aarch64`
     - Windows `x86_64`
-- **PJRT Plugins for CUDA 12 & 13, ROCm 7, TPUs, and AWS Neuron:**
+- **PJRT Plugins for CUDA 12 & 13, ROCm 10, TPUs, and AWS Neuron:**
     - Linux `x86_64`
 - **PJRT Plugin for Metal (JAX Metal):**
     - MacOS `aarch64`
 - **PJRT Plugin for MPS (`jax-mps`):**
     - MacOS `aarch64`
 
-CUDA 12 and CUDA 13 build rows prove that the plugins and their native dependencies compile and link. They do not claim
-GPU execution. Executable Mosaic GPU and cuTile seam probes require the dedicated Linux NVIDIA workflow, a supported
+The CUDA 12 plugin targets compute capability 6.0 or newer, following the pinned Eigen headers' minimum. CUDA 12 and
+CUDA 13 build rows prove that the plugins and their native dependencies compile and link. They do not claim GPU
+execution. Executable Mosaic GPU and cuTile seam probes require the dedicated Linux NVIDIA workflow, a supported
 compute capability, NVIDIA driver r580 or newer, CUDA Toolkit 13.1 or newer, and the pinned cuTile toolchain.
 
 ### Native Archive Contract
@@ -190,7 +194,7 @@ shipped in Cargo source packages or native release archives.
 ### Mosaic GPU Contract
 
 The portable archive exposes the pinned Mosaic GPU dialect C API and the `mosaic_gpu-serde` pass. Its Rust constants
-record serde version 8, `MosaicGpuKernelProto` resource version 3, and the `mosaic_gpu_v2` XLA FFI target. Programs
+record serde version 9, `MosaicGpuKernelProto` resource version 4, and the `mosaic_gpu_v2` XLA FFI target. Programs
 cross the compiler boundary as MLIR bytecode; the private wheel functions `MosaicGpuCompile`, `MosaicGpuUnload`, and
 `MosaicGpuClearKernelCache` are not a supported ABI.
 
@@ -232,24 +236,40 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
       registration-only objects, including the PJRT CPU compiler.
 2. Rebuild and publish precompiled `ryft-xla-sys` artifacts using `.github/workflows/build_ryft_xla_sys.yaml`.
     - Make sure your OpenXLA upgrade changes are committed and pushed to a branch before triggering the workflow.
+    - Create and push `ryft-xla-sys-<XLA_COMMIT>` at that exact build commit. The workflow checks this tag before
+      starting native builds and records the build commit and run in the release. Pre-creating the tag also avoids
+      relying on the workflow token to create tags for commits that change workflow files. Do not move an existing
+      published tag without explicit approval.
     - Trigger the GitHub workflow that builds `ryft-xla-sys` on the branch that contains your changes:
       ```bash
       gh workflow run build_ryft_xla_sys.yaml --repo eaplatanios/ryft --ref <branch-name>
       ```
-    - You can use the following command to monitor the run until completion:
+    - You can use the following command to check the run status periodically:
       ```bash
-      gh run watch <run-id> --repo eaplatanios/ryft --exit-status
+      gh run view <run-id> --repo eaplatanios/ryft --json status,conclusion
       ```
       This workflow can take a couple of hours because it builds multiple platform-specific artifacts.
-    - If needed, download the produced artifacts locally for checksum verification:
+    - After successful publication, download the finalized release assets for checksum verification:
       ```bash
-      gh run download <run-id> --repo eaplatanios/ryft --dir /tmp/ryft-xla-sys-artifacts
+      gh release download ryft-xla-sys-<XLA_COMMIT> \
+        --repo eaplatanios/ryft \
+        --pattern '*.tar.gz' \
+        --dir /tmp/ryft-xla-sys-release
       ```
     - Confirm that the release tag follows the expected format (`ryft-xla-sys-<XLA_COMMIT>`), and then compute
-      the updated SHA-256 checksum for each artifact using this command from within the directory containing the
-      downloaded artifacts:
+      the updated SHA-256 checksum for every downloaded asset from its final bytes:
       ```bash
-      shasum -a 256 '*.tar.gz
+      shasum -a 256 /tmp/ryft-xla-sys-release/*.tar.gz
+      ```
+      Compare final bytes with any workflow artifacts used for earlier checks. Intermediate hashes must not replace
+      finalized release checksums.
+    - For Rust-only consumer fixes after publication, reuse the four-platform consumer matrix against the existing
+      release without rebuilding or replacing native artifacts. Its release tag comes from the checked-out XLA pin:
+      ```bash
+      gh workflow run build_ryft_xla_sys.yaml \
+        --repo eaplatanios/ryft \
+        --ref <branch-name> \
+        -f verify_published_only=true
       ```
     - After the workflow publishes release artifacts for the new `XLA_COMMIT`, update these functions in `build.rs`:
         - `BuildConfiguration::precompiled_artifact_name`

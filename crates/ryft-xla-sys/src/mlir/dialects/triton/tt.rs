@@ -47,4 +47,13 @@ unsafe extern "C" {
         value: MlirStringRef,
     ) -> MlirAttribute;
     pub fn mlirTritonTtEnumAttrGetValue(attribute: MlirAttribute, kind: MlirTritonTtEnumAttribute) -> MlirStringRef;
+
+    pub fn mlirAttributeIsATritonTtCachePolicyAttr(attribute: MlirAttribute) -> bool;
+    pub fn mlirTritonTtCachePolicyAttrGet(
+        context: MlirContext,
+        cache_modifier: MlirStringRef,
+        eviction_policy: MlirStringRef,
+    ) -> MlirAttribute;
+    pub fn mlirTritonTtCachePolicyAttrGetCacheModifier(attribute: MlirAttribute) -> MlirStringRef;
+    pub fn mlirTritonTtCachePolicyAttrGetEvictionPolicy(attribute: MlirAttribute) -> MlirStringRef;
 }

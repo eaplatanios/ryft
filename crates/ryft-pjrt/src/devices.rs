@@ -1336,6 +1336,7 @@ mod tests {
             target_config: None,
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
         };
         let executable = client.compile(&program, &compilation_options).unwrap();
 
@@ -1384,6 +1385,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .unwrap();
         assert_eq!(execution.output().len(), 1);

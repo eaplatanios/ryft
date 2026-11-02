@@ -35,14 +35,33 @@ pub struct Topology {
 ///
 /// This type corresponds to `CpuTopologyProto` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "4")]
 pub struct CpuTopology {
     /// CPU devices that belong to this topology.
     #[prost(message, repeated, tag = "1")]
     pub cpu_devices: Vec<CpuTopologyDevice>,
 
-    /// Machine-level attributes associated with this topology.
-    #[prost(string, repeated, tag = "4")]
-    pub machine_attributes: Vec<String>,
+    /// Target machine configuration shared by the CPU devices in this topology.
+    #[prost(message, optional, tag = "5")]
+    pub target_machine_options: Option<CpuTargetMachineOptions>,
+}
+
+/// CPU target triple, processor model, and enabled features used for native compilation.
+///
+/// This type corresponds to `xla.cpu.TargetMachineOptionsProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Eq, Hash, Message)]
+pub struct CpuTargetMachineOptions {
+    /// Target triple identifying the architecture, vendor, operating system, and environment.
+    #[prost(string, tag = "1")]
+    pub triple: String,
+
+    /// Processor model used for code generation.
+    #[prost(string, tag = "2")]
+    pub cpu: String,
+
+    /// Target feature string passed to the native compiler.
+    #[prost(string, tag = "3")]
+    pub features: String,
 }
 
 /// Description of a CPU device in [`CpuTopology`].
@@ -84,6 +103,10 @@ pub struct GpuTopology {
     /// GPU target configuration.
     #[prost(message, optional, tag = "8")]
     pub gpu_target_config: Option<GpuTargetConfiguration>,
+
+    /// Target machine configuration used for host code generation.
+    #[prost(message, optional, tag = "9")]
+    pub host_target_machine_options: Option<CpuTargetMachineOptions>,
 
     /// Number of devices per process. This can be smaller than the number of devices per host (e.g., when a host
     /// contains multiple processes). If not set, it defaults to the number of devices per host.
@@ -962,25 +985,59 @@ pub struct CollectiveFilter {
     pub op_type: Option<i32>,
 }
 
-/// Specifies which backends to enable auto-tuning for during compilation. Auto-tuning is the process of empirically
-/// testing different algorithm implementations to find the fastest one for a given operation on specific hardware.
-/// This enum controls which library backends are eligible for auto-tuning.
+/// Code generation backends eligible for auto-tuning during compilation.
 ///
-/// This type corresponds to `DebugOptions.AutotuneBackend` in [XLA](https://github.com/openxla/xla).
+/// This type corresponds to `xla.autotuner.Backend` in [XLA](https://github.com/openxla/xla).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
 #[repr(i32)]
 pub enum AutoTuneBackend {
-    /// Enable auto-tuning for all supported backends.
-    All = 0,
+    /// No specific backend is selected.
+    Unspecified = 0,
 
-    /// Enable auto-tuning only for NVIDIA cuDNN library operations.
+    /// NVIDIA cuDNN library operations.
     Cudnn = 1,
 
-    /// Enable auto-tuning only for Triton compiler-generated kernels.
+    /// Triton compiler-generated kernels.
     Triton = 2,
 
-    /// Enable auto-tuning only for NVIDIA cuBLASLt library operations.
+    /// NVIDIA cuBLASLt library operations.
     Cublaslt = 4,
+
+    /// AMD hipBLASLt library operations.
+    Hipblaslt = 6,
+
+    /// AMD MIOpen library operations.
+    Miopen = 7,
+
+    /// Custom GPU kernels.
+    CustomKernel = 8,
+
+    /// Block-level GPU fusion emitter.
+    BlockLevelEmitter = 9,
+
+    /// Native code generation emitter.
+    NativeEmitter = 10,
+
+    /// LLVM kernel emitter.
+    LlvmKernelEmitter = 11,
+
+    /// NVIDIA cuBLASLt operations with fission.
+    CublasltFission = 13,
+
+    /// Custom kernels with fission.
+    CustomKernelFission = 14,
+
+    /// AMD hipBLASLt operations with fission.
+    HipblasltFission = 16,
+
+    /// YNNPACK CPU operations.
+    Ynnpack = 17,
+
+    /// Block-level CPU fusion emitter.
+    BlockLevelEmitterCpu = 18,
+
+    /// TensorIR CUDA Tile fusion emitter.
+    TensorIr = 19,
 }
 
 /// Controls the behavior of the auto-tuning results cache. Auto-tuning can be expensive and so XLA supports caching the
@@ -1017,6 +1074,15 @@ pub enum CollectiveKernelType {
 
     /// All-gather kernel.
     AllGather = 2,
+
+    /// Reduce-scatter kernel.
+    ReduceScatter = 3,
+
+    /// All-to-all kernel.
+    AllToAll = 4,
+
+    /// All supported collective kernels.
+    AllCollectives = 8,
 }
 
 /// Controls whether a collective operation is pipelined.
@@ -1131,6 +1197,12 @@ pub enum CommandBufferCommandType {
 
     /// Convolution operation.
     Convolution = 11,
+
+    /// Host execution command.
+    HostExecute = 12,
+
+    /// Collective communication implemented by a custom kernel.
+    CollectivesKernel = 13,
 }
 
 /// Controls whether the GPU backend may use deviceless CUB calls during compilation.
@@ -1176,7 +1248,7 @@ pub enum CommandBufferSchedulingMode {
 }
 
 /// Controls when cuDNN fusions are compiled in "deviceless" mode, meaning driven purely by the device description
-/// without a live cuDNN handle. Deviceless compilation requires cuDNN version 9.8 or newer.
+/// without a live cuDNN handle. Deviceless compilation requires cuDNN version 9.23 or newer.
 ///
 /// This type corresponds to `DebugOptions.CudnnDevicelessCompilationMode` in
 /// [XLA](https://github.com/openxla/xla).
@@ -1396,6 +1468,83 @@ pub enum XnnGraphFusionMode {
 
     /// Bypass the cost model and always fuse when possible.
     BypassCostModel = 3,
+}
+
+/// CPU optimization preset.
+///
+/// This type corresponds to `DebugOptions.CpuOptPreset` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CpuOptimizationPreset {
+    /// Use the default optimization preset.
+    Default = 0,
+
+    /// Favor executable runtime performance.
+    FastRuntime = 1,
+
+    /// Favor compilation speed.
+    FastCompile = 2,
+}
+
+/// CPU scheduling policy.
+///
+/// This type corresponds to `DebugOptions.CpuSchedulerType` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CpuSchedulerType {
+    /// Balance memory consumption and concurrency.
+    Default = 0,
+
+    /// Minimize memory consumption.
+    MemoryOptimized = 1,
+
+    /// Maximize concurrency, potentially increasing memory use.
+    ConcurrencyOptimized = 2,
+}
+
+/// Virtual address remapping policy for GPU command buffers.
+///
+/// This type corresponds to `DebugOptions.CommandBufferUpdateMode` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CommandBufferUpdateMode {
+    /// Use dynamic addresses and update commands when addresses change.
+    AlwaysUpdate = 0,
+
+    /// Give preallocated temporary buffers fixed virtual addresses.
+    SkipTemp = 1,
+
+    /// Give temporary buffers and buffers with profiled stable addresses fixed virtual addresses.
+    SkipProfiled = 2,
+}
+
+/// Triton policy when deterministic GPU operations are requested.
+///
+/// This type corresponds to `DebugOptions.DeterministicOpsTritonMode` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum DeterministicOperationsTritonMode {
+    /// Use the default policy.
+    Unset = 0,
+
+    /// Disable Triton.
+    Off = 1,
+
+    /// Allow Triton without checking its determinism.
+    Unchecked = 2,
+}
+
+/// Compilation stage at which an executable may return its HLO early.
+///
+/// This type corresponds to `DebugOptions.EarlyExitPoint` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum EarlyExitPoint {
+    /// Compile through the normal pipeline.
+    Unset = 0,
+
+    /// Exit after configuration assignment.
+    AfterConfigAssignment = 1,
 }
 
 /// Debugging options for XLA compilation and execution. These options control various aspects of the XLA compiler and
@@ -2257,14 +2406,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "138")]
     pub xla_gpu_unsafe_fallback_to_driver_on_ptxas_not_found: Option<bool>,
 
-    /// If `true`, the embedded device library will be used in code generation.
-    #[prost(bool, optional, tag = "420")]
-    pub xla_gpu_use_embedded_device_lib: Option<bool>,
-
-    /// If `true`, lld will be used as a library for the linking step.
-    #[prost(bool, optional, tag = "389")]
-    pub xla_gpu_use_in_process_lld: Option<bool>,
-
     /// If `true`, `memcpy` will be used for P2P communication within a node (NVLink).
     #[prost(bool, optional, tag = "287")]
     pub xla_gpu_use_memcpy_local_p2p: Option<bool>,
@@ -2747,6 +2888,200 @@ pub struct DebugOptions {
     /// textproto of autotuner.CandidateConfigs.
     #[prost(string, optional, tag = "544")]
     pub xla_candidate_configs_file: Option<String>,
+
+    /// Deprecated flag for concurrent GPU graph regions. Use [`Self::xla_gpu_command_buffer_scheduling_mode`] instead.
+    #[deprecated]
+    #[prost(bool, optional, tag = "215")]
+    pub xla_gpu_graph_enable_concurrent_region: Option<bool>,
+
+    /// Legacy NCCL clique optimization flag retained on the wire. It has no effect.
+    #[deprecated]
+    #[prost(bool, optional, tag = "244")]
+    pub xla_gpu_enable_nccl_clique_optimization: Option<bool>,
+
+    /// Internal flag that enables or disables Triton matrix multiplication fusions.
+    #[prost(bool, optional, tag = "322")]
+    pub xla_gpu_unsupported_enable_triton_gemm: Option<bool>,
+
+    /// Internal flag that enables or disables ragged all-to-all decomposition.
+    #[prost(bool, optional, tag = "350")]
+    pub xla_gpu_unsupported_enable_ragged_all_to_all_decomposer: Option<bool>,
+
+    /// Internal flag that enables a one-shot ragged all-to-all kernel within a single host.
+    #[prost(bool, optional, tag = "375")]
+    pub xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel: Option<bool>,
+
+    /// If `true`, enable experimental Triton fusions with multiple outputs.
+    #[prost(bool, optional, tag = "382")]
+    pub xla_gpu_unsupported_enable_triton_multi_output_fusion: Option<bool>,
+
+    /// Internal flag that enables or disables all-reduce decomposition.
+    #[prost(bool, optional, tag = "384")]
+    pub xla_gpu_unsupported_enable_all_reduce_decomposer: Option<bool>,
+
+    /// Legacy one-shot all-reduce kernel flag retained on the wire.
+    #[deprecated]
+    #[prost(bool, optional, tag = "387")]
+    pub xla_gpu_unsupported_use_all_reduce_one_shot_kernel: Option<bool>,
+
+    /// Internal flag that enables or disables ragged all-to-all decomposition across hosts.
+    #[prost(bool, optional, tag = "415")]
+    pub xla_gpu_unsupported_enable_ragged_all_to_all_multi_host_decomposer: Option<bool>,
+
+    /// Internal override for the number of devices in the fast interconnect domain. `0` keeps the detected size.
+    #[prost(int64, optional, tag = "416")]
+    pub xla_gpu_unsupported_override_fast_interconnect_slice_size: Option<i64>,
+
+    /// If `true`, auto-tune all fusions using the block-level emitter.
+    #[prost(bool, optional, tag = "444")]
+    pub xla_gpu_experimental_all_fusions_with_triton: Option<bool>,
+
+    /// If `true`, dump instructions before and after auto-tuning.
+    #[prost(bool, optional, tag = "445")]
+    pub xla_gpu_dump_autotuned_instructions: Option<bool>,
+
+    /// If `true`, include inline stack frames when dumping HLO.
+    #[prost(bool, optional, tag = "447")]
+    pub xla_hlo_print_inline_stack_frames: Option<bool>,
+
+    /// [`CpuSchedulerType`] controlling the balance between CPU memory consumption and concurrency.
+    #[prost(enumeration = "CpuSchedulerType", optional, tag = "448")]
+    pub xla_cpu_scheduler_type: Option<i32>,
+
+    /// Maximum number of trace events retained while profiling an AMD GPU.
+    #[prost(int64, optional, tag = "449")]
+    pub xla_gpu_rocm_max_trace_events: Option<i64>,
+
+    /// Duration after which stalled host execution of a GPU executable terminates the process. This covers work
+    /// submission and host synchronization, so it does not bound device completion. Accepts duration strings such as
+    /// `"300ms"` or `"2h45m"`. The default `"inf"` disables the timeout.
+    #[prost(string, optional, tag = "451")]
+    pub xla_gpu_execution_terminate_timeout: Option<String>,
+
+    /// If `true`, use the sharding representation based on meshes and axes.
+    #[prost(bool, optional, tag = "452")]
+    pub xla_enable_hlo_sharding_v3: Option<bool>,
+
+    /// If `true`, log minimum and maximum values for runtime thunks selected for floating-point checks.
+    #[prost(bool, optional, tag = "453")]
+    pub xla_gpu_log_minmax: Option<bool>,
+
+    /// If `true`, print the invocation count and elapsed time for each HLO pass.
+    #[prost(bool, optional, tag = "454")]
+    pub xla_gpu_print_compilation_stats: Option<bool>,
+
+    /// If `true`, dump buffer assignment analysis when [`Self::xla_dump_hlo_as_text`] is enabled.
+    #[prost(bool, optional, tag = "466")]
+    pub xla_dump_buffer_assignment_analysis: Option<bool>,
+
+    /// [`CpuOptimizationPreset`] controlling the CPU compilation optimization strategy.
+    #[prost(enumeration = "CpuOptimizationPreset", optional, tag = "467")]
+    pub xla_cpu_opt_preset: Option<i32>,
+
+    /// Name of the GPU collective implementation to use (e.g., `"nccl"` or `"loopback"`). An empty string selects the
+    /// registered implementation with the highest priority.
+    #[prost(string, optional, tag = "468")]
+    pub xla_gpu_collectives_implementation: Option<String>,
+
+    /// [`CommandBufferUpdateMode`] controlling virtual address remapping for GPU command buffers.
+    #[prost(enumeration = "CommandBufferUpdateMode", optional, tag = "469")]
+    pub xla_gpu_command_buffer_update_mode: Option<i32>,
+
+    /// If `true`, use multiple streams for asynchronous collective operations.
+    #[prost(bool, optional, tag = "470")]
+    pub xla_gpu_experimental_enable_collective_multi_streaming: Option<bool>,
+
+    /// If `true`, split collective-permute into connected replica groups. This enables smaller NCCL communicators
+    /// and peer memory copies for local groups in distributed setups.
+    #[prost(bool, optional, tag = "471")]
+    pub xla_gpu_collective_permute_connected_components: Option<bool>,
+
+    /// If `true`, permit skipping defensive copies for aliased collective memory parameters when execution uses every
+    /// device in the topology.
+    #[prost(bool, optional, tag = "545")]
+    pub xla_gpu_enable_persistent_symmetric_memory: Option<bool>,
+
+    /// If `true`, use the RAFT implementation for stable TopK.
+    #[prost(bool, optional, tag = "546")]
+    pub xla_gpu_experimental_enable_raft_for_stable_topk: Option<bool>,
+
+    /// Preferred [`AutoTuneBackend`]. If it produces valid configurations, select one of them even when another backend
+    /// is faster. Otherwise, consider the other eligible backends.
+    #[prost(enumeration = "AutoTuneBackend", optional, tag = "547")]
+    pub xla_autotuner_preferred_backend: Option<i32>,
+
+    /// If `true`, replace CPU custom calls with operations that have no effect.
+    #[prost(bool, optional, tag = "548")]
+    pub xla_cpu_mock_custom_calls: Option<bool>,
+
+    /// [`EarlyExitPoint`] at which compilation returns its HLO. Mutually exclusive with
+    /// [`Self::xla_early_exit_with_layouts`].
+    #[prost(enumeration = "EarlyExitPoint", optional, tag = "549")]
+    pub xla_gpu_experimental_early_exit: Option<i32>,
+
+    /// If `true`, emit the GPU runtime thunk for collective-reduce instructions.
+    #[prost(bool, optional, tag = "550")]
+    pub xla_gpu_experimental_emit_collective_reduce: Option<bool>,
+
+    /// If `true`, disable CUDA virtual memory management for device allocations and collective fusion.
+    #[prost(bool, optional, tag = "551")]
+    pub xla_gpu_experimental_vmm_disabled: Option<bool>,
+
+    /// If `true`, represent non-linear dynamic slice and update offsets with one table entry per loop iteration.
+    #[prost(bool, optional, tag = "552")]
+    pub xla_gpu_experimental_enable_dynamic_slice_table_offsets: Option<bool>,
+
+    /// Duration after which unfinished device work terminates the process, measured from guard creation on the
+    /// host. The wall time includes work already queued before this executable. Uses the duration format of
+    /// [`Self::xla_gpu_execution_terminate_timeout`], with `"inf"` disabling the timeout.
+    #[prost(string, optional, tag = "553")]
+    pub xla_gpu_device_execution_terminate_timeout: Option<String>,
+
+    /// GPU topology file or inline topology description for compilation without a live device. Inline descriptions
+    /// use `[platform:]partitions x hosts_per_partition x devices_per_host`.
+    #[prost(string, optional, tag = "554")]
+    pub xla_gpu_topology_filename: Option<String>,
+
+    /// If `true`, allow divide, remainder, minimum, maximum, and clamp in dynamic slice fusion offset expressions.
+    #[prost(bool, optional, tag = "555")]
+    pub xla_gpu_experimental_enable_dynamic_slice_extended_offsets: Option<bool>,
+
+    /// [`DeterministicOperationsTritonMode`] controlling Triton when deterministic GPU operations are requested.
+    #[prost(enumeration = "DeterministicOperationsTritonMode", optional, tag = "556")]
+    pub xla_gpu_experimental_deterministic_ops_triton: Option<i32>,
+
+    /// If `true`, allow auto-tuning to select the TensorIR CUDA Tile fusion emitter. Requires SM 90 or newer and CUDA
+    /// 13.3 or newer with `tileiras` at runtime.
+    #[prost(bool, optional, tag = "557")]
+    pub xla_gpu_experimental_enable_tensor_ir: Option<bool>,
+
+    /// If `true`, enumerate reduction dimension tile sizes when searching block-level Triton tilings. Currently
+    /// supported only for fusions with a single reduction over one dimension.
+    #[prost(bool, optional, tag = "558")]
+    pub xla_gpu_experimental_enable_reduction_dimension_tiling: Option<bool>,
+
+    /// If `true`, require the complete code generation environment to match when reading an auto-tuning cache entry.
+    /// Otherwise, require only the selected backend version to match.
+    #[prost(bool, optional, tag = "559")]
+    pub xla_autotune_cache_require_strict_codegen_match: Option<bool>,
+
+    /// GPU allocator memory fraction override. `"0.75"` fixes the fraction, `"0.75+"` permits growth to all device
+    /// memory, and `"0.75-0.85"` caps growth at 85%. An empty string keeps the client configuration.
+    #[prost(string, optional, tag = "560")]
+    pub xla_gpu_memory_fraction_policy: Option<String>,
+
+    /// If `true`, register NCCL windows using `NCCL_WIN_COLL_SYMMETRIC` rather than `NCCL_WIN_DEFAULT`.
+    #[prost(bool, optional, tag = "561")]
+    pub xla_gpu_experimental_nccl_window_symmetric: Option<bool>,
+
+    /// If `true`, lower eligible associative scans to Triton fusions.
+    #[prost(bool, optional, tag = "562")]
+    pub xla_gpu_experimental_enable_triton_scan: Option<bool>,
+
+    /// If `true`, require BLASLt matrix multiplication to execute the exact [`BlasLtMatmulAlgorithm`] instead of
+    /// falling back to a heuristic algorithm index.
+    #[prost(bool, optional, tag = "563")]
+    pub xla_gpu_require_exact_blas_lt_algorithm: Option<bool>,
 }
 
 /// Represents the device IDs assigned to replicas for a single computation. In XLA's device assignment model, each
@@ -3039,6 +3374,79 @@ pub struct AutoTuneConvolutionKey {
     pub tensor_core_operations_enabled: bool,
 }
 
+/// cuBLASLt algorithm configuration used to replay an exact matrix multiplication implementation.
+///
+/// This type corresponds to `stream_executor.cuda.CublasLtMatmulAlgorithmProto` in
+/// [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Message)]
+pub struct CublasLtMatmulAlgorithm {
+    /// Algorithm identifier.
+    #[prost(int32, tag = "1")]
+    pub algorithm_id: i32,
+
+    /// Tile identifier.
+    #[prost(int32, tag = "2")]
+    pub tile_id: i32,
+
+    /// Split-K parameter.
+    #[prost(int32, tag = "3")]
+    pub split_k: i32,
+
+    /// Reduction scheme identifier.
+    #[prost(int32, tag = "4")]
+    pub reduction_scheme: i32,
+
+    /// Cooperative Thread Array (CTA) swizzling parameter.
+    #[prost(int32, tag = "5")]
+    pub cta_swizzling: i32,
+
+    /// Custom algorithm option.
+    #[prost(int32, tag = "6")]
+    pub custom_option: i32,
+
+    /// Pipeline stage identifier.
+    #[prost(int32, tag = "7")]
+    pub stages_id: i32,
+
+    /// Inner shape identifier.
+    #[prost(int32, tag = "8")]
+    pub inner_shape_id: i32,
+
+    /// Cluster shape identifier.
+    #[prost(int32, tag = "9")]
+    pub cluster_shape_id: i32,
+
+    /// Numerical implementation flags.
+    #[prost(int64, tag = "10")]
+    pub numerical_implementation_flags: i64,
+}
+
+/// Vendor-specific BLASLt matrix multiplication algorithm.
+///
+/// This type corresponds to `stream_executor.gpu.BlasLtMatmulAlgorithmProto.algorithm` in
+/// [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Oneof)]
+pub enum BlasLtMatmulAlgorithmKind {
+    /// NVIDIA cuBLASLt algorithm.
+    #[prost(message, tag = "2")]
+    CublasLt(CublasLtMatmulAlgorithm),
+}
+
+/// BLASLt library version and exact algorithm configuration.
+///
+/// This type corresponds to `stream_executor.gpu.BlasLtMatmulAlgorithmProto` in
+/// [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Message)]
+pub struct BlasLtMatmulAlgorithm {
+    /// Version of the BLASLt library that produced the algorithm.
+    #[prost(int64, tag = "1")]
+    pub library_version: i64,
+
+    /// Vendor-specific algorithm configuration.
+    #[prost(oneof = "BlasLtMatmulAlgorithmKind", tags = "2")]
+    pub algorithm: Option<BlasLtMatmulAlgorithmKind>,
+}
+
 /// Auto-tuning configuration key for a General Matrix Multiply (GEMM) algorithm.
 ///
 /// This type corresponds to `AutotuneResult.GemmKey` in [XLA](https://github.com/openxla/xla).
@@ -3051,6 +3459,14 @@ pub struct AutoTuneGemmKey {
     /// Workspace size (in bytes) used during auto-tuning.
     #[prost(int64, tag = "2")]
     pub workspace_size_in_bytes: i64,
+
+    /// If `true`, run an FP8-output hipBLASLt operation with a wider output and convert it to FP8 in a loop fusion.
+    #[prost(bool, tag = "3")]
+    pub unfuse_fp8_output: bool,
+
+    /// Versioned BLASLt algorithm configuration for exact replay.
+    #[prost(message, optional, tag = "4")]
+    pub algorithm_proto: Option<BlasLtMatmulAlgorithm>,
 }
 
 /// Auto-tuning configuration key for a CUDA convolution execution plan.
@@ -3104,10 +3520,18 @@ pub struct AutoTuneTritonGemmKey {
     #[prost(bool, tag = "9")]
     pub is_warp_specialization_allowed: bool,
 
+    /// Number of waves per execution unit on AMD GPUs.
+    #[prost(int64, tag = "10")]
+    pub waves_per_execution_unit: i64,
+
     /// The `group_size` used for L2 tile reordering (grouping) in ragged-dot fusions. A value <= 1 disables the
     /// reordering.
     #[prost(int64, tag = "11")]
     pub group_size: i64,
+
+    /// AMD matrix fused multiply-add instruction size in the M and N dimensions. `0` selects automatically.
+    #[prost(int64, tag = "12")]
+    pub matrix_fused_multiply_add_size: i64,
 }
 
 /// Auto-tuning configuration key for a custom fused kernel.
@@ -3153,6 +3577,11 @@ pub struct AutoTuneAlgorithmKey {
     /// and allow for fine-grained control over the behavior of the algorithm.
     #[prost(map = "int64, int64", tag = "4")]
     pub tuning_knobs: HashMap<i64, i64>,
+
+    /// Legacy flag retained on the wire. The cuDNN frontend API is always used.
+    #[deprecated]
+    #[prost(bool, tag = "5")]
+    pub is_cudnn_frontend: bool,
 
     /// Workspace size (in bytes) required by this algorithm. This is only relevant for ROCm since, when using ROCm, it
     /// is impossible to re-query the required workspace size after running the algorithm search, and so we must store
@@ -3295,7 +3724,7 @@ pub struct AutoTuneResult {
     pub failure: Option<AutoTuneFailureResult>,
 
     /// TKey identifying the selected algorithm configuration.
-    #[prost(oneof = "AutoTuneResultKey", tags = "5, 6, 17, 15, 18, 16")]
+    #[prost(oneof = "AutoTuneResultKey", tags = "5, 6, 17, 15, 18, 16, 19")]
     pub key: Option<AutoTuneResultKey>,
 }
 
@@ -3439,9 +3868,24 @@ pub struct RocmComputeCapability {
     pub gcn_architecture_name: String,
 }
 
+/// oneAPI compute capability for Intel GPUs.
+///
+/// This type corresponds to `stream_executor.OneAPIComputeCapabilityProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Eq, Hash, Message)]
+#[prost(reserved = "2")]
+pub struct OneApiComputeCapability {
+    /// Xe architecture name.
+    #[prost(string, tag = "1")]
+    pub architecture: String,
+
+    /// Xe generation used to distinguish devices whose architecture name is unknown.
+    #[prost(uint32, optional, tag = "3")]
+    pub generation: Option<u32>,
+}
+
 /// GPU compute capability supporting multiple vendor-specific formats.
 ///
-/// This type corresponds to `stream_executor.GpuComputeCapabilityProto` in [XLA](https://github.com/openxla/xla).
+/// This type corresponds to `stream_executor.GpuDeviceInfoProto.compute_capability` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Eq, Hash, Oneof)]
 pub enum GpuComputeCapability {
     /// Compute capability for NVIDIA CUDA GPUs.
@@ -3451,6 +3895,10 @@ pub enum GpuComputeCapability {
     /// Compute capability for AMD ROCm GPUs.
     #[prost(message, tag = "17")]
     RocmComputeCapability(RocmComputeCapability),
+
+    /// Compute capability for Intel oneAPI GPUs.
+    #[prost(message, tag = "22")]
+    OneApiComputeCapability(OneApiComputeCapability),
 }
 
 /// Additional connectivity metadata describing how a GPU is wired to its peers.
@@ -3649,8 +4097,20 @@ pub struct GpuDeviceInformation {
     #[prost(int64, tag = "46")]
     pub collective_memory_granularity_in_bytes: i64,
 
+    /// Additional shared memory available per block in bytes.
+    #[prost(int64, tag = "47")]
+    pub oversized_shared_memory_per_block_in_bytes: i64,
+
+    /// If `true`, confidential computing is enabled on the device.
+    #[prost(bool, tag = "48")]
+    pub confidential_computing_enabled: bool,
+
+    /// Number of physical locality domains. Values below `2` do not enable additional memory placement options.
+    #[prost(int32, tag = "49")]
+    pub locality_domain_count: i32,
+
     /// Compute capability of the device specifying the GPU architecture and its supported features.
-    #[prost(oneof = "GpuComputeCapability", tags = "16, 17")]
+    #[prost(oneof = "GpuComputeCapability", tags = "16, 17, 22")]
     pub compute_capability: Option<GpuComputeCapability>,
 }
 
@@ -3776,6 +4236,11 @@ pub struct CompilationOptions {
     #[prost(enumeration = "Precision", tag = "10")]
     pub matrix_unit_operand_precision: i32,
 
+    /// Legacy compiler variant override.
+    #[deprecated]
+    #[prost(string, optional, tag = "11")]
+    pub compiler_variant: Option<String>,
+
     /// Individually defined output indices.
     #[prost(int32, repeated, tag = "12")]
     pub individually_defined_output_indices: Vec<i32>,
@@ -3809,6 +4274,22 @@ pub struct ExecutableMemoryStatistics {
     /// Peak number of bytes used in device memory.
     #[prost(int64, tag = "14")]
     pub device_peak_memory_in_bytes: i64,
+
+    /// Total memory footprint in bytes.
+    #[prost(int64, tag = "15")]
+    pub total_size_in_bytes: i64,
+
+    /// Total number of allocation bytes.
+    #[prost(int64, tag = "16")]
+    pub total_allocation_bytes: i64,
+
+    /// Number of allocations whose size is indefinite.
+    #[prost(int64, tag = "17")]
+    pub indefinite_allocations: i64,
+
+    /// Peak heap usage before padding in bytes.
+    #[prost(int64, tag = "18")]
+    pub peak_unpadded_heap_bytes: i64,
 
     /// Number of bytes used for storing the generated code in host memory.
     #[prost(int64, tag = "7")]
@@ -3933,6 +4414,10 @@ pub struct ProfileOptions {
     /// If not specified, the actual hostname will be used.
     #[prost(string, tag = "15")]
     pub override_hostname: String,
+
+    /// If `true`, programmatic replay uses multiple profiling passes.
+    #[prost(bool, tag = "16")]
+    pub enable_multipass: bool,
 }
 
 /// Device type to profile.
@@ -4271,4 +4756,108 @@ pub struct ExecutableAbiVersion {
     /// Serialized ABI version payload interpreted by the corresponding platform implementation.
     #[prost(bytes = "vec", tag = "2")]
     pub version: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_cpu_topology_target_machine_options() {
+        // Field 4 was retired. The target machine description is a nested message at field 5.
+        let bytes = [0x2a, 0x09, 0x0a, 0x01, b't', 0x12, 0x01, b'c', 0x1a, 0x01, b'f'];
+        let topology = CpuTopology::decode(bytes.as_slice()).unwrap();
+        assert_eq!(
+            topology.target_machine_options,
+            Some(CpuTargetMachineOptions { triple: "t".to_string(), cpu: "c".to_string(), features: "f".to_string() }),
+        );
+        assert_eq!(topology.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn test_debug_options_optional_fields() {
+        // Explicit false values and enum selections must survive wire decoding and re-encoding.
+        let bytes = [0x98, 0x22, 0x13, 0xa0, 0x22, 0x00, 0xa8, 0x22, 0x01, 0xe0, 0x22, 0x02];
+        let options = DebugOptions::decode(bytes.as_slice()).unwrap();
+        assert_eq!(options.xla_autotuner_preferred_backend(), AutoTuneBackend::TensorIr);
+        assert_eq!(options.xla_cpu_mock_custom_calls, Some(false));
+        assert_eq!(options.xla_gpu_experimental_early_exit(), EarlyExitPoint::AfterConfigAssignment);
+        assert_eq!(
+            options.xla_gpu_experimental_deterministic_ops_triton(),
+            DeterministicOperationsTritonMode::Unchecked,
+        );
+        assert_eq!(options.encode_to_vec(), bytes);
+        assert_eq!(DebugOptions::default().encode_to_vec(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_auto_tune_gemm_key_algorithm() {
+        // The exact cuBLASLt algorithm is carried inside GEMM field 4, separate from the legacy algorithm index.
+        let bytes = [0x18, 0x01, 0x22, 0x07, 0x08, 0x82, 0x01, 0x12, 0x02, 0x08, 0x07];
+        let key = AutoTuneGemmKey::decode(bytes.as_slice()).unwrap();
+        assert!(key.unfuse_fp8_output);
+        let algorithm = key.algorithm_proto.unwrap();
+        assert_eq!(algorithm.library_version, 130);
+        assert_eq!(
+            algorithm.algorithm,
+            Some(BlasLtMatmulAlgorithmKind::CublasLt(CublasLtMatmulAlgorithm {
+                algorithm_id: 7,
+                ..Default::default()
+            })),
+        );
+        assert_eq!(key.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn test_auto_tune_result_backend_configuration() {
+        // The backend configuration variant must be included in the parent message's oneof tag inventory.
+        let bytes = [0x9a, 0x01, 0x03, 0x0a, 0x01, b'b'];
+        let result = AutoTuneResult::decode(bytes.as_slice()).unwrap();
+        assert_eq!(
+            result.key,
+            Some(AutoTuneResultKey::Other(AutoTuneBackendConfigurationKey { name: "b".to_string(), config: None })),
+        );
+        assert_eq!(result.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn test_gpu_device_information_one_api_and_memory() {
+        let bytes = [
+            0xb2, 0x01, 0x06, 0x0a, 0x02, b'x', b'e', 0x18, 0x0f, 0xf8, 0x02, 0x80, 0x20, 0x80, 0x03, 0x01, 0x88, 0x03,
+            0x02,
+        ];
+        let information = GpuDeviceInformation::decode(bytes.as_slice()).unwrap();
+        assert_eq!(
+            information.compute_capability,
+            Some(GpuComputeCapability::OneApiComputeCapability(OneApiComputeCapability {
+                architecture: "xe".to_string(),
+                generation: Some(15),
+            })),
+        );
+        assert_eq!(information.oversized_shared_memory_per_block_in_bytes, 4096);
+        assert!(information.confidential_computing_enabled);
+        assert_eq!(information.locality_domain_count, 2);
+        assert_eq!(information.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn test_executable_memory_statistics_totals() {
+        let bytes = [0x78, 0x80, 0x08, 0x80, 0x01, 0x80, 0x08, 0x88, 0x01, 0x01, 0x90, 0x01, 0x80, 0x04];
+        let statistics = ExecutableMemoryStatistics::decode(bytes.as_slice()).unwrap();
+        assert_eq!(statistics.total_size_in_bytes, 1024);
+        assert_eq!(statistics.total_allocation_bytes, 1024);
+        assert_eq!(statistics.indefinite_allocations, 1);
+        assert_eq!(statistics.peak_unpadded_heap_bytes, 512);
+        assert_eq!(statistics.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn test_profile_options_enable_multipass() {
+        let bytes = [0x80, 0x01, 0x01];
+        let options = ProfileOptions::decode(bytes.as_slice()).unwrap();
+        assert!(options.enable_multipass);
+        assert_eq!(options.encode_to_vec(), bytes);
+    }
 }

@@ -341,6 +341,71 @@ pub fn multiply<
         })
 }
 
+/// StableHLO [`Operation`] that computes the fused multiply-add of corresponding elements from three floating-point
+/// tensors. The product and sum are computed with unbounded range and precision and rounded once to the result type.
+/// All operands and the result have the same shape and floating-point element type.
+///
+/// # Example
+///
+/// ```mlir
+/// %result = stablehlo.fma %a, %b, %c : tensor<3xf32>
+/// ```
+///
+/// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#fma) for more information.
+pub trait FusedMultiplyAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the first factor of this [`FusedMultiplyAddOperation`].
+    fn multiplicand(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the second factor of this [`FusedMultiplyAddOperation`].
+    fn multiplier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the value added to the product in this [`FusedMultiplyAddOperation`].
+    fn addend(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
+    }
+}
+
+mlir_op!(FusedMultiplyAdd);
+mlir_op_trait!(FusedMultiplyAdd, OneResult);
+mlir_op_trait!(FusedMultiplyAdd, ZeroRegions);
+mlir_op_trait!(FusedMultiplyAdd, ZeroSuccessors);
+
+/// Constructs a detached [`FusedMultiplyAddOperation`] at the specified [`Location`]. Refer to
+/// [`FusedMultiplyAddOperation`] for its semantics.
+pub fn fused_multiply_add<
+    'multiplicand,
+    'multiplier,
+    'addend,
+    'c: 'multiplicand + 'multiplier + 'addend,
+    't: 'c,
+    Multiplicand: Value<'multiplicand, 'c, 't>,
+    Multiplier: Value<'multiplier, 'c, 't>,
+    Addend: Value<'addend, 'c, 't>,
+    L: Location<'c, 't>,
+>(
+    multiplicand: Multiplicand,
+    multiplier: Multiplier,
+    addend: Addend,
+    location: L,
+) -> Result<DetachedFusedMultiplyAddOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
+    OperationBuilder::new("stablehlo.fma", location)
+        .add_operand(multiplicand)?
+        .add_operand(multiplier)?
+        .add_operand(addend)?
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::fused_multiply_add`"))
+        })
+}
+
 /// StableHLO [`Operation`] that performs element-wise division of two tensors. The output shape is determined by
 /// [broadcasting](https://openxla.org/xla/broadcasting) the shapes of the two input tensors. The specific semantics
 /// depend on the element type:
@@ -519,11 +584,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, Operation, Size};
+    use crate::{Block, Context, OneOperand, Operation, Size, Value};
 
     use super::{
-        AddOperation, DivideOperation, MultiplyOperation, RemainderOperation, SubtractOperation, abs, add, divide,
-        is_finite, multiply, negate, remainder, sign, subtract,
+        AddOperation, DivideOperation, FusedMultiplyAddOperation, MultiplyOperation, RemainderOperation,
+        SubtractOperation, abs, add, divide, fused_multiply_add, is_finite, multiply, negate, remainder, sign,
+        subtract,
     };
 
     #[test]
@@ -813,6 +879,63 @@ mod tests {
                   func.func @multiply_test(%arg0: tensor<2x2xi32>, %arg1: tensor<2x2xi32>) -> tensor<2x2xi32> {
                     %0 = stablehlo.multiply %arg0, %arg1 : tensor<2x2xi32>
                     return %0 : tensor<2x2xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_fused_multiply_add() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(3)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let multiplicand = block.argument(0).unwrap();
+                let multiplier = block.argument(1).unwrap();
+                let addend = block.argument(2).unwrap();
+                let operation = fused_multiply_add(multiplicand, multiplier, addend, location).unwrap();
+                assert_eq!(operation.multiplicand().unwrap(), multiplicand);
+                assert_eq!(operation.multiplier().unwrap(), multiplier);
+                assert_eq!(operation.addend().unwrap(), addend);
+                assert_eq!(operation.operand_count(), 3);
+                assert_eq!(operation.result_count(), 1);
+                assert_eq!(operation.result(0).unwrap().r#type().unwrap(), tensor_type);
+                assert_eq!(operation.attribute_count(), 0);
+                assert_eq!(operation.region_count(), 0);
+                let operation = block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "fma_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @fma_test(\
+                    %arg0: tensor<3xf32>, \
+                    %arg1: tensor<3xf32>, \
+                    %arg2: tensor<3xf32>\
+                  ) -> tensor<3xf32> {
+                    %0 = stablehlo.fma %arg0, %arg1, %arg2 : tensor<3xf32>
+                    return %0 : tensor<3xf32>
                   }
                 }
             "},

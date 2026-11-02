@@ -1312,7 +1312,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_vector_reduce_fadd_test(%arg0: f32, %arg1: vector<4xf32>) -> f32 {
-                    %0 = \"llvm.intr.vector.reduce.fadd\"(%arg0, %arg1) <{fastmathFlags = #llvm.fastmath<none>}> : (f32, vector<4xf32>) -> f32
+                    %0 = llvm.intr.vector.reduce.fadd(%arg0, %arg1) : (f32, vector<4xf32>) -> f32
                     return %0 : f32
                   }
                 }
@@ -1564,7 +1564,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_vector_reduce_fmul_test(%arg0: f32, %arg1: vector<4xf32>) -> f32 {
-                    %0 = \"llvm.intr.vector.reduce.fmul\"(%arg0, %arg1) <{fastmathFlags = #llvm.fastmath<none>}> : (f32, vector<4xf32>) -> f32
+                    %0 = llvm.intr.vector.reduce.fmul(%arg0, %arg1) : (f32, vector<4xf32>) -> f32
                     return %0 : f32
                   }
                 }

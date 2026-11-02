@@ -2461,10 +2461,11 @@ impl<'s> Client<'s> {
                 shape_dims = specification.dimensions.as_ref().as_ptr() as *const i64,
                 shape_num_dims = specification.dimensions.as_ref().len(),
                 shape_element_type = specification.element_type.to_c_api(),
-                shape_layout = &mut layout as *mut _,
+                shape_layout = std::ptr::null_mut(),
                 memory = memory.default_memory().to_c_api(),
                 payload = payload,
                 payload_size = payload_size,
+                device_layout = &mut layout as *mut _,
             },
             { buffer },
         )
@@ -3509,6 +3510,7 @@ pub(crate) mod ffi {
         pub buffer: *mut PJRT_Buffer,
         pub payload: *const PJRT_NamedValue,
         pub payload_size: usize,
+        pub device_layout: *mut PJRT_Buffer_MemoryLayout,
     }
 
     impl PJRT_Client_CreateErrorBuffer_Args {
@@ -3525,6 +3527,7 @@ pub(crate) mod ffi {
             memory: *mut PJRT_Memory,
             payload: *const PJRT_NamedValue,
             payload_size: usize,
+            device_layout: *mut PJRT_Buffer_MemoryLayout,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -3541,6 +3544,7 @@ pub(crate) mod ffi {
                 buffer: std::ptr::null_mut(),
                 payload,
                 payload_size,
+                device_layout,
             }
         }
     }
@@ -4189,7 +4193,7 @@ mod tests {
                 TestPlatform::Cpu
                 | TestPlatform::Cuda12
                 | TestPlatform::Cuda13
-                | TestPlatform::Rocm7
+                | TestPlatform::Rocm10
                 | TestPlatform::Tpu => {
                     // Test invoking the callback with no error.
                     let (buffer, callback) = buffer_and_callback.unwrap();
