@@ -115,6 +115,12 @@ pub trait StatefulCompilationDomain: CompilationDomain {
 /// Cache identity is derived from the lowered program alone. [`CompilationDomain::lower`] folds every option, compiler,
 /// target, and topology property that affects compilation into [`CompilationDomain::LoweredProgram`], so key equality
 /// always means that compiled programs are interchangeable.
+///
+/// In-memory caching and coordination of concurrent compilations for the same key require only
+/// [`Self::compilation_key`]. Persistent caching and artifact exchange additionally use the optional
+/// stable [`Self::persistent_cache_key`] and serialization hooks (i.e., [`Self::serialize_program`] and
+/// [`Self::deserialize_program`]). Their availability may depend on the active runtime plugin or the
+/// particular compiled program, so implementing this trait does not guarantee serialization support.
 pub trait CompilationCacheDomain: CompilationDomain {
     /// Exact structural cache key for interchangeable compiled programs.
     type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
@@ -131,31 +137,41 @@ pub trait CompilationCacheDomain: CompilationDomain {
         None
     }
 
-    /// Serializes a compiled program for persistent caching and artifact exchange. `Ok(None)` means unsupported.
+    /// Serializes a compiled program for persistent caching and artifact exchange. Returns `Ok(Some(bytes))` on success
+    /// or `Ok(None)` when serialization is unavailable for this backend instance or compiled program (e.g., when the
+    /// active runtime plugin does not implement executable serialization). This runtime capability check allows a
+    /// domain to retain in-memory caching even when it cannot serialize executables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization fails. Unavailable serialization is reported as `Ok(None)` instead.
     #[inline]
     fn serialize_program(&self, _program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(None)
     }
 
-    /// Deserializes a persistent cache or artifact exchange payload. `Ok(None)` means unsupported or incompatible.
+    /// Deserializes a persistent cache or artifact exchange payload. Returns `Ok(Some(program))` on success or
+    /// `Ok(None)` when deserialization is unavailable for this backend instance or the payload is incompatible with the
+    /// current backend, compiler, or target. An incompatible payload is a cache miss rather than a decoding failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed payloads or failures while restoring an otherwise compatible compiled program.
     #[inline]
     fn deserialize_program(&self, _bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
         Ok(None)
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Optional capability for inspecting a compiled program without recompiling it.
-///
-/// Analysis is deliberately separate from [`CompilationDomain`] because not every backend or runtime plugin can
-/// expose compiler cost and memory information. Implementations should cache immutable backend results when querying
-/// them is expensive. Calling this function must never trigger compilation.
+/// Optional capability for inspecting a compiled program without recompiling it. Analysis is deliberately separate from
+/// [`CompilationDomain`] because not every backend or runtime plugin can expose compiler cost and memory information.
+/// Implementations should cache immutable backend results when querying them is expensive. Calling this function must
+/// never trigger compilation.
 pub trait AnalyzableCompilationDomain: CompilationDomain {
-    /// Backend-owned typed analysis report.
+    /// Backend-owned typed analysis report type.
     type Analysis;
 
-    /// Analyzes the compiled program carried by an [`ExecutableFunction`] without recompiling it.
+    /// Analyzes the compiled program carried by the provided [`ExecutableFunction`] without recompiling it.
     fn analyze<Input: Parameterized<Self::Type>, Output: Parameterized<Self::Type>>(
         &self,
         executable_function: &ExecutableFunction<Self, Input, Output>,
