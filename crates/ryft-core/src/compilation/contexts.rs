@@ -1,33 +1,31 @@
 use std::hash::Hash;
-use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::captures::{CaptureConstant, CapturingContext, ClosedProgram};
-use crate::compilation::functions::{
-    CompilationTracer, ExecutableFunction, FlatCompilationProgram, ReferenceExecution, StagedFunction,
-};
-use crate::contexts::{Domain, StagingContext};
-use crate::macros::check_builders;
-use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{ProgramError, Typed, validate_reference_boundary};
-use crate::tracing::{DomainTracingContext, Tracer};
+use crate::captures::CaptureConstant;
+use crate::compilation::functions::{ExecutableFunction, ReferenceExecution, StagedProgram};
+use crate::contexts::Domain;
+use crate::parameters::Parameterized;
+use crate::programs::ProgramError;
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four phases:
 ///
-///   1. [`Self::stage`] traces a closure into a [`StagedFunction`] that retains the options for the later phases.
-///   2. [`Self::lower`] lowers a staged function into a lowered function.
-///   3. [`Self::compile`] compiles a lowered function into a compiled function.
-///   4. [`Self::execute`] executes a compiled function on runtime inputs.
+///   1. [`StagedProgram::stage`] traces a flat closure into a [`StagedProgram`], typically through
+///      [`StagedFunction::stage`](crate::StagedFunction::stage) or [`stage`](crate::stage) for typed callers.
+///   2. [`Self::lower`] lowers a [`StagedProgram`] into a [`Self::LoweredProgram`], typically through
+///      [`StagedFunction::lower`](crate::StagedFunction::lower).
+///   3. [`Self::compile`] compiles a [`Self::LoweredProgram`] into a [`Self::CompiledProgram`], typically through
+///      [`LoweredFunction::compile`](crate::LoweredFunction::compile).
+///   4. [`Self::execute`] executes a compiled function on runtime inputs, typically through
+///      [`ExecutableFunction::call`].
 ///
-/// The domain performs every phase, while staged, lowered, compiled, and executable functions remain passive values.
-/// Core owns everything that depends on the structured input and output types of a function. It traces closures,
-/// lifts runtime captures into leading program inputs, checks input counts and compiled output types, and reconstructs
-/// structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::execute`] over flat programs,
-/// types, and values, including any validation, caching, or runtime conversion that they choose to apply. Staging
-/// traces exactly the input types that it receives. Backends apply options that change input types before staging
-/// (e.g., in [`Self::dispatch_signature`] for retained dispatch), apply options that change output types during
-/// lowering, and reject staged functions that they cannot execute during lowering as well.
+/// Core owns staging and everything that depends on the structured input and output types of a function. It traces
+/// closures, lifts runtime captures into leading program inputs, checks input counts and compiled output types, and
+/// reconstructs structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::execute`] over
+/// flat programs, types, and values, including any backend validation, caching, or runtime conversion. Staging traces
+/// exactly the input types that it receives. Backends apply options that change input types before staging (e.g., in
+/// [`Self::dispatch_signature`] for retained dispatch), apply options that change output types during lowering, and
+/// reject staged functions that they cannot execute during lowering as well.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-defined key for one input specialization of a retained Just-In-Time (JIT) dispatcher.
     type DispatchKey: Clone + Eq + Hash;
@@ -60,123 +58,19 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
-    /// Traces the fallible `function` into a [`StagedFunction`]. `function` receives the symbolic references of
-    /// `captures`, tracers for those captures, and tracers for inputs of `input_types`, and returns its traced outputs.
-    /// This is the only staging primitive. It traces at exactly `input_types` and retains `options` in the returned
-    /// [`StagedFunction`] for lowering and compilation.
-    #[inline]
-    fn stage<Input, Output, F>(
-        &self,
-        function: F,
-        captures: Vec<Self::Value>,
-        input_types: Input,
-        options: Self::Options,
-    ) -> Result<StagedFunction<Self, Input, Output>, Self::Error>
-    where
-        Self: Sized,
-        Input: Parameterized<Self::Type>,
-        Input::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
-        Output: Parameterized<Self::Type>,
-        Output::Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<CompilationTracer<Self>>,
-        Output::To<CompilationTracer<Self>>: Parameterized<
-                CompilationTracer<Self>,
-                To<Self::Type> = Output,
-                To<Self::Constant> = Output::To<Self::Constant>,
-            >,
-        F: FnOnce(
-            Vec<Self::Constant>,
-            Vec<CompilationTracer<Self>>,
-            Input::To<CompilationTracer<Self>>,
-        ) -> Result<Output::To<CompilationTracer<Self>>, Self::Error>,
-        DomainTracingContext<Self, Self::Value>:
-            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
-    {
-        // Captured references must name distinct runtime allocations. Validate them before replacing concrete values
-        // with symbolic capture references, while their runtime identities are still available. Public inputs are
-        // abstract types here, so only captures can be checked at this boundary.
-        validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
-
-        // Retain the structured boundary for program construction and the flat public types for later call validation
-        // before consuming the input types to create tracers.
-        let input_structure = input_types.parameter_structure();
-        let input_type_values = input_types.parameters().cloned().collect::<Vec<_>>();
-
-        // A fresh context isolates this trace. Runtime captures stay in its side table, while the program stores typed
-        // references to their slots. The closure receives both those constant payloads and their tracers.
-        let context = DomainTracingContext::<Self, Self::Value>::new();
-        let capture_table = context.captures().clone();
-        let builder = context.builder().clone();
-        let capture_constants =
-            captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
-        let capture_tracers = capture_constants
-            .iter()
-            .cloned()
-            .map(|capture| StagingContext::constant(&context, capture))
-            .collect::<Vec<_>>();
-
-        // Replace each input type with a symbolic input while preserving its container structure. Invoking the closure
-        // once records the operations it binds through these inputs and the captured tracers.
-        let inputs = input_types.map_parameters(|input_type| context.input(input_type)).map_err(ProgramError::from)?;
-        let outputs = function(capture_constants, capture_tracers, inputs)?;
-
-        // Atom identifiers are local to a builder. Reject foreign output tracers before reading their identifiers so
-        // they cannot accidentally name unrelated atoms in this trace.
-        check_builders!(&builder, [outputs.parameters().map(|output| output.builder())])?;
-
-        // Convenience operators can record errors in the builder and return poisoned tracers instead of returning an
-        // error from the closure. Report the original error even if the closure discarded the affected values.
-        if let Some(error) = builder.borrow_mut().error.take() {
-            return Err(error.into());
-        }
-
-        // Extract all output metadata before releasing the tracers. Atom identifiers finalize the program, while the
-        // flat types and container structure let compiled calls validate and reconstruct their structured outputs.
-        let output_structure = outputs.parameter_structure();
-        let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-        let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-
-        // The context and output tracers own `Rc` clones of the capture table and builder. Drop them explicitly because
-        // their automatic drops would run at the end of this scope, after the `Rc::try_unwrap` calls below. Those calls
-        // require unique ownership, and any remaining clones indicate a handle that escaped the trace.
-        drop(outputs);
-        drop(context);
-        let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-
-        // Remove dead computation before pruning captures so slots referenced only by dead code can be released.
-        // Observable effects remain in the program even when no output consumes their results.
-        let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
-
-        // Validate every capture reference against its runtime slot and type, then prune unused captures and renumber
-        // the surviving references together with their table entries to keep the closed program consistent.
-        let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
-        Ok(StagedFunction::new(source_program, input_type_values, output_types, output_structure, options))
-    }
-
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Lowers the lifted program of a staged function into the program representation of this backend (i.e.,
-    /// [`Self::LoweredProgram`]) and returns it together with its effective flat output types. Callers typically use
-    /// [`StagedFunction::lower`] rather than calling this function directly. The lowered program must capture every
-    /// option, compiler, target, and topology property that affects compilation, because caching backends derive the
-    /// identity of compiled programs from the lowered program alone.
+    /// Lowers `staged` into the program representation of this backend (i.e., [`Self::LoweredProgram`]) and returns it
+    /// together with its effective flat output types. Callers typically use
+    /// [`StagedFunction::lower`](super::functions::StagedFunction::lower) rather than calling this function directly.
+    /// The lowered program must capture every option, compiler, target, and topology property that affects compilation,
+    /// because caching backends derive the identity of compiled programs from the lowered program alone.
     ///
     /// # Parameters
     ///
-    ///   - `program`: Source program of the staged function with its runtime captures lifted into leading inputs.
-    ///     Refer to [`StagedFunction::lifted_program`] for more information on this.
-    ///   - `capture_count`: Number of leading inputs of `program` that are lifted runtime captures.
-    ///   - `input_types`: Flat declared public input types of the staged function, excluding captures.
-    ///   - `output_types`: Flat output types of the staged function.
-    ///   - `options`: Compilation options retained by the staged function.
-    fn lower(
-        &self,
-        program: &FlatCompilationProgram<Self>,
-        capture_count: usize,
-        input_types: &[Self::Type],
-        output_types: &[Self::Type],
-        options: &Self::Options,
-    ) -> Result<(Self::LoweredProgram, Vec<Self::Type>), Self::Error>;
+    ///   - `staged`: Owned staging artifact borrowed for lowering. Use [`StagedProgram::lifted_program`] to obtain the
+    ///     source program with captures lifted into leading inputs.
+    fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<Self::Type>), Self::Error>;
 
     /// Compiles a lowered program into an executable program of this backend (i.e., [`Self::CompiledProgram`]) and
     /// returns it together with its effective flat output types. Callers use

@@ -1,5 +1,6 @@
-//! Typed compilation lifecycle handles and retained JIT dispatch.
+//! Core-owned flat staging, typed compilation lifecycle handles, and retained JIT dispatch.
 //!
+//! [`StagedProgram::stage`] implements flat tracing. [`StagedFunction::stage`] preserves typed container structures.
 //! The lifecycle handles ([`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`])
 //! carry a program through staging, lowering, compilation, and execution together with its runtime captures and
 //! structured signatures. [`StagedFunction::lower`], [`LoweredFunction::compile`], and [`ExecutableFunction::call`]
@@ -11,6 +12,7 @@
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,13 +21,13 @@ use crate::captures::{CapturingContext, ClosedProgram};
 use crate::compilation::caching::accumulate_duration;
 use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::macros::check_count;
+use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
-use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
     AttachedRegions, Operation, Program, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
-    Value,
+    Value, validate_reference_boundary,
 };
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
@@ -102,6 +104,168 @@ pub type FlatCompilationProgram<C> = Program<
 
 /// Tracer used while staging a compiled function in the operation universe of `C`.
 pub type CompilationTracer<C> = Tracer<DomainTracingContext<C, <C as Domain>::Value>>;
+
+/// Owned flat staging artifact constructed by [`Self::stage`] and borrowed by [`CompilationDomain::lower`].
+///
+/// This artifact retains the source program, runtime captures, flat public signature, and compilation options.
+/// [`StagedFunction`] pairs it with the Rust input and output container structures used by typed callers. Captures
+/// remain symbolic constants in the source program and become leading inputs in [`Self::lifted_program`].
+pub struct StagedProgram<C: CompilationDomain> {
+    /// Flat source program and the runtime values referenced by its captured constants.
+    source_program: ClosedProgram<C::Value, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+
+    /// Flat declared public input types, excluding captures.
+    input_types: Vec<C::Type>,
+
+    /// Flat source-program output types before rewrites during lowering.
+    output_types: Vec<C::Type>,
+
+    /// Compilation options retained for lowering and compilation.
+    options: C::Options,
+
+    /// Memoized source program with runtime captures lifted into leading flat inputs.
+    lifted_program: OnceLock<Arc<FlatCompilationProgram<C>>>,
+}
+
+impl<C: CompilationDomain> StagedProgram<C> {
+    /// Traces the fallible flat `function` into an owned [`StagedProgram`]. `function` receives the symbolic references
+    /// of `captures`, tracers for those captures, and one tracer per entry of `input_types`, and returns flat output
+    /// tracers. This is the only staging primitive. It traces at exactly `input_types` and retains `options` for
+    /// lowering and compilation. On success, this constructor invokes `function` exactly once. Typed callers typically
+    /// use [`StagedFunction::stage`] instead.
+    ///
+    /// # Parameters
+    ///
+    ///   - `_domain`: Domain whose type, constant, operation, and runtime value families the trace uses.
+    ///   - `function`: Fallible closure to trace with symbolic captures and flat inputs.
+    ///   - `captures`: Runtime values to register in the source program's capture table.
+    ///   - `input_types`: Flat abstract public input signature.
+    ///   - `options`: Options retained for lowering and compilation.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from capture validation, the closure, or program construction. Foreign output tracers and handles
+    /// that escape the trace are rejected during finalization.
+    #[inline]
+    pub fn stage<F>(
+        _domain: &C,
+        function: F,
+        captures: Vec<C::Value>,
+        input_types: Vec<C::Type>,
+        options: C::Options,
+    ) -> Result<Self, C::Error>
+    where
+        F: FnOnce(
+            Vec<C::Constant>,
+            Vec<CompilationTracer<C>>,
+            Vec<CompilationTracer<C>>,
+        ) -> Result<Vec<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        // Captured references must name distinct runtime allocations. Validate them before replacing concrete values
+        // with symbolic capture references, while their runtime identities are still available. Public inputs are
+        // abstract types here, so only captures can be checked at this boundary.
+        validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
+
+        // A fresh context isolates this trace. Runtime captures stay in its side table, while the program stores typed
+        // references to their slots. The closure receives both those constant payloads and their tracers.
+        let context = DomainTracingContext::<C, C::Value>::new();
+        let capture_table = context.captures().clone();
+        let builder = context.builder().clone();
+        let capture_constants =
+            captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
+        let capture_tracers = capture_constants
+            .iter()
+            .cloned()
+            .map(|capture| StagingContext::constant(&context, capture))
+            .collect::<Vec<_>>();
+
+        // Create one symbolic input per declared public type. Invoking the closure once records the operations it
+        // binds through these inputs and the captured tracers, independently of any caller's container structure.
+        let inputs = input_types.iter().cloned().map(|input_type| context.input(input_type)).collect();
+        let outputs = function(capture_constants, capture_tracers, inputs)?;
+
+        // Atom identifiers are local to a builder. Reject foreign output tracers before reading their identifiers so
+        // they cannot accidentally name unrelated atoms in this trace.
+        check_builders!(&builder, [outputs.iter().map(|output| output.builder())])?;
+
+        // Convenience operators can record errors in the builder and return poisoned tracers instead of returning an
+        // error from the closure. Report the original error even if the closure discarded the affected values.
+        if let Some(error) = builder.borrow_mut().error.take() {
+            return Err(error.into());
+        }
+
+        // Extract the output metadata before releasing the tracers. Atom identifiers finalize the program, while the
+        // flat types describe its output signature for lowering and later call validation.
+        let output_ids = outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        let output_types = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+
+        // The context and output tracers own `Rc` clones of the capture table and builder. Drop them explicitly because
+        // their automatic drops would run at the end of this scope, after the `Rc::try_unwrap` calls below. Those calls
+        // require unique ownership, and any remaining clones indicate a handle that escaped the trace.
+        drop(outputs);
+        drop(context);
+        let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+
+        // Remove dead computation before pruning captures so slots referenced only by dead code can be released.
+        // Observable effects remain in the program even when no output consumes their results.
+        let program = builder
+            .build::<Vec<C::Constant>, Vec<C::Constant>>(
+                output_ids,
+                vec![Placeholder; input_types.len()],
+                vec![Placeholder; output_types.len()],
+            )?
+            .into_simplified()?;
+
+        // Validate every capture reference against its runtime slot and type, then prune unused captures and renumber
+        // the surviving references together with their table entries to keep the closed program consistent.
+        let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
+        Ok(Self { source_program, input_types, output_types, options, lifted_program: OnceLock::new() })
+    }
+
+    /// Returns the flat source program and its runtime captures.
+    #[inline]
+    pub fn source_program(
+        &self,
+    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
+        &self.source_program
+    }
+
+    /// Returns the flat declared public input types, excluding captures.
+    #[inline]
+    pub fn input_types(&self) -> &[C::Type] {
+        &self.input_types
+    }
+
+    /// Returns the flat source-program output types before rewrites during lowering.
+    #[inline]
+    pub fn output_types(&self) -> &[C::Type] {
+        &self.output_types
+    }
+
+    /// Returns the compilation options retained by this artifact.
+    #[inline]
+    pub fn options(&self) -> &C::Options {
+        &self.options
+    }
+
+    /// Returns the source program with captures lifted into leading inputs, in `[captures..., public inputs...]`
+    /// order. Backends lower this program and use the capture count of [`Self::source_program`] to distinguish the
+    /// lifted captures from public inputs. The derived program is cached, so repeated calls return the same [`Arc`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
+    pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
+        if let Some(program) = self.lifted_program.get() {
+            return Ok(program.clone());
+        }
+        let program = Arc::new(self.source_program.to_program_with_lifted_captures()?);
+        Ok(self.lifted_program.get_or_init(|| program).clone())
+    }
+}
 
 /// Completion-bearing result of one externally stateful compiled invocation.
 ///
@@ -202,11 +366,10 @@ pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Typ
 
 /// Staged, unlowered form of one compiled function.
 ///
-/// A staged function is the first callable package in the lifecycle. It owns the typed source [`ClosedProgram`]
-/// together with the call-level state that a bare program never carries, namely its runtime capture table, exact
-/// public input and output structures, and compilation options. It can be inspected, lowered by its domain, or
-/// embedded as a compiled-call boundary in an enclosing trace. No backend lowering or executable compilation has
-/// happened yet.
+/// A staged function is the first callable package in the lifecycle. It pairs an owned [`StagedProgram`] with the
+/// exact public input and output container structures that typed calls need. It can be inspected, lowered by its
+/// domain, or embedded as a compiled-call boundary in an enclosing trace. No backend lowering or executable compilation
+/// has happened yet.
 pub struct StagedFunction<
     C: CompilationDomain,
     Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
@@ -222,23 +385,14 @@ struct StagedFunctionState<
     Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
     Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
 > {
-    /// Source program and concrete runtime captures produced by tracing.
-    source_program: ClosedProgram<C::Value, C::Constant, C::Operation, Input::To<C::Constant>, Output::To<C::Constant>>,
+    /// Owned flat staging artifact, including runtime captures, signatures, and options.
+    program: StagedProgram<C>,
 
-    /// Flat declared public input types, excluding hidden captures.
-    input_types: Vec<C::Type>,
-
-    /// Flat declared output types in source-program order.
-    output_types: Vec<C::Type>,
+    /// Input parameter structure used to reconstruct typed tracer inputs and abstract signatures.
+    input_structure: Input::ParameterStructure,
 
     /// Output parameter structure used to reconstruct structured values.
     output_structure: Output::ParameterStructure,
-
-    /// Options retained for lowering and compilation.
-    options: Arc<C::Options>,
-
-    /// Memoized source program with captures lifted into leading flat inputs.
-    lifted_program: OnceLock<Arc<FlatCompilationProgram<C>>>,
 }
 
 impl<C, Input, Output> Clone for StagedFunction<C, Input, Output>
@@ -262,62 +416,102 @@ where
     Output: Parameterized<C::Type>,
     Output::Family: ParameterizedFamily<C::Constant>,
 {
-    /// Creates a staged function from its traced source program, its flat public input and output types, its output
-    /// structure, and the options that it retains for lowering and compilation.
-    pub(super) fn new(
-        source_program: ClosedProgram<
-            C::Value,
-            C::Constant,
-            C::Operation,
-            Input::To<C::Constant>,
-            Output::To<C::Constant>,
-        >,
-        input_types: Vec<C::Type>,
-        output_types: Vec<C::Type>,
-        output_structure: Output::ParameterStructure,
+    /// Traces a fallible typed `function` through `domain`, retaining its exact input and output container structures.
+    /// The function receives symbolic capture constants, capture tracers, and structured input tracers. Runtime
+    /// captures and compilation options are owned by the resulting [`StagedProgram`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `domain`: Domain whose flat staging primitive records the function.
+    ///   - `function`: Fallible closure to trace once with symbolic captures and inputs.
+    ///   - `captures`: Runtime values to register in the source program's capture table.
+    ///   - `input_types`: Structured abstract public input signature.
+    ///   - `options`: Options retained for lowering and compilation.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from tracing or reconstructing the structured inputs.
+    pub fn stage<F>(
+        domain: &C,
+        function: F,
+        captures: Vec<C::Value>,
+        input_types: Input,
         options: C::Options,
-    ) -> Self {
-        Self {
-            state: Arc::new(StagedFunctionState {
-                source_program,
-                input_types,
-                output_types,
-                output_structure,
-                options: Arc::new(options),
-                lifted_program: OnceLock::new(),
-            }),
-        }
+    ) -> Result<Self, C::Error>
+    where
+        Input::Family: ParameterizedFamily<CompilationTracer<C>>,
+        Output::Family: ParameterizedFamily<CompilationTracer<C>>,
+        F: FnOnce(
+            Vec<C::Constant>,
+            Vec<CompilationTracer<C>>,
+            Input::To<CompilationTracer<C>>,
+        ) -> Result<Output::To<CompilationTracer<C>>, C::Error>,
+        DomainTracingContext<C, C::Value>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        // Flat arities cannot recover nested empty containers or other structural metadata. Keep the input structure
+        // before flattening, and record the output structure while the closure still owns its structured results.
+        let input_structure = input_types.parameter_structure();
+        let mut output_structure = None;
+        let program = StagedProgram::stage(
+            domain,
+            |capture_constants, capture_tracers, inputs| {
+                let inputs = Input::To::<CompilationTracer<C>>::from_parameters(input_structure.clone(), inputs)
+                    .map_err(ProgramError::from)?;
+                let outputs = function(capture_constants, capture_tracers, inputs)?;
+                output_structure = Some(outputs.parameter_structure());
+                Ok(outputs.into_parameters().collect())
+            },
+            captures,
+            input_types.into_parameters().collect(),
+            options,
+        )?;
+
+        // The inherent flat staging constructor invokes the closure exactly once on success, so it must have recorded
+        // this structure. Backends cannot override that constructor or bypass the callback.
+        let output_structure = output_structure.unwrap();
+        Ok(Self { state: Arc::new(StagedFunctionState { program, input_structure, output_structure }) })
     }
 
-    /// Returns the source program and its runtime captures.
+    /// Returns the owned flat staging artifact retained by this function.
+    #[inline]
+    pub fn staged_program(&self) -> &StagedProgram<C> {
+        &self.state.program
+    }
+
+    /// Returns the flat source program and its runtime captures. Container structures remain on this function and are
+    /// available through [`Self::input_structure`] and [`Self::output_structure`].
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Input::To<C::Constant>, Output::To<C::Constant>> {
-        &self.state.source_program
+    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
+        self.state.program.source_program()
     }
 
     /// Returns the flat declared public input types, excluding hidden captures.
     #[inline]
     pub fn input_types(&self) -> &[C::Type] {
-        self.state.input_types.as_slice()
+        self.state.program.input_types()
     }
 
     /// Returns the flat source-program output types.
     #[inline]
     pub fn output_types(&self) -> &[C::Type] {
-        self.state.output_types.as_slice()
+        self.state.program.output_types()
     }
 
-    /// Reconstructs the structured abstract input signature retained by the source program.
+    /// Returns the exact input parameter structure retained by this function.
+    #[inline]
+    pub fn input_structure(&self) -> &Input::ParameterStructure {
+        &self.state.input_structure
+    }
+
+    /// Reconstructs the structured abstract input signature retained by this function.
     pub fn input_signature(&self) -> Result<Input, ParameterError>
     where
         Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Type, To = Input>, To<C::Type> = Input>,
     {
-        let program = self.state.source_program.program();
-        let input_types =
-            program.input_ids().iter().map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned());
-        Input::from_parameters(program.input_structure().clone(), input_types)
+        Input::from_parameters(self.state.input_structure.clone(), self.input_types().iter().cloned())
     }
 
     /// Returns the output parameter structure retained by this staged function.
@@ -329,7 +523,7 @@ where
     /// Returns the compilation options bound to this staged function.
     #[inline]
     pub fn options(&self) -> &C::Options {
-        self.state.options.as_ref()
+        self.state.program.options()
     }
 
     /// Stages a call to this function into the active context recovered from `inputs`.
@@ -375,7 +569,8 @@ where
     {
         let capture_references = self
             .state
-            .source_program
+            .program
+            .source_program()
             .captures()
             .iter()
             .cloned()
@@ -434,7 +629,7 @@ where
         // Capture-reference indices belong to the caller's capture table and may differ from the source program's
         // local indices, and so only positional arity and types can be validated against the source program's
         // encapsulated capture table.
-        let captures = self.state.source_program.captures();
+        let captures = self.source_program().captures();
         check_count!("input", capture_references, captures.len(), ProgramError);
         for (index, (expected, actual)) in captures.iter().zip(capture_references).enumerate() {
             let expected_type = expected.r#type();
@@ -467,7 +662,7 @@ where
     fn callee_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
         let callee = self.lifted_program()?;
         if self.output_types().iter().any(Type::is_reference) {
-            let capture_count = self.state.source_program.captures().len();
+            let capture_count = self.source_program().captures().len();
             let analysis = callee.reference_analysis(capture_count)?;
             for (index, root) in analysis.output_roots().iter().enumerate() {
                 if let Some(root) = root
@@ -489,7 +684,8 @@ where
     /// Returns the source program with its runtime captures lifted into leading flat inputs, in the
     /// `[captures..., public inputs...]` order that compiled executables are invoked with. Backends lower this program
     /// rather than the [`ClosedProgram`] returned by [`Self::source_program`], and use the capture count of the source
-    /// program to tell lifted captures apart from public inputs.
+    /// program to tell lifted captures apart from public inputs. The source program itself has a flat boundary, while
+    /// this function retains its exact container structures separately.
     ///
     /// The program is derived once and then cached on the shared staged state, so repeated calls, including calls on
     /// clones of this function, return the same [`Arc`].
@@ -498,23 +694,12 @@ where
     ///
     /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
     pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError> {
-        if let Some(program) = self.state.lifted_program.get() {
-            return Ok(program.clone());
-        }
-        let program = Arc::new(self.state.source_program.to_program_with_lifted_captures()?);
-        Ok(self.state.lifted_program.get_or_init(|| program).clone())
+        self.state.program.lifted_program()
     }
 
     /// Lowers this function into a [`LoweredFunction`] through `domain` (refer to [`CompilationDomain::lower`]).
     pub fn lower(&self, domain: &C) -> Result<LoweredFunction<C, Input, Output>, C::Error> {
-        let program = self.lifted_program()?;
-        let (lowered_program, output_types) = domain.lower(
-            &program,
-            self.state.source_program.captures().len(),
-            self.input_types(),
-            self.output_types(),
-            self.options(),
-        )?;
+        let (lowered_program, output_types) = domain.lower(self.staged_program())?;
         Ok(LoweredFunction { program: Arc::new(lowered_program), staged: self.clone(), output_types })
     }
 }
@@ -892,7 +1077,7 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Input::To<C::Constant>, Output::To<C::Constant>> {
+    ) -> &ClosedProgram<C::Value, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
         self.staged().source_program()
     }
 
@@ -1428,7 +1613,8 @@ where
                 .map_err(ProgramError::from)?;
         statistics.traces.fetch_add(1, Ordering::Relaxed);
         let tracing_start = Instant::now();
-        let staged = self.state.domain.stage(
+        let staged = StagedFunction::stage(
+            &self.state.domain,
             |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
             Vec::new(),
             input_types,
@@ -1569,8 +1755,8 @@ where
 
 /// Stages an infallible capture-free function through `domain`.
 ///
-/// This is the convenience form of [`CompilationDomain::stage`] for functions without runtime captures. Call
-/// [`CompilationDomain::stage`] directly when the function is fallible or closes over runtime captures.
+/// This is the convenience form of [`StagedFunction::stage`] for infallible functions without runtime captures. Use
+/// [`StagedFunction::stage`] when the function is fallible or closes over runtime captures.
 pub fn stage<C, F, Input, Output>(
     domain: &C,
     function: F,
@@ -1588,17 +1774,18 @@ where
         Parameterized<CompilationTracer<C>, To<C::Type> = Output, To<C::Constant> = Output::To<C::Constant>>,
     DomainTracingContext<C, C::Value>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    domain.stage(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
+    StagedFunction::stage(domain, |_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -1679,19 +1866,16 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(
-            &self,
-            program: &FlatCompilationProgram<Self>,
-            capture_count: usize,
-            _input_types: &[ArrayType],
-            output_types: &[ArrayType],
-            options: &Self::Options,
-        ) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+            let program = staged.lifted_program()?;
+            let capture_count = staged.source_program().captures().len();
+            let output_types = staged.output_types();
+            let options = staged.options();
             if options.fail_lowering {
                 return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
             }
             let program = TestLoweredProgram {
-                program: program.clone(),
+                program: program.as_ref().clone(),
                 capture_count,
                 output_types: output_types.to_vec(),
                 options: options.clone(),
@@ -1816,13 +2000,9 @@ mod tests {
 
         fn lower(
             &self,
-            program: &FlatCompilationProgram<Self>,
-            _capture_count: usize,
-            _input_types: &[ArrayIrType],
-            output_types: &[ArrayIrType],
-            _options: &Self::Options,
+            staged: &StagedProgram<Self>,
         ) -> Result<(Self::LoweredProgram, Vec<ArrayIrType>), ProgramError> {
-            Ok((program.clone(), output_types.to_vec()))
+            Ok((staged.lifted_program()?.as_ref().clone(), staged.output_types().to_vec()))
         }
 
         fn compile(
@@ -1893,12 +2073,50 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_domain_stage_propagates_closure_error() {
+    fn test_staged_program_stage() {
+        let input_type = ArrayType::scalar(DataType::F64);
+        let capture = Array::scalar(7.0).unwrap();
+        let invocations = Cell::new(0);
+        let staged = {
+            let domain = TestDomain::new();
+            StagedProgram::stage(
+                &domain,
+                |_, mut captures, mut inputs| {
+                    invocations.set(invocations.get() + 1);
+                    Ok(vec![captures.remove(0), inputs.remove(0)])
+                },
+                vec![capture.clone()],
+                vec![input_type.clone()],
+                TestOptions::default(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(invocations.get(), 1);
+
+        // The flat artifact owns its captures and can be lowered after the domain that staged it is gone.
+        assert_eq!(staged.source_program().captures(), &[capture]);
+        assert_eq!(staged.input_types(), &[input_type.clone()]);
+        assert_eq!(staged.output_types(), &[input_type.clone(), input_type]);
+        let (lowered, output_types) = TestDomain::new().lower(&staged).unwrap();
+        assert_eq!(lowered.capture_count, 1);
+        assert_eq!(output_types, staged.output_types());
+        assert_eq!(
+            lowered.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                in (%0, %1)"},
+        );
+    }
+
+    #[test]
+    fn test_staged_program_stage_propagates_closure_error() {
         let domain = TestDomain::new();
-        let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> = domain.stage(
+        let result = StagedProgram::stage(
+            &domain,
             |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
             Vec::new(),
-            ArrayType::scalar(DataType::F64),
+            vec![ArrayType::scalar(DataType::F64)],
             TestOptions::default(),
         );
 
@@ -1906,18 +2124,34 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_domain_stage_prunes_unused_captures() {
+    fn test_staged_program_stage_prunes_unused_captures() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
-            .stage(
-                |_, _, input: CompilationTracer<TestDomain>| Ok(input),
-                vec![Array::scalar(7.0).unwrap()],
-                ArrayType::scalar(DataType::F64),
-                TestOptions::default(),
-            )
-            .unwrap();
+        let staged = StagedProgram::stage(
+            &domain,
+            |_, _, inputs| Ok(inputs),
+            vec![Array::scalar(7.0).unwrap()],
+            vec![ArrayType::scalar(DataType::F64)],
+            TestOptions::default(),
+        )
+        .unwrap();
 
         assert!(staged.source_program().captures().is_empty());
+    }
+
+    #[test]
+    fn test_staged_program_stage_rejects_escaped_tracers() {
+        let retained = RefCell::new(None);
+        let result = StagedProgram::stage(
+            &TestDomain::new(),
+            |_, _, mut inputs| {
+                *retained.borrow_mut() = Some(inputs.remove(0));
+                Ok(Vec::new())
+            },
+            Vec::new(),
+            vec![ArrayType::scalar(DataType::F64)],
+            TestOptions::default(),
+        );
+        assert!(matches!(result, Err(ProgramError::EscapedProgramBuilder)));
     }
 
     #[test]
@@ -1953,6 +2187,34 @@ mod tests {
     }
 
     #[test]
+    fn test_staged_function_stage_preserves_empty_structures() {
+        let domain = TestDomain::new();
+        let input_types = (vec![Vec::new(), Vec::new()], ArrayType::scalar(DataType::F64));
+        let staged: StagedFunction<TestDomain, (Vec<Vec<ArrayType>>, ArrayType), (Vec<Vec<ArrayType>>, ArrayType)> =
+            StagedFunction::stage(
+                &domain,
+                |_, _, (_, input)| Ok((vec![Vec::new(), Vec::new(), Vec::new()], input)),
+                Vec::new(),
+                input_types.clone(),
+                TestOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(staged.input_signature().unwrap(), input_types);
+        assert_eq!(
+            staged.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)"},
+        );
+        let executable = staged.lower(&domain).unwrap().compile(&domain).unwrap().into_executable_function();
+        assert_eq!(
+            executable.call(&domain, (vec![Vec::new(), Vec::new()], Array::scalar(3.0).unwrap())).unwrap(),
+            (vec![Vec::new(), Vec::new(), Vec::new()], Array::scalar(3.0).unwrap()),
+        );
+    }
+
+    #[test]
     fn test_staged_function_clone() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage(
@@ -1964,6 +2226,7 @@ mod tests {
         .unwrap();
         let staged_clone = staged.clone();
         assert!(std::ptr::eq(staged.options(), staged_clone.options()));
+        assert!(Arc::ptr_eq(&staged.lifted_program().unwrap(), &staged_clone.lifted_program().unwrap()));
 
         let first = staged_clone.lower(&domain).unwrap().compile(&domain).unwrap();
         let second = staged.lower(&domain).unwrap().compile(&domain).unwrap();
@@ -2022,14 +2285,14 @@ mod tests {
     #[test]
     fn test_compiled_function() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
-            .stage(
-                |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Array::scalar(7.0).unwrap()],
-                (),
-                TestOptions::default(),
-            )
-            .unwrap();
+        let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
+            &domain,
+            |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            TestOptions::default(),
+        )
+        .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
 
         assert_eq!(compiled.executable_function().call(&domain, ()).unwrap(), Array::scalar(7.0).unwrap());
@@ -2062,14 +2325,14 @@ mod tests {
     #[test]
     fn test_compiled_function_into_executable_function() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
-            .stage(
-                |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Array::scalar(7.0).unwrap()],
-                (),
-                TestOptions::default(),
-            )
-            .unwrap();
+        let staged: StagedFunction<TestDomain, (), ArrayType> = StagedFunction::stage(
+            &domain,
+            |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            (),
+            TestOptions::default(),
+        )
+        .unwrap();
         let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let executable = compiled.into_executable_function();
 

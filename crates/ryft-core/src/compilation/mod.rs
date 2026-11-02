@@ -20,14 +20,14 @@
 //!
 //! # Terminology
 //!
-//! A _program_ is the transformable IR value (i.e., atoms, instructions, regions, and boundary types), which carries
-//! neither captures nor a structured signature. A _function_ is the callable package that pairs a program with
-//! everything a call needs, namely the capture table, the structured input and output signatures, the compilation
-//! options, and the backend artifacts. Every lifecycle handle below is therefore a function rather than a program, and
-//! [`CompiledFunctionDispatcher`] is not a program at all but a retained dispatcher over a Rust closure that produces
-//! one program per specialization. The `*Program` names inside the domain contracts
-//! ([`CompilationDomain::LoweredProgram`], [`CompilationDomain::CompiledProgram`], and [`FlatCompilationProgram`])
-//! name the backend and IR artifacts that those functions carry.
+//! A bare [`Program`](crate::Program) is the transformable IR value (i.e., atoms, instructions, regions, and boundary
+//! types). [`StagedProgram`] owns a flat source program together with its runtime capture table, public types, and
+//! compilation options. A _function_ adds the Rust input and output container structures needed for typed calls and
+//! carries the resulting backend artifacts through the lifecycle. Every lifecycle handle below is therefore a function,
+//! and [`CompiledFunctionDispatcher`] is a retained dispatcher over a Rust closure that produces one program per
+//! specialization. The `*Program` names inside the domain contracts (i.e., [`CompilationDomain::LoweredProgram`],
+//! [`CompilationDomain::CompiledProgram`], and [`FlatCompilationProgram`]) name the backend and IR artifacts that
+//! those functions carry.
 //!
 //! # Entry Points
 //!
@@ -36,9 +36,10 @@
 //!     [`CompiledFunctionDispatcher`] specializes on explicit static host parameters, the dynamic input's parameter
 //!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization stages, lowers,
 //!     and requests compilation; warm calls dispatch directly to the retained executable.
-//!   - Use [`stage`] for ordinary capture-free staging. Call [`CompilationDomain::stage`] directly when fallibility,
-//!     runtime captures, or symbolic capture references are needed. Then continue with [`StagedFunction::lower`]
-//!     and [`LoweredFunction::compile`].
+//!   - Use [`stage`] for ordinary capture-free staging. Use [`StagedFunction::stage`] when fallibility, runtime
+//!     captures, or symbolic capture references are needed. Then continue with [`StagedFunction::lower`] and
+//!     [`LoweredFunction::compile`]. [`StagedProgram::stage`] exposes the underlying flat staging primitive and
+//!     returns an owned [`StagedProgram`] for direct backend use.
 //!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::call`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
 //!     [`ExecutableFunction::call_statefully`] or [`ExecutableFunction::call_statefully_async`] instead. Retained
@@ -67,8 +68,8 @@
 //!
 //! # Lifecycle Handles
 //!
-//!   1. [`StagedFunction`] owns a typed [`ClosedProgram`](crate::ClosedProgram), concrete runtime captures, public
-//!      input and output signatures, output structure, and compilation options. It contains no backend lowering or
+//!   1. [`StagedFunction`] pairs a flat [`StagedProgram`] with the exact input and output container structures. The
+//!      artifact owns the source program, captures, public types, and options. It contains no backend lowering or
 //!      executable, and its [`StagedFunction::call`] method stages a nested call into an active context rather than
 //!      executing at runtime.
 //!   2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
@@ -141,13 +142,14 @@
 //! analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when staged
 //! functions must compose inside other traces.
 //!
-//! Core implements [`CompilationDomain::stage`], which backends must not override and which traces exactly
-//! the input types that it receives. Backends apply options that change input types before staging (e.g., in
-//! [`CompilationDomain::dispatch_signature`]) and options that change output types during lowering. The remaining
-//! [`CompilationDomain`] functions have no generic parameters and work on flat programs, types, and values. Core owns
-//! everything that depends on structured signatures: [`StagedFunction::lower`], [`LoweredFunction::compile`], and
-//! [`ExecutableFunction::call`] lift captures, check input counts and compiled output types, call the backend, and
-//! reconstruct structured outputs.
+//! Core owns flat staging through the inherent [`StagedProgram::stage`] constructor. It traces exactly the input types
+//! that it receives and invokes the closure exactly once on success. Backends apply options that change input types
+//! before staging (e.g., in [`CompilationDomain::dispatch_signature`]) and options that change output types during
+//! lowering. [`CompilationDomain`] contains only backend hooks, with no generic functions, over flat programs, types,
+//! and values. Core owns everything that depends on structured signatures. [`StagedFunction::stage`] preserves the
+//! container structures. [`StagedFunction::lower`], [`LoweredFunction::compile`], and [`ExecutableFunction::call`]
+//! carry the typed metadata through lowering, check input counts and compiled output types, call the backend, and
+//! reconstruct structured outputs. [`StagedProgram::lifted_program`] supplies the shared flat capture-lifting step.
 
 pub mod caching;
 pub mod contexts;
@@ -163,5 +165,5 @@ pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolic
 pub use functions::{
     CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction,
     FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, ReferenceExecution,
-    StagedFunction, jit, jit_with_options, jit_with_options_and_capacity, stage,
+    StagedFunction, StagedProgram, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };

@@ -1741,7 +1741,7 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::CompilationDomain;
-    use crate::compilation::functions::{CompilationTracer, FlatCompilationProgram, StagedFunction, stage};
+    use crate::compilation::functions::{CompilationTracer, StagedFunction, StagedProgram, stage};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 
@@ -1785,15 +1785,8 @@ mod tests {
             Ok((input_types.clone(), input_types))
         }
 
-        fn lower(
-            &self,
-            _program: &FlatCompilationProgram<Self>,
-            _capture_count: usize,
-            _input_types: &[ArrayType],
-            output_types: &[ArrayType],
-            _options: &Self::Options,
-        ) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
-            Ok((output_types.to_vec(), output_types.to_vec()))
+        fn lower(&self, staged: &StagedProgram<Self>) -> Result<(Self::LoweredProgram, Vec<ArrayType>), Self::Error> {
+            Ok((staged.output_types().to_vec(), staged.output_types().to_vec()))
         }
 
         fn compile(
