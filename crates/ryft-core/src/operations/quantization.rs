@@ -1031,12 +1031,11 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOperation
 where
     C::Operation: From<ScaledDotOperation>,
 {
+    #[inline]
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         _context: &DifferentiationContext<C, P>,
@@ -1082,6 +1081,7 @@ where
             )?)?,
             None => ValueProjection::<ArrayType>::into_projected(lhs.clone())?.convert_element_type(DataType::BF16)?,
         };
+
         let rhs = match rhs_scale {
             Some(scale) => ValueProjection::<ArrayType>::into_projected(rhs.block_dequantize(
                 scale,
@@ -1090,29 +1090,31 @@ where
             )?)?,
             None => ValueProjection::<ArrayType>::into_projected(rhs.clone())?.convert_element_type(DataType::BF16)?,
         };
+
         let output = if self.accumulation_type == DataType::BF16 {
             lhs.dot(&rhs, &self.dimensions)?
         } else {
             lhs.dot_with_accumulation_type(&rhs, &self.dimensions, self.accumulation_type)?
         };
+
         Ok(vec![ValueProjection::<ArrayType>::from_projected(output)])
     }
 }
 
 /// Value-level generalized block-scaled dot product capability. [`ScaledDot`] is the receiver-style entry point for
 /// staging or executing [`ScaledDotOperation`]s, which contract element arrays after scaling every block of their
-/// contracting dimensions by the corresponding scale value. [`BlockQuantize`] produces element and scale arrays in the
-/// layout that this capability consumes.
+/// contracting dimensions by the corresponding scale value. [`BlockQuantize`] produces element and scale arrays
+/// in the layout that this capability consumes.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Computes the generalized dot product `(self * lhs_scale) · (rhs * rhs_scale)`, where each scale is repeated over
-    /// its blocks before the multiplication and an absent scale is the multiplicative identity. Refer to
+    /// Computes the generalized dot product `(self * lhs_scale) · (rhs * rhs_scale)`, where each scale is repeated
+    /// over its blocks before the multiplication and an absent scale is the multiplicative identity. Refer to
     /// [`ScaledDotOperation`] for the exact semantics and input constraints. Returns a [`ProgramError`] if the inputs
-    /// are incompatible with each other or with `dimensions`, or if the operation cannot be recorded in the context of
-    /// the value.
+    /// are incompatible with each other or with `dimensions`, or if the operation cannot be recorded in the context
+    /// of the value.
     ///
     /// # Parameters
     ///
@@ -1172,8 +1174,8 @@ impl ScaledDot for Array {
         dimensions: Option<&DotDimensionNumbers>,
         accumulation_type: Option<DataType>,
     ) -> Result<Self, ProgramError> {
-        // Lift concrete arrays into the array IR so that the eager interpretation rule can read their extents as
-        // dimension values and validate the inputs before dequantizing and contracting them.
+        // Lift concrete arrays into the array IR so that the eager interpretation rule can read their extents
+        // as dimension values and validate the inputs before dequantizing and contracting them.
         let dimensions = match dimensions {
             Some(dimensions) => dimensions.clone(),
             None => ScaledDotOperation::default_dimensions(self.r#type().rank())?,
@@ -1226,6 +1228,8 @@ where
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
 /// assigns to the left input, the right input, and the gradients. It is the analogue of the `BlockScaleConfig` of
@@ -4615,7 +4619,9 @@ mod tests {
             .trim_end(),
         );
         let evaluation = program
-            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .partially_evaluate(
+                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
+            )
             .unwrap();
         assert_eq!(
             evaluation.program().to_string(),
@@ -5299,7 +5305,9 @@ mod tests {
         // scale extent that does not divide the element extent reports the divisibility assertion. Partially evaluating
         // the program with unknown inputs preserves both diagnostics.
         let evaluation = program
-            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .partially_evaluate(
+                &program.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>(),
+            )
             .unwrap();
         let inputs = vec![ones.clone(), ones.clone(), ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())];
         let expected = AssertionError::Failed {
