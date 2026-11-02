@@ -166,7 +166,7 @@ pub mod functions;
 pub mod operations;
 
 pub use caching::{
-    CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
+    CompilationCacheOutcome, CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent,
     CompilationMissReason, DiskCache,
 };
 pub use contexts::{

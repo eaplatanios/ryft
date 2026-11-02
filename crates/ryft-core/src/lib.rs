@@ -51,7 +51,7 @@ pub use batching::{
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::{
     AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangePolicy,
-    CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
+    CompilationCacheDomain, CompilationCacheOutcome, CompilationCacheStatistics, CompilationCacheTier,
     CompilationContext, CompilationDomain, CompilationEvent, CompilationExchangeError, CompilationMissReason,
     CompilationTracer, Compile, CompiledFunction, CompiledFunctionDispatcher, DiskCache, DispatcherStatistics,
     ExecutableFunction, LoweredFunction, StagedCallOperation, StagedFunction, StagedProgram, StatefulCompilationDomain,

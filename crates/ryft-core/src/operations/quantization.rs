@@ -1,20 +1,19 @@
 //! Block-scaled (i.e., microscaling) quantization through [`BlockQuantize`], [`BlockDequantize`], [`ScaledDot`], and
-//! [`BlockScaledDot`]. [`BlockQuantize`] splits a floating-point array into an array of narrow elements and an array of
-//! block scales, [`BlockDequantize`] reconstructs their values at a chosen precision, and [`ScaledDotOperation`]
+//! [`BlockScaledDot`]. [`BlockQuantize`] splits a floating-point array into an array of narrow elements and an array
+//! of block scales, [`BlockDequantize`] reconstructs their values at a chosen precision, and [`ScaledDotOperation`]
 //! contracts such element and scale pairs as a generalized dot product of their dequantized values. Together they
-//! cover the NVFP4 format and the [OCP Microscaling Formats][OCP MX] (e.g., MXFP8) that low precision matrix units
-//! consume natively.
+//! cover the NVFP4 format and the [Open Compute Project Microscaling Formats](
+//! https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+//! (e.g., MXFP8) that low precision matrix units consume natively.
 //!
 //! [`BlockQuantize`] and [`BlockDequantize`] compose existing operations and inherit their transform rules.
 //! [`ScaledDotOperation`] supports eager arrays, staged programs, array IR projections, partial evaluation, and
-//! batching, and it intentionally has no differentiation rule. The XLA backend lowers it to cuDNN's block-scaled matrix
-//! product on CUDA where cuDNN supports the call and to the `xla.scaled_dot` composite otherwise.
+//! batching, and it intentionally has no differentiation rule. The XLA backend lowers it to cuDNN's block-scaled
+//! matrix product on CUDA where cuDNN supports the call and to the `xla.scaled_dot` composite otherwise.
 //! [`block_scaled_dot`] creates the differentiable training entry point, the analogue of `jax.nn.scaled_dot_general`,
 //! which quantizes unquantized inputs in its primal and implements both the JAX gradient policies and the NVFP4
 //! training recipe of NVIDIA (i.e., current global scaling, stochastic gradient rounding, random Hadamard transforms
 //! of the weight gradient inputs, and 16×16 weight scale tiles).
-//!
-//! [OCP MX]: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 //!
 //! # Example
 //!
@@ -25,8 +24,7 @@
 //! let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
 //! assert_eq!(scales.to_f64s(), vec![1.0, 0.25]);
 //! let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
-//! let product =
-//!     elements.scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))?;
+//! let product = elements.scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))?;
 //! assert_eq!(product.to_f64s(), vec![51.0625]);
 //! # Ok(())
 //! # }
@@ -83,10 +81,8 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, DomainTracingContext};
 
-// TODO(eaplatanios): Review from here onwards (and also the module docstring).
-
-/// Value-level block quantization capability. [`BlockQuantize::block_quantize`] splits an `f32` or `f64` array into an
-/// array of narrow elements and an array of scales with one scale per block of consecutive values along the last
+/// Value-level block quantization capability. [`BlockQuantize::block_quantize`] splits an `f32` or `f64` array into
+/// an array of narrow elements and an array of scales with one scale per block of consecutive values along the last
 /// dimension, which are the inputs that [`ScaledDot`] consumes. This supports quantizing values on the fly (e.g., a KV
 /// cache) without a dedicated primitive, because the recipe composes existing operations and inherits their transform
 /// rules. Both sides of a [`ScaledDot`] contraction quantized this way must contract their last dimension, which
@@ -95,21 +91,22 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// along other axes, scales the input by a global scale first, and rounds stochastically. Its blocks may span several
 /// axes (e.g., the 16×16 weight tiles of the NVFP4 training recipe of NVIDIA), with one scale per tile.
 ///
-/// The scale data type selects one of two standard microscaling recipes.
+/// The scale data type selects one of two standard microscaling recipes:
 ///
-///   - **`f8e4m3fn` scales** (the NVFP4 recipe of NVIDIA) set the scale of each block to
-///     `max_abs(block) / element_max`, where `element_max` is the largest finite magnitude of the element type (e.g.,
-///     `6.0` for `f4e2m1fn`), so that the largest element of each block quantizes to the top of the element grid.
-///     Scales are clamped to `[2^-9, 448]`, which spans the positive finite `f8e4m3fn` values, including subnormal
-///     ones. JAX does not clamp from below, so blocks whose scales round to zero there divide by zero, while here
-///     they use the smallest scale.
-///   - **`f8e8m0fnu` scales** (the [OCP MX] recipe, e.g., MXFP8 and MXFP4) set the shared scale of each block to the
-///     power of two `2^(floor(log2(max_abs(block))) - emax)`, where `emax` is the largest exponent of the element type
-///     (e.g., `2` for `f4e2m1fn`, `8` for `f8e4m3fn`, and `15` for `f8e5m2`), so that the largest element of each
-///     block lands in the top binade of the element type. Scales are clamped to `[2^-126, 2^127]`. The upper bound is
-///     the largest `f8e8m0fnu` value, and the lower bound is the smallest normal `f32` value rather than the smallest
-///     `f8e8m0fnu` value `2^-127`, so that a backend that flushes subnormal values to zero cannot produce a zero scale,
-///     which `f8e8m0fnu` cannot represent.
+///   - **`f8e4m3fn` Scales (i.e., the NVFP4 recipe of NVIDIA):** Set the scale of each block to `max_abs(block)
+///     / element_max`, where `element_max` is the largest finite magnitude of the element type (e.g., `6.0` for
+///     `f4e2m1fn`), so that the largest element of each block quantizes to the top of the element grid. Scales are
+///     clamped to `[2^-9, 448]`, which spans the positive finite `f8e4m3fn` values, including subnormal ones. JAX
+///     does not clamp from below, so blocks whose scales round to zero there divide by zero, while here they use
+///     the smallest scale.
+///   - **`f8e8m0fnu` Scales (i.e., the [Open Compute Project (OCP) Microscaling (MX)](
+///     https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) recipe; e.g., MXFP8 and
+///     MXFP4):** Set the shared scale of each block to the power of two `2^(floor(log2(max_abs(block))) - emax)`, where
+///     `emax` is the largest exponent of the element type (e.g., `2` for `f4e2m1fn`, `8` for `f8e4m3fn`, and `15` for
+///     `f8e5m2`), so that the largest element of each block lands in the top binade of the element type. Scales are
+///     clamped to `[2^-126, 2^127]`. The upper bound is the largest `f8e8m0fnu` value, and the lower bound is the
+///     smallest normal `f32` value rather than the smallest `f8e8m0fnu` value `2^-127`, so that a backend that
+///     flushes subnormal values to zero cannot produce a zero scale, which `f8e8m0fnu` cannot represent.
 ///
 /// Both recipes divide each input value by the scale of its block after narrowing that scale to the scale type, which
 /// is exactly the scale that [`ScaledDotOperation`] dequantizes with. They then clamp the quotients to the finite range
@@ -127,12 +124,10 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// Both recipes round their scales and elements to the grids of the narrow types arithmetically (i.e., with exact
 /// power of two spacings derived from exponent bits) before converting them, so that every conversion is exact. This
 /// keeps quantization intact under compilers that fold a conversion to a narrow type into a following conversion back,
-/// as XLA does on GPUs, where JAX places optimization barriers for the same reason.
+/// as the XLA backend does on GPUs, where JAX places optimization barriers for the same reason.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
-///
-/// [OCP MX]: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Quantizes `self` into a pair `(elements, scales)`, with one scale per block of `block_size` consecutive values
@@ -163,7 +158,7 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized 
     ///
     /// A `global_scale` divides `self` before the block scales are computed, as in the NVFP4 recipe, which scales
     /// tensors both globally and per block, and as with the `global_scale` of the JAX `quantize` helper, so the
-    /// dequantized value of an element is `element · scale · global_scale`. A `rounding_noise` array of uniform samples
+    /// dequantized value of an element is `element * scale * global_scale`. A `rounding_noise` array of uniform samples
     /// in `[0, 1)` (e.g., drawn with [`Random::random_uniform`]) replaces rounding to the nearest value (with ties to
     /// even) by stochastic rounding. Each scaled value `x` then rounds to `floor(x / ulp + noise) · ulp`, where `ulp`
     /// is the spacing of the element type grid at `x`, so that it rounds up with probability equal to its distance from
@@ -176,8 +171,8 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized 
     /// multiple of `block_size`, because [`ScaledDot`] requires non-empty scales whose blocks have at least two values
     /// along each contracting dimension. A `global_scale` must be a rank-0 array of the data type of `self` and
     /// requires `f8e4m3fn` scales, because power of two scales already span the range of their element types (JAX
-    /// likewise rejects global scales for MX formats). A `rounding_noise` array must have the data type and shape of
-    /// `self`. Returns a [`ProgramError`] if these requirements are not met, if `element_type` is not one of
+    /// likewise rejects global scales for MX formats). A `rounding_noise` array must have the data type and shape
+    /// of `self`. Returns a [`ProgramError`] if these requirements are not met, if `element_type` is not one of
     /// `f4e2m1fn`, `f8e4m3fn`, and `f8e5m2`, if `scale_type` is not one of `f8e4m3fn` and `f8e8m0fnu`, or if a
     /// composed operation fails.
     ///
@@ -240,6 +235,7 @@ where
                 .into());
             }
         };
+
         let input_type = self.r#type().into_owned();
         let compute_type = input_type.data_type();
         if !matches!(compute_type, DataType::F32 | DataType::F64) {
@@ -248,23 +244,28 @@ where
             ))
             .into());
         }
+
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid("`block_quantize` input must have a static shape").into());
         };
+
         let dimensions = shape.dimensions().to_vec();
         if dimensions.is_empty() {
             return Err(TypeError::invalid("`block_quantize` does not support rank-0 inputs").into());
         }
+
         if block_size < 2 {
             return Err(TypeError::invalid(format!(
                 "`block_quantize` block size must be at least 2 but got {block_size}"
             ))
             .into());
         }
+
         let block_axes = block_axes.into().normalize(dimensions.len())?;
         if block_axes.is_empty() {
             return Err(TypeError::invalid("`block_quantize` requires at least one block axis").into());
         }
+
         for &axis in &block_axes {
             let size = dimensions[axis];
             if size == 0 || size % block_size != 0 {
@@ -275,6 +276,7 @@ where
                 .into());
             }
         }
+
         if let Some(global_scale) = global_scale {
             if scale_type != DataType::F8E4M3FN {
                 return Err(TypeError::invalid(format!(
@@ -282,6 +284,7 @@ where
                 ))
                 .into());
             }
+
             let global_scale_type = global_scale.r#type();
             if global_scale_type.rank() != 0 || global_scale_type.data_type() != compute_type {
                 return Err(TypeError::invalid(format!(
@@ -291,6 +294,7 @@ where
                 .into());
             }
         }
+
         if let Some(rounding_noise) = rounding_noise {
             let noise_type = rounding_noise.r#type();
             if noise_type.data_type() != compute_type || noise_type.shape() != input_type.shape() {
@@ -302,7 +306,7 @@ where
             }
         }
 
-        // Splitting every block axis into a pair of (block count, block size) dimensions keeps the row-major element
+        // Splitting every block axis into a pair of `(block_count, block_size)` dimensions keeps the row-major element
         // order, so each block is the set of values that share all block counts. Reducing the block size dimensions
         // yields one maximum per block.
         let mut scale_dimensions = Vec::with_capacity(dimensions.len());
@@ -321,15 +325,14 @@ where
                 block_dimensions.push(Dimension::Static(size));
             }
         }
+
         let scale_value_type = ArrayType::new(
             compute_type,
             Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
         );
+
         let element_value_type = ArrayType::new(compute_type, input_type.shape().clone());
         let domain = self.domain();
-        let fill = |value: f64| domain.fill(&scale_value_type, value);
-        let fill_elements = |value: f64| domain.fill(&element_value_type, value);
-        let fill_scalar = |value: f64| domain.fill(&ArrayType::scalar(compute_type), value);
 
         // A global scale divides the input before anything else, so the block scales describe the globally scaled
         // values. The scalar is broadcast with its own type, keeping its placement, and the division aligns it.
@@ -351,19 +354,23 @@ where
         let block_max =
             input.reshape(Shape::new(block_dimensions))?.abs()?.reduce(&reduction_axes, ReductionKind::Max)?;
         let stored_scales = if scale_type == DataType::F8E4M3FN {
-            // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type, and the
-            // clamped scale rounds to the nearest `f8e4m3fn` value.
-            let scales = block_max
-                .div(&fill(element_format.max)?)?
-                .clamp(&fill_scalar(smallest_scale)?, &fill_scalar(largest_scale)?)?;
-            round_to_floating_point_grid(&scales, -6, 3, None, &fill)?
+            // NVFP4 linear scaling maps the block maximum to the largest finite magnitude of the element type,
+            // and the clamped scale rounds to the nearest `f8e4m3fn` value.
+            let scales = block_max.div(&domain.fill(&scale_value_type, element_format.max)?)?.clamp(
+                &domain.fill(&ArrayType::scalar(compute_type), smallest_scale)?,
+                &domain.fill(&ArrayType::scalar(compute_type), largest_scale)?,
+            )?;
+            round_to_floating_point_grid(&scales, -6, 3, None, &|value| domain.fill(&scale_value_type, value))?
         } else {
             // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
             // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
             // blocks whose maxima are not finite to the largest scale.
-            binade_power(&block_max, &fill)?
-                .mul(&fill((-f64::from(element_format.max_exponent)).exp2())?)?
-                .clamp(&fill_scalar(smallest_scale)?, &fill_scalar(largest_scale)?)?
+            binade_power(&block_max, &|value| domain.fill(&scale_value_type, value))?
+                .mul(&domain.fill(&scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
+                .clamp(
+                    &domain.fill(&ArrayType::scalar(compute_type), smallest_scale)?,
+                    &domain.fill(&ArrayType::scalar(compute_type), largest_scale)?,
+                )?
         };
         let scales = stored_scales.convert_element_type(scale_type)?;
 
@@ -377,25 +384,35 @@ where
         let expanded_scales =
             stored_scales.broadcast(expanded_type, scale_axes.as_slice())?.reshape(input_type.shape().clone())?;
         let quotients = input.div(&expanded_scales)?;
+
         // The quotients are clamped to the finite range of the element type before rounding, which saturates infinite
         // values rather than dividing infinite spacings, and the largest magnitude is on the grid, so rounding to the
         // nearest value keeps the clamped quotients in range. Stochastic rounding can still step past the largest
         // magnitude when adding noise just below one rounds up to the next integer, so its result is clamped again.
-        let quotients = quotients.clamp(&fill_scalar(-element_format.max)?, &fill_scalar(element_format.max)?)?;
+        let quotients = quotients.clamp(
+            &domain.fill(&ArrayType::scalar(compute_type), -element_format.max)?,
+            &domain.fill(&ArrayType::scalar(compute_type), element_format.max)?,
+        )?;
         let elements = round_to_floating_point_grid(
             &quotients,
             element_format.min_exponent,
             element_format.mantissa_bits,
             rounding_noise,
-            &fill_elements,
+            &|value| domain.fill(&element_value_type, value),
         )?;
         let elements = match rounding_noise {
-            Some(_) => elements.clamp(&fill_scalar(-element_format.max)?, &fill_scalar(element_format.max)?)?,
+            Some(_) => elements.clamp(
+                &domain.fill(&ArrayType::scalar(compute_type), -element_format.max)?,
+                &domain.fill(&ArrayType::scalar(compute_type), element_format.max)?,
+            )?,
             None => elements,
         };
+
         Ok((elements.convert_element_type(element_type)?, scales))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level block dequantization capability. [`BlockDequantize::block_dequantize`] reconstructs an array from
 /// elements and scales by repeating each scale over its block and multiplying at a chosen floating-point precision.
