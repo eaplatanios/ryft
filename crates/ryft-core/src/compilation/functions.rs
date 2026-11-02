@@ -9,14 +9,15 @@ use std::time::{Duration, Instant};
 use crate::captures::{CapturingContext, ClosedProgram};
 use crate::compilation::caching::accumulate_duration;
 use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
+use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
-    AttachedRegions, FlatProgram, Operation, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements,
-    Typed, Value, validate_reference_boundary,
+    AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed, Value,
+    validate_reference_boundary,
 };
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
@@ -254,41 +255,11 @@ impl<C: CompilationDomain> StagedProgram<C> {
     }
 }
 
-/// Operation-family capability for representing a call to a staged program.
-///
-/// The call operation carries only metadata. Its callee is a flat program, whose captures have been lifted into
-/// leading inputs, composed into the region driver passed to [`Context::bind`], which interns it as a shared callee
-/// root region by [`Arc`] identity. The concrete operation family decides how that boundary lowers and how batching,
-/// differentiation, partial evaluation, and other transforms rewrite it. This keeps higher-order call semantics with
-/// the operation that owns them while the lifecycle and capture plumbing remain backend-neutral.
-pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Type> + Sized {
-    /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee through a shared-callee
-    /// region driver, while `capture_count` records the exact leading lifted-capture prefix of that callee boundary.
-    fn compiled_call(capture_count: usize) -> Self;
-
-    /// Constructs one call with its exact callee signature. Families that export callee-local nominal identities
-    /// override this hook to allocate instruction-owned result identities while forwarding input identities.
-    /// Allocation happens when the call is built, and output inference must remain deterministic.
-    ///
-    /// The default returns [`Self::compiled_call`], leaving result inference to the family. A family whose inference
-    /// reports the callee's result types then makes each call instruction define the callee-local identities itself.
-    /// Program construction rejects a second call to the same callee in one region, because it would define those
-    /// identities again although sharing a callee root does not make the runtime results of separate calls the same
-    /// quantity. Override this function to instantiate fresh result identities for every call instead.
-    fn compiled_call_with_type_signature(
-        capture_count: usize,
-        _input_types: &[Constant::Type],
-        _output_types: &[Constant::Type],
-    ) -> Result<Self, TypeError> {
-        Ok(Self::compiled_call(capture_count))
-    }
-}
-
 /// Staged, unlowered form of one compiled function.
 ///
 /// A staged function is the first callable package in the lifecycle. It pairs an owned [`StagedProgram`] with the
 /// exact public input and output container structures that typed calls need. It can be inspected, lowered by its
-/// domain, or embedded as a compiled-call boundary in an enclosing trace. No backend lowering or executable compilation
+/// domain, or embedded as a staged-call boundary in an enclosing trace. No backend lowering or executable compilation
 /// has happened yet.
 pub struct StagedFunction<
     C: CompilationDomain,
@@ -452,7 +423,7 @@ where
     /// active context.
     pub fn call<V>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: CompiledCallOperation<C::Constant>,
+        C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
         V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + CapturingContext<Capture = C::Value>
@@ -477,7 +448,7 @@ where
         inputs: Input::To<V>,
     ) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: CompiledCallOperation<C::Constant>,
+        C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
         Caller: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + CapturingContext<Capture = C::Value>
@@ -503,11 +474,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
         let callee = self.callee_program()?;
-        let operation = C::Operation::compiled_call_with_type_signature(
-            capture_count,
-            &callee.input_types(),
-            &callee.output_types(),
-        )?;
+        let operation =
+            C::Operation::staged_call_with_types(capture_count, &callee.input_types(), &callee.output_types())?;
         let outputs = context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
@@ -519,7 +487,7 @@ where
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        C::Operation: CompiledCallOperation<C::Constant>,
+        C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
         V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + Constant<V, C::Constant>,
     {
@@ -541,7 +509,7 @@ where
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        C::Operation: CompiledCallOperation<C::Constant>,
+        C::Operation: StagedCallOperation<C::Constant>,
         V: Value<Type = C::Type>,
         Caller: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + Constant<V, C::Constant>,
@@ -567,11 +535,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
         let callee = self.callee_program()?;
-        let operation = C::Operation::compiled_call_with_type_signature(
-            captures.len(),
-            &callee.input_types(),
-            &callee.output_types(),
-        )?;
+        let operation =
+            C::Operation::staged_call_with_types(captures.len(), &callee.input_types(), &callee.output_types())?;
         context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 

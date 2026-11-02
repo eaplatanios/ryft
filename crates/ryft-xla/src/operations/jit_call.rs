@@ -9,16 +9,16 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, AttachedRegions,
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
-    CompiledCallOperation, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation,
-    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
-    ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow, RegionId,
-    RegionInterface, RegionLiveness, RegionRef, RegionSlot, RematerializationOptimizationBarrier, ShardMapOperation,
-    Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero,
+    Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, InputRegionProvenance,
+    InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
+    OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
+    RematerializationOptimizationBarrier, ShardMapOperation, StagedCallOperation, Tracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -743,13 +743,13 @@ impl<T: Type> CallTypeBindings<T> {
     }
 }
 
-impl CompiledCallOperation<XlaConstant> for XlaOperation {
+impl StagedCallOperation<XlaConstant> for XlaOperation {
     #[inline]
-    fn compiled_call(capture_count: usize) -> Self {
+    fn staged_call(capture_count: usize) -> Self {
         Self::JitCall(JitCallOperation::new(capture_count))
     }
 
-    fn compiled_call_with_type_signature(
+    fn staged_call_with_types(
         capture_count: usize,
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],

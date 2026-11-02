@@ -53,8 +53,8 @@ pub use compilation::{
     AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangePolicy,
     CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
     CompilationContext, CompilationDomain, CompilationEvent, CompilationExchangeError, CompilationMissReason,
-    CompilationTracer, Compile, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, DiskCache,
-    ExecutableFunction, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, StagedFunction, StagedProgram,
+    CompilationTracer, Compile, CompiledFunction, CompiledFunctionDispatcher, DiskCache, ExecutableFunction,
+    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, StagedCallOperation, StagedFunction, StagedProgram,
     StatefulCompilationDomain, StatefulExecution, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };
 pub use contexts::{

@@ -9,13 +9,13 @@ use pretty_assertions::assert_eq;
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
     Accuracy, Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions,
-    CastOperation, CastType, CompiledCallOperation, Context, DataType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, DimensionBounds,
-    DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext,
-    InterpretableOperation, InterpretationDriver, Linearization, LogicalMesh, ManualVariationAlignment, NoIdentity,
-    Operation, ParallelVary, Parameter, PartitionedProgram, Placeholder, Program, ProgramBuilder, ProgramError, Region,
-    RegionDriver, RegionInterface, RegionRef, RegionSlot, ScanInterpretationDomain, ScanOperation, ShardingDimension,
-    Sin, SinOperation, TangentActivity, Type, TypeError, Typed, Value, ValueDirectDispatch,
+    CastOperation, CastType, Context, DataType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Dimension, DimensionBounds, DimensionFromScalarOperation,
+    DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext, InterpretableOperation,
+    InterpretationDriver, Linearization, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation, ParallelVary,
+    Parameter, PartitionedProgram, Placeholder, Program, ProgramBuilder, ProgramError, Region, RegionDriver,
+    RegionInterface, RegionRef, RegionSlot, ScanInterpretationDomain, ScanOperation, ShardingDimension, Sin,
+    SinOperation, StagedCallOperation, TangentActivity, Type, TypeError, Typed, Value, ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.
@@ -364,7 +364,7 @@ fn test_external_cast_type_owns_inference() {
 }
 
 #[test]
-fn test_compiled_call_operation_compiled_call_with_type_signature() {
+fn test_staged_call_operation_staged_call_with_types() {
     /// Downstream call whose results are exactly its callee's results.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct ExternalCallOperation;
@@ -389,7 +389,7 @@ fn test_compiled_call_operation_compiled_call_with_type_signature() {
         }
     }
 
-    /// Downstream operation family that implements only the required `compiled_call` constructor.
+    /// Downstream operation family that implements only the required `staged_call` constructor.
     #[derive(Clone, Debug, ryft_macros::Operation)]
     #[ryft(crate = "ryft_core", type(ArrayIrType), constant(ArrayIrValue<Array>))]
     enum ExternalOperation {
@@ -397,8 +397,8 @@ fn test_compiled_call_operation_compiled_call_with_type_signature() {
         Call(ExternalCallOperation),
     }
 
-    impl CompiledCallOperation<ArrayIrValue<Array>> for ExternalOperation {
-        fn compiled_call(_capture_count: usize) -> Self {
+    impl StagedCallOperation<ArrayIrValue<Array>> for ExternalOperation {
+        fn staged_call(_capture_count: usize) -> Self {
             Self::Call(ExternalCallOperation)
         }
     }
@@ -423,9 +423,9 @@ fn test_compiled_call_operation_compiled_call_with_type_signature() {
         )
         .unwrap();
 
-    // The default binds `compiled_call`, so the call instruction itself defines the callee-local result identity.
+    // The default binds `staged_call`, so the call instruction itself defines the callee-local result identity.
     let operation =
-        ExternalOperation::compiled_call_with_type_signature(0, &callee.input_types(), &callee.output_types()).unwrap();
+        ExternalOperation::staged_call_with_types(0, &callee.input_types(), &callee.output_types()).unwrap();
     let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ExternalOperation>::new();
     let extent = builder.add_input(ArrayType::scalar(DataType::I64).into());
     let region = builder.import_program(callee.clone());

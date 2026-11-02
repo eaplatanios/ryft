@@ -97,7 +97,7 @@
 //! preserves device-resident buffers, and lets compilation depend on capture types rather than data.
 //!
 //! [`CapturingContext`](crate::CapturingContext) lets ordinary and transform contexts register captures through their
-//! parent. To embed a staged function in a larger trace, an operation family implements [`CompiledCallOperation`], and
+//! parent. To embed a staged function in a larger trace, an operation family implements [`StagedCallOperation`], and
 //! that operation then owns how the nested call behaves under lowering, batching, differentiation, partial evaluation,
 //! and interpretation.
 //!
@@ -146,8 +146,8 @@
 //! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity from
 //! the lowered program alone, and key equality must mean that compiled artifacts are interchangeable. Optional hooks
 //! add persistent keying and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or memory
-//! analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when staged
-//! functions must compose inside other traces.
+//! analysis without recompilation, and implement [`StagedCallOperation`] on the operation family when staged functions
+//! must compose inside other traces.
 //!
 //! Core owns flat staging through the inherent [`StagedProgram::stage`] constructor. It traces exactly the input types
 //! that it receives and invokes the closure exactly once on success. Backends apply options that change input types
@@ -162,6 +162,7 @@ pub mod caching;
 pub mod contexts;
 pub mod exchange;
 pub mod functions;
+pub mod operations;
 
 pub use caching::{
     CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
@@ -173,6 +174,7 @@ pub use contexts::{
 };
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
-    CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction,
-    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
+    CompilationTracer, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FunctionSpecializationKey,
+    JitCacheStatistics, LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
+pub use operations::StagedCallOperation;
