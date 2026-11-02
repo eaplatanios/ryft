@@ -512,12 +512,9 @@ struct StagedFunctionState<
     output_structure: Output::ParameterStructure,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Backend lowering of a [`StagedFunction`], ready for executable compilation.
-///
-/// It stays a function rather than a program, because the lowered program of the backend is only one of the artifacts
-/// it carries, alongside the captures, signatures, and options inherited from its staged source.
+/// Backend lowering of a [`StagedFunction`], ready for executable compilation. It stays a function rather than a
+/// program, because the lowered program of the backend is only one of the artifacts it carries, alongside the captures,
+/// signatures, and options inherited from its staged source.
 pub struct LoweredFunction<
     C: CompilationDomain,
     Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>,
@@ -531,19 +528,6 @@ pub struct LoweredFunction<
 
     /// Effective flat output types after lowering-time rewrites.
     output_types: Vec<C::Type>,
-}
-
-impl<C, Input, Output> Clone for LoweredFunction<C, Input, Output>
-where
-    C: CompilationDomain,
-    Input: Parameterized<C::Type>,
-    Input::Family: ParameterizedFamily<C::Constant>,
-    Output: Parameterized<C::Type>,
-    Output::Family: ParameterizedFamily<C::Constant>,
-{
-    fn clone(&self) -> Self {
-        Self { program: self.program.clone(), staged: self.staged.clone(), output_types: self.output_types.clone() }
-    }
 }
 
 impl<C, Input, Output> LoweredFunction<C, Input, Output>
@@ -578,7 +562,7 @@ where
         &self.output_types
     }
 
-    /// Compiles this function into a [`CompiledFunction`] through `domain` (refer to [`CompilationDomain::compile`]).
+    /// Compiles this function into a [`CompiledFunction`] through `domain` via [`CompilationDomain::compile`].
     ///
     /// # Errors
     ///
@@ -599,47 +583,32 @@ where
     }
 }
 
-/// Runtime-only handle for one compiled executable.
-///
-/// This handle retains only the state required to validate and execute calls, namely the backend executable, concrete
-/// captures, flat signatures, and structured output shape. That call-level state is what still makes it a function
-/// rather than a program, even though it has shed every transformable artifact. It deliberately does not retain the
-/// staged or lowered programs, so it becomes [`Send`] and [`Sync`] automatically whenever those runtime fields are
-/// `Send + Sync`. In contrast, [`CompiledFunction`] remains transformable and may retain `Rc`-backed source programs.
+impl<C, Input, Output> Clone for LoweredFunction<C, Input, Output>
+where
+    C: CompilationDomain,
+    Input: Parameterized<C::Type>,
+    Input::Family: ParameterizedFamily<C::Constant>,
+    Output: Parameterized<C::Type>,
+    Output::Family: ParameterizedFamily<C::Constant>,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { program: self.program.clone(), staged: self.staged.clone(), output_types: self.output_types.clone() }
+    }
+}
+
+/// Runtime-only handle for one compiled executable. This handle retains only the state required to validate and
+/// execute calls, namely the backend executable, concrete captures, flat signatures, and structured output shape.
+/// That call-level state is what still makes it a function rather than a program, even though it has shed every
+/// transformable artifact. It deliberately does not retain the staged or lowered programs, so it becomes [`Send`] and
+/// [`Sync`] automatically whenever those runtime fields are `Send + Sync`. In contrast, [`CompiledFunction`] remains
+/// transformable and may retain `Rc`-backed source programs.
 pub struct ExecutableFunction<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
     /// Shared immutable runtime state, which makes clones constant-time.
     state: Arc<ExecutableFunctionState<C, Input, Output>>,
 }
 
-/// Shared runtime state of an [`ExecutableFunction`].
-struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
-    /// Shared backend executable.
-    program: Arc<C::CompiledProgram>,
-
-    /// Concrete runtime captures supplied before the public inputs on every call.
-    captures: Vec<C::Value>,
-
-    /// Flat declared public input types, excluding hidden captures.
-    input_types: Vec<C::Type>,
-
-    /// Effective flat output types produced by the executable.
-    output_types: Vec<C::Type>,
-
-    /// Output parameter structure used to reconstruct structured runtime values.
-    output_structure: Output::ParameterStructure,
-
-    /// Structured input type marker.
-    input: PhantomData<fn(Input)>,
-}
-
-impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> Clone
-    for ExecutableFunction<C, Input, Output>
-{
-    #[inline]
-    fn clone(&self) -> Self {
-        Self { state: Arc::clone(&self.state) }
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>>
     ExecutableFunction<C, Input, Output>
@@ -795,6 +764,36 @@ where
         self.validate_flat_input_count(&inputs)?;
         Ok(self.inputs_with_captures(inputs))
     }
+}
+
+impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> Clone
+    for ExecutableFunction<C, Input, Output>
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { state: Arc::clone(&self.state) }
+    }
+}
+
+/// Shared runtime state of an [`ExecutableFunction`].
+struct ExecutableFunctionState<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<C::Type>> {
+    /// Shared backend executable.
+    program: Arc<C::CompiledProgram>,
+
+    /// Concrete runtime captures supplied before the public inputs on every call.
+    captures: Vec<C::Value>,
+
+    /// Flat declared public input types, excluding hidden captures.
+    input_types: Vec<C::Type>,
+
+    /// Effective flat output types produced by the executable.
+    output_types: Vec<C::Type>,
+
+    /// Output parameter structure used to reconstruct structured runtime values.
+    output_structure: Output::ParameterStructure,
+
+    /// Structured input type marker.
+    input: PhantomData<fn(Input)>,
 }
 
 /// Compiled executable plus the staged and lowered metadata required to invoke it safely.
