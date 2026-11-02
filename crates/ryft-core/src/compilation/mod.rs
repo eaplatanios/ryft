@@ -37,8 +37,8 @@
 //!     structure, and the domain's runtime-derived dispatch key. Its first call for a specialization stages, lowers,
 //!     and requests compilation; warm calls dispatch directly to the retained executable.
 //!   - Use [`stage`] for ordinary capture-free staging. Call [`CompilationDomain::stage`] directly when fallibility,
-//!     runtime captures, or symbolic capture references are needed. Then continue with [`CompilationDomain::lower`]
-//!     and [`CompilationDomain::compile`].
+//!     runtime captures, or symbolic capture references are needed. Then continue with [`StagedFunction::lower`]
+//!     and [`LoweredFunction::compile`].
 //!   - Execute an [`ExecutableFunction`] through [`ExecutableFunction::call`]. Domains with transactional
 //!     external state implement [`StatefulCompilationDomain`], and their executable functions are invoked through
 //!     [`ExecutableFunction::call_statefully`] or [`ExecutableFunction::call_statefully_async`] instead. Retained
@@ -74,8 +74,8 @@
 //!   2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
 //!      options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
 //!   3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
-//!      transformations. Pure runtime execution uses [`CompilationDomain::call`]; transactional external state uses
-//!      [`StatefulCompilationDomain::call_statefully_async`].
+//!      transformations. Pure runtime execution uses [`ExecutableFunction::call`]; transactional external state uses
+//!      [`ExecutableFunction::call_statefully_async`].
 //!   4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
 //!      [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed. This runtime-only
 //!      handle gains [`Send`] and [`Sync`] structurally whenever its backend fields do.
@@ -144,12 +144,10 @@
 //! Core implements [`CompilationDomain::stage`], which backends must not override and which traces exactly
 //! the input types that it receives. Backends apply options that change input types before staging (e.g., in
 //! [`CompilationDomain::dispatch_signature`]) and options that change output types during lowering. The remaining
-//! [`CompilationDomain`] functions accept [`LoweringRequest`], [`CompilationRequest`], and [`CallRequest`]
-//! implementations. These traits keep the structured input and output bounds of each phase in one place and expose
-//! only the operations that a backend needs to complete it. They are also required by a limitation of the Rust
-//! compiler, which [`CompilationDomain`] documents. Ordinary callers use [`CompilationDomain::stage`] or [`stage`],
-//! while backend implementations name the request traits in their bounds and complete each phase
-//! through their `into_lowered`, `into_compiled`, or `reconstruct` functions.
+//! [`CompilationDomain`] functions have no generic parameters and work on flat programs, types, and values. Core owns
+//! everything that depends on structured signatures: [`StagedFunction::lower`], [`LoweredFunction::compile`], and
+//! [`ExecutableFunction::call`] lift captures, check input counts and compiled output types, call the backend, and
+//! reconstruct structured outputs.
 
 pub mod caching;
 pub mod contexts;
@@ -160,13 +158,10 @@ pub use caching::{
     CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
     CompilationMissReason, DiskCache,
 };
-pub use contexts::{
-    AnalyzableCompilationDomain, CallRequest, CompilationCacheDomain, CompilationDomain, CompilationRequest,
-    LoweringRequest, StatefulCompilationDomain,
-};
+pub use contexts::{AnalyzableCompilationDomain, CompilationCacheDomain, CompilationDomain, StatefulCompilationDomain};
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use functions::{
-    CompilationCall, CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher,
-    ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction,
-    ReferenceExecution, StagedFunction, jit, jit_with_options, jit_with_options_and_capacity, stage,
+    CompilationTracer, CompiledCallOperation, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction,
+    FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, ReferenceExecution,
+    StagedFunction, jit, jit_with_options, jit_with_options_and_capacity, stage,
 };

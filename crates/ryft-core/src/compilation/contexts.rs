@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use crate::captures::{CaptureConstant, CapturingContext, ClosedProgram};
 use crate::compilation::functions::{
-    CompilationTracer, CompiledFunction, ExecutableFunction, FlatCompilationProgram, LoweredFunction,
-    ReferenceExecution, StagedFunction,
+    CompilationTracer, ExecutableFunction, FlatCompilationProgram, ReferenceExecution, StagedFunction,
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::macros::check_builders;
@@ -15,110 +14,22 @@ use crate::tracing::{DomainTracingContext, Tracer};
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Lowering request consumed by [`CompilationDomain::lower`] and implemented by [`StagedFunction`]. Refer to the
-/// [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete types.
-pub trait LoweringRequest<C: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Returns the staged artifact.
-    fn staged(&self) -> &StagedFunction<C, Self::Input, Self::Output>;
-
-    /// Opens runtime captures as leading flat inputs.
-    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<C>>, ProgramError>;
-
-    /// Assembles the backend-established lowering.
-    fn into_lowered(
-        self,
-        program: C::LoweredProgram,
-        output_types: Vec<C::Type>,
-    ) -> LoweredFunction<C, Self::Input, Self::Output>;
-}
-
-/// Compilation request consumed by [`CompilationDomain::compile`] and implemented by [`LoweredFunction`]. Refer to
-/// the [`CompilationDomain`] documentation for why the domain functions accept request traits rather than concrete
-/// types.
-pub trait CompilationRequest<C: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Constant>>;
-
-    /// Returns the lowered artifact.
-    fn lowered(&self) -> &LoweredFunction<C, Self::Input, Self::Output>;
-
-    /// Assembles the backend-established compiled artifact.
-    fn into_compiled(
-        self,
-        program: Arc<C::CompiledProgram>,
-        output_types: Vec<C::Type>,
-    ) -> CompiledFunction<C, Self::Input, Self::Output>;
-}
-
-/// Execution request consumed by [`CompilationDomain::call`] and implemented by
-/// [`CompilationCall`](super::functions::CompilationCall). Refer to the [`CompilationDomain`] documentation for why the
-/// domain functions accept request traits rather than concrete types.
-pub trait CallRequest<C: CompilationDomain>: Sized {
-    /// Structured abstract input type.
-    type Input: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
-
-    /// Structured abstract output type.
-    type Output: Parameterized<C::Type, Family: ParameterizedFamily<C::Value>>;
-
-    /// Structured runtime output type.
-    type RuntimeOutput;
-
-    /// Returns the executable artifact.
-    fn executable(&self) -> &ExecutableFunction<C, Self::Input, Self::Output>;
-
-    /// Returns flat public runtime inputs, excluding captures.
-    fn inputs(&self) -> &[C::Value];
-
-    /// Consumes the request and prepends runtime captures to its flat inputs.
-    fn into_arguments(self) -> Vec<C::Value>;
-
-    /// Reconstructs structured runtime outputs.
-    fn reconstruct(
-        executable: &ExecutableFunction<C, Self::Input, Self::Output>,
-        outputs: Vec<C::Value>,
-    ) -> Result<Self::RuntimeOutput, C::Error>;
-}
-
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four phases:
 ///
 ///   1. [`Self::stage`] traces a closure into a [`StagedFunction`] that retains the options for the later phases.
-///   2. [`Self::lower`] transforms the staged artifact into [`Self::LoweredProgram`].
-///   3. [`Self::compile`] transforms the lowered artifact into [`Self::CompiledProgram`].
-///   4. [`Self::call`] executes an [`ExecutableFunction`] against structured runtime inputs.
+///   2. [`Self::lower`] lowers a staged function into a lowered function.
+///   3. [`Self::compile`] compiles a lowered function into a compiled function.
+///   4. [`Self::call`] executes a compiled function on structured runtime inputs.
 ///
 /// The domain performs every phase, while staged, lowered, compiled, and executable functions remain passive values.
-/// Lowering, compilation, and execution are implemented entirely by the backend, including any validation, caching, or
-/// runtime conversion that the backend chooses to apply. Staging is implemented by core, because only core can trace
-/// Rust closures, and it traces exactly the input types that it receives. Backends apply options that change input
-/// types before staging (e.g., in [`Self::dispatch_signature`] for retained dispatch), apply options that change output
-/// types during lowering, and reject staged functions that they cannot execute during lowering as well.
-///
-/// # Request Traits
-///
-/// [`Self::lower`], [`Self::compile`], and [`Self::call`] accept [`LoweringRequest`], [`CompilationRequest`], and
-/// [`CallRequest`] implementations rather than the concrete [`StagedFunction`], [`LoweredFunction`], and
-/// [`CompilationCall`](super::functions::CompilationCall) types. Each request trait carries the structured input and
-/// output bounds of its phase as bounds on its associated types and exposes only the operations that a backend needs
-/// to complete that phase.
-///
-/// The request traits also work around a limitation of the Rust compiler (as of version 1.99), and so they cannot be
-/// replaced by explicit bounds on the concrete types. When a trait function bounds an associated type of one of its
-/// generic parameters through a trait whose arguments mention an associated type of `Self` (e.g.,
-/// `Input: Parameterized<Self::Type, Family: ParameterizedFamily<Self::Constant>>`), implementations of that function
-/// for concrete domains fail to compile with an unsatisfied `Input: Parameterized<...>` bound (E0277), even when they
-/// repeat the bound verbatim. Bounds on the associated types of a request trait are not affected. The same limitation
-/// is why [`Self::stage`] is a provided function that backends must not override. Its default implementation compiles
-/// because it is checked once for a generic domain, but any override for a concrete domain fails with that error.
+/// Core owns everything that depends on the structured input and output types of a function. It traces closures,
+/// lifts runtime captures into leading program inputs, checks input counts and compiled output types, and reconstructs
+/// structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::call`] over flat programs,
+/// types, and values, including any validation, caching, or runtime conversion that they choose to apply. Staging
+/// traces exactly the input types that it receives. Backends apply options that change input types before staging
+/// (e.g., in [`Self::dispatch_signature`] for retained dispatch), apply options that change output types during
+/// lowering, and reject staged functions that they cannot execute during lowering as well.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-defined key for one input specialization of a retained Just-In-Time (JIT) dispatcher.
     type DispatchKey: Clone + Eq + Hash;
@@ -216,60 +127,73 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         Ok(StagedFunction::new(source_program, input_type_values, output_types, output_structure, options))
     }
 
-    /// Lowers a staged function into the program representation of this backend (i.e., [`Self::LoweredProgram`]).
+    /// Lowers the lifted program of a staged function into the program representation of this backend (i.e.,
+    /// [`Self::LoweredProgram`]) and returns it together with its effective flat output types. Callers use
+    /// [`StagedFunction::lower`] rather than calling this function directly.
+    ///
     /// The lowered program must capture every option, compiler, target, and topology property that affects
     /// compilation, because caching backends derive the identity of compiled programs from the lowered program alone.
-    fn lower<Request>(
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Source program of the staged function with its runtime captures lifted into leading inputs
+    ///     (refer to [`StagedFunction::lifted_program`]).
+    ///   - `capture_count`: Number of leading inputs of `program` that are lifted runtime captures.
+    ///   - `input_types`: Flat declared public input types of the staged function, excluding captures.
+    ///   - `output_types`: Flat output types of the staged function.
+    ///   - `options`: Compilation options retained by the staged function.
+    fn lower(
         &self,
-        staged: Request,
-    ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
-    where
-        Self: Sized,
-        Request: LoweringRequest<Self>;
+        program: &FlatCompilationProgram<Self>,
+        capture_count: usize,
+        input_types: &[Self::Type],
+        output_types: &[Self::Type],
+        options: &Self::Options,
+    ) -> Result<(Self::LoweredProgram, Vec<Self::Type>), Self::Error>;
 
-    /// Compiles a lowered function into an executable program of this backend (i.e., [`Self::CompiledProgram`]).
+    /// Compiles a lowered program into an executable program of this backend (i.e., [`Self::CompiledProgram`]) and
+    /// returns it together with its effective flat output types. Callers use
+    /// [`LoweredFunction::compile`](super::functions::LoweredFunction::compile) rather than calling this function
+    /// directly, which also checks that the returned output types refine the lowered ones.
     /// Caching backends usually implement this function via
-    /// [`CompilationContext::compile_request`](super::caching::CompilationContext::compile_request).
-    fn compile<Request>(
+    /// [`CompilationContext::compile`](super::caching::CompilationContext::compile).
+    fn compile(
         &self,
-        lowered: Request,
-    ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
-    where
-        Self: Sized,
-        Request: CompilationRequest<Self>;
+        program: &Self::LoweredProgram,
+    ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Type>), Self::Error>;
 
-    /// Executes a compiled function on structured runtime inputs and returns its structured outputs. Callers
-    /// typically use [`ExecutableFunction::call`] rather than calling this function directly.
-    fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
-    where
-        Self: Sized,
-        Request: CallRequest<Self>;
+    /// Executes a compiled program on flat runtime `arguments` and returns its flat outputs. Callers use
+    /// [`ExecutableFunction::call`] rather than calling this function directly.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Compiled program to execute.
+    ///   - `input_types`: Flat declared public input types of the compiled function, excluding captures.
+    ///   - `arguments`: Runtime captures of the compiled function followed by exactly one public input per entry of
+    ///     `input_types`, in the `[captures..., public inputs...]` order of lifted programs.
+    fn call(
+        &self,
+        program: &Self::CompiledProgram,
+        input_types: &[Self::Type],
+        arguments: Vec<Self::Value>,
+    ) -> Result<Vec<Self::Value>, Self::Error>;
 }
 
 /// Optional execution capability for compiled functions that bind external mutable references.
 ///
-/// Implementations must keep hidden state results out of [`CallRequest::RuntimeOutput`] and preserve their reference
+/// Implementations must keep hidden state results out of the outputs that they return and preserve their reference
 /// transaction guarantees even when the public output has no leaves or fails reconstruction.
 pub trait StatefulCompilationDomain: CompilationDomain {
-    /// Executes a compiled function that binds external mutable references and returns its structured outputs
-    /// together with the completion of the whole invocation, without waiting for that completion.
-    fn call_statefully_async<Request>(
+    /// Executes a compiled program that binds external mutable references and returns its flat outputs together with
+    /// the completion of the whole invocation, without waiting for that completion. The parameters are the same as for
+    /// [`CompilationDomain::call`]. Callers use [`ExecutableFunction::call_statefully_async`] rather than calling this
+    /// function directly.
+    fn call_statefully_async(
         &self,
-        request: Request,
-    ) -> ReferenceExecution<Request::RuntimeOutput, Self::Error>
-    where
-        Self: Sized,
-        Request: CallRequest<Self>;
-
-    /// Executes a stateful call and waits for the whole invocation to complete before returning.
-    #[inline]
-    fn call_statefully<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
-    where
-        Self: Sized,
-        Request: CallRequest<Self>,
-    {
-        self.call_statefully_async(request).r#await()
-    }
+        program: &Self::CompiledProgram,
+        input_types: &[Self::Type],
+        arguments: Vec<Self::Value>,
+    ) -> ReferenceExecution<Vec<Self::Value>, Self::Error>;
 }
 
 /// Optional capability for caching backend-compiled programs in a
