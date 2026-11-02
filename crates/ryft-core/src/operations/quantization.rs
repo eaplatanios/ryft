@@ -365,7 +365,7 @@ where
             // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
             // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
             // blocks whose maxima are not finite to the largest scale.
-            binade_power(&block_max, &|value| domain.fill(&scale_value_type, value))?
+            binade_scale(&block_max, &|value| domain.fill(&scale_value_type, value))?
                 .mul(&domain.fill(&scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
                 .clamp(
                     &domain.fill(&ArrayType::scalar(compute_type), smallest_scale)?,
@@ -411,8 +411,6 @@ where
         Ok((elements.convert_element_type(element_type)?, scales))
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level block dequantization capability. [`BlockDequantize::block_dequantize`] reconstructs an array from
 /// elements and scales by repeating each scale over its block and multiplying at a chosen floating-point precision.
@@ -487,8 +485,8 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape
         let block_axes = validate_block_dequantize_inputs(&element_type, &scale_type, block_axes.into(), data_type)?;
         let (Some(element_shape), Some(scale_shape)) = (element_type.static_shape(), scale_type.static_shape()) else {
             return Err(TypeError::invalid(
-                "`block_dequantize` homogeneous inputs must have static shapes; use array IR values for dynamic \
-                 extents",
+                "`block_dequantize` homogeneous inputs must have static shapes; use array IR values \
+                 for dynamic extents",
             )
             .into());
         };
@@ -523,10 +521,10 @@ where
         + DynamicReshape
         + ValueProjection<ArrayType>
         + ValueProjection<DimensionType>,
+    V::Domain: Context<Type = ArrayIrType> + DimensionConstant,
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Mul,
     <V as ValueProjection<DimensionType>>::Projected:
         Value<Type = DimensionType> + Compare<V> + DimensionMax + Div + Rem,
-    V::Domain: Context<Type = ArrayIrType> + DimensionConstant,
 {
     fn block_dequantize<A: Into<Axes>>(
         &self,
@@ -553,7 +551,7 @@ where
             output_axes.push(expanded_dimensions.len());
             expanded_dimensions.push(scale_dimension.clone());
             if block_axes.contains(&axis) {
-                // Divide by max(scale, 1) so that empty scales report the positivity assertion instead of a failed
+                // Divide by `max(scale, 1)` so that empty scales report the positivity assertion instead of a failed
                 // remainder or division. Each assertion precedes the shape operations that require the ratio.
                 let element_extent =
                     ValueProjection::<DimensionType>::into_projected(element_dimensions[axis].clone())?;
@@ -588,6 +586,8 @@ where
         Ok(ValueProjection::<ArrayType>::from_projected(elements.mul(&expanded_scales)?))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`ScaledDotOperation`].
 pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
@@ -2443,7 +2443,7 @@ struct QuantizedInput<V> {
 /// stochastic with `rounding_noise` (refer to [`BlockQuantize::block_quantize_with_options`]). `value` must be finite,
 /// and the result is not clamped to the finite range of the narrow type.
 ///
-/// The grid spacing at `x` derives from the power of two of [`binade_power`], which is zero for zero and subnormal
+/// The grid spacing at `x` derives from the power of two of [`binade_scale`], which is zero for zero and subnormal
 /// values, where the clamp to the smallest normal value applies. Rounding to the nearest value is exact, because it
 /// only multiplies or divides by powers of two and rounds to an integer. Stochastic rounding adds the noise first,
 /// and that addition itself rounds, so values within one unit in the last place of the compute type below an integer
@@ -2467,7 +2467,7 @@ where
     V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
     F: Fn(f64) -> Result<V, ProgramError>,
 {
-    let spacing = binade_power(value, fill)?
+    let spacing = binade_scale(value, fill)?
         .clamp(&fill(2f64.powi(min_exponent))?, &fill(f64::INFINITY)?)?
         .mul(&fill(2f64.powi(-mantissa_bits))?)?;
     let quotients = value.div(&spacing)?;
@@ -2486,7 +2486,7 @@ where
 ///
 ///   - `value`: Value whose element type is the compute type.
 ///   - `fill`: Function that returns a value with the type of `value` and every element set to its argument.
-fn binade_power<V, F>(value: &V, fill: &F) -> Result<V, ProgramError>
+fn binade_scale<V, F>(value: &V, fill: &F) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + And + ConvertElementType,
     F: Fn(f64) -> Result<V, ProgramError>,
