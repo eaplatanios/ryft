@@ -133,7 +133,8 @@ pub trait CompilationCacheDomain: CompilationDomain {
     /// and must cover the complete computation, options, compiler and backend versions, and target topology. Core
     /// hashes them only to obtain safe filenames and does not add any missing semantic state.
     #[inline]
-    fn persistent_cache_key(&self, _key: &Self::CacheKey) -> Option<Vec<u8>> {
+    fn persistent_cache_key(&self, key: &Self::CacheKey) -> Option<Vec<u8>> {
+        let _ = key;
         None
     }
 
@@ -146,7 +147,8 @@ pub trait CompilationCacheDomain: CompilationDomain {
     ///
     /// Returns an error when serialization fails. Unavailable serialization is reported as `Ok(None)` instead.
     #[inline]
-    fn serialize_program(&self, _program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
+        let _ = program;
         Ok(None)
     }
 
@@ -158,7 +160,8 @@ pub trait CompilationCacheDomain: CompilationDomain {
     ///
     /// Returns an error for malformed payloads or failures while restoring an otherwise compatible compiled program.
     #[inline]
-    fn deserialize_program(&self, _bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
+    fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
+        let _ = bytes;
         Ok(None)
     }
 }
@@ -174,7 +177,7 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
     /// Analyzes the compiled program carried by the provided [`ExecutableFunction`] without recompiling it.
     fn analyze<Input: Parameterized<Self::Type>, Output: Parameterized<Self::Type>>(
         &self,
-        executable_function: &ExecutableFunction<Self, Input, Output>,
+        executable: &ExecutableFunction<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error>
     where
         Self: Sized;

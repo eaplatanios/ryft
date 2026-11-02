@@ -22,11 +22,11 @@ use ryft_core::{
     MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
     Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
     ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
-    ReferenceReplacementPreparation, ReferenceSource, RegionDriver, RegionKey, RegionRef, ScatterMode,
+    ReferenceReplacementPreparation, ReferenceSource, ReferenceType, RegionDriver, RegionKey, RegionRef, ScatterMode,
     ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, SpecializationCache,
-    SpecializationCacheEntry, SpecializationCacheStatistics, StatefulCompilationDomain, StaticShape, StridedLayout,
-    Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
-    Zero, ZeroOperation, validate_reference_boundary,
+    SpecializationCacheEntry, SpecializationCacheStatistics, StagedProgram, StatefulCompilationDomain, StaticShape,
+    StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection,
+    ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array, ProjectedContext};
@@ -3970,14 +3970,12 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types.into()))
     }
 
-    fn lower(
-        &self,
-        program: &FlatCompilationProgram<Self>,
-        capture_count: usize,
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
-        options: &XlaOptions,
-    ) -> Result<(XlaLoweredProgram, Vec<ArrayIrType>), Self::Error> {
+    fn lower(&self, staged: &StagedProgram<Self>) -> Result<(XlaLoweredProgram, Vec<ArrayIrType>), Self::Error> {
+        let program = staged.lifted_program()?;
+        let capture_count = staged.source_program().captures().len();
+        let input_types = staged.input_types();
+        let output_types = staged.output_types();
+        let options = staged.options();
         if apply_input_shardings(input_types.to_vec(), options)? != input_types {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: "staged input types do not carry the shardings requested by `in_shardings`; apply them to the \
@@ -3985,8 +3983,8 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
                     .to_string(),
             });
         }
-        validate_reference_outputs(program, capture_count, output_types)?;
-        let lowered_program = self.lower_xla_program(program, capture_count, options)?;
+        validate_reference_outputs(program.as_ref(), capture_count, output_types)?;
+        let lowered_program = self.lower_xla_program(program.as_ref(), capture_count, options)?;
         let lowered_output_types = lowered_program.output_types().to_vec();
         // Lowering applies the output sharding overrides to the program outputs, so the traced output types of the
         // staged function are checked against the lowered ones with those same overrides applied.
@@ -4015,38 +4013,36 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok((compiled, output_types))
     }
 
-    fn call(
+    fn execute(
         &self,
         program: &XlaCompiledProgram<'c>,
-        input_types: &[ArrayIrType],
-        arguments: Vec<XlaValue<'c>>,
+        inputs: Vec<XlaValue<'c>>,
     ) -> Result<Vec<XlaValue<'c>>, Self::Error> {
-        self.call_stateless(program, input_types, arguments).map(|(outputs, _)| outputs)
+        self.execute_stateless(program, inputs).map(|(outputs, _)| outputs)
     }
 }
 
 impl<'c> XlaDomain<'c> {
-    /// Executes one stateless call on flat `arguments` (refer to [`CompilationDomain::call`]) and returns its public
-    /// outputs together with the whole-execution completion fence.
+    /// Executes a compiled program without external reference state on flat `inputs` (refer to
+    /// [`CompilationDomain::execute`]) and returns its public outputs together with the whole-execution completion
+    /// fence.
     ///
-    /// The returned output arrays already carry the fence individually, so the synchronous [`CompilationDomain`]
-    /// `call` drops the returned fence; the stateful asynchronous surface threads it into a completion instead so
-    /// that awaiting a reference-free invocation still observes asynchronous execution errors. When the program has
+    /// The returned output arrays already carry the fence individually, so [`CompilationDomain::execute`] drops the
+    /// returned fence; the stateful asynchronous surface threads it into a completion instead so that awaiting a
+    /// reference-free invocation still observes asynchronous execution errors. When the program has
     /// no outputs, the effect scope retains effectful completion. Only pure zero-output calls explicitly wait.
-    fn call_stateless(
+    fn execute_stateless(
         &self,
         program: &XlaCompiledProgram<'c>,
-        input_types: &[ArrayIrType],
-        arguments: Vec<XlaValue<'c>>,
+        inputs: Vec<XlaValue<'c>>,
     ) -> Result<(Vec<XlaValue<'c>>, ExecutionFence), XlaDomainError> {
         if program.requires_stateful_call() {
             return Err(XlaDomainError::UnsupportedReferenceAbi {
                 reason: "external reference state requires `call_statefully`".to_string(),
             });
         }
-        check_count!("input", arguments, program.capture_count + input_types.len(), ProgramError);
-        for (declared, input) in input_types.iter().zip(&arguments[program.capture_count..]) {
-            let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
+        check_count!("input", inputs, program.input_types.len(), ProgramError);
+        for (declared, input) in program.input_types.iter().zip(&inputs) {
             // Array inputs borrow their types, while the array IR type of other inputs is built only to report them.
             match input {
                 XlaValue::Array(array) => validate_xla_input_type(declared, &array.r#type())?,
@@ -4056,12 +4052,12 @@ impl<'c> XlaDomain<'c> {
                 )?,
             }
         }
-        let arguments = arguments
+        let inputs = inputs
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let execution = self.execute_compiled_async(program, arguments)?;
+        let execution = self.execute_compiled_async(program, inputs)?;
         if execution.output().is_empty() && !program.signature.has_effects() {
             execution.fence().block_until_ready()?;
         }
@@ -4083,14 +4079,13 @@ impl<'c> XlaDomain<'c> {
         })
     }
 
-    /// Submits one stateful call on flat `arguments` (refer to [`CompilationDomain::call`]), publishes its
-    /// dependencies, and commits hidden final states without waiting for device completion when the logical boundary
-    /// is static.
+    /// Submits a stateful execution of a compiled program on flat `inputs` (refer to
+    /// [`StatefulCompilationDomain::execute_statefully`]), publishes its dependencies, and commits hidden final
+    /// states without waiting for device completion when the logical boundary is static.
     fn execute_stateful_async(
         &self,
         program: &XlaCompiledProgram<'c>,
-        input_types: &[ArrayIrType],
-        arguments: Vec<XlaValue<'c>>,
+        inputs: Vec<XlaValue<'c>>,
     ) -> ReferenceExecution<Vec<XlaValue<'c>>, XlaDomainError> {
         if let Err(error) = ensure_effect_dispatch_allowed() {
             return ReferenceExecution::ready(Err(error));
@@ -4098,7 +4093,7 @@ impl<'c> XlaDomain<'c> {
         if program.reference_states.is_empty() {
             // A reference-free invocation binds no holders, but the completion contract still promises that awaiting
             // the result observes whole-invocation completion, so the execution fence rides along as the completion.
-            return match self.call_stateless(program, input_types, arguments) {
+            return match self.execute_stateless(program, inputs) {
                 Ok((output, fence)) => ReferenceExecution::pending(
                     Ok(output),
                     ReferenceCompletion::new(XlaReferenceCompletion { fence }),
@@ -4108,18 +4103,30 @@ impl<'c> XlaDomain<'c> {
             };
         }
         let prepared = (|| -> Result<_, XlaDomainError> {
-            check_count!("input", arguments, program.capture_count + input_types.len(), ProgramError);
-            for (declared, actual) in
-                input_types.iter().zip(arguments[program.capture_count..].iter().map(Typed::r#type))
-            {
-                match (declared, actual.as_ref()) {
-                    (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
-                        validate_xla_input_type(declared, actual)?;
-                    }
-                    (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) => {
-                        validate_xla_input_type(declared.referent(), actual.referent())?;
+            check_count!("input", inputs, program.input_types.len(), ProgramError);
+            let reference_state_input_indices = program
+                .reference_states
+                .iter()
+                .map(|state| state.source().flat_input_index(program.capture_count))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Discharge retains each reference's position but replaces its type with the referent's array type.
+            // The compiled binding table restores that distinction without a caller-supplied signature. Its indices
+            // are validated in increasing order during lowering and persistent executable restoration.
+            for (index, (declared, input)) in program.input_types.iter().zip(&inputs).enumerate() {
+                let expects_reference = reference_state_input_indices.binary_search(&index).is_ok();
+                match (expects_reference, input) {
+                    (false, XlaValue::Array(array)) => validate_xla_input_type(declared, &array.r#type())?,
+                    (true, XlaValue::Reference(reference)) => {
+                        validate_xla_input_type(declared, reference.r#type().referent())?;
                     }
                     _ => {
+                        let actual = input.r#type();
+                        let declared = if expects_reference {
+                            ArrayIrType::Reference(ReferenceType::new(declared.clone()))
+                        } else {
+                            ArrayIrType::Array(declared.clone())
+                        };
                         return Err(ProgramError::InvalidArgument {
                             message: format!("runtime input type `{actual}` does not match declared type `{declared}`"),
                         }
@@ -4128,17 +4135,12 @@ impl<'c> XlaDomain<'c> {
                 }
             }
 
-            let (captures, inputs) = arguments.split_at(program.capture_count.min(arguments.len()));
-            validate_reference_boundary(inputs.iter(), captures.iter()).map_err(ProgramError::from)?;
-            let reference_state_input_indices = program
-                .reference_states
-                .iter()
-                .map(|state| state.source().flat_input_index(program.capture_count))
-                .collect::<Result<Vec<_>, _>>()?;
+            let (captures, public_inputs) = inputs.split_at(program.capture_count.min(inputs.len()));
+            validate_reference_boundary(public_inputs.iter(), captures.iter()).map_err(ProgramError::from)?;
             let mut bindings =
                 Vec::<(ReferenceId, ArrayReference<XlaArray<'c>>)>::with_capacity(program.reference_states.len());
             for &logical_input_index in &reference_state_input_indices {
-                let reference = match arguments.get(logical_input_index) {
+                let reference = match inputs.get(logical_input_index) {
                     Some(XlaValue::Reference(reference)) => reference.handle(),
                     Some(value) => {
                         return Err(XlaDomainError::UnsupportedReferenceAbi {
@@ -4151,7 +4153,7 @@ impl<'c> XlaDomain<'c> {
                     None => {
                         return Err(ProgramError::InvalidInputCount {
                             expected: program.input_types.len(),
-                            actual: arguments.len(),
+                            actual: inputs.len(),
                         }
                         .into());
                     }
@@ -4193,7 +4195,7 @@ impl<'c> XlaDomain<'c> {
 
             let mut mutated_outputs = BTreeMap::new();
             for (state, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
-                let XlaValue::Reference(reference) = &arguments[logical_input_index] else {
+                let XlaValue::Reference(reference) = &inputs[logical_input_index] else {
                     unreachable!("reference bindings were validated before holder acquisition")
                 };
                 let guard_index = guard_indices[&reference.handle().id()];
@@ -4201,7 +4203,7 @@ impl<'c> XlaDomain<'c> {
                     mutated_outputs.insert(guard_index, logical_output_index);
                 }
             }
-            let mut arguments = Some(arguments);
+            let mut inputs = Some(inputs);
 
             let donation_overrides =
                 reference_state_input_indices.iter().map(|&index| (index, false)).collect::<Vec<_>>();
@@ -4219,10 +4221,10 @@ impl<'c> XlaDomain<'c> {
                     .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, XlaArray<'c>>>, XlaDomainError>>()?;
                 let observations =
                     guards.iter().map(ReadyOrPendingReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
-                let logical_arguments = arguments.as_ref().unwrap();
-                let mut execution_arguments = logical_arguments.clone();
+                let logical_inputs = inputs.as_ref().unwrap();
+                let mut execution_inputs = logical_inputs.clone();
                 for &logical_input_index in &reference_state_input_indices {
-                    let XlaValue::Reference(reference) = &logical_arguments[logical_input_index] else {
+                    let XlaValue::Reference(reference) = &logical_inputs[logical_input_index] else {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
                     let snapshot = observations[guard_indices[&reference.handle().id()]].snapshot().clone();
@@ -4234,11 +4236,11 @@ impl<'c> XlaDomain<'c> {
                             ),
                         });
                     }
-                    execution_arguments[logical_input_index] = XlaValue::Array(snapshot);
+                    execution_inputs[logical_input_index] = XlaValue::Array(snapshot);
                 }
                 drop(guards);
 
-                let arrays = execution_arguments
+                let arrays = execution_inputs
                     .into_iter()
                     .map(ValueProjection::<ArrayType>::into_projected)
                     .collect::<Result<Vec<_>, _>>()
@@ -4287,35 +4289,34 @@ impl<'c> XlaDomain<'c> {
                 let dependencies =
                     observations.iter().filter_map(|observation| observation.dependency().cloned()).collect::<Vec<_>>();
                 // Observation validation under the ordered guards commits this attempt. Dropping the original logical
-                // arguments here releases only retry ownership, allowing ordinary inputs to remain donatable.
-                drop(arguments.take());
+                // inputs here releases only retry ownership, allowing ordinary inputs to remain donatable.
+                drop(inputs.take());
                 // Nothing has been submitted or published yet, so a failed projection simply releases the guards.
-                let (execution_arguments, input_refinements, physical_output_count) =
+                let (execution_inputs, input_refinements, physical_output_count) =
                     prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
                 let read_only_guard_storage = RefCell::new(read_only_guards);
                 let prepared_replacement_storage = RefCell::new(prepared_replacements);
                 let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
                 let replacement_transactions = RefCell::new(Vec::with_capacity(mutated_outputs.len()));
-                let execution =
-                    self.execute_pjrt_buffers(program, execution_arguments, physical_output_count, |fence| {
-                        let mut completions = dependencies.clone();
-                        completions.push(ReferenceCompletion::new(XlaReferenceCompletion { fence: fence.clone() }));
-                        #[cfg(test)]
-                        if let Some(injected) = take_stateful_completion_injection() {
-                            completions.push(injected);
-                        }
-                        let completion = ReferenceCompletion::joined(completions);
-                        for guard in read_only_guard_storage.borrow_mut().iter_mut() {
-                            guard.preserve_value_until(completion.clone());
-                        }
-                        let mut transactions = replacement_transactions.borrow_mut();
-                        for (logical_output_index, prepared) in
-                            std::mem::take(&mut *prepared_replacement_storage.borrow_mut())
-                        {
-                            transactions.push((logical_output_index, prepared.begin(completion.clone())));
-                        }
-                        *publication.borrow_mut() = Some(completion);
-                    });
+                let execution = self.execute_pjrt_buffers(program, execution_inputs, physical_output_count, |fence| {
+                    let mut completions = dependencies.clone();
+                    completions.push(ReferenceCompletion::new(XlaReferenceCompletion { fence: fence.clone() }));
+                    #[cfg(test)]
+                    if let Some(injected) = take_stateful_completion_injection() {
+                        completions.push(injected);
+                    }
+                    let completion = ReferenceCompletion::joined(completions);
+                    for guard in read_only_guard_storage.borrow_mut().iter_mut() {
+                        guard.preserve_value_until(completion.clone());
+                    }
+                    let mut transactions = replacement_transactions.borrow_mut();
+                    for (logical_output_index, prepared) in
+                        std::mem::take(&mut *prepared_replacement_storage.borrow_mut())
+                    {
+                        transactions.push((logical_output_index, prepared.begin(completion.clone())));
+                    }
+                    *publication.borrow_mut() = Some(completion);
+                });
                 break 'snapshot (
                     execution,
                     input_refinements,
@@ -4461,13 +4462,12 @@ impl<'c> XlaDomain<'c> {
 }
 
 impl<'c> StatefulCompilationDomain for XlaDomain<'c> {
-    fn call_statefully_async(
+    fn execute_statefully(
         &self,
         program: &XlaCompiledProgram<'c>,
-        input_types: &[ArrayIrType],
-        arguments: Vec<XlaValue<'c>>,
+        inputs: Vec<XlaValue<'c>>,
     ) -> ReferenceExecution<Vec<XlaValue<'c>>, Self::Error> {
-        self.execute_stateful_async(program, input_types, arguments)
+        self.execute_stateful_async(program, inputs)
     }
 }
 
@@ -5296,9 +5296,9 @@ impl<'c> AnalyzableCompilationDomain for XlaDomain<'c> {
 
     fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
         &self,
-        executable_function: &ryft_core::compilation::ExecutableFunction<Self, Input, Output>,
+        executable: &ryft_core::compilation::ExecutableFunction<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error> {
-        let program = executable_function.compiled_program();
+        let program = executable.compiled_program();
         program
             .analysis
             .get_or_init(|| analyze_xla_program(program).map_err(|error| error.to_string()))
@@ -5359,8 +5359,8 @@ fn apply_input_shardings(
 }
 
 /// Returns the structured `input_types` with the input sharding overrides of `options` applied (refer to
-/// [`apply_input_shardings`]). Call this before [`CompilationDomain::stage`] when staging with options that may
-/// carry input sharding overrides.
+/// [`apply_input_shardings`]). Call this before [`StagedFunction::stage`](ryft_core::StagedFunction::stage) when
+/// staging with options that may carry input sharding overrides.
 pub(crate) fn with_input_shardings<In: Parameterized<ArrayIrType>>(
     input_types: In,
     options: &XlaOptions,
@@ -13603,8 +13603,9 @@ mod tests {
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
-        let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> = domain
-            .stage::<_, ArrayIrType, ArrayIrType>(
+        let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+                &domain,
                 add_capture,
                 vec![XlaValue::Array(capture.clone())],
                 ArrayIrType::Array(input_type.clone()),
@@ -13699,12 +13700,31 @@ mod tests {
         let input = XlaArray::from_host_buffer(
             &domain,
             input_type,
-            mesh,
+            mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.execute_xla_program(&restored, vec![capture, input]).unwrap();
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
+        // A restored program owns the complete declaration contract, including the hidden capture prefix.
+        assert!(matches!(
+            domain.execute(&restored, vec![XlaValue::Array(capture.clone())]),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 1 })),
+        ));
+        let wrong_type = f64_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        for index in 0..2 {
+            let expected = format!(
+                "runtime input type {} does not refine declared type {}",
+                wrong_type.r#type(),
+                restored.input_types[index],
+            );
+            let mut inputs = vec![XlaValue::Array(capture.clone()), XlaValue::Array(input.clone())];
+            inputs[index] = XlaValue::Array(wrong_type.clone());
+            assert!(matches!(
+                domain.execute(&restored, inputs),
+                Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected,
+            ));
+        }
+        let outputs = domain.execute(&restored, vec![XlaValue::Array(capture), XlaValue::Array(input)]).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![11.0, 22.0, 33.0, 44.0]);
 
         let analysis = analyze_xla_program(&restored).unwrap();
         assert_eq!(analyze_xla_program(&restored).unwrap(), analysis);
@@ -14245,15 +14265,15 @@ mod tests {
             Ok(input)
         }
         assert!(matches!(
-            domain
-                .stage::<_, ArrayIrType, ArrayIrType>(
-                        forward,
-                        Vec::new(),
-                        reference_type.clone(),
-                        XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
-                    )
-                .and_then(|staged| staged.lower(&domain))
-                .map(|_| ()),
+            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+                &domain,
+                forward,
+                Vec::new(),
+                reference_type.clone(),
+                XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
+            )
+            .and_then(|staged| staged.lower(&domain))
+            .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "external reference inputs do not support explicit input shardings",
         ));
@@ -14269,15 +14289,15 @@ mod tests {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
-            domain
-                .stage::<_, ArrayIrType, ArrayIrType>(
-                        allocate,
-                        Vec::new(),
-                        ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-                        XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
-                    )
-                .and_then(|staged| staged.lower(&domain))
-                .map(|_| ()),
+            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+                &domain,
+                allocate,
+                Vec::new(),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
+            )
+            .and_then(|staged| staged.lower(&domain))
+            .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
                               the stateful XLA ABI, which has no protocol to turn a backend array into a host \
@@ -14287,15 +14307,15 @@ mod tests {
         // Forwarding an external reference through an output is rejected by the same contract when lowered, because
         // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
-            domain
-                .stage::<_, ArrayIrType, ArrayIrType>(
-                        forward,
-                        Vec::new(),
-                        reference_type,
-                        XlaOptions::new(mesh.clone()),
-                    )
-                .and_then(|staged| staged.lower(&domain))
-                .map(|_| ()),
+            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+                &domain,
+                forward,
+                Vec::new(),
+                reference_type,
+                XlaOptions::new(mesh.clone()),
+            )
+            .and_then(|staged| staged.lower(&domain))
+            .map(|_| ()),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
                               does not return forwarded references; read the reference after the call instead",
@@ -14324,9 +14344,14 @@ mod tests {
 
         // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
         // did not receive the requested input shardings before staging.
-        let staged = domain
-            .stage::<_, ArrayIrType, ArrayIrType>(forward, Vec::new(), scalar_type.clone(), options.clone())
-            .unwrap();
+        let staged = StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(
+            &domain,
+            forward,
+            Vec::new(),
+            scalar_type.clone(),
+            options.clone(),
+        )
+        .unwrap();
         assert!(matches!(
             staged.lower(&domain).map(|_| ()),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
@@ -14335,7 +14360,9 @@ mod tests {
         ));
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
-        let staged = domain.stage::<_, ArrayIrType, ArrayIrType>(forward, Vec::new(), input_types, options).unwrap();
+        let staged =
+            StagedFunction::<_, ArrayIrType, ArrayIrType>::stage(&domain, forward, Vec::new(), input_types, options)
+                .unwrap();
         assert!(staged.lower(&domain).is_ok());
     }
 
@@ -15660,6 +15687,67 @@ mod tests {
     }
 
     #[test]
+    fn test_stateful_compilation_domain_execute_uses_compiled_input_types() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = XlaProgramBuilder::new();
+        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
+        let update = builder.add_input(ArrayIrType::Array(scalar_type));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program: FlatXlaProgram = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 1, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let bytes = domain.serialize_xla_program(&compiled).unwrap().unwrap();
+        let restored = domain.deserialize_xla_program(&bytes).unwrap().unwrap();
+
+        for program in [&compiled, &restored] {
+            let holder = ArrayReference::new(f32_scalar(&domain, &mesh, 1.0));
+            let reference = XlaValue::Reference(crate::XlaReference::new(holder.clone(), domain.clone()));
+            let update = XlaValue::Array(f32_scalar(&domain, &mesh, 2.0));
+
+            // Kind checks use the stored binding positions, including captures, before acquiring mutable state.
+            let expected = format!(
+                "runtime input type `{}` does not match declared type `{}`",
+                update.r#type(),
+                reference.r#type(),
+            );
+            assert!(matches!(
+                domain.execute_statefully(program, vec![update.clone(), update.clone()]).r#await(),
+                Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected,
+            ));
+            let expected = format!(
+                "runtime input type `{}` does not match declared type `{}`",
+                reference.r#type(),
+                update.r#type(),
+            );
+            assert!(matches!(
+                domain.execute_statefully(program, vec![reference.clone(), reference.clone()]).r#await(),
+                Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected,
+            ));
+            assert!(matches!(
+                domain.execute_statefully(program, Vec::new()).r#await(),
+                Err(XlaDomainError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 0 })),
+            ));
+            assert_eq!(read_f32s(&client, &holder.read().unwrap()), vec![1.0]);
+
+            let outputs = domain.execute_statefully(program, vec![reference, update]).r#await().unwrap();
+            assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
+            assert_eq!(read_f32s(&client, &holder.read().unwrap()), vec![3.0]);
+        }
+    }
+
+    #[test]
     fn test_xla_persistent_v6_round_trips_and_validates_external_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -15917,7 +16005,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let lowered = domain
-            .lower_xla_program(&external_reference_read_program(state_type.clone()), 0, &XlaOptions::new(mesh))
+            .lower_xla_program(&external_reference_read_program(state_type.clone()), 0, &XlaOptions::new(mesh.clone()))
             .unwrap();
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let bytes = domain.serialize_xla_program(&compiled).unwrap().unwrap();
@@ -15932,6 +16020,19 @@ mod tests {
             restored.reference_states.as_ref(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
+
+        // Runtime holders have exact extents. The restored declarations retain the bounds against which they refine.
+        let array = XlaArray::from_host_buffer(
+            &domain,
+            replicated_vector_type(&mesh, 3),
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice(),
+        )
+        .unwrap();
+        let holder = ArrayReference::new(array);
+        let reference = XlaValue::Reference(crate::XlaReference::new(holder, domain.clone()));
+        let outputs = domain.execute_statefully(&restored, vec![reference]).r#await().unwrap();
+        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
