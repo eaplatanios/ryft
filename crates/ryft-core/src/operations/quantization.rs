@@ -757,8 +757,6 @@ pub struct ScaledDotOperation {
     has_rhs_scale: bool,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ScaledDotOperation {
     /// Creates a new [`ScaledDotOperation`].
     ///
@@ -784,11 +782,12 @@ impl ScaledDotOperation {
     /// as a batching dimension. For example, rank-two inputs describe the matrix product `[M, K] × [K, N] → [M, N]`
     /// and rank-three inputs describe the batched matrix product `[B, M, K] × [B, K, N] → [B, M, N]`. Returns a
     /// [`TypeError`] when `rank` is smaller than two.
+    #[inline]
     pub fn default_dimensions(rank: usize) -> Result<DotDimensionNumbers, TypeError> {
         if rank < 2 {
             return Err(TypeError::invalid(format!(
-                "default `{SCALED_DOT_OPERATION_NAME}` dimension numbers require inputs of rank at least 2 but got \
-                 rank {rank}",
+                "default `{SCALED_DOT_OPERATION_NAME}` dimension numbers require inputs of rank at least 2 \
+                 but got rank {rank}",
             )));
         }
         Ok(DotDimensionNumbers::new(vec![rank - 1], vec![rank - 2], (0..rank - 2).collect(), (0..rank - 2).collect()))
@@ -824,14 +823,16 @@ impl ScaledDotOperation {
         2 + usize::from(self.has_lhs_scale) + usize::from(self.has_rhs_scale)
     }
 
-    /// Splits `inputs` into the left and right element inputs followed by the optional left and right scale inputs.
+    /// Splits `inputs` into the left and right element inputs followed by the optional left- and right-hand side
+    /// scale inputs.
     fn split_inputs<'o, Input>(
         &self,
         inputs: &'o [Input],
     ) -> Result<(&'o Input, &'o Input, Option<&'o Input>, Option<&'o Input>), TypeError> {
         if inputs.len() != self.input_count() {
             return Err(TypeError::invalid(format!(
-                "`{SCALED_DOT_OPERATION_NAME}` expects {} inputs but got {}",
+                "`{}` expects {} inputs but got {}",
+                SCALED_DOT_OPERATION_NAME,
                 self.input_count(),
                 inputs.len(),
             )));
@@ -864,20 +865,22 @@ impl Operation for ScaledDotOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         let (lhs, rhs, lhs_scale, rhs_scale) = self.split_inputs(input_types)?;
         ArrayType::check_matching_manual_variation(SCALED_DOT_OPERATION_NAME, &input_types.iter().collect::<Vec<_>>())?;
+
         let rank = lhs.rank();
         if std::iter::once(rhs).chain(lhs_scale).chain(rhs_scale).any(|input_type| input_type.rank() != rank) {
             return Err(TypeError::invalid(format!("`{SCALED_DOT_OPERATION_NAME}` inputs must have the same rank")));
         }
+
         for (index, input_type) in input_types.iter().enumerate() {
             let data_type = input_type.data_type();
-            // Complex inputs are rejected because the `bf16` dequantization would silently drop their imaginary
-            // parts.
+            // Complex inputs are rejected because the `bf16` dequantization would silently drop their imaginary parts.
             if !data_type.is_real() && data_type != DataType::Boolean {
                 return Err(TypeError::invalid(format!(
-                    "`{SCALED_DOT_OPERATION_NAME}` input {index} must have a real numeric or Boolean element type but \
-                     got `{data_type}`",
+                    "`{SCALED_DOT_OPERATION_NAME}` input {index} must have a real numeric or Boolean element type \
+                     but got `{data_type}`",
                 )));
             }
+
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{SCALED_DOT_OPERATION_NAME}` does not support unreduced inputs",
@@ -910,12 +913,13 @@ impl Operation for ScaledDotOperation {
                 if !contracting_dimensions.contains(&axis) {
                     if input_dimension != scale_dimension {
                         return Err(TypeError::invalid(format!(
-                            "`{SCALED_DOT_OPERATION_NAME}` {side} dimension {axis} has size `{input_dimension}` but \
-                             its scale has size `{scale_dimension}`",
+                            "`{SCALED_DOT_OPERATION_NAME}` {side} dimension {axis} has size `{input_dimension}` \
+                             but its scale has size `{scale_dimension}`",
                         )));
                     }
                     continue;
                 }
+
                 match (input_dimension.value(), scale_dimension.value()) {
                     (_, Some(0)) => {
                         return Err(TypeError::invalid(format!(
@@ -946,15 +950,17 @@ impl Operation for ScaledDotOperation {
                 }
             }
         }
+
         Ok(vec![output_type])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("dimensions", &self.dimensions)?;
-            operation.field("accumulation_type", &self.accumulation_type)?;
-            operation.field("lhs_scale", &self.has_lhs_scale)?;
-            operation.field("rhs_scale", &self.has_rhs_scale)
+            operation.field("accumulation_type", self.accumulation_type)?;
+            operation.field("lhs_scale", self.has_lhs_scale)?;
+            operation.field("rhs_scale", self.has_rhs_scale)
         })
     }
 }
@@ -963,6 +969,7 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ScaledDotOperati
 where
     C::Value: ScaledDot,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -993,14 +1000,17 @@ where
         if inputs.len() != self.input_count() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_count(), actual: inputs.len() }.into());
         }
+
         self.dimensions.validate(
             SCALED_DOT_OPERATION_NAME,
             inputs[0].unbatched_type().rank(),
             inputs[1].unbatched_type().rank(),
         )?;
+
         if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         }
+
         validate_common_mapped_dimension(SCALED_DOT_OPERATION_NAME, inputs)?;
 
         // Every scale array must keep the rank of its element array, so every input moves its mapped axis to the front
@@ -1020,6 +1030,8 @@ where
         )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOperation
 where
@@ -2861,6 +2873,7 @@ mod tests {
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
+    use crate::programs::TypedProgram;
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
