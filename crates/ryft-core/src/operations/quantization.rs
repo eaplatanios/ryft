@@ -701,16 +701,14 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ScaledDotOperation`].
 pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 
-/// Primitive representing a generalized block-scaled dot product operation. Its first two inputs are the left and right
-/// element arrays. The optional left and right scale arrays follow in that order, and [`Self::has_lhs_scale`] and
-/// [`Self::has_rhs_scale`] record which of them are present. Element and scale arrays may have any real numeric or
-/// Boolean element type, and all inputs must have the same rank and matching varying manual axes. Unreduced inputs are
-/// rejected.
+/// Primitive representing a generalized block-scaled dot product operation. Its first two inputs are the left and
+/// right element arrays. The optional left and right scale arrays follow in that order, and [`Self::has_lhs_scale`]
+/// and [`Self::has_rhs_scale`] record which of them are present. Element and scale arrays may have any real numeric
+/// or Boolean element type, and all inputs must have the same rank and matching varying manual axes. Unreduced inputs
+/// are rejected.
 ///
 /// Each scale array has the same rank as its element array. Its non-contracting dimensions match the element array
 /// exactly, and the extent of every contracting element dimension is an integer multiple of at least two of the
@@ -742,7 +740,8 @@ pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 /// parameters, and treating them as constants would silently define a straight-through estimator that is not part of
 /// the operation's semantics. The `scaled_matmul` primitive of JAX likewise has no differentiation rule. To train with
 /// block-scaled formats, use [`block_scaled_dot`], which quantizes unquantized inputs and defines an explicit
-/// gradient policy, like `jax.nn.scaled_dot_general`.
+/// gradient policy, like JAX's
+/// [`jax.nn.scaled_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_dot_general.html).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScaledDotOperation {
     /// Contracting and batching dimension specification.
@@ -757,6 +756,8 @@ pub struct ScaledDotOperation {
     /// Whether the operation has a right scale input.
     has_rhs_scale: bool,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ScaledDotOperation {
     /// Creates a new [`ScaledDotOperation`].
